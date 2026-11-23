@@ -25,6 +25,7 @@ from unittest import mock
 from scripts.notify import push_texts, silence
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -100,7 +101,7 @@ if sys.argv[1:] == ["release"]:
 raise SystemExit(pushover.send(sys.argv[1:], keys, post))
 '''))
         environment = {
-            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": MISSING_HERDR_BIN,
             "PYTHONPATH": str(checkout / "scripts/lib/python_startup"),
             "CONF_DIR": str(root / "config"), "NOTIFY_STATE_DIR": str(root / "notify"),
             "XDG_STATE_HOME": str(root / "state"), "USER_ZONE": "America/New_York",

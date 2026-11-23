@@ -21,6 +21,7 @@ from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, 
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
 from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.atomic_file import write_text_atomic
@@ -751,7 +752,7 @@ if "--assignment-file" in arguments:''', 1)
                                  defaults=MAC_RUN_SETTINGS)
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
-            + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n")
+            + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         wrapper = root / "reservation-race.py"
         _ = wrapper.write_text(RESERVATION_RACE_TOOL)
         owner = self.claim(root / "race-owner.json", NEXT_SESSION)

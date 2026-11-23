@@ -51,7 +51,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
-from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_submissions
+from scripts.review_links import new_item_dialog, question_record, reply_tokens, review_actions, review_items, review_submissions
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -761,6 +761,7 @@ class ChangePageTests(unittest.TestCase):
         _ = write_config_fixture(configuration / "nix_env.conf", defaults=nix_fixture_settings())
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
         self.repo = self.temporary / "repo"
         if legacy_links:
@@ -770,7 +771,6 @@ class ChangePageTests(unittest.TestCase):
             "NEXT_STATE_DIR": str(self.temporary / "next"),
             "SCRATCH_ROOT": str(self.temporary / "scratch"),
             "SCRATCH_HOLDS": str(self.temporary / "holds.json"),
-            "SCRATCH_VISIBLE_ROOT": str(self.temporary / "repro"),
             "FEATURE_LOG_VAULT": str(self.temporary / "vault"),
             "XDG_STATE_HOME": str(self.temporary / "state"),
             "STAFF_FILE": str(self.temporary / "staff.json"),
@@ -1297,9 +1297,13 @@ class ChangePageTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root)
         first = review_actions.prepare_submission_delivery(native, request.words, status)
         assert isinstance(first, change_page.MessageDelivery)
-        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, status),
-                              change_page.NoMessageDelivery)
-        self.assertIn(change_page.reply_command(native.key, native.reply_token), first.message)
+        with self.assertRaisesRegex(review_actions.SubmissionDeliveryPending, "still sending"):
+            _ = review_actions.prepare_submission_delivery(native, request.words, status)
+        command = change_page.reply_command(native.key)
+        self.assertIn(command, first.message)
+        sent_message = first.message.removesuffix(command) + change_page.reply_command(native.key, native.reply_token)
+        self.assertNotIn(native.reply_token, native.path.read_text(encoding="utf-8"))
+        self.assertNotIn(native.reply_token, status.path(first.page, first.row).read_text(encoding="utf-8"))
         with patch.object(change_page, 'send_with_retries', return_value=[
             change_page.DeliveryFailure(recipient.id, 'The fixture sender is unavailable.')
         ]), patch.object(change_page, 'send_to_staff') as alert:
@@ -1315,10 +1319,15 @@ class ChangePageTests(unittest.TestCase):
             with patch.object(restarted, 'write_slots', side_effect=OSError('Cannot write the delivery receipt.')):
                 change_page.recover_review_messages(restarted)
             change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
-            send.assert_called_once_with(recipient.id, change_page.SENDER, first.message,
+            send.assert_called_once_with(recipient.id, change_page.SENDER, sent_message,
                 key=change_page.review_delivery_key(first.page.review_list, first.row, first.attempt))
+        self.assertNotIn(native.reply_token, status.path(first.page, first.row).read_text(encoding="utf-8"))
+        self.assertNotIn(native.reply_token, status.closeout_path(first.page, first.row).read_text(encoding="utf-8"))
         self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, restarted),
                               change_page.NoMessageDelivery)
+        self.assertTrue(review_submissions.answer(native.key, 'The check passed.', native.reply_token))
+        self.assertIsInstance(review_actions.prepare_submission_delivery(
+            review_submissions.submit(request), request.words, restarted), change_page.NoMessageDelivery)
 
     def test_delivery_failure_survives_restart_until_the_same_row_succeeds(self) -> None:
         status = change_page.DeliveryStatus(self.root)

@@ -11,6 +11,7 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.build_queue.admission_test_support import caller_admission
@@ -18,6 +19,7 @@ from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
 from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test, claim_state
 
@@ -74,8 +76,7 @@ class SshReservationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
         _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\nslots=1\nslots.hana=1\n")
 
@@ -172,8 +173,7 @@ class SshResultBoundaryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
 
     def test_linux_result_keeps_completion_separate_from_unconfirmed_cleanup(self) -> None:
         offload = eligibility_support.offload
@@ -251,7 +251,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
 ''')
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-                              + "kind.natedev=local\nplatform.natedev=linux\n")
+                              + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", defaults=MAC_RUN_SETTINGS)
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")

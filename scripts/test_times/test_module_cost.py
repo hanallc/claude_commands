@@ -27,6 +27,7 @@ from scripts.lib.descendants import adopt_descendants
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.test_times import module_cost, task_cpu
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 def setUpModule() -> None:
@@ -947,7 +948,7 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
                 + '        with lock_path.open("r+") as probe:\n'
                 + '            with self.assertRaises(BlockingIOError): fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
                 + f'        with open({str(leases)!r}, "a") as log: log.write("held\\n")\n'
-                + '        self.assertEqual(os.environ["HERDR_BIN"], "/nonexistent/herdr")\n'
+                + f'        self.assertEqual(os.environ["HERDR_BIN"], {MISSING_HERDR_BIN!r})\n'
                 + '        self.assertTrue(sys.dont_write_bytecode)\n'
                 + '        for code in ("pass", "import os"):\n'
                 + '            subprocess.run([sys.executable, "-c", code], check=True)\n',

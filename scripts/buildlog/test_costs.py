@@ -24,6 +24,7 @@ from scripts.buildlog import store
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
 from scripts.buildlog.test_holds import hold_event
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 class CostTests(unittest.TestCase):
@@ -219,7 +220,8 @@ class CostTests(unittest.TestCase):
         _ = config.write_text("targets=natedev,mac,aws\nkind.natedev=local\nplatform.natedev=linux\n"
                               + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                               + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
-                              + "sync.hosts.mac=replacement-mac\nsync.hosts.aws=cloud-host\nsync.hosts.natedev=local-host\n")
+                              + "sync.hosts.mac=replacement-mac\nsync.hosts.aws=cloud-host\nsync.hosts.natedev=local-host\n"
+                              + UNREACHABLE_WAIT_FIXTURE)
         _ = config.with_name("mac_test.conf").write_text("host=fixture\n")
         _ = config.with_name("aws.conf").write_text("host=fixture\n")
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), closing(self.fixture.connection(

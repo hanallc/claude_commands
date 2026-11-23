@@ -18,6 +18,7 @@ from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.mac_test import claim_state, mac_test
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 class VerifySshRoutingTests(VerifySshTargetsFixture):
@@ -371,9 +372,9 @@ raise SystemExit(75)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
             + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n"
-            + "settings.hana-gpu=cloud_gate.conf\n")
+            + "settings.hana-gpu=cloud_gate.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = (self.root / "cloud_gate.conf").write_text(
-            "execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
+            "enabled=on\nexecution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
             + "hana_gpu_repository=https://example.com/team/hana\n"
             + "hana_gpu_instance_types=g6.2xlarge\nhana_gpu_selections=sample:shader_variants\n")
         account = self.target_state("aws")
@@ -404,7 +405,7 @@ raise SystemExit(75)
         self.assertEqual(check.returncode, 2, check.stdout + check.stderr)
         request, check_request = requests
         self.assertEqual(check_request.constraints.command, (
-            "cargo", "check", "--workspace", "--lib", "--bins", "--features", "hana/dynamic_linking"))
+            "cargo", "check", "--workspace", "--all-targets", "--features", "hana/dynamic_linking"))
         self.assertEqual(request.constraints.command, (
             "cargo", "nextest", "run", "--no-fail-fast", "--workspace", "--test", "shader_variants",
             "-E", "package(sample)"))

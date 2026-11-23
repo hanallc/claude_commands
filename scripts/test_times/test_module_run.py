@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
 
+from contextlib import ExitStack, redirect_stderr
+from io import StringIO
 from dataclasses import dataclass
+import errno
+from itertools import product
 import json
 import math
 import os
@@ -18,13 +22,17 @@ import tempfile
 import textwrap
 from typing import ClassVar, cast, override
 import unittest
+from unittest.mock import patch
 
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import gate
+from scripts.test_times import module_run
 from scripts.test_times.gate_record import ModuleTimes
 from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
@@ -308,6 +316,286 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
 
 
+class LiveConfigGuardTests(unittest.TestCase):
+    def test_child_guard_allows_private_cleanup_and_relative_open(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected, private, alias = (root / name for name in ("config", "private", "alias"))
+        protected.mkdir()
+        private.mkdir()
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        child = """
+import os
+import shutil
+
+assert os.open in os.supports_dir_fd
+assert shutil.rmtree.avoids_symlink_attacks
+fd = os.open("../private", os.O_RDONLY)
+os.close(os.open("fixture", os.O_WRONLY | os.O_CREAT, dir_fd=fd))
+os.close(fd)
+shutil.rmtree("../private")
+try:
+    shutil.rmtree("../alias")
+except OSError:
+    pass
+else:
+    raise AssertionError("rmtree accepted a symlink")
+"""
+        with module_run.guard_live_config(protected, root, log):
+            result = subprocess.run([sys.executable, "-c", child], cwd=protected, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(private.exists())
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_child_guard_preserves_checkout_startup_and_next_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        library = RUNNER.parents[1] / "lib"
+        startup = root / "guard"
+        startup.mkdir()
+        following = root / "following"
+        following.mkdir()
+        _ = (following / "sitecustomize.py").write_text(
+            "import os\nos.environ['CONFIG_TEST_NEXT_HOOK'] = 'loaded'\n", encoding="utf-8")
+        child = """
+import os
+import runpy
+import sys
+
+runpy.run_path(sys.argv[1])
+print(os.environ['CONFIG_TEST_NEXT_HOOK'])
+"""
+        environment = {"PYTHONPATH": os.pathsep.join((str(library / "python_startup"), str(following))),
+                       "CLAUDE_PYTHON": sys.executable}
+        with patch.dict(os.environ, environment), module_run.guard_live_config(
+                root / "config", startup, root / "violations"):
+            for program in (sys.executable, str(library / "py")):
+                with self.subTest(program=program):
+                    result = subprocess.run([program, "-c", child, str(library / "package_root.py")], cwd=root,
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "loaded\n")
+                    self.assertEqual(result.stderr, "")
+
+    def test_runner_rejects_a_caught_write_in_a_python_child(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+try:
+    Path(sys.argv[1]).write_text("changed")
+except AssertionError:
+    print("refused")
+"""
+        children: list[subprocess.CompletedProcess[str]] = []
+
+        def fixture_test() -> None:
+            shim = Path(module_run.__file__).resolve().parents[1] / "lib" / "py"
+            for program in (sys.executable, str(shim)):
+                children.append(subprocess.run([program, "-c", child, str(config)], cwd=root,
+                                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS))
+
+        suite = unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+        with (patch.object(Path, "home", return_value=home),
+              patch.dict(os.environ, {"CLAUDE_PYTHON": sys.executable}),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", return_value=suite),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+        self.assertEqual([(child.returncode, child.stdout, child.stderr) for child in children],
+                         [(0, "refused\n", ""), (0, "refused\n", "")])
+        self.assertEqual(config.read_text(), "original\n")
+
+    def test_child_guard_expires_when_the_runner_removes_the_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+
+hook, config = map(Path, sys.argv[1:])
+try:
+    config.write_text("blocked")
+except AssertionError:
+    print("refused")
+hook.unlink()
+config.write_text("expired")
+"""
+        log = root / "violations"
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                result = subprocess.run([sys.executable, "-c", child, str(root / "sitecustomize.py"), str(config)],
+                                        cwd=root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "refused\n")
+        self.assertEqual(config.read_text(), "expired")
+        self.assertFalse((root / "sitecustomize.py").exists())
+
+    def test_guard_allows_mkdir_on_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            alias.mkdir(exist_ok=True)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_file_exists_for_a_private_link_target(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        source = root / "source"
+        source.touch()
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.symlink(source, alias)
+            with self.assertRaises(FileExistsError):
+                os.link(source, alias)
+        self.assertEqual(alias.readlink(), protected)
+        self.assertFalse(log.exists())
+
+    def test_guard_resolves_symlinks_before_parent_traversal(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        private = root / "private"
+        nested = private / "nested"
+        nested.mkdir(parents=True)
+        (private / protected.name).mkdir()
+        alias = root / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        through_alias = alias / ".." / protected.name
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            _ = (through_alias / "file").write_text("private")
+            (through_alias / "directory").mkdir()
+        self.assertEqual((private / protected.name / "file").read_text(), "private")
+        self.assertTrue((private / protected.name / "directory").is_dir())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_nofollow_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(OSError) as error:
+                os.close(os.open(alias, os.O_WRONLY | os.O_NOFOLLOW))
+            self.assertEqual(error.exception.errno, errno.ELOOP)
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_exclusive_create_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.close(os.open(alias, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        self.assertFalse(log.exists())
+
+    def test_guard_allows_rename_and_removal_of_a_private_link_to_live_config(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        private = root / "private"
+        private.mkdir()
+        alias = private / "console.conf"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            renamed = private / "renamed"
+            _ = alias.rename(renamed)
+            self.assertTrue(renamed.is_symlink())
+            renamed.unlink()
+            renamed.symlink_to(config)
+            _ = alias.write_text("private")
+            _ = alias.replace(renamed)
+            self.assertEqual(renamed.read_text(), "private")
+            renamed.unlink()
+            private.rmdir()
+        self.assertFalse(os.path.lexists(alias))
+        self.assertFalse((root / "sitecustomize.py").exists())
+        self.assertFalse(log.exists())
+        directory_alias = root / "alias"
+        directory_alias.symlink_to(protected, target_is_directory=True)
+        empty = protected / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                with self.assertRaises(AssertionError):
+                    _ = (directory_alias / config.name).rename(root / "moved")
+                with self.assertRaises(AssertionError):
+                    _ = directory_alias.rename(protected / "moved")
+                with self.assertRaises(AssertionError):
+                    (directory_alias / config.name).unlink()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / empty.name).rmdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-directory").mkdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-link").symlink_to(config)
+        self.assertEqual(config.read_text(), "original\n")
+        self.assertTrue(empty.is_dir())
+
+    def test_runner_refuses_live_config_writes_even_if_the_test_catches_them(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        console = protected / "console.conf"
+        _ = console.write_text("page.list.owner=original\n")
+        private = root / "private.conf"
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+
+        def fixture_test() -> None:
+            _ = private.write_text("page.list.owner=fixture\n")
+            with self.assertRaises(AssertionError):
+                _ = private.replace(console)
+
+        def discover(_names: list[str]) -> unittest.TestSuite:
+            with self.assertRaises(AssertionError):
+                _ = (alias / "console.conf").write_text("page.list.owner=fixture\n")
+            return unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+
+        with (patch.object(Path, "home", return_value=home),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", side_effect=discover),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+
+        self.assertEqual(console.read_text(), "page.list.owner=original\n")
+        self.assertEqual(private.read_text(), "page.list.owner=fixture\n")
+
+
 class ModuleRunnerTests(unittest.TestCase):
     outcomes: ClassVar[FixtureRun]
     empty: ClassVar[FixtureRun]
@@ -337,8 +625,10 @@ class ModuleRunnerTests(unittest.TestCase):
         )
 
     def test_config_reads_include_python_and_shell_children(self) -> None:
+        from scripts.lib import build_folders
+
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
             config = root / "config"
             config.mkdir()
@@ -356,9 +646,68 @@ class Reads(unittest.TestCase):
         subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
                        {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
 """
-            fixture = run_fixture(root, "config_reads", source)
-            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
-            self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+            with self.subTest(runner="standalone"):
+                fixture = run_fixture(root, "config_reads", source)
+                self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
+            for gate_case in ("absolute", "relative with read-only scratch"):
+                with self.subTest(runner=gate_case), ExitStack() as cleanup:
+                    parent = root / "jobs"
+                    parent.mkdir(exist_ok=True)
+                    module = cleanup.enter_context(build_folders.tool_folder("test-module", parent))
+                    relative = gate_case != "absolute"
+                    gate_root = Path(os.path.relpath(module)) if relative else module
+                    fixture_path = root / "test_gate_reads.py"
+                    _ = fixture_path.write_text(source + f"""
+        import json
+        from pathlib import Path
+        module = Path(os.environ['TMPDIR'])
+        self.assertNotIn('GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_MODULE_DIR', os.environ)
+        paths = [Path(os.environ[name]) for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR', 'CONF_READ_LOG')]
+        scratch, review, config_log = paths
+        for folder in (scratch, review):
+            folder.mkdir()
+            (folder / 'output').write_text('module output')
+            self.assertEqual((folder / 'output').read_text(), 'module output')
+        self.assertEqual(set(config_log.read_text().splitlines()), {{'alpha', 'beta', 'gamma'}})
+        self.assertEqual(list(module.glob('*.lease.json')), [])
+        print('runner files ' + json.dumps([str(path.relative_to(module)) for path in paths]))
+        if {relative!r}:
+            retained = module / 'scratch' / 'nested'
+            retained.mkdir(parents=True)
+            (retained / 'output').write_text('read-only scratch output')
+            retained.chmod(0o500)
+""", encoding="utf-8")
+                    extra = {**os.environ, **interpreter_cache_environment(root / "cache"),
+                             "CONF_DIR": str(config), "PYTHONPATH": str(root)}
+                    env = gate.test_module_environment(gate_root, extra)
+                    shim = gate.python_shim(repository)
+                    job = gate.start_gate_job(
+                        "test_times", fixture_path, [str(shim), str(RUNNER), str(root), fixture_path.name],
+                        repository, env, gate_root / "output.log")
+                    try:
+                        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        gate.kill_job_group(job)
+                        raise
+                    runner_entries = sorted(path.name for path in module.glob("test-run-roots*"))
+                    runner_entries.extend(path.name for path in module.glob("config-reads*"))
+                    retained = module / "scratch" / "nested" / "output"
+                    scratch_output = retained.read_text() if relative and status == 0 else ""
+                    job.folder_cleanup = cleanup.pop_all()
+                    result = gate.finish_gate_job(job, status)
+                    self.assertEqual(status, 0, result.output)
+                    self.assertEqual(result.returncode, 0, result.output)
+                    self.assertIn("runner files ", result.output)
+                    self.assertEqual(runner_entries, [])
+                    if relative:
+                        self.assertEqual(scratch_output, "read-only scratch output")
+                    self.assertIsInstance(result.times, dict)
+                    self.assertEqual(cast(ModuleTimes, result.times).get("config_reads"), ["alpha", "beta", "gamma"])
+                    self.assertEqual(list(parent.iterdir()), [])
 
     def test_folder_scans_record_repository_listings_and_skip_imports_and_children(self) -> None:
         cases: tuple[tuple[str, str, list[str]], ...] = (
@@ -481,8 +830,12 @@ shutil.rmtree(path)""", []),
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
+            # The runner starts a direct test, and the direct test reads its time limit from this file.
+            settings = outside / "settings"
+            _ = write_config_fixture(settings / "test_times.conf", "# whole: 1..\ndirect_test.time_limit_seconds=120\n")
             environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
-                           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+                           "CONF_DIR": str(settings), "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1",
+                           "GIT_CONFIG_GLOBAL": os.devnull}
             inner = root / "nested"
             (inner / "config").mkdir(parents=True)
             _ = (inner / "config/limits.conf").write_text("value=private\n")
@@ -500,8 +853,7 @@ shutil.rmtree(path)""", []),
                               + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
                               + textwrap.indent(action, "        ") + "\n")
                     _ = (root / "tests/test_listing.py").write_text(source)
-                    entry = "import runpy, sys; runpy.run_path(sys.argv.pop(1))['main']()"
-                    result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                    result = subprocess.run([sys.executable, str(runner), str(root / "tests"), "test_listing.py"],
                                             cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
                                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     if name in blocked:
@@ -511,7 +863,7 @@ shutil.rmtree(path)""", []),
                         if name == "read config":
                             untimed = {key: value for key, value in environment.items() if key != "TEST_TIMES_OUT"}
                             result = subprocess.run(
-                                [sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                                [sys.executable, str(runner), str(root / "tests"), "test_listing.py"],
                                 cwd=root, env=untimed, capture_output=True, text=True, check=False,
                                 timeout=TEST_HANG_GUARD_SECS,
                             )
@@ -781,9 +1133,9 @@ class FixtureCPU(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
-            env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
-                   "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            env["PYTHONPATH"] = str(root)
+            env = direct_test_fixture_environment(root)
+            env.update(TEST_TIMES_OUT=str(output), HOME=str(root / "home"),
+                       BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
             result = subprocess.run(
                 [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -795,43 +1147,120 @@ class FixtureCPU(unittest.TestCase):
             self.assertEqual(list(root.glob(".output.*")), [])
 
 
+class MacGateModuleTests(unittest.TestCase):
+    def test_macos_gate_keeps_the_module_temporary_folder(self) -> None:
+        from scripts.lib import build_folders
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        module = self.enterContext(build_folders.tool_folder("test-module", root))
+        case = root / "test_gate_parent.py"
+        _ = case.write_text(f"""import os
+from pathlib import Path
+import unittest
+
+class GateParent(unittest.TestCase):
+    def test_module_folder(self):
+        module = Path({str(module)!r})
+        self.assertEqual(Path(os.environ['TMPDIR']), module)
+        self.assertEqual(Path(os.environ['SCRATCH_ROOT']), module / 'test-run-roots' / 'scratch')
+        self.assertEqual(Path(os.environ['ASTRA_REVIEW_DIR']), module / 'test-run-roots' / 'astra')
+        self.assertEqual(Path(os.environ['CONF_READ_LOG']), module / 'config-reads' / 'reads')
+""", encoding="utf-8")
+        environment = direct_test_fixture_environment(root)
+        environment.update(GATE_PARENT_PID=str(os.getpid()), HOME=str(root / "home"), PYTHONPATH=str(root))
+        entry = "import runpy, sys; sys.platform = 'darwin'; runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        result = subprocess.run(
+            [str(gate.python_shim(RUNNER.parents[2])), "-c", entry, str(RUNNER), str(root), case.name],
+            cwd=RUNNER.parents[2], env=gate.test_module_environment(module, environment),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
 class ModuleProcessCleanupTests(unittest.TestCase):
     def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
-        for parent_name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID"):
-            with self.subTest(parent_name=parent_name):
-                root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        from scripts.lib import build_folders
+
+        cases = ("standalone", "unleased TMPDIR", "gate")
+        parent_names = ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID")
+        for runner_case, parent_name in product(cases, parent_names):
+            with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
+                root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
-                self.addCleanup(processes.finish)
-                environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-                    "PYTHONPATH": str(root)})
-                _ = environment.pop("TEST_TIMES_OUT", None)
-                _ = (root / "test_parent.py").write_text("""import signal, unittest
+                environment = processes.environment(direct_test_fixture_environment(root))
+                environment.update({**interpreter_cache_environment(root / "cache"),
+                                    "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+                                    "PYTHONPATH": str(root)})
+                _ = environment.pop("MERGE_GATE_MODULE_DIR", None)
+                module = root / "module"
+                if runner_case == "gate":
+                    module = cleanup.enter_context(build_folders.tool_folder("module", root))
+                    environment = gate.test_module_environment(module, environment)
+                elif runner_case == "unleased TMPDIR":
+                    module.mkdir()
+                    environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
+                case = root / "test_parent.py"
+                _ = case.write_text("""import os, select, unittest
+from pathlib import Path
+from scripts.lib import conf_reads
+
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
+        for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
+            folder = Path(os.environ[name])
+            folder.mkdir()
+            (folder / 'output').write_text(name)
+        conf_reads.record('ready')
         print('ready', flush=True)
-        signal.pause()
+        select.select([], [], [])
 """, encoding="utf-8")
-                parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                repository = RUNNER.parents[2]
+                log = root / "runner.log"
+                shim = repository / "scripts/lib/py"
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
+                source = f"""import os, sys
+from pathlib import Path
+from scripts.production import gate
+job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
+                         Path({str(repository)!r}), dict(os.environ), Path({str(log)!r}))
+print(job.process.pid, flush=True)
+sys.exit(job.process.wait())
+"""
+                _ = cleanup.callback(processes.finish)
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
                 processes.track(parent)
-                _ = environment.pop("GATE_PARENT_PID", None)
-                _ = environment.pop("MERGE_GATE_PARENT_PID", None)
-                environment[parent_name] = str(parent.pid)
-                runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
-                    env=environment, cwd=root, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-                processes.track(runner)
-                output = runner.stdout
+                output = parent.stdout
                 assert output is not None
                 self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-                self.assertEqual(cast(str, output.readline()), "ready\n")
-                parent.send_signal(signal.SIGTERM)
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                _ = cleanup.callback(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                if runner_case == "gate":
+                    for folder, name in (("scratch", "SCRATCH_ROOT"), ("astra", "ASTRA_REVIEW_DIR")):
+                        self.assertEqual((module / "test-run-roots" / folder / "output").read_text(), name)
+                    self.assertEqual((module / "config-reads" / "reads").read_text(), "ready\n")
+                elif runner_case == "unleased TMPDIR":
+                    lease = cast(dict[str, object], json.loads((module / "test-run-roots.lease.json").read_text()))
+                    self.assertEqual(lease["pid"], runner_pid)
+                parent.terminate()
                 self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-                stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
-                self.assertNotIn("Traceback", stderr)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
+                if runner_case != "standalone":
+                    self.assertEqual(list(module.glob("test-run-roots*")), [])
+                if runner_case == "gate":
+                    self.assertEqual(list(module.glob("config-reads*")), [])
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -898,12 +1327,9 @@ class InheritedSignal(unittest.TestCase):
         source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
                   .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
         _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
-        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-            "PYTHONDONTWRITEBYTECODE": "1"})
-        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
-            _ = environment.pop(name, None)
-        environment["PYTHONPATH"] = str(root)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(root))
         process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)

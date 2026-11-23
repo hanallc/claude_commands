@@ -32,14 +32,15 @@ from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 from scripts.build_targets import targets, target_config
-from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert, write_live_mac_state
 from scripts.message import roster
 from scripts.message import session_send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
-from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest
-from scripts.build_targets.target_test_support import HOLD_TARGET_SETTINGS, mac_target_settings
+from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest, fixture_mac_mirror
+from scripts.build_targets.target_test_support import (HOLD_TARGET_SETTINGS, mac_target_settings,
+                                                       UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS)
 from scripts.mac_test.config_test_support import MAC_IDLE_SETTINGS, MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
@@ -54,6 +55,7 @@ REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
 REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
+REAL_MAC_REPOSITORY_IDENTITY = claim_state.mac_repository_identity
 REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
 WAITING_SESSION = OwningSession("waiting-session")
 
@@ -338,6 +340,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
+        _ = write_live_mac_state(self.mac_state, block=True)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         expected = ("MAC BLOCKED by research since 13:50 (P15 F11 L0 run): 7 steps wait for the Mac, "
                     "idle 10 min; /build:mac unblock clears it.")
@@ -720,7 +723,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
         config = self.write_config(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             with mock.patch.object(
@@ -735,7 +738,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_probe_uses_shared_settings_reader_without_building_config(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
-        config = eligibility.OffloadConfig(False, eligibility.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
+        config = eligibility.OffloadConfig(False, eligibility.SshConnectionSettings("reader-mac", 2.0, 10.0, UNREACHABLE_WAIT_FIXTURE_SECONDS), 3.0, 4.0, 5.0, "6", {})
         calls: list[eligibility.OffloadConfig] = []
 
         def reachable(
@@ -816,7 +819,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         super().setUp()
         config = self.write_config(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n")
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n"
                                  + "linux_only..claude=\noffload_exclude..claude=doc\n", defaults=MAC_RUN_SETTINGS)
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n')
@@ -826,6 +829,12 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             _ = (member / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
+        mirror = fixture_mac_mirror(self.root, "hana", "https://fixture.invalid/hana")
+
+        def mac_repository(worktree: str) -> claim_state.ResolvedMacMirror | claim_state.WholeMacScope:
+            return mirror if Path(worktree) == self.root else claim_state.WHOLE_MAC
+
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity", side_effect=mac_repository))
 
     def kind_output(self, kind: str, package: str = "", free_gib: float = 60) -> str:
         output = io.StringIO()
@@ -884,7 +893,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         _ = self.write_config(
             "targets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         self.assertEqual(self.kind_output("check"),
                          "any_target\nnatedev\teligible\t-\t-\t-\n"
                          + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\teligible\t-\t{self.settings}\tmacos\n")
@@ -959,6 +968,32 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, expected)
 
+    def test_copy_folder_names_keep_the_repository_linux_only_policy(self) -> None:
+        # A prepared or merged copy is a shared clone in a folder that is not named for the repository.
+        # setUp sets linux_only.hana=linux-part; the copy must read that policy, not one for its folder name.
+        origin = "https://fixture.invalid/hana"
+        source = self.root / "repositories" / "hana"
+        _ = self.enterContext(mock.patch("subprocess.run", REAL_SUBPROCESS_RUN))
+        _ = self.enterContext(mock.patch("subprocess.Popen", REAL_SUBPROCESS_POPEN))
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity", REAL_MAC_REPOSITORY_IDENTITY))
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture", "--no-gpg-sign", "--allow-empty"],
+                           check=True)
+        _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", origin], check=True)
+        for step, folder in (("prepared", "copies-source/source"), ("merged", "copies-merge/merged")):
+            copy = self.root / "tmp" / folder
+            _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(copy)], check=True)
+            _ = subprocess.run(["git", "-C", str(copy), "remote", "set-url", "origin", origin], check=True)
+            for package, expected in (("portable", placement.AllowedHost()),
+                                      ("linux-part", placement.FixedExclusion("linux_only"))):
+                with self.subTest(step=step, package=package):
+                    constraints = build_targets.fixed_placement_constraints(
+                        copy, package, "test", ("cargo", "test"), NoOwningSession(), "fixed-source",
+                        selection=Pinned("mac"))
+                    mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+                    self.assertEqual(mac.eligibility, expected)
+
     def test_claude_doc_exclusion_applies_only_to_the_default_route(self) -> None:
         cases: tuple[tuple[str, build_targets.StepKind, TargetSelection, placement.HostEligibility], ...] = (
             (".claude", "doc", ROUTED, placement.FixedExclusion("offload_exclude")),
@@ -969,7 +1004,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         )
         for repo, kind, selection, expected in cases:
             with self.subTest(repo=repo, kind=kind, selection=selection), mock.patch.object(
-                eligibility, "repository_identity", return_value=eligibility.KnownRepository(repo),
+                claim_state, "mac_repository_identity",
+                return_value=fixture_mac_mirror(self.root, repo, f"https://fixture.invalid/{repo}"),
             ):
                 constraints = build_targets.fixed_placement_constraints(
                     self.root, "portable", kind, ("cargo", kind), NoOwningSession(), "fixed-source",
@@ -1700,14 +1736,13 @@ class RecordedStepKindTests(unittest.TestCase):
     def test_step_policy_passes_the_snapshot_backoff_to_each_remote_kind(self) -> None:
         target = targets.SshTarget("mac", "macos", Path("/fixture/mac.conf"))
         unreadable = eligibility.UnreadableBackoff("bad")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
-        with mock.patch.object(eligibility, "read_config", return_value=config), \
+        with mock.patch.object(eligibility, "read_target_settings"), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("hana")) as checks:
             result = build_targets.step_policy(target, Path("/fixture/hana"), "hana", "final", backoff=unreadable)
         self.assertEqual(result, eligibility.KnownRepository("hana"))
         self.assertEqual([call.kwargs["kind"] for call in checks.call_args_list], ["check", "test"])
         self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in checks.call_args_list))
-        with mock.patch.object(eligibility, "read_config", return_value=config), \
+        with mock.patch.object(eligibility, "read_target_settings"), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("state")):
             self.assertEqual(build_targets.step_policy(target, Path("/fixture/hana"), "hana", "check", backoff=unreadable),
                              targets.ExcludedTarget(target, "state"))

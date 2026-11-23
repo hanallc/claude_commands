@@ -36,7 +36,8 @@ from scripts.copies.remote_test_support import local_remote_transport
 from scripts.lint.memory_test_support import seed_config_fixture_folder
 from scripts.production.change_review_test_support import REVIEW_DELIVERY_SETTINGS, write_change_review_settings
 from scripts.production.config_test_support import QUESTION_TITLE_SETTINGS
-from scripts.review_links import change_browser, change_page, new_item_dialog, review_actions, review_items, review_later, review_submissions
+from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_later, review_submissions
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
@@ -65,8 +66,10 @@ class TidyWrappedTests(unittest.TestCase):
         })
         write_change_review_settings(configuration, self.root)
         self.enterContext(mock.patch.dict(os.environ, {
-            **environment, "HERDR_BIN": "/nonexistent/herdr", "USER_ZONE": "America/New_York",
+            **environment, "HERDR_BIN": MISSING_HERDR_BIN, "USER_ZONE": "America/New_York",
+            "XDG_STATE_HOME": str(self.root / "key-state"),
         }))
+        _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def write(self, path: Path, content: str) -> Path:
@@ -137,6 +140,7 @@ class TidyWrappedTests(unittest.TestCase):
         _ = investigation.mark_read(child.id, closed.id)
         native = investigation.file(child.id, "Native report", "Keep the unit filing in its native store.",
                                     waiting_why="Check the report")
+        originals = {item.key: item.path.read_bytes() for item in saved}
 
         _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
         result = self.run_tidy(doc)
@@ -148,6 +152,10 @@ class TidyWrappedTests(unittest.TestCase):
                 retry = review_submissions.submit(request)
                 self.assertEqual((retry.key, retry.owner, retry.original_path), (original.key, parent.id, original.path))
                 self.assertEqual(retry.path.parent, investigation.folder(parent.id))
+                self.assertEqual(retry.path.read_bytes(), originals[original.key].replace(
+                    f'owner: "{child.id}"\n'.encode(), f'owner: "{parent.id}"\n'.encode(), 1))
+                token = original.reply_token if request.kind == new_item_dialog.SubmissionKind.BUG else ""
+                self.assertEqual(retry.reply_token, token)
                 report = investigation.read_review_record(retry.path)
                 self.assertEqual(report.source_owner, child.id)
                 item = review_items.investigation_item(report, staff.snapshot(), retry.path)
@@ -195,6 +203,9 @@ class TidyWrappedTests(unittest.TestCase):
     def test_restart_keeps_the_destination_reply_when_the_receipt_is_missing(self) -> None:
         self.check_wrap_recovery("destination reply", remove_receipt=True)
 
+    def test_restart_replaces_a_legacy_token_in_the_changed_destination(self) -> None:
+        self.check_wrap_recovery("destination reply", legacy_target=True)
+
     def test_restart_refuses_to_remove_either_copy_when_both_change(self) -> None:
         self.check_wrap_recovery("both replies")
 
@@ -203,7 +214,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def check_wrap_recovery(
         self, change: Literal["source reply", "destination read", "destination reply", "both replies", "missing digest"],
-        *, remove_receipt: bool = False,
+        *, remove_receipt: bool = False, legacy_target: bool = False,
     ) -> None:
         class StoppedWrap(BaseException):
             """The process stops without rolling back the move."""
@@ -215,8 +226,6 @@ class TidyWrappedTests(unittest.TestCase):
         receipt = review_submissions.image_folder(original).parent / "receipt.json"
         journal = receipt.with_name("move.json")
         stop_before_receipt = change != "destination reply"
-        if change == "destination read":
-            self.assertTrue(review_submissions.answer(original.key, "Reply before wrap", original.reply_token))
         _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
         root = self.root / "review"
         status = change_page.DeliveryStatus(root)
@@ -235,6 +244,9 @@ class TidyWrappedTests(unittest.TestCase):
 
         with mock.patch.object(change_page, "send_to_staff") as send:
             change_page.deliver(review_actions.prepare_submission_delivery(original, request.words, status), status)
+            if change == "destination read":
+                # The answer follows the delivery that carried its reply token.
+                self.assertTrue(review_submissions.answer(original.key, "Reply before wrap", original.reply_token))
             with (mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
                   mock.patch.object(Path, "unlink", autospec=True, side_effect=stop_at_source),
                   mock.patch.object(atomic_file, "write_text_atomic", side_effect=stop_at_receipt),
@@ -261,6 +273,15 @@ class TidyWrappedTests(unittest.TestCase):
             if change == "missing digest":
                 del move_fields["destination_digest"]
                 _ = journal.write_text(json.dumps(move_fields))
+            expected_target = target.read_bytes()
+            if legacy_target:
+                token = original.reply_token.encode()
+                nonce_field = f', "reply_token_nonce": "{original.details.reply_token_nonce}"'.encode()
+                expected_target = expected_target.replace(nonce_field, b"")
+                legacy = expected_target.replace(b"reply_token_sha256", b"reply_token", 1).replace(
+                    original.details.reply_token_sha256.encode(), token, 1)
+                self.assertIn(token, legacy)
+                _ = target.write_bytes(legacy)
             if remove_receipt:
                 receipt.unlink()
             preserved_paths = (original.path, target, journal)
@@ -286,7 +307,7 @@ class TidyWrappedTests(unittest.TestCase):
         if change == "source reply":
             self.assertEqual(kept.answer, "Source reply")
         else:
-            self.assertEqual(target.read_bytes(), before[1])
+            self.assertEqual(target.read_bytes(), expected_target)
             if change == "destination read":
                 self.assertEqual(kept.state, investigation.InvestigationState.READ)
             else:
@@ -297,7 +318,13 @@ class TidyWrappedTests(unittest.TestCase):
         request = self.user_request(new_item_dialog.SubmissionKind.QUESTION, child.id)
         sent = review_submissions.submit(request)
         token = sent.reply_token
-        before = update_registration.read_review_question(sent.path)
+        nonce_field = f', "reply_token_nonce": "{sent.details.reply_token_nonce}"'.encode()
+        original = sent.path.read_bytes().replace(nonce_field, b"")
+        self.assertNotIn(b"reply_token_nonce", original)
+        _ = sent.path.write_bytes(original.replace(b"reply_token_sha256", b"reply_token", 1).replace(
+            sent.details.reply_token_sha256.encode(), token.encode(), 1))
+        expected = original.replace(f"production_id: {child.id}\n".encode(), f"production_id: {parent.id}\n".encode(), 1)
+        reply_tokens.path().unlink()
 
         _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
         result = self.run_tidy(doc)
@@ -305,13 +332,15 @@ class TidyWrappedTests(unittest.TestCase):
         moved = review_submissions.submit(request)
         self.assertEqual((moved.key, moved.owner, moved.original_path), (sent.key, parent.id, sent.path))
         self.assertFalse(sent.path.exists())
-        self.assertEqual(update_registration.read_review_question(moved.path),
-                         replace(before, path=moved.path, owner=parent.id))
+        self.assertEqual(moved.path.read_bytes(), expected)
+        self.assertFalse(reply_tokens.path().exists())
+        self.assertTrue(new_item_dialog.matches_reply_token(moved.details, token))
         self.assertTrue(review_submissions.answer(sent.key, "Reply after wrap", token))
         self.assertFalse(review_submissions.answer(sent.key, "Reply after wrap", token))
         replied = update_registration.read_review_question(moved.path)
         self.assertEqual(replied.item.get("followups"), [{"followup": request.words, "reply": "Reply after wrap"}])
         self.assertNotIn("followup", replied.item)
+        self.assertFalse(reply_tokens.path().exists())
 
     def test_wrap_refuses_an_id_collision_without_moving_either_record(self) -> None:
         doc, child, parent = self.review_wrap_fixture()
@@ -378,7 +407,9 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertNotIn("followup", update_registration.read_review_question(first.path).item)
         current = update_registration.read_review_question(second.path)
         details = new_item_dialog.read_submission(current.item.get("review_submission"))
-        self.assertIn(change_page.reply_command(second.key, details.reply_token), delivery.message)
+        self.assertIn(change_page.reply_command(second.key), delivery.message)
+        self.assertIn(change_page.reply_command(second.key, details.reply_token),
+                      change_page.outbound_review_message(delivery).text)
         self.assertTrue(review_submissions.answer(second.key, "More detail", details.reply_token))
 
 
@@ -544,7 +575,7 @@ class TidyWrappedTests(unittest.TestCase):
         unrelated_before = unrelated.read_bytes(), unrelated.stat().st_mtime_ns
         reminders = self.write(self.state / "outstanding" / f"{owner.id}.json", "[]\n")
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
@@ -592,7 +623,7 @@ class TidyWrappedTests(unittest.TestCase):
         paths = [*state, question, document, other / relative, caller / relative, self.root / "staff.json"]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),

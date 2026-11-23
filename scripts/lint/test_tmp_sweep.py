@@ -927,7 +927,7 @@ class ProcessUseTests(TmpSweepCase):
         used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
         self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
         assert isinstance(used, tmp_sweep.ProcessUsesKnown)
-        self.assertEqual(used.paths, [(str(root), 17, tmp_sweep.WORKS_IN), (str(executable), 17, tmp_sweep.MAPS_FILE)])
+        self.assertEqual(used.paths, [(str(root), 17, tmp_sweep.ROOTS_IN), (str(executable), 17, tmp_sweep.MAPS_FILE)])
         self.assertEqual(used.unreadable_process_pids, ())
 
     def test_process_scan_skips_a_zombie(self) -> None:

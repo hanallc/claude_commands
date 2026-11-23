@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import unittest
-from typing import override
+from shlex import split
+from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 from uuid import uuid4
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff, update_registration
 from scripts.production import test_waiting_why as fixtures
-from scripts.review_links import change_browser, change_page, new_item_dialog, review_actions, review_items, review_page, review_submissions
+from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_page, review_submissions
 
 
 class WaitingActionTests(unittest.TestCase):
@@ -18,9 +20,7 @@ class WaitingActionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = fixtures.WaitingWhyTests('runTest')
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, fixtures.WaitingWhyTests('runTest'))
 
     def test_user_question_automatically_stores_its_text_for_each_type(self) -> None:
         doc = self.fixture.fixture.production
@@ -85,7 +85,18 @@ class WaitingActionTests(unittest.TestCase):
         with patch.object(change_page, 'send_to_staff', return_value=None) as send:
             change_page.deliver(delivery, status)
         self.assertIn('\n' + words + '\nAnswer with this command:', delivery.message)
-        send.assert_called_once_with(recipient.id, change_page.SENDER, delivery.message,
+        self.assertEqual(send.call_count, 1)
+        message = cast(str, send.call_args.args[2])
+        command = split(message.splitlines()[-1])
+        token = command[command.index('--question') + 1]
+        self.assertNotEqual(token, sent.reply_token)
+        note = sent.path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(reply_tokens.digest(token), note)
+        self.assertEqual(reply_tokens.derive(review_submissions.current_reply_proof(sent.key)), token)
+        self.assertNotIn(token, status.path(delivery.page, delivery.row).read_text(encoding='utf-8'))
+        self.assertNotIn(token, status.closeout_path(delivery.page, delivery.row).read_text(encoding='utf-8'))
+        send.assert_called_once_with(recipient.id, change_page.SENDER, message,
                                      key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt))
 
 

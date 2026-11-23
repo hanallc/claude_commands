@@ -14,6 +14,7 @@ from scripts.buildlog.store import host_name
 from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.lib.scratch_test_support import write_scratch_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/lib/nix_env.py"
@@ -80,7 +81,7 @@ class NixFixture(unittest.TestCase):
         self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),
-                    "HERDR_BIN": "/nonexistent/herdr",
+                    "HERDR_BIN": MISSING_HERDR_BIN,
                     "DIRENV_LOG": str(self.root / "direnv.jsonl"),
                     "DIRENV_APPROVAL": str(self.root / "approved"),
                     "KEEP": "caller", "REMOVE": "old"}

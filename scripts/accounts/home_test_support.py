@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.accounts import accounts
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.showrunner_registry_test_support import scratch_showrunner_registry
 from scripts.whoami import note_file
@@ -96,7 +97,7 @@ no_worker_mode_fyi=morty dwight
 
 def clear_notes_directory_cache() -> None:
     """Clear the notes folder when a test changes the configuration."""
-    configured = cast(object, getattr(note_file, "_configured_notes_dir"))
+    configured = cast(object, getattr(note_file, "_notes_dir_at"))
     clear = cast(Callable[[], None], getattr(configured, "cache_clear"))
     clear()
 
@@ -152,6 +153,8 @@ def scratch_account_home(home: Path, environment: Mapping[str, str], *, clear: b
         write_account_settings(settings)
         with (scratch_accounts_config() as config,
               patch.object(accounts, "trust_settings_file", return_value=settings),
-              patch.dict(os.environ, {**environment, "HOME": str(home), "CONF_DIR": str(config)}, clear=clear),
+              # A missing herdr path keeps the host herdr out of the fixture; the gate uses the same path.
+              patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN, **environment, "HOME": str(home),
+                                      "CONF_DIR": str(config)}, clear=clear),
               scratch_showrunner_registry(home)):
             yield

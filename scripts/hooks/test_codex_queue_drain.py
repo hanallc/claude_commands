@@ -20,6 +20,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import send
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 HOOK = Path(__file__).with_name("codex-queue-drain.py")
@@ -36,7 +37,7 @@ class CodexQueueDrainTests(StaffTestCase):
         configuration.mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CODEX_THREAD_ID": "inherited-thread",
-            "CLAUDE_CODE_SESSION_ID": "", "HERDR_BIN": "/nonexistent/herdr",
+            "CLAUDE_CODE_SESSION_ID": "", "HERDR_BIN": MISSING_HERDR_BIN,
             "CONF_DIR": str(configuration),
         })))
         _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "state/message"))

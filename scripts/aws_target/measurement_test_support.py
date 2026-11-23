@@ -18,6 +18,7 @@ from scripts.buildlog import index, store
 from scripts.buildlog.index_test_support import BUILDLOG_INDEX_SETTINGS
 from scripts.lib import conf
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.config_test_support import MAC_CONNECTION_SETTINGS
 
@@ -80,7 +81,8 @@ class MeasurementFixture(CostFixture):
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
-            + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n")
+            + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n"
+            + UNREACHABLE_WAIT_FIXTURE)
 
     def book(self) -> ledger.CostLedger:
         return ledger.CostLedger(self.state)

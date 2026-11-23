@@ -9,7 +9,7 @@ import argparse
 import ast
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -30,21 +30,23 @@ from uuid import uuid4
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
-from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
+from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
+    gate_regions, money, read_settings)
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
-from scripts.lib import cancellation
+from scripts.lib import cancellation, git_index
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf, git_index
+from scripts.lib import conf
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
-from scripts.production.gate_modules import GateRefused, discover_test_modules
+from scripts.production.gate_modules import GateRefused, is_test_module
 from scripts.production import gate
+from scripts.style.git_process import parse_tree_listing
 from scripts.test_times import gate_record
 
 
@@ -99,28 +101,19 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
-class CloudGateSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
-
-
-@dataclass(frozen=True)
-class InvalidCloudGateSwitch:
-    reason: str
-
-
-type CloudGateSetting = CloudGateSwitch | InvalidCloudGateSwitch
-
-
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
 
-def launch_switch(configuration: conf.ConfigRead) -> CloudGateSetting:
-    try:
-        return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
-    except conf.Unusable as error:
-        return InvalidCloudGateSwitch(str(error))
+def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
+    """Name an open reservation that reconcile ends: a dead worker's, or an expired one with no known worker."""
+    if not ledger.gate_is_open(reservation):
+        return False
+    if isinstance(reservation.owner, ledger.GateWorkerOwner):
+        current = process_start(reservation.owner.pid)
+        return not (isinstance(current, Unreadable)
+            or isinstance(current, Started) and current.start == reservation.owner.start)
+    return reservation.expires <= now
 
 
 def read(path: Path) -> dict[str, object]:
@@ -541,18 +534,13 @@ class GateWorker:
         return not pending
 
     def cleanup_due(self, reservation: ledger.GateReservation) -> bool:
-        """Preserve live or unreadable workers before checking expiry."""
-        if isinstance(reservation.owner, ledger.GateWorkerOwner):
-            current = process_start(reservation.owner.pid)
-            return not (isinstance(current, Unreadable)
-                or isinstance(current, Started) and current.start == reservation.owner.start)
-        return reservation.expires <= int(self.clock())
+        return cleanup_due(reservation, int(self.clock()))
 
     def reconcile(self) -> None:
         """Clean expired or dead attempts while preserving live workers."""
         attempts: list[GateCleanupAttempt] = []
         for reservation in self.book.read_snapshot().gate_reservations:
-            if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)) or not self.cleanup_due(reservation):
+            if not self.cleanup_due(reservation):
                 continue
             launch: dict[str, object] = {}
             checked = False
@@ -864,6 +852,8 @@ class GateWorker:
         interruption_confirmed = False
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
+            # Read the wait before any launch, so a bad value costs no box.
+            unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -917,11 +907,17 @@ class GateWorker:
                 downloaded_log_etag = ''
                 instance_check_s = settings().whole('instance_check_s')
                 next_instance_check = time.monotonic()
+                # The box pushes gate.log every log_push_s; no new log for unreachable_wait_s means it is unreachable.
+                # A paired trial pauses the pushes while it measures, so only the EC2 state shows that it lives.
+                watch_silence = request.get('task') != 'paired'
+                seen_log_etag = ''
+                last_answer = time.monotonic()
                 while self.clock() < ledger.instant(request, 'expires'):
                     now = time.monotonic()
                     deadline_reached = now >= deadline
                     stop_reason = ''
                     stop_code = ''
+                    silent_s = 0.0
                     ec2_error: AwsUnavailable | None = None
                     if deadline_reached or now >= next_instance_check:
                         next_instance_check = now + instance_check_s
@@ -945,6 +941,11 @@ class GateWorker:
                         etags = self.artifact_etags(bucket, prefix)
                         log_etag = etags.get(log_key, '')
                         log_changed = bool(log_etag and log_etag != downloaded_log_etag)
+                        if log_etag != seen_log_etag:
+                            seen_log_etag = log_etag
+                            last_answer = now
+                        elif watch_silence:
+                            silent_s = now - last_answer
                         if boot_error_key in etags and self.download(bucket, boot_error_key, folder / 'boot-error.json'):
                             reason = ledger.text(read(folder / 'boot-error.json'), 'error')
                             if log_changed:
@@ -983,8 +984,10 @@ class GateWorker:
                                 deadline = began + limit if limit else float('inf')
                         s3_outage.reset()
                     except subprocess.TimeoutExpired:
-                        pass
+                        # Time when S3 cannot be read is not silence from the box.
+                        last_answer = now
                     except AwsUnavailable as error:
+                        last_answer = now
                         if not s3_outage.retry_after_failure(error, self.clock()):
                             raise
                     if ec2_error is not None:
@@ -993,6 +996,9 @@ class GateWorker:
                         if stop_code in SPOT_INTERRUPTION_CODES:
                             interruption_code = stop_code
                         raise ValueError(stop_reason)
+                    if silent_s >= unreachable_wait_s:
+                        raise ValueError(f'unreachable: the box sent no log for {silent_s:.0f} seconds '
+                                         + f'({target_config.UNREACHABLE_WAIT_KEY}={unreachable_wait_s})')
                     if deadline_reached:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
@@ -1160,17 +1166,80 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.report_not_written(error)
 
 
-def working_tree(repo: Path) -> tuple[str, set[str]]:
-    dirty = affected_modules.dirty_paths(repo)
-    if not dirty:
-        return gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'), dirty
+@dataclass(frozen=True)
+class MissingGateIndex:
+    """The checkout has no index file."""
+
+
+@dataclass(frozen=True)
+class GateIndexStamp:
+    device: int
+    inode: int
+    changed_ns: int
+    modified_ns: int
+
+    @classmethod
+    def read(cls, path: Path) -> GateIndexStamp | MissingGateIndex:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return MissingGateIndex()
+        return cls(info.st_dev, info.st_ino, info.st_ctime_ns, info.st_mtime_ns)
+
+
+@contextmanager
+def stable_gate_index(source: Path) -> Generator[Path]:
+    def contents(path: Path) -> bytes:
+        with suppress(FileNotFoundError):
+            return path.read_bytes()
+        return b''
+
     with tempfile.TemporaryDirectory(prefix='cloud-gate-index-') as temporary:
         index = Path(temporary) / 'index'
-        git_index.private_copy(Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'index')), index)
+        stamp = GateIndexStamp.read(source)
+        # Keep the stat cache and its timestamp for Git's racy-entry check.
+        with suppress(FileNotFoundError):
+            git_index.private_copy(source, index)
+        copied = contents(index)
+        yield index
+        if contents(source) != copied or GateIndexStamp.read(source) != stamp:
+            raise GateRefused('The Git index changed during the checkout read')
+
+
+def working_tree(repo: Path) -> tuple[str, set[str]]:
+    head, index_path = gate.checked_git(
+        repo, 'rev-parse', '--path-format=absolute', 'HEAD^{tree}', '--git-path', 'index').split('\n', 1)
+    routed = gate.routed_gate_tree(repo)
+    bound = routed.tree if isinstance(routed, gate.RoutedGateTree) else head
+
+    def git(index: Path, *arguments: str, input: bytes = b'') -> bytes:
         environment = {**os.environ, 'GIT_INDEX_FILE': str(index)}
-        _ = subprocess.run(['git', 'add', '-A'], cwd=repo, env=environment, check=True, capture_output=True)
-        tree = subprocess.run(['git', 'write-tree'], cwd=repo, env=environment, check=True, capture_output=True, text=True)
-        return tree.stdout.strip(), dirty
+        return subprocess.run(['git', *arguments], cwd=repo, env=environment, input=input,
+                              check=True, capture_output=True).stdout
+
+    with stable_gate_index(Path(index_path)) as index:
+        index_changes = git(index, 'diff-index', '--cached', '--no-renames', '--ignore-submodules=none',
+                            '--name-status', '-z', head)
+        files = git(index, 'ls-files', '-v', '-z', '--cached', '--modified', '--others', '--exclude-standard')
+        states = {entry[:1] for entry in files.split(b'\0') if entry}
+        # H marks tracked entries. Other tags can indicate changes or skipped checks.
+        if bound == head and not index_changes and states <= {b'H'}:
+            return head, set()
+        staged = index_changes.split(b'\0')
+        skipped = any(state == b'S' or state.islower() for state in states)
+        if bound != head or b'D' in staged[::2] or skipped:
+            # Keep removed paths and read files that the copied index marks to skip.
+            entries = git(index, 'ls-files', '--stage', '-z')
+            index = index.with_name('working')
+            _ = git(index, 'read-tree', bound, head)
+            _ = git(index, 'update-index', '--replace', '-z', '--index-info', input=entries)
+        _ = git(index, 'add', '-A')
+        tree = git(index, 'write-tree').decode('ascii').strip()
+        working_changes = (git(index, 'diff-tree', '--no-renames', '--ignore-submodules=none', '--name-only', '-r',
+                               '-z', head, tree).split(b'\0') if tree != head else [])
+    dirty = {path.decode('utf-8', errors='replace') for path in (*staged[1::2], *working_changes)}
+    dirty.discard('')
+    return tree, dirty
 
 
 def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:
@@ -1189,19 +1258,39 @@ def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, ex
             _ = gate.checked_git(repo, 'update-ref', '-d', ref)
 
 
+def require_selected_tree(repo: Path, tree: str, selected: gate.AllModules | gate.TreeSelection) -> None:
+    if ((isinstance(selected, gate.TreeSelection) and tree != selected.tree)
+            or not gate.matches_routed_gate_tree(repo, tree)):
+        raise GateRefused('The checkout changed after the test selection')
+
+
+def request_test_modules(repo: Path, tree: str, selected: gate.AllModules | gate.TreeSelection) -> list[str]:
+    listing = gate.checked_git(repo, 'ls-tree', '-rz', '--full-tree', tree, '--', 'scripts/')
+    modules: list[str] = []
+    for name, entry in parse_tree_listing(listing).items():
+        path = Path(name)
+        if entry.kind != 'blob' or not is_test_module(name) or '__pycache__' in path.parts[:-1]:
+            continue
+        if len(path.parts) < 3:
+            raise GateRefused(f'test module must be in a suite folder under scripts/: {path.name}')
+        modules.append(name)
+    if isinstance(selected, gate.TreeSelection):
+        paths = set(selected.paths)
+        if not paths <= set(modules):
+            raise GateRefused('selected modules are absent from the tested tree')
+        modules = [name for name in modules if name in paths]
+    return sorted(modules, key=lambda name: Path(name).parts)
+
+
 def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
                     selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
-    if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
-        raise GateRefused('The checkout changed after the test selection')
+    require_selected_tree(repo, tree, selected)
+    if not dirty and gate.checked_git(repo, 'rev-parse', f'{head}^{{tree}}') != tree:
+        raise GateRefused('The checkout changed during cloud request preparation')
     commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
-    modules = discover_test_modules(repo)
-    if isinstance(selected, gate.TreeSelection):
-        paths = set(selected.paths)
-        if not paths <= {str(path.relative_to(repo)) for _, path in modules}:
-            raise GateRefused('selected modules are absent from the tested tree')
-        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
+    modules = request_test_modules(repo, tree, selected)
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
     from urllib.parse import urlsplit
@@ -1210,10 +1299,66 @@ def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float
     folder.mkdir(parents=True, exist_ok=True)
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.wire, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': '',
+        'mode': mode.wire, 'modules': modules, 'source_key': '',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
     return request
+
+
+class IncompatibleSavedGateRequest(ValueError):
+    """The saved request cannot run the selected modules."""
+
+
+def read_saved_request(repo: Path, path: Path, tree: str,
+                       selected: gate.AllModules | gate.TreeSelection) -> dict[str, object]:
+    request = read(path)
+    if request.get('attempt', path.parent.name) != path.parent.name:
+        raise ValueError('The saved request differs from the current cloud attempt')
+    if request.get('modules') != request_test_modules(repo, tree, selected):
+        raise IncompatibleSavedGateRequest('The saved request has a different module list')
+    return request
+
+
+def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
+                         directory: Path, sidecar: Path) -> list[str]:
+    return service_command('scripts.aws_target.cloud_gate',
+        [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
+         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
+
+
+def reconcile_command(directory: Path) -> list[str]:
+    """Run only the reconcile step; one unit name lets one reconcile run at a time."""
+    return service_command('scripts.aws_target.cloud_gate',
+        ['--reconcile', '--directory', str(directory), '--settings', str(account_settings_path())], 'cloud-gate-reconcile')
+
+
+def end_open_gates(directory: Path, service: Callable[[Sequence[str]], int]) -> None:
+    """Start the reconcile step while the switch is off when a gate is due for cleanup; the step launches no box.
+
+    An error here prints its own line and never changes the off reason of the caller."""
+    try:
+        book = ledger.CostLedger(directory)
+        now = int(time.time())
+        if book.path.exists() and any(cleanup_due(row, now) for row in book.read_snapshot().gate_reservations):
+            _ = service(reconcile_command(directory))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f'The cloud gate reconcile did not start: {error}', file=sys.stderr, flush=True)
+
+
+def settle_incompatible_attempt(folder: Path, book: ledger.CostLedger,
+                                service: Callable[[Sequence[str]], int]) -> bool:
+    def settled(*, cleanup_finished: bool) -> bool:
+        rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
+        for row in rows:
+            if row.attempt == folder.name:
+                return not ledger.gate_is_open(row)
+        return cleanup_finished and not (folder / 'launch.json').exists()
+
+    if settled(cleanup_finished=False):
+        return True
+    # Use the old unit name so systemd refuses cleanup while its worker runs.
+    command = gate_attempt_command('--cleanup', folder, book.directory, folder / 'reservation.cgroup')
+    return service(command) == 0 and settled(cleanup_finished=True)
 
 
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
@@ -1285,11 +1430,11 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    switch = launch_switch(settings())
-    if isinstance(switch, InvalidCloudGateSwitch):
-        return LocalFallback(switch.reason)
-    if switch is CloudGateSwitch.OFF:
-        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
+    switch = aws_switch(settings())
+    if not isinstance(switch, AwsOn):
+        reason = cloud_gate_off_reason(switch)
+        end_open_gates(attempt.directory, service)
+        return LocalFallback(reason)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
@@ -1299,6 +1444,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if not current.exists() and not deployment_path.exists():
             return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
+        require_selected_tree(repo, tree, selected)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.wire, 'full': full, 'module_time_limit_s': module_time_limit_s,
@@ -1307,12 +1453,33 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if previous.get('mode') == mode.value:
             previous['mode'] = mode.wire
         same_request = all(previous.get(key) == value for key, value in identity.items())
+        book = ledger.CostLedger(directory)
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         result_path = folder / 'outcome.json'
         saved_result = read(result_path) if result_path.exists() else {}
+        ended = same_request and saved_result.get('status') != 'complete' and book.path.exists() and any(
+            row.attempt == folder.name and not ledger.gate_is_open(row)
+            for row in book.read_snapshot().gate_reservations)
+        saved_request: dict[str, object] = {}
+        if same_request and (folder / 'request.json').exists():
+            try:
+                saved_request = read_saved_request(repo, folder / 'request.json', tree, selected)
+            except IncompatibleSavedGateRequest:
+                if not settle_incompatible_attempt(folder, book, service):
+                    attempt.identifier = folder.name
+                    attempt.gate_job = _saved_gate_job(previous)
+                    return LocalFallback('The incompatible cloud attempt has not ended')
+                same_request = False
+                ended = False
+                folder = root / uuid4().hex
+                result_path = folder / 'outcome.json'
+                saved_result = {}
+            except (OSError, ValueError, KeyError, TypeError):
+                if not ended and saved_result.get('status') in (None, 'pending'):
+                    raise
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
-                request = read(folder / 'request.json')
+                request = saved_request
                 saved_attempt = request.setdefault('attempt', folder.name)
                 if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
                         or saved_attempt != folder.name):
@@ -1337,12 +1504,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
-        book = ledger.CostLedger(directory)
-        ended = book.path.exists() and any(
-            row.attempt == folder.name and isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))
-            for row in book.read_snapshot().gate_reservations)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
             folder = root / uuid4().hex
+            saved_request = {}
         elif same_request:
             attempt.gate_job = _saved_gate_job(previous)
         attempt.identifier = folder.name
@@ -1382,12 +1546,14 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         if box_failures > box_retry_limit:
                             reservation.status = 0
                             return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
-                    command = service_command('scripts.aws_target.cloud_gate',
-                        ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
-                         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
-                    request = (read(folder / 'request.json') if (folder / 'request.json').exists()
-                               else prepare(repo, folder, mode, module_time_limit_s,
-                                            selected=selected, gate_job=attempt.gate_job))
+                        # A retry launches a new box, so it reads the switch again.
+                        switch = aws_switch(settings())
+                        if not isinstance(switch, AwsOn):
+                            reservation.status = 0
+                            return LocalFallback(cloud_gate_off_reason(switch))
+                    command = gate_attempt_command('--worker', folder, directory, sidecar)
+                    request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
+                                                       selected=selected, gate_job=attempt.gate_job)
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
@@ -1436,6 +1602,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         return LocalFallback(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
                     return LocalFallback('No cloud capacity choice remains')
                 folder = root / uuid4().hex
+                saved_request = {}
                 attempt.identifier = folder.name
                 attempt.gate_job = command_job
                 folder.mkdir()
@@ -1445,18 +1612,17 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
     """Use the installed scaler environment for each gate controller."""
     credential = str(admin_secrets.credentials_file())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
-    owner = ['--setenv=' + name + '=' + os.environ[name] for name in
-             ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_NAME', admission_records.BUILDLOG_UNIT)
-             if name in os.environ]
+    owner = ['--setenv=' + name + '=' + value for name, value in admission_records.owner_environment().items()]
     cleanup: list[str] = []
     stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
-    if paired:
-        folder = arguments[arguments.index('--paired-worker') + 1]
-        command = shlex.join([sys.executable, '-m', module, '--paired-cleanup', folder])
-    else:
-        cleanup_arguments = ['--cleanup' if value == '--worker' else value for value in arguments]
+    if '--cleanup' not in arguments and '--reconcile' not in arguments:
+        if paired:
+            folder = arguments[arguments.index('--paired-worker') + 1]
+            cleanup_arguments = ['--paired-cleanup', folder]
+        else:
+            cleanup_arguments = ['--cleanup' if value == '--worker' else value for value in arguments]
         command = shlex.join([sys.executable, '-m', module, *cleanup_arguments])
-    cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
+        cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
     return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
             '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
             *configuration, *owner, *cleanup,
@@ -1503,18 +1669,31 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     _ = group.add_argument('--worker', type=Path)
     _ = group.add_argument('--cleanup', type=Path)
+    _ = group.add_argument('--reconcile', action='store_true')
     _ = parser.add_argument('--directory', required=True, type=Path)
-    _ = parser.add_argument('--sidecar', required=True, type=Path)
+    _ = parser.add_argument('--sidecar', type=Path, help='required with --worker and --cleanup')
     _ = parser.add_argument('--settings', type=Path, default=account_settings_path())
     args = parser.parse_args()
-    cleanup = cast(Path | None, args.cleanup)
-    folder = cleanup if cleanup is not None else cast(Path, args.worker)
     directory = cast(Path, args.directory)
-    with control_lock(folder):
-        settings_path = cast(Path, args.settings)
+    settings_path = cast(Path, args.settings)
+    sidecar = cast(Path | None, args.sidecar)
+    reconcile = cast(bool, args.reconcile)
+    if sidecar is None and not reconcile:
+        parser.error('--worker and --cleanup require --sidecar')
+
+    def gate_worker() -> GateWorker:
         configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
-        worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
+        # The reconcile step publishes no progress, so it has no sidecar.
+        return GateWorker(api, ledger.CostLedger(directory), settings_path, sidecar or Path(os.devnull))
+
+    if reconcile:
+        gate_worker().reconcile()
+        return 0
+    cleanup = cast(Path | None, args.cleanup)
+    folder = cleanup if cleanup is not None else cast(Path, args.worker)
+    with control_lock(folder):
+        worker = gate_worker()
         if cleanup is not None:
             with cancellation.defer_cleanup_signals():
                 return int(not cleanup_folder(folder, worker))

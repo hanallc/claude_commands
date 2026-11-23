@@ -16,6 +16,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.agents.remote import local_machine
 from scripts.aws_target import aws_page, machines_page
 from scripts.disks import disks_page
 from scripts.lib import conf
@@ -27,7 +28,9 @@ from scripts.production.change_review_test_support import (
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
+    review_submissions,
 )
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import console_settings
 
 
@@ -83,6 +86,101 @@ class ConsoleTests(unittest.TestCase):
         source = console.render(pages, console.UnavailablePage()).decode()
         self.assertIn('data-page="aws_machines" data-url="" data-title="AWS Machines" aria-label="AWS Machines — Not available"', source)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the owner dialog.")
+    def test_unavailable_aws_machines_opens_new_item_for_builds(self) -> None:
+        production = self.root / "builds.md"
+        _ = production.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
+        builds = staff.StaffRow(staff.StaffId("builds-staff"), "showrunner", "builds", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("builds-session"),
+                                doc=staff.LiveDoc(local_machine(), production))
+        production = self.root / "sdlc.md"
+        _ = production.write_text("# SDLC\n> **Status: PRODUCTION — running.**\n")
+        sdlc = staff.StaffRow(staff.StaffId("sdlc-staff"), "showrunner", "sdlc", staff.STAFF_ROOT,
+                              current_session=staff.StaffId("sdlc-session"),
+                              doc=staff.LiveDoc(local_machine(), production))
+        morty = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("morty-session"))
+        dwight = staff.StaffRow(staff.StaffId("dwight-staff"), "producer", "dwight", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("dwight-session"))
+        aws = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(builds.id),
+                             current_session=staff.StaffId("aws-session"),
+                             unit_type=staff.UnitDetails("direct"))
+        _ = write_config_fixture(self.configuration / "console.conf",
+                                 f"page.aws_machines.owner={aws.id}\npage.list.owner={morty.id}\n")
+        pages = (console.ConsolePage("aws_machines", "AWS Machines", "server", "AWS Machines", console.UnavailablePage()),
+                 console.ConsolePage("list", "List", "list-checks", "The List", console.UnavailablePage()))
+        members = staff.StaffSnapshot((aws, builds, sdlc, morty, dwight))
+        with patch.object(staff, "local_snapshot", return_value=members):
+            source = console.render(pages, console.UnavailablePage())
+        settings = conf.read_or_repository("console")
+        options: dict[str, object] = {}
+        for page in pages:
+            owner = review_submissions.page_owner(page.identity, settings, members)
+            assert isinstance(owner, staff.StaffRow)
+            options[page.identity] = {"token": "fixture", "page_owner": owner.id,
+                                      "recipients": review_submissions.recipient_options(members, owner=owner)}
+        probe = b"""<script>
+(async()=>{
+ const failures=[], check=(ok,message)=>{if(!ok) failures.push(message);};
+ const realFetch=window.fetch.bind(window), requests=[], captures=[];
+ const pageOptions=__PAGE_OPTIONS__;
+ window.fetch=async (input, options)=>{
+  const route=new URL(input, location.href);
+  if(route.pathname==='/console/review/new-item' && route.search) {
+   requests.push(route.search);
+   return Response.json(pageOptions[route.searchParams.get('page')]);
+  }
+  if(route.pathname==='/console/review/new-item' && options?.method==='POST') {
+   captures.push(options.body);
+  }
+  return Response.json({}, {status:400});
+ };
+ try {
+  const pane=document.querySelector('#page-unavailable');
+  const control=pane.querySelector('[data-page-owner="aws_machines"]');
+  const button=control.querySelector('[data-owner-new]');
+  check(!pane.hidden && pane.textContent.includes('Not available'), 'The unavailable notice is visible.');
+  check(control.getClientRects().length && control.querySelector('.page-owner-name').textContent==='aws',
+        'The unavailable page shows its configured owner.');
+  check(button.getAttribute('aria-label')==='New item for builds', 'The button names the configured route.');
+  const dialog=document.querySelector('#review-new-item'), recipients=dialog.querySelector('[data-recipients]');
+  const loaded=()=>new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(recipients.firstChild){observer.disconnect();resolve();}});
+   observer.observe(recipients,{childList:true});
+  });
+  const awsOptions=loaded();
+  button.click();
+  check(dialog.open, 'The owner button opens the shared dialog.');
+  await awsOptions;
+  check(requests.join()==='?page=aws_machines' && recipients.querySelector('input:checked')?.value==='builds-staff',
+        'The dialog requests the AWS Machines owner and selects builds.');
+  const choices=()=>[...recipients.querySelectorAll('[data-button-face]')].map(chip=>chip.textContent).sort().join();
+  check(choices()==='builds,dwight,morty,sdlc', 'The dialog offers every producer and showrunner.');
+  const screenshot=dialog.querySelector('[name=include_page]');
+  check(!screenshot.getClientRects().length && !screenshot.checked,
+        'The unavailable page offers no screenshot.');
+  check(dialog.querySelector('[data-capture-slot]').hidden && captures.length===0,
+        'The unavailable page starts no capture.');
+  recipients.querySelector('input[value=dwight-staff]').closest('label').click();
+  check(recipients.querySelector('input:checked')?.value==='dwight-staff',
+        'A producer chip changes the selected recipient.');
+  dialog.querySelector('[data-close]').click();
+  document.querySelector('[data-page=list]').click();
+  const listOwner=pane.querySelector('[data-page-owner=list]');
+  check(!control.getClientRects().length && listOwner.getClientRects().length,
+        'The owner changes with the selected unavailable page.');
+  const listOptions=loaded();
+  listOwner.querySelector('[data-owner-new]').click();
+  await listOptions;
+  check(requests.join()==='?page=aws_machines,?page=list' &&
+        recipients.querySelector('input:checked')?.value==='morty-staff',
+        'The List dialog selects its owner.');
+  check(choices()==='builds,dwight,morty,sdlc', 'The List dialog offers the same recipients.');
+ } catch(error) {failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
+        self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
+
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         output = self.root / "snapshots/aws"
         output.mkdir(parents=True)
@@ -97,12 +195,12 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review", "placement_disk"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 25)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 9)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 8)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 27)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 10)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 9)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -172,6 +270,13 @@ class ConsoleTests(unittest.TestCase):
             "owner.default: Use the same staff ID as page.review.owner.",
         ))
 
+    def test_the_placement_disk_page_has_its_keys_and_an_available_icon(self) -> None:
+        keys = conf.shipped_keys(Path(__file__).resolve().parents[2] / "config/console.conf")
+        self.assertLessEqual({f"page.placement_disk.{name}" for name in ("label", "icon", "title", "url", "owner")}, keys)
+        self.assertIn("torus", console.ICON_NAMES)
+        self.assertTrue((page_frame.ICONS / "torus.svg").is_file())
+        self.assertIn('class="lucide lucide-torus"', console.icon_svg("torus"))
+
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
         folder.mkdir(parents=True)
@@ -189,14 +294,14 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
-        self.assertIsInstance(pages[2].destination, console.AvailablePage)
-        self.assertIsInstance(pages[4].destination, console.UnavailablePage)
+        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
+        self.assertIsInstance(pages[3].destination, console.AvailablePage)
+        self.assertIsInstance(pages[5].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
-        self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
+        self.assertEqual(markup.pages, ["placement_disk", "review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -208,9 +313,9 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review"])
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review", "placement_disk"])
         self.assertIsInstance(pages[3].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[-1].destination, console.AvailablePage)
+        self.assertIsInstance(pages[-2].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:

@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.build_hold import cargo_folder
 from scripts.buildlog import index
 from scripts.buildlog import parse
 from scripts.buildlog import repository
@@ -253,9 +255,7 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         self.enterContext(mock.patch.dict(os.environ))
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]
@@ -433,9 +433,7 @@ class NextestFormTests(unittest.TestCase):
 
 class CargoSubcommandTests(unittest.TestCase):
     def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
-        wrapper = (Path(__file__).parents[1] / "build_hold" / "cargo").read_text()
-        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
-        self.assertEqual(parse.CARGO_BUILD_VERBS, frozenset(branch.split("|")))
+        self.assertEqual(parse.CARGO_BUILD_VERBS, cargo_folder.wrapper_words("build_subcommands"))
         for verb in parse.CARGO_BUILD_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
             with self.subTest(verb=verb):
                 self.assertEqual(parse.cargo_subcommand(("+nightly", "--config=term.color=never", verb)), verb)

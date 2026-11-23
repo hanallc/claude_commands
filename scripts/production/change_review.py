@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, main_push_lock, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -53,6 +53,7 @@ from scripts.production import change_routing, delivery_state, session_staff, sh
 from scripts.production.production_doc import ProductionDocument, Refusal, production_field
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
+from scripts.worktree import worktrees
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -95,6 +96,10 @@ _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
+SCRATCH_NOT_REMOVED = "scratch not removed:"
+TRY_FOLDER_NOT_CHECKED = "try folder not checked:"
+# A verdict intent stays for a retry while a line starts with one of these.
+RETRY_PREFIXES = (SCRATCH_NOT_REMOVED, TRY_FOLDER_NOT_CHECKED)
 lists_directory = change_routing.lists_directory
 PREFIX = "change-review - "
 FENCE = "---"
@@ -617,29 +622,30 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
-        blobs = [(str(path.resolve().relative_to(root)),
-                  checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
-                 for path in paths]
-        subject = f"change-review: {what}"
-        with build_folders.tool_folder("change-review-index") as temporary:
-            index = temporary / "index"
-            environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
-            for attempt in range(5):
-                head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
-                _ = checked("read-tree", head if head else "--empty", env=environment)
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
-                tree = checked("write-tree", env=environment)
-                if head and tree == checked("rev-parse", head + "^{tree}"):
-                    return
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
-                commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
-                updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
-                if not updated.returncode:
-                    return
-                if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
-                    raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
+        with main_push_lock.main_push_lock(root, "change-review", wait=False):
+            blobs = [(str(path.resolve().relative_to(root)),
+                      checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
+                     for path in paths]
+            subject = f"change-review: {what}"
+            with build_folders.tool_folder("change-review-index") as temporary:
+                index = temporary / "index"
+                environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+                for attempt in range(5):
+                    head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+                    _ = checked("read-tree", head if head else "--empty", env=environment)
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
+                    tree = checked("write-tree", env=environment)
+                    if head and tree == checked("rev-parse", head + "^{tree}"):
+                        return
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+                    commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
+                    updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
+                    if not updated.returncode:
+                        return
+                    if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
+                        raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
         reason = next(iter(str(error).splitlines()), type(error).__name__)
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
@@ -2000,15 +2006,38 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """End the scratch task of `row` and return any error.
+    """End the scratch task and the try folder of `row`.
 
+    Return the error lines and the kept try folder lines.
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
         _ = scratch.end(f"row:{_owner(path)}-{row}")
-        return []
+        lines: list[str] = []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
-        return [f"scratch not removed: {error}"]
+        lines = [f"{SCRATCH_NOT_REMOVED} {error}"]
+    return lines + end_try_folder(path, row)
+
+
+def end_try_folder(path: Path, row: str) -> list[str]:
+    """Remove the try folder `try-<row>` of the row's Producer; return one line for each kept folder or error.
+
+    An empty Producer cell names the list's showrunner, and only a filled cell reads staff.
+    """
+    local = row.rpartition("/")[2]
+    try:
+        found = next((item for item in review_rows(path) if item["#"] == local), None)
+        identity = found.get(PRODUCER, "").strip() if found is not None else ""
+        team = _owner(path)
+        if identity:
+            producer = change_routing.producer_row(staff.snapshot(), staff.StaffId(identity))
+            if isinstance(producer, change_routing.UnroutedChange):
+                return [f"{TRY_FOLDER_NOT_CHECKED} {producer.note}"]
+            team = producer.name
+        return worktrees.remove_named(team, f"try-{local}")
+    except Exception as error:
+        first_line = str(error).partition("\n")[0]
+        return [f"{TRY_FOLDER_NOT_CHECKED} {first_line}"]
 
 
 class VerdictDurabilityUnconfirmed(RuntimeError):
@@ -2139,7 +2168,7 @@ class PendingVerdictCleanup:
                     return []
                 closeout(self.load(self.intent, self.path.parent.resolve()))
                 lines = end_row_scratch(self.path, self.row)
-                if not any(line.startswith('scratch not removed:') for line in lines):
+                if not any(line.startswith(RETRY_PREFIXES) for line in lines):
                     self.intent.unlink(missing_ok=True)
                 return lines
         except Exception as error:

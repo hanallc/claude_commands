@@ -39,7 +39,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS, MAC_SWEEP_SETTINGS
 from scripts.lint.config_test_support import SWEEP_FLOOR_SETTINGS
-from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.build_targets.target_test_support import mac_target_settings, UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
@@ -207,15 +207,27 @@ class RemoteEntryTests(unittest.TestCase):
         if not isinstance(start, process_identity.Started):
             self.fail("The test process has no start identity")
         paths.claims.mkdir(parents=True)
-        _ = (paths.claims / "repository.json").write_text(json.dumps({
+        record = {
             "claim_id": "live-copy-claim", "episode": "copy-episode", "attempt": "copy-attempt",
             "submitting_session": "",
             "pid": os.getpid(), "proc_start": start.start, "what": "tests", "worktree": str(self.source),
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
-        }))
-        with self.assertRaisesRegex(copies.CopyError, "busy"):
-            copies.remove_trees("alpha")
-        self.assertTrue(self.mirror.exists())
+        }
+        key = "https://fixture.invalid/team/repository"
+        stem = claim_state.mac_claim_stem(key, 0)
+        identity = claim_state.CleanupOnlyMacRepository(key, "repository", f"{stem}.json", stem)
+        for name, fields in (
+            ("repository.json", record),
+            (identity.claim_file, {**record, "repo_name": "alias", "repo_key": key,
+                                  "mac_repository": identity.record()}),
+        ):
+            with self.subTest(claim_file=name):
+                path = paths.claims / name
+                _ = path.write_text(json.dumps(fields))
+                with self.assertRaisesRegex(copies.CopyError, "busy"):
+                    copies.remove_trees("alpha")
+                self.assertTrue(self.mirror.exists())
+                path.unlink()
 
     def test_configured_symlink_parent_permits_copy_and_removal(self) -> None:
         actual = self.root / "actual"
@@ -661,7 +673,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "slots=2\n", defaults=MAC_OFFLOAD_SETTINGS)
         target = target_config.SshTarget("linux", "linux", settings)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                       1, 1, 1, "1", {"slots": "2"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
@@ -828,9 +840,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             args.pid, args.worktree, args.what, args.target = os.getpid(), str(self.source), "reserved", "linux"
             paths = mac_test.state_paths("linux")
             scope = mac_test.RepositoryScope("repository", "key")
-            with mac_test.locked(paths.lock), redirect_stdout(io.StringIO()):
+            with mac_test.locked(paths.lock):
                 first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
-            self.assertEqual(first, mac_test.ClaimFinished(0))
+            self.assertEqual(first, mac_test.ClaimFinished(0, ("claimed", "slot: 1")))
             reservation, = mac_test.read_claims(paths)
             request = replace(request, admission=offload.MacClaimFromWait(
                 os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))

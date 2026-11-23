@@ -16,18 +16,19 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.build_targets.target_test_support import mac_target_settings, UNREACHABLE_WAIT_FIXTURE
 from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
+from scripts.buildlog import repository
 from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -39,6 +40,13 @@ SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "build_targets
 NOW = datetime(2026, 10, 11, 21, 0, tzinfo=timezone.utc)
 SINCE = datetime(2026, 10, 11, 20, 5, tzinfo=timezone.utc)
 END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)
+
+
+def fixture_mac_mirror(worktree: Path, repository: str, key: str) -> claim_state.ResolvedMacMirror:
+    """Give routing tests a mirror identity without Git commands."""
+    fence = claim_state.mac_claim_stem(key, 0)
+    return claim_state.ResolvedMacMirror(key, repository, f"{fence}.json", fence, str(worktree))
+
 
 HoldRecord = TypedDict(
     "HoldRecord",
@@ -95,9 +103,7 @@ class IsolatedTargetTest(unittest.TestCase):
         self.mac_state.mkdir()
         (self.root / "sessions").mkdir()
         _ = config_environment(self.root)
-        _ = write_config_fixture(self.root / "build_targets.conf",
-                                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                                 + "kind.natedev=local\nplatform.natedev=linux\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", defaults=mac_target_settings())
         _ = write_config_fixture(self.settings, "host=test-mac\n", defaults=MAC_RUN_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
@@ -712,7 +718,7 @@ class TargetStateTests(IsolatedTargetTest):
 class ReservationTests(IsolatedTargetTest):
     def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
         _ = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", defaults=MAC_RUN_SETTINGS)
         args = build_targets.CliArguments()
         args.target, args.kind, args.package = "mac", "test", "sample"
@@ -748,7 +754,9 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(session_owner, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.ResolvedMacMirror(
+                            "fixture-hana", "hana", "hana.json", "hana", str(self.root))), \
+                        mock.patch.object(repository, "repository_key", return_value="https://fixture.invalid/hana"), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):

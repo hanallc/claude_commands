@@ -153,7 +153,8 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 ## Step 5: Wrap up
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
-Read the held messages from the command output. The command lists them oldest first.
+The command output names the held messages file. Read the file at your own pace.
+Each release in the file lists its messages oldest first.
 
 When every item is done:
 

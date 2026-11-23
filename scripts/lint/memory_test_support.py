@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from scripts.build_hold.override_guard import require_checkout
 from scripts.build_targets.target_test_support import LOCAL_TARGET_SETTINGS
 from scripts.lib.build_folders_test_support import workspace_folder_settings
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 from scripts.lint.config_test_support import LINT_TOOL_SETTINGS, LINT_SENDER_SETTINGS
 
 if TYPE_CHECKING:
@@ -206,6 +207,11 @@ def install_admission_fixture(root: Path, *, min_pass_gap_seconds: float = 0) ->
     seed_config_fixture_folder(root, {"build_admission.conf": source})
 
 
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
+
+
 def gate_isolation_environment(root: Path) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     install_admission_fixture(root)
@@ -222,6 +228,9 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+        # The fixture names its own owner and drops the caller's, so a test never reads the owner around it.
+        "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "BUILDLOG_OWNER_STAFF_ID": "",
+        "CLAUDE_SESSION_NAME": FIXTURE_OWNER,
     }
 
 

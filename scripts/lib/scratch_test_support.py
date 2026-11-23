@@ -6,9 +6,8 @@ from pathlib import Path
 from scripts.lint.memory_test_support import write_config_fixture
 
 
-def write_scratch_settings(directory: Path, root: Path, *, visible_root: Path | None = None) -> None:
+def write_scratch_settings(directory: Path, root: Path) -> None:
     _ = write_config_fixture(directory / "scratch.conf", f"""\
-visible_root={visible_root or root / 'repro'}
 holds_file={root / 'holds.json'}
 # whole: 1..
 default_life_seconds=86400

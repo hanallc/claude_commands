@@ -25,7 +25,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
 from scripts.build_hold.test_override_guard import installed_script
-from scripts.mac_test import mac_queue_run, mac_test
+from scripts.mac_test import mac_queue_run, mac_test, mac_transport
 from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.mac_test.offload_test_support import mac_queue_settings
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -110,7 +110,8 @@ def plain_ssh_builds(root: Path) -> list[str]:
 
 
 # The queue releases on process end, so these files set no signal handler (user rule, 2026-11-14).
-NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/cargo_gate/gate.zsh")
+NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/mac_transport.py",
+                    "mac_test/cargo_gate/gate.zsh")
 SIGNAL_HANDLER = re.compile(r"\bsignal\.(?:signal|SIG_IGN|SIG_DFL|pthread_sigmask|setitimer)\b|\bfrom signal import\b"
                             + r"|^\s*trap\b|\bTRAP[A-Z]+\b")
 
@@ -230,6 +231,30 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
             self.assertTrue(block.is_file())
 
+    def test_shot_of_the_block_holding_units_worker_starts_with_its_own_placement_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            named_run = root / "unit-run"
+            holder = fixture_runtime_id("queue-shot-holder")
+            environment = {**queue_fixture(root), "UNIT_RUN_DIR": str(named_run),
+                           "CLAUDE_CODE_SESSION_ID": "worker-session", "CODEX_THREAD_ID": "worker-thread"}
+            director = staff.StaffId(fixture_runtime_id("queue-shot-director"))
+            parent = staff.StaffRow(director, "showrunner", "fixture-director", staff.StaffRoot(),
+                                    current_session=director)
+            row = staff.StaffRow(staff.StaffId(fixture_runtime_id("queue-shot-unit")), "unit", "fixture-holder",
+                                 staff.ReportsTo(director), current_session=staff.StaffId(holder),
+                                 run=staff.OpenRun(named_run), unit_type=staff.UnitDetails("direct"))
+            _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot((parent, row)).encode())
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, session=holder)
+            with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "shot")[3:]]), 0)
+            placed = self.events(root)[0]
+            self.assertEqual(placed[placed.index("--session-id") + 1], "worker-thread")
+            self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+
     def test_block_during_recovery_prevents_prepare_and_removes_retry_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -307,6 +332,50 @@ if sys.argv[1] == "prepare":
                 self.assertFalse((root / "remote").exists())
                 self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
                 self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+
+    def check_kind_waits_for_a_block_after_its_placement(self, kind: str) -> None:
+        """A block or an unreadable block record that appears at placement keeps the kind waiting."""
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                pending = root / "block-on-placement.json"
+                if unreadable:
+                    _ = pending.write_text("damaged\n")
+                    expected = f"Waiting for a readable Mac block record: {block}"
+                else:
+                    self.write_block(pending)
+                    expected = "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac"
+                waits = 0
+
+                def release_block() -> None:
+                    nonlocal waits
+                    waits += 1
+                    self.assertTrue(block.is_file())
+                    self.assertFalse((root / "remote").exists())
+                    self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                    block.unlink()
+
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_block),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(self.command(root, kind)[3:]), 0)
+                self.assertEqual(waits, 1)
+                self.assertEqual(output.getvalue().splitlines(), [expected, "Mac output", "mac_exit=0"])
+                self.assertTrue((root / "remote").is_file())
+                self.assertEqual([event[0] for event in self.events(root)],
+                                 ["place-step", "cancel-placement", "place-step", "cancel-placement"])
+
+    def test_shot_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("shot")
+
+    def test_install_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("install")
+
+    def test_probe_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("probe")
 
     def test_expired_block_lifts_without_the_watcher_and_preserves_a_failed_ci_restore(self) -> None:
         for restore_fails in (False, True):
@@ -695,7 +764,7 @@ else:
                 on_close = (f"state=$(ps -o state= -p $(<{root}/work)); "
                             + f"print -r -- \"${{state:-absent}}\" > {root}/work-state; "
                             + f"kill -TERM $(<{root}/app)")
-                wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
+                wrapper = mac_transport.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
                 # Its own session stands in for the SSH session on the Mac.
                 with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True, start_new_session=True) as process:

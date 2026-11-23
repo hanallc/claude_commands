@@ -66,6 +66,7 @@ from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.message.session_send_test_support import SEND_TIMING_FIXTURES
 from scripts.agents.test_pane_record_recovery import FakeClient, fixture_launch_transcript
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account
@@ -4106,7 +4107,7 @@ prompt_grace_seconds=120
                 now = Mock(return_value=initial)
                 seed: moves.RequestedMove = {"kind": "requested", "tool": "claude", "at": initial.isoformat(),
                     "subject": "unrelated", "move_id": "earlier", "why": "earlier", "window": "unknown",
-                    "from": "claude2", "to": "claude3"}
+                    "from": "claude2", "to": "claude3", "scope": "session"}
                 if clock_reversed:
                     moves.append_move(seed)
 
@@ -4398,6 +4399,25 @@ prompt_grace_seconds=120
         self.assertEqual(shown.getvalue(), advice)
         self.assertEqual(legacy.read_text(), report)
         self.assertEqual(moves.pending_move_requests(), ())
+
+    def test_legacy_group_result_and_retry_preserve_the_group(self) -> None:
+        identity = self.entry["session_id"]
+        batch_id = "a" * 32
+        legacy = moves.store_file().parent / "move-results" / f"{batch_id}.json"
+        legacy.parent.mkdir(parents=True)
+        report = json.dumps({"group": "showrunners", "target": "claude3",
+                             "pending": [{"reference": identity, "name": "alpha"}]})
+        _ = legacy.write_text(report)
+        advice = f"alpha: start a new move with {moves.MOVE_COMMAND} batch --group showrunners -- {identity}\n"
+
+        with (patch.object(accounts, "current_move_account", return_value="claude4"),
+              patch.object(stop_resume, "_stop") as stopped):
+            for command in ("result", "retry"):
+                with self.subTest(command=command), redirect_stdout(io.StringIO()) as shown:
+                    self.assertEqual(stop_resume.main([command, batch_id]), 0)
+                    self.assertEqual(shown.getvalue(), advice)
+        stopped.assert_not_called()
+        self.assertEqual(legacy.read_text(), report)
 
     def test_retry_names_an_invalid_file_and_moves_the_valid_member(self) -> None:
         identity = self.entry["session_id"]
@@ -5140,6 +5160,45 @@ prompt_grace_seconds=120
         self.assertEqual(self.client.started, [])
 
 
+    def test_resume_launches_in_the_saved_move_destination(self) -> None:
+        from scripts.worktree import worktrees
+
+        old = self.root / "old checkout"
+        new = self.root / "new checkout"
+        (old / "crates").mkdir(parents=True)
+        self.entry["cwd"] = str(old / "crates")
+        pane_record.write("agents", self.entry)
+        identity = worktrees.FolderIdentity.read(old)
+        _ = old.rename(new)
+        move = worktrees.WorktreeMove(old, new, "origin", "alpha", "test", worktrees.MoveOutput.LIVE_UNIT)
+        journal = worktrees.MoveJournal(move, identity, identity, "", Path(".git"), (), worktrees.MoveStage.FINISHED)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            worktrees.write_move(journal)
+            result = stop_resume.resume("alpha", why="worktree move")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(new / "crates"))
+
+    def test_resume_uses_the_saved_folder_with_an_incomplete_move_record(self) -> None:
+        from scripts.worktree import worktrees
+
+        saved = self.root / "saved checkout"
+        saved.mkdir()
+        self.entry["cwd"] = str(saved)
+        pane_record.write("agents", self.entry)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            record = worktrees.move_file(saved)
+            record.parent.mkdir(parents=True)
+            _ = record.write_text("{}")
+            result = stop_resume.resume("alpha", why="worktree move")
+            _ = record.write_text(json.dumps({"old": str(saved)}))
+            self.assertEqual(worktrees.moved_launch_folder(saved), saved)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(saved))
+
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
         self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
@@ -5823,7 +5882,7 @@ prompt_grace_seconds=120
                         return write(descriptor, data[:-1])
                     return write(descriptor, data)
 
-                def append_request(entry: moves.MoveEntry) -> None:
+                def append_request(entry: moves.MoveWriteEntry) -> None:
                     nonlocal first_id, append_failed
                     append(entry)
                     if fail_read and not append_failed and entry["kind"] == "requested" and entry["subject"] == subject:
@@ -5972,7 +6031,7 @@ prompt_grace_seconds=120
             return results[0] if identity == "bad" else results[1]
 
         append = moves.append_move
-        def fail_one(entry: moves.MoveEntry) -> None:
+        def fail_one(entry: moves.MoveWriteEntry) -> None:
             if entry["kind"] == "confirmed" and entry["subject"] == "bad":
                 raise OSError("TEST receipt write failed")
             append(entry)
@@ -6592,7 +6651,7 @@ class BuildWaitTests(unittest.TestCase):
         configuration = self.root / "config"
         environment = config_environment(configuration)
         write_machine_config(configuration)
-        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN="/nonexistent/herdr")
+        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN=MISSING_HERDR_BIN)
         _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))

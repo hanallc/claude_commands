@@ -18,6 +18,7 @@ from unittest.mock import patch
 from scripts.backup import state_backup
 from scripts.backup.state_backup import ALERT_KEY, READ_BLOCK_SIZE, LastBackup, checksum_path
 from scripts.lib.atomic_file import prepared_replacement
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,7 +70,7 @@ platform.natedev = linux
 kind.mac = ssh
 platform.mac = macos
 settings.mac = fixture-mac.conf
-""", encoding="utf-8")
+""" + UNREACHABLE_WAIT_FIXTURE, encoding="utf-8")
         _ = (config / "fixture-mac.conf").write_text("""\
 host = fixture-mac
 # range: 5e-324..

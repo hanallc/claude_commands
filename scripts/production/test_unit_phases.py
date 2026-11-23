@@ -461,7 +461,7 @@ class UnitPhasesTests(unittest.TestCase):
             event.update(schema_version=progress_history.SCHEMA_VERSION, run_id=run.name, working_dir=str(self.root))
         _ = history.write_text("".join(json.dumps(event) + "\n" for event in events))
         _ = state.write_text(json.dumps(converted))
-        commit = "a" * 40
+        commit = self.repository()
         checkpoint = progress("checkpoint", "--commit", commit, "--phase-id", "visible")
         self.assertEqual(checkpoint.returncode, 0, checkpoint.stderr)
         history_before = history.read_bytes()

@@ -87,9 +87,8 @@ from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
 from scripts.mac_test.mirror_root import MacMirrorRoot
+from scripts.lib.sizes import GIB, MIB, gib, mib
 
-GIB = 1 << 30
-MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
@@ -2645,14 +2644,6 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
         finally:
             os.close(held)
     return 0
-
-
-def gib(size: int) -> str:
-    return f"{size / GIB:.1f} GiB"
-
-
-def mib(size: int) -> str:
-    return f"{size / MIB:.1f} MiB"
 
 
 def when(timestamp: float) -> str:

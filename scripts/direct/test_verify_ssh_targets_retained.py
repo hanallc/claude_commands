@@ -15,7 +15,7 @@ from unittest import mock
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
-from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
@@ -23,6 +23,7 @@ from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import claim_state
 
 from scripts.lib import process_start as process_identity
 
@@ -31,6 +32,100 @@ mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
+    def test_lost_mac_releases_the_verify_place_and_keeps_the_claim(self) -> None:
+        self.check_lost_mac("lost-cleanup-timeout")
+
+    def test_mac_runner_exit_without_result_releases_the_verify_place(self) -> None:
+        self.check_lost_mac("missing-result-after-authorization")
+
+    def test_lost_mac_authorization_reply_releases_the_verify_place(self) -> None:
+        self.check_lost_mac("lost-authorization-reply")
+
+    def test_mac_cleanup_stream_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("cleanup-stream-timeout", status=42)
+
+    def test_mac_post_fetch_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("post-fetch-cleanup-timeout", status=42)
+
+    def test_mac_check_cleanup_timeout_preserves_the_failed_verdict(self) -> None:
+        self.check_lost_mac("cleanup-stream-timeout", status=42, command="check")
+
+    def test_mac_setup_failure_with_cleanup_timeout_ends_without_a_retry(self) -> None:
+        self.check_lost_mac("setup-failure-cleanup-timeout")
+
+    def test_lost_mac_check_releases_the_verify_place_and_keeps_the_claim(self) -> None:
+        self.check_lost_mac("lost-cleanup-timeout", command="check")
+
+    def check_lost_mac(self, mode: str, *, status: int = 2, command: str = "test") -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        settings = self.root / "mac_test.conf"
+        _ = write_config_fixture(settings, "leftover_timeout_s=1\n")
+        _ = self.hold_memory()
+        slots_during_authorization: list[int] = []
+        previous = self.admission.server.handle_request
+
+        def observe(request: wire.Request,
+                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            replies = previous(request, connection)
+            if any(isinstance(reply, wire.FirstAuthorization) for reply in replies):
+                slots_during_authorization.extend(
+                    slot.owner.pid for slot in self.admission.server.verify_run_slots.values())
+            return replies
+
+        with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):
+            process = self.start_verify(command, "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": json.dumps({"mac": mode})})
+            try:
+                self.wait_for_path(self.runner_state / "mac-loss-ready", (process,))
+                output, errors = process.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("Verify did not exit after the Mac lost its result or cleanup.")
+            finally:
+                if process.poll() is None:
+                    self.stop_verify(process)
+
+        self.assertEqual(process.returncode, status, output + errors)
+        if status == 2:
+            self.assertIn("the Mac does not answer; stop and submit again", errors)
+        else:
+            self.assertIn("cleanup timed out after 1 s", output)
+            self.assertNotIn("the Mac does not answer; stop and submit again", errors)
+        # A Mac run takes no natedev run slot (036f97c797: the slot comes with the first local memory grant).
+        self.assertEqual(slots_during_authorization, [])
+        self.assertEqual(self.local_runs(), [])
+        if command == "check":
+            self.assertFalse(any(event["args"][:1] == ["check"] for event in self.cargo_events()))
+        if mode == "missing-result-after-authorization":
+            self.assertEqual(self.attempts(), [])
+        else:
+            attempt, = self.attempts()
+            # A setup failure is an observed end; only its cleanup is lost.
+            lost_end = "confirmed" if mode == "setup-failure-cleanup-timeout" else "missing"
+            expected = ("lost", lost_end) if status == 2 else ("failed", "confirmed")
+            self.assertEqual((attempt["outcome"], attempt["completion"]), expected)
+            self.assertEqual(attempt["cleanup"], "unconfirmed")
+        if mode == "post-fetch-cleanup-timeout":
+            event, = self.ssh_events()
+            self.assertEqual(event["actions"][-3:], ["run", "fetch", "run"])
+        controls = caller_provider_controls(self, self.admission)
+        claim, = controls.claims("mac")
+        identity = claim_state.claim_identity(claim.record)
+        journal = claim_state.claim_pending_start(controls.claim_paths("mac"), claim.path, claim.record)
+        self.assertEqual(journal.is_file(), mode != "post-fetch-cleanup-timeout")
+
+        _ = self.admission.run_pass()
+        with self.admission.loop_turn():
+            server = self.admission.server
+            self.assertEqual(server.verify_run_slots, {})
+            key = execution_identity.attempt_key(identity.episode, identity.attempt)
+            saved = server.assignments[key]
+            self.assertIsInstance(saved.provider, placement.ProviderClaimReference)
+            assert isinstance(saved.provider, placement.ProviderClaimReference)
+            self.assertEqual(saved.provider.claim_id, identity.claim_id)
+            self.assertIsInstance(saved.remote_start_hold, admission_records.RemoteStartHoldEnded)
+            self.assertFalse(any(place.episode == identity.episode for place in server.places.values()))
+
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
         with subprocess.Popen(["true"],

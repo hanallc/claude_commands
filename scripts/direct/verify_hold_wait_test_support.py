@@ -6,6 +6,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.lib.checkout_test_support import fixture_shim_source
 
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import write_pressure_reading
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
@@ -22,7 +23,6 @@ import tempfile
 import threading
 import textwrap
 import time
-import traceback
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
@@ -38,10 +38,12 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.local_release_wait import episode_is_assigned
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
+from scripts.lib.release_waiter import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lib.fixture_test_support import clean_up_fixture, register_fixture_class_cleanup, set_up_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -240,14 +242,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
-    cleanup_failures: tuple[str, ...] = ()
 
     @classmethod
     @override
     def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
-        cls.addClassCleanup(builder.doCleanups)
+        cls.addClassCleanup(clean_up_fixture, builder)
         builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
         _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
@@ -274,7 +275,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def setUp(self) -> None:
-        self.cleanup_failures = ()
         self.root: Path = self.fixture_root
         self.addCleanup(shutil.rmtree, self.root)
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -294,17 +294,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             admission, {**self.environment, **self.placement_policy}, key)
         controls = caller_provider_controls(self, admission)
         self.provider_observations: list[placement.HostEvidenceKey] = controls.observations
-
-    @override
-    def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
-        def recorded_cleanup() -> None:
-            try:
-                _ = function(*args, **kwargs)
-            except BaseException:
-                self.cleanup_failures += (traceback.format_exc(),)
-                raise
-
-        super().addCleanup(recorded_cleanup)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -330,13 +319,11 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
-        cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
-        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
+        register_fixture_class_cleanup(cls.addClassCleanup, VerifyHoldTools).setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture_cleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)
@@ -402,9 +389,6 @@ exit "$status"
             "recipients": {}, "entries": [],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle))
-
-    def fixture_cleanups(self) -> None:
-        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)
@@ -482,7 +466,7 @@ exit "$status"
         settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
         _ = (self.fixture.root / "build_targets.conf").write_text(
             f"targets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
-            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n")
+            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n" + UNREACHABLE_WAIT_FIXTURE)
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:

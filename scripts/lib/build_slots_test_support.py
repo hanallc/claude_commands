@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.scratch_test_support import write_scratch_settings
@@ -70,6 +71,10 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     write_private_slot_roots(settings, root, machine)
     environment = config_environment(configuration)
     limits = f"# whole: 1..\nslots.{machine}.default_max={default_maximum}\n"
+    machines = settings.with_name("machines.conf")
+    mac_hosts = conf.read(machines).words("mac.hosts") if machines.exists() else ()
+    if mac_hosts and mac_hosts[0] != machine:
+        limits += f"# whole: 1..\nslots.{mac_hosts[0]}.default_max=1\n"
     if isinstance(maximum, int):
         limits += f"# whole: 1..\nslots.{machine}.{repository}.max={maximum}\n"
     _ = write_config_fixture(settings, limits)

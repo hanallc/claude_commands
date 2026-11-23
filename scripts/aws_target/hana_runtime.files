@@ -42,6 +42,7 @@ scripts/buildlog/treekey.py
 scripts/copies/copies.py
 scripts/direct/local_release_wait.py
 scripts/direct/recorder_state.py
+scripts/direct/runner_result.py
 scripts/direct/step_selection.py
 scripts/lib/atomic_file.py
 scripts/lib/boot_identity.py
@@ -67,10 +68,12 @@ scripts/lib/process_group.py
 scripts/lib/process_start.py
 scripts/lib/process_stat.py
 scripts/lib/python_startup/sitecustomize.py
+scripts/lib/release_waiter.py
 scripts/lib/removal_guard.py
 scripts/lib/scratch.py
 scripts/lib/session_folder.py
 scripts/lib/session_paths.py
+scripts/lib/showrunner_state.py
 scripts/lib/slot_root.py
 scripts/lib/suite_runners.py
 scripts/lib/test_phase.py

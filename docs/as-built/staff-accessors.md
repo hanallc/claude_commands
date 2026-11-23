@@ -206,12 +206,14 @@ The shared pane launch builder uses `set_home`.
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | write | initial_snapshot, local_snapshot, by_id, set_home |
+| `scripts/herdr/pass_notices.py` | read | snapshot, by_id, backend, StaffId, StaffRefused, CodexBackend |
 | `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/turn_end.py` | write | snapshot, backend, native_id, runtime_id, retire; worker_admission.parent, find_worker, transcript_source, transcript_entries |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hooks/conversation_pause.py` | read | local_by_current_session; StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
+| `scripts/hooks/idle_update.py` | read | StaffSnapshot and Kind (types); the prompt hook passes the row |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/session-start-direct-resume.py` | read | local_by_current_session, unit_command |
@@ -230,6 +232,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lint/sweep.py` | read | local_snapshot, StaffSnapshot (type), StaffId; holder_sessions names the parent director of a detached worker run |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
+| `scripts/maintenance/folder_size.py` | read | snapshot and active select producers. LiveDoc supplies the recorded path. StaffId identifies the notice recipient. |
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
@@ -261,6 +264,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
 | `scripts/production/waiting_why.py` | read | snapshot supplies the filer name for missing Waiting reasons |
 | `scripts/production/live_units.py` | read | snapshot |
+| `scripts/production/producer_map.py` | read | snapshot, active, by_id, by_path and qualified_name resolve members, find the producer that each showrunner or unit reports to, and name the member to map |
+| `scripts/production/producer_map_rows.py` | read | snapshot, active and by_id check and name each producer_map row that /tune saves |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/checkpoint_gate.py` | read | snapshot |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
@@ -320,6 +325,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
+| `scripts/review_links/console.py` | read | local_snapshot gives the staff rows for the page owner controls in the unavailable view; StaffRow (type) checks the shown owner |
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
@@ -329,6 +335,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
 | `scripts/review_links/review_submissions.py` | read | snapshot and by_id find the active recipient and locate the saved record for retries and replies. |
+| `scripts/review_links/new_item.py` | read | snapshot, active, by_current_session and caller_identity resolve the /new_item assignee and this session, name the active producers, and guess a name that is not known |
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
@@ -339,6 +346,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/producer_creation.py` | read | authority_snapshot, is_owner, slot_operation, validate_name, producer_creation_registry; the staff owner reads and updates the creation marker |
 | `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
+| `scripts/agents/reboot.py` | read | initial_snapshot, StaffId, StaffRow. The reboot checks live sessions and identifies saved sessions that still need to start. |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
@@ -369,10 +377,11 @@ The shared pane launch builder uses `set_home`.
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `scripts/whoami/five_hour.py` | read | snapshot |
 | `scripts/whoami/quota_alert.py` | read | snapshot; send.staff_named |
+| `scripts/worktree/finished_worktrees.py` | read | StaffSnapshot, PresentWorktree, StaffRefused; the snapshot comes from worktrees.staff_record |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-222 accessor rows: 41 write, 180 read, 1 owner.
+The table has 228 accessor rows (41 write, 186 read, and 1 owner).
 
 ## Approved copies
 

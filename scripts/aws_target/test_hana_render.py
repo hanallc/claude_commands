@@ -17,7 +17,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.aws_target import hana_guest, hana_receiver, hana_render, hana_runner
+from scripts.aws_target import hana_guest, hana_protocol, hana_receiver, hana_render, hana_runner
 from scripts.aws_target.hana_image_test_support import stage_runtime_sources
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -26,12 +26,14 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE_LIST = ROOT / 'scripts/aws_target/hana_image.files'
 RENDER_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+IMAGE_SOURCE_HASH = ROOT / 'scripts/aws_target/hana_image.sha256'
 
 # The guest does not ship these imports for host operations, tests, and type annotations.
 UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
     'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
+    'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
     'buildlog/step_context.py': {'lib/cargo_target_config.py'},
@@ -70,6 +72,13 @@ def imported_source_paths(source: Path) -> Iterator[Path]:
 
 
 class HanaRenderTests(unittest.TestCase):
+    def test_checked_in_image_source_hash_is_current(self) -> None:
+        computed = hana_render.image_source_sha256(ROOT)
+        self.assertEqual(IMAGE_SOURCE_HASH.read_text().strip(), computed,
+            f'An image file changed. Write the new sha {computed} to {IMAGE_SOURCE_HASH.relative_to(ROOT)}. '
+            + 'If the edit changes what the receiver accepts or does, also bump hana_protocol.RUNTIME_ABI. '
+            + 'If it does not, update only the sha.')
+
     def test_listed_files_render_all_guest_names_modes_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / 'checkout'
@@ -256,6 +265,21 @@ class HanaRenderTests(unittest.TestCase):
                     source = image_inputs / path
                     _ = source.write_text('# Code outside the image closure\n')
                     self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            with self.subTest('Edit an image Python file'):
+                protocol = image_inputs / 'scripts/aws_target/hana_protocol.py'
+                protocol_source = protocol.read_bytes()
+                _ = protocol.write_bytes(protocol_source + b'\n# A host-only edit.\n')
+                self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+                _ = protocol.write_bytes(protocol_source)
+            with (self.subTest('Bump the runtime ABI'),
+                  mock.patch.object(hana_protocol, 'RUNTIME_ABI', hana_protocol.RUNTIME_ABI + 1)):
+                self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            with self.subTest('Change the build root'):
+                _ = folders.write_text(folder_values.replace('roots.build.fixture-guest=/fixture/build',
+                                                             'roots.build.fixture-guest=/fixture/other'))
+                self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+            _ = folders.write_text(folder_values)
+            self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             _ = folders.write_text(folder_values.replace('fixture-guest=0.4', 'fixture-guest=0.5'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             for key, value, invalid in (

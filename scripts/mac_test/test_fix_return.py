@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.build_targets.target_test_support import mac_target_settings
+from scripts.build_targets.target_test_support import mac_target_settings, UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.lib import berth_board
 from scripts.mac_test.config_test_support import MAC_OFFLOAD_SETTINGS
 from scripts.lint.memory_test_support import config_environment
@@ -153,7 +153,7 @@ class ReturnFixTests(unittest.TestCase):
 
     def return_fix(self, sent: offload.TreeKey) -> fix_return.FixResult:
         config = eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
+            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10, UNREACHABLE_WAIT_FIXTURE_SECONDS), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=1, default_target_budget_gib="24", values={},
         )
         request = offload.OffloadRequest(

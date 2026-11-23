@@ -19,7 +19,6 @@ import fcntl
 import json
 import math
 from dataclasses import dataclass
-from enum import Enum
 import os
 import select
 import signal
@@ -30,7 +29,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TextIO, TypedDict, cast
+from typing import TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
@@ -39,17 +38,12 @@ from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test.mac_transport import (MacPlacement, RemoteRun, RemoteState, remote_command, stop_command,
+                                            stop_remote, stream_remote)
 
 
 def admission_command() -> list[str]:
     return [os.path.expanduser(word) for word in shlex.split(conf.read("mac_gate").text("admission_client_command"))]
-
-
-@dataclass(frozen=True)
-class MacPlacement:
-    host: str
-    episode: str
-    attempt: str
 
 
 def parse_placement(output: str) -> MacPlacement:
@@ -90,99 +84,6 @@ def mac_placement_refusal(output: str) -> MacPlacementRefusal | NoMacPlacementRe
     return NoMacPlacementRefusal()
 
 
-def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
-    """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
-
-    zsh refuses job control without a terminal, so the work shares the session's group. When the
-    input closes, the watcher ends every other process of the group, then runs `on_close` (work
-    such as a GUI app that started outside the group).
-    """
-    if owned_close:
-        # The gate hook stops the guest. Leave the hook alive until it finishes.
-        return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close) + r"""
-exec 3<&0
-{
-    read -r _ <&3
-    exec /bin/zsh -c "$on_close"
-} </dev/null >/dev/null 2>&1 &!
-/bin/zsh -c "$work" </dev/null
-printf '\nmac_exit=%s\n' $?
-""")
-    return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
-            + f"\ngrace_polls={grace_polls}" + r"""
-exec 3<&0
-group=$(ps -o pgid= -p $$)
-group=${group//[[:space:]]/}
-printf 'mac_group=%s\n' "$group"
-{
-    read -r _ <&3
-    zmodload zsh/system zsh/zselect
-    self=$sysparams[pid]
-    members() { reply=(${(f)"$(pgrep -g $group)"}); reply=(${reply:#$self}) }
-    members; (( ! $#reply )) || kill -TERM $reply
-    for _ in {1..$grace_polls}; do members; (( $#reply )) || break; zselect -t 10; done
-    members; (( ! $#reply )) || kill -KILL $reply
-    [[ -z $on_close ]] || /bin/zsh -c "$on_close"
-} </dev/null >/dev/null 2>&1 &
-watcher=$!
-/bin/zsh -c "$work" </dev/null
-code=$?
-kill -TERM "$watcher" 2>/dev/null
-printf '\nmac_exit=%s\n' $code
-""")
-
-
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str,
-                   *, owned_close: bool = False) -> list[str]:
-    work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
-    work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
-    # Ten polls a second while the group ends.
-    grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
-    wrapper = remote_wrapper(work, on_close, grace_polls, owned_close=owned_close)
-    return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
-
-
-class RemoteState(Enum):
-    NOT_STARTED = "not started"
-    LIVE = "live"
-    EXITED = "exited"
-
-
-@dataclass
-class RemoteRun:
-    state: RemoteState = RemoteState.NOT_STARTED
-    group: int = 0
-
-
-def stop_remote(placement: MacPlacement, remote: RemoteRun) -> bool:
-    if remote.group == 0:
-        return False
-    grace = conf.read("mac_gate").number("terminate_grace_seconds")
-    # The installed helper checks the group id before it sends; the ps check below proves the stop.
-    script = f"""group={remote.group}
-signal_group() {{ "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/process_group.py" "$group" "$1" 2>/dev/null }}
-signal_group TERM
-sleep {grace}
-signal_group KILL
-groups=$(ps -axo pgid=) || exit 1
-if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
-printf 'mac_stopped=%s\\n' "$group"
-"""
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", placement.host,
-                             "/bin/zsh -c " + shlex.quote(script)], capture_output=True, text=True)
-    return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
-
-
-def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            _ = process.wait(timeout=conf.read("mac_gate").number("terminate_grace_seconds"))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            _ = process.wait()
-
-
 def capture_command(command: list[str], *, capture_stderr: bool) -> tuple[int, str, str]:
     with subprocess.Popen(command, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE if capture_stderr else None, text=True) as process:
@@ -191,27 +92,6 @@ def capture_command(command: list[str], *, capture_stderr: bool) -> tuple[int, s
             return process.returncode, output, errors or ""
         finally:
             stop_command(process)
-
-
-def stream_remote(command: list[str], remote: RemoteRun, ssh: contextlib.ExitStack) -> int:
-    process = ssh.enter_context(subprocess.Popen(
-        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
-    _ = ssh.callback(stop_command, process)
-    remote.state = RemoteState.LIVE
-    assert process.stdout is not None
-    last = ""
-    for line in cast(TextIO, process.stdout):
-        if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
-            remote.group = int(line.removeprefix("mac_group="))
-            continue
-        print(line, end="", flush=True)
-        last = line.rstrip("\n")
-    ssh_status = process.wait()
-    if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
-        remote.state = RemoteState.EXITED
-        return int(last.removeprefix("mac_exit="))
-    print("mac queue: the Mac returned no exit status", file=sys.stderr)
-    return ssh_status or 255
 
 
 def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
@@ -285,8 +165,10 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
                 saved = cast(SavedRun, json.loads(record.read_text()))
                 try:
                     script, phase = ended_run_callback(saved["lifecycle_script"])
-                    status = run_callback(str(script), phase, directory / "argv.json",
-                                          saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                    argv_file = directory / "argv.json"
+                    with lifecycle_mirror_lease(argv_file, saved["host"]):
+                        status = run_callback(str(script), phase, argv_file, saved["arguments"],
+                                              {**environment, "MAC_QUEUE_HOST": saved["host"]})
                 except OSError as error:
                     print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
                     continue
@@ -310,6 +192,25 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
     return Path(saved_script), "cleanup"
 
 
+@contextlib.contextmanager
+def lifecycle_mirror_lease(argv_file: Path, host: str) -> Generator[None]:
+    """Keep the prepared mirror under the shared host lease through cleanup."""
+    try:
+        path = Path(argv_file.with_suffix(".json.lease").read_text().strip())
+    except FileNotFoundError:
+        yield
+        return
+
+    from scripts.copies import copies
+
+    with contextlib.ExitStack() as lease:
+        try:
+            lease.enter_context(copies.remote_mirror_lease(host, path))
+        except copies.CopyError as error:
+            raise OSError(str(error)) from error
+        yield
+
+
 class Arguments(argparse.Namespace):
     what: str = ""
     kind: str = ""
@@ -327,18 +228,27 @@ class Arguments(argparse.Namespace):
         return self.kind == "run" and Path(self.lifecycle_script).name == MAC_RUN_SCRIPT.name
 
 
+@dataclass(frozen=True)
+class UnreadableMacBlock:
+    """The block record cannot be read, so the run waits until it reads again."""
+
+    path: Path
+
+
+MacRunBlock = claim_state.PendingMacBlock | claim_state.ActiveMacBlock | UnreadableMacBlock
+
+
 def blocking_run(
     args: Arguments, owner: OwningSession | NoOwningSession,
-) -> claim_state.MacBlockState | mac_test.ClaimFinished:
-    if args.kind != "run":
-        return mac_test.NO_MAC_BLOCK
+) -> claim_state.NoMacBlock | MacRunBlock | mac_test.ClaimDenied:
+    """Check the Mac block for every run kind: shot, install, probe and run."""
     paths = claim_state.state_paths()
     try:
         block = mac_test.blocking_claim_block(paths, owner)
     except (OSError, claim_state.StateReadError):
         if args.is_mac_run:
             return mac_test.unreadable_claim(paths.block)
-        raise
+        return UnreadableMacBlock(paths.block)
     if not args.is_mac_run:
         return block
     if not isinstance(block, claim_state.NoMacBlock):
@@ -354,37 +264,47 @@ def wait_to_retry() -> None:
     time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
 
 
+def shell_session() -> OwningSession | NoOwningSession:
+    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return OwningSession(session) if session else NoOwningSession()
+
+
 def run(args: Arguments) -> int:
     since = time.time()
-    owner = owning_session() if args.kind == "run" else NoOwningSession()
-    if isinstance(owner, NoOwningSession):
-        session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        if session:
-            owner = OwningSession(session)
+    # A block admits its holding unit's workers, so each kind checks the block as the unit's session.
+    block_owner = owning_session()
+    if isinstance(block_owner, NoOwningSession):
+        block_owner = shell_session()
+    placement_owner = block_owner if args.kind == "run" else shell_session()
     announced = False
-    reported_block = False
+    reported = ""
     try:
         while True:
-            block = blocking_run(args, owner)
+            block = blocking_run(args, block_owner)
             if isinstance(block, claim_state.NoMacBlock):
                 if not announced:
                     print(f"Mac queue: {args.what}", file=sys.stderr)
                     announced = True
-                result = run_attempt(args, since, owner)
+                result = run_attempt(args, since, placement_owner, block_owner)
                 if isinstance(result, int):
                     return result
                 block = result
-            if isinstance(block, mac_test.ClaimFinished):
+            if isinstance(block, mac_test.ClaimDenied):
+                print(block.reason)
                 return MAC_RUN_REFUSED_STATUS
-            block = mac_test.lift_expired_claim_block(claim_state.state_paths(), owner, block)
-            if isinstance(block, claim_state.NoMacBlock):
-                continue
-            if not reported_block:
+            if isinstance(block, UnreadableMacBlock):
+                message = ("Mac block record unreadable" if args.no_wait
+                           else "Waiting for a readable Mac block record") + f": {block.path}"
+            else:
+                block = mac_test.lift_expired_claim_block(claim_state.state_paths(), block_owner, block)
+                if isinstance(block, claim_state.NoMacBlock):
+                    continue
                 holder = mac_test.holder_name(block.holder)
                 reason = " ".join(block.reason.splitlines())
-                message = "Mac blocked" if args.no_wait else "Waiting for the Mac block"
-                print(f"{message} held by {holder}: {reason}", flush=True)
-                reported_block = True
+                message = ("Mac blocked" if args.no_wait else "Waiting for the Mac block") + f" held by {holder}: {reason}"
+            if message != reported:
+                print(message, flush=True)
+                reported = message
             if args.no_wait:
                 return MAC_BUSY_STATUS
             wait_to_retry()
@@ -394,8 +314,9 @@ def run(args: Arguments) -> int:
 
 
 def run_attempt(
-    args: Arguments, since: float, owner: OwningSession | NoOwningSession,
-) -> int | claim_state.PendingMacBlock | claim_state.ActiveMacBlock:
+    args: Arguments, since: float, placement_owner: OwningSession | NoOwningSession,
+    block_owner: OwningSession | NoOwningSession,
+) -> int | MacRunBlock:
     episode, pid = uuid.uuid4().hex, os.getpid()
     source = subprocess.run(["git", "-C", str(args.worktree), "rev-parse", "HEAD"],
                             capture_output=True, text=True)
@@ -403,27 +324,27 @@ def run_attempt(
     command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
     original_command = command.copy()
     status = 1
-    block: claim_state.MacBlockState | mac_test.ClaimFinished = mac_test.NO_MAC_BLOCK
+    block: claim_state.NoMacBlock | MacRunBlock | mac_test.ClaimDenied = mac_test.NO_MAC_BLOCK
     remote = RemoteRun()
-    prepared = False
     placement = MacPlacement("", episode, "")
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
-    _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
+    # place-step reads `what` from this file, so the Builds row shows `<owner>: <what>`.
+    _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid, "what": args.what}))
     assignment_file.chmod(0o600)
-    with run_directory(episode) as directory, contextlib.ExitStack() as ssh:
+    with run_directory(episode) as directory, contextlib.ExitStack() as mirror, contextlib.ExitStack() as ssh:
         argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
-        lease_descriptor = -1
+        cleanup_leased = False
         mac_run = args.is_mac_run
         try:
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
-                    args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
+                    args.worktree, args.package, args.kind, source_key, claim_state.session_id(placement_owner),
                     assignment_file, command, wait_events=not mac_run), capture_stderr=mac_run)
                 if code in (0, MAC_BUSY_STATUS):
-                    block = blocking_run(args, owner)
+                    block = blocking_run(args, block_owner)
                 if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
                     print(errors, end="", file=sys.stderr, flush=True)
                 refusal = (mac_placement_refusal(output)
@@ -449,27 +370,33 @@ def run_attempt(
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
                 clean_ended_runs(callback_environment)
-                block = blocking_run(args, owner)
+                block = blocking_run(args, block_owner)
                 on_close = ""
                 if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
-                    prepared = True
-                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
-                                          callback_environment, interrupt_prepare=args.owned_close)
+                    try:
+                        status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
+                                              callback_environment, interrupt_prepare=args.owned_close)
+                    finally:
+                        interrupted = isinstance(sys.exception(), KeyboardInterrupt)
+                        try:
+                            mirror.enter_context(lifecycle_mirror_lease(argv_file, placement.host))
+                        except (OSError, ValueError) as error:
+                            if not interrupted:
+                                raise
+                            print(f"mac queue: lifecycle cleanup lease unavailable: {error}", file=sys.stderr)
+                        else:
+                            cleanup_leased = True
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
                         close_path = argv_file.with_suffix(".json.close")
                         on_close = close_path.read_text() if close_path.exists() else ""
-                        lease_path = argv_file.with_suffix(".json.lease")
-                        if lease_path.exists():
-                            lease_descriptor = os.open(lease_path.read_text().strip(), os.O_WRONLY | os.O_CREAT, 0o600)
-                            fcntl.flock(lease_descriptor, fcntl.LOCK_EX)
                 else:
                     status = 0
                 if status == 0 and isinstance(block, claim_state.NoMacBlock):
-                    block = blocking_run(args, owner)
+                    block = blocking_run(args, block_owner)
                     if isinstance(block, claim_state.NoMacBlock):
                         # Record failure until the Mac reports an exit status.
                         status = 1
@@ -477,7 +404,8 @@ def run_attempt(
                             raise ValueError("the run needs a close hook")
                         status = stream_remote(remote_command(placement, args.cwd, command, on_close,
                                                               owned_close=args.owned_close), remote, ssh)
-            if isinstance(block, mac_test.ClaimFinished):
+            if isinstance(block, mac_test.ClaimDenied):
+                print(block.reason)
                 status = MAC_RUN_REFUSED_STATUS
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
@@ -491,7 +419,7 @@ def run_attempt(
                     safe = stop_remote(placement, remote)
                 except OSError:
                     safe = False
-            if prepared and (safe or args.owned_close):
+            if cleanup_leased and (safe or args.owned_close):
                 try:
                     cleanup_status = run_callback(args.lifecycle_script, "cleanup", argv_file, original_command, callback_environment)
                 except OSError as error:
@@ -507,8 +435,7 @@ def run_attempt(
                     (directory / "run.json").unlink()
             # Owned cleanup uses the close hook while SSH still holds its input open.
             ssh.close()
-            if lease_descriptor >= 0:
-                os.close(lease_descriptor)
+            mirror.close()
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
             reason = (f"the Mac run ended with status {status}" if remote.state != RemoteState.NOT_STARTED
                       else "the Mac run did not start")
@@ -529,7 +456,7 @@ def run_attempt(
             if not released:
                 print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1
-    if status == 0 and isinstance(block, (claim_state.PendingMacBlock, claim_state.ActiveMacBlock)):
+    if status == 0 and not isinstance(block, (claim_state.NoMacBlock, mac_test.ClaimDenied)):
         return block
     return status
 

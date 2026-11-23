@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.buildlog import index
 from scripts.buildlog import health, launches
 from scripts.buildlog import record
@@ -86,9 +87,7 @@ class RecordRerunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner_sessions = build_fixture_sessions("different-parent-session")
         # Reuse the real recorder fixture's Git, tool and isolated-root setup.
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         configuration = self.fixture.base / "config"
         _ = write_config_fixture(configuration / "test_times.conf", defaults=nextest_timing_settings())
@@ -199,9 +198,7 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(gzip.decompress(self.saved_logs()[0].read_bytes()), self.output)
 
     def launch_fixture(self) -> launch_tests.LaunchRecordingTests:
-        fixture = launch_tests.LaunchRecordingTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
+        fixture = set_up_fixture(self.addCleanup, launch_tests.LaunchRecordingTests())
         # Keep the recorder's root and two-machine configuration for the launch source.
         point_root_at(self, self.fixture.root)
         _ = self.enterContext(mock.patch.dict(  # pyright: ignore[reportAny]

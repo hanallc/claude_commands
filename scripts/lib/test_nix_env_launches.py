@@ -97,7 +97,10 @@ class HerdrLaunchTests(NixFixture):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture")
         self.assertIsInstance(result, herdr.AgentLaunched)
         self.assertEqual(opened.call_args.args[3], str(self.work))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture",
+            "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
         started.assert_called_once()
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
@@ -170,7 +173,9 @@ class HerdrLaunchTests(NixFixture):
             _ = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [],
                                    herdr.NoOpeningPrompt(), 100, agent="fixture", unset_environment=frozenset({"REMOVE_ME"}))
         self.assertNotIn("REMOVE_ME", cast(dict[str, str], ensure.call_args.args[1]))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
 
     def test_add_unit_uses_session_cwd_before_opening(self) -> None:
         request = add_unit.UnitLaunch(production=self.production(), identity=add_unit.UnitIdentity("unit", "worker"),

@@ -1573,14 +1573,16 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    try:
-        settings = conf.read("shutdown")
-        for key in ("START_SECONDS", "STAY_SECONDS"):
-            _ = settings.number(key)
-    except conf.Unusable as error:
-        return ResumeFailed(session, str(error))
-    with staff.row_operation(session):
-        return _resume(session, why=why, to=to, requester=requester, client=client)
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(herdr.reboot_lock())
+            settings = conf.read("shutdown")
+            for key in ("START_SECONDS", "STAY_SECONDS"):
+                _ = settings.number(key)
+        except (conf.Unusable, herdr.RebootLockBusy) as error:
+            return ResumeFailed(session, str(error))
+        with staff.row_operation(session):
+            return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
 @dataclass(frozen=True)
@@ -1850,8 +1852,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        from scripts.worktree import worktrees
+
         entry = entry.copy()
         entry["session_id"] = identity
+        entry["cwd"] = str(worktrees.moved_launch_folder(Path(entry["cwd"])))
         entry["environment"] = names.environment(entry)
 
         source = pane_launch.config_home(entry, record=names.tab_record)
@@ -2113,7 +2118,8 @@ def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int
     batch = _move_batch.get()
     identities = {session: batch.native_sessions[session] for session in selected}
     group = ("--group", batch.intent.group) if isinstance(batch.intent, moves.FollowGroupAccount) else ()
-    _ = _detach(["batch", "--target", target, *group, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
+    group_scope = ("--explicit-group-scope",) if batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT else ()
+    _ = _detach(["batch", "--target", target, *group, *group_scope, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
                  "--request-id", batch.request_id,
                  *(arg for session, identity in identities.items() if (label := source_accounts.get(session))
                    for arg in ("--source-account", f"{identity}={label}")),
@@ -2222,7 +2228,8 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
 
 
 def _prepare_move_request(reference: str, plan: MoveStopTarget, target: str, why: str, cause: moves.MoveCause,
-                          fallback_source: str, names: LaunchNames) -> moves.RequestedMove:
+                          fallback_source: str, names: LaunchNames, *,
+                          intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget) -> moves.RequestedMove:
     """Build a request from the proved live source or the retained source."""
     source = plan.source.session.account if isinstance(plan.source, LiveMoveSource) else fallback_source
     row = plan.member.staff_row(names.tab_record)
@@ -2245,7 +2252,8 @@ def _prepare_move_request(reference: str, plan: MoveStopTarget, target: str, why
             print(f"anomaly: {identity}: session home is unknown; retain the normal source account", file=sys.stderr)
     return {"kind": "requested", "at": datetime.now(timezone.utc).isoformat(),
         "move_id": uuid4().hex, "tool": tool, "subject": f"{identity}: {row.name}" if row is not None else reference,
-        "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause}
+        "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause,
+        "scope": "session" if intent is moves.ExplicitMoveTarget.REQUESTED_ACCOUNT else "group"}
 
 
 def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFailed | SessionNotFound | ResumePending) -> None:
@@ -2666,7 +2674,8 @@ def _remove_latest_move(identity: str, request_id: str) -> None:
 
 def _claim_move_request(row: LockedMoveRow, batch: MoveBatch, target: str, *, new: bool) -> bool:
     destination = f"group:{batch.intent.group}" if isinstance(batch.intent, moves.FollowGroupAccount) else target
-    claim = moves.LatestMoveRequest(batch.request_id, destination)
+    claim = moves.LatestMoveRequest(batch.request_id, destination,
+                                   explicit_group_scope=batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT)
     try:
         current = moves.read_latest_request(row.identity)
         retry = batch.origin
@@ -2829,7 +2838,7 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
     failures: dict[str, StopFailed] = {}
     for session, plan in plans.items():
         attempt = MoveStopAttempt(plan, partial(_prepare_move_request, session, plan, target, why, cause,
-                                                source_accounts.get(session, ""), names))
+                                                source_accounts.get(session, ""), names, intent=batch.intent))
         attempts[session] = attempt
         if isinstance(plan.source, StoppedMoveSource):
             try:
@@ -3011,6 +3020,8 @@ def _reconcile_move(identity: str, name: str, destination: str, request: moves.L
             target, intent = _pending_target(destination)
             if isinstance(intent, moves.FollowGroupAccount):
                 target = accounts.current_move_account(intent.group)
+            elif isinstance(request, moves.LatestMoveRequest) and request.explicit_group_scope:
+                intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
             owner = record.by_current_session(identity)
             member = (_staff_move_member(owner.id, record) if owner is not None
                       else ResolvedMoveMember(pane_launch.NativeLaunchReference(identity), name))
@@ -3056,7 +3067,8 @@ def _pending_move_command(command: str, request_id: str) -> int:
             print(f"{member.name}: could not check the pending move: {reason}.{advice}", file=sys.stderr if not advice else sys.stdout)
             code = 1
         elif isinstance(request, LegacyMoveReport):
-            print(f"{member.name}: start a new move with {moves.batch_move_command(identity, state.account)}")
+            target = state.intent if isinstance(state.intent, moves.FollowGroupAccount) else state.account
+            print(f"{member.name}: start a new move with {moves.batch_move_command(identity, target)}")
         elif command == "result":
             print(f"{member.name}: {destination}")
         else:
@@ -3110,6 +3122,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--source-account", action="append", default=[])
     _ = batch.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = batch.add_argument("--group", choices=accounts.CLAUDE_GROUPS, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--explicit-group-scope", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("--staff-member", action="append", default=[], help=argparse.SUPPRESS)
     _ = batch.add_argument("--log", type=Path)
     _ = batch.add_argument("--preload-restarted", action="store_true", help=argparse.SUPPRESS)
@@ -3143,7 +3156,13 @@ def main(argv: list[str] | None = None) -> int:
     if not (target or group):
         batch.error("provide --target for an explicit move or --group for a group move")
     token = _batch_process.set(True)
-    intent = moves.FollowGroupAccount(group) if group is not None else moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
+    intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
+    if group is not None:
+        intent = moves.FollowGroupAccount(group)
+    elif cast(bool, args.explicit_group_scope):
+        intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
+    else:
+        intent = moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
     request_id = cast(str, args.request_id)
     request = (DetachedMoveRequest(request_id, frozenset(cast(list[str], args.staff_member)))
                if request_id else _NEW_MOVE_REQUEST)

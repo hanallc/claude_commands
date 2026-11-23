@@ -76,7 +76,7 @@ class ScratchTests(unittest.TestCase):
             **environment,
             **fixture,
             "HOME": str(self.base),
-            copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
+            copy_record.ROOT_ENV: str(self.base / "scratch"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
             "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json"),
             # An absent session root: a run without the test-run folder must not reach the live root.
@@ -208,7 +208,7 @@ class ScratchTests(unittest.TestCase):
         self.assertCountEqual([entry.path for entry in result], [shot, second, taken, adopted])
         self.assertTrue(all(path.is_dir() for path in (shot, second, unnamed, taken, until, adopted)))
         self.assertEqual({name for name, hold in scratch.holds().items() if not hold["ended"]}, {str(unnamed)})
-        self.assertEqual(scratch.new("gate:other", visible=False).parent, folder)
+        self.assertEqual(scratch.new("gate:other").parent, folder)
         self.assertFalse((self.base / "scratch").exists())
 
     def test_checkout_removal_saves_outputs_before_source_deletion_and_keeps_retry_evidence(self) -> None:
@@ -1893,7 +1893,7 @@ def load(name, *args, **kwargs):
         raise ImportError('helper imports are closed after startup')
     return original_import(name, *args, **kwargs)
 builtins.__import__ = load
-print(scratch.target('gate:proof', 'tree', False))
+print(scratch.target('gate:proof', 'tree'))
 """
         result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", probe], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2964,11 +2964,6 @@ print(scratch.target('gate:proof', 'tree', False))
             _ = scratch.new(RUN, "gate")
         self.assertEqual(list((self.base / "scratch").iterdir()), [])
 
-    def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
-        self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")
-        with self.assertRaises(scratch.ScratchError):
-            _ = scratch.new(RUN, "x", visible=True)
-
     def test_a_malformed_task_or_name_is_refused(self) -> None:
         for task in ("run", "session:abc", "row:cargo-liner", "row:a/C1", "phase:"):
             with self.assertRaises(scratch.ScratchError, msg=task):
@@ -2977,7 +2972,7 @@ print(scratch.target('gate:proof', 'tree', False))
             _ = scratch.new(RUN, "../out")
 
     def test_end_marks_only_the_selected_task_folders(self) -> None:
-        mine = [scratch.new(ROW, "demo", visible=True), scratch.new(ROW, "copy")]
+        mine = [scratch.new(ROW, "demo"), scratch.new(ROW, "copy")]
         other = scratch.new("phase:builds/7")
         loose = self.base / "scratch" / "loose"
         loose.mkdir()
@@ -2991,7 +2986,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertTrue(loose.is_dir())
 
     def test_stopped_removal_keeps_its_task_record_until_the_rerun_finishes(self) -> None:
-        path = scratch.new(ROW, "stopped", visible=True)
+        path = scratch.new(ROW, "stopped")
         first, second = path / "a", path / "b"
         _ = first.write_text("first child")
         _ = second.write_text("second child")
@@ -3038,7 +3033,7 @@ print(scratch.target('gate:proof', 'tree', False))
     def test_removal_rerun_finds_the_task_after_its_record_or_folder_is_deleted(self) -> None:
         for index, boundary in enumerate(("record removed", "before rmdir", "after rmdir")):
             with self.subTest(boundary=boundary):
-                path = scratch.new(ROW, f"final-stop-{index}", visible=True)
+                path = scratch.new(ROW, f"final-stop-{index}")
                 other = scratch.new(RUN, "kept")
                 real_unlink = os.unlink
                 real_rmdir = Path.rmdir
@@ -3066,7 +3061,7 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertFalse(path.exists())
                 self.assertNotIn(path, [folder.path for folder in scratch.folders()])
                 self.assertTrue(other.is_dir())
-                self.assertEqual(list(path.parent.iterdir()), [])
+                self.assertEqual([entry for entry in path.parent.iterdir() if path.name in entry.name], [])
 
     def test_end_keep_predicate_preserves_folders_and_holds_until_the_command_finishes(self) -> None:
         kept = scratch.new(RUN, "live")
@@ -3174,7 +3169,7 @@ print(scratch.target('gate:proof', 'tree', False))
     def test_adopt_moves_a_loose_folder_in(self) -> None:
         loose = self.base / "rust" / "c54demo"
         (loose / "src").mkdir(parents=True)
-        path = scratch.adopt(loose, ROW, "demo", visible=True)
+        path = scratch.adopt(loose, ROW, "demo")
         self.assertFalse(loose.exists())
         self.assertTrue((path / "src").is_dir())
         record = scratch.task_of(path)
@@ -3201,7 +3196,7 @@ print(scratch.target('gate:proof', 'tree', False))
         git("init", "-q")
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
         git("update-ref", "refs/remotes/origin/main", "HEAD")
-        path = scratch.target(RUN, "wt", False)
+        path = scratch.target(RUN, "wt")
         git("worktree", "add", "-q", str(path))
         scratch.write_record(path, RUN, 0.0)
         _ = (path / "work").write_text("keep this work")

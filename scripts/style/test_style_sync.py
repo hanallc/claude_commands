@@ -217,7 +217,6 @@ class StyleSyncTests(unittest.TestCase):
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
             # A child's fresh gate copy goes in the test folder, so a killed child leaves nothing outside it.
             "TMPDIR": str(self.root),
         })))

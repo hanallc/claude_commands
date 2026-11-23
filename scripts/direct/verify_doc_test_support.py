@@ -18,6 +18,7 @@ from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
 from scripts.agents.test_support import write_machine_config
 from scripts.lib.checkout_test_support import seed_test_configuration
 from scripts.lint.config_test_support import LINT_TOOL_SETTINGS
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -254,7 +255,7 @@ class VerifyDocFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", defaults=MAC_RUN_SETTINGS)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")

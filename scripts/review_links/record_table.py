@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from scripts.lib import conf
-from scripts.review_links import page_frame
 
 
-DIALOG_ID = 'record-item-dialog'
 DELIVERY_WINDOW_SECONDS = 30
 
 
@@ -20,18 +18,28 @@ def delivery_window_seconds(settings: conf.ConfigRead) -> int:
     return settings.value('page_delivery_window_seconds', conf.positive_whole, default=DELIVERY_WINDOW_SECONDS)
 
 
-def render_dialog() -> str:
-    """Render the dialog that Review and The List use for open records."""
-    return page_frame.console_dialog(
-        DIALOG_ID, 'record-item-title', 'Item',
-        '<div data-record-dialog-detail></div>',
-        before_body=('<div class="record-dialog-status">'
-                     '<span data-record-missing role="status" hidden>This item is no longer in the list.</span>'
-                     '<span data-record-updates role="status" hidden>Updates available</span>'
-                     '<button type="button" data-show-record-updates hidden>Show updates</button></div>'),
-        footer=('<footer><div data-record-error role="status" hidden></div>'
-                '<div data-record-link-notice role="status" hidden></div></footer>'),
-    )
+def log_max_height_rem(settings: conf.ConfigRead) -> int:
+    """Read the log height limit on a narrow page."""
+    return settings.whole('list_log_max_height_rem')
+
+
+def log_panel(log_id: str, entries: str) -> str:
+    """Render a log that scrolls in its own area."""
+    return ('<section class="list-log-panel"><h3>Log · newest first</h3>'
+            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
+            + '<ol class="list-log">' + entries + '</ol></div></section>')
+
+
+RECORD_MISSING = '<span data-record-missing role="status" hidden>This item is no longer in the list.</span>'
+RECORD_DETAIL_ERROR = '<div data-record-error role="status" hidden></div>'
+RECORD_LINK_NOTICE = '<div data-record-link-notice role="status" hidden></div>'
+
+
+def render_inline_detail() -> str:
+    """Render the template for the open row."""
+    return ('<template id="record-inline-view"><div data-record-inline-view>'
+            + '<div class="record-row-status">' + RECORD_MISSING + RECORD_LINK_NOTICE + '</div>'
+            + '<div data-record-inline-detail></div>' + RECORD_DETAIL_ERROR + '</div></template>')
 
 
 @dataclass(frozen=True)
@@ -105,7 +113,57 @@ def date_time_picker(*, field: str, action: str, value: str) -> str:
             +'</div></div>')
 
 
-STYLE = '''<style>
+EMPTY_RESULT_STYLE = '''<style>
+[data-empty-result] button[hidden]{display:none!important}
+[data-empty-result] td.empty-result-cell{padding:12px 16px;text-align:left;white-space:normal;color:var(--ink-2)}
+.empty-result-content,.empty-result-actions{display:flex;align-items:center;flex-wrap:wrap}
+.empty-result-content{gap:8px 16px;overflow-wrap:anywhere}.empty-result-actions{gap:8px}
+.empty-result-actions button{font:inherit;min-height:44px;margin:0;padding:6px 12px;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer}
+.empty-result-actions button:hover{background:var(--hover)}
+@media(max-width:960px){.list-table [data-empty-result] :is(tr,td){display:block}}
+</style>'''
+
+EMPTY_RESULT_SCRIPT = r'''
+const emptyResultRows=new WeakMap();
+const emptyResultList=new Intl.ListFormat('en',{type:'conjunction'});
+function updateEmptyResult(table,{empty,noun='item',search='',labels=[],clearSearch,resetFilters}){
+ const words=search.trim();
+ let row=emptyResultRows.get(table);
+ if(!empty || (!words && !labels.length)){
+  row?.remove();
+  return false;
+ }
+ if(!row){
+  row=table.createTBody();
+  row.dataset.emptyResult='';
+  const cell=row.insertRow().insertCell();
+  cell.className='empty-result-cell';
+  cell.colSpan=[...table.tHead.rows[0].cells].reduce((width,heading)=>width+heading.colSpan,0);
+  cell.innerHTML='<div class="empty-result-content"><span role="status"></span>'
+   +'<div class="empty-result-actions"><button type="button" data-clear-empty-search>Clear search</button>'
+   +'<button type="button" data-reset-empty-filters>Show all items</button></div></div>';
+  emptyResultRows.set(table,row);
+ }
+ if(row.parentElement!==table) table.append(row);
+ const filters=emptyResultList.format(labels);
+ const status=row.querySelector('[role="status"]');
+ const clear=row.querySelector('[data-clear-empty-search]');
+ const reset=row.querySelector('[data-reset-empty-filters]');
+ const subject='No '+noun;
+ const text=words ? subject+' contains "'+words+'"'+(filters ? ' and matches '+filters : '')+'.'
+  : subject+' matches '+filters+'.';
+ clear.hidden=!words;
+ clear.onclick=clearSearch ?? null;
+ reset.hidden=!filters;
+ reset.onclick=resetFilters ?? null;
+ if(status.textContent!==text) status.textContent=text;
+ return true;
+}
+'''
+
+
+STYLE = EMPTY_RESULT_STYLE + '''<style>
 [hidden]{display:none!important}body{background:var(--bg);color:var(--ink)}
 main{font-size:15px;line-height:1.5}
 .list-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
@@ -175,21 +233,18 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-window-before],[data-window-after],[data-window-gap]{border:0!important;margin:0!important;border-radius:0!important}
-#record-item-dialog{margin:16px auto auto}
-#record-item-dialog .console-dialog-frame{grid-template-rows:auto auto minmax(0,1fr) 70px}
-#record-item-dialog .console-dialog-body{scrollbar-gutter:stable}
-#record-item-dialog .console-dialog-frame>footer{overflow-y:auto;overscroll-behavior:contain}
-.record-dialog-status{height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
-.record-dialog-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
+:is(.record-row-status,.review-card-status){height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
+.review-card-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
 border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink)}
-.record-dialog-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-@media(max-width:480px){.record-dialog-status{padding-inline:16px}}
+.review-card-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+@media(max-width:480px){:is(.record-row-status,.review-card-status){padding-inline:16px}}
+[data-record-inline-view] .record-row-status{border-inline-start:3px solid var(--accent);text-align:left}
+[data-record-inline-view] .record-row-status:not(:has(> :not([hidden]))){display:none}
+[data-record-inline-view] [data-record-error]{padding-inline:24px;text-align:left}
+[data-record-inline-view] [data-record-link-notice]{padding:0;border:0}
 :is([data-record-missing],[data-record-error],[data-record-link-notice]){color:var(--warning)}
 :is([data-record-error],[data-record-link-notice]){padding-block:12px;border-top:1px solid var(--line);overflow-wrap:anywhere}
-:is([data-record-dialog-detail],[data-review-card]) button[aria-disabled="true"]{opacity:.5;cursor:default}
-[data-record-dialog-detail] :is(.list-panel,.review-panel){grid-template-columns:minmax(0,1fr);padding:0;border:0}
-[data-record-dialog-detail] .review-actions{display:grid;gap:16px}
-[data-record-dialog-detail] .review-action-group+.review-action-group{padding:0;border:0}
+[data-review-card] button[aria-disabled="true"]{opacity:.5;cursor:default}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
 [data-missing-keys]{white-space:pre-line}
 [data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
@@ -253,15 +308,131 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 
 
 DETAIL_SCRIPT = r'''
-function recordDetails(item){return item?.dialogDetails ?? item?.querySelector('[data-detail]>td');}
+function recordDetails(item){return item?.openDetails ?? item?.querySelector('[data-detail]>td');}
 function recordIsOpen(item){return item?.querySelector('.list-toggle')?.getAttribute('aria-expanded')==='true';}
 function recordFromDetail(element){
- return element?.closest('[data-record-dialog-detail]')?.recordItem ?? element?.closest('[data-list-item]');
+ return element?.closest('[data-list-item]');
 }
 '''
 
 
-SCRIPT = DETAIL_SCRIPT + r'''const filterControl={
+SCRIPT = DETAIL_SCRIPT + EMPTY_RESULT_SCRIPT + r'''
+let recordSpaceAbove,recordSpaceBelow,recordScrollTop,trackedRecordRow;
+const recordScrollInputs=['wheel','touchmove','keydown'];
+const recordScrollKeys=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' ']);
+function recordSpaceHeight(space){return space?.getBoundingClientRect().height ?? 0;}
+function setRecordSpace(space,height){
+ if(height>0){space.style.height=height+'px';return space;}
+ space?.remove();
+}
+function createRecordSpace(frame,above){
+ const space=document.createElement('div');
+ space.setAttribute('aria-hidden','true');
+ space.style.overflowAnchor='none';
+ if(above) frame.prepend(space);else frame.append(space);
+ return space;
+}
+function bindRecordScroll(){
+ if(recordSpaceAbove || recordSpaceBelow || trackedRecordRow)
+  addEventListener('scroll',recordScrolled,{passive:true});
+ else removeEventListener('scroll',recordScrolled);
+ for(const type of recordScrollInputs){
+  if(recordSpaceAbove) addEventListener(type,recordScrollAtLimit,{passive:true});
+  else removeEventListener(type,recordScrollAtLimit);
+ }
+}
+function stopTrackingRecordRow(){
+ trackedRecordRow?.observer.disconnect();
+ trackedRecordRow=undefined;
+ bindRecordScroll();
+}
+function clearRecordSpace(){
+ recordSpaceAbove?.remove();recordSpaceBelow?.remove();
+ recordSpaceAbove=recordSpaceBelow=undefined;
+ stopTrackingRecordRow();
+}
+function releaseRecordPosition(current){
+ const height=recordSpaceHeight(recordSpaceAbove);
+ clearRecordSpace();
+ const target=Math.max(0,current-height);
+ if(height && target!==window.scrollY) window.scrollTo({top:target,behavior:'instant'});
+}
+function recordScrolled(){
+ const current=window.scrollY;
+ if(current!==recordScrollTop) releaseRecordPosition(current);
+}
+function recordScrollAtLimit(event){
+ // Input at a scroll limit can leave the scroll position unchanged.
+ const {scrollHeight,clientHeight}=document.scrollingElement;
+ if(window.scrollY>0 && window.scrollY<scrollHeight-clientHeight) return;
+ if(event.defaultPrevented || (event.type==='wheel' && (!event.deltaY || event.ctrlKey))) return;
+ if(event.type==='keydown'){
+  if(!recordScrollKeys.has(event.key) || event.altKey || event.metaKey) return;
+  const target=event.target instanceof Element ? event.target : null;
+  if(target?.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])') ||
+     (event.key===' ' && target?.closest('button,summary,[role="button"]'))) return;
+ }
+ releaseRecordPosition(window.scrollY);
+}
+function alignRecordRowTop(row,top,remainingShrink){
+ const difference=row.getBoundingClientRect().top-top;
+ if(!difference && !remainingShrink && !recordSpaceBelow) return;
+ const frame=row.closest('main');
+ if(!frame){
+  window.scrollBy({top:difference,behavior:'instant'});
+  recordScrollTop=window.scrollY;
+  return;
+ }
+ const hadSpaceAbove=Boolean(recordSpaceAbove),hadSpaceBelow=Boolean(recordSpaceBelow);
+ const scroller=document.scrollingElement;
+ // Scroll anchoring would move the page when the top space changes.
+ const anchor=scroller.style.overflowAnchor;
+ scroller.style.overflowAnchor='none';
+ const desired=window.scrollY+difference-recordSpaceHeight(recordSpaceAbove);
+ // Firefox scrolls by whole pixels from a fractional position, so the target keeps the current fraction.
+ const target=Math.max(0,window.scrollY+Math.ceil(desired-window.scrollY)),above=target-desired;
+ if(above>0 && !recordSpaceAbove) recordSpaceAbove=createRecordSpace(frame,true);
+ recordSpaceAbove=setRecordSpace(recordSpaceAbove,above);
+ const {scrollHeight,clientHeight}=document.scrollingElement;
+ // scrollHeight is at least the viewport height, even when the body is shorter.
+ const documentHeight=scrollHeight>clientHeight ? scrollHeight : document.body.getBoundingClientRect().bottom+window.scrollY;
+ // Keep the current scroll reachable even if the animation shrinks in one frame.
+ const below=target ? Math.ceil(target+clientHeight+remainingShrink-documentHeight+recordSpaceHeight(recordSpaceBelow)) : 0;
+ if(below>0 && !recordSpaceBelow) recordSpaceBelow=createRecordSpace(frame,false);
+ recordSpaceBelow=setRecordSpace(recordSpaceBelow,below);
+ window.scrollTo({top:target,behavior:'instant'});
+ scroller.style.overflowAnchor=anchor;
+ recordScrollTop=window.scrollY;
+ if(hadSpaceAbove!==Boolean(recordSpaceAbove) || hadSpaceBelow!==Boolean(recordSpaceBelow)) bindRecordScroll();
+}
+function visibleRecordRow(item){
+ const row=item?.querySelector('.list-row');
+ if(row?.isConnected && row.getClientRects().length) return row;
+}
+function trackRecordRowDuringMotion(row,top,motions){
+ stopTrackingRecordRow();
+ if(!row) return;
+ const clips=[...motions.values()].filter(motion=>motion.leaving).map(motion=>motion.clip);
+ const remainingShrink=()=>clips.reduce((height,clip)=>height+clip.getBoundingClientRect().height,0);
+ alignRecordRowTop(row,top,remainingShrink());
+ if(!motions.size) return;
+ const observer=new ResizeObserver(()=>{
+  if(trackedRecordRow?.observer!==observer) return;
+  recordScrolled();
+  if(trackedRecordRow && row.isConnected && row.getClientRects().length) alignRecordRowTop(row,top,remainingShrink());
+ });
+ trackedRecordRow={row,top,observer};
+ for(const {clip} of motions.values()) observer.observe(clip);
+ recordScrollTop=window.scrollY;
+ bindRecordScroll();
+}
+function activeChipLabels(content,selector){
+ return [...content.querySelectorAll(selector)].map(button=>{
+  const label=[...button.childNodes].filter(node=>node.nodeName!=='B').map(node=>node.textContent).join('').trim();
+  return button.closest('[role="group"]').getAttribute('aria-label')+': '+label;
+ });
+}
+const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
  setWords(control,value){
@@ -354,20 +525,48 @@ let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 let windowEntries=[],pendingFrame=0,revealKey='';
-const dialog=document.getElementById('record-item-dialog'),dialogBody=dialog?.querySelector('.console-dialog-body');
-const dialogDetail=dialog?.querySelector('[data-record-dialog-detail]');
-const dialogTitle=dialog?.querySelector('h2'),dialogMissing=dialog?.querySelector('[data-record-missing]');
-const dialogError=dialog?.querySelector('[data-record-error]');
-const dialogUpdates=dialog?.querySelector('[data-record-updates]');
-const showUpdates=dialog?.querySelector('[data-show-record-updates]');
-const dialogLinkNotice=dialog?.querySelector('[data-record-link-notice]');
-const closeDialogButton=dialog?.querySelector('[data-close]');
-let dialogItem=null,dialogNeedsRecord=false,dialogSuspended=false;
+const inlineView=document.getElementById('record-inline-view')?.content.firstElementChild.cloneNode(true);
+const viewDetail=inlineView?.querySelector('[data-record-inline-detail]');
+const detailFocus=()=>openItem?.querySelector('.list-toggle');
+const detailMissing=inlineView?.querySelector('[data-record-missing]');
+const detailError=inlineView?.querySelector('[data-record-error]');
+const detailLinkNotice=inlineView?.querySelector('[data-record-link-notice]');
+let openItem=null,openNeedsRecord=false;
+// Changes when a row opens or closes; never on a remount, a snapshot or a link to the open row.
+let openSession=0;
 let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
-const pendingDetail=new Map();
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
+function preserveRecordRowTop(update){
+ const before=visibleRecordRow(openItem),key=openItem?.dataset.key;
+ const top=before?.getBoundingClientRect().top;
+ const result=update();
+ const after=visibleRecordRow(openItem);
+ if(top!==undefined && after && key===openItem.dataset.key)
+  trackRecordRowDuringMotion(after,top,rowMotion);
+ return result;
+}
+/** @typedef {{key: string, index: string, offset: number}} LogPosition */
+/** @type {LogPosition | null} */
+let heldLog=null;
+const openLog=()=>recordDetails(openItem)?.querySelector('.list-log-scroll');
+// Moving or replacing the open row resets its log scroll, so hold the first visible entry for this task.
+function holdLog(){
+ const log=openLog();
+ if(heldLog || !log?.clientHeight || !log.scrollTop) return;
+ const top=log.getBoundingClientRect().top;
+ const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
+ if(!entry) return;
+ heldLog={key:openItem.dataset.key,index:entry.dataset.logIndex,offset:entry.getBoundingClientRect().top-top};
+ queueMicrotask(()=>{heldLog=null;});
+}
+function restoreLog(){
+ const log=openLog();
+ if(!heldLog || openItem?.dataset.key!==heldLog.key) return;
+ const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
+ if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
+}
 function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
 function spacer(node,height){
  node.innerHTML=height>0 ? '<tr aria-hidden="true"><td colspan="'+columns.length+'" style="height:'+height+'px;padding:0;border:0"></td></tr>' : '';
@@ -388,6 +587,7 @@ function mergeRanges(ranges){
 }
 function drawWindow(){
  if(!options.mount) return;
+ holdLog();
  const table=content.querySelector('table'),before=table.querySelector('[data-window-before]'),after=table.querySelector('[data-window-after]');
  for(const [key,node] of mounted){const height=node.getBoundingClientRect().height;if(height>0) measured.set(key,height);}
  const motions=motionsByKey();
@@ -410,7 +610,7 @@ function drawWindow(){
  const focusedRow=document.activeElement?.closest('[data-list-item]');
  const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
- for(const key of new Set([focused,opened.values().next().value,dialogItem?.dataset.key])){
+ for(const key of new Set([focused,opened.values().next().value,openItem?.dataset.key])){
   if(!key || options.pinOpenRow?.(key)===false) continue;
   const at=entries.findIndex(({data})=>data.key===key);
   if(at>=0) ranges.push([Math.max(0,at-1),Math.min(entries.length,at+2)]);
@@ -450,53 +650,42 @@ function drawWindow(){
   if(cursor.nextElementSibling!==node) cursor.after(node);
   cursor=node;
  }
- syncItemDialog();
+ syncOpenItem();
+ restoreLog();
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
 }
 function updateItemDetail(item,update){
  const detail=recordDetails(item);
- if(detail!==dialogDetail || !dialog.open){update(detail);return;}
- const top=dialogBody.scrollTop,field=document.activeElement;
+ if(detail!==viewDetail){update(detail);return;}
+ const field=document.activeElement;
  const selector=detail.contains(field) && (field.id ? '#'+CSS.escape(field.id) :
   field.localName+['name','value','href'].map(name=>field.hasAttribute(name) ?
    '['+name+'="'+CSS.escape(field.getAttribute(name))+'"]' : '').join(''));
  const at=selector ? [...detail.querySelectorAll(selector)].indexOf(field) : -1;
  const start=field?.selectionStart,end=field?.selectionEnd,direction=field?.selectionDirection;
+ holdLog();
  update(detail);
+ restoreLog();
  if(at>=0 && !field.isConnected){
   const next=detail.querySelectorAll(selector)[at];
-  (next ?? closeDialogButton).focus({preventScroll:true});
+  (next ?? detailFocus()).focus({preventScroll:true});
   if(typeof start==='number' && next?.setSelectionRange) next.setSelectionRange(start,end,direction);
  }
- dialogBody.scrollTop=top;
 }
 function drawDetailStatus(){
- if(!dialog) return;
+ if(!inlineView) return;
  const error=savedDisplayFailed ? 'Saved; the item could not refresh.' : statusError;
- dialogError.hidden=!error || !dialogMissing.hidden;
- dialogError.textContent=error;
- showUpdates.hidden=dialogUpdates.hidden=!pendingDetail.size || !dialogMissing.hidden;
- const blocked=itemUpdateRequired();
- for(const button of dialogDetail.querySelectorAll('form button:is([type="submit"],:not([type]))')){
-  if(blocked) button.setAttribute('aria-disabled','true');
-  else button.removeAttribute('aria-disabled');
- }
+ detailError.hidden=!error || !detailMissing.hidden;
+ detailError.textContent=error;
 }
-function itemUpdateRequired(){return [...pendingDetail.values()].some(update=>update.blocks);}
 function itemError(message){statusError=message;drawDetailStatus();}
-function queueItemUpdate(item,slot,update,blocks=true){
- if(item!==dialogItem){update?.(item,recordDetails(item));return;}
- if(deliveryRequest()){
-  pendingDetail.delete(slot);
-  if(update){
-   options.rememberItem?.(item);
-   updateItemDetail(item,detail=>update(item,detail));
-  }
-  drawDetailStatus();
-  return;
+function queueItemUpdate(item,update){
+ if(item!==openItem){update?.(item,recordDetails(item));return;}
+ if(update){
+  options.rememberItem?.(item);
+  updateItemDetail(item,detail=>update(item,detail));
  }
- if(update) pendingDetail.set(slot,{update,blocks});else pendingDetail.delete(slot);
  drawDetailStatus();
 }
 function installItemRevision(revision,render){
@@ -513,13 +702,12 @@ function presentItemRevision(item,revision,render,{initial=false,force=false}={}
   drawDetailStatus();
   return;
  }
- queueItemUpdate(item,'body',force || revision!==shownRevision ? install : null);
+ queueItemUpdate(item,force || revision!==shownRevision ? install : null);
 }
 function installOwnItemResult(request,revision,render){
  if(!currentItemRequest(request)) return;
- const item=dialogItem;
+ const item=openItem;
  options.rememberItem?.(item);
- pendingDetail.clear();
  const install=installItemRevision(revision,render);
  updateItemDetail(item,detail=>install(item,detail));
  drawDetailStatus();
@@ -543,7 +731,7 @@ function finishDeliveryWindow(request){
  if(currentItemRequest(request)) request.until=0;
 }
 function currentItemRequest(request){
- return Boolean(request) && itemRequest===request && dialogItem?.dataset.key===request.key && opened.has(request.key);
+ return Boolean(request) && itemRequest===request && openItem?.dataset.key===request.key && opened.has(request.key);
 }
 function savedItemError(request){
  if(!currentItemRequest(request)) return;
@@ -551,129 +739,101 @@ function savedItemError(request){
  drawDetailStatus();
 }
 function showDraftCopy(words,editable){
- if(!words || editable || dialogDetail.querySelector('[data-review-draft]')) return;
+ if(!words || editable || viewDetail.querySelector('[data-review-draft]')) return;
  const label=document.createElement('label'),field=document.createElement('textarea');
  label.textContent='Your unsaved words';
  field.value=words;field.readOnly=true;field.dataset.reviewDraft='';
- label.append(field);dialogDetail.append(label);
-}
-function applyItemUpdates(){
- const item=dialogItem;
- if(!item || !pendingDetail.size) return;
- options.rememberItem?.(item);
- const full=pendingDetail.get('body');
- const updates=[...pendingDetail.values()].filter(update=>update!==full);
- pendingDetail.clear();
- updateItemDetail(item,detail=>{
-  full?.update(item,detail);
-  for(const {update} of updates) update(item,detail);
- });
- drawDetailStatus();
- return true;
-}
-showUpdates?.addEventListener('click',()=>{
- const focused=document.activeElement===showUpdates;
- applyItemUpdates();
- if(focused) closeDialogButton.focus({preventScroll:true});
-});
-function setDialogTitle(item){
- dialogTitle.textContent=options.itemTitle?.(item) ?? item.querySelector('.list-toggle').textContent.replace(/^›/,'').trim();
+ label.append(field);viewDetail.append(label);
 }
 function returnItemDetail(){
- if(!dialogItem) return;
- if(!dialogMissing.hidden || !applyItemUpdates()) options.rememberItem?.(dialogItem);
- pendingDetail.clear();
+ if(!openItem) return;
+ options.rememberItem?.(openItem);
  itemRequest=null;
  savedDisplayFailed=false;
  statusError='';
- delete dialogItem.dialogDetails;
- recordDetails(dialogItem).replaceChildren(...dialogDetail.childNodes);
- delete dialogDetail.recordItem;
- dialogItem=null;
+ delete openItem.openDetails;
+ recordDetails(openItem).replaceChildren(...viewDetail.childNodes);
+ inlineView.remove();
+ clearRecordSpace();
+ openItem=null;
 }
-function syncItemDialog(){
- if(!dialog) return;
+function syncOpenItem(){
+ if(!inlineView) return;
  const key=opened.values().next().value;
  if(!key){
-  if(!dialogItem) return;
-  const previous=dialogItem.dataset.key;
-  const restoreFocus=!dialogSuspended && options.ownsFocus?.()!==false;
-  returnItemDetail();dialog.close();
+  if(!openItem) return;
+  const previous=openItem.dataset.key;
+  const focused=document.activeElement;
+  const restoreFocus=inlineView.contains(focused) && options.ownsFocus?.()!==false;
+  returnItemDetail();
   if(restoreFocus){
    const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
    (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
   }
   return;
  }
- const sameItem=dialogItem?.dataset.key===key;
- let item=options.mount ? mounted.get(key) ?? (sameItem && !dialogNeedsRecord ? dialogItem : null) : itemWithKey(key);
+ const sameItem=openItem?.dataset.key===key;
+ let item=options.mount ? mounted.get(key) ?? (sameItem && !openNeedsRecord ? openItem : null) : itemWithKey(key);
  if(options.mount && !item && options.hasKey(key)){
   item=options.mount(itemWithKey(key).dataset);
   item.hidden=true;setExpanded(item,true);
  }
  if(!item || (options.hasKey && !options.hasKey(key))){
   if(sameItem){
-   dialogMissing.hidden=false;
-   pendingDetail.clear();drawDetailStatus();
-   dialogDetail.querySelectorAll('form button').forEach(control=>control.disabled=true);
+   detailMissing.hidden=false;
+   drawDetailStatus();
+   viewDetail.querySelectorAll('form button').forEach(control=>control.disabled=true);
   }
   return;
  }
- dialogNeedsRecord=false;
- if(item===dialogItem) return;
- const wasMissing=!dialogMissing.hidden;
- const keepBody=sameItem && !dialogDetail.querySelector('[data-record-loading]');
+ openNeedsRecord=false;
+ if(item===openItem) return;
+ const wasMissing=!detailMissing.hidden;
+ const keepBody=sameItem && !viewDetail.querySelector('[data-record-loading]');
  const incoming=recordDetails(item);
- if(keepBody) delete dialogItem.dialogDetails;
- else{
-  if(dialogItem) returnItemDetail();
-  dialogDetail.replaceChildren(...incoming.childNodes);
+ const children=[...incoming.childNodes];
+ if(keepBody){
+  delete openItem.openDetails;
+  }else{
+  if(openItem) returnItemDetail();
+  viewDetail.replaceChildren(...children);
   shownRevision=options.itemRevision?.(item);
-  setDialogTitle(item);
  }
- dialogItem=item;dialogDetail.recordItem=item;item.dialogDetails=dialogDetail;
- dialogMissing.hidden=true;
- if(options.itemRevision && keepBody){
-  const revision=options.itemRevision(item);
-  presentItemRevision(item,revision,(row,detail)=>{
-   const slot=options.retainedDetailSlot;
-   const retained=slot && detail.querySelector(slot);
-   if(retained) incoming.querySelector(slot)?.replaceWith(retained.cloneNode(true));
-   detail.replaceChildren(...incoming.childNodes);
-   setDialogTitle(row);
-   options.detailInstalled?.(row);
-  },{force:wasMissing});
- }else if(!keepBody) options.detailInstalled?.(item);
+ incoming.replaceChildren(inlineView);
+ openItem=item;item.openDetails=viewDetail;
+ detailMissing.hidden=true;
+ if(options.itemRevision && keepBody) presentNewDetail(item,children,wasMissing);
+ else if(!keepBody) options.detailInstalled?.(item);
  drawDetailStatus();
- if(!dialog.open && !dialogSuspended) dialog.showModal();
- if(!sameItem && !dialogSuspended){
-  closeDialogButton.focus({preventScroll:true});
-  dialogBody.scrollTop=0;
- }
 }
-function suspendItemDialog(){
- if(!dialog?.open) return;
- const top=dialogBody.scrollTop;
- dialogSuspended=true;
- dialog.close();
- return ()=>{
-  dialogSuspended=false;
-  if(!dialogItem) return;
-  dialog.showModal();
-  dialogBody.scrollTop=top;
- };
+function presentNewDetail(item,children,wasMissing){
+ presentItemRevision(item,options.itemRevision(item),(row,detail)=>{
+  const slot=options.retainedDetailSlot;
+  const retained=slot && detail.querySelector(slot);
+  detail.replaceChildren(...children);
+  if(retained) detail.querySelector(slot)?.replaceWith(retained.cloneNode(true));
+  options.detailInstalled?.(row);
+ },{force:wasMissing});
 }
-if(dialog) bindConsoleDialog(dialog,()=>{
- if(!dialog.open) return;
- closeCard(dialogItem.dataset.key,false);
- apply(true);
-});
+// The open row keeps its node through a new snapshot and takes the new data.
+function keepOpenRow(){
+ const item=openItem,key=item?.dataset.key;
+ const next=inlineView && options.itemRevision && item && !item.isConnected && opened.has(key) && itemWithKey(key);
+ if(!next) return;
+ for(const {name} of [...item.attributes]) if(!next.hasAttribute(name)) item.removeAttribute(name);
+ for(const {name,value} of next.attributes) item.setAttribute(name,value);
+ item.querySelector('.list-row').replaceWith(next.querySelector('.list-row'));
+ const children=[...recordDetails(next).childNodes],wasMissing=!detailMissing.hidden;
+ next.replaceWith(item);
+ detailMissing.hidden=true;
+ presentNewDetail(item,children,wasMissing);
+}
 function mount(data){
  const key=data.key;
  let node=mounted.get(key);
  if(!node){
-  node=!dialogNeedsRecord && options.pinOpenRow?.(key)!==false && dialogItem?.dataset.key===key
-   ? dialogItem : options.mount(data);
+  node=!openNeedsRecord && options.pinOpenRow?.(key)!==false && openItem?.dataset.key===key
+   ? openItem : options.mount(data);
   mounted.set(key,node);resize?.observe(node);
  }
  node.hidden=false;
@@ -756,17 +916,16 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');
  const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
-  opened.clear();
   const key=saved.opened.includes(item) ? item : saved.opened[0];
-  if(key) openCard(key);
+  if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
   if(itemWithKey(item)){openCard(item);revealKey=item;}
-  else if(dialog && !options.keepItemOnMissingLink) opened.clear();
- }else if(dialog && !followingItemLink) opened.clear();
+  else if(inlineView && !options.keepItemOnMissingLink) opened.clear();
+ }else if(inlineView && !followingItemLink) opened.clear();
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
@@ -826,9 +985,8 @@ function stopMotion(item){
 function setExpanded(item,expanded){
  const detail=item.querySelector('[data-detail]'),toggle=item.querySelector('.list-toggle');
  const changed=recordIsOpen(item)!==expanded;
- detail.hidden=true;
+ detail.hidden=!expanded;
  toggle.setAttribute('aria-expanded',String(expanded));
- if(dialog){toggle.setAttribute('aria-controls',dialog.id);toggle.setAttribute('aria-haspopup','dialog');}
  item.querySelector('.list-row').classList.toggle('open',expanded);
  return changed;
 }
@@ -859,11 +1017,15 @@ function animateRow(table,item,showRow,previousItem=item){
  ],{duration,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
+  if(trackedRecordRow) recordScrolled();
+  const tracked=trackedRecordRow;
   stopMotion(item);
   if(table.closest('[data-linked-item]')) apply(false,{animate:true});
   else scheduleWindow();
+  if(tracked && tracked.row===visibleRecordRow(openItem))
+   trackRecordRowDuringMotion(tracked.row,tracked.top,rowMotion);
  },()=>{});
- rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
+ rowMotion.set(item,{spacer,clip,copy,animation,finished,leaving:!showRow,sortValues:showRow ? sortValues(item.dataset) :
   previous?.sortValues ?? sortValues(item.dataset)});
 }
 function showHiddenActionResults(items){
@@ -871,7 +1033,7 @@ function showHiddenActionResults(items){
  if(!status) return;
  const hidden=key=>{
   const item=items.find(item=>item.dataset.key===key);
-  return !item || item.hidden || dialogItem!==item ||
+  return !item || item.hidden || openItem!==item ||
    !recordDetails(item)?.querySelector('[data-send-status]');
  };
  const messages=[];
@@ -900,7 +1062,7 @@ function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
 function matches(item,selection,counts){
- if(!isSelected(item)) return false;
+ if(selection.keys.size && !selection.keys.has(item.dataset.key)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
  const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
@@ -922,7 +1084,7 @@ function currentSelection(overrides={}){
  return {owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...overrides};
 }
 function apply(write=true,layout={}){
- options.beforeApply?.();
+ holdLog();
  applyRows(write,layout);
 }
 function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=false,pushPlace=false,top}={}){
@@ -934,7 +1096,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const missingLinkedItem=linkedItem!=='' && !hasKey(linkedItem);
  if(missingLinkedItem){
   keys.delete(linkedItem);
-  if(dialogItem?.dataset.key!==linkedItem) opened.delete(linkedItem);
+  if(openItem?.dataset.key!==linkedItem) opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
  if(dismissMissingItem && rows.some(item=>item.dataset.key===linkedItem && canRevealLinked(item,currentSelection()))){
@@ -944,16 +1106,16 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
- const search=query.trim().toLowerCase();
- if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ // Use one clock read for the rows, the owner selection, and the counts.
+ const now=Date.now();
+ if(normalizeOwner) owner=options.selectOwner?.(rows,currentSelection({now})) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- // One clock read per pass, so rows and counts agree when a time passes mid-pass.
- const active={...currentSelection(),now:Date.now()};
+ const active=currentSelection({now});
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -966,10 +1128,15 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const compareOrder=(a,b)=>compare(Number(a.dataset.order),Number(b.dataset.order));
  const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
   (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0;
+ const table=content.querySelector('table');let count=0,closedHiddenItem=false;
  if(options.mount){
   const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
+  const openKey=opened.values().next().value;
+  if(inlineView && hasKey(openKey) && !visibleKeys.has(openKey)){
+   if(dismissMissingItem) closeCard(openKey,false);
+   else if(options.pinOpenRow?.(openKey)!==false) visibleKeys.add(openKey);
+  }
   for(const [key,node] of mounted){
    if(visibleKeys.has(key)) continue;
    if(motion) animateRow(table,node,false);
@@ -1006,11 +1173,15 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   }
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
-   const expanded=opened.has(item.dataset.key);
    const matched=matches(item,active,counts);
    const showRow=matched || item===linked,wasShown=!item.hidden;
+   if(!showRow && opened.has(item.dataset.key) && options.closeHiddenItem?.(dismissMissingItem)){
+    closeCard(item.dataset.key,false);
+    closedHiddenItem=true;
+   }
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
+   const expanded=opened.has(item.dataset.key);
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -1033,17 +1204,17 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || missing.length>0;
- if(!options.mount) syncItemDialog();
+ const noResults=count===0 && missing.length===0;
+ if(!options.mount) syncOpenItem();
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
-  const message=linkedItem && missingLinkedItem && dialogItem?.dataset.key!==linkedItem ? options.missingItem(linkedItem) : '';
-  const inside=dialogItem && message;
+  const message=linkedItem && missingLinkedItem && openItem?.dataset.key!==linkedItem ? options.missingItem(linkedItem) : '';
+  const inside=openItem && message;
   missingItem.textContent=inside ? '' : message;
   missingItem.hidden=!message || Boolean(inside);
-  if(dialogLinkNotice){
-   dialogLinkNotice.textContent=inside || '';
-   dialogLinkNotice.hidden=!inside;
+  if(detailLinkNotice){
+   detailLinkNotice.textContent=inside || '';
+   detailLinkNotice.hidden=!inside;
   }
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
@@ -1053,11 +1224,26 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
- options.applied?.(selection,active);
+ restoreLog();
+ options.applied?.(selection,active,{rows,matches,count});
+ const reset=options.emptyFilters && noResults ? resetSelection(active.now) : null;
+ const canResetToResults=reset!==null && rows.some(item=>matches(item,reset));
+ const filteredEmpty=options.emptyFilters && updateEmptyResult(table,{
+  empty:canResetToResults,search:query,
+  labels:canResetToResults ? options.emptyFilters(content,active) : [],
+  clearSearch,resetFilters
+ });
+ empty.hidden=!noResults || Boolean(filteredEmpty);
  if(write || location.hash===placeHash &&
-  (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
+  (closedHiddenItem || revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
    filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
+ if(inlineView && (rowMotion.size || trackedRecordRow)){
+  const row=visibleRecordRow(openItem);
+  if(row && rowMotion.size){
+   if(trackedRecordRow?.row!==row) trackRecordRowDuringMotion(row,row.getBoundingClientRect().top,rowMotion);
+  }else if(trackedRecordRow) stopTrackingRecordRow();
+ }
 }
 function placeState(top){
  return {recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top,...(linkedItem && pendingItem ? {pendingItem:true} : {})}};
@@ -1114,12 +1300,15 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
- if(dialog && !target && !keepItemOnMissing) opened.clear();
+ // A link to a missing item closes the open row, so the page shows the missing item notice.
+ if(!target && !keepItemOnMissing) opened.clear();
  if(options.mount && target) revealKey=key;
  apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
-  if(!dialog?.open) content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
+  const notice=inlineView?.isConnected && !detailLinkNotice.hidden ? detailLinkNotice :
+   content.querySelector('[data-missing-item]');
+  notice?.scrollIntoView({block:'nearest',behavior:'instant'});
   return;
  }
  const row=mountedTarget.querySelector('.list-row');
@@ -1128,21 +1317,24 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(bannerHeight+16)+'px';
- if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});
+ const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ row.style.scrollMarginTop=(inset+16)+'px';
+ row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
 }
 function openCard(key){
+ if(!opened.has(key)) openSession++;
  opened.clear();
  opened.add(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
 function closeCard(key,write=true){
  const wasOpen=opened.delete(key);
+ if(wasOpen) openSession++;
  if(!wasOpen && linkedItem!==key) return;
  linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
@@ -1158,7 +1350,24 @@ function followRecordLink(event){
  event.preventDefault();
  jump(key,{keepItemOnMissing:true});
 }
-dialogDetail?.addEventListener('click',followRecordLink);
+function clearSearch(){
+ query='';
+ if(sharedWords()) filterControl.setWords(words(),query);
+ apply(true);
+ words().focus({preventScroll:true});
+}
+function resetSelection(now){
+ return {owner:'',sourceOwner:'',show:'all',type:'',query:'',keys:new Set(),
+  filters:Object.fromEntries(filterNames.map(name=>[name,''])),now};
+}
+function resetFilters(){
+ const reset=resetSelection();
+ ({owner,sourceOwner,show,type,query,keys}=reset);
+ Object.assign(filters,reset.filters);
+ if(sharedWords()) filterControl.setWords(words(),query);
+ apply(true);
+ options.firstFilter(content).focus({preventScroll:true});
+}
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>{
@@ -1191,15 +1400,16 @@ function bind(){
   apply(true,{animate:true});
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
+  if(type===button.dataset.typeChip) return;
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,queueItemUpdate,presentItemRevision,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
+ preserveRecordRowTop,holdLog,restoreLog,
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
-  return dialog?.open && location.hash===placeHash && dialogItem?.dataset.key===key &&
-   opened.has(key) && dialogMissing.hidden && dialogDetail.contains(form) &&
-   !itemUpdateRequired();
+  return openItem && !openItem.hidden && location.hash===placeHash && openItem.dataset.key===key &&
+   opened.has(key) && detailMissing.hidden && viewDetail.contains(form);
  },
  revealMatchingItem(key){
   const target=itemWithKey(key);
@@ -1237,10 +1447,12 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=currentWords(),previousQuery=query;
-  dialogNeedsRecord=Boolean(dialogItem && options.mount);
+  holdLog();
+  openNeedsRecord=Boolean(openItem && options.mount);
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
+  keepOpenRow();
   if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};

@@ -26,7 +26,7 @@ from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
 from scripts.buildlog.health import Machine
 from scripts.buildlog.test_index import point_root_at
-from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
 
 QUESTION_STAND_IN = '''import json, pathlib, sys
@@ -64,8 +64,19 @@ exec "$VAULT_TEST_GIT" "$@"
 GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
     "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-    "GIT_CONFIG_NOSYSTEM": "1",
 }
+
+
+def vault_fixture_environment(folder: Path) -> dict[str, str]:
+    """Return the caller's environment without its GIT_* variables.
+
+    Add a private Git configuration with merge.ff=only, and the fixture identity.
+    """
+    environment = fixture_git_environment(folder)
+    # Both live machines set merge.ff=only; the fixture keeps the same rule.
+    with Path(environment["GIT_CONFIG_GLOBAL"]).open("a", encoding="utf-8") as config:
+        _ = config.write("[merge]\n\tff = only\n")
+    return {**environment, **GIT_IDENTITY}
 
 
 def option(args: list[str], flag: str) -> str:
@@ -105,9 +116,7 @@ class VaultPullTests(unittest.TestCase):
         github = cls.template / "github.git"
         local = cls.template / "natedev"
         mac = cls.template / "mac"
-        with mock.patch.dict(os.environ, {
-            **GIT_IDENTITY, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(cls.template)),
-        }):
+        with mock.patch.dict(os.environ, vault_fixture_environment(cls.template), clear=True):
             _ = cls.command(["git", "init", "--bare", "--initial-branch=main", str(github)])
             _ = cls.command(["git", "init", "--initial-branch=main", str(local)])
             _ = (local / "shared.md").write_text("base\n")
@@ -125,10 +134,8 @@ class VaultPullTests(unittest.TestCase):
         self.mac = self.folder / "mac-host/rust/hanadocs"
         self.mac.parent.mkdir(parents=True)
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.folder), "BUILDLOG_PEER": "fixture-mac",
-            **GIT_IDENTITY,
-            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.folder)),
-        }))
+            **vault_fixture_environment(self.folder), "HOME": str(self.folder), "BUILDLOG_PEER": "fixture-mac",
+        }, clear=True))
         for name, destination in (("github.git", self.github), ("natedev", self.local), ("mac", self.mac)):
             _ = shutil.copytree(self.template / name, destination)
         for repository in (self.local, self.mac):
@@ -290,6 +297,28 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.git(self.github, "show", "main:from-mac.md"), "Mac")
         self.assertEqual(self.git(self.github, "show", "main:from-natedev.md"), "natedev")
 
+    def test_a_caller_git_variable_does_not_reach_the_fixture_commands(self) -> None:
+        folder = self.folder / "caller"
+        folder.mkdir()
+        caller = {"GIT_INDEX_FILE": str(folder / "index"), "GIT_DIR": str(folder / "repository.git")}
+        probe = VaultPullTests("test_a_mac_with_no_edits_fast_forwards_without_a_merge_commit")
+        with mock.patch.dict(os.environ, caller):
+            probe.setUp()
+            try:
+                self.assertFalse(set(caller) & set(os.environ))
+                self.assertIn("ff = only", Path(os.environ["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8"))
+                _ = probe.git(probe.local, "add", "shared.md")
+            finally:
+                probe.doCleanups()
+        self.assertFalse((folder / "index").exists())
+
+    def test_a_mac_with_no_edits_fast_forwards_without_a_merge_commit(self) -> None:
+        local = self.commit(self.local, {"from-natedev.md": "natedev\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.git(self.github, "rev-parse", "main"), local)
+
     def test_concurrent_github_edits_merge_in_the_natedev_object_store(self) -> None:
         _ = (self.mac / "mac.md").write_text("Mac\n")
         self.github_update = {"github.md": "GitHub\n"}
@@ -327,7 +356,7 @@ class VaultPullTests(unittest.TestCase):
     def test_open_mac_merge_files_a_conflict_question_without_changing_the_commit_or_file(self) -> None:
         local, mac = self.conflict()
         _ = self.git(self.mac, "fetch", "origin", "main")
-        merged = subprocess.run(["git", "-C", str(self.mac), "merge", "--no-edit", "origin/main"],
+        merged = subprocess.run(["git", "-C", str(self.mac), "merge", "--ff", "--no-edit", "origin/main"],
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(merged.returncode, 1)
         text = (self.mac / "shared.md").read_text()
@@ -585,7 +614,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
         self.assertIn("conflict", option(args, "--context"))
-        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.")
+        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, run `git -C ~/rust/hanadocs merge --ff origin/main`, then resolve the conflicting edits.")
         self.assertEqual([args[index + 1] for index, value in enumerate(args) if value == "--choice"], [
             "Combine the edits and commit the result. This keeps the wanted content from both copies.",
             "Choose one copy for each file and commit the result. This replaces the other copy's content."])

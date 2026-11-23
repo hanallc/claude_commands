@@ -78,6 +78,7 @@ BASELINE_FILE = "phase_baseline"
 BASELINE_STATUS_FILE = "progress_baseline_status"
 FILES_FILE = "files"
 WORKTREE_FILE = "worktree"
+MOVE_UNIT_HOME = "Move the unit home into the worktree model by the showrunner's order."
 AWAITING_FIRST_TOUCH = "enrolled_awaiting_first_touch"
 ACTIVE = "active"
 NOT_ENROLLED = "repository_not_enrolled"
@@ -411,6 +412,14 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     return KnownPhaseWorktree(root)
 
 
+def claimed_launch_directory(directory: Path, requested: Path) -> Path:
+    """Select a start directory in the claimed checkout for `assign_claude.run`, the only caller."""
+    if not ((directory / BASELINE_FILE).is_file() or (directory / WORKTREE_FILE).is_file()):
+        return requested
+    root = phase_worktree(directory).root.resolve()
+    return requested if requested.resolve().is_relative_to(root) else root
+
+
 class _ModelWorktreePath(NamedTuple):
     repo: str
     unit: str
@@ -430,7 +439,10 @@ def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
     return _ModelWorktreePath(repo, unit, short_name, model_path)
 
 
-def _require_model_worktree(root: Path, owner_unit: str) -> None:
+def _require_model_worktree(
+    root: Path, owner_unit: str, *,
+    fix: str = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>.",
+) -> None:
     from scripts.worktree import worktrees
 
     try:
@@ -450,7 +462,6 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
             raise ValueError(
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
     except (OSError, ValueError, worktrees.Refused) as error:
-        fix = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>."
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
@@ -520,20 +531,26 @@ class _RecordedCheckout(NamedTuple):
     available: bool
 
 
-def _recorded_checkout(directory: Path) -> _NoRecordedCheckout | _RecordedCheckout:
+def _recorded_checkout(directory: Path, home_root: Path) -> _NoRecordedCheckout | _RecordedCheckout:
     if not _has_recorded_checkout(directory):
         return _NoRecordedCheckout()
-    root = phase_worktree(directory).root.resolve()
+    override = directory / WORKTREE_FILE
+    root = Path(override.read_text(encoding="utf-8").strip()).resolve() if override.is_file() else home_root
     git_root = repository_root(root)
-    return _RecordedCheckout(root, model=isinstance(_model_worktree_path(root), _ModelWorktreePath),
-                             available=git_root is not None and git_root.resolve() == root)
+    available = git_root is not None and git_root.resolve() == root
+    # An empty folder can remain after checkout removal. The claim can replace it.
+    if (not available and root.is_relative_to(copy_record.worktree_root())
+            and root.is_dir() and any(root.iterdir())):
+        raise StateRefused(f"{root}: Git cannot read this path inside the worktree model")
+    return _RecordedCheckout(root, model=isinstance(_model_worktree_path(root), _ModelWorktreePath), available=available)
 
 
-def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argument: str | None) -> Path | None:
+def _record_claim_checkout(
+    directory: Path, requested: Path | None, home: _PhaseRunHome, *, repo_argument: str | None,
+) -> Path | None:
     """Select and record the checkout while the caller holds the phase lock."""
     replacing = False
-    require_model = False
-    match _recorded_checkout(directory), requested:
+    match _recorded_checkout(directory, home.root), requested:
         case _NoRecordedCheckout(), Path() as root:
             pass
         case _NoRecordedCheckout(), None:
@@ -544,7 +561,6 @@ def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argu
             pass
         case _RecordedCheckout(root=previous, model=False), Path() as root if root != previous:
             replacing = True
-            require_model = True
         case _RecordedCheckout(model=True, available=False), Path() as root:
             replacing = True
         case _RecordedCheckout(root=previous), _:
@@ -552,9 +568,8 @@ def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argu
                 raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout; recorded checkout is {previous}")
             raise StateRefused(f"{previous}: no usable checkout for this phase. Pass --repo with a valid checkout.")
 
-    home = _phase_run_home(directory)
-    is_home = root == home.root.resolve()
-    if require_model or not is_home:
+    is_home = root == home.root
+    if not is_home:
         _require_model_worktree(root, home.unit)
     if replacing:
         _require_checkout_move(directory)
@@ -1092,13 +1107,19 @@ def _claim_command(args: argparse.Namespace) -> int:
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
     repo_argument = cast(str | None, args.repo)
-    requested = repository_root(Path(repo_argument) if repo_argument is not None else WORKING_DIRECTORY)
+    start = Path(repo_argument) if repo_argument is not None else WORKING_DIRECTORY
     try:
+        unit, home_path = _phase_run_home(directory)
+        home = _PhaseRunHome(unit, home_path.resolve())
+        _require_model_worktree(home.root, home.unit, fix=MOVE_UNIT_HOME)
+        requested = repository_root(start)
         root = None
         if requested is not None or _has_recorded_checkout(directory):
             with phase_lock(directory):
-                root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None,
+                root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None, home,
                                               repo_argument=repo_argument)
+        if root is None and start.resolve().is_relative_to(copy_record.worktree_root()):
+            raise StateRefused(f"{start}: Git cannot read this path inside the worktree model")
     except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2

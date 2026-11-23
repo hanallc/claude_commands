@@ -39,6 +39,7 @@ from scripts.message.session_send_test_support import SEND_SETTINGS
 from scripts.review_links import for_you
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
@@ -680,8 +681,12 @@ class AdhocItemsTests(unittest.TestCase):
                         result.keep(item)
                 command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
                 result = subprocess.run(command, text=True, capture_output=True, check=True)
-                self.assertEqual(result.stdout, "Messages from the review\n\n"
-                    + "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
+                held_file = Path(directory) / ".local/state/adhoc_review/.holds/review-session.held.md"
+                header, entries = held_file.read_text(encoding="utf-8").split("\n\n", 1)
+                self.assertRegex(header, r"^Released at \d\d:\d\d:\d\d E[SD]T$")
+                self.assertEqual(result.stdout, review_hold.held_notice(2, held_file, header) + "\n")
+                self.assertEqual(entries,
+                    "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
                     + "2. Pat · build\n   Sent: 12:06 EST\n   Sender native id: codex:pat\n   Second report.\n")
                 self.assertEqual(result.stderr, "")
                 again = subprocess.run(command, text=True, capture_output=True, check=True)
@@ -709,14 +714,18 @@ class AdhocItemsTests(unittest.TestCase):
                     assert isinstance(result, review_hold.OpenReview)
                     result.keep(message)
                 command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
+                held_file = Path(directory) / ".local/state/adhoc_review/.holds/review-session.held.md"
                 payload = json.dumps({"session_id": "review-session", "source": "resume",
                                       "hook_event_name": "SessionStart"})
                 reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                header = held_file.read_text(encoding="utf-8").splitlines()[0]
+                self.assertRegex(header, r"^Released at \d\d:\d\d:\d\d UTC$")
                 self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": ("Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n"
-                                          + "   Sender native id: unavailable\n   A saved report."),
+                    "additionalContext": review_hold.held_notice(1, held_file, header),
                 }})
+                self.assertIn("1. Drew\n   Sent: 16:20 UTC\n   Sender native id: unavailable\n   A saved report.\n",
+                              held_file.read_text(encoding="utf-8"))
                 self.assertEqual(reply.stderr, "")
                 again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
                 self.assertEqual(again.stdout + again.stderr, "")
@@ -1348,7 +1357,7 @@ class CountsRowTests(ConfiguredShellTests):
                 path.unlink()
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
@@ -1388,7 +1397,7 @@ class CountsRowTests(ConfiguredShellTests):
     def test_each_count_in_the_row_is_bold_inside_its_fixture_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}

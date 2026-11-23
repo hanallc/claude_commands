@@ -12,6 +12,7 @@ from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test.config_test_support import MAC_RUN_SETTINGS
+from scripts.build_targets.target_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -103,7 +104,7 @@ trap observe_admission DEBUG
         _ = runner.write_text(routes.RUNNER)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n",
                                  defaults=MAC_RUN_SETTINGS)
         self.environment.update({

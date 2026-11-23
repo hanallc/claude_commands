@@ -28,6 +28,7 @@ import unittest
 from unittest import mock
 from urllib.request import Request
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
@@ -131,9 +132,7 @@ class HanaRunnerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = source_tests.HanaSourceTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, source_tests.HanaSourceTests())
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
                                  'loopback.command_timeout_s=600\n')
         self.root = self.fixture.root
