@@ -300,6 +300,7 @@ class PrivateReadings:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.host_path: Path = root / "meminfo"
+        self.pressure_path: Path = root / "pressure"
         self.counts: Counter[str] = Counter()
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
@@ -311,7 +312,7 @@ class PrivateReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host, policy=policy)
+        return gate.read_pressure(host, policy=policy, pressure_path=self.pressure_path)
 
     def build_space(self, floor: int) -> records.NoBuildSpaceHold:
         self.counts[f"build_space:{floor}"] += 1
@@ -675,7 +676,7 @@ class AdmissionFixture(ExitStack):
 
     def hold_starts(self, *, unreadable: bool = False) -> None:
         """Hold new starts without creating a running reservation."""
-        path = self.root / "pressure"
+        path = self.readings.pressure_path
         if unreadable:
             path.unlink()
         else:
