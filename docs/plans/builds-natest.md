@@ -1474,3 +1474,18 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/affected_modules.py`, its tests; `scripts/accounts/test_accounts.py` only if its scan needs a change.
 - **Workers:** the director (no-worker mode) or 1 writer; one fresh review.
 - **Acceptance gate:** a doc-only change selects fewer than 50 modules; a full gate passes (the change alters affected selection). Send builds three numbers (bob, 17:36): the CPU minutes of an affected run before the repair, the CPU minutes after it, and how many affected runs a day pay it.
+
+### Phase 444 — a test cannot read or write the live config that /tune writes  · status: todo
+**Depends on:** none (builds 17:11 PST: after item 191 work)
+
+#### Work Order
+- **Goal:** nate (17:11 PST, through builds): "Are you fixing the underlying issue for the tests erroring when the Mac goes away?" 9 tests in `build_queue/test_placement.py` read the live `mac_test` config and broke when bob tuned offload off. `conf.read`, `conf.read_or_repository` and `conf.sh` read `CONF_DIR`, else `~/.claude/config`, the live folder `/tune` writes. The test harness sets no `CONF_DIR`, so a module that does not set its own reads live values, and a test that writes config writes live (the `console.conf` leak is the same kind).
+- **Spec:**
+  1. `scripts/test_times/module_run.py` sets `CONF_DIR`, unless the environment already has it, to a copy of the tested checkout's `config/` in the module's runner folder. Every gate, affected and `--module` run starts each module through it.
+  2. A guard in the test startup (an audit hook) fails a test process that opens a file under the live `~/.claude/config`, with the line `test read the live config <path>: write the key in CONF_DIR`. Python tools that a test starts load the same startup, so the guard covers them.
+  3. One natedev run with the guard on lists each module that still reads live config. The list goes to resources' sweep; resources owns those fixes.
+  4. Tests: table rows in the `test_times` tests: a module without `CONF_DIR` reads the checkout copy; a module with its own `CONF_DIR` keeps it; a live read fails with the line.
+  5. A second kind follows in its own phase: a test that depends on a committed tunable value. A one-off run with an empty folder and no repository fallback lists those tests.
+- **Files:** `scripts/test_times/module_run.py`, the test startup in `scripts/lib/python_startup/`, their tests.
+- **Workers:** the director (no-worker mode) or 1 writer; one fresh review.
+- **Acceptance gate:** the changed modules and their direct importers pass; the guard run's list goes to resources; a full gate passes (every module runs under the new harness).
