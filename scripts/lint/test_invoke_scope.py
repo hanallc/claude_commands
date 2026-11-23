@@ -610,14 +610,7 @@ sweep_after_step test-step
                 # A read-write open does not wait for the reader; the line waits in the FIFO.
                 release_writer = os.open(release, os.O_RDWR)
                 _ = os.write(release_writer, b"go\n")
-                events = b""
-                while True:
-                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
-                    self.assertTrue(ready, "sweep stand-in still holds its pipe")
-                    chunk = os.read(reader, 4096)
-                    if not chunk:
-                        break
-                    events += chunk
+                events = self.read_until_closed(reader, deadline)
                 if switch == "1":
                     self.assertFalse((root / "runtime" / "lint-sweep").exists())
                 # systemd-cat inherits the events pipe, so it has ended with the pipe.
@@ -630,8 +623,22 @@ sweep_after_step test-step
                     _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
+    def read_until_closed(self, reader: int, deadline: float) -> bytes:
+        """Read the pipe until every writer closes it, or fail at the deadline."""
+        data = b""
+        while True:
+            ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
+            self.assertTrue(ready, "the sweep still holds its pipe")
+            chunk = os.read(reader, 4096)
+            if not chunk:
+                return data
+            data += chunk
+
     def forced_sweep_launches(self, state: str) -> str:
-        """Run a forced step, as verify.sh doc runs it, and return the commands its sweep starts."""
+        """Run a forced step, as verify.sh doc runs it, and return the commands its sweep starts.
+
+        The step carries the force both exported and as a call prefix, so the sweep sees both layers.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "runtime"
@@ -646,7 +653,7 @@ sweep_after_step test-step
             reader, writer = os.pipe()
             try:
                 command = ('source "$1"; run_once() { printf "%s\\n" "${2##*/}" >&"$SWEEP_TEST_FD"; }; '
-                           "sweep_after_step test-step")
+                           "LINT_CONFIG_FORCE=1 sweep_after_step test-step")
                 result = subprocess.run(
                     ("bash", "-c", command, "sweep-test", str(INVOKE)), cwd=root, capture_output=True,
                     text=True, check=False, pass_fds=(writer,), timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
@@ -658,15 +665,8 @@ sweep_after_step test-step
                 os.close(writer)
                 writer = -1
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                launches = b""
                 deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
-                while True:
-                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
-                    self.assertTrue(ready, "the background sweep still holds its pipe")
-                    chunk = os.read(reader, 4096)
-                    if not chunk:
-                        return launches.decode()
-                    launches += chunk
+                return self.read_until_closed(reader, deadline).decode()
             finally:
                 if writer >= 0:
                     os.close(writer)

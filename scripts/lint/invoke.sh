@@ -615,8 +615,9 @@ sweep_after_step() {
         done
         unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
         unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
-        # A gate forces its checks, not this upkeep sweep: sweep=off stops it.
-        unset LINT_CONFIG_FORCE
+        # A gate forces its checks, not this background sweep: sweep=off stops it.
+        # An assignment, not unset: unset can uncover an exported value below a call prefix.
+        LINT_CONFIG_FORCE=0
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
