@@ -1230,6 +1230,47 @@ class PageWindowTests(unittest.TestCase):
   check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Closing New item removes the copy.');
   check(document.activeElement===document.querySelector('[data-page-actions] [data-owner-new]'),
    'Focus returns to the New item button on the page.');
+  // On a phone, New item is taller than the view. It stays centered, and its height clears the copy.
+  Object.assign(frameElement.style,{width:'390px',height:'844px'});
+  await painted();
+  check(pressNewItem('at 390 px')!==null,'The press reaches New item at 390 px.');
+  await until(()=>dialog.open,'New item at 390 px');
+  await painted();
+  for(const [name,control] of [['Close',dialog.querySelector('[data-close]')],['The words box',words],['Send',send]])
+   check(onTop(control),'At 390 px the New item control is on top: '+name+'.');
+  const box=dialog.getBoundingClientRect();
+  check(Math.abs(box.top-(innerHeight-box.bottom))<1 && box.top>=actionsBottom(),
+   'At 390 px New item stays centered below the action area.');
+  // A picture load or a resize measures New item again. The measure keeps the scroll of its body.
+  const body=dialog.querySelector('.new-item-body');
+  body.scrollTop=1e4;
+  await painted();
+  const end=body.scrollTop;
+  check(end>0,'At 390 x 844 the New item body scrolls: '+end+'.');
+  document.dispatchEvent(new Event('load'));
+  dispatchEvent(new Event('resize'));
+  await painted();
+  check(body.scrollTop===end,'A picture load and a resize keep the scroll of the New item body: '+end+' became '+body.scrollTop+'.');
+  // On a desktop, the copy is beside New item, so New item keeps the place and the height of main.
+  Object.assign(frameElement.style,{width:'1440px',height:'900px'});
+  await painted();
+  const wide=dialog.getBoundingClientRect();
+  check(Math.abs(wide.top-(innerHeight-wide.bottom))<1 && getComputedStyle(dialog).maxHeight===(innerHeight-32)+'px'
+   && (Math.abs(wide.top-16)<1 || wide.height<innerHeight-32),
+   'At 1440 x 900 New item has the place and the height limit of main: '+JSON.stringify(wide));
+  dialog.querySelector('[data-cancel]').click();
+  // A 24-letter owner name makes the controls wider. At 900 px a 10-letter name does not meet New item; this one does.
+  document.querySelector('[data-page-actions] .page-owner-name').textContent='Review and console admin';
+  Object.assign(frameElement.style,{width:'900px',height:'700px'});
+  await painted();
+  check(pressNewItem('with a long owner name')!==null,'The press reaches New item with a long owner name.');
+  await until(()=>dialog.open,'New item with a long owner name');
+  await painted();
+  const long=dialog.getBoundingClientRect();
+  check(onTop(dialog.querySelector('[data-close]')) && long.top>=actionsBottom()
+   && Math.abs(long.top-(innerHeight-long.bottom))<1,
+   'With a long owner name at 900 px, Close is on top and New item stays centered below the action area.');
+  dialog.querySelector('[data-cancel]').click();
  }catch(error){failures.push(String(error));}
  await report();
 })();''')

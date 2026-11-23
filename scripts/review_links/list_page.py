@@ -1089,19 +1089,20 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
-[data-list-review-dialog]{position:fixed;inset:0;margin:var(--page-window-top,16px) auto auto;width:min(1060px,calc(100% - 48px));
+[data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
+width:min(1060px,calc(100% - 48px));
 max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
 background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
 [data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
 .list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
 font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 82px - var(--page-window-top,16px));border:0}
+max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
 :root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
 :root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
-[data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;border-radius:0;
-margin:var(--page-window-top,0px) 0 0}
+[data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
+border-radius:0;margin:var(--page-window-top,0px) 0 0}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}

@@ -5891,39 +5891,6 @@ window.fetch=async(url)=>{
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]])
 
-    def test_new_item_opens_above_the_record_window_and_its_screenshot_shows_the_window(self) -> None:
-        from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
-
-        if not WINDOW_BROWSERS:
-            self.skipTest('Chrome or Firefox is required for the window rule.')
-        owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
-        markup = page_frame.with_owner(browser_markup(self.root).encode(), 'review', owner,
-                                       staff.StaffSnapshot((owner,)), new_item_dialog.render)
-        probe = r'''
-(async()=>{
- if(nested) return;
- try{
-  await painted();
-  const dialog=document.querySelector('#record-item-dialog'),row=document.querySelector('[data-list-item]');
-  row.querySelector('.list-toggle').click();
-  await until(()=>dialog.open,'the record window');
-  await painted();
-  check(onTop(dialog.querySelector('[data-close]')),'The action area does not cover the record window Close button.');
-  check(dialog.getBoundingClientRect().top>=actionsBottom(),'The record window starts below the action area.');
-  check(pressNewItem('over the record window')!==null,'The press reaches New item.');
-  const capture=await newItemOver(dialog,'the record window');
-  check(new URLSearchParams(capture.place.split('#')[1] || '').get('item')===row.dataset.key,
-   'The screenshot address names the open item: '+capture.place);
-  await closeNewItem(dialog,'the record window');
-  await opensAgain(capture.place,doc=>doc.querySelector('#record-item-dialog')?.open===true,'the record window');
- }catch(error){failures.push(String(error));}
- await report();
-})();'''
-        page = markup.replace(b'</body>', b'<script>' + (WINDOW_PROBE + probe).encode() + b'</script></body>', 1)
-        for browser in WINDOW_BROWSERS:
-            with self.subTest(browser=browser):
-                self.assertEqual(window_probe_results({review_page.PAGE_PATH: page}, review_page.PAGE_PATH, browser), [[]])
-
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_owner_button_is_the_only_title_action(self) -> None:
         owner = replace(self.ready_submission_recipient(), name='Review and console delivery')

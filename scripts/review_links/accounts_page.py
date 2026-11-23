@@ -359,9 +359,9 @@ def _swatch(spans: list[accounts.BoardSpan]) -> str:
     css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
     background = f' style="background:{css}"' if css else ""
     key = html.escape(spans[0]["color_key"], quote=True)
-    return (f'<button type="button" class="color-swatch" data-color-key="{key}" data-window-place="color:{key}" '
+    return (f'<button type="button" class="color-swatch" data-color-key="{key}" '
             + f'data-color-name="{name}" data-saved-color="{css}"{background} '
-            + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+            + f'aria-label="Change {name} color" aria-haspopup="dialog" data-window-place="color:{key}"></button>')
 
 
 def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...],
@@ -1296,8 +1296,7 @@ function position(){
  if(!selected) return;
  const box=selected.getBoundingClientRect(), size=popup.getBoundingClientRect();
  popup.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
- const clear=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-window-top')) || 8;
- popup.style.top=Math.max(clear,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
+ popup.style.top=Math.max(8,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
 }
 // Every swatch and word of one key, such as units on each units row, shows one color.
 function swatches(key){return [...document.querySelectorAll('[data-color-key]')].filter(button=>button.dataset.colorKey===key);}

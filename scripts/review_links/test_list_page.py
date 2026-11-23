@@ -81,8 +81,11 @@ async function reviewCardPosition(card){
  const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
  const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
  const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
- return {top,left,main,height,requested,
-  resized:!frame || Math.abs(height-(fullscreen ? win.parent.innerHeight : Math.min(requested,win.parent.innerHeight-98)))<1,
+ // The cap is the view height under the top of the List box, less 82 px for the box parts around the frame.
+ const start=frame ? frame.closest('dialog').getBoundingClientRect().top : 0;
+ const cap=win.parent.innerHeight-start-(fullscreen ? 0 : 82);
+ return {top,left,main,height,requested,cap,
+  resized:!frame || Math.abs(height-(fullscreen ? cap : Math.min(requested,cap)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
   dark:win.matchMedia('(prefers-color-scheme:dark)').matches};
 }
@@ -123,8 +126,8 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
    before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
-  if(layout==='short') check(before.requested<win.parent.innerHeight-98,'The short card fits below the iframe height cap.');
-  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-(win.parent.innerHeight-98))<1,
+  if(layout==='short') check(before.requested<before.cap,'The short card fits below the iframe height cap.');
+  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-before.cap)<1,
    'The tall card reaches the iframe height cap.');
   if(layout==='phone') check(win.top.innerWidth===390 && win.frameElement.closest('dialog').hasAttribute('data-fullscreen'),
    'The phone card fills the List dialog at 390 pixels.');
@@ -1297,16 +1300,23 @@ async function inspect(){
  check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
+ // A top window starts at the bottom of the action area, or at the top of the view on a page without one.
+ const area=doc.querySelector('[data-page-actions]:not([data-page-window-actions])');
+ const clear=area ? Math.max(area.getBoundingClientRect().top,
+  ...[...area.children].map(control=>control.getBoundingClientRect().bottom)) : 0;
  if(phone){
   const box=dialog.getBoundingClientRect();
-  const top=listFrame?.getBoundingClientRect().top ?? box.top;
-  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.height-innerHeight)<=1 && top===0,
-   'The phone dialog fills the screen. '+JSON.stringify({width:innerWidth,height:innerHeight,box,top}));
+  const top=listFrame?.getBoundingClientRect().top ?? 0;
+  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.top-clear)<1 && Math.abs(box.bottom-innerHeight)<=1
+   && top===0,
+   'The phone dialog fills the screen below the action area. '
+   +JSON.stringify({width:innerWidth,height:innerHeight,box,top,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the phone width.');
  }else{
   const box=dialog.getBoundingClientRect();
-  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && box.top===16,
-   'The desktop dialog is centered horizontally and starts 16 pixels from the top.');
+  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && Math.abs(box.top-clear-16)<1,
+   'The desktop dialog is centered horizontally and starts 16 pixels below the action area. '
+   +JSON.stringify({box,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
  if(short && !direct){

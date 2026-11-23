@@ -141,7 +141,10 @@ justify-content:flex-end;align-items:flex-start;gap:8px;max-width:100%;margin-bo
 # A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
 # The window rule: while a page window (a modal dialog) is open, the rest of the page is inert.
 # Thus each open window gets a copy of the action area at the same place, above the window.
-# The window keeps the copy until it closes. --page-window-top tells windows where to start below it.
+# The window keeps the copy until it closes. When a window meets the controls from left to right,
+# the frame sets --page-window-top on it to the bottom of the action area. A centered window limits
+# its height with it, so it stays centered and clears the copy. A window at the top starts below it.
+# Without the value, each window has the place and the height of main.
 # A screenshot address names the open window, so the capture shows the page as the user sees it.
 ACTIONS_SCRIPT = """<script>
 function stickyPageStatusHeight(){
@@ -219,13 +222,30 @@ function measurePageActions(){
   dialog.addEventListener('close',()=>button.focus({preventScroll:true}),{once:true});
   dialog.showModal();
  });
- function place(){
+ // A scroll does not change the left and right edges, so it only moves the copy and the value (measure=false).
+ function place(measure=true){
   if(!windows.length) return;
   const home=pageActionsArea();
   if(!home) return;
-  const box=home.getBoundingClientRect();
-  for(const {copy} of windows) Object.assign(copy.style,{top:box.top+'px',left:box.left+'px',width:box.width+'px'});
-  root.style.setProperty('--page-window-top',pageActionsBox(home).bottom+pageActionsSpace()+'px');
+  const box=home.getBoundingClientRect(), area=pageActionsBox(home);
+  for(const entry of windows){
+   const {dialog,copy}=entry;
+   Object.assign(copy.style,{top:box.top+'px',left:box.left+'px',width:box.width+'px'});
+   if(measure){
+    // The window gets the value only where its parts meet the controls from left to right.
+    const meets=()=>[...dialog.children].some(part=>{
+     const edges=part.getBoundingClientRect();
+     return part!==copy && edges.width>0 && edges.left<area.right && edges.right>area.left;
+    });
+    // The value only makes parts narrower, because the zoom image follows its height limit.
+    // Thus a window that meets with the value also meets without it.
+    // Remove the value only when the window does not meet with it, so a measure keeps the scroll of the window.
+    entry.meets=meets() || (dialog.style.getPropertyValue('--page-window-top')!==''
+     && (dialog.style.removeProperty('--page-window-top'),meets()));
+   }
+   const value=entry.meets ? area.bottom+'px' : '';
+   if(dialog.style.getPropertyValue('--page-window-top')!==value) dialog.style.setProperty('--page-window-top',value);
+  }
  }
  document.addEventListener('beforetoggle',event=>{
   const dialog=event.target, home=pageActionsArea();
@@ -241,15 +261,20 @@ function measurePageActions(){
    windows.push({dialog,copy,place:launcher ? launcher.dataset.windowPlace ?? launcher.getAttribute('href') : ''});
    // The copy comes last, so the window keeps its own first focus.
    dialog.append(copy);
-   place();
+   // The window has its box only after it opens. The measure runs before the browser shows it.
+   queueMicrotask(place);
   }else if(index>=0){
    windows.splice(index,1)[0].copy.remove();
-   if(windows.length) place();
-   else root.style.removeProperty('--page-window-top');
+   dialog.style.removeProperty('--page-window-top');
+   place();
   }
  },true);
- addEventListener('resize',place);
- addEventListener('scroll',place,{passive:true});
+ // The edges change only when a window opens or closes, the view or the area changes size, or a picture loads.
+ // The width of each window follows only these, so no observer of the window is necessary.
+ addEventListener('resize',()=>place());
+ addEventListener('scroll',()=>place(false),{passive:true});
+ // A picture in a window gets its width when it loads.
+ document.addEventListener('load',()=>place(),true);
  window.pageCapturePlace=(except)=>{
   const address=location.pathname+location.search+location.hash;
   const shown=windows.filter(entry=>entry.dialog!==except && entry.dialog.open).at(-1)?.place;
@@ -586,8 +611,9 @@ def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
 
 CONSOLE_DIALOG_STYLE = '''
 [data-console-dialog] {
- position: fixed; inset: var(--page-window-top, 0px) 0 0; box-sizing: border-box; margin: auto; padding: 0;
- width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px - var(--page-window-top, 0px));
+ position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
+ width: min(560px, calc(100vw - 32px)); max-width: none;
+ max-height: calc(100dvh - 2 * max(16px, var(--page-window-top, 16px)));
  color: var(--ink, #f0efec); background: var(--card, #1a1a19); border: 1px solid var(--line, #34332f);
  border-radius: 12px; box-shadow: 0 20px 60px #0006; overflow: hidden;
  font: 15px/1.45 system-ui, sans-serif;
@@ -596,7 +622,7 @@ CONSOLE_DIALOG_STYLE = '''
 [data-console-dialog] [hidden] { display: none; }
 [data-console-dialog]::backdrop { background: #0009; }
 .console-dialog-frame { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; margin: 0;
- max-height: calc(100dvh - 34px - var(--page-window-top, 0px)); }
+ max-height: calc(100dvh - 2px - 2 * max(16px, var(--page-window-top, 16px))); }
 .console-dialog-frame > :is(header, footer) { padding-inline: 24px; }
 .console-dialog-frame > header {
  display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-block: 20px 16px;
@@ -724,12 +750,11 @@ ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
 [data-image-zoom]{cursor:zoom-in}
 [data-image-zoom-dialog]{position:fixed;inset:0;box-sizing:border-box;width:100vw;height:100dvh;
-max-width:none;max-height:none;margin:0;padding:var(--page-window-top,16px) 16px 16px;border:0;background:#000d;
-outline:none;overflow:hidden}
+max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;outline:none;overflow:hidden}
 [data-image-zoom-dialog][open]{display:grid;place-items:center}
 [data-image-zoom-dialog]::backdrop{background:transparent}
 [data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;
-max-height:calc(100dvh - 16px - var(--page-window-top,16px));
+max-height:calc(100dvh - 2 * max(16px, var(--page-window-top, 16px)));
 border:0;border-radius:0;cursor:zoom-out}
 '''
 

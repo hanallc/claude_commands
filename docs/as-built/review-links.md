@@ -221,15 +221,29 @@ These are the windows:
 1. The picture zoom window in `page_frame.py`.
 2. The New item window in `new_item_dialog.py`.
 3. The List review box in `list_page.py`.
-4. The record window of the shared record table in `record_table.py`.
-5. The Accounts color picker in `accounts_page.py`.
+4. The Accounts color picker in `accounts_page.py`.
 A modal dialog makes the rest of the page inert, and a popover shown after it is also inert.
 Thus the frame adds a copy of the action area to each window when the window starts to open (`beforetoggle`).
 The copy is the last child of the window, at the same place as the area, and the window removes it when it closes.
 The copy has the same labels as the area. It has no `id` attributes.
 The controls in the copy have no plate and no edge, so each part of the copy that shows is a control.
 The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
-Each window starts below the area: the frame sets `--page-window-top` while a window is open.
+A window meets the action area when a part of the window and the controls of the area overlap from left to right.
+While a window meets the area, the frame sets `--page-window-top` on it to the bottom of the action area.
+The frame measures each open window at these times:
+- when the window opens, and when another window closes,
+- when the view or the action area changes size,
+- when a picture loads.
+It measures first with the current value. A window that meets with the value keeps it, so the measure keeps the scroll of the window.
+Only when the window does not meet with the value, the frame removes it and measures again.
+This second measure is necessary for the zoom image, because its width follows its height limit.
+A scroll does not change the left and right edges. On a scroll, the frame moves the copy and sets the value again only when it changes.
+A centered window stays centered on both axes.
+Its maximum height is `100dvh - 2 * max(16px, --page-window-top)`, so a tall window that meets the area clears the copy.
+New item, the other console dialogs and the picture zoom image use this limit.
+A window that does not meet the area has no value, so it keeps the place and the height limit of main.
+The Accounts color picker keeps its place next to its swatch, and the copy covers none of its controls.
+The List review box is placed at the top of the view, so it starts below the action area.
 The keyboard reaches the copy in the window: press Tab after the last control of the window.
 Escape, the backdrop and the focus return of each window do not change.
 New item opened over another window opens above it.
@@ -698,7 +712,7 @@ The screenshot shows the page as the user sees it, with the window under New ite
 NAME is the `data-window-place` value or the `href` of the control that opened the window.
 When the page loads, the frame removes the parameter from the address and clicks that control again.
 A link that the frame clicks again does not move the page.
-The record window keeps its own place in the address (`item=`).
+A Review or List row that is open keeps its own place in the address (`item=`).
 The dialog keeps **Send** available while it takes the screenshot.
 Send uses page data if the preview is still pending.
 Send saves the capture intent with the native item and links the List draft to it.
@@ -1320,9 +1334,10 @@ A Validating card lets the user ask the validator a question.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
+The dialog reaches the right edge of the List column, so it meets the action area and starts below it (`--page-window-top`).
 At the console's phone breakpoint, the dialog fills the screen below the action area, including on the direct List page.
-On a desktop, the List centers the dialog horizontally. Its top is at `--page-window-top`, 8 px below the action area.
-When no action area is set, the top is 16 px.
+On a desktop, the List centers the dialog horizontally, 16 px below the action area.
+On a page without an action area, the phone dialog fills the screen and the desktop dialog is 16 px from the top.
 The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
@@ -1706,8 +1721,8 @@ Each card shows, in this order:
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
-It fits the view below the action area and never exceeds the image's natural size.
-Its top margin is `--page-window-top`, 8 px below the action area, and the other margins are 16 px.
+It fits the view with a 16px margin and never exceeds the image's natural size.
+When the image meets the action area, its height also clears the copy, and the image stays centered.
 Escape or a click on the backdrop or image closes it.
 The page keeps its scroll position and returns focus to the image link.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
