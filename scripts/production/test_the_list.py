@@ -345,7 +345,7 @@ key = args[args.index("--key") + 1]
 to = args[args.index("--to") + 1]
 with attempted.open("a") as stream:
     stream.write(json.dumps(args) + "\n")
-if "Slow notice" in args[-1] and key.endswith(":owner_start"):
+if ("Slow notice" in args[-1] or "Accepted notice" in args[-1]) and key.endswith(":owner_start"):
     lock = log.with_name("sender-child.lock")
     program = (
         "import fcntl, sys, time\n"
@@ -354,9 +354,12 @@ if "Slow notice" in args[-1] and key.endswith(":owner_start"):
         "    print('ready', flush=True)\n"
         "    time.sleep(10)\n"
     )
-    with subprocess.Popen([sys.executable, "-c", program, str(lock)], stdout=subprocess.PIPE,
-                          start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as child:
-        assert child.stdout.readline() == b"ready\n"
+    command = [sys.executable, "-c", program, str(lock)]
+    child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                             start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1")
+    assert child.stdout.readline() == b"ready\n"
+    child.stdout.close()
+    if "Slow notice" in args[-1]:
         child.wait()
 if ("Orphan sender" in args[-1] or "Exited sender" in args[-1]) and key.endswith(":owner_start"):
     program = (
@@ -389,7 +392,7 @@ if "Lose receipt" in args[-1] and key.endswith(":producer_start"):
     sys.exit(3)
 if to == "user":
     print("KEPT: held during silence")
-elif key.endswith(":owner_start"):
+elif key.endswith(":owner_start") and "Accepted notice" not in args[-1]:
     print("QUEUED: owner is offline")
     sys.exit(1)
 else:
@@ -514,9 +517,9 @@ else:
                     self.assertIs(changed.state, the_list.ItemState.WORKING)
                     self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
 
-            for case in ("interrupted owner", "slow notice", "scan resume", "overlapping runs",
+            for case in ("interrupted owner", "slow notice", "accepted notice", "scan resume", "overlapping runs",
                          "same check", "state changed", "all confirmations", "pending instruction",
-                         "Mac", "orphan sender", "exited sender"):
+                         "reopened", "Mac", "orphan sender", "exited sender"):
                 with self.subTest(case=case):
                     for path in (sent, attempted):
                         _ = path.write_text("")
@@ -524,14 +527,16 @@ else:
                     match case:
                         case "interrupted owner":
                             self.check_scheduled_instruction_interrupt(attempted)
-                        case "slow notice":
-                            self.check_slow_scheduled_notice(sent, attempted)
+                        case "slow notice" | "accepted notice":
+                            self.check_slow_scheduled_notice(sent, attempted, accepted=case == "accepted notice")
                         case "scan resume":
                             self.check_scheduled_scan_resumes(sent)
                         case "overlapping runs" | "same check" | "state changed":
                             self.check_overlapping_scheduled_runs(sent, attempted, case)
                         case "all confirmations" | "pending instruction":
                             self.check_manual_run_settlement(attempted, pending_instruction=case == "pending instruction")
+                        case "reopened":
+                            self.check_reopened_run_settlement(attempted)
                         case "Mac":
                             self.check_mac_scheduled_run(attempted)
                         case "orphan sender" | "exited sender":
@@ -569,10 +574,10 @@ else:
         self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows],
                          ["producer_start", "user_timeout", "producer_timeout"])
 
-    def check_slow_scheduled_notice(self, sent: Path, attempted: Path) -> None:
+    def check_slow_scheduled_notice(self, sent: Path, attempted: Path, *, accepted: bool) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")
         changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
-        slow = self.add("Slow notice", changes=changes)
+        slow = self.add("Accepted notice" if accepted else "Slow notice", changes=changes)
         later = self.add("Later item", changes=changes)
         with redirect_stderr(io.StringIO()) as errors:
             the_list.fire_scheduled(UPKEEP_INTERVAL)
@@ -582,7 +587,16 @@ else:
         rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
         self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
         done = the_list.load(MORTY.id, slow.id)
-        self.assertIn("Delivery uncertain for owner start", str(done.log[-1].what))
+        if accepted:
+            self.assertIn("sender group timed out after the sender exited", errors.getvalue())
+            run = done.run_deliveries[0]
+            self.assertEqual(run.notices[0], the_list.ScheduledNotice(the_list.RunNotice.OWNER_START,
+                                                                     the_list.NoticeState.ACCEPTED))
+            self.assertEqual(done.log[run.log_index].what,
+                             f"Scheduled run due {START.isoformat()}. Instruction sent. Waiting for confirmation.")
+            self.assertNotIn("Delivery uncertain", "\n".join(str(entry.what) for entry in done.log))
+        else:
+            self.assertIn("Delivery uncertain for owner start", str(done.log[-1].what))
         for item in (slow, later):
             self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
         the_list.fire_scheduled(UPKEEP_INTERVAL)
@@ -745,6 +759,37 @@ the_list.fire_scheduled(timedelta(minutes=2))
             with patch.object(the_list, "now", return_value=tick + wait):
                 the_list.fire_scheduled(UPKEEP_INTERVAL)
         self.assertEqual(attempted.read_text(), sends)
+
+    def check_reopened_run_settlement(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        item = self.add("Reopened run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (patch.object(the_list, "_deliver_scheduled_notice", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(self.command("close", "--id", item.id, "--words", "Close this item.", "--source", "nate"),
+                         (0, "", ""))
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        self.assertIs(closed.run_deliveries[0].confirmation, the_list.AwaitingInstruction.OWNER)
+
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        instructed = the_list.load(MORTY.id, item.id)
+        run = instructed.run_deliveries[0]
+        deadline = START + timedelta(minutes=2)
+        self.assertEqual(run.confirmation, the_list.AwaitingConfirmation(deadline))
+        self.assertEqual(self.command("reopen", "--id", item.id, "--source", "nate"), (0, "", ""))
+        reopened = the_list.load(MORTY.id, item.id)
+        self.assertIs(reopened.state, the_list.ItemState.NEW)
+        self.assertEqual(reopened.run_deliveries, ())
+        self.assertEqual(reopened.log[run.log_index].what,
+                         f"Scheduled run due {START.isoformat()}. Settled by a manual state change.")
+        self.assertEqual(reopened.log[-1].what, the_list.Reopened())
+
+        sends = attempted.read_text()
+        with patch.object(the_list, "now", return_value=deadline):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sends)
+        self.assertEqual(the_list.load(MORTY.id, item.id), reopened)
 
     def check_mac_scheduled_run(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")

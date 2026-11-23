@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryFile
 from time import monotonic
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1803,6 +1804,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             return UnchangedEdit(item)
         moment = now()
         changed = edit(item, moment)
+        if changed.state is not item.state:
+            changed = _settle_run_confirmations(changed, moment)
         entries: list[ItemChange] = []
         schedule_changed = _schedule_fields(item.schedule) != _schedule_fields(changed.schedule)
         if changed != item or schedule_changed:
@@ -2192,7 +2195,7 @@ def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNoti
 
 
 # Adopt and reap children that remain in the sender group after the sender exits.
-_WAIT_FOR_SENDER_GROUP = """import os
+_WAIT_FOR_SENDER_GROUP = r"""import os
 import signal
 import subprocess
 import sys
@@ -2202,13 +2205,15 @@ from scripts.lib.descendants import adopt_descendants
 
 if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN or not adopt_descendants():
     sys.exit("cannot reap the sender group")
-status = subprocess.call(sys.argv[1:])
+report = int(sys.argv[1])
+status = subprocess.call(sys.argv[2:])
+os.write(report, f"{status} {os.fstat(1).st_size} {os.fstat(2).st_size}\n".encode())
+os.close(report)
 while True:
     try:
         os.waitpid(0, 0)
     except ChildProcessError:
         break
-sys.exit(status if status >= 0 else 128 - status)
 """
 
 
@@ -2216,22 +2221,36 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
     budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
     deadline = monotonic() + budget
     sender = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
-    # Kill the group at the deadline even if the sender would exit on TERM.
-    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
-               _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), *sender]
-    # Keep the sender's delivery children in the same process group.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                          errors="replace", start_new_session=True,
-                          env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
-        try:
-            stdout, stderr = child.communicate(timeout=max(0, deadline - monotonic()))
-        except BaseException:
-            with suppress(ProcessLookupError):
-                process_group.send_process_group(child.pid, signal.SIGKILL)
-            raise
-    if child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL):
-        raise ListError("message delivery timed out")
-    attempt = send_result.send_outcome(child.returncode, stdout)
+    # Keep the sender output available even if a child keeps its descriptors open.
+    with TemporaryFile() as report, TemporaryFile() as output, TemporaryFile() as errors:
+        command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
+                   _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), str(report.fileno()), *sender]
+        timed_out = False
+        with subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True,
+                              pass_fds=(report.fileno(),), env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
+            try:
+                _ = child.wait(timeout=max(0, deadline - monotonic()))
+            except BaseException as error:
+                with suppress(ProcessLookupError):
+                    process_group.send_process_group(child.pid, signal.SIGKILL)
+                if not isinstance(error, subprocess.TimeoutExpired):
+                    raise
+                timed_out = True
+        timed_out = timed_out or child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL)
+        _ = report.seek(0)
+        receipt = report.readline()
+        _ = output.seek(0)
+        _ = errors.seek(0)
+        if not receipt.endswith(b"\n"):
+            if timed_out:
+                raise ListError("message delivery timed out")
+            raise ListError(errors.read().decode("utf-8", "replace").strip() or "the sender did not report its result")
+        status, output_size, error_size = map(int, receipt.split())
+        stdout = output.read(output_size).decode("utf-8", "replace")
+        stderr = errors.read(error_size).decode("utf-8", "replace")
+    if timed_out:
+        print(f"the_list: {identity}: {notice}: sender group timed out after the sender exited", file=sys.stderr)
+    attempt = send_result.send_outcome(status, stdout)
     if (isinstance(attempt, send_result.ConfirmedSendOutcome)
             and attempt.header.outcome in {"sent", "queued", "kept", "skipped", "replaced"}):
         return
@@ -2495,8 +2514,6 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
             _require_schedule_scope(item.schedule, schedule_scope)
         if changed.state is ItemState.SCHEDULED:
             changed = replace(changed, parked_until=NoTimestamp.UNSET)
-        if changed.state is not item.state:
-            changed = _settle_run_confirmations(changed, moment)
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
@@ -2631,9 +2648,8 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         answered = tuple(question for question in item.questions if question.answer is not None)
         closed_questions = tuple(ItemChange(moment, QuestionClosed(question), source)
                                  for question in item.questions if question.answer is None)
-        changed = replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
-                          questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
-        return _settle_run_confirmations(changed, moment)
+        return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
+                       questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
 
     def close_event(changed: ListItem) -> FieldChange:
         if changed.state is not ItemState.CLOSED:

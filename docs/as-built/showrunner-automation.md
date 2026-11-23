@@ -617,7 +617,8 @@ Use `all` to change or remove the series.
 Use `--repeat ''` to remove the repeat and keep the pending run.
 Supply a new start if the pending start is in the past.
 Use scoped `update --state Working`, `park`, or `close` to remove a repeat schedule.
-A state update settles all runs awaiting confirmation and clears their deadlines in one save.
+A manual state change, including reopening, settles all runs awaiting confirmation in one save.
+The same save clears their deadlines.
 Runs awaiting the owner instruction keep their delivery state.
 The next run stays scheduled.
 The record keeps its earlier log entries when the schedule changes or ends.
@@ -630,6 +631,7 @@ If the scan reaches its time limit, the next check starts after the last item it
 Delivery has separate time limits for a notice, an item, and the whole check.
 The watchdog keeps the sender group's deadline after upkeep or the sender exits.
 It stays active until the sender group exits or the deadline expires.
+The List reports a group timeout separately from the sender's result.
 
 On the first check at or after the start, the List saves the run and sets the item to Working.
 The owner receives the instruction. The producer receives a copy.
