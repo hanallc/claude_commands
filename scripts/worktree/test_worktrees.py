@@ -3025,29 +3025,21 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.environment.update({"PATH": str(bin_dir) + os.pathsep + self.environment["PATH"],
                                  "LINT_SWEEP_STATE_DIR": str(state)})
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
-        host = host_name()
-        _ = write_config_fixture(config, f"roots.slot_cargo.{host}={cargo_root}\nroots.cargo_paths.{host}={mirror}\n"
-            + f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
+        _ = write_config_fixture(config, f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
             + f"roots.workspace={self.root / 'worktrees'}\n")
         return tree, build
 
-    def test_landed_worktree_lists_its_external_cargo_output(self) -> None:
+    def test_landed_legacy_worktree_reports_only_its_checkout(self) -> None:
+        # The old Cargo mirror keys are gone, so its output is no longer found or listed.
         tree, build = self.landed_cargo_worktree()
         file = build / "debug/deps/libportable-1234567890abcdef.rlib"
         file.parent.mkdir(parents=True)
         _ = file.write_text("build output")
-        self.assertEqual(self.finish_landed(reviewed=(build, tree)),
+        self.assertEqual(self.finish_landed(reviewed=(tree,)),
                          [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
         self.assertEqual(file.read_text(), "build output")
-        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
-
-    def test_landed_worktree_reports_an_empty_external_output(self) -> None:
-        tree, build = self.landed_cargo_worktree()
-        build.mkdir()
-        self.assertEqual(self.finish_landed(reviewed=(build, tree)),
-                         [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
-        self.assertTrue(build.is_dir())
         self.assertTrue(tree.is_dir())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
 
     def test_worktree_removal_keeps_unassigned_outputs(self) -> None:
         tree, default = self.landed_cargo_worktree()
