@@ -242,7 +242,7 @@ When the family is not known, any unresolved family refusal blocks the destinati
 The producers use their `[producers]` rows.
 Unit directors and showrunners use `director` and `showrunner` in `[production.claude]`.
 Producers on two families, or an unreadable setting, give an unknown family.
-Automatic group moves and their next-move target checks use the group's family.
+Automatic group moves, their next-move target checks and group completion use the group's family.
 Codex selection also checks allowance and whether `codex_credit_accounts` lets the account spend credits.
 
 `_exec_codex_account()` serves both `codex` and numbered Codex aliases.
@@ -384,7 +384,7 @@ Its schedule history is `~/.local/state/agent-notes/group-completion/completed.j
 Natedev is the only authority on which groups a machine may complete.
 Each natedev refusal pass that is not a dry run or a proof writes `~/.local/state/accounts/completion_plan.json`.
 The plan holds the pass time `at` and, for each permitted group, `target`, `cause`, `why` and `selected_at`.
-The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal.
+The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal for the group's model family.
 Legacy selections stay natedev's job, because natedev upgrades them in the role map.
 `accounts completion-plan-read` prints the plan on natedev, and the Mac reads it through the role map ssh transport.
 The Mac pass first reads its local group members and stops before ssh when no member is live.

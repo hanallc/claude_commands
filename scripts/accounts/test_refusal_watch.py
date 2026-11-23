@@ -1471,6 +1471,22 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(plan, refusal_watch.CompletionPlan(NOW, {"showrunners": refusal_watch.PlannedCompletion(
             "claude3", "by hand", "complete showrunners move to claude3", NOW - timedelta(minutes=5))}))
 
+    def test_completion_plan_drops_only_the_group_whose_family_the_target_refused(self) -> None:
+        self.write_models()
+        path = self.groups()
+        _ = path.write_text(json.dumps({"units": self.selection("claude3"), "showrunners": self.selection("claude3"),
+                                        "producers": self.selection("claude3")}))
+        refusals.write_refusal(refusals.AccountRefusal("claude", TARGET_LOGIN, refusals.KnownWindow("weekly"),
+            refusals.KnownReset(NOW + timedelta(days=2)), REFUSAL_AT, refusals.ModelFamily("fable")))
+
+        _ = refusal_watch.run(NOW, recover_units=False)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(accounts.main(["completion-plan-read"]), 0)
+
+        plan = refusal_watch.decode_completion_plan(output.getvalue())
+        self.assertEqual(sorted(plan.groups), ["showrunners", "units"])
+
     def test_plan_save_errors_do_not_stop_the_natedev_pass(self) -> None:
         path = self.groups()
         _ = path.write_text(json.dumps({"units": self.selection("claude1"), "showrunners": self.selection("claude3")}))
