@@ -80,12 +80,16 @@ def source_stamp(path: str) -> SourceStamp | MissingSource:
     return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
 
 
+def module_attributes(module: ModuleType) -> dict[str, object]:
+    """Read the attributes of a module without executing a lazy module."""
+    return cast(dict[str, object], object.__getattribute__(module, "__dict__"))
+
+
 def module_source_path(module: object) -> str:
     """Read the source path without executing a lazy module."""
     if not isinstance(module, ModuleType):
         return ""
-    attributes = cast(dict[str, object], object.__getattribute__(module, "__dict__"))
-    path = attributes.get("__file__")
+    path = module_attributes(module).get("__file__")
     return path if isinstance(path, str) else ""
 
 
@@ -103,6 +107,9 @@ class LoadedSources:
     A tree update between two calls leaves old modules in sys.modules while a lazy
     import reads a new file, and the two versions need not fit. A changed source
     drops every tracked module, so the next call imports one consistent tree.
+    A namespace package has no source file, so it stays loaded; the drop also
+    removes each dropped module from its parent, or `from package import module`
+    returns the old module.
     """
 
     def __init__(self) -> None:
@@ -130,6 +137,10 @@ class LoadedSources:
         for name, module in list(sys.modules.items()):
             if name != "__main__" and module_source_path(module) in self.stamps:
                 del sys.modules[name]
+                parent, _, child = name.rpartition(".")
+                package = sys.modules.get(parent)
+                if isinstance(package, ModuleType) and module_attributes(package).get(child) is module:
+                    del module_attributes(package)[child]
         programs.clear()
         self.stamps.clear()
         importlib.invalidate_caches()
