@@ -891,10 +891,10 @@ A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
-The table has two swatch columns without a heading.
+The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
 The role swatch column is between **role** and **next**.
-All named headers sort on click or Enter.
+Select a named header or press Enter to sort.
 The dot and swatch headers have no sort control.
 The arrow sits before a right-aligned label and after a left-aligned label.
 The arrow uses the column gap without adding to the table width.
@@ -958,6 +958,10 @@ It refuses a clear for an empty group.
 The cell then shows the next queued target, or `none`.
 Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
+
+The Roles table has a `next` column after **account**.
+It shows the same target, `none`, `auto` or `unavailable` as text, without a button.
+A role with no selected account shows a dash.
 A failed move shows `<group>: <reason>` in the status line.
 Codex workers keep their own moves; the menu shows no Codex account.
 
@@ -991,7 +995,10 @@ A filter that hides the row closes it.
 If the row closes with an action result, the page notice keeps the result until the row opens again or a new action starts.
 The footer gets fresh counts from the other pages on each refresh.
 The List discards a result if a newer snapshot has replaced its source.
-The log uses the page scroll.
+The open row's log scrolls in its own area.
+On a desktop, the log ends with the details beside it.
+On a narrow page, the log is at most `list_log_max_height_rem` tall, which each render reads.
+A refresh, a save result, a sort or a filter change keeps the log's first visible entry at the same place.
 Opening a List item leaves its unread state unchanged.
 After a lost Park or Remove reply, The List reads the current row state.
 A confirmed Park or Remove collapses the row.
@@ -1443,7 +1450,6 @@ An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
 A refresh retains the search text, selection, focus, open item, and filters.
-The dialog keeps its own scroll position.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.

@@ -42,7 +42,7 @@ from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_count
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
@@ -171,7 +171,7 @@ class RecordTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
             name: value
-            for name, value in os.environ.items()
+            for name, value in memory_gate_shell_environment().items()
             if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.production.staff_test_support import foreign_hostname
 
 import json
@@ -48,10 +49,7 @@ def build(record_id: str, seconds: float, **fields: object) -> Record:
 
 
 def moment_fixture(test: unittest.TestCase) -> MomentTests:
-    fixture = MomentTests(methodName="runTest")
-    test.addCleanup(fixture.doCleanups)
-    fixture.setUp()
-    return fixture
+    return set_up_fixture(test.addCleanup, MomentTests(methodName="runTest"))
 
 
 def read_only_cli(test: unittest.TestCase, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -76,9 +74,7 @@ class MomentTests(unittest.TestCase):
         # Reuse the p50 fixtures, including index, timezone and log isolation.
         self.journal = memory_fixtures.isolated_journal(self)
         self.configured_moments = moments.MOMENTS
-        self.fixture = report_fixtures.PowerProfileTests(methodName="runTest")
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, report_fixtures.PowerProfileTests(methodName="runTest"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_PROGRESS_DIR": str(self.fixture.root / "progress"),
         })))
