@@ -269,6 +269,7 @@ class ScratchGuardTests(unittest.TestCase):
             (f"cargo new --name x /tmp/claude/{self.name}", f"{os.path.realpath('/tmp/claude')}/{self.name}"),
             ("mktemp -d", f"{self.temp}/tmp.XXXXXXXXXX"),
             ("tar -xzf a.tgz -C ~/rust", f"{rust}/(archive entries)"),
+            ("git clone x ~/rust/repro/cargo-liner-C54-demo", f"{rust}/repro"),
         ]:
             self.assert_refused(command, folder)
 
@@ -280,7 +281,6 @@ class ScratchGuardTests(unittest.TestCase):
         for command in [
             "mkdir -p /tmp/claude-1000/-home-x/session/scratchpad/copy",
             "mkdir -p /tmp/claude/unit/abc /tmp/claude/delegate/abc /tmp/claude/scratch/run-x",
-            "git clone x ~/rust/repro/cargo-liner-C54-demo",
             f"make_a_worktree hana ~/rust/{self.name}",
             "mkdir -p ~/rust/hana/target/sub",
             "mktemp -d -p /tmp/claude-1000/-home-x/session/scratchpad",

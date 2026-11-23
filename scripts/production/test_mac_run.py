@@ -402,7 +402,6 @@ class MacRunTests(unittest.TestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "COPIES_CONFIG": str(copies_config),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
