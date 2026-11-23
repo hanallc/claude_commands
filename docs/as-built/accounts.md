@@ -827,6 +827,8 @@ Account and role changes preserve these boundaries:
 The Tokens table appears below Models on the Accounts page.
 It shows each token's purpose, end date, days left, and state.
 The page uses the user's time zone and shows the renewal steps below the table.
+Each token's steps are closed by default under a **Renew `<name>`** or **Replace the token on the Mac** summary.
+A click on the summary opens the steps.
 Set a GitHub token's end date with `/tune showrunners token_expiry.<name>.ends <YYYY-MM-DD>`.
 The page warns during a reminder window and marks expired tokens as errors.
 The table includes the token that registers the Hana Linux CI runners.
