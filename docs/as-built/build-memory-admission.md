@@ -1619,16 +1619,26 @@ Send exit 0 gives `Delivered`. Exit 1 gives `QueuedUnconfirmed`. Other failures 
 A failed Codex send prints the sender's error detail on stderr.
 The cycle saves the outcome after the sender returns.
 A stopped send stays pending and can repeat the notice on retry.
-`Not reached, tell them yourself: <session name> (<reason>)` names failed and unconfirmed deliveries.
+`Not reached, tell them yourself: <session name> (session gone)` names each gone session once when no later release can reach it.
+`Release notices still pending for <name>, ...` names each session with unsent notices once.
 It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
+
+**Stopped run notices.** Each run that a hold stopped has its own entry with a run ID.
+Release sends one notice for all unsent runs that go to the same owner, worker and director folder.
+The notice gives the run count and each run ID. Runs with the same label share the label.
+When the owner is closed or gone, the runs go to the director. Each director gets one notice for the runs of all its closed workers.
+One notice names at most `RELEASE_NOTICE_RUN_LIMIT` (500) runs, so it fits in one argument. A longer list goes in more notices.
+Every entry of a notice gets that notice's outcome. A session that owns runs gets no separate session notice.
+A delivered or queued entry is never sent again. A release that finishes a pending record sends only its unsent entries.
+A run of a gone Claude session with no director has no route. It is recorded as `RecipientGone`, is not retried, and is named under `Not reached`.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.
 
 **Release intent.** The last holder's release is saved atomically in `BUILD_HOLD_RELEASE_DIR/pending-release.json` before its holder file is removed. A new hold keeps an earlier pending record under `releases/<release-id>/`, so it cannot drop that release's notices. `release` and `release --resume` drain each pending record on its own when no hold is in force: a record whose notice or broadcast fails stays pending, and the drain goes on to the next. Under the release lock, a damaged pending record or referenced cycle is renamed with the same `.damaged-<UTC YYYYMMDDTHHMMSSZ>` suffix used for a damaged current cycle (`-2`, `-3` when taken). One line names its path, error and saved path, and the drain continues. A damaged or missing cycle is rebuilt from its pending intent's holder and recipients before sending; an uncertain delivery can repeat. A stop after the rename leaves the intent available for a rerun. A drained record becomes the one completed receipt for its holder key, at `receipts/<holder-key>/completed-release.json`, replaced in place, so receipts do not grow; older receipt folders are moved there on release lookup. A release without a usable cycle keeps its broadcast pending until the broadcast returns. Live holder files take precedence over receipts. A finished release prints `hold is already released.` even after another cycle opens, followed by the details of any record it drained, `Not reached, tell them yourself` lines included.
 
-`status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, unsent names and `/build:hold release` to finish it. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted` or `DeliveryFailed` means unsent; a broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
+`status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, each unsent recipient once and `/build:hold release` to finish it. Each recipient shows its staff name when a staff row matches its session. Otherwise it shows the recorded name, which is often the session ID. A recipient with stopped runs shows the count, for example `phases (160 stopped runs), 341b4683-5b89-4a73-a075-887be3211060 (9 stopped runs)`. Queued notices follow as `; queued: <names>`. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted`, `DeliveryFailed` or `WorkerClosed` means unsent. `RecipientGone` means unsent only for a Codex session, because its thread can open again. `QueuedUnconfirmed` is not unsent: the queued notice arrives when the session returns, so a release does not queue a second copy. A broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
 
 **Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities, and delivery outcomes.
 Each holder's `since` must have a time offset.

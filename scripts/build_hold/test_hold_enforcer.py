@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1391,7 +1391,7 @@ class HoldEnforcerTests(unittest.TestCase):
         attempts: list[str] = []
         sent: list[tuple[str, str]] = []
 
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
+        def send(_entries: Sequence[build_hold.ReleaseEntry], to: str, notice: str) -> build_hold.ReleaseNoticeResult:
             attempts.append(to)
             if to == f"codex:{closed.current_session}":
                 return build_hold.ReleaseWorkerClosed()
@@ -1403,13 +1403,14 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "hold is already released.")
 
-        expected = (f"codex:{live.current_session}", f"codex:{ended.current_session}", str(director.id),
-                    f"codex:{ended.current_session}")
+        expected = (f"codex:{live.current_session}", f"codex:{ended.current_session}", str(director.id))
         self.assertEqual([to for to, _ in sent], list(expected))
-        self.assertEqual(attempts, [*expected[:2], f"codex:{closed.current_session}", *expected[2:]])
-        for index, ((_, notice), (worker, _, _, _)) in enumerate(zip(sent, cases, strict=False)):
-            self.assertIn(f"Restart the stopped run python3 unittest for {worker.name}.", notice)
-            self.assertIn(f"Run ID run-{index}.", notice)
+        self.assertEqual(attempts, [*expected[:2], f"codex:{closed.current_session}", expected[2]])
+        notices = [notice for _, notice in sent]
+        self.assertIn("Restart the stopped run python3 unittest for live. Run ID run-0.", notices[0])
+        # The two runs of one worker go out in one notice.
+        self.assertIn("Restart the 2 stopped runs for ended: python3 unittest (Run IDs run-1, run-3).", notices[1])
+        self.assertIn("Restart the stopped run python3 unittest for closed. Run ID run-2.", notices[2])
         cycle = build_hold.read_cycle()
         assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual([entry["delivery"] for entry in build_hold.stopped_run_entries(cycle["entries"]).values()],
@@ -1424,9 +1425,10 @@ class HoldEnforcerTests(unittest.TestCase):
         entry = build_hold.new_entry(address, worker.name)
         failure = build_hold.ReleaseSendFailed("delivery was not confirmed")
         with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
-            result = build_hold.send_stopped_run_release(entry, run, "released", staff.initial_snapshot())
+            result = build_hold.send_stopped_runs_release([{**entry, "run": run}], "released", staff.initial_snapshot())
         self.assertEqual(result, failure)
-        send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
+        send.assert_called_once_with([{**entry, "run": run}], address,
+                                     "released Restart the stopped run checks for worker. Run ID checks.")
 
     def test_release_does_not_name_a_run_if_enforcer_exits_before_signaling(self) -> None:
         _ = self.enterContext(mock.patch.object(process_stop, "supported", return_value=False))
@@ -1663,9 +1665,11 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
-        self.assertEqual([cast(str, call.args[1]) for call in send.call_args_list], [f"codex:{thread}"] * 2)
-        for call, label in zip(send.call_args_list, ("bash verify.sh check", "cargo test"), strict=True):
-            self.assertIn(f"Restart the stopped run {label} ", cast(str, call.args[2]))
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), f"codex:{thread}")
+        rows = self.rows()
+        self.assertIn(f"Restart the 2 stopped runs for worker: bash verify.sh check (Run ID process:{rows[0]['id']}); "
+                      + f"cargo test (Run ID process:{rows[1]['id']}).", cast(str, send.call_args.args[2]))
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
