@@ -22,7 +22,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire
 from scripts.build_queue import queue_place
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
-from scripts.build_queue import ci_cargo_front
+from scripts.build_queue import ci_cargo_front, ci_job_start
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -366,20 +366,20 @@ class JobStartTests(unittest.TestCase):
             write_process(proc, 100, parent=50, start="12345", name="Runner.Worker")
             write_process(proc, 200, parent=100, start="12400", name="bash")
             write_process(proc, 300, parent=200, start="12500", name="a) (b c")
-            self.assertEqual(ci_cargo_front.job_start(300, proc), 12345 / os.sysconf("SC_CLK_TCK"))
+            self.assertEqual(ci_job_start.job_start(300, proc), 12345 / os.sysconf("SC_CLK_TCK"))
 
     def test_a_missing_parent_stat_means_no_job_start(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             proc = Path(folder)
             write_process(proc, 300, parent=200, start="12500", name="python3")
-            self.assertIsNone(ci_cargo_front.job_start(300, proc))
+            self.assertIsNone(ci_job_start.job_start(300, proc))
 
     def test_a_parent_cycle_without_a_runner_worker_means_no_job_start(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             proc = Path(folder)
             write_process(proc, 200, parent=300, start="12400", name="bash")
             write_process(proc, 300, parent=200, start="12500", name="python3")
-            self.assertIsNone(ci_cargo_front.job_start(300, proc))
+            self.assertIsNone(ci_job_start.job_start(300, proc))
 
     def test_no_runner_worker_ancestor_warns_only_in_a_github_job(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -387,7 +387,7 @@ class JobStartTests(unittest.TestCase):
             write_process(proc, os.getpid(), parent=200, name="python3")
             write_process(proc, 200, parent=1, name="bash")
             write_process(proc, 1, parent=0, name="systemd")
-            self.assertIsNone(ci_cargo_front.job_start(os.getpid(), proc))
+            self.assertIsNone(ci_job_start.job_start(os.getpid(), proc))
             for actions, warning in (("", ""), ("true", "::warning::build queue: no readable Runner.Worker ancestor")):
                 held = mock.Mock(side_effect=queue_place.QueuePlaceRefused("stopped by the test"))
                 errors = io.StringIO()
@@ -402,9 +402,21 @@ class JobStartTests(unittest.TestCase):
                     self.assertTrue(errors.getvalue().startswith(warning), errors.getvalue())
 
     def test_queue_job_start_converts_boot_time_to_the_queue_clock(self) -> None:
-        self.assertEqual(ci_cargo_front.queue_job_start(100.0, now=1_000_000.0, boot_now=400.0),
+        self.assertEqual(ci_job_start.queue_job_start(100.0, now=1_000_000.0, boot_now=400.0),
                          records.JobStart(999_700.0))
-        self.assertEqual(ci_cargo_front.queue_job_start(None, now=1_000_000.0, boot_now=400.0), records.NO_JOB_START)
+        self.assertEqual(ci_job_start.queue_job_start(None, now=1_000_000.0, boot_now=400.0), records.NO_JOB_START)
+
+    def test_the_service_reader_puts_the_job_start_on_the_system_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            boot_start = time.clock_gettime(time.CLOCK_BOOTTIME) - 900
+            write_process(proc, 100, parent=1, start=str(int(boot_start * os.sysconf("SC_CLK_TCK"))), name="Runner.Worker")
+            write_process(proc, 300, parent=100, start="1", name="python3")
+            before = time.time()
+            started = ci_job_start.read_queue_job_start(300, proc)
+            assert isinstance(started, records.JobStart)
+            self.assertAlmostEqual(started.started_at, before - 900, delta=2)
+            self.assertEqual(ci_job_start.read_queue_job_start(100_000, proc), records.NO_JOB_START)
 
     def test_a_ci_step_reads_its_job_start_once_and_sends_it_on_the_queue_clock(self) -> None:
         class FixedClock:
