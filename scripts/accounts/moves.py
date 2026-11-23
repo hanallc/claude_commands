@@ -13,7 +13,7 @@ from importlib import import_module
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
@@ -56,10 +56,15 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
 
 
-class RequestedMove(MoveCommon, RequestedFields):
+class RecordedMoveRequest(MoveCommon, RequestedFields):
     terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[MoveCause]
+    scope: NotRequired[ReadOnly[Literal["group", "session"]]]
+
+
+class RequestedMove(RecordedMoveRequest):
+    scope: Literal["group", "session"]
 
 
 class ConfirmedMove(MoveCommon):
@@ -95,7 +100,9 @@ class RoomAgainMove(MoveCommon):
     label: HistoricalAccountLabel
 
 
-MoveEntry = RequestedMove | ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveOutcomeEntry = ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveEntry = RecordedMoveRequest | MoveOutcomeEntry
+MoveWriteEntry = RequestedMove | MoveOutcomeEntry
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,7 @@ class MoveSuperseded(StopFailed):
 
 class ExplicitMoveTarget(Enum):
     REQUESTED_ACCOUNT = "use the requested account"
+    GROUP_ACCOUNT = "use the account requested by a group operation"
 
 
 @dataclass(frozen=True)
@@ -193,6 +201,7 @@ def native_row_key(reference: str) -> str:
 class LatestMoveRequest:
     request_id: str
     target: str
+    explicit_group_scope: bool = False
 
 
 class NoLatestMoveRequest:
@@ -213,8 +222,11 @@ def write_latest_request(native_session: str, request: LatestMoveRequest, *, nam
     """Replace the request while the caller holds the session locks."""
     path = latest_request_path(native_session)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps({"request_id": request.request_id, "target": request.target,
-        "name": name or "unnamed session", "native_session": native_session}), new_file_mode=0o600)
+    fields: dict[str, str | bool] = {"request_id": request.request_id, "target": request.target,
+        "name": name or "unnamed session", "native_session": native_session}
+    if request.explicit_group_scope:
+        fields["explicit_group_scope"] = True
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
 
 
 def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
@@ -227,12 +239,14 @@ def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
         request_id, target = fields.get("request_id"), fields.get("target")
+        explicit_group_scope = fields.get("explicit_group_scope", False)
         native_session, name = fields.get("native_session"), fields.get("name")
         if (isinstance(request_id, str) and request_id and isinstance(target, str) and target
                 and (not target.startswith("group:") or target[6:] in role_map.CLAUDE_GROUPS)
                 and isinstance(native_session, str) and native_session and latest_request_path(native_session) == path
-                and isinstance(name, str) and name):
-            return PendingMoveRequest(MoveMember(native_session, name), LatestMoveRequest(request_id, target))
+                and isinstance(name, str) and name and isinstance(explicit_group_scope, bool)):
+            return PendingMoveRequest(MoveMember(native_session, name),
+                                      LatestMoveRequest(request_id, target, explicit_group_scope))
     raise ValueError("invalid latest move request")
 
 
@@ -365,6 +379,8 @@ def _valid(value: object) -> bool:
     kind = fields.get("kind")
     if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand", "auto")):
         return False
+    if "scope" in fields and (kind != "requested" or fields["scope"] not in ("group", "session")):
+        return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
             return False
@@ -376,7 +392,7 @@ def _valid(value: object) -> bool:
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
-def _canonical_entry(entry: MoveEntry) -> MoveEntry:
+def _canonical_entry[Entry: MoveEntry](entry: Entry) -> Entry:
     from scripts.whoami.note_file import canonical_label
 
     fields: dict[str, object] = dict(entry)
@@ -384,7 +400,7 @@ def _canonical_entry(entry: MoveEntry) -> MoveEntry:
         value = fields.get(field)
         if isinstance(value, str):
             fields[field] = canonical_label(value)
-    return cast(MoveEntry, cast(object, fields))
+    return cast(Entry, cast(object, fields))
 
 
 
@@ -478,7 +494,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
-def append_move(entry: MoveEntry) -> None:
+def append_move(entry: MoveWriteEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     entry = _canonical_entry(entry)
     if entry["kind"] == "requested":

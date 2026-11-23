@@ -138,6 +138,12 @@ def _perform(part: Part) -> int:
         if part is Part.NOTES:
             for line in agent_notes.update(include_warnings=False):
                 print(line)
+            from scripts.accounts import role_activity
+            # The notes are written. Any other error fails this part with its traceback, so a defect shows.
+            try:
+                role_activity.sample_now(datetime.now(timezone.utc))
+            except (OSError, ValueError) as error:
+                print(f"role activity: {' '.join(str(error).split())}")
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
             from scripts.lib import live_settings, mac_wake

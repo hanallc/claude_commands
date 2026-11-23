@@ -19,10 +19,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast, override
 
+from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
 from scripts.production.issues import Issue
-from scripts.review_links import new_item_dialog, review_events
+from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
@@ -288,6 +289,53 @@ def _save(store: Investigations, item: Investigation, path: Path,
     return item
 
 
+def write_review_submission(path: Path, item: Investigation, details: new_item_dialog.ReviewSubmission) -> None:
+    """Update the submission fields while the caller holds the record lock."""
+    store = _store(item.owner)
+    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details))
+
+
+def _write_submission_fields(store: Investigations, identity: str, path: Path,
+                             fields: dict[str, object]) -> None:
+    """Replace the submission field without rewriting the rest of the note."""
+    with path.open(encoding="utf-8", newline="") as stream:
+        lines = record_store.lines_with_endings(stream.read())
+    for index, line in enumerate(lines[1:], 1):
+        if line.rstrip("\r\n") == "---":
+            break
+        if line.startswith("review_submission:"):
+            newline = line[len(line.rstrip("\r\n")):]
+            lines[index] = "review_submission: " + json.dumps(json.dumps(fields), ensure_ascii=False) + newline
+            with investigation_numbers() as numbers, numbers.write(path, identity, store.owner, folder=store.folder()):
+                atomic_file.write_text_atomic(path, "".join(lines))
+            return
+    raise InvestigationError(f"{path}: the Review submission field is missing")
+
+
+def renew_reply_proof(path: Path, item: Investigation, proof: reply_tokens.ReplyTokenProof) -> None:
+    """Replace the proof under the Investigation lock."""
+    store = _store(item.owner)
+    fields, _ = store.read(item.id, path=path)
+    value = cast(dict[str, object], json.loads(fields["review_submission"]))
+    _write_submission_fields(store, item.id, path, new_item_dialog.renewed_submission_fields(value, proof))
+
+
+def scrub_reply_token(path: Path, owner: staff.StaffId, identity: str) -> bool:
+    store = _store(owner)
+    with store.locked():
+        fields, _ = store.read(identity, path=path)
+        raw = fields.get("review_submission", "")
+        if not raw:
+            return False
+        value = cast(dict[str, object], json.loads(raw))
+        details = new_item_dialog.read_submission(value)
+        updated = new_item_dialog.hashed_submission_fields(value, details)
+        if updated is value:
+            return False
+        _write_submission_fields(store, identity, path, updated)
+        return True
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -403,7 +451,8 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
         return item
 
 
-def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "",
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *,
+                  new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof = reply_tokens.MINT_REPLY_PROOF,
                   check: Callable[[], object] | None = None) -> Investigation:
     """Record feedback or a question and keep each previous answer in the log."""
     if not words.strip():
@@ -412,7 +461,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
-        replace_wait = (item.state == InvestigationState.OPEN and action == 'question' and bool(reply_token)
+        replace_wait = (item.state == InvestigationState.OPEN and action == 'question'
+                        and isinstance(new_reply_proof, reply_tokens.ReplyTokenProof)
                         and isinstance(item.submission, new_item_dialog.ReviewSubmission))
         if item.state != InvestigationState.ANSWER_READY and not replace_wait:
             raise InvestigationError(f"{identity}: the answer is no longer ready")
@@ -424,8 +474,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
         if action == 'question':
             submission = item.submission
             if isinstance(submission, new_item_dialog.ReviewSubmission):
-                token = reply_token or new_item_dialog.new_reply_token()
-                submission = replace(submission, reply_token=token)
+                proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+                submission = submission.with_reply_proof(proof)
             item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event),
                            waiting_why=review_events.require_waiting_why(words),submission=submission)
         else:

@@ -78,8 +78,11 @@ async function reviewCardPosition(card){
  }
  const main=card.querySelector('main').getBoundingClientRect().height;
  const frame=win.frameElement;
- return {top,left,main,height:frame?.getBoundingClientRect().height ?? win.innerHeight,
-  resized:!frame || Number.parseFloat(frame.style.getPropertyValue('--review-card-height'))===Math.ceil(main),
+ const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
+ const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
+ const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
+ return {top,left,main,height,requested,
+  resized:!frame || Math.abs(height-(fullscreen ? win.parent.innerHeight : Math.min(requested,win.parent.innerHeight-98)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
   dark:win.matchMedia('(prefers-color-scheme:dark)').matches};
 }
@@ -116,12 +119,12 @@ async function checkReviewCardConflict(card,layout,check,advance){
   const after=await reviewCardPosition(card);
   const marker=notice.textContent;
   check(before.dark && after.dark,'The Review card uses dark mode.');
-  check(before.resized && after.resized,'The linked card height follows the measured document.');
+  check(before.resized && after.resized,'The frame takes the height the card requests, up to the cap.');
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
-   before.main===after.main && before.height===after.height,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
-  if(layout==='short') check(before.main<win.parent.innerHeight-108,'The short card fits below the iframe height cap.');
-  if(layout==='cap') check(before.main>before.height && Math.abs(before.height-(win.parent.innerHeight-108))<1,
+   before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
+  if(layout==='short') check(before.requested<win.parent.innerHeight-98,'The short card fits below the iframe height cap.');
+  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-(win.parent.innerHeight-98))<1,
    'The tall card reaches the iframe height cap.');
   if(layout==='phone') check(win.top.innerWidth===390 && win.frameElement.closest('dialog').hasAttribute('data-fullscreen'),
    'The phone card fills the List dialog at 390 pixels.');
@@ -141,6 +144,9 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(form().elements.revision.value!==revision && notice.textContent===marker &&
    form().elements.feedback.value===edited && card.querySelector('[data-review-body]').textContent.includes(nextBody),
    'Show updates applies the new revision and keeps the edit and failure reason.');
+  const words=card.querySelectorAll('textarea');
+  check(words.length===1 && words[0]===form().elements.feedback && !words[0].readOnly,
+   'Show updates keeps one editable draft.');
   return {before,after};
  }finally{
   win.fetch=request;
@@ -1082,14 +1088,23 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         listing = self.root / f"{change_review.PREFIX}sdlc.md"
         _ = doc.write_text(f'# Production\n- **Showrunner checkout:** `{self.root}`\n- **Change review:** `{listing}`\n')
         now = datetime.now(UTC)
+        title = "Check the complete title of a linked review that opens in the List with its own header and controls"
+        instructions = "Open the linked change." + " Read each field before you answer." * 36
+        tall_title = [f"Title line {line}" for line in range(1, 13)]
+        short_title = "Check the `status` field."
+        check_url = "https://example.com/check"
         original = (change_review.BODY.replace("\n## Reviewed",
-            f"| C1 | Check the List review overlay | {now.date().isoformat()} | Open the linked change. |\n\n## Reviewed")
+            f"| C1 | {title} | {now.date().isoformat()} | Open the linked change. |\n"
+            + f"| C3 | {'<br>'.join(tall_title)} | {now.date().isoformat()} | Open the card. |\n"
+            + f"| C4 | {short_title} | {now.date().isoformat()} | {short_title} |\n"
+            + f"| C5 | {check_url} | {now.date().isoformat()} | {check_url} |\n\n## Reviewed")
             + "| C2 | A completed change | works | 2026-11-15 |\n")
         members = staff.StaffSnapshot((MORTY, DWIGHT, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc)), OTHER))
         item = self.add("Check the linked reviews", number=111)
         _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
-        _ = self.add("An unrelated List row", number=112)
-        waiting = investigation.file(OWNER.id, "Check the waiting review", "What caused the error?",
+        extra = self.add("Check the linked reviews at short heights", number=112)
+        _ = the_list.link(MORTY.id, extra.id, ("sdlc/C3", "sdlc/C4", "sdlc/C5"), source="morty")
+        waiting = investigation.file(OWNER.id, "Check the waiting review", "Check the waiting review",
                                      waiting_why="The owner checks the error.")
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
         waiting_item = self.add("Check the linked reviews that are waiting", number=113)
@@ -1110,6 +1125,7 @@ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const params=new URLSearchParams(location.search);
 const shot=params.has('shot');
 const waitingKey=WAITING_KEY;
+const expectedTitle=REVIEW_TITLE,tallTitle=TALL_TITLE;
 CONFLICT_CHECK
 const advance=async()=>{
  if(!(await fetch('/advance-overlay',{method:'POST'})).ok) throw new Error('The source change could not be updated.');
@@ -1117,12 +1133,13 @@ const advance=async()=>{
 const report=async()=>{await fetch('/results',{method:'POST',body:JSON.stringify(failures)});};
 const listFrame=document.querySelector('iframe:not([hidden])');
 const direct=!listFrame;
+const short=params.has('short') || (direct && innerWidth===500);
 const animationFrames=win=>new Promise(resolve=>win.requestAnimationFrame(()=>win.requestAnimationFrame(resolve)));
 async function inspect(){
  const doc=listFrame?.contentDocument || document,win=doc.defaultView;
  const dialog=doc.querySelector('[data-list-review-dialog]');
  const row=()=>doc.querySelector('[data-number="111"]');
- const link=key=>[...win.recordDetails(row()).querySelectorAll('a[data-list-review-card]')].find(link=>
+ const link=(key,item=row())=>[...win.recordDetails(item).querySelectorAll('a[data-list-review-card]')].find(link=>
   new URL(link.href).searchParams.get('body')===key);
  const changed=(node,ready,description)=>new Promise((resolve,reject)=>{
   const observer=new win.MutationObserver(checkReady);
@@ -1142,6 +1159,25 @@ async function inspect(){
   if(!frame) throw new Error('The card frame is missing.');
   return new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
  };
+ async function inspectLater(cardDoc){
+  const cardWin=cardDoc.defaultView,box=cardDoc.querySelector('.review-box');
+  const foot=box.querySelector('.review-box-footer'),height=foot.getBoundingClientRect().height;
+  const later=foot.querySelector('[data-later-toggle]'),menu=foot.querySelector('[data-later-menu]');
+  const menuFits=()=>{
+   const bounds=menu.getBoundingClientRect();
+   return bounds.top>=box.getBoundingClientRect().top-box.scrollTop &&
+    bounds.bottom<=foot.getBoundingClientRect().top && menu.scrollHeight<=menu.clientHeight;
+  };
+  later.click();
+  await animationFrames(cardWin);
+  check(menuFits() && !menu.hidden,'The Later menu fits above the footer without scrolling.');
+  menu.querySelector('[data-later-choose]').click();
+  await animationFrames(cardWin);
+  check(menuFits() && menu.hasAttribute('data-choosing'),'The calendar fits above the footer without scrolling.');
+  check(foot.getBoundingClientRect().height===height,'The calendar keeps the footer height.');
+  later.click();
+  await animationFrames(cardWin);
+ }
  check(!dialog.querySelector('iframe'),'List loads no card before a click.');
  for(const cell of doc.querySelectorAll('.record-id')){
   if(cell.closest('tbody').hidden) continue;
@@ -1162,12 +1198,19 @@ async function inspect(){
  const waitingCard=await readCard(waitingLink);
  check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
   'The summary opens the linked Waiting card.');
+ check(waitingCard.querySelector('.review-box-meta').textContent.includes('The owner checks the error.'),
+  'The metadata shows the Waiting reason.');
+ check(!waitingCard.querySelector('[data-review-body] section').getClientRects().length,
+  'The body hides the section that repeats the title.');
  dialog.querySelector('button').click();
  const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
- check(!done.querySelector('[data-review-form] textarea'),'The Done card has no action.');
- check(!done.querySelector('[data-review-index]') &&
-  win.recordIsOpen(row()),'The Review dialog loads one card and the List row stays expanded.');
+ check(!done.querySelector('[data-review-form]'),'The Done card has no action form.');
+ const shortBody=done.querySelector('.review-box-scroll');
+ check(shortBody.scrollHeight<=shortBody.clientHeight,'The short card fits without scrolling.');
+ check(!done.querySelector('[data-review-body] section').getClientRects().length,'The empty check section is hidden.');
+ check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
+ check(win.recordIsOpen(row()),'The Review dialog leaves the List row expanded.');
  const close=dialog.querySelector('button');
  done.body.tabIndex=-1;done.body.focus();
  done.body.dispatchEvent(new done.defaultView.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
@@ -1179,6 +1222,32 @@ async function inspect(){
  const form=ready.querySelector('[data-review-form]');
  check(!!form.querySelector('[value="works"]') && !!form.querySelector('[value="feedback"]') &&
   !!form.querySelector('[data-later-toggle]'),'The card shows the Review actions.');
+ const head=ready.querySelector('.review-box-header'),body=ready.querySelector('.review-box-scroll');
+ const foot=form.closest('footer'),panel=body.querySelector('.review-panel');
+ check(head.querySelector('h1').textContent===expectedTitle && !ready.querySelector('.list-row'),
+  'The header shows the full title without a table row.');
+ const box=ready.querySelector('.review-box'),frame=ready.defaultView.frameElement;
+ if(box.hasAttribute('data-whole-scroll')){
+  check(!direct && (short || params.has('cap')),'Only a short window scrolls the whole card.');
+  box.scrollTop=box.scrollHeight;
+  const bounds=foot.getBoundingClientRect();
+  check(box.scrollTop>0 && body.scrollTop===0 && bounds.top>=0 && bounds.bottom<=frame.clientHeight,
+   'Scrolling the card brings the entire footer into view.');
+  box.scrollTop=0;
+ }else{
+  const top=head.getBoundingClientRect().top,bottom=foot.getBoundingClientRect().bottom;
+  const needsScroll=body.scrollHeight>body.clientHeight;
+  body.scrollTop=body.scrollHeight;
+  check((body.scrollTop>0)===needsScroll && box.scrollTop===0 && ready.scrollingElement.scrollTop===0,
+   'Only the card body scrolls when its content exceeds its height.');
+  check(head.getBoundingClientRect().top===top && foot.getBoundingClientRect().bottom===bottom,
+   'The header and feedback controls stay fixed.');
+  check(bottom<=frame.clientHeight && body.clientHeight>=96,
+   'The frame contains the entire footer and at least 96 pixels of the body.');
+ }
+ await inspectLater(ready);
+ const columns=ready.defaultView.getComputedStyle(panel).gridTemplateColumns.split(' ').length;
+ check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
  if(phone){
@@ -1193,10 +1262,36 @@ async function inspect(){
    'The desktop dialog is centered horizontally and starts 16 pixels from the top.');
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
- if(direct || params.has('cap')){
+ if(short && !direct){
+  close.click();
+  const extra=doc.querySelector('[data-number="112"]');
+  extra.querySelector('.list-toggle').click();
+  const tall=await readCard(link('sdlc/C3',extra));
+  await animationFrames(tall.defaultView);
+  const box=tall.querySelector('.review-box'),scroll=tall.querySelector('.review-box-scroll');
+  const tallFoot=tall.querySelector('.review-box-footer'),title=box.querySelector('h1');
+  check(title.textContent===tallTitle && box.scrollHeight>box.clientHeight,
+   'The box scrolls with the full 12-line title.');
+  box.scrollTop=box.scrollHeight;
+  const bounds=tallFoot.getBoundingClientRect(),viewport=box.getBoundingClientRect();
+  check(box.scrollTop>0 && scroll.scrollTop===0 && bounds.top>=viewport.top && bounds.bottom<=viewport.bottom,
+   'Scrolling the box brings the whole footer into view.');
+  close.click();
+  const compact=await readCard(link('sdlc/C4',extra));
+  await animationFrames(compact.defaultView);
+  check(!compact.querySelector('[data-review-body] section').getClientRects().length,
+   'The body hides text that matches an inline code title.');
+  await inspectLater(compact);
+  close.click();
+  const repeated=await readCard(link('sdlc/C5',extra));
+  const checkLink=repeated.querySelector('[data-review-body] a[href="https://example.com/check"]');
+  check(checkLink?.getClientRects().length,'The check link stays visible when it matches the title.');
+ }
+ if(!short && (direct || params.has('cap'))){
   await checkReviewCardConflict(ready,direct ? 'phone' : 'cap',check,advance);
   await report();return;
  }
+ if(short){await report();return;}
  if(shot){
   check(win.matchMedia('(prefers-color-scheme:dark)').matches,'The desktop uses dark mode.');
   await report();return;
@@ -1334,7 +1429,7 @@ async function inspect(){
   for(const realm of [win,cardWin]){
    const animate=realm.Element.prototype.animate;
    realm.Element.prototype.animate=function(keyframes,options){
-    if(this.matches('[data-review-card] tbody, [data-list-review-dialog] iframe'))
+    if(this.matches('.review-box, [data-list-review-dialog] iframe'))
      fades.push([this.tagName,options.duration]);
     return animate.call(this,keyframes,options);
    };
@@ -1391,7 +1486,7 @@ async function inspect(){
   releaseRefresh();
  }
  await refreshed;
- if(!phone) check(JSON.stringify(fades)===JSON.stringify([['TBODY',180],['TBODY',260],['IFRAME',180]]),
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260],['IFRAME',180]]),
   'The overlay uses the configured card fade durations.');
  check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
   row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
@@ -1410,7 +1505,8 @@ const inspectPage=()=>{void inspect().catch(error=>{failures.push(String(error))
 if(direct) inspectPage();
 else listFrame.addEventListener('load',inspectPage,{once:true});
 if(direct || shot){const image=new Image();image.hidden=true;image.src='/complete';document.body.append(image);}
-</script>'''.replace('WAITING_KEY', json.dumps(waiting_key)).replace('CONFLICT_CHECK', REVIEW_CARD_CONFLICT_CHECK)
+</script>'''.replace('WAITING_KEY', json.dumps(waiting_key)).replace('CONFLICT_CHECK', REVIEW_CARD_CONFLICT_CHECK).replace(
+            'REVIEW_TITLE', json.dumps(title)).replace('TALL_TITLE', json.dumps("\n".join(tall_title)))
         standalone_probe = '<script>' + REVIEW_CARD_CONFLICT_CHECK + r'''
 (async()=>{
  const failures=[];
@@ -1429,12 +1525,15 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
             + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
             + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
-        for size in ("1440,1000", "1440,620", "600,900", "390,900", "standalone", *(("screenshot",) if proof else ())):
+        for size in ("1440,1000", "1440,620", "1474,600", "600,900", "390,900", "500,800",
+                     "standalone", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 initial = original
                 if size == "1440,620":
                     initial = original.replace("Open the linked change.",
                                                "Open the linked change. " + "Check each recorded result. " * 160)
+                elif size in ("1474,600", "600,900", "390,900", "500,800", "screenshot"):
+                    initial = original.replace("Open the linked change.", instructions)
                 _ = listing.write_text(initial)
                 browser_root = root / size.replace(",", "x")
                 results: list[list[str]] = []
@@ -1444,7 +1543,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                     @override
                     def html_response(self, status: int, content: bytes, *,
                                       delivery_pending: bool | None = None) -> None:
-                        if self.path == list_page.PAGE_PATH + "?direct=1":
+                        if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
                         super().html_response(status, content, delivery_pending=delivery_pending)
 
@@ -1489,6 +1588,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                       patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
                       patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
                       patch.object(change_page, "deliver"), patch.object(change_review, "_commit"),
+                      patch.object(change_page, "feature_review_id", return_value=""),
                       patch.object(change_review, "lists_directory", return_value=self.root),
                       patch.object(staff, "snapshot", return_value=members),
                       patch.object(list_page, "counts_strip", return_value=""),
@@ -1499,7 +1599,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                         viewport = "1440,1000" if size in ("screenshot", "standalone") else size
                         width, height = map(int, viewport.split(","))
                         route = destination
-                        if size == "390,900":
+                        if size == "500,800":
+                            route = list_place.replace("#", "?direct=1&short=1#", 1)
+                        elif size == "1474,600":
+                            route += "&short=1"
+                        elif size == "390,900":
                             route = list_place.replace("#", "?direct=1#", 1)
                         elif size == "1440,620":
                             route += "&cap=1"

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE as HAND_MADE, GateJobNotRecorded, StepJob as StepJob
 from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
@@ -115,8 +115,8 @@ SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".
 VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
     "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
-    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}
-QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named"}
+    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named", HAND_MADE.step: "hand made"}
 SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
                      "merge-gate": "merge", "targeted-test": "targeted"}
 MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
@@ -127,6 +127,10 @@ GATE_PROGRAMS = {
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
+# gate.py exits with this status when the assigned Mac Linux guest took no run.
+# It first writes the claim failure next to the placement file, so its caller can place the gate again.
+MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
+CLAIM_FAILURE_SUFFIX = ".claim-failure"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
@@ -214,9 +218,10 @@ def _verify_step(arguments: Sequence[str]) -> StepJob | OtherCommand:
 
 
 def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
-    """Find the command after the copies.py run options."""
+    """Read the command that the copies.py process supervises."""
     program = parse_command_program(argv)
-    if isinstance(program, OtherCommand) or program[0] != "copies.py" or not program[1] or program[1][0] != "run":
+    if (isinstance(program, OtherCommand) or program[0] != "copies.py"
+            or not program[1] or program[1][0] not in ("run", "gate-step")):
         return OTHER_COMMAND
     arguments = program[1]
     if "--" not in arguments:
@@ -262,7 +267,7 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
-    """Read the gate job from its process or the copies.py caller."""
+    """Read the gate job from the gate process or its copies.py supervisor."""
     expected = GATE_PROGRAMS.get(step, ())
     if not expected:
         return OTHER_COMMAND

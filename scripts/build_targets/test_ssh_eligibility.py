@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from typing import cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
@@ -25,12 +26,13 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import unittest
 from unittest import mock
 
-from scripts.build_targets import build_targets as build_targets, targets
+from scripts.build_targets import build_targets as build_targets, target_config, targets
+from scripts.build_targets.test_targets import fixture_mac_mirror
 from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
 from scripts.build_hold import owning_session as session_owner
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 
 class SshEligibilityTests(unittest.TestCase):
@@ -51,7 +53,7 @@ class SshEligibilityTests(unittest.TestCase):
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=linux-part\n")
         _ = write_config_fixture(self.root / "linux.conf",
                               "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\nslots.hana=2\n", template="mac_test")
@@ -64,10 +66,13 @@ class SshEligibilityTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
+        key = "https://github.com/team/hana"
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
-                                               return_value=eligibility.KnownRepository("hana", "github.com/team/hana")))
+                                               return_value=eligibility.KnownRepository("hana", key)))
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity",
+                                               return_value=fixture_mac_mirror(self.root, "hana", key)))
         _ = self.enterContext(mock.patch.object(mac_test, "target_claim_scope",
-                                               return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
+                                               return_value=mac_test.RepositoryScope("hana", key)))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
@@ -138,6 +143,43 @@ class SshEligibilityTests(unittest.TestCase):
         args.recover_only = recover_only
         return build_targets.command_reserve(args)
 
+    def add_mac_linux_guest(self) -> target_config.SshTarget:
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac,natedev,linux\n", "targets=mac,natedev,linux,mac-linux\n")
+            + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n")
+        _ = (self.root / "mac_linux.conf").write_text("ssh.hops=mac linux-guest\nguest.user=gate-runner\n")
+        return target_config.configured_ssh_target(eligibility.MAC_LINUX_TARGET)
+
+    def test_mac_linux_guest_config_is_excluded_without_offload_settings(self) -> None:
+        guest = self.add_mac_linux_guest()
+        config = build_targets.ssh_target_config(guest)
+        self.assertEqual(config, targets.ExcludedTarget(guest, "The Mac Linux guest requires an exact queue assignment"))
+
+    def test_probe_of_the_mac_linux_guest_reads_its_state_without_a_probe(self) -> None:
+        guest = self.add_mac_linux_guest()
+        self.assertIsInstance(build_targets.probe_target(guest), targets.Free)
+        self.assertEqual(self.commands, [])
+
+    def test_eligible_kind_with_the_mac_linux_guest_answers_for_every_target(self) -> None:
+        _ = self.add_mac_linux_guest()
+        self.mac_offload_off()
+        output = io.StringIO()
+        arguments = ["build_targets.py", "eligible", "--kind", "test", "--repo-root", str(self.root), "--package", "linux-part"]
+        with mock.patch.object(sys, "argv", arguments), redirect_stdout(output):
+            self.assertEqual(build_targets.main(), 0)
+        self.assertNotIn("natedev_only state unreadable", output.getvalue())
+        rows = {row[0]: row for row in (line.split("\t") for line in output.getvalue().splitlines()[1:])}
+        self.assertEqual(rows["mac-linux"][1], "excluded")
+        self.assertIn("linux", rows)
+
+    def test_probe_backoff_keeps_the_mac_linux_guest_backoff_without_a_probe(self) -> None:
+        _ = self.add_mac_linux_guest()
+        backoff = eligibility.backoff_path(eligibility.MAC_LINUX_TARGET)
+        backoff.parent.mkdir(parents=True, exist_ok=True)
+        _ = backoff.write_text(f"{self.now + 3600}\n")
+        with mock.patch.object(time, "time", return_value=float(self.now)):
+            self.assertEqual(build_targets.command_probe_backoff(eligibility.MAC_LINUX_TARGET, probe=True), 1)
+        self.assertEqual(self.commands, [])
 
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")

@@ -34,6 +34,7 @@ from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state, mac_test
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[str]]:
@@ -519,7 +520,8 @@ class BuildLimitsTests(unittest.TestCase):
             settings = root / "mac.conf"
             _ = settings.write_text("linux_only.project=linux_package\nlinux_only.quiet=\n", encoding="utf-8")
             _ = (root / "build_targets.conf").write_text(
-                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n", encoding="utf-8")
+                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE,
+                encoding="utf-8")
             claims = root / "claims"
             claims.mkdir()
             since = datetime(2026, 11, 22, 12, tzinfo=UTC)
@@ -579,14 +581,16 @@ class BuildLimitsTests(unittest.TestCase):
                              (1, 1, ["Build name"]))
             self.assertEqual((mac_cells["cleanup"].used, mac_cells["cleanup"].runs), (1, []))
             self.assertEqual((mac_cells["quiet"].used, mac_cells["quiet"].limit), (0, 1))
-        for shown, project_count in ((keyless, 1), (unresolved, 2)):
-            with self.subTest(mac_claims=project_count):
-                self.assertEqual(shown.mac.unattributed, 0)
-                self.assertEqual(shown.mac.waits, normal.mac.waits)
-                mac_cells = {row.name: row.mac for row in shown.repositories}
-                self.assertEqual(mac_cells["project"].used, project_count)
-                self.assertEqual(mac_cells["cleanup"].used, 1)
-                self.assertNotIn("other", mac_cells)
+        # A Mac claim with no repository key holds the whole Mac, so the heading counts it.
+        self.assertEqual((keyless.mac.unattributed, keyless.mac.unattributed_note, keyless.mac.waits),
+                         (1, "", normal.mac.waits))
+        keyless_cells = {row.name: row.mac for row in keyless.repositories}
+        self.assertEqual((keyless_cells["project"].used, keyless_cells["cleanup"].used), (None, 1))
+        self.assertEqual(unresolved.mac.unattributed, 0)
+        self.assertEqual(unresolved.mac.waits, normal.mac.waits)
+        unresolved_cells = {row.name: row.mac for row in unresolved.repositories}
+        self.assertEqual((unresolved_cells["project"].used, unresolved_cells["cleanup"].used), (2, 1))
+        self.assertNotIn("other", unresolved_cells)
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
         self.assertEqual(full_mac.mac.unattributed_note, "")

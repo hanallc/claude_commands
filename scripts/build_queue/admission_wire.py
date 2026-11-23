@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from stat import S_ISREG
 from scripts.build_queue import execution_identity
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
@@ -157,6 +158,11 @@ NO_RUN = NoRun()
 
 
 @dataclass(frozen=True)
+class SessionNotSent:
+    """A client from before the session field sent no owning session."""
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -174,6 +180,8 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    # The session that owns the run; a natedev hold of this session does not hold the step.
+    session: OwningSession | NoOwningSession | SessionNotSent = field(default=SessionNotSent(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -519,14 +527,28 @@ class PlacementStatusRequest(CallerCode):
     """The request asks for the status of an episode and attempt."""
     episode: str
     attempt: str
+    include_permission: bool = False
+
+
+@dataclass(frozen=True)
+class LaunchPermissionNotReported:
+    """The status reply does not identify the launch permission."""
+
+
+LAUNCH_PERMISSION_NOT_REPORTED = LaunchPermissionNotReported()
 
 
 @dataclass(frozen=True)
 class KnownPlacementStatus:
-    """The status holds a known assignment, its state, and provider claim."""
+    """The status holds a known assignment, its state, and provider claim.
+
+    A permission request also gets the final report. A reply from an older service has no report.
+    """
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
+    permission: placement.LaunchPermission | LaunchPermissionNotReported = LAUNCH_PERMISSION_NOT_REPORTED
+    report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 
 @dataclass(frozen=True)
@@ -773,6 +795,9 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    # An older reader has no session field; a request with no session leaves it out.
+    if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
+        del record["session"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:

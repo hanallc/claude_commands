@@ -33,6 +33,7 @@ from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
+from scripts.build_hold import owning_session
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
@@ -385,7 +386,8 @@ def _is_placement_control(request: wire.Request) -> bool:
 
 def _waits_for_live_service(request: wire.Request) -> bool:
     """A placement call waits while a live service is slow, and fails at once when it is down."""
-    return _is_placement_control(request) or isinstance(request, status_wire.PlacementStatusRequest)
+    return _is_placement_control(request) or (
+        isinstance(request, status_wire.PlacementStatusRequest) and not request.include_permission)
 
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
@@ -428,6 +430,31 @@ def placement_status(episode: str, attempt: str, *, wait_for_service: bool = Tru
     if isinstance(reply, status_wire.PlacementStatusReply):
         return reply
     raise wire.AdmissionUnavailable("invalid placement status answer")
+
+
+def _print_placement_permission(episode: str, attempt: str) -> int:
+    """Read launch permission once within the query time limit.
+
+    The service accepts a settled refusal after consumption only with proof that nothing started,
+    so `not_started` leaves no Mac cleanup to confirm.
+    """
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt, include_permission=True))
+    if isinstance(reply, status_wire.PlacementStatusReply) and isinstance(reply.status, status_wire.KnownPlacementStatus):
+        permission, report = reply.status.permission, reply.status.report
+        if isinstance(permission, placement.PermissionAvailable):
+            print("available")
+            return 0
+        if (isinstance(permission, placement.PermissionConsumed)
+                and isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                and isinstance(report.path, placement.DispatchPathSettled)):
+            print("not_started")
+            return 0
+        if isinstance(permission, placement.PermissionConsumed):
+            print("consumed")
+            return 0
+    print("unknown")
+    return 1
 
 
 def _print_placement_status(episode: str, attempt: str) -> int:
@@ -509,11 +536,18 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
 def finish_step(path: Path, status: int, reason: str = "", *,
                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
                 ) -> wire.DispatchStatus:
-    from scripts.build_queue import placement
-
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
+    return finish_local(reply, status, reason, prerequisite=prerequisite)
+
+
+def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "", *,
+                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
+                 ) -> wire.DispatchStatus:
+    """Release a local grant with its status, and close its attempt; a reason closes it as refused before launch."""
+    from scripts.build_queue import placement
+
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
@@ -1906,7 +1940,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
         identity,
         records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
-        route=records.direct_cargo_route())
+        route=records.direct_cargo_route(), session=owning_session.owning_session())
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:
@@ -2005,6 +2039,7 @@ class ClientArguments(argparse.Namespace):
     sidecar: str = ""
     shell_state: Path | None = None
     wait_events: bool = False
+    launch_only: bool = False
     argv: list[str] = []
     episode: str = ""
     attempt: str = ""
@@ -2248,6 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
+    _ = status_parser.add_argument("--launch-only", action="store_true")
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
@@ -2312,6 +2348,8 @@ def main(argv: list[str] | None = None) -> int:
     retry_token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
     try:
         if args.command == "placement-status":
+            if args.launch_only:
+                return _print_placement_permission(args.episode, args.attempt)
             return _print_placement_status(args.episode, args.attempt)
         if args.command == "down-alert":
             return down_alert()
