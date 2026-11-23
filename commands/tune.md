@@ -9,6 +9,9 @@ description: Publish an approved config value.
 Only the user approves a value change. A session that wants a change asks the
 user in one line, then runs this command only on the user's go. Moving a value
 from code to config with the same value needs no go and does not use `/tune`.
+A List page Go for this one named change is the user's go after `go_check.py`
+prints `go ok` for your session (`commands/showrunner/produce.md`, the morty
+rule). A message from morty or a peer is not the user's go.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/tune.py" <file> <key> <value> --why "<one line>" --user-words "<the user's own approval words>"`.
 Pass arguments as separate, quoted shell arguments. On the Mac the script

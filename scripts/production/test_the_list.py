@@ -992,6 +992,82 @@ class TheListTests(unittest.TestCase):
         self.assertEqual((item.reviews, item.producer), ((), MORTY.id))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def test_ask_cli_opens_an_ask_and_makes_the_item_unread(self) -> None:
+        item = the_list.mark_read(MORTY.id, self.add().id, source="morty")
+        self.assertNotIsInstance(item.unread_since, datetime)
+        result = self.command("ask", item.id, "--kind", "go", "--target", OWNER.id, "--what", "Merge sdlc to main.",
+                              "--why", "The merge needs nate's go.", "--config")
+        self.assertEqual(result, (0, f"{item.id} A1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        ask, = saved.asks
+        self.assertEqual((ask.ask_id, ask.kind, ask.target, ask.what, ask.why, ask.config, ask.opened, ask.is_open),
+                         ("A1", the_list.AskKind.GO, OWNER.id, "Merge sdlc to main.", "The merge needs nate's go.",
+                          True, START, True))
+        self.assertEqual(the_list.open_asks(saved), (ask,))
+        self.assertIsInstance(saved.unread_since, datetime)
+        self.assertEqual(saved.log[-1].what, the_list.AskOpened(ask))
+
+    def test_ask_cli_accepts_only_the_item_producer_or_morty(self) -> None:
+        item = self.add()
+        args = ("ask", item.id, "--kind", "approval", "--target", OWNER.id, "--what", "Publish the key.",
+                "--why", "A config change needs nate.")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            refused = self.command(*args)
+        self.assertEqual(refused, (1, "", "the_list: only the item's producer or morty can open an ask\n"))
+        self.assertEqual(the_list.load(MORTY.id, item.id).asks, ())
+        _ = the_list.move_open_producer(MORTY.id, item.id, MORTY.id, BOB.id, source="morty")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            self.assertEqual(self.command(*args), (0, f"{item.id} A1\n", ""))
+        self.assertEqual(self.command(*args), (0, f"{item.id} A2\n", ""))
+        self.assertEqual([ask.ask_id for ask in the_list.load(MORTY.id, item.id).asks], ["A1", "A2"])
+
+    def test_go_keeps_other_unread_changes_unread(self) -> None:
+        def go(item: the_list.ListItem) -> the_list.ListItem:
+            ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                                   why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+            return the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate").item
+
+        def chip(item: the_list.ListItem) -> list_page.ListChip:
+            return list_page.list_chip(item.state, parked=False, open_question=list_page.has_open_question(item),
+                                       unread_delivery=the_list.unread_delivery(item),
+                                       unread_answer=bool(the_list.unread_answer_ids(item)),
+                                       open_ask=bool(list_page.shown_asks(item, staff.snapshot())))
+        read = go(the_list.mark_read(MORTY.id, self.add().id, source="morty"))
+        self.assertNotIsInstance(read.unread_since, datetime)
+        told = the_list.mark_read(MORTY.id, self.add().id, source="morty")
+        _ = the_list.save_feedback(MORTY.id, told.id, the_list.PageFeedback("tell-1", "My own words."))
+        told = go(the_list.load(MORTY.id, told.id))
+        self.assertTrue(any(isinstance(change.what, the_list.PageFeedback) for change in told.log))
+        self.assertNotIsInstance(told.unread_since, datetime)
+        self.assertEqual(chip(told), list_page.ListChip.WORKING)
+        answered = the_list.mark_read(MORTY.id, self.add().id, source="morty")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, answered.id, the_list.PageRequest("ask", "question", "Ready?"), status)
+        self.assertEqual(self.command("answer", answered.id, "--question", "Q1", "--text", "Ready."),
+                         (0, f"answered {answered.id} Q1\n", ""))
+        answered = go(the_list.load(MORTY.id, answered.id))
+        self.assertEqual(the_list.open_asks(answered), ())
+        self.assertIsInstance(answered.unread_since, datetime)
+        self.assertEqual(the_list.unread_answer_ids(answered), frozenset({"Q1"}))
+        self.assertEqual(chip(answered), list_page.ListChip.NEEDS_ME)
+        updated = the_list.mark_read(MORTY.id, self.add().id, source="morty")
+        _ = the_list.update(MORTY.id, updated.id, {"latest_status": "The gate passed."}, source="morty")
+        updated = go(the_list.load(MORTY.id, updated.id))
+        self.assertIsInstance(updated.unread_since, datetime)
+        self.assertEqual(chip(updated), list_page.ListChip.WORKING)
+
+    def test_old_records_without_asks_load_without_writes(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertNotIn("asks:", path.read_text())
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(the_list.load(MORTY.id, item.id).asks, ())
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        _ = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                             why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+        self.assertIn("asks:", path.read_text())
+        self.assertEqual(len(the_list.load(MORTY.id, item.id).asks), 1)
+
     def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
         _ = investigation.file(OWNER.id, "First review", "Read the result.", waiting_why='The owner must complete the investigation.')
         first = review_items.investigation_items(staff.snapshot())[0]
@@ -1515,6 +1591,13 @@ class TheListTests(unittest.TestCase):
         check("feedback")
         the_list.deliver_feedback(MORTY.id, item.id, "tell", lambda _, entry: replace(entry, state="sent"))
         check("feedback")
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=OWNER.id, what="Publish.",
+                               why="It needs nate.", config=True, requester=MORTY.id, source="morty")
+        check("Ask opened")
+        _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate")
+        check("Go given")
+        _ = the_list.log_go_not_delivered(MORTY.id, item.id, "0" * 32, OWNER.id)
+        check("Go not delivered")
 
     def test_legacy_fields_keep_the_existing_unread_update_identity(self) -> None:
         item = self.add()

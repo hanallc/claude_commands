@@ -72,6 +72,11 @@ Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_
 Use `the_list.py update --id L<n>` to update your items.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
+When a session needs nate's go or approval for one named change, open an ask on its item:
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py ask L<n> --kind go|approval --target <staff id> --what "<the one change>" --why "<why it needs nate>"`.
+Add `--config` for a settings.json, CLAUDE.md or config change. Only the item's producer or morty can open an ask.
+The ask makes the item unread, so it shows in Needs me with a Go or Approved button.
+nate's click sends the target and morty one message with a go id. Only the target can use the go id, once, after `go_check.py` prints `go ok`.
 A producer other than morty asks morty to add, close, park, or assign its items.
 It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
