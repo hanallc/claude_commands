@@ -78,10 +78,6 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
     return ListChip.MORTY_ANSWERING if open_question else chip
 
 
-def has_open_question(item: the_list.ListItem) -> bool:
-    return any(question.answer is None for question in item.questions)
-
-
 class ListRecord(NamedTuple):
     """An item and the fixed producer ID that owns its record."""
 
@@ -230,8 +226,8 @@ def log_field_html(field: str, value: object, today: datetime, names: staff_name
     return field_html(field, value, today, names)
 
 
-def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   fields: Mapping[str, object], evidence_id: str, keeper_label: str) -> str:
+def log_entry_html(record: ListRecord, change: the_list.ItemChange, index: int, today: datetime,
+                   names: staff_names.StaffNames, fields: Mapping[str, object], evidence_id: str) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
     question: Literal["Question", "Answer"] | None = None
@@ -243,9 +239,11 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
+        recipient = the_list.notice_recipient(record.keeper, content)
         label = {"pending": "Feedback for ", "sent": "Feedback sent to ",
-                 "alerted": "Feedback could not reach "}[content.state] + keeper_label
-        body = label + by + change_browser.question_paragraphs(content.words)
+                 "alerted": "Feedback could not reach "}[content.state]
+        body = label + names.html(recipient, owner_name(names.members, recipient)) + by
+        body += change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
@@ -280,8 +278,6 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
                   unread_answers: frozenset[str]) -> str:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
-    keeper = names.members.by_id(record.keeper)
-    keeper_label = html.escape(keeper.name) if keeper is not None else "the record keeper"
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
@@ -290,8 +286,8 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}", keeper_label)))
+            rows.append((change.time, log_entry_html(record, change, index, today, names, fields,
+                                                    f"list-evidence-{row_id}-{index}")))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
@@ -624,11 +620,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
-    sent = the_list.sent_to_morty(item)
+    sent = the_list.sent_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        keeper = names.members.by_id(entry.keeper)
-        notice = "sent to " + (names.html(keeper.id, keeper.name) if keeper is not None else "the record keeper")
+        recipient = the_list.notice_recipient(entry.keeper, feedback)
+        notice = "sent to " + names.html(recipient, owner_name(names.members, recipient))
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
@@ -738,7 +734,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     unread = item.unread_since
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
-    open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
+    open_question = item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
@@ -814,7 +810,7 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
-        delivery = change_page.NoMessageDelivery()
+        delivery = _notice_delivery(keeper, read_edit.item, request)
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status)
     if not include_detail:
@@ -860,14 +856,20 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         return ListFeedbackDelivery(keeper, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
         raise question_record.AnswerRefused("enter words for the record keeper")
-    saved_notice = the_list.feedback_requests(changed).get(request)
-    delivery = (ListFeedbackDelivery(keeper, identity, request)
-                if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
+    delivery = _notice_delivery(keeper, changed, request)
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
-                   if saved_notice is None else UnparkOutcome.CLEARED)
+                   if request not in the_list.feedback_requests(changed) else UnparkOutcome.CLEARED)
         return ListUnparkSubmission(outcome, delivery)
     return delivery
+
+
+def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
+                     request: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+    """Send the notice that an item action saved, if it is still pending."""
+    notice = the_list.feedback_requests(item).get(request)
+    return (ListFeedbackDelivery(keeper, item.id, request)
+            if notice is not None and notice.state == "pending" else change_page.NoMessageDelivery())
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -890,11 +892,12 @@ def deliver(submission: ListActionSubmission) -> None:
                    if feedback.action == "tell" else feedback.words)
         source = the_list.folder(delivery.keeper) / f"{item.id}.md"
         key = change_page.review_delivery_key(source, item.id, feedback.request)
-        failures = change_page.send_with_retries(change_page.SENDER, (delivery.keeper,), message,
+        recipient = the_list.notice_recipient(delivery.keeper, feedback)
+        failures = change_page.send_with_retries(change_page.SENDER, (recipient,), message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key)
         if not failures:
             return replace(feedback, state="sent")
-        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != delivery.keeper)
+        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != recipient)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
@@ -1013,7 +1016,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     for index, (entry, parked) in enumerate(ordered_items):
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
-        open_question = has_open_question(entry.item)
+        open_question = the_list.has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         unread_answers = the_list.unread_answer_ids(entry.item)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
