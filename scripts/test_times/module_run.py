@@ -650,7 +650,10 @@ class UnleasedGateJob:
 
 @dataclass(frozen=True)
 class DirectModuleRun:
-    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout."""
+    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout.
+
+    A checkout without a modeled output uses `$TMPDIR/test-runs` instead.
+    """
     parent: PreparedTestRunsParent
 
 

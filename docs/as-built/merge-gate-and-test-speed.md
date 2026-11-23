@@ -739,7 +739,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A new direct test run in that runner also puts its `TMPDIR` there.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, a direct run sweeps free folders in its `test-runs` parent, including older `test-run-*` folders.
+  Before allocation, each run that prepares a `test-runs` parent sweeps its free folders, including older `test-run-*` folders.
+  This includes a direct run and the `gate.py --affected` outer run.
+  `test_run_folder()` uses the checkout output even when TMPDIR names a gate module folder.
   The sweep does not wait for held folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
