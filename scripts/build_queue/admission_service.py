@@ -277,6 +277,30 @@ class OwnerProcessUnreadable:
 
 
 OwnerStartReading = LiveOwnerIdentity | OwnerProcessGone | OwnerProcessUnreadable
+OwnerProcessReading = gate.ProcessIdentity | OwnerProcessGone | OwnerProcessUnreadable
+
+
+def linux_owner_process(pid: int, proc: Path) -> OwnerProcessReading:
+    """Read the parent PID and start time from one process record."""
+    if pid <= 0:
+        return OwnerProcessUnreadable("invalid process id")
+    try:
+        stat = read_proc_text(proc / str(pid) / "stat")
+    except (FileNotFoundError, ProcessLookupError):
+        return OwnerProcessGone()
+    except OSError as error:
+        return OwnerProcessUnreadable(str(error))
+    _, separator, rest = stat.rpartition(")")
+    fields = rest.split()
+    if (not separator or len(fields) <= 19 or not fields[19].isascii() or not fields[19].isdigit()
+            or fields[0] not in ("R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I")):
+        return OwnerProcessUnreadable("invalid process stat fields")
+    if fields[0] in ("Z", "X"):
+        return OwnerProcessGone()
+    try:
+        return gate.ProcessIdentity(int(fields[1]), fields[19])
+    except ValueError:
+        return OwnerProcessUnreadable("invalid parent process id")
 
 
 def owner_may_be_live(reading: OwnerStartReading, start_time: str) -> bool:
@@ -289,6 +313,7 @@ class Proc(Protocol):
     def path(self) -> Path: ...
     def processes(self) -> dict[int, gate.ProcessIdentity]: ...
     def owner_start(self, pid: int) -> OwnerStartReading: ...
+    def owner_process(self, pid: int) -> OwnerProcessReading: ...
     def pidfd(self, pid: int) -> int: ...
     def lifetime(self, row: records.Reservation, owner_live: bool
                  ) -> gate.StepLifetime: ...
@@ -312,23 +337,14 @@ class SystemProc:
             if isinstance(reading, process_start.Unreadable):
                 return OwnerProcessUnreadable(reading.reason)
             return OwnerProcessGone()
-        if pid <= 0:
-            return OwnerProcessUnreadable("invalid process id")
+        process = self.owner_process(pid)
+        return LiveOwnerIdentity(process.start) if isinstance(process, gate.ProcessIdentity) else process
+
+    def owner_process(self, pid: int) -> OwnerProcessReading:
         root = self.path
         if "BUILDLOG_PROC" not in os.environ and (verify_root := os.environ.get("VERIFY_PROC_ROOT")) is not None:
             root = Path(verify_root)
-        try:
-            stat = read_proc_text(root / str(pid) / "stat")
-        except (FileNotFoundError, ProcessLookupError):
-            return OwnerProcessGone()
-        except OSError as error:
-            return OwnerProcessUnreadable(str(error))
-        _, separator, rest = stat.rpartition(")")
-        fields = rest.split()
-        if (not separator or len(fields) <= 19 or not fields[19].isascii() or not fields[19].isdigit()
-                or fields[0] not in ("R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I")):
-            return OwnerProcessUnreadable("invalid process stat fields")
-        return OwnerProcessGone() if fields[0] in ("Z", "X") else LiveOwnerIdentity(fields[19])
+        return linux_owner_process(pid, root)
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(pid)
@@ -362,15 +378,19 @@ class WaiterPlace:
     episode: str
     priority_since: float | OrderNotStarted = OrderNotStarted()
     token_left_at: float | TokenNotLeft = TokenNotLeft()
-    order_since: float | OrderNotStarted = field(default_factory=OrderNotStarted, kw_only=True)
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
+    move_id: str = field(default="", kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
+    run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
 
 
-def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
+def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
+                 ) -> WaiterPlace:
     """Keep a logical identity with every active place."""
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
-        order_since=row.get("order_since", row["since"]), queue_identity=gate.queue_life_identity(row))
+        queue_identity=gate.queue_life_identity(row), move_id=row.get("move_id", ""),
+        ci_runner=row.get("ci_runner", ""), run=run)
 
 
 @dataclass(frozen=True)
@@ -390,6 +410,11 @@ class OwnerExited:
 
 
 @dataclass(frozen=True)
+class LocalGrantReturned:
+    """The caller gave back its local placement grant."""
+
+
+@dataclass(frozen=True)
 class NoFinalizationIntent:
     pass
 
@@ -398,6 +423,9 @@ class NoFinalizationIntent:
 class TokenWaiting:
     request_id: str
     left_at: float
+
+
+ReservationEnding = NotEnding | ReleaseStatus | OwnerExited | LocalGrantReturned | TokenWaiting
 
 
 @dataclass(frozen=True)
@@ -422,7 +450,7 @@ class ReservationRecord:
     filters: tuple[str, ...] = ()
     shape: str = ""
     test_phase_need: records.TestPhaseNeed | gate.NoTestPhaseNeed = gate.NoTestPhaseNeed("not_recorded")
-    ending: NotEnding | ReleaseStatus | OwnerExited | TokenWaiting = NotEnding()
+    ending: ReservationEnding = NotEnding()
     finalization: records.FinalizationIntent | NoFinalizationIntent = NoFinalizationIntent()
     charge_use: test_phase.TestPhaseChargeUse | test_phase.NoTestPhaseChargeUse = test_phase.NoTestPhaseChargeUse()
     run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -505,11 +533,20 @@ def gate_worktree_repository_name(worktree: str) -> str | records.UnknownReposit
 
 def gate_repository_name(step: str, repository_name: str, worktree: str) -> str:
     """Resolve the Git repository for a gate with a legacy program profile."""
-    if step in records.REPOSITORY_RUN_STEPS and Path(repository_name).is_absolute() and Path(worktree).is_absolute():
+    if step in records.REPOSITORY_GATE_STEPS and Path(repository_name).is_absolute() and Path(worktree).is_absolute():
         name = gate_worktree_repository_name(worktree)
         if isinstance(name, str):
             return name
     return repository_name
+
+
+def profile_repository_name(profile: records.StepProfile | records.ProgramProfile) -> str:
+    """Get the repository name used by the run limits."""
+    if isinstance(profile.repository, records.RepositoryIdentity):
+        return profile.repository.name or profile.repo
+    if isinstance(profile, records.ProgramProfile):
+        return gate_repository_name(profile.step, profile.repo, profile.worktree)
+    return profile.repo
 
 
 @dataclass(frozen=True)
@@ -518,10 +555,16 @@ class LiveGrant:
 
 
 @dataclass(frozen=True)
+class NoQueueUndoAnchor:
+    """The replay entry has no saved queue anchor."""
+
+
+@dataclass(frozen=True)
 class ReplayEntry:
     reply: wire.Reply
     ended_at: float | LiveGrant
     reservation: str = ""
+    undo_anchor: QueueAnchor | NoQueueUndoAnchor = NoQueueUndoAnchor()
 
 
 class ReplayLedger(dict[str, ReplayEntry]):
@@ -592,6 +635,81 @@ class PendingCloudGroup:
 
 
 @dataclass(frozen=True)
+class PendingVerifyGrants:
+    """The reservations can still return the slot before execution."""
+    reservations: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UsedVerifySlot:
+    """A local step used the slot, so the run keeps it until exit."""
+
+
+@dataclass(frozen=True)
+class QueueHeadAnchor:
+    """Place a pinned row at the head of the full order."""
+
+
+@dataclass(frozen=True)
+class QueueRowAnchor:
+    """Place a pinned row directly after this row."""
+
+    row_id: str
+
+
+QueueAnchor = QueueHeadAnchor | QueueRowAnchor
+
+
+@dataclass(frozen=True)
+class QueuePin:
+    row_id: str
+    anchor: QueueAnchor
+
+
+QueuePins = tuple[QueuePin, ...]
+
+
+def queue_anchor_at(order: list[str], index: int) -> QueueAnchor:
+    return QueueRowAnchor(order[index - 1]) if index else QueueHeadAnchor()
+
+
+def pinned_order(order: list[str], pins: QueuePins) -> list[str]:
+    """Follow the pinned rows after each row in the main order."""
+    if not pins:
+        return order
+    members = set(order)
+    followers = {pin.anchor: pin.row_id for pin in pins if pin.row_id in members
+                 and (isinstance(pin.anchor, QueueHeadAnchor) or pin.anchor.row_id in members)}
+    pinned = set(followers.values())
+    ordered: list[str] = []
+    roots = (QueueHeadAnchor(), *(QueueRowAnchor(row_id) for row_id in order if row_id not in pinned))
+    for anchor in roots:
+        if isinstance(anchor, QueueRowAnchor):
+            ordered.append(anchor.row_id)
+        while anchor in followers:
+            row_id = followers.pop(anchor)
+            ordered.append(row_id)
+            anchor = QueueRowAnchor(row_id)
+    return ordered
+
+
+@dataclass(frozen=True)
+class VerifyRunSlot:
+    """Hold one repository slot until the Verify process exits."""
+    repository: str
+    owner: wire.Owner
+    use: PendingVerifyGrants | UsedVerifySlot = UsedVerifySlot()
+
+    @property
+    def run_key(self) -> str:
+        return records.run_owner(self.owner.pid, self.owner.start_time)
+
+    @property
+    def key(self) -> str:
+        return f"{self.run_key}:{self.repository}"
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -607,6 +725,33 @@ class ServiceState:
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
+    queue_pins: QueuePins = ()
+    verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
+
+
+def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
+    """Keep legacy slots only when the state records a local grant."""
+    slots = {key: slot for key, slot in state.verify_run_slots.items() if key == slot.key}
+    if len(slots) == len(state.verify_run_slots):
+        return slots
+    granted: set[VerifyRunSlot] = set()
+    for record in state.reservations.values():
+        if isinstance(record.place, wire.LocalPlace) and "verify" in record.queue_waiter:
+            repository = record.queue_waiter.get("repository_name", record.repo)
+            granted.add(VerifyRunSlot(repository, record.owner))
+            if isinstance(record.run, wire.RunIdentity):
+                granted.add(VerifyRunSlot(repository, wire.Owner(record.run.pid, record.run.start_time)))
+    for saved in state.assignments.values():
+        assignment = saved.assignment
+        request = state.placement_requests.get(assignment.episode)
+        if (assignment.destination.provider == "local" and isinstance(saved.permission, placement.PermissionConsumed)
+                and request is not None and isinstance(request.identity.verify, records.VerifyCall)):
+            repository = profile_repository_name(request.profile)
+            granted.add(VerifyRunSlot(repository, wire.Owner(request.owner.pid, request.owner.start_time)))
+            if isinstance(request.run, wire.RunIdentity):
+                granted.add(VerifyRunSlot(repository, wire.Owner(request.run.pid, request.run.start_time)))
+    slots.update((slot.key, slot) for slot in state.verify_run_slots.values() if slot in granted)
+    return slots
 
 
 @dataclass(frozen=True)
@@ -1149,6 +1294,7 @@ def durable_copy(value: object) -> object:
 class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
+    wait_positions: dict[str, int]
     view_bytes: bytes = b""
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
@@ -1242,6 +1388,7 @@ class AdmissionPassInputs:
     """Keep the local inputs and the queue order that includes held CI waiters."""
     local: records.QueueInputs
     queue_order: list[tuple[Path, records.RankedWaiter]]
+    ranked_waiters: list[tuple[Path, records.RankedWaiter]]
 
 
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
@@ -1287,6 +1434,9 @@ class WaiterClaimDisposition(Enum):
     TRANSFER = auto()
 
 
+BeforeLaunchRefusal = placement.PrelaunchRefused | execution_identity.HanaCommandAdmissionRefused
+
+
 @dataclass
 class WaitingAdmission:
     request: wire.AdmitRequest | wire.LaunchRequest
@@ -1306,7 +1456,7 @@ def _no_fault(_stage: str) -> None:
     pass
 
 
-def _place_key(owner: wire.Owner, since: float) -> str:
+def _place_key(owner: wire.Owner | placement.SubmittingOwner, since: float) -> str:
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
@@ -1333,7 +1483,7 @@ def _notify(message: str) -> None:
             _ = notifier.send(message.encode())
 
 
-def finalization_outcome(ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting
+def finalization_outcome(ending: ReservationEnding
                          ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded, gate.StepEnd | gate.TokenReturn]:
     if isinstance(ending, TokenWaiting):
         return step_estimator.Completed(), 0, gate.TokenReturn()
@@ -1377,7 +1527,8 @@ class StateIntents:
     def __init__(self, reservations: dict[str, ReservationRecord],
                  advance_generation: Callable[[], None], episode: str,
                  persist: Callable[[], None], fault: Callable[[str], None],
-                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites) -> None:
+                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites, *,
+                 retire_verify_grant: Callable[[str], None] | None = None) -> None:
         boundary = writes.writes if isinstance(writes, RegisteredServiceWrites) else writes
         selected = (reservations[episode],) if isinstance(writes, RegisteredServiceWrites) else reservations.values()
         boundary.require(*(Path(record.path) for record in selected),
@@ -1389,6 +1540,7 @@ class StateIntents:
         self.episode: str = episode
         self.persist: Callable[[], None] = persist
         self.fault: Callable[[str], None] = fault
+        self.retire_verify_grant: Callable[[str], None] | None = retire_verify_grant
 
     def _require_record(self) -> None:
         record = self.reservations[self.episode]
@@ -1415,9 +1567,16 @@ class StateIntents:
             raise ValueError("finalization reservation changed")
         self.fault("after_history_append")
         record = self.reservations[self.episode]
-        if not isinstance(record.ending, TokenWaiting):
-            _ = self.places.pop(_place_key(record.owner, record.queue_waiter["since"]), None)
+        key = _place_key(record.owner, record.queue_waiter["since"])
+        place = self.places.get(key)
+        # A placement release can precede a refusal before launch.
+        awaiting_report = (isinstance(record.ending, ReleaseStatus) and place is not None
+                           and place.episode == self.episode and bool(place.move_id))
+        if not isinstance(record.ending, TokenWaiting) and not awaiting_report:
+            _ = self.places.pop(key, None)
         del self.reservations[self.episode]
+        if self.retire_verify_grant is not None:
+            self.retire_verify_grant(record.reservation_id)
         self.persist()
 
 
@@ -1480,6 +1639,7 @@ class AdmissionServer:
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
                  host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+        state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
         self.writes.require()
         self.state_dir: Path = state_dir
@@ -1489,7 +1649,10 @@ class AdmissionServer:
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
+        self.verify_run_slots: dict[str, VerifyRunSlot] = {}
         self.pending_cloud_groups: dict[str, PendingCloudGroup] = {}
+        self.queue_pins: QueuePins = ()
+        self.move_line: records.QueueMoveLine = records.QueueMoveLine(uuid.uuid4().hex, ())
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
@@ -1628,10 +1791,12 @@ class AdmissionServer:
                 state.places[key] = replace(place, queue_identity={
                     **identity, "session_name": caller.name, "unit": caller.unit})
             self.reservations, self.places = state.reservations, state.places
+            self.queue_pins = state.queue_pins
             self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.priority = state.spacing, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
+            self.verify_run_slots = saved_verify_run_slots(state)
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
             self.placement_requests = {
@@ -1673,9 +1838,9 @@ class AdmissionServer:
     def _live_reservation_ids(self) -> set[str]:
         return {record.reservation_id for record in self.reservations.values()}
 
-    def _inputs_with_current_slots(self, inputs: records.QueueInputs) -> records.QueueInputs:
-        self._prune_runs()
-        self._claim_slots()
+    def _inputs_with_current_slots(self, inputs: records.QueueInputs,
+                                   ordered: list[tuple[Path, records.RankedWaiter]]) -> records.QueueInputs:
+        self._claim_slots(ordered)
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
         occupied = self._occupied_local_cargo_folders()
         local_owners = {records.waiter_owner(row) for _, row in remaining.ordered}
@@ -1689,7 +1854,14 @@ class AdmissionServer:
                 if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
                     del self.slots[key]
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
-                       occupied_cargo_folders=occupied)
+                       occupied_cargo_folders=occupied, verify_run_owners=self._verify_run_owners())
+
+    def _refresh_pass_slots(self, inputs: records.QueueInputs,
+                            ordered: list[tuple[Path, records.RankedWaiter]]) -> records.QueueInputs:
+        waiting_owners = {records.waiter_owner(waiting.row) for waiting in self.waiters.values()}
+        local_paths = {path for path, row in inputs.ordered if records.waiter_owner(row) in waiting_owners}
+        inputs = replace(inputs, ordered=[(path, row) for path, row in ordered if path in local_paths])
+        return self._inputs_with_current_slots(inputs, ordered)
 
     def persist(self) -> None:
         now = self.clock.now()
@@ -1713,7 +1885,8 @@ class AdmissionServer:
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups)
+            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
+            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -1807,6 +1980,7 @@ class AdmissionServer:
         owners.update(waiting.request.owner for waiting in self.waiters.values())
         owners.update(place.owner for place in self.places.values())
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
+        owners.update(slot.owner for slot in self.verify_run_slots.values())
         owners.update(wire.Owner(request.owner.pid, request.owner.start_time)
                       for request in self.placement_requests.values() if request.owner.host == self.host)
         owners.update(self._claim_holders())
@@ -1840,32 +2014,74 @@ class AdmissionServer:
         return reasons
 
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
+        """Collect the present queue rows."""
         rows: list[tuple[Path, records.RankedWaiter]] = []
         for waiting in self.waiters.values():
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
                 continue
             row = gate.rank_waiter(waiting.row, records.NormalOrder())
-            row["order_since"] = row.get("order_since", row["since"])
-            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.run, wire.RunIdentity):
-                place = self.run_places.get(records.run_owner(waiting.request.run.pid, waiting.request.run.start_time))
-                if place is not None:
-                    row["order_since"] = min(place.since, row["order_since"])
+            run = waiting.request.run if isinstance(waiting.request, wire.AdmitRequest) else wire.NO_RUN
+            row["order_since"] = self._run_order_since(row["since"], run)
             rows.append((self.state_dir / records.waiter_owner(row), row))
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
+            row["order_since"] = self._run_order_since(row["since"], request.run)
             rows.append((self.state_dir / records.waiter_owner(row), row))
-        return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
+        return rows
 
     @staticmethod
     def _priority_name(row: records.Waiter) -> str:
         return row.get("ci_runner") or row.get("unit", "")
 
-    def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+    def _queue_order(self) -> list[tuple[Path, records.RankedWaiter]]:
+        return self._visible_queue_order(self._full_queue_order(self._ranked_waiters()))
+
+    def _ranked_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
         rows = self._ordered_waiters()
-        if isinstance(self.priority, records.NoQueuePriority):
-            return rows, self.priority
+        present = {row.get("move_id") for _, row in rows}
+        for place in self.places.values():
+            if place.move_id and place.move_id not in present:
+                grant = self.reservations.get(place.episode)
+                row: records.Waiter = (grant.queue_waiter if grant is not None else
+                    {**place.queue_identity, "need": 0, "ci_runner": place.ci_runner})
+                ranked = gate.rank_waiter({**row, "move_id": place.move_id,
+                    "order_since": self._run_order_since(place.since, place.run)}, records.NormalOrder())
+                key = records.waiter_owner(row) if grant is not None else place.move_id
+                rows.append((self.state_dir / key, ranked))
+        if isinstance(self.priority, records.QueuePriority):
+            return self._rank_priority_waiters(rows, self.priority)
+        return gate.sort_waiters(rows)
+
+    def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
+                          ) -> list[tuple[Path, records.RankedWaiter]]:
+        saved = {place.move_id for place in self.places.values() if place.move_id}
+        rows = {row_id: (path, row) for path, row in ranked if (row_id := row.get("move_id")) in saved}
+        return [rows[row_id] for row_id in pinned_order(list(rows), self.queue_pins)]
+
+    def _visible_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
+                             ) -> list[tuple[Path, records.RankedWaiter]]:
+        visible = {waiting.row.get("move_id") for waiting in self.waiters.values()}
+        reservations = self.last_inputs.reservations if isinstance(self.last_inputs, records.QueueInputs) else ()
+        counted = {row.get("reservation_id") for row in reservations}
+        for record in self.reservations.values():
+            if record.reservation_id in counted:
+                # The pass already shows this grant in Running.
+                continue
+            place = self.places.get(_place_key(record.owner, record.queue_waiter["since"]))
+            if place is not None and place.episode == record.episode and place.move_id:
+                visible.add(place.move_id)
+        for request in self.placement_requests.values():
+            if request.episode in self.waiters or not self._placement_waiting(request):
+                continue
+            place = self.places.get(_place_key(request.owner, request.since))
+            if place is not None and place.episode == request.episode:
+                visible.add(place.move_id)
+        return [(path, row) for path, row in ordered if row.get("move_id") in visible]
+
+    def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
         # Match CI priority by runner. Keep the runner out of the published unit field.
         ci_waiters: dict[Path, records.RankedWaiter] = {}
         sessions: list[str] = []
@@ -1880,10 +2096,43 @@ class AdmissionServer:
                 sessions.append(row.get("session_id", ""))
             ranking_rows.append((path, row))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
-        ranked, priority = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(self.priority, labels))
+        ranked, _ = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(priority, labels))
         return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
-                 if path in ci_waiters else row) for path, row in ranked], priority
+                 if path in ci_waiters else row) for path, row in ranked]
 
+    def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
+                           movable: set[str]) -> records.QueueMoveLine:
+        members: list[records.QueueMoveMember] = []
+        for _, row in rows:
+            row_id = row.get("move_id")
+            assert row_id
+            members.append(records.QueueMoveMember(row_id, movable=row_id in movable))
+        return self._revise_move_line(tuple(members))
+
+    def _published_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
+        # A speculative copy still waits for placement while its parent holds local memory.
+        hidden = {place.move_id for request in self.placement_requests.values()
+                  if isinstance(request.purpose, placement.SpeculativeCopy)
+                  and (parent := self.reservations.get(request.purpose.parent_episode)) is not None
+                  and isinstance(parent.place, wire.LocalPlace)
+                  and (place := self.places.get(_place_key(request.owner, request.since))) is not None
+                  and place.episode == request.episode}
+        return [(path, row) for path, row in ordered if row.get("move_id") not in hidden]
+
+    def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...]) -> records.QueueMoveLine:
+        if members != self.move_line.members:
+            self.move_line = records.QueueMoveLine(uuid.uuid4().hex, members)
+        return self.move_line
+
+    def _movable_wait_ids(self, *, check_owners: bool = False) -> set[str]:
+        return {waiting.row.get("move_id", "") for episode, waiting in self.waiters.items()
+            if episode not in self.current_assignments and waiting.row.get("move_id") and (not check_owners or
+                self.proc.owner_start(waiting.request.owner.pid) == LiveOwnerIdentity(waiting.request.owner.start_time))
+            and ((request := self.placement_requests.get(episode)) is None
+                 or (request.owner.host == self.host
+                     and isinstance(self._local_placement_eligibility(request),
+                                    (placement.AllowedHost, placement.EvidenceNeeded))))}
 
     def _prune_runs(self) -> None:
         now = self.clock.now()
@@ -1906,21 +2155,92 @@ class AdmissionServer:
                 else:
                     del self.slots[key]
 
-    def _claim_slots(self) -> None:
+    def _prune_verify_run_slots(self) -> None:
+        for key, slot in list(self.verify_run_slots.items()):
+            if owner_may_be_live(self.proc.owner_start(slot.owner.pid), slot.owner.start_time):
+                self._watch_owner(slot.owner)
+            else:
+                del self.verify_run_slots[key]
+
+    def _verify_run_owners(self) -> dict[str, frozenset[str]]:
+        owners: dict[str, set[str]] = {}
+        for slot in self.verify_run_slots.values():
+            owners.setdefault(slot.repository, set()).add(slot.run_key)
+        return {repository: frozenset(runs) for repository, runs in owners.items()}
+
+    def _finish_verify_grant(self, reservation: str, *, started: bool) -> None:
+        for key, slot in self.verify_run_slots.items():
+            if not isinstance(slot.use, PendingVerifyGrants) or reservation not in slot.use.reservations:
+                continue
+            remaining = slot.use.reservations - {reservation}
+            if started:
+                self.verify_run_slots[key] = replace(slot, use=UsedVerifySlot())
+            elif remaining:
+                self.verify_run_slots[key] = replace(slot, use=PendingVerifyGrants(remaining))
+            else:
+                del self.verify_run_slots[key]
+            return
+
+    def _verify_slot_owner(self, request: wire.AdmitRequest, repository: str) -> wire.Owner:
+        owner, run = request.owner, request.run
+        if VerifyRunSlot(repository, owner).key in self.verify_run_slots:
+            return owner
+        inherited = isinstance(run, wire.RunIdentity) and run.pid != owner.pid
+        if not inherited and not any(slot.repository == repository for slot in self.verify_run_slots.values()):
+            return owner
+        child = self.proc.owner_process(owner.pid)
+        if not isinstance(child, gate.ProcessIdentity) or child.start != owner.start_time:
+            return owner
+        lineage = {owner.pid: child}
+        while child.parent > 0 and child.parent not in lineage:
+            pid = child.parent
+            parent = self.proc.owner_process(pid)
+            if not isinstance(parent, gate.ProcessIdentity) or int(parent.start) > int(child.start):
+                break
+            lineage[pid] = parent
+            ancestor = VerifyRunSlot(repository, wire.Owner(pid, parent.start))
+            if (ancestor.key in self.verify_run_slots or
+                    isinstance(run, wire.RunIdentity) and run == wire.RunIdentity(pid, parent.start)):
+                # Check for process exit or reparenting during the walk.
+                if all(self.proc.owner_process(pid) == identity for pid, identity in lineage.items()):
+                    return ancestor.owner
+                break
+            child = parent
+        return owner
+
+    def _verify_slot_requests(self, inputs: records.QueueInputs, limits: records.RepositoryRunLimits
+                              ) -> dict[str, VerifyRunSlot]:
+        slots: dict[str, VerifyRunSlot] = {}
+        for waiting in self.waiters.values():
+            row, request = waiting.row, waiting.request
+            owner = records.waiter_owner(row)
+            if (owner not in inputs.waiter_orders or not isinstance(request, wire.AdmitRequest)
+                    or not isinstance(request.place, wire.LocalPlace) or "verify" not in row):
+                continue
+            if limits.exempt_unit and (row.get("unit") == limits.exempt_unit or owner in inputs.run_limit_exempt_owners):
+                continue
+            repository = row.get("repository_name", "")
+            slots[owner] = VerifyRunSlot(repository, self._verify_slot_owner(request, repository))
+        return slots
+
+    def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
-        for waiting in sorted(self.waiters.values(), key=lambda item: gate.waiter_order(item.row)):
+        waiters = {records.waiter_owner(item.row): item for item in self.waiters.values()}
+        for _, row in ordered:
+            owner = records.waiter_owner(row)
+            waiting = waiters.get(owner)
+            if waiting is None or not gate.can_use_natedev(row):
+                continue
             request = waiting.request
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
             if saved is not None and isinstance(saved.remote_start_hold, records.RemoteStartHold):
                 continue
             placement_request = self.placement_requests.get(request.episode)
-            if placement_request is not None and isinstance(placement_request.purpose, placement.SpeculativeCopy):
-                continue
-            if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
+            if placement_request is not None and not isinstance(self._local_placement_eligibility(placement_request),
+                                                                (placement.AllowedHost, placement.EvidenceNeeded)):
                 continue
             if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
                 continue
-            owner = records.waiter_owner(waiting.row)
             if owner in claimed or isinstance(gate.waiter_state(waiting.row), records.TokenWaitingWaiter):
                 continue
             candidates = [(key, slot) for key, slot in self.slots.items()
@@ -1943,6 +2263,13 @@ class AdmissionServer:
         key = records.run_owner(run.pid, run.start_time)
         if key not in self.run_places and self._run_alive(run):
             self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
+
+    def _run_order_since(self, since: float, run: wire.RunIdentity | wire.NoRun) -> float:
+        if isinstance(run, wire.RunIdentity):
+            place = self.run_places.get(records.run_owner(run.pid, run.start_time))
+            if place is not None:
+                return min(place.since, since)
+        return since
 
     def _known_owner(self, owner: wire.Owner) -> bool:
         return (any(isinstance(watch, OwnerWatch) and watch.owner == owner for watch in self.watchers.values())
@@ -1988,11 +2315,17 @@ class AdmissionServer:
         return self._live(wire.Owner(run.pid, run.start_time))
 
     def _prune_places(self, owner_exit: OwnerWatch | None = None) -> None:
+        if owner_exit is not None:
+            owner = owner_exit.owner
+            for key, slot in tuple(self.verify_run_slots.items()):
+                if slot.owner == owner:
+                    del self.verify_run_slots[key]
         for key, place in list(self.places.items()):
             ended = owner_exit is not None and owner_exit.owner == place.owner
             if (ended or not self._live(place.owner)) and not any(
                     record.owner == place.owner for record in self.reservations.values()):
                 self._record_left(place.episode, place.queue_identity, "owner_gone")
+                self._clear_wait_rank(place.owner, place.since, place.episode)
                 del self.places[key]
         self.persist()
 
@@ -2003,17 +2336,18 @@ class AdmissionServer:
             "pid": request.owner.pid, "start_time": request.owner.start_time,
             "need": (0 if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
                      else profile.peak.bytes), "since": since,
-            "order_since": (place.order_since if isinstance(place, WaiterPlace)
-                            and not isinstance(place.order_since, OrderNotStarted) else since),
+            "order_since": since,
             "session_id": identity.session_id, "session_name": identity.name,
             "step": identity.step, "folder": identity.folder, "unit": identity.unit,
             "estimated_at": profile.estimated_at or self.clock.now(),
             "fresh_test": isinstance(request, wire.AdmitRequest) and request.fresh_test,
             "need_source": profile.peak.source, "need_runs": profile.peak.count,
             "need_basis": gate.need_basis_record(profile.peak.basis), "test_scope": profile.scope,
-            "repository_name": profile.repo,
+            "repository_name": profile_repository_name(profile),
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
+        if isinstance(place, WaiterPlace) and place.episode == request.episode and place.move_id:
+            row["move_id"] = place.move_id
         if isinstance(identity.verify, records.VerifyCall):
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
@@ -2028,10 +2362,7 @@ class AdmissionServer:
                 row["token_back_at"] = request.token_back_at
         if isinstance(profile.repository, records.RepositoryIdentity):
             row["repo_identity"] = profile.repository.key
-            row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
-        elif isinstance(profile, records.ProgramProfile):
-            row["repository_name"] = gate_repository_name(profile.step, profile.repo, profile.worktree)
         if isinstance(request, wire.AdmitRequest):
             row["package"] = step_estimator.test_package(list(request.argv))
             row["filters"] = list(step_estimator.test_filters(list(request.argv)))
@@ -2113,11 +2444,16 @@ class AdmissionServer:
             resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
             if resolved_name != repository_name:
                 row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
+            lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
+            unscoped_direct = (not record.sidecar and episode not in self.placement_requests
+                               and episode in evidence.lifetimes)
+            if isinstance(lifetime, gate.PopulatedStepScope) or unscoped_direct:
+                self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
             memories.append((row, memory))
-            self._watch_scope(evidence.lifetimes.get(episode, gate.LiveOwnerProcess()), episode)
+            self._watch_scope(lifetime, episode)
         for waiting in self.waiters.values():
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
                 continue
@@ -2133,7 +2469,9 @@ class AdmissionServer:
                                                   pressure.swap_used_percent, config.policy)
         readings = gate.QueueSnapshotReadings(dict(evidence.processes), {}, evidence.host,
             pressure, self.spacing, list(evidence.compilers), policy=config.policy)
-        ordered, priority = self._queue_order()
+        self._prune_runs()
+        ranked = self._ranked_waiters()
+        ordered = self._visible_queue_order(self._full_queue_order(ranked))
         unowned = self._unowned_memory(evidence, [row for row, _memory in memories])
         pending_remote_starts = frozenset(records.waiter_owner(waiting.row)
             for episode, key in self.current_assignments.items()
@@ -2154,12 +2492,13 @@ class AdmissionServer:
         limits = config.policy.repository_runs
         sessions = list(dict.fromkeys(session for _, row in local_rows
             if not row.get("unit") and (session := row.get("session_id", ""))
-            and limits.for_step(self.host, row.get("repository_name", ""), row.get("step", ""))))
+            and ("verify" in row or isinstance(limits.for_step(
+                self.host, row.get("repository_name", ""), row.get("step", "")), records.RepositoryRunLimit))))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
         exempt = frozenset(records.waiter_owner(row) for _, row in local_rows
             if (session := row.get("session_id", "")) in labels
             and gate.queue_unit(row.get("unit", ""), session, labels) == limits.exempt_unit)
-        inputs = gate.build_queue_inputs(local_rows, memories, readings, now, priority, unowned)
+        inputs = gate.build_queue_inputs(local_rows, memories, readings, now, self.priority, unowned)
         inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
                          local_machine=self.host, run_limit_exempt_owners=exempt)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
@@ -2172,9 +2511,9 @@ class AdmissionServer:
             self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
                 rank=profile_rank, share_percent=profile_share)
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
-        local = self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
+        local = self._progress_inputs(self._inputs_with_current_slots(inputs, ordered), dict(evidence.processes),
                                       config.policy, profile_rank, profile_share)
-        return AdmissionPassInputs(local, ordered)
+        return AdmissionPassInputs(local, ordered, ranked)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -2410,6 +2749,7 @@ class AdmissionServer:
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
         self._prune_runs()
+        self._prune_verify_run_slots()
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
@@ -2448,7 +2788,7 @@ class AdmissionServer:
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
-        inputs = captured.local
+        inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
         ci_holds = self._ci_hold_reasons()
@@ -2456,7 +2796,9 @@ class AdmissionServer:
         if held_owners:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
-        inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
+        verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
+        inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
+        inputs = self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
@@ -2468,8 +2810,7 @@ class AdmissionServer:
         head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
                       if isinstance(head, gate.QueuedHead) else "")
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
-        starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
-                        key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
+        starts = [row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)]
         for decision in starts:
             episode = by_owner[decision.owner]
             waiting = self.waiters.get(episode)
@@ -2489,33 +2830,36 @@ class AdmissionServer:
                             del self.slots[slot_key]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
-            self._admit([waiting], config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
+            self._admit([waiting], config, self.configuration.peak_history_share_percent,
+                        cargo_folder=cargo_folder, verify_slots=verify_slots)
         self.persist()
-        waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-            row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
-            for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
-        positions = {row.owner: position for position, row in enumerate(result.rows, 1)}
-        for position, decision in enumerate(result.rows, 1):
-            episode = by_owner[decision.owner]
-            if episode in self.waiters:
-                waiting = self.waiters[episode]
-                reason = decision.reason
-                cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-                order = decision.decision.order_hold
-                text = (f"behind #{positions[records.waiter_owner(order.waiter)]}"
-                        if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead)
-                        else reason_phrase(reason, waiting_steps))
-                reply = wire.Wait(reason, position, head_label, text,
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder,
-                                        head_label, head_need))
-                if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
-                    self._deliver(waiting, reply)
-                    waiting.last_reply, waiting.last_sent = reply, inputs.now
-        for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
-            waiting = self.waiters[episode]
-            decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
-            reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
-                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
+        visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
+        self._publish_replies(visible_order, ci_holds=ci_holds)
+        assert isinstance(self.published, PublishedReplies)
+        waiting_steps = self.published.view.reading.view.waiting
+        positions = self.published.wait_positions
+        decisions = {decision.owner: decision for decision in result.rows}
+        for owner, position in positions.items():
+            episode = by_owner.get(owner, "")
+            waiting = self.waiters.get(episode)
+            if waiting is None:
+                continue
+            if (entry := decisions.get(owner)) is not None:
+                reason, decision, holder = entry.reason, entry.decision, entry.holder
+                label = head_label
+            elif (ci_reason := ci_holds.get(episode)) is not None:
+                reason, holder = ci_reason, records.NoHolder()
+                decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
+                label = ""
+            else:
+                continue
+            cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+            order = decision.order_hold
+            blocker = (positions.get(records.waiter_owner(order.waiter), 0)
+                       if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead) else 0)
+            text = f"behind #{blocker}" if blocker else reason_phrase(reason, waiting_steps)
+            reply = wire.Wait(reason, position, label, text,
+                self._wait_snapshot(waiting, decision, inputs, config, reason, holder, head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -2525,11 +2869,8 @@ class AdmissionServer:
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
         remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
-        local_rows = ((path, gate.rank_waiter(row, inputs.waiter_orders[owner])) for path, row in inputs.ordered
-                      if (owner := records.waiter_owner(row)) in remaining)
-        held_rows = ((path, row) for path, row in captured.queue_order
-                     if (owner := records.waiter_owner(row)) in held_owners and owner in remaining)
-        ordered = list(heapq.merge(local_rows, held_rows, key=lambda item: gate.waiter_order(item[1])))
+        snapshot_owners = (inputs.waiter_orders.keys() | held_owners) & remaining
+        ordered = [(path, row) for path, row in visible_order if records.waiter_owner(row) in snapshot_owners]
         try:
             queue_snapshot.write_queue_snapshot(self.state_dir,
                 replace(inputs, ordered=ordered, spacing=self.spacing,
@@ -2538,7 +2879,6 @@ class AdmissionServer:
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
-        self._publish_replies()
         if self.reader_requested:
             self.start_reader()
         if not isinstance(self.system_reader, NoSystemReader):
@@ -2636,7 +2976,8 @@ class AdmissionServer:
             size = group.size if isinstance(group, status_wire.CloudGroup) else 1
             if not blocked:
                 if self._cloud_order(waiting) < disconnected and len(members) == size and used + size <= slots:
-                    self._admit(members, config, configuration.peak_history_share_percent, cargo_folder=placement.NoCargoFolder())
+                    self._admit(members, config, configuration.peak_history_share_percent,
+                                cargo_folder=placement.NoCargoFolder(), verify_slots={})
                     used += size
                     started = True
                     continue
@@ -2737,32 +3078,53 @@ class AdmissionServer:
         return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote)),
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
-    def _publish_replies(self) -> None:
+    def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]], *,
+                         ci_holds: Mapping[str, records.WaitReason] | None = None) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
                 or not isinstance(self.last_inputs, records.QueueInputs)
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
             return
+        ordered = self._published_queue_order(ordered)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
-        waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
-                        for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
-        reading = replace(reading, view=replace(reading.view, waiting=waiting))
-        ci_holds = self._ci_hold_reasons()
-        if ci_holds:
-            held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
-                ci_runner=row.get("ci_runner", ""), verify=row.get("verify", records.NotVerifyCall()))
-                for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
-            reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
-                ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
-                    gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
+        local = {path: replace(step, verify=row.get("verify", step.verify))
+                 for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
+        holds = self._ci_hold_reasons() if ci_holds is None else ci_holds
+        ci_reasons = {records.waiter_owner(self.waiters[episode].row): reason
+                      for episode, reason in holds.items() if episode in self.waiters}
+        routed = {place.move_id: request for request in self.placement_requests.values()
+                  if (place := self.places.get(_place_key(request.owner, request.since))) is not None
+                  and place.episode == request.episode}
+        visible: list[records.WaitingStep] = []
+        positions: dict[str, int] = {}
+        for position, (path, row) in enumerate(ordered, 1):
+            owner = records.waiter_owner(row)
+            positions[owner] = position
+            if path in local:
+                visible.append(local[path])
+                continue
+            request = routed.get(row.get("move_id", ""))
+            candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
+            targets = tuple(dict.fromkeys(item.destination.target for item in candidates
+                if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
+            reason = ci_reasons.get(owner, records.ReadyForAdmission())
+            if request is not None and self._local_placement_eligibility(request) == placement.TemporaryExclusion("blocked"):
+                holder = self.local_hold_holders.get(request.episode)
+                reason = records.NatedevHeld(holder.unit if isinstance(holder, placement.ResourceHolderUnit) else "", "")
+            visible.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
+                reason, row.get("unit", ""), route=records.waiter_route(row),
+                job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
+                verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
+                speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy)))
+        move_line = self._current_move_line(ordered, self._movable_wait_ids())
+        reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
-        self.published = PublishedReplies(view, explain)
+        self.published = PublishedReplies(view, explain, positions)
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -2786,14 +3148,63 @@ class AdmissionServer:
         return wire.encode_reply(reply).encode()
 
 
-    def _save_place(self, waiting: WaitingAdmission) -> None:
-        row, request = waiting.row, waiting.request
+    def _save_place(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
+                    row: records.Waiter) -> None:
         if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
             return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
-        place = waiter_place(row, request.episode)
-        self.places[key] = replace(place, queue_identity=previous.queue_identity) if previous is not None else place
+        run = request.run if isinstance(request, (wire.AdmitRequest, wire.PlacementRequest)) else wire.NO_RUN
+        place = waiter_place(row, request.episode, run=run)
+        if previous is not None:
+            if previous.episode == request.episode:
+                place = replace(place, queue_identity=previous.queue_identity)
+            elif previous.move_id:
+                self._depart_queue_id(previous.move_id)
+        if not place.move_id:
+            row["move_id"] = uuid.uuid4().hex
+            place = replace(place, move_id=row["move_id"])
+        self.places[key] = place
+
+    def _set_queue_pins(self, pins: QueuePins) -> None:
+        if pins != self.queue_pins:
+            self.queue_pins = pins
+            self.move_line = replace(self.move_line, revision=uuid.uuid4().hex)
+
+    def _depart_queue_id(self, row_id: str) -> None:
+        if not self.queue_pins:
+            return
+        pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
+        departed = QueueRowAnchor(row_id)
+        anchor = pins.pop(row_id, None)
+        if anchor is None:
+            if departed not in pins.values():
+                return
+            order = [row.get("move_id", "") for _, row in self._full_queue_order(self._ranked_waiters())]
+            index = order.index(row_id)
+            anchor = queue_anchor_at(order, index)
+        self._set_queue_pins(tuple(QueuePin(member, anchor if previous == departed else previous)
+                                   for member, previous in pins.items()))
+
+    def _end_move(self, waiting: WaitingAdmission) -> None:
+        self._clear_wait_rank(waiting.request.owner, waiting.row["since"], waiting.request.episode)
+
+    def _clear_wait_rank(self, owner: wire.Owner, since: float, episode: str) -> None:
+        key = _place_key(owner, since)
+        place = self.places.get(key)
+        if place is not None and place.episode == episode and place.move_id:
+            self._depart_queue_id(place.move_id)
+            self.places[key] = replace(place, move_id="")
+            if (waiting := self.waiters.get(episode)) is not None:
+                _ = waiting.row.pop("move_id", None)
+
+    def _end_placement_rank(self, request: wire.PlacementRequest) -> None:
+        waiting = self.waiters.get(request.episode)
+        if waiting is not None:
+            self._end_move(waiting)
+        else:
+            self._clear_wait_rank(wire.Owner(request.owner.pid, request.owner.start_time), request.since,
+                                  request.episode)
 
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: records.AdmissionDecision,
@@ -2859,9 +3270,11 @@ class AdmissionServer:
         else:
             shape = ""
         cloud = isinstance(request.place, wire.CloudPlace)
+        queue_waiter = records.stored_waiter(waiting.row)
+        _ = queue_waiter.pop("move_id", None)
         record = ReservationRecord(request.episode, str(stem), request.owner, 0 if cloud else profile.peak.bytes,
             profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
-            request.test_width, request.call, stem.name, records.stored_waiter(waiting.row),
+            request.test_width, request.call, stem.name, queue_waiter,
             profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
             profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
             shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
@@ -2874,7 +3287,8 @@ class AdmissionServer:
         return self._freeze_test_phase_need(record, config, share_percent)
 
     def _admit(self, waiters: list[WaitingAdmission], config: records.MemoryConfig, share_percent: int, *,
-               cargo_folder: placement.CargoFolder | placement.NoCargoFolder) -> None:
+               cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
+               verify_slots: Mapping[str, VerifyRunSlot]) -> None:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
@@ -2892,6 +3306,16 @@ class AdmissionServer:
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
+                slot = verify_slots.get(records.waiter_owner(waiting.row))
+                if slot is not None:
+                    current = self.verify_run_slots.get(slot.key)
+                    if current is None:
+                        self.verify_run_slots[slot.key] = replace(slot,
+                            use=PendingVerifyGrants(frozenset({admission.reservation_id})))
+                        self._watch_owner(slot.owner)
+                    elif isinstance(current.use, PendingVerifyGrants):
+                        self.verify_run_slots[slot.key] = replace(current,
+                            use=PendingVerifyGrants(current.use.reservations | {admission.reservation_id}))
                 for key, slot in list(self.slots.items()):
                     if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
                         del self.slots[key]
@@ -2902,7 +3326,9 @@ class AdmissionServer:
                     wire.CleanupTiming(config.silence_seconds, config.reconnect_seconds))
                 self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
                 self._watch_owner(request.owner)
-            self._save_place(waiting)
+            self._save_place(request, waiting.row)
+            if isinstance(admission, wire.LaunchAdmitted):
+                self._end_move(waiting)
             replies.append(reply)
         first = waiters[0].request
         if (isinstance(first, wire.AdmitRequest) and isinstance(first.place, wire.CloudPlace)
@@ -2914,17 +3340,30 @@ class AdmissionServer:
         for waiting, reply in zip(waiters, replies, strict=True):
             self._remove_waiter(waiting, reply)
 
-    def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
+    def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
+        started = isinstance(ending, ReleaseStatus)
+        if not started and "verify" in record.queue_waiter and record.sidecar:
+            try:
+                started = bool(Path(record.sidecar).read_text().strip())
+            except FileNotFoundError:
+                pass
+        if started:
+            self._finish_verify_grant(record.reservation_id, started=True)
         record = replace(record, ending=ending)
         self.reservations[episode] = record
         self.persist()
         row = reservation_row(record)
-        if isinstance(ending, (OwnerExited, NotEnding)):
+        if isinstance(ending, (OwnerExited, NotEnding, LocalGrantReturned)):
             lifetime = self._lifetime(record)
             if isinstance(lifetime, gate.PopulatedStepScope):
+                self._finish_verify_grant(record.reservation_id, started=True)
+                self.persist()
                 self._watch_scope(lifetime, episode)
                 return
+            self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
+        elif isinstance(ending, ReleaseStatus) and episode not in self.placement_requests:
+            self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
         if record.episode.startswith("uid:"):
@@ -2937,12 +3376,18 @@ class AdmissionServer:
         if isinstance(ending, TokenWaiting):
             row_waiter = record.queue_waiter.copy()
             row_waiter["token_left_at"] = ending.left_at
-            self.places[_place_key(record.owner, row_waiter["since"])] = waiter_place(row_waiter, record.episode)
+            key = _place_key(record.owner, row_waiter["since"])
+            place = self.places.get(key)
+            if place is not None and place.episode == record.episode and place.move_id:
+                row_waiter["move_id"] = place.move_id
+            self.places[key] = waiter_place(row_waiter, record.episode, run=record.run)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
-                                self.places, RegisteredServiceWrites(self.writes)),
+                                self.places, RegisteredServiceWrites(self.writes),
+                                retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False)),
             end_kind=end_kind)
-        if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
+        if ((started or not isinstance(ending, LocalGrantReturned))
+                and isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
             if isinstance(record.slot_staff, records.NoEndedStepStaff):
@@ -3295,6 +3740,8 @@ done
         self.assignments = {key: saved for key, saved in self.assignments.items()
                             if saved.assignment.episode not in ended}
         for episode in ended:
+            if (request := self.placement_requests.get(episode)) is not None:
+                self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
@@ -3433,7 +3880,7 @@ done
                             if isinstance(recovered, HanaSettled):
                                 outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
                                 evidence = (execution_identity.ExecutionNotStarted()
-                                    if isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                                    if isinstance(outcome, BeforeLaunchRefusal)
                                     else recovered.evidence)
                                 return wire.ExecutionReport('hana-recovery:' + reference.claim_id, saved.assignment,
                                     reference, evidence, outcome, placement.DispatchPathSettled())
@@ -3506,9 +3953,6 @@ done
         place = self.places.get(_place_key(admission.owner, admission.since), records.NoWaiter())
         row = self._row(admission, place)
         if isinstance(request.run, wire.RunIdentity):
-            run_place = self.run_places.get(records.run_owner(request.run.pid, request.run.start_time))
-            if run_place is not None:
-                row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
@@ -3574,7 +4018,7 @@ done
                         for report in (attempt.terminal_report,)
                         if isinstance(attempt.state, placement.ClosedAssignment)
                         and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                        and isinstance(report.outcome, BeforeLaunchRefusal)
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
                         and scopes_overlap(attempt.provider.scope, destination.scope))
@@ -3628,11 +4072,7 @@ done
     def _update_remote_start_hold(self, request: wire.PlacementRequest, key: str,
                                   saved: records.SavedPlacementAssignment, remote_start_hold_seconds: int) -> bool:
         if (saved.assignment.destination.provider == "local"
-                or not isinstance(saved.state, placement.CurrentAssignment)
-                or isinstance(saved.remote_start_hold, records.RemoteStartHoldEnded)):
-            return False
-        if not self._can_hold_local_place(request):
-            self.assignments[key] = self._end_remote_start_hold(request, saved)
+                or not isinstance(saved.state, placement.CurrentAssignment)):
             return False
         if isinstance(saved.permission, placement.PermissionConsumed):
             evidence = self.execution_evidence.get(key)
@@ -3642,9 +4082,15 @@ done
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
+                self._end_placement_rank(request)
                 self.assignments[key] = self._end_remote_start_hold(request, saved)
                 return False
         hold = saved.remote_start_hold
+        if isinstance(hold, records.RemoteStartHoldEnded):
+            return False
+        if not self._can_hold_local_place(request):
+            self.assignments[key] = self._end_remote_start_hold(request, saved)
+            return False
         now = self.clock.now()
         if isinstance(hold, records.RemoteStartHoldUnrecorded):
             hold = records.RemoteStartHold(now + remote_start_hold_seconds)
@@ -3689,6 +4135,7 @@ done
             key = self.current_assignments.get(request.episode, "")
             saved = self.assignments.get(key)
             if not self._placement_owner_live(request.owner):
+                self._end_placement_rank(request)
                 if saved is not None:
                     if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
@@ -3704,6 +4151,7 @@ done
             self.local_hold_holders[request.episode] = local_holder
             admission = self._placement_admission(request)
             row = self._placement_row(request)
+            self._save_place(request, row)
             if isinstance(admission, wire.AdmitRequest):
                 prepared.add(request.episode)
                 previous = self.waiters.get(request.episode)
@@ -3712,7 +4160,6 @@ done
                     self._remove_waiter(previous, claim_disposition=WaiterClaimDisposition.TRANSFER)
                 waiting = WaitingAdmission(admission, row, NO_CONNECTION, continuation_claim=claim)
                 self.waiters[request.episode] = waiting
-                self._save_place(waiting)
                 self._run_place(admission, waiter_place(row, request.episode))
         for episode, waiting in tuple(self.waiters.items()):
             if episode in self.placement_requests and episode not in prepared:
@@ -3785,6 +4232,8 @@ done
                       and not any(attempt.assignment.episode == request.episode
                                   and attempt.retry == placement.DoNotRetry(placement.HANA_IMAGE_STALE)
                                   for attempt in self.assignments.values()))
+        owner = records.run_owner(request.owner.pid, request.owner.start_time)
+        position = self.published.wait_positions.get(owner, 0) if isinstance(self.published, PublishedReplies) else 0
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
             state = self._assignment_state(saved)
@@ -3793,7 +4242,7 @@ done
             if isinstance(state, placement.ClosedAssignment):
                 # A released provider claim is final only after a pass settles the attempt and its retry.
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
-                return wire.PlacementWait(request.episode, request.since, 1,
+                return wire.PlacementWait(request.episode, request.since, position,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
@@ -3802,7 +4251,7 @@ done
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
             if isinstance(saved.permission, placement.PermissionConsumed):
-                return wire.PlacementWait(request.episode, request.since, 1,
+                return wire.PlacementWait(request.episode, request.since, position,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
@@ -3836,17 +4285,16 @@ done
                 if isinstance(candidate.eligibility, placement.FixedExclusion))
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""), placement.ClosedAssignment(reason),
                 placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
-        ordered, _priority = self._queue_order()
-        owner = records.waiter_owner(self._placement_row(request))
-        position = next((index for index, (_, row) in enumerate(ordered, 1)
-                         if records.waiter_owner(row) == owner), len(ordered) + 1)
         waiting = self.waiters.get(request.episode)
-        if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
-            reason = waiting.last_reply.reason
+        wait = waiting.last_reply if waiting is not None else NO_WAIT_REPLY
+        if isinstance(wait, wire.Wait):
+            if wait.position != position:
+                wait = replace(wait, position=position)
+            reason = wait.reason
             cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired):
+            if isinstance(cause, placement.CargoFolderWait | records.BuildSpaceHold | records.EstimateExpired | records.RunLimitWait):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
-                    waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
+                    wait, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
             return wire.PlacementWait(request.episode, request.since, position, candidates, provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
         blocked = [candidate for candidate in candidates
@@ -3868,9 +4316,9 @@ done
             assert isinstance(candidate.eligibility, placement.TemporaryExclusion)
             return wire.PlacementWait(request.episode, request.since, position, candidates,
                 wire.PlacementResourceWait(candidate.destination.target, candidate.eligibility.reason, holder), diagnostics, disk_exclusions, retry_notices)
-        if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
+        if isinstance(wait, wire.Wait):
             return wire.PlacementWait(request.episode, request.since, position,
-                self.placement_eligibility.get(request.episode, ()), waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
+                candidates, wait, diagnostics, disk_exclusions, retry_notices)
         return wire.PlacementWait(request.episode, request.since, position,
             self.placement_eligibility.get(request.episode, ()), provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
 
@@ -3883,7 +4331,8 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
-    def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
+    def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
+                        policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
@@ -3898,17 +4347,15 @@ done
             request = owners.get(records.waiter_owner(row))
             prerequisite = (self.prerequisites.get(request.episode) if request is not None
                             else placement.TokenNotRequired())
-            if (isinstance(prerequisite, placement.TokenRequired)
-                    and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked)):
+            unchecked = (isinstance(prerequisite, placement.TokenRequired)
+                         and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
+            if unchecked:
                 row = row.copy()
-                if "token_left_at" in row:
-                    del row["token_left_at"]
-                if "token_back_at" in row:
-                    del row["token_back_at"]
+                _ = row.pop("token_left_at", None)
+                _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
         preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
-        ordered, _priority = self._queue_order()
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -4140,12 +4587,17 @@ done
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         self._remove_waiter(self.waiters.get(assignment.episode))
-        if self.current_assignments.get(assignment.episode) == key:
-            request = self.placement_requests.get(assignment.episode)
+        current = self.current_assignments.get(assignment.episode) == key
+        request = self.placement_requests.get(assignment.episode)
+        if current:
             if request is not None:
                 saved = self._end_remote_start_hold(request, saved)
+                if reason in ("cancelled", "completed"):
+                    self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
+        if current and request is not None and self._placement_waiting(request):
+            self._save_place(request, self._placement_row(request))
         self._prune_host_evidence()
         self.persist()
         self.next_pass = self.clock.monotonic()
@@ -4155,8 +4607,7 @@ done
         """Close a Hana attempt when its journal confirms release before launch."""
         assignment = saved.assignment
         if (assignment.destination.provider != "ssh"
-                or not isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled,
-                                                     execution_identity.HanaCommandAdmissionRefused))
+                or not isinstance(report.outcome, BeforeLaunchRefusal | placement.AttemptCancelled)
                 or not isinstance(saved.permission, placement.PermissionAvailable)):
             return False
         from scripts.aws_target import hana_placement
@@ -4236,6 +4687,13 @@ done
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
+        assignment = saved.assignment
+        if (assignment.destination.provider == "local" and isinstance(outcome, placement.PrelaunchRefused)
+                and (reservation := self.reservations.get(assignment.episode)) is not None):
+            with retry_cleanup(Path(reservation.path)):
+                self._end(assignment.episode, LocalGrantReturned())
+            if assignment.episode in self.reservations:
+                return
         if isinstance(outcome, placement.AttemptCompleted):
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
@@ -4270,9 +4728,10 @@ done
                 if saved is not None and (isinstance(saved.permission, placement.PermissionAvailable)
                         or saved.assignment.destination.provider == "local"):
                     if saved.assignment.destination.provider == "local" and request.episode in self.reservations:
-                        reservation = self.reservations[request.episode]
-                        with retry_cleanup(Path(reservation.path)):
-                            self._end(request.episode, OwnerExited())
+                        try:
+                            self._end(request.episode, LocalGrantReturned())
+                        except (OSError, ValueError, TypeError, KeyError) as error:
+                            return [wire.Refused(f"cannot return the local grant: {error}")]
                     report = saved.terminal_report
                     if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):
@@ -4283,6 +4742,7 @@ done
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason))
                 elif saved is None:
+                    self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
@@ -4329,6 +4789,8 @@ done
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
+            if self._placement_waiting(request):
+                self._save_place(request, self._placement_row(request))
             self._watch_owner(request.owner)
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
@@ -4373,7 +4835,7 @@ done
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
-                and (isinstance(request.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                and (isinstance(request.outcome, BeforeLaunchRefusal)
                     or isinstance(request.outcome, placement.AttemptCancelled)
                     and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
                     and saved.terminal_report.outcome == request.outcome)
@@ -4384,7 +4846,7 @@ done
             self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
-                    or isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                    or isinstance(outcome, BeforeLaunchRefusal)
                     and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
                 previous = saved.terminal_report
                 if isinstance(previous, placement.NoTerminalReport):
@@ -4409,11 +4871,16 @@ done
             else:
                 self.persist()
                 self.next_pass = self.clock.monotonic()
-        self._publish_replies()
+        if not self.pass_stale:
+            self._publish_replies(self._queue_order())
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
         if isinstance(request, status_wire.PlacementStatusRequest):
+            return ""
+        if isinstance(request, wire.VerifyRunSlotRequest):
+            if uid != os.getuid() and process_uid(request.owner.pid, self.proc.path) != uid:
+                return "Verify process belongs to another account or no longer exists"
             return ""
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
@@ -4426,6 +4893,8 @@ done
             return ""
         if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             return "queue priority and head admission require the service account"
+        if isinstance(request, (wire.QueueMoveRequest, wire.QueueUndoRequest)):
+            return "queue moves require the service account"
         if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             return ""
         key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
@@ -4514,7 +4983,8 @@ done
 
     def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
-        refusal = self._authorize(request, peer_uid(connection))
+        uid = peer_uid(connection)
+        refusal = self._authorize(request, uid)
         if refusal:
             return [wire.Refused(refusal)]
         if isinstance(request, status_wire.PlacementStatusRequest):
@@ -4524,6 +4994,9 @@ done
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
             return [wire.Refused("Repository copy capacity no longer requires admission")]
+        if isinstance(request, wire.VerifyRunSlotRequest):
+            # Older clients can still ask. Only a local memory grant takes a slot.
+            return [wire.Ok()]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, wire.PlacementRequest):
@@ -4555,11 +5028,13 @@ done
             if not isinstance(self.pending_configuration, NoPass):
                 _ = self.run_pass()
             elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
+                self._prune_runs()
+                ordered = self._queue_order()
                 if isinstance(self.last_policy, records.AdmissionPolicy):
-                    self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
+                    self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                     self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
                 self.pass_stale = False
-                self._publish_replies()
+                self._publish_replies(ordered)
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, records.QueueInputs)
@@ -4573,6 +5048,8 @@ done
             if isinstance(request, wire.ViewRequest):
                 return [published.view]
             return [wire.MineReply(published.view.reading)]
+        if isinstance(request, (wire.QueueMoveRequest, wire.QueueUndoRequest)):
+            return self._move_queue(request)
         key = request.episode if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) else request.request_id
         replay = self.ledger.get(key)
         if replay is not None:
@@ -4607,7 +5084,7 @@ done
             if previous is not None and previous.connection is not connection:
                 self._remove_waiter(previous, claim_disposition=WaiterClaimDisposition.TRANSFER)
             self.waiters[key] = WaitingAdmission(request, row, connection, continuation_claim=claim)
-            self._save_place(self.waiters[key])
+            self._save_place(request, row)
             self._watch_owner(request.owner)
             if (isinstance(request, wire.AdmitRequest) and request.token_back_at
                     and not isinstance(place.token_left_at, TokenNotLeft)):
@@ -4642,7 +5119,9 @@ done
             self.persist()
             if (isinstance(self.last_inputs, records.QueueInputs)
                     and isinstance(self.last_policy, records.AdmissionPolicy)):
-                self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
+                self._prune_runs()
+                ordered = self._queue_order()
+                self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
             return [self.ledger[key].reply]
@@ -4656,6 +5135,87 @@ done
             replies = self._pending_replies.pop(key, [])
             return replies if ran else []
         return [self.ledger[key].reply]
+
+    def _move_queue(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest) -> list[wire.Reply]:
+        key = "queue-move:" + request.request_id
+        previous = self.ledger.get(key)
+        if previous is not None:
+            return [previous.reply]
+        if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
+            return [wire.Refused(self.configuration.reason)]
+        full_order = self._full_queue_order(self._ranked_waiters())
+        rows = self._published_queue_order(self._visible_queue_order(full_order))
+        line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
+        result = self._move_destination(request, line, [row.get("move_id", "") for _, row in full_order])
+        if isinstance(result, wire.QueueMoveConflict):
+            return self._mutation_reply(key, result)
+        reply, undo_anchor = result
+        self.ledger[key] = ReplayEntry(reply, self.clock.now(), undo_anchor=undo_anchor)
+        self.pass_stale = True
+        self.next_pass = self.clock.monotonic()
+        self.persist()
+        return [reply]
+
+    def _move_destination(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest, line: records.QueueMoveLine,
+                          full_order: list[str]) -> tuple[wire.QueueMoved, QueueAnchor] | wire.QueueMoveConflict:
+        changed = wire.QueueMoveConflict(line, "The queue changed. Try the move again.")
+        unavailable = wire.QueueMoveConflict(line, "Undo not available")
+        by_id = {member.row_id: member for member in line.members}
+        row_id = request.row_id
+        moving = by_id.get(row_id)
+        undo = isinstance(request, wire.QueueUndoRequest)
+        if moving is None or not moving.movable or request.revision != line.revision:
+            return unavailable if undo else changed
+
+        visible_order = list(by_id)
+        old_index = visible_order.index(row_id)
+        del visible_order[old_index]
+        full_index = full_order.index(row_id)
+        previous_anchor = queue_anchor_at(full_order, full_index)
+        if isinstance(request, wire.QueueUndoRequest):
+            saved = self.ledger.get("queue-move:" + request.move_request_id)
+            if (saved is None or not isinstance(saved.reply, wire.QueueMoved) or saved.reply.row_id != row_id
+                    or isinstance(saved.undo_anchor, NoQueueUndoAnchor)):
+                return unavailable
+            destination = saved.undo_anchor
+            if isinstance(destination, QueueRowAnchor) and destination.row_id not in full_order:
+                return wire.QueueMoveConflict(line, "The old neighbor left the queue.")
+        elif isinstance(request.destination, wire.QueueHeadDrop):
+            destination = QueueHeadAnchor()
+        else:
+            drop = request.destination
+            if drop.neighbor not in visible_order:
+                return changed
+            place = visible_order.index(drop.neighbor) + int(drop.side == "after")
+            if place == old_index:
+                return wire.QueueMoved(row_id, line, old_index + 1, old_index + 1), previous_anchor
+            destination = QueueHeadAnchor() if place == 0 else drop
+
+        self._move_pin(row_id, destination, full_order, full_index, previous_anchor)
+        updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id))
+        new_index = next(index for index, member in enumerate(updated.members) if member.row_id == row_id)
+        return wire.QueueMoved(row_id, updated, old_index + 1, new_index + 1), previous_anchor
+
+    def _move_pin(self, row_id: str, destination: wire.QueueDrop | QueueAnchor, order: list[str],
+                  old_index: int, old_anchor: QueueAnchor) -> None:
+        pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
+        moved = QueueRowAnchor(row_id)
+        del order[old_index]
+        if old_index < len(order) and pins.get(order[old_index]) == moved:
+            pins[order[old_index]] = old_anchor
+
+        if isinstance(destination, QueueHeadAnchor):
+            index = 0
+        elif isinstance(destination, QueueRowAnchor):
+            index = order.index(destination.row_id) + 1
+        else:
+            index = order.index(destination.neighbor) + int(destination.side == "after")
+        anchor = queue_anchor_at(order, index)
+        if index < len(order) and pins.get(order[index]) == anchor:
+            pins[order[index]] = moved
+        pins[row_id] = anchor
+        order.insert(index, row_id)
+        self._set_queue_pins(tuple(QueuePin(member, pins[member]) for member in order if member in pins))
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:
@@ -4759,7 +5319,8 @@ done
         _ = self._run_pass(configuration)
         return [self.ledger[key].reply]
 
-    def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused, reservation: str = "") -> list[wire.Reply]:
+    def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused | wire.QueueMoveConflict,
+                        reservation: str = "") -> list[wire.Reply]:
         live = any(record.reservation_id == reservation for record in self.reservations.values())
         self.ledger[key] = ReplayEntry(reply, LiveGrant() if live else self.clock.now(), reservation)
         self.persist()
@@ -4878,6 +5439,7 @@ done
         for episode, waiting in list(self.waiters.items()):
             if waiting.connection is connection:
                 self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled")
+                self._end_move(waiting)
                 _ = self.places.pop(_place_key(waiting.request.owner, waiting.row["since"]), None)
                 self._remove_waiter(waiting, reply, claim_disposition=WaiterClaimDisposition.RETURN)
                 changed = True

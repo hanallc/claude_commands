@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.agents import detached_runs, remote
 from scripts.astra import astra_review  # noqa: E402
@@ -24,7 +25,7 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production import test_worker as worker_tests
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.herdr import herdr, side_pane, turn_end, worker_panes
+from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
 from scripts.direct import assign, progress_history, remove_run_scratch, workers
 from scripts.message import send
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
@@ -66,8 +67,7 @@ class AstraReviewTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.root = self.fixture.fixture.root
         self.router.setup(self, self.root)
         self.fixture.agent.consultations(self)
@@ -626,7 +626,7 @@ class AstraReviewTests(StaffTestCase):
         def read_during_delivery(options: send.Options) -> send.Result:
             delivered = send_notice(options)
             pending = worker_panes.worker_pass(row, run)
-            self.assertNotIn("hook_notice", pending)
+            self.assertFalse(pass_notices.is_settled(run, instance, "done"))
             self.assertEqual(pending["status"], "error")
             reads.append(self.run_script("--read", str(reply), "--run-directory", str(run)))
             return delivered
@@ -642,7 +642,7 @@ class AstraReviewTests(StaffTestCase):
         saved = state["pass"][row.name]
         self.assertEqual((saved["instance_id"], saved["status"], saved["finished_at"]),
                          (instance, "error", ended["finished_at"]))
-        self.assertTrue(saved["hook_notice"])
+        self.assertTrue(pass_notices.is_settled(run, instance, "done"))
         self.assertEqual(tuple(self.fixture.agent.submitted), prompts)
 
     def test_read_prints_the_validated_reply_when_the_file_changes(self) -> None:

@@ -49,6 +49,7 @@ from scripts.lib.shell_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
+
 _REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
 
 
@@ -1411,6 +1412,7 @@ PINNED_TARGET="" STEP_FORCE_MAC=0
 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
+admit_verify_run() { :; }
 LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scripts/direct/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")

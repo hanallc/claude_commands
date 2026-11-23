@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
@@ -43,7 +44,7 @@ from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
+from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, sessions
@@ -100,7 +101,7 @@ class DetachedRunsTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.stack = contextlib.ExitStack()
+        self.stack = self.enterContext(contextlib.ExitStack())
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
@@ -120,9 +121,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
 
-        fixture = StaffTestCase()
-        fixture.setUp()
-        _ = self.stack.callback(fixture.doCleanups)
+        fixture = set_up_fixture(self.stack.callback, StaffTestCase())
         _, self.unit, _ = fixture.tree()
         self.unit = staff.set_worktree(self.unit.id, staff.PresentWorktree("natedev", self.root), expected=self.unit.worktree)
         self.stack.enter_context(patch.dict(os.environ, {
@@ -146,11 +145,6 @@ class DetachedRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(patch.object(send, "deliver_worker_text", side_effect=deliver_fixture))
         _ = self.stack.enter_context(patch.object(detached_runs, "deliver_in_fresh_process",
                                                  side_effect=deliver_in_fixture))
-
-    @override
-    def tearDown(self) -> None:
-        self.stack.close()
-
 
     def record_worker(self, name: str, thread_id: str) -> staff.StaffRow:
         fixture_session(thread_id, staff.CodexBackend(self.root / "codex-home"))
@@ -2253,9 +2247,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = pane_support.WorkerPaneTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, pane_support.WorkerPaneTests())
         self.inputs = []
         self.notices = []
         self.defer_transcript = False
@@ -3053,7 +3045,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         nonlocal locks
                         locks += 1
                         if locks == 2:
-                            self.assertTrue(progress_history.stopped_notice_delivered(self.run_dir, dispatch))
+                            self.assertTrue(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
                             if later == "new prompt":
                                 agent.append(pane, "user", "Check another file.")
                                 self.fixture.world.locations[pane]["agent_status"] = "working"
@@ -3076,9 +3068,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
                     if later == "new prompt":
                         self.assertEqual(errors.getvalue().splitlines(), ["impl: kept pane: agent state is working"])
-                        digest = hashlib.sha256(dispatch.encode()).hexdigest()
-                        diagnostic_path = self.run_dir / f".{digest}.completion-diagnostics.json"
-                        self.assertEqual(worker_lifecycle.read_json_object(diagnostic_path),
+                        self.assertEqual(self.stopped_diagnostics(dispatch),
                                          {"impl: kept pane: agent state is working": True})
                         self.assertEqual(agent.notices[1], "impl: kept pane: agent state is working")
                         self.assertEqual(agent.notice_senders[-1], send.CodexSender(str(row.current_session)))
@@ -3115,12 +3105,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(len(agent.notices), notice_count)
                     self.assertEqual(reply_path.read_bytes(), saved_reply)
 
+    def stopped_diagnostics(self, dispatch: str) -> dict[str, bool]:
+        record = pass_notices.read(self.run_dir, dispatch)
+        assert record is not None
+        return {notice.text: notice.settled for notice in record.notices.values()
+                if notice.kind == pass_notices.NoticeKind.DIAGNOSTIC}
+
     def check_stopped_diagnostic_retry(self, agent: test_worker.DispatchAgent, row: staff.StaffRow,
                                        pane: str, dispatch: str, event: turn_end.WorkerEvent,
                                        *, reassign: bool, assign_during_retry: bool = False) -> None:
         message = "impl: kept pane: agent state is working"
-        digest = hashlib.sha256(dispatch.encode()).hexdigest()
-        diagnostic = self.run_dir / f".{digest}.completion-diagnostics.json"
         self.fixture.world.locations[pane]["agent_status"] = "working"
         deliver = send.send
 
@@ -3133,7 +3127,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
               contextlib.redirect_stderr(io.StringIO()),
               self.assertRaisesRegex(ValueError, "private diagnostic send failed")):
             _ = turn_end.handle(event)
-        self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: False})
+        self.assertEqual(self.stopped_diagnostics(dispatch), {message: False})
         self.assertEqual(len(agent.notices), 1)
         self.assertIn("phase 40: stopped", agent.notices[0])
 
@@ -3178,7 +3172,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             with patch.object(send, "send", side_effect=assign_before_delivery):
                 self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
                 self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
-            self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: True})
+            self.assertEqual(self.stopped_diagnostics(dispatch), {message: True})
             self.assertEqual(agent.notices[1:], [message])
             self.assertEqual(agent.submitted[-1][0], pane)
             passed = worker_panes.worker_pass(row, self.run_dir)
@@ -3188,7 +3182,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         before = (self.run_dir / unit_runs.STATE_FILE).read_bytes()
         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
-        self.assertEqual(worker_lifecycle.read_json_object(diagnostic), {message: True})
+        self.assertEqual(self.stopped_diagnostics(dispatch), {message: True})
         self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
         self.assertEqual(agent.notices[1:], [message])
         self.assertIn(pane, self.fixture.world.locations)
@@ -3213,6 +3207,15 @@ class PaneRunDeliveryTests(unittest.TestCase):
         digest = hashlib.sha256(dispatch.encode()).hexdigest()
         diagnostics = self.run_dir / f".{digest}.completion-diagnostics.json"
         return StoppedDiagnosticFixture(agent, row, pane, dispatch, path, diagnostics)
+
+    def saved_diagnostics(self, dispatch: str, legacy: Path) -> dict[str, bool]:
+        """Read the pass diagnostics; a legacy file that no retry imported yet is on top."""
+        record = pass_notices.read(self.run_dir, dispatch)
+        saved = {} if record is None else {notice.text: notice.settled for notice in record.notices.values()
+                                           if notice.kind == pass_notices.NoticeKind.DIAGNOSTIC}
+        if legacy.is_file():
+            saved |= {text: settled is True for text, settled in worker_lifecycle.read_json_object(legacy).items()}
+        return saved
 
     def check_diagnostic_retry_after_close(self, *, end_worker: bool,
                                            retry: Literal["direct", "detached", "terminal run"]) -> None:
@@ -3247,7 +3250,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 if end_worker:
                     self.assertIsNone(staff.by_id(identity))
             self.assertIn("private diagnostic send failed", errors.getvalue())
-            self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: False})
+            self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: False})
             saved = progress_history.hook_completion(progress_history.pass_for_finalization(self.run_dir, case.dispatch))
             assert isinstance(saved, progress_history.HookCompletion)
             self.assertTrue(saved.finished)
@@ -3277,7 +3280,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     arguments = ["progress_history.py", "recover-run-ends", "--root", str(self.run_dir.parent)]
                     with patch.object(sys, "argv", arguments):
                         progress_history.main()
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: True})
         self.assertEqual(attempts, [message, message])
         self.assertEqual(case.agent.notices[1:], [message])
 
@@ -3320,7 +3323,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("private diagnostic send failed", errors.getvalue())
         self.assertIsNone(staff.by_id(case.row.id))
         self.assertIsNone(unit_runs.open_run(str(parent.current_session)))
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics)[message], False)
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics)[message], False)
         self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], True)
 
         _ = detached_runs.prune_finished(case.detached_record.parent)
@@ -3329,7 +3332,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
         self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
         self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
-        self.assertIs(worker_lifecycle.read_json_object(case.diagnostics)[message], True)
+        self.assertIs(self.saved_diagnostics(case.dispatch, case.diagnostics)[message], True)
         self.assertEqual(case.agent.notices.count(message), 1)
 
     def test_ordinary_completion_keeps_diagnostics_from_the_stopped_pass(self) -> None:
@@ -3356,7 +3359,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
 
         self.assertIsNone(staff.by_id(case.row.id), errors.getvalue())
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: False})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: False})
         self.assertIs(worker_lifecycle.read_json_object(path)["completion_pending"], True)
         _ = detached_runs.prune_finished(path.parent)
         self.assertTrue(path.is_file())
@@ -3364,7 +3367,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
 
         self.assertIs(worker_lifecycle.read_json_object(path)["completion_pending"], False)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: True})
         self.assertEqual(case.agent.notices[1:], [message])
 
     def test_finished_stop_preserves_an_unreadable_diagnostic_for_restore(self) -> None:
@@ -3393,7 +3396,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
         self.assertEqual(worker.restore(parent.id), worker.ExitCode.OK)
         self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: True})
         self.assertEqual(case.agent.notices[1:], [message])
 
     def test_terminal_run_recovery_retries_diagnostics_without_a_run_pointer(self) -> None:
@@ -3421,16 +3424,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with (patch.object(turn_end, "_stopped_pane_use", return_value=worker.DispatchEvidenceUnknown("missing pane evidence")),
               patch.object(send, "send", side_effect=fail_first), contextlib.redirect_stderr(io.StringIO())):
             self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, case.row.id), worker.CompletionRecovery.PENDING_CLOSE)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first_message: False})
-        self.assertEqual(worker_lifecycle.read_json_object(later_path), {later_message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first_message: False})
+        self.assertEqual(self.saved_diagnostics(later, later_path), {later_message: True})
         self.assertEqual(case.agent.notices[1:], [later_message])
         parent = self.fixture.parent
         with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(case.row.name)) as hold:
             assert isinstance(hold, worker_panes.WorkerLockHold)
             self.assertEqual(turn_end.recover_completion(case.row, parent, self.run_dir, hold,
                 record=staff.snapshot(), pane=worker.KeepCompletedPane.KEEP), worker.CompletionRecovery.NO_PENDING_NOTICE)
-            self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first_message: False})
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first_message: True})
+            self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first_message: False})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first_message: True})
         self.assertEqual(case.agent.notices[1:], [later_message, first_message])
 
     def test_stopped_diagnostic_added_during_delivery_survives_the_success_write(self) -> None:
@@ -3447,21 +3450,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     with (patch.object(worker_panes, "close", return_value=worker_panes.Kept("private close failure")),
                           self.assertRaisesRegex(ValueError, "private close failure")):
                         _ = turn_end.recover_stopped_in_run(self.run_dir, case.row.id, hold=hold)
-                    self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first: False, second: False})
+                    self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first: False, second: False})
             return deliver(options)
 
         with patch.object(send, "send", side_effect=record_close_failure):
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.PENDING)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first: True, second: False})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first: True, second: False})
         self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {first: True, second: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {first: True, second: True})
         self.assertEqual(case.agent.notices[1:], [first, second])
 
     def test_stopped_diagnostic_retry_keeps_the_message_key_after_a_success_write_failure(self) -> None:
         case = self.stopped_diagnostic_fixture()
         message = "Pending diagnostic."
         write_text_atomic(case.diagnostics, json.dumps({message: False}))
-        write = worker.CompletionArtifacts.write
         deliver = send.send
         attempts: list[tuple[str | None, send.TransportRecipientIdentity | send.LogicalRecipientIdentity]] = []
 
@@ -3473,18 +3475,13 @@ class PaneRunDeliveryTests(unittest.TestCase):
             attempts.append(receipt)
             return deliver(options)
 
-        def fail_stamp(artifacts: worker.CompletionArtifacts, path: Path, text: str, *, create_only: bool = False) -> None:
-            if path == case.diagnostics:
-                raise OSError("private diagnostic stamp failure")
-            write(artifacts, path, text, create_only=create_only)
-
         with patch.object(send, "send", side_effect=deliver_once):
-            with (patch.object(worker.CompletionArtifacts, "write", new=fail_stamp),
+            with (patch.object(pass_notices, "_settle", side_effect=OSError("private diagnostic stamp failure")),
                   contextlib.redirect_stderr(io.StringIO())):
                 self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.PENDING)
-            self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: False})
+            self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: False})
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: True})
         first, second = attempts
         self.assertEqual(first, second)
         self.assertTrue(first[0])
@@ -3494,8 +3491,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
         case = self.stopped_diagnostic_fixture()
         message = "Pending diagnostic."
         write_text_atomic(case.diagnostics, json.dumps({message: False}))
-        lock = case.diagnostics.with_name(case.diagnostics.name.replace(".completion-diagnostics.json", ".notice.lock"))
-        with worker.CompletionArtifacts(self.fixture.parent, self.run_dir).lock(lock):
+        lock = case.diagnostics.with_name(case.diagnostics.name.replace(".completion-diagnostics.json",
+                                                                        ".pass-notices.delivery.lock"))
+        with lock.open("a") as delivery:
+            fcntl.flock(delivery, fcntl.LOCK_EX)
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.PENDING)
         state = self.run_dir / unit_runs.STATE_FILE
         saved = state.read_bytes()
@@ -3503,7 +3502,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.UNREADABLE)
             self.assertEqual(turn_end.recover_stopped_in_run(self.run_dir, case.row.id), worker.CompletionRecovery.PENDING_CLOSE)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: False})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: False})
         self.assertEqual(case.agent.notices[1:], [])
         _ = state.write_bytes(saved)
         fields = unit_runs.read_run_fields(self.run_dir)
@@ -3513,7 +3512,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(state, json.dumps(fields))
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.UNREADABLE)
-        self.assertEqual(worker_lifecycle.read_json_object(case.diagnostics), {message: True})
+        self.assertEqual(self.saved_diagnostics(case.dispatch, case.diagnostics), {message: True})
         _ = state.write_bytes(saved)
         self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
         self.assertEqual(case.agent.notices[1:], [message])

@@ -35,6 +35,7 @@ if __name__ == "__main__":
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
     import argparse
+    from scripts.accounts import role_map
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -1037,10 +1038,34 @@ def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
 
 
 @contextmanager
-def slot_operation(key: str, name: str) -> Generator[None]:
+def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+    """Lock the native session before its staff row, if it has one."""
+    if join_recovery:
+        if not _joined_operation(*_row_lock(native_key)):
+            raise StaffRefused("recovery did not pass the native session lock")
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is None or not _joined_operation(*_row_lock(row.id)):
+            raise StaffRefused("recovery did not pass the staff row lock")
+        yield record
+        return
+    with slot_operation(native_key, session, join=False), ExitStack() as locks:
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is not None:
+            _ = locks.enter_context(slot_operation(row.id, row.name, join=False))
+            record = initial_snapshot()
+            current = record.by_current_session(session)
+            if current is None or current.id != row.id:
+                raise StaffRefused(f"{row.name}: the session owner changed while acquiring its row")
+        yield record
+
+
+@contextmanager
+def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
-    if _joined_operation(path, variable):
+    if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1597,6 +1622,72 @@ def authority_snapshot() -> StaffSnapshot:
     return replace(_snapshot_value(cast(dict[str, object], value)), production=True)
 
 
+@dataclass(frozen=True)
+class PeerStatusAuthority:
+    membership: StaffSnapshot
+    accounts: role_map.RoleMap
+
+    def encode(self) -> str:
+        from scripts.accounts import role_map
+
+        return json.dumps({
+            "staff": self.membership.encode(),
+            "role_map": role_map.encode_role_map(self.accounts),
+        })
+
+
+@dataclass(frozen=True)
+class ReadStatusAuthority:
+    """Read staff and roles from their authorities during status."""
+
+
+def peer_status_authority() -> PeerStatusAuthority | ReadStatusAuthority:
+    """Supply staff and roles from the production staff owner."""
+    from scripts.accounts import role_map
+
+    if _file_override() or not is_owner():
+        return ReadStatusAuthority()
+    try:
+        roles = role_map.read_role_map()
+    except role_map.RoleMapUnavailable:
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(authority_snapshot(), roles)
+
+
+def decode_peer_status_authority(text: str) -> PeerStatusAuthority | ReadStatusAuthority:
+    """Decode the peer's staff and roles together."""
+    from scripts.accounts import role_map
+
+    try:
+        value = _decode(text)
+        if not isinstance(value, dict):
+            return ReadStatusAuthority()
+        document = cast(dict[str, object], value)
+        membership, roles = document.get("staff"), document.get("role_map")
+        if not isinstance(membership, str) or not isinstance(roles, str):
+            return ReadStatusAuthority()
+        accounts = role_map.decode_role_map_strict(roles)
+        fields = _record_fields(membership)
+        record = _snapshot_value(fields)
+    except (OSError, ValueError, RecursionError):
+        return ReadStatusAuthority()
+    if not _clean_parse(fields, record):
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(replace(record, production=True), accounts)
+
+
+@contextmanager
+def status_authority(reading: PeerStatusAuthority | ReadStatusAuthority) -> Generator[None]:
+    """Use the supplied staff and roles for this status command."""
+    from scripts.accounts import role_map
+
+    with ExitStack() as scope:
+        if isinstance(reading, PeerStatusAuthority):
+            _ = scope.enter_context(supplied_snapshot(reading.membership))
+            _ = scope.enter_context(role_map.supplied_role_map(reading.accounts))
+        yield
+
+
 def local_snapshot() -> StaffSnapshot:
     """Read only this machine's retained record; never contact its remote owner."""
     return _load()
@@ -1736,14 +1827,8 @@ def _copy_to_mac(*, detached: bool = True) -> None:
                     stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
                 )
             return
-        import signal
-
         path = _default_file()
-        # Keep this lock through SSH so an older send cannot follow a newer send.
-        with path.with_name("mac-copy.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            text = path.read_text(encoding="utf-8")
-            command = '''set -e
+        command = '''set -e
 directory="$HOME/.local/state/staff"
 mkdir -p "$directory"
 temporary=$(mktemp "$directory/staff.json.mac-copy.XXXXXXXX")
@@ -1751,31 +1836,18 @@ trap 'rm -f "$temporary"' EXIT
 cat > "$temporary"
 mv -f "$temporary" "$directory/staff.json"
 '''
-            def stop(_number: int, _frame: object) -> None:
-                raise InterruptedError("copier terminated")
-
-            # Defer SIGTERM until the SSH child has a cleanup handler.
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-            previous_handler = signal.signal(signal.SIGTERM, stop)
-            try:
-                with subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", remote.other_machine(), command],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                ) as process:
-                    try:
-                        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                        _, errors = process.communicate(input=text, timeout=remote.STANDARD_TIME_LIMIT["seconds"])
-                    except BaseException:
-                        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-                        process.terminate()
-                        _ = process.wait()
-                        raise
-                    if process.returncode:
-                        reason = " ".join(errors.split()) or f"ssh exited {process.returncode}"
-                        raise OSError(reason)
-            finally:
-                _ = signal.signal(signal.SIGTERM, previous_handler)
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        seconds = remote.STANDARD_TIME_LIMIT["seconds"]
+        # The holder keeps the lock if the copier exits before SSH.
+        result = subprocess.run([
+            "flock", str(path.with_name("mac-copy.lock")), "sh", "-c",
+            'exec timeout -s KILL "$1" ssh -o BatchMode=yes "$2" "$3" < "$4"',
+            "sh", str(seconds), remote.other_machine(), command, str(path),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+        if result.returncode in (124, 137):
+            raise OSError(f"ssh timed out after {seconds:g} s")
+        if result.returncode:
+            reason = " ".join(result.stderr.split()) or f"ssh exited {result.returncode}"
+            raise OSError(reason)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 

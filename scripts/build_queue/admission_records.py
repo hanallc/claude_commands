@@ -152,23 +152,44 @@ class GpuTestSlots:
 # These steps run test binaries; a GPU repository's tests open render apps.
 GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
-REPOSITORY_RUN_STEPS = frozenset({"gate", "test-affected"})
+REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected"})
+RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
+
+
+@dataclass(frozen=True)
+class NoRepositoryRunLimit:
+    """The repository has no run limit for this admission."""
+
+
+@dataclass(frozen=True)
+class RepositoryRunLimit:
+    """Hold a new run when this many runs already use the machine."""
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if self.maximum < 0:
+            raise ValueError("expected a non-negative run limit")
 
 
 @dataclass(frozen=True)
 class RepositoryRunLimits:
-    """Limit concurrent gate and test-affected runs by machine and repository."""
+    """Limit concurrent local runs by machine and repository."""
     by_machine_and_repository: Mapping[str, int] = field(default_factory=dict[str, int])
     exempt_unit: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "by_machine_and_repository", MappingProxyType(dict(self.by_machine_and_repository)))
 
-    def for_step(self, machine: str, repository: str, step: str) -> int:
-        """Return the configured limit, or zero for an unrestricted step."""
-        if step in REPOSITORY_RUN_STEPS:
-            return self.by_machine_and_repository.get(f"{machine}.{repository}", 0)
-        return 0
+    def for_step(self, machine: str, repository: str, step: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
+        if step not in REPOSITORY_GATE_STEPS:
+            return NoRepositoryRunLimit()
+        return self.for_repository(machine, repository)
+
+    def for_repository(self, machine: str, repository: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
+        key = f"{machine}.{repository}"
+        if key not in self.by_machine_and_repository:
+            return NoRepositoryRunLimit()
+        return RepositoryRunLimit(self.by_machine_and_repository[key])
 
 
 @dataclass(frozen=True)
@@ -658,6 +679,7 @@ class Waiter(TypedDict):
     need: int
     since: float
     order_since: NotRequired[float]
+    move_id: NotRequired[str]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
@@ -1031,7 +1053,7 @@ class EstimateExpired:
 
 @dataclass(frozen=True)
 class NatedevHeld:
-    """A CI step waits for the release of a natedev hold."""
+    """A step waits for the release of a natedev hold."""
     holder: str
     purpose: str
 
@@ -1053,7 +1075,9 @@ WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMe
 
 
 def held_text(wait: NatedevHeld) -> str:
-    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    if wait.holder and wait.purpose:
+        return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    return f"{wait.holder} holds natedev" if wait.holder else "natedev is held"
 
 
 def build_space_text(wait: BuildSpaceHold) -> str:
@@ -1101,6 +1125,25 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
+class QueueMoveMember:
+    """Identify a queue row and show if it can move."""
+    row_id: str
+    movable: bool = field(default=True, kw_only=True)
+
+
+@dataclass(frozen=True)
+class QueueMoveLine:
+    """Keep the move revision and the order of the queue rows."""
+    revision: str
+    members: tuple[QueueMoveMember, ...]
+
+
+@dataclass(frozen=True)
+class QueueMoveUnavailable:
+    """The service did not publish an order that supports moves."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1119,6 +1162,8 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    speculative_copy: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1219,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    move_line: QueueMoveLine | QueueMoveUnavailable = field(default=QueueMoveUnavailable(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1330,6 +1376,7 @@ class QueueInputs:
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
+    order_captured: bool = field(default=False, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
@@ -1338,6 +1385,8 @@ class QueueInputs:
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
     local_machine: str = field(default="natedev", kw_only=True)
     run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
+    verify_run_owners: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]], kw_only=True)
+    verify_slot_requests: Mapping[str, str] = field(default_factory=dict[str, str], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1511,6 +1560,12 @@ def configuration_diagnostics(messages: Iterable[str]) -> tuple[ConfigurationDia
     return tuple(ConfigurationDiagnostic(message) for message in dict.fromkeys(messages))
 
 
+def _repository_run_maximum(raw: str) -> int:
+    if re.fullmatch(r"[+-]?[0-9]+", raw) is None:
+        raise ValueError("expected a whole number")
+    return RepositoryRunLimit(int(raw)).maximum
+
+
 def read_memory_config(*, report: bool = True) -> MemoryConfig:
     """Resolve the live configuration for one admission decision."""
     with conf.diagnostics(report=False) as messages:
@@ -1518,8 +1573,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
         keys = settings_read.settings
         values = keys if isinstance(keys, dict) else settings_read.values()
 
-        def value[Value](key: str, convert: Callable[[str], Value]) -> Value:
-            result = settings_read.origin(key, convert)
+        def value[Value](key: str, convert: Callable[[str], Value], *, use_file_limits: bool = True) -> Value:
+            result = settings_read.origin(key, convert, use_file_limits=use_file_limits)
             if isinstance(result, conf.UnavailableValue):
                 raise conf.Unusable(f"{result.reason}; no usable committed value")
             if isinstance(result, conf.RecoveredValue):
@@ -1558,9 +1613,12 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
                            for key in values if key.startswith("program_first_peak_gib.")}
-            run_limits = {key.removeprefix("max_runs."): value(key, conf.positive_whole)
-                          for key in values if key.startswith("max_runs.")}
-            exempt_unit = value("max_runs_exempt_unit", str) if run_limits else ""
+            # The admission policy also accepts zero for keys with older file limits.
+            run_limits = {
+                key.removeprefix("max_runs."): value(key, _repository_run_maximum, use_file_limits=False)
+                for key in values if key.startswith("max_runs.") and key != RUN_LIMIT_EXEMPT_KEY
+            }
+            exempt_unit = value(RUN_LIMIT_EXEMPT_KEY, str) if run_limits else ""
             if "cargo" not in first_peaks:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(

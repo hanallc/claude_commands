@@ -15,8 +15,9 @@ import shutil
 import stat
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,10 +26,11 @@ from scripts.production import investigation, log_backup, record_store, showrunn
 from scripts.copies import copies  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
-from scripts.review_links import new_item_dialog  # noqa: E402
+from scripts.review_links import new_item_dialog, review_later  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
+    from scripts.review_links.review_submissions import SubmissionMove
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -62,14 +64,16 @@ class ReviewRecordMove:
 
     source: Path
     target: Path
+    source_owner: staff.StaffId
     owner: staff.StaffId
     identity: str
     kind: new_item_dialog.SubmissionKind
     submission: new_item_dialog.ReviewSubmission
+    source_digest: str
     content: bytes
 
     @classmethod
-    def plan(cls, source: Path, target: Path, owner: staff.StaffId, identity: str,
+    def plan(cls, source: Path, target: Path, source_owner: staff.StaffId, owner: staff.StaffId, identity: str,
              kind: new_item_dialog.SubmissionKind, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
         field = b"production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else b"owner"
         value = owner.encode() if field == b"production_id" else b'"' + owner.encode() + b'"'
@@ -82,8 +86,8 @@ class ReviewRecordMove:
         header, count = re.subn(rb"(?m)^" + field + rb": [^\r\n]*", field + b": " + value, content[:end])
         if count != 1:
             raise TidyRefused(f"{source}: the record has no unique owner field")
-        return cls(source.resolve(), target.parent.resolve() / target.name, owner, identity, kind, submission,
-                   header + content[end:])
+        return cls(source.resolve(), target.parent.resolve() / target.name, source_owner, owner, identity, kind, submission,
+                   sha256(content).hexdigest(), header + content[end:])
 
     def check_collision(self, occupied: set[Path]) -> None:
         if self.source == self.target or occupied - {self.target} or (os.path.lexists(self.target) and not (
@@ -95,6 +99,8 @@ class ReviewRecordMove:
         with numbers.write(self.target, self.identity, self.owner, new_record=True):
             if os.path.lexists(self.target):
                 self.check_collision(set())
+                atomic_file.sync_folder(self.target.parent)
+                atomic_file.sync_folder(self.target.parent.parent)
                 yield
                 return
             mode = stat.S_IMODE(self.source.stat().st_mode)
@@ -113,7 +119,8 @@ class ReviewRecordMove:
                         atomic_file.sync_folder(self.target.parent)
                     raise
 
-    def apply(self, numbers: record_store.LockedRecordNumbers) -> None:
+    def location(self) -> SubmissionMove:
+        """Keep the first native path with the current destination."""
         from scripts.review_links import review_submissions
 
         request_id = self.submission.request_id
@@ -123,28 +130,101 @@ class ReviewRecordMove:
         if isinstance(hint, review_submissions.UnreadableRequestFile):
             raise hint.error
         original = self.source
+        browser_token_digest = ""
         if isinstance(hint, review_submissions.NativeSubmissionDestination):
             if (hint.address != address or hint.id != self.identity
                     or hint.payload_hash != self.submission.request_digest):
                 raise TidyRefused(f"{self.identity}: the Review receipt disagrees with {self.source}")
             original = hint.original_path
+            browser_token_digest = hint.browser_token_digest
         elif (isinstance(hint, review_submissions.PendingFiling)
               and hint.payload_hash != self.submission.request_digest):
             raise TidyRefused(f"{self.identity}: the pending Review request disagrees with {self.source}")
-        destination = review_submissions.NativeSubmissionDestination(
+        return review_submissions.SubmissionMove(
             self.identity, self.kind, recipient, request_id, self.submission.request_digest,
-            self.target, original, self.owner)
-        folder = review_submissions.image_folder(self.submission).parent
+            self.target, original, self.owner, self.source, self.source_owner,
+            review_submissions.MoveContentDigests(self.source_digest, sha256(self.content).hexdigest()),
+            browser_token_digest=browser_token_digest,
+            has_capture_intent=isinstance(self.submission.capture_intent, new_item_dialog.DeferredCaptureIntent))
+
+    def apply(self, numbers: record_store.LockedRecordNumbers, later: Path, journal: Path,
+              destination: SubmissionMove) -> None:
+        from scripts.review_links import review_submissions
+
+        folder = journal.parent
         receipt, pending = folder / "receipt.json", folder / "pending.json"
+        moves_later = self.kind != new_item_dialog.SubmissionKind.QUESTION
         with (self.publish_record(numbers),
               record_store.keep_file_on_error(receipt),
               record_store.keep_file_on_error(pending),
-              record_store.keep_file_on_error(self.source)):
+              record_store.keep_file_on_error(self.source),
+              record_store.keep_file_on_error(later) if moves_later else nullcontext()):
             review_submissions._write_location(receipt, destination)  # pyright: ignore[reportPrivateUsage]
             pending.unlink(missing_ok=True)
             atomic_file.sync_folder(folder)
+            if moves_later:
+                review_later.move_locked(later, f"investigation/{self.source_owner}/{self.identity}",
+                                        f"investigation/{self.owner}/{self.identity}")
             self.source.unlink()
             atomic_file.sync_folder(self.source.parent)
+        _finish_move(journal)
+
+
+def _finish_move(journal: Path) -> None:
+    """Keep the original delivery path after the native transfer completes."""
+    os.replace(journal, journal.with_name("moved.json"))
+    atomic_file.sync_folder(journal.parent)
+
+
+def recover_review_moves(root: Path) -> None:
+    """Resume native transfers interrupted before the old copy was removed."""
+    from scripts.production import update_registration as questions
+    from scripts.review_links import review_submissions as submissions
+
+    for journal in submissions.pending_submission_moves(root):
+        try:
+            move = submissions._read_request_file(journal, journal.parent.name)  # pyright: ignore[reportPrivateUsage]
+            if isinstance(move, submissions.NoRequestFile):
+                continue
+            if not isinstance(move, submissions.SubmissionMove):
+                raise TidyRefused("The Review move is invalid.")
+            owners = (move.source_owner, move.owner)
+            with (review_later.locked() as later, investigation.recipient_locks(*owners),
+                  questions.wrap_question_locks(*owners)):
+                if submissions._read_request_file(journal, journal.parent.name) != move:  # pyright: ignore[reportPrivateUsage]
+                    continue
+                target = submissions._read_native_submission(move.address, move.path, move.owner)  # pyright: ignore[reportPrivateUsage]
+                source = submissions._read_native_submission(move.address, move.source, move.source_owner)  # pyright: ignore[reportPrivateUsage]
+                for found in (source, target):
+                    if isinstance(found, submissions.LocatedSubmission) and (
+                            found.destination.id, found.destination.payload_hash) != (move.id, move.payload_hash):
+                        raise TidyRefused(f"{move.id}: the native record does not match the move")
+                if isinstance(source, submissions.NoNativeSubmission):
+                    if not isinstance(target, submissions.LocatedSubmission) or os.path.lexists(move.source):
+                        raise TidyRefused(f"{move.id}: the move has no verified remaining copy")
+                    atomic_file.sync_folder(move.source.parent)
+                    _finish_move(journal)
+                    continue
+                plan = ReviewRecordMove.plan(move.source, move.path, move.source_owner, move.owner,
+                                             move.id, move.kind, source.details)
+                if isinstance(target, submissions.LocatedSubmission):
+                    if move.path.is_symlink():
+                        raise TidyRefused(f"{move.id}: the Review move destination is a symbolic link")
+                    if isinstance(move.digests, submissions.MissingMoveDigests):
+                        raise TidyRefused(f"{move.id}: the move has missing content digests; kept both copies")
+                    target_content = move.path.read_bytes()
+                    if sha256(target_content).hexdigest() != move.digests.destination:
+                        if plan.source_digest != move.digests.source:
+                            raise TidyRefused(f"{move.id}: both copies changed; kept both copies")
+                        plan = replace(plan, content=target_content)
+                    elif plan.content != target_content:
+                        atomic_file.write_bytes_atomic(move.path, plan.content)
+                numbers = (questions.question_numbers() if move.kind == new_item_dialog.SubmissionKind.QUESTION
+                           else investigation.investigation_numbers())
+                with numbers as locked:
+                    plan.apply(locked, later, journal, move)
+        except (TidyRefused, OSError, ValueError, investigation.InvestigationError, questions.RegistrationFailure) as error:
+            print(f"Review move {journal}: {error}", file=sys.stderr)
 
 
 def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, ...], document: Path,
@@ -162,14 +242,15 @@ def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, .
     target = owner if parent is None else parent
     sources = (*(() if parent is None else (owner,)), *units)
     assert isinstance(target.doc, (staff.LiveDoc, staff.WrappedDoc))
-    with (investigation.recipient_locks(target.id, *(row.id for row in sources)),
+    with (review_later.locked() as later,
+          investigation.recipient_locks(target.id, *(row.id for row in sources)),
           questions.wrap_question_locks(target.id, *(row.id for row in sources))):
         moves: list[ReviewRecordMove] = []
         for row in sources:
             for path, item in investigation.open_review_investigations(row.id):
                 assert isinstance(item.submission, new_item_dialog.ReviewSubmission)
                 moves.append(ReviewRecordMove.plan(path, investigation.folder(target.id) / f"{item.id}.md",
-                                                   target.id, item.id, new_item_dialog.SubmissionKind(item.kind.value),
+                                                   row.id, target.id, item.id, new_item_dialog.SubmissionKind(item.kind.value),
                                                    item.submission))
             records = (questions.question_records_for_document(document, identities, strict=True) if row.id == owner.id
                        else questions.question_records_for_owner(row.id, statuses=("open",), strict=True))
@@ -184,15 +265,16 @@ def keep_open_review_items(owner: staff.StaffRow, units: tuple[staff.StaffRow, .
                 if re.fullmatch(r"Q[1-9][0-9]*", identity) is None:
                     raise TidyRefused(f"{record.path}: the sent Question has no stored ID")
                 moves.append(ReviewRecordMove.plan(record.path, questions.review_question_path(folder, details.request_id),
-                                                   target.id, identity, new_item_dialog.SubmissionKind.QUESTION, details))
+                                                   row.id, target.id, identity, new_item_dialog.SubmissionKind.QUESTION, details))
         if not moves:
             return
-        apply_review_moves(moves, target.doc.path, identities)
+        apply_review_moves(moves, target.doc.path, identities, later)
 
 
-def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identities: QuestionStaff) -> None:
+def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identities: QuestionStaff, later: Path) -> None:
     """Check all IDs before changing a native record."""
     from scripts.production import update_registration as questions
+    from scripts.review_links import review_submissions
 
     owner = moves[0].owner
     with investigation.investigation_numbers() as investigation_numbers, questions.question_numbers() as question_numbers:
@@ -210,7 +292,12 @@ def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identiti
             move.check_collision(paths)
             paths.add(move.source)
         for move in moves:
-            move.apply(question_numbers if move.kind == new_item_dialog.SubmissionKind.QUESTION else investigation_numbers)
+            destination = move.location()
+            journal = review_submissions.image_folder(move.submission).parent / "move.json"
+            review_submissions._write_location(journal, destination)  # pyright: ignore[reportPrivateUsage]
+            atomic_file.sync_folder(journal.parent.parent)
+            numbers = question_numbers if move.kind == new_item_dialog.SubmissionKind.QUESTION else investigation_numbers
+            move.apply(numbers, later, journal, destination)
 
 
 def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:

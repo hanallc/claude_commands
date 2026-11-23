@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -20,7 +21,7 @@ import shutil
 import signal
 import stat
 import subprocess
-from enum import Enum
+from enum import Enum, auto
 from pathlib import Path
 import sys
 import tempfile
@@ -199,9 +200,14 @@ def inherited_temporary_parent() -> Path:
     return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
 
 
+def configured_gate_root() -> Path:
+    """Return the configured root for gate temporary folders."""
+    return Path(_settings().text("roots.gate"))
+
+
 def tmpfs_temporary_parent() -> Path:
     """Keep nested work under the caller's tmpfs folder."""
-    root = Path(_settings().text("roots.gate"))
+    root = configured_gate_root()
     inherited = inherited_temporary_parent().resolve()
     return inherited if inherited.is_relative_to(root) else root
 
@@ -431,9 +437,23 @@ def main_output_path(repo: str) -> Path:
     return build_root() / _form_name(repo) / "main"
 
 
+def _ci_folder(repo: str) -> Path:
+    return build_root() / _form_name(repo) / "ci"
+
+
 def ci_path(repo: str, number: int) -> Path:
     """Return the path for a numbered CI runner."""
-    return build_root() / _form_name(repo) / "ci" / _folder_number(number)
+    return _ci_folder(repo) / _folder_number(number)
+
+
+def ci_folders(repo: str) -> list[tuple[int, Path]]:
+    """List existing CI runner folders in runner number order."""
+    parent = _ci_folder(repo)
+    try:
+        numbers = copy_numbers(parent)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [(number, parent / _folder_number(number)) for number in sorted(numbers) if numbers[number]]
 
 
 def copy_path(repo: str, unit: str, number: int) -> Path:
@@ -597,6 +617,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
     settings = _settings() if settings is None else settings
@@ -619,8 +640,18 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all maker leases in source and command subprocesses."""
-    return tuple(_locks)
+    """Retain all build locks in source and command subprocesses."""
+    return (*_inherited_build_locks.get(), *_locks)
+
+
+@contextmanager
+def inherit_build_lock(descriptor: int) -> Generator[None]:
+    """Pass an inherited build lock to child processes."""
+    token = _inherited_build_locks.set((*_inherited_build_locks.get(), descriptor))
+    try:
+        yield
+    finally:
+        _inherited_build_locks.reset(token)
 
 
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
@@ -688,15 +719,33 @@ def _mac_mount_points() -> tuple[Path, ...]:
         _ = cast(None, free(mounts))
 
 
-def _linux_mount_points() -> tuple[Path, ...]:
-    points: list[Path] = []
+@dataclass(frozen=True)
+class LinuxMount:
+    mount_id: int
+    device: bytes
+    root: Path
+    point: Path
+
+
+def _decode_mount_path(value: bytes) -> Path:
+    return Path(os.fsdecode(re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), value)))
+
+
+def linux_mounts() -> tuple[LinuxMount, ...]:
+    mounts: list[LinuxMount] = []
     for line in Path("/proc/self/mountinfo").read_bytes().splitlines():
         fields = line.split()
         if len(fields) < 10 or b"-" not in fields[6:]:
             raise ValueError("invalid Linux mount table entry")
-        decoded = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), fields[4])
-        points.append(Path(os.fsdecode(decoded)))
-    return tuple(points)
+        root, point = map(_decode_mount_path, fields[3:5])
+        if not root.is_absolute() or not point.is_absolute():
+            raise ValueError("invalid Linux mount path")
+        mounts.append(LinuxMount(int(fields[0]), fields[2], root, point))
+    return tuple(mounts)
+
+
+def _linux_mount_points() -> tuple[Path, ...]:
+    return tuple(mount.point for mount in linux_mounts())
 
 
 def may_remove_build_path(path: Path) -> bool:
@@ -937,6 +986,64 @@ def numbered_copy_record(path: Path) -> NumberedCopyRecord:
         return UnreadableNumberedCopySource(path, str(error))
     except (OSError, ValueError, RuntimeError) as error:
         return UnreadableNumberedCopySource(path, str(error))
+
+
+class NumberedCopyEnvrc(Enum):
+    """The numbered copy requires byte proof for its envrc."""
+
+    OUTSIDE_COPY = auto()
+    TRUSTED = auto()
+    NEEDS_APPROVAL = auto()
+
+
+def numbered_copy_envrc(envrc: Path, *, trusted_source: Callable[[Path], bool]) -> NumberedCopyEnvrc:
+    """Compare an envrc with the recorded commit in a trusted source checkout."""
+    try:
+        root = build_root()
+        candidate = Path(os.path.abspath(envrc))
+        physical_root = root.resolve()
+        for directory, base in ((candidate.parent, root.absolute()),
+                                (candidate.parent.resolve(), physical_root)):
+            if not directory.is_relative_to(base):
+                continue
+            parts = directory.relative_to(base).parts
+            if len(parts) >= 3 and parts[1] not in ("main", "ci") and re.fullmatch(r"[0-9]+", parts[2]):
+                parent = root.joinpath(*parts[:3])
+                break
+        else:
+            return NumberedCopyEnvrc.OUTSIDE_COPY
+        exact = physical_root / parent.relative_to(root)
+        if (candidate.name != ".envrc" or candidate.parent.resolve() != exact
+                or len(parts) != 3):
+            return NumberedCopyEnvrc.NEEDS_APPROVAL
+        record = numbered_copy_record(parent)
+        if not isinstance(record, NumberedCopySource) or not trusted_source(record.source):
+            return NumberedCopyEnvrc.NEEDS_APPROVAL
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            identity = os.fstat(stream.fileno())
+            if not stat.S_ISREG(identity.st_mode):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            command = ["git", "--git-dir", str(record.common_directory)]
+            environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+            timeout = repository_git_timeout()
+            entry = subprocess.run([*command, "ls-tree", record.commit, "--", ".envrc"],
+                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
+            if not entry.stdout.startswith((b"100644 blob ", b"100755 blob ")):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            expected = subprocess.run(
+                [*command, "cat-file", "blob", f"{record.commit}:.envrc"],
+                cwd=record.source, env=environment, capture_output=True, check=True, timeout=timeout)
+            if stream.read(len(expected.stdout) + 1) != expected.stdout:
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+            current = candidate.lstat()
+            if (not os.path.samestat(identity, current) or identity.st_ctime_ns != current.st_ctime_ns
+                    or identity.st_mtime_ns != current.st_mtime_ns
+                    or record != numbered_copy_record(parent)):
+                return NumberedCopyEnvrc.NEEDS_APPROVAL
+        return NumberedCopyEnvrc.TRUSTED
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return NumberedCopyEnvrc.NEEDS_APPROVAL
 
 
 def _copy_creation_fields(path: Path, info: os.stat_result, source: Path, fields: dict[str, object]) -> None:
@@ -1539,18 +1646,22 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    removal_path = path if directory is None else Path(path.name)
+    name = os.fspath(removal_path)
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
         entry = Path(name)
         for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(path.name):
+            if not candidate.is_relative_to(removal_path):
                 continue
             inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
             if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
@@ -1561,13 +1672,14 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> Non
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
     try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if os.path.samestat(current, allocated):
-        if not may_remove_build_path(path):
-            raise PermissionError(f"{path}: retain the protected build folder")
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    if allocated is not None and not os.path.samestat(current, allocated):
+        return
+    if not may_remove_build_path(path):
+        raise PermissionError(f"{path}: retain the protected build folder")
+    shutil.rmtree(name, dir_fd=directory, onexc=repair)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -1920,7 +2032,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
+    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
 
@@ -1938,7 +2050,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)

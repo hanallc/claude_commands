@@ -46,7 +46,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
         from scripts.production import add_unit
         from scripts.production import unit_lookup
-        from scripts.agents.test_pane_restore import FakeClient
+        from scripts.agents.test_pane_record_recovery import FakeClient
         from datetime import datetime, timezone
 
         old = self.root / "project-alpha"

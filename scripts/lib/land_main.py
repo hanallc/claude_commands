@@ -15,7 +15,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -97,13 +97,36 @@ class NoTimeLimit:
 
 
 UNLIMITED_GIT = NoTimeLimit()
+ALLOWED_GIT_SETTINGS = frozenset({"core.fsync"})
+
+
+def _git_quote(value: str) -> str:
+    """Quote a field for Git's GIT_CONFIG_PARAMETERS parser."""
+    return "'" + value.replace("'", r"'\''").replace("!", r"'\!'") + "'"
+
+
+def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
+    if not git_config:
+        return None
+    environment = os.environ.copy()
+    parameters = [environment.get("GIT_CONFIG_PARAMETERS", "")]
+    for setting in git_config:
+        key, separator, value = setting.partition("=")
+        if key.lower() not in ALLOWED_GIT_SETTINGS:
+            allowed = ", ".join(sorted(ALLOWED_GIT_SETTINGS))
+            raise LandError(f"Git setting {key!r} is forbidden. Allowed settings are {allowed}.")
+        quoted_value = _git_quote(value) if separator else ""
+        parameters.append(f"{_git_quote(key)}={quoted_value}")
+    environment["GIT_CONFIG_PARAMETERS"] = " ".join(filter(None, parameters))
+    return environment
 
 
 def run_git(checkout: Path, *arguments: str,
-            time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> subprocess.CompletedProcess[str]:
+            time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+            environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(["git", "-C", str(checkout), *arguments],
-                              capture_output=True, text=True, check=False,
+                              capture_output=True, text=True, check=False, env=environment,
                               timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
     except subprocess.TimeoutExpired as error:
         details = "; ".join(output.decode(errors="replace").strip()
@@ -118,14 +141,17 @@ def git_output(result: subprocess.CompletedProcess[str], operation: str) -> str:
 
 
 def checked_git(checkout: Path, *arguments: str,
-                time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
-    return git_output(run_git(checkout, *arguments, time_limit=time_limit), arguments[0]).strip()
+                time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+                environment: dict[str, str] | None = None) -> str:
+    return git_output(run_git(checkout, *arguments, time_limit=time_limit, environment=environment),
+                      arguments[0]).strip()
 
 
 def remote_branch_commit(checkout: Path, remote: str, branch: str, *,
-                         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
+                         time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+                         environment: dict[str, str] | None = None) -> str:
     """Return the exact commit that the remote advertises for the branch."""
-    return remote_branch_tip(checkout, remote, branch, time_limit=time_limit).commit
+    return remote_branch_tip(checkout, remote, branch, time_limit=time_limit, environment=environment).commit
 
 
 class RemoteDefaultBranch(Enum):
@@ -139,14 +165,15 @@ class AdvertisedBranchTip:
 
 
 def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBranch, *,
-                      time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> AdvertisedBranchTip:
+                      time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
+                      environment: dict[str, str] | None = None) -> AdvertisedBranchTip:
     """Resolve one advertised branch tip without updating local refs."""
     # The snapshot protects against fetches in this checkout.
     # Another clone can still publish a different commit after ls-remote.
     default = isinstance(branch, RemoteDefaultBranch)
     ref = "HEAD" if default else f"refs/heads/{branch}"
     query = run_git(checkout, "ls-remote", "--symref" if default else "--refs", "--", remote, ref,
-                    time_limit=time_limit)
+                    time_limit=time_limit, environment=environment)
     targets: list[str] = []
     matching_shas: list[str] = []
     for row in git_output(query, "ls-remote").splitlines():
@@ -169,12 +196,14 @@ def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBr
             raise LandError(f"{remote}: expected one symbolic HEAD branch")
         branch = targets[0]
     sha = matching_shas[0]
-    object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit)
+    object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit,
+                          environment=environment)
     if object_type.returncode:
         _ = checked_git(checkout, "-c", "remote.origin.followRemoteHEAD=never", "fetch",
                         "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
-                        "--", remote, sha, time_limit=time_limit)
-        object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit)
+                        "--", remote, sha, time_limit=time_limit, environment=environment)
+        object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit,
+                              environment=environment)
     if git_output(object_type, "cat-file").strip() != "commit":
         raise LandError(f"{remote}: {sha} for {ref} is not a commit")
     return AdvertisedBranchTip(branch, sha)
@@ -182,17 +211,19 @@ def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBr
 
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
-         retry_source: Path | None = None) -> Landed:
+         retry_source: Path | None = None, git_config: Sequence[str] = ()) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
+    environment = _git_config_environment(git_config)
+
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
-        return run_git(checkout, *arguments, time_limit=time_limit)
+        return run_git(checkout, *arguments, time_limit=time_limit, environment=environment)
 
     def checked(*arguments: str) -> str:
-        return checked_git(checkout, *arguments, time_limit=time_limit)
+        return checked_git(checkout, *arguments, time_limit=time_limit, environment=environment)
 
     with main_push_lock.main_push_lock(checkout):
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
-        origin = remote_branch_commit(checkout, "origin", branch, time_limit=time_limit)
+        origin = remote_branch_commit(checkout, "origin", branch, time_limit=time_limit, environment=environment)
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()

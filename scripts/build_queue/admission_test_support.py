@@ -274,6 +274,9 @@ class TestProcesses:
         start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
+    def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        return service.linux_owner_process(pid, Path("/proc"))
+
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 
@@ -358,7 +361,7 @@ class SocketPeer:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 skip_idle_spacing: bool = False) -> None:
+                 state_dir: Path | None = None, skip_idle_spacing: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
@@ -370,7 +373,8 @@ class AdmissionFixture(ExitStack):
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
             short_socket_directory()))
-        self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
+        logs = log_dir if log_dir is not None else self.root / "log"
+        self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path: Path = self.socket_dir / "admission.sock"
         self.scenery_reservations: set[str] = set()
@@ -390,7 +394,7 @@ class AdmissionFixture(ExitStack):
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
             "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
-            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
+            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
             "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
             "BUILDLOG_RUN": "",
             "NOTIFY_SOCKET": "", "LISTEN_FDS": "",

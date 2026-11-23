@@ -72,7 +72,6 @@ from scripts.mac_test.claim_state import (
     RunState as RunState,
     NO_RUN as NO_RUN,
     StatePaths as StatePaths,
-    state_paths as state_paths,
     locked as locked,
     read_json_object as read_json_object,
     read_run as read_run,
@@ -235,6 +234,7 @@ class ExpiredBlockLiftFailed:
 
 ExpiredBlockLiftFailure = NoExpiredBlockLiftFailure | ExpiredBlockLiftFailed
 NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
+BLOCK_LIFT_FAILURE_FILE = "block-lift-failure.json"
 
 
 @dataclass(frozen=True)
@@ -345,6 +345,16 @@ class CliArguments(argparse.Namespace):
         self.attempt: str = ""
         self.identity: bool = False
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
+
+
+def state_paths(target: str = "") -> StatePaths:
+    from scripts.mac_test import eligibility
+
+    if target == eligibility.MAC_LINUX_TARGET:
+        guest = eligibility.configured_ssh_target(target)
+        return StatePaths(eligibility.ssh_target_state_directory(target), target,
+                          registry_selected=True, platform=guest.platform)
+    return claim_state.state_paths(target)
 
 
 def config_path(target: str = "") -> Path:
@@ -545,9 +555,29 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
     return block
 
 
+def lift_expired_claim_block(
+    paths: StatePaths, session: SubmittingSession, block: PendingMacBlock | ActiveMacBlock,
+) -> MacBlockState:
+    if utc_now() < block.expires:
+        return block
+    with locked(paths.control_lock):
+        current = blocking_claim_block(paths, session)
+        if isinstance(current, NoMacBlock) or utc_now() < current.expires:
+            return current
+        if isinstance(read_block_lift_failure(paths, current), ExpiredBlockLiftFailed):
+            return current
+        target = paths.target if paths.registry_selected else ""
+        return expire_block(paths, read_config(target), (), current).block
+
+
 def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
     print(f"blocked by {holder_name(block.holder)}: {block.reason}")
     return ClaimFinished(10)
+
+
+def unreadable_claim(path: Path) -> ClaimFinished:
+    print(f"state unreadable: {path}")
+    return ClaimFinished(12)
 
 
 def timestamp(value: datetime) -> str:
@@ -1209,18 +1239,47 @@ def send_to_block_recipients(
         )
 
 
+def read_block_lift_failure(paths: StatePaths, block: PendingMacBlock | ActiveMacBlock) -> ExpiredBlockLiftFailure:
+    path = paths.directory / BLOCK_LIFT_FAILURE_FILE
+    saved = read_json_object(path)
+    if saved is None or saved.get("holder") != block.holder or saved.get("since") != timestamp(block.since):
+        return NO_EXPIRED_BLOCK_LIFT_FAILURE
+    return ExpiredBlockLiftFailed(required_string(saved, "gh_error_line", path))
+
+
+def remove_block(paths: StatePaths, block: PendingMacBlock | ActiveMacBlock) -> None:
+    with locked(paths.lock):
+        at = utc_now()
+        try:
+            paths.block.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            record_hold_event("ended", block, at, paths.target)
+    (paths.directory / BLOCK_LIFT_FAILURE_FILE).unlink(missing_ok=True)
+
+
 def expire_block(
     paths: StatePaths,
     config: MacTestConfig,
     claims: tuple[HeldClaim, ...],
     block: PendingMacBlock | ActiveMacBlock,
+    *,
+    retry_failed_restore: bool = True,
 ) -> SettleOutcome:
+    if not retry_failed_restore:
+        failure = read_block_lift_failure(paths, block)
+        if isinstance(failure, ExpiredBlockLiftFailed):
+            return SettleOutcome(claims, block, failure, NO_PROBLEM, NO_PROBLEM)
     label = "Mac" if paths.target == "mac" else paths.target
     if not config.ci_repo:
         block = replace_ci(block, "not_configured")
     elif ci_needs_restore(block.ci):
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
+            write_json(paths.directory / BLOCK_LIFT_FAILURE_FILE, {
+                "holder": block.holder, "since": timestamp(block.since), "gh_error_line": restored.line,
+            })
             text = (
                 f"Message from mac-test: {label} block by {holder_name(block.holder)} is past "
                 + f"its time limit but still in place: CI's {label} switch could not be "
@@ -1240,14 +1299,7 @@ def expire_block(
                 NO_PROBLEM,
                 NO_PROBLEM,
             )
-    with locked(paths.lock):
-        at = utc_now()
-        try:
-            paths.block.unlink()
-        except FileNotFoundError:
-            pass
-        else:
-            record_hold_event("ended", block, at, paths.target)
+    remove_block(paths, block)
     skipped = (
         skipped_ci_runs(config, block.since)
         if block.ci != "not_configured"
@@ -1637,7 +1689,7 @@ def full_settle(
         )
     now = utc_now()
     if now >= block.expires:
-        outcome = expire_block(paths, config, claims, block)
+        outcome = expire_block(paths, config, claims, block, retry_failed_restore=not watcher_holds_lock)
         if (
             not watcher_holds_lock
             and not isinstance(outcome.block, NoMacBlock)
@@ -1824,15 +1876,13 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
-        print(f"state unreadable: {error.path}")
-        return ClaimFinished(12)
+        return unreadable_claim(error.path)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
         block = blocking_claim_block(paths, session)
     except (OSError, StateReadError):
-        print(f"state unreadable: {paths.block}")
-        return ClaimFinished(12)
+        return unreadable_claim(paths.block)
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
@@ -2215,7 +2265,10 @@ def free_now(
     else:
         path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
         capacity_settings = conf.read(path)
-    if not capacity_settings.value("offload", conf.on_off):
+    guest = paths.target == eligibility.MAC_LINUX_TARGET
+    enabled = (eligibility.mac_linux_enabled(conf.read("build_targets")) if guest
+               else capacity_settings.value("offload", conf.on_off))
+    if not enabled:
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2235,7 +2288,7 @@ def free_now(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
-    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+    if not guest and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
             scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
                            for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))
@@ -2429,14 +2482,7 @@ def command_unblock(
                     + f"on ({restored.line}). Run github-warmup, then unblock again."
                 )
                 return 2
-        with locked(paths.lock):
-            at = utc_now()
-            try:
-                paths.block.unlink()
-            except FileNotFoundError:
-                pass
-            else:
-                record_hold_event("ended", block, at, paths.target)
+        remove_block(paths, block)
         if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":

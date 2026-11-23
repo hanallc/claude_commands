@@ -110,7 +110,23 @@ fi
 # variables and the variables that rustc dependency data names. No crate reads
 # BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
 BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='
+exec 2>&3 3>&-
+{ : > "$0"; } 2>/dev/null || exit 125
+cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+if [ "${BUILDLOG_DEFER_SCOPE_SIDECAR:-0}" = 1 ]; then
+    export BUILDLOG_SCOPE_SIDECAR="$0.cgroup"
+else
+    printf "%s\n" "$cgroup" > "$0.cgroup"
+fi
+{ echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true
+export BUILDLOG_STEP_SCOPE="$cgroup"
+"$@"
+s=$?
+cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true
+cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true
+cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null
+exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
@@ -165,8 +181,12 @@ buildlog_step_compiles() {
 buildlog_exec() {
     local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
-            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        local socket_path="${ADMISSION_SOCKET:-}" step_directory
+        if [[ -n "$socket_path" && "$socket_path" != /* ]] && step_directory=$(pwd -P); then
+            socket_path="$step_directory/$socket_path"
+        fi
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}" "$socket_path"
         export BUILDLOG_RESERVED_STEP
     fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
@@ -603,9 +623,7 @@ require_nextest() {
     fi
 }
 
-# The nextest width mode: trial alternates physical and logical by block, and
-# physical or logical fixes the width. The trial block length must stay in sync
-# with BLOCK_S in scripts/buildlog/width_trial.py.
+# Use the logical or physical core count for the nextest width.
 LINT_TEST_WIDTH=logical
 
 nextest_physical_cores() {
@@ -647,24 +665,14 @@ nextest_logical_cores() {
     return 0
 }
 
-nextest_width_arm() {
-    local epoch="$1"
-    if (( (epoch / 6000) % 2 == 0 )); then
-        LINT_TEST_WIDTH_ARM=physical
-    else
-        LINT_TEST_WIDTH_ARM=logical
-    fi
-}
-
 # On a host whose CARGO_MAKEFLAGS names a jobserver pool (natedev's
 # /dev/steve), a test run holds one pool token for each test thread, so test
 # threads and compile jobs share the one CPU pool. run_once runs the step
 # through nextest_tokens.py, inside the step's scope: it builds with --no-run
 # while it holds no test token, takes the tokens, and runs the tests at one
 # thread for each token. It writes that width to LINT_NEXTEST_WIDTH_FILE, and
-# run_once records the step at that width. The trial mode takes no tokens,
-# since width_trial.py names its arm by width. A host with no pool (the Mac)
-# runs at the mode's width.
+# run_once records the step at that width.
+# A host without a pool runs at the selected width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
 LINT_TEST_TOKENS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_tokens.py"
 
@@ -742,7 +750,7 @@ run_nextest() {
         build_hold_wait_local || return $?
     fi
 
-    local arg arm="" width="" LINT_NEXTEST_POOL=""
+    local arg width="" LINT_NEXTEST_POOL=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
         for arg in "$@"; do
             case "$arg" in
@@ -757,15 +765,6 @@ run_nextest() {
         done
 
         case "$LINT_TEST_WIDTH" in
-            trial)
-                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
-                arm="$LINT_TEST_WIDTH_ARM"
-                ;;
-            physical|logical)
-                arm="$LINT_TEST_WIDTH"
-                ;;
-        esac
-        case "$arm" in
             physical)
                 nextest_physical_cores
                 width="${LINT_PHYSICAL_CORES:-}"
@@ -776,7 +775,7 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            [[ "$LINT_TEST_WIDTH" == trial ]] || nextest_token_pool
+            nextest_token_pool
             run cargo nextest run --test-threads "$width" "$@"
             return
         fi

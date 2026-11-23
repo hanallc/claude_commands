@@ -22,6 +22,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import queue_place as shell_place
 from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 
 class CheckerCall(TypedDict):
@@ -91,7 +92,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
-        self.environment = {**os.environ,
+        self.environment = {**memory_gate_shell_environment(),
             "TEST_WAIT_ROOT": str(self.root), "BUILDLOG_MEM_CHECK_RETRY_S": "2",
             "BUILDLOG_MEM_WAIT_SINCE": str(int(time.time()) - 1200),
             "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "",

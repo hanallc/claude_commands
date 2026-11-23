@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 
+import fcntl
 import json
 from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -26,7 +28,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, NamedTuple, cast, final, override
+from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
@@ -1246,12 +1248,13 @@ class PromptSubmissionTests(unittest.TestCase):
         failures: list[float] = []
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and from_second <= self.elapsed < until_second:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch transcript temporarily unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
         with patch.object(Path, "open", open_transcript):
             yield failures
@@ -2479,12 +2482,13 @@ class PromptSubmissionTests(unittest.TestCase):
             return self.read_screen(*arguments)
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and blocked:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch final transcript check unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
         with (patch.object(self.client, "run", side_effect=show_draft),
               patch.object(Path, "open", open_transcript)):
@@ -3245,9 +3249,59 @@ class LaunchDestinationTests(StaffTestCase):
         super().setUp()
         proc = self.root / "proc"
         proc.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr",
+            "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
+        })))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
+
+    def test_worker_launch_refuses_before_creating_a_pane_during_reboot(self) -> None:
+        from scripts.herdr import test_worker_panes, worker_panes
+
+        launch = herdr.launch_prepared_agent
+        case = test_worker_panes.WorkerPaneTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with (lock.open("a") as external,
+              patch.object(herdr, "launch_prepared_agent", side_effect=launch) as attempted,
+              patch.object(herdr, "start_agent", side_effect=AssertionError("Started during reboot")) as started):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = case.start()
+        attempted.assert_called_once()
+        started.assert_not_called()
+        self.assertIsInstance(result, worker_panes.UncertainWorker)
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.reason.endswith("A reboot is running; wait for it to end."), result.reason)
+        self.assertEqual(case.world.commands, [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=case.parent_id), [])
+
+    def test_the_same_server_uses_one_lock_across_state_homes(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        with herdr.reboot_lock(exclusive=True):
+            self.assertTrue(path.is_file())
+            with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "other-state")}),
+                  patch.object(os, "getpid", return_value=os.getpid() + 1),
+                  self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock()):
+                self.fail("A different state folder passed the server lock")
+        self.assertFalse((self.root / "other-state").exists())
+
+    def test_nested_shared_lock_reuses_the_process_descriptor(self) -> None:
+        def nested() -> None:
+            with herdr.reboot_lock():
+                pass
+
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            with herdr.reboot_lock(), ThreadPoolExecutor(max_workers=1) as pool:
+                nested()
+                pool.submit(nested).result(timeout=5)
+                with self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock(exclusive=True):
+                    self.fail("A shared lock must not become exclusive")
+            flock.assert_called_once()
+        with herdr.reboot_lock(exclusive=True):
+            pass
 
     def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
         prepared = herdr.PreparedAgentEnvironment(self.root, {})
@@ -4054,6 +4108,53 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([entry.args for entry in checks.call_args_list], [(session,)] * 3)
         self.assertTrue(all(entry.kwargs["action"] == "keys" for entry in checks.call_args_list))
 
+    def test_answer_question_records_the_text_before_typing(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        record = script_prompts.record
+        with self.question_box(client, pane, session) as commands:
+            def record_before_send(pane: str, text: str) -> None:
+                self.assertNotIn(("pane", "send-text", pane, text), commands)
+                record(pane, text)
+
+            with patch.object(script_prompts, "record", side_effect=record_before_send) as evidence:
+                client.answer_question(pane, text, target=session)
+            evidence.assert_called_once_with(pane, text)
+        self.assertIn(("pane", "send-text", pane, text), commands)
+        self.assertTrue(script_prompts.typed_by_script(pane, text))
+
+    def test_send_keys_records_printable_text_before_transport(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        keys = ("y", "e", "s", "enter", "shift+g", "o", "space", "n", "o", "w", "period", "return")
+
+        def send(*arguments: str) -> str:
+            self.assertEqual(arguments, ("pane", "send-keys", pane, *keys))
+            self.assertTrue(script_prompts.keys_since(pane, before_send))
+            self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
+            self.assertTrue(script_prompts.typed_by_script(pane, "Go now."))
+            return ""
+
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", side_effect=send) as transport):
+            client.send_keys(pane, *keys, target=session)
+        transport.assert_called_once()
+
+    def test_send_keys_leaves_no_mark_for_control_keys(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", return_value="") as transport):
+            client.send_keys(pane, "ctrl-c", "BackSpace", "Enter", target=session)
+        transport.assert_called_once_with("pane", "send-keys", pane, "ctrl-c", "BackSpace", "Enter")
+        self.assertFalse(script_prompts.keys_since(pane, before_send))
+
     def test_answer_question_sends_all_keys_with_the_real_codex_box_composer(self) -> None:
         client = self.herdr
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
@@ -4161,11 +4262,27 @@ class HerdrTests(unittest.TestCase):
                     client.prompt("w1:p1", "Continue", target="fixture-submission")
                 text = cast(str, submit.call_args.args[-1])
                 self.assertTrue(text.startswith('<system-reminder source="script">'))
-                self.assertFalse(script_prompts.root().exists())
+                self.assertFalse(script_prompts.typed_by_script("w1:p1", text))
                 with patch.object(script_prompts, "typed_here", side_effect=AssertionError("store read")):
                     source = conversation_pause.prompt_source(text, lambda: frozenset(), lambda: (),
                                                               typed_by_script=script_prompts.typed_here)
                 self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
+
+    def test_enveloped_prompt_keeps_plain_text_evidence_at_the_record_limit(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-submission"
+        configuration = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(configuration / "script_prompts.conf", "# whole: 1..\nmax_records=1\n")
+        script_prompts.record(pane, "yes")
+        with (self.prompt_target(client, pane, session),
+              patch.object(client, "run", return_value="") as transport):
+            client.prompt(pane, "Continue", target=session)
+        text = script_prompt("Continue")
+        transport.assert_called_once_with("agent", "prompt", pane, text)
+        self.assertFalse(script_prompts.typed_by_script(pane, text))
+        self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
 
     def test_timed_out_slash_command_keeps_its_source_record(self) -> None:
         from scripts.lib import script_prompts
@@ -4805,7 +4922,6 @@ class HerdrTests(unittest.TestCase):
         with (native_process_commands(11, generations=(weak,)),
               patch.object(herdr, "Herdr", return_value=client),
               patch.object(os, "kill") as signalled,
-              patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
               patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start failed"))):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
@@ -5575,6 +5691,19 @@ class HerdrTests(unittest.TestCase):
         self.configure(["--session", "default", "session", "list", "--json"], json.dumps({"sessions": rows}))
         self.assertEqual(herdr.live_sessions(), rows[:1])
 
+    def test_reboot_blocks_both_server_start_functions(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        path.parent.mkdir(parents=True)
+        with (path.open("a") as external, patch.object(herdr, "run_program") as command,
+              patch("scripts.lib.detached.start_detached") as detach):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(herdr.RebootLockBusy):
+                _ = herdr.start_server("agents", 1_000)
+            with (patch.object(herdr, "_PLATFORM", "darwin"), self.assertRaises(herdr.RebootLockBusy)):
+                _ = herdr.restore_server("agents", 1_000, session_kind=herdr.NonDesktopSession())
+        command.assert_not_called()
+        detach.assert_not_called()
+
     def test_server_start_skips_running_server(self) -> None:
         self.configure_herdr(["status", "server"], "server:\nstatus: running\n")
         self.configure_herdr(["workspace", "list"], json.dumps({
@@ -5955,7 +6084,8 @@ class HerdrTests(unittest.TestCase):
 
     def test_attached_clients_count_only_interactive_clients_for_the_session(self) -> None:
         clients = [["herdr", "session", "attach", "fixture"], ["herdr", "--session", "fixture"],
-                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"]]
+                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"],
+                   ["herdr", "--session", "fixture", "client"]]
         excluded = [["herdr", "--session", "fixture", *command] for command in (
             ["server"], ["pane", "read", "p1"], ["agent", "list"], ["status"],
             ["status", "server"], ["workspace", "create"], ["session", "list"], ["--help"], ["--version"],
@@ -5964,7 +6094,7 @@ class HerdrTests(unittest.TestCase):
                          ["echo", "herdr", "session", "attach", "fixture"]])
         for pid, argv in enumerate(clients + excluded, 100):
             _ = self.process(pid, 1, argv, {})
-        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(4))
+        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(5))
         self.assertEqual(herdr.attached_clients("missing"), herdr.NoClientAttached())
 
     def test_attached_clients_handle_default_unreadable_and_vanished_processes(self) -> None:

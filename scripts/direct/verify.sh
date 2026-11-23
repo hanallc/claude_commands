@@ -619,12 +619,10 @@ verify_helper() {
         return 0
     fi
     (
-    if [[ "${1:-}" == --stdin ]]; then
-        shift
-        set -- 1 "$@"
-    else
-        set -- 0 "$@"
-    fi
+    case "${1:-}" in
+        --stdin|--require-helper) ;;
+        *) set -- --normal "$@" ;;
+    esac
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
         if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
             export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
@@ -646,10 +644,10 @@ verify_helper() {
             } < <(command env -0 && printf '\0')
         fi
     fi
-    local input="" has_input=$1 status output errors entry
+    local input="" helper_mode=$1 status output errors entry
     local forwarded=()
     shift
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
@@ -689,11 +687,15 @@ verify_helper() {
             exec 72>&-
         fi
     fi
+    if [[ "$helper_mode" == --require-helper ]]; then
+        printf 'verify.sh: the Python helper could not run %s %s\n' "${1##*/}" "${2:-}" >&2
+        return 2
+    fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
         exec 73< <(printf '%s\0' "${forwarded[@]}")
         export VERIFY_RESULT_ENVIRONMENT_FD=73
     fi
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         printf '%s' "$input" | "$PY" "$@"
     else
         "$PY" "$@"
@@ -3139,9 +3141,7 @@ route_test() {
             require_nextest
         fi
         collect_routing_wait
-        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then
-            exit "$LOOKUP_STATUS"
-        fi
+        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then exit "$LOOKUP_STATUS"; fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
@@ -3517,8 +3517,8 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
-# placement that failed before its step started. A fix pass that still changes
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or an
+# admission or placement failure. A fix pass that still changes
 # the tree at the limit can leave more fixes for the next call.
 # An incomplete fix pass can also leave fixes for the next call.
 lint_failure_is_the_tree() {
@@ -4012,8 +4012,12 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
+    # The admission service uses the sidecar to tell that the guard allowed the step.
+    if sidecar := os.environ.pop("BUILDLOG_SCOPE_SIDECAR", ""):
+        Path(sidecar).write_text(os.environ["BUILDLOG_STEP_SCOPE"] + "\n")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
+os.environ.pop("BUILDLOG_DEFER_SCOPE_SIDECAR", None)
 sys.exit(shell_status(subprocess.call(command)))
 '
 
@@ -4096,6 +4100,7 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            BUILDLOG_DEFER_SCOPE_SIDECAR=1 \
             VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer

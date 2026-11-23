@@ -26,6 +26,32 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+## Mac Linux gate type checks
+
+A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
+The guest puts the type-check environment in the copy's gate tool folder.
+For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
+If a tool is missing, the guest refuses the route.
+The guest returns the type-check result with the test results.
+If the assigned Mac Linux guest refuses the route, the gate fails and reports the guest and the reason.
+The caller must submit a new run to retry.
+
+## Mac queue runs
+
+`mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
+The run uses the holding unit's session for the block check and the placement request.
+Workers of that unit can start a run during its block.
+A run that waits for another session's block prints one line with the holder and reason.
+The run returns any placement before it waits for the block to clear.
+The wait can lift an expired block through the Mac block expiry procedure.
+A failed CI restore keeps the block in place.
+`--no-wait` reports the block and exits with status 78.
+`mac_run.sh` exits with status 9 for a foreign block or unreadable coordination state.
+It also exits with status 9 when the queue reports that the Mac is busy or blocked.
+It retries other placement waits, including waits for host evidence, queue position, or memory.
+It prints the claim refusal or queue diagnostic and returns any placement before exit.
+Other queue runs retry a busy reply unless they use `--no-wait`.
+
 Doc uses a snapshot of the staged tree.
 After success, verify writes a doc pass record if the staged tree still matches the snapshot.
 The Mac runner uses the original repository identity and copies the snapshot from `--source-root`.
@@ -41,6 +67,18 @@ Tree repair steps remain local.
 Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A busy Mac keeps the lint on natedev. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting.
 
 A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+
+## Mac Linux guest folders
+
+The Mac Linux route runs the suite in a numbered copy.
+It makes a per-run tool folder under the copy's `target` directory.
+Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
+The guest removes the tool folder when the suite returns.
+A forced stop can leave the tool folder in the numbered copy.
+On a later allocation, the shared build folder allocator removes the folder if its lease owner has ended and the locks permit removal.
+The suite uses a private PID namespace and mounts its own `/proc`.
+At the guest deadline, the namespace ends all suite processes, including processes that change groups.
+If `bwrap` is missing, the route declines before it sends the source.
 
 ## How it works
 
@@ -428,6 +466,8 @@ An interrupted run stops and reaps both log readers after recording its result. 
 
 An active Mac gate uses the lifecycle script that started the run.
 Its close hook stops the attempt with the script uploaded to the Mac during preparation.
+Each preparation records its own Mac attempt directory.
+A retry uses a fresh directory even if cleanup retains the previous checkout.
 When a later queue run finds an ended gate, it calls the installed natedev lifecycle script.
 The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.

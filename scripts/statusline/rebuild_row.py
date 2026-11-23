@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -23,6 +23,13 @@ from scripts.lib import atomic_file, conf_reads
 from scripts.rebuild import need
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+MACHINES = ("natedev", "mac")
+
+
+def rebuild_names(machines: Iterable[str]) -> str:
+    """Name each waiting machine once in status line order."""
+    waiting = set(machines)
+    return ", ".join(f"rebuild {machine}" for machine in MACHINES if machine in waiting)
 
 
 @dataclass(frozen=True)
@@ -179,8 +186,8 @@ def compare(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSys
         if system_path(running):
             running_paths[machine] = running
             if system_path(path) and running != path:
-                items.append(f"rebuild {machine}")
-    return RebuildComparison(", ".join(items),
+                items.append(machine)
+    return RebuildComparison(rebuild_names(items),
                              RunningSystemProbes("natedev" in running_paths, "mac" in running_paths),
                              running_paths)
 
@@ -232,7 +239,7 @@ class RebuildAnswer:
     running_paths: dict[str, str] = field(default_factory=dict)
 
     def row(self) -> str:
-        return ", ".join(f"rebuild {machine}" for machine in self.machines)
+        return rebuild_names(self.machines)
 
     def configured_revision(self) -> str:
         if isinstance(self.expected, ExpectedSystems):
@@ -465,7 +472,7 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
-    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines),
+    return replace(answer, machines=tuple(machine for machine in MACHINES if machine in machines),
                    needs=needs)
 
 

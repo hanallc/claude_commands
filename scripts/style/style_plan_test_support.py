@@ -211,8 +211,9 @@ class StylePlanFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True)
+        self.fixture_root.mkdir()
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True, dirs_exist_ok=True)
         self.configure_fixture()
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 

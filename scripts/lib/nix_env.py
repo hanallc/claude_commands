@@ -173,12 +173,12 @@ def _legacy_copy_envrc(envrc: Path) -> bool:
 
 def registered_copy(envrc: Path) -> bool:
     """Prove a copy's envrc against its source commit."""
-    from scripts.lib import build_slots
+    from scripts.lib import build_folders
 
     try:
-        numbered = build_slots.numbered_copy_envrc(envrc, trusted_source=trusted_root)
-        if numbered is not build_slots.NumberedCopyEnvrc.OUTSIDE_COPY:
-            return numbered is build_slots.NumberedCopyEnvrc.TRUSTED
+        numbered = build_folders.numbered_copy_envrc(envrc, trusted_source=trusted_root)
+        if numbered is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
+            return numbered is build_folders.NumberedCopyEnvrc.TRUSTED
         slot = slot_envrc_trust(envrc)
         if slot is not SlotEnvrcTrust.NOT_A_SLOT:
             return slot is SlotEnvrcTrust.TRUSTED
@@ -191,12 +191,12 @@ def generated_source(root: Path) -> bool:
     """Accept a scratch record that marks files written by our code."""
     try:
         folder = root.resolve(strict=True)
-        from scripts.lib import build_slots, copy_record
+        from scripts.lib import build_folders, copy_record
 
         if folder.parent != copy_record.root().resolve():
             return False
-        numbered = build_slots.numbered_copy_envrc(folder / ".envrc", trusted_source=trusted_root)
-        if numbered is not build_slots.NumberedCopyEnvrc.OUTSIDE_COPY:
+        numbered = build_folders.numbered_copy_envrc(folder / ".envrc", trusted_source=trusted_root)
+        if numbered is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
             return False
         record = copy_record.read_record(folder / copy_record.RECORD)
         return isinstance(record, copy_record.Registered) and record.fields.get("generated_source") is True
@@ -206,15 +206,15 @@ def generated_source(root: Path) -> bool:
 
 def trusted_envrc(envrc: Path) -> bool:
     """Check numbered copy proof before checking general approval."""
-    from scripts.lib import build_slots
+    from scripts.lib import build_folders
 
     try:
-        numbered = build_slots.numbered_copy_envrc(envrc, trusted_source=trusted_root)
-        if numbered is not build_slots.NumberedCopyEnvrc.OUTSIDE_COPY:
-            return numbered is build_slots.NumberedCopyEnvrc.TRUSTED
+        numbered = build_folders.numbered_copy_envrc(envrc, trusted_source=trusted_root)
+        if numbered is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
+            return numbered is build_folders.NumberedCopyEnvrc.TRUSTED
         resolved = envrc.resolve(strict=True)
-        if resolved != envrc.absolute() and build_slots.numbered_copy_envrc(
-                resolved, trusted_source=trusted_root) is not build_slots.NumberedCopyEnvrc.OUTSIDE_COPY:
+        if resolved != envrc.absolute() and build_folders.numbered_copy_envrc(
+                resolved, trusted_source=trusted_root) is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
             return False
         slot = slot_envrc_trust(envrc)
         if slot is not SlotEnvrcTrust.NOT_A_SLOT:

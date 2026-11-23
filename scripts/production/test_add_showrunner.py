@@ -129,6 +129,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         _ = self.enterContext(patch.object(add_showrunner, "local_machine", return_value="natedev"))
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))

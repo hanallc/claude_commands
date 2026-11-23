@@ -635,13 +635,20 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     A claim file prevents duplicate delivery.
     """
     runs = _runs_dir(session_dir)
-    if not runs.is_dir():
-        return []
-    with (runs / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
-        result = _reap_orphans_locked(runs, worker)
-    result.complete()
-    return result.run_ids
+    if runs.is_dir():
+        with (runs / ".start.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            result = _reap_orphans_locked(runs, worker)
+        result.complete()
+        run_ids = result.run_ids
+    else:
+        run_ids = []
+    run = runs.parent
+    if next(run.glob(".*.pass-notices.jsonseq"), None) is not None:
+        retry = cast(Callable[[Path, str], None],
+                     import_module("scripts.herdr.pass_notices").retry)
+        retry(run, worker)
+    return run_ids
 
 
 def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:

@@ -1228,6 +1228,7 @@ class HookCompletion:
     recording_done: bool = False
     sender_native_id: str = ""
     stopped_reply: StoppedReplyDisposition = StoppedReplyDisposition.PENDING
+    pending_diagnostics: tuple[str, ...] = ()
 
 
 class NoHookCompletion(Enum):
@@ -1245,7 +1246,7 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
         tuple(str(item) for item in cast(list[object], details)) if isinstance(details, list) else (),
         fields.get("actions_done") is True, fields.get("pane_closed") is True,
         fields.get("role_released") is True, fields.get("finished") is True, fields.get("recording_done") is True,
-        string(fields.get("sender_native_id")), disposition)
+        string(fields.get("sender_native_id")), disposition, tuple(string_list(fields.get("pending_diagnostics"))))
 
 
 def retained_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:

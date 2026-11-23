@@ -69,8 +69,9 @@ import statistics
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
-from typing import Literal, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -78,7 +79,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
-from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.lib.build_steps import gate_job_for_command, gate_job_from_process, read_step_names
 from scripts.lint import sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -105,9 +106,11 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_records  # noqa: E402
+from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_client import (  # noqa: E402
+    AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation,
+)
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
@@ -115,6 +118,7 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
+GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -197,12 +201,25 @@ class SharedMachine:
 
 
 @dataclass(frozen=True)
+class ConfiguredGateParent:
+    """Use the gate parent from build_folders.conf."""
+
+
+@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
+        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
+
+
+@dataclass(frozen=True)
+class NamedModules:
+    """Run only the paths that the caller names for a diagnostic check."""
+    paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -374,7 +391,7 @@ class SharedCPUPool:
 
 @contextmanager
 def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
-    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    path = cpu_pool_path()
     try:
         descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -773,6 +790,7 @@ class NoGateRecovery:
 NO_GATE_RECOVERY = NoGateRecovery()
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
     "merge_gate_recovery", default=NO_GATE_RECOVERY)
+_reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
 def gate_run_directory(repo: Path) -> Path:
@@ -785,60 +803,84 @@ def recover_gate_runs(repo: Path) -> None:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == requested_checkout and current.pid == os.getpid():
         return
-    root = gate_state_dir() / "active-runs"
+    own_directory = gate_run_directory(repo)
+    root = own_directory.parent
     if not root.exists():
         return
     refusals: list[str] = []
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
             try:
-                recover_gate_directory(directory, requested_checkout=requested_checkout)
+                recover_gate_directory(directory, own_directory=own_directory)
             except RollbackRecoveryRefused as error:
                 refusals.append(str(error))
     if refusals:
         raise RollbackRecoveryRefused("\n".join(refusals))
 
 
-def recover_gate_directory(directory: Path, *, requested_checkout: str = "") -> None:
+def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
     refusals: list[str] = []
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
-            data = cast(dict[str, object], json.loads(path.read_text()))
-            if data.get("finished") is True:
-                continue
-            pid, start = cast(int, data["pid"]), cast(str, data["start"])
-            owner = process_start(pid)
-            if isinstance(owner, Unreadable):
-                raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
-            if isinstance(owner, Started) and owner.start == start:
-                continue
-            groups = cast(dict[str, str], data["groups"])
-            tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), cast(str, token["value"]))
-                      for token in cast(list[dict[str, object]], data["tokens"])]
-            folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
-                       for entry in cast(list[object], data["folders"])]
-            recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
-                                    {int(group): identity for group, identity in groups.items()},
-                                    folders, tokens, cast(str, data["rollback"]),
-                                    cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
-            active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
-                recovery.recover()
-            except RollbackRecoveryRefused as error:
-                if not requested_checkout or recovery.repo == requested_checkout:
-                    refusals.append(str(error))
-                else:
-                    print(str(error), file=sys.stderr, flush=True)
-            finally:
-                ACTIVE_GATE_RECOVERY.reset(active)
+                recover_gate_record(path)
+            except GateRefused as error:
+                if directory == own_directory:
+                    if isinstance(error, RollbackRecoveryRefused):
+                        refusals.append(str(error))
+                        continue
+                    raise
+                report_key = (os.getpid(), path)
+                if report_key not in _reported_foreign_gate_refusals:
+                    reason = " ".join(str(error).splitlines())
+                    print(f"Gate recovery kept {str(path)!r}: {reason}", file=sys.stderr)
+                    _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
     if refusals:
         raise RollbackRecoveryRefused("\n".join(refusals))
+
+
+def recover_gate_record(path: Path) -> None:
+    """Recover one record under its directory lock."""
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The gate can remove its record while the scanner reads the directory.
+        return
+    if data.get("finished") is True:
+        return
+    pid, start = cast(int, data["pid"]), cast(str, data["start"])
+    owner = process_start(pid)
+    if isinstance(owner, Unreadable):
+        raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
+    if isinstance(owner, Started) and owner.start == start:
+        return
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The owner can finish cleanup before the process check detects its exit.
+        return
+    if data.get("finished") is True:
+        return
+    groups = cast(dict[str, str], data["groups"])
+    tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
+                            cast(int, token["inode"]), cast(str, token["value"]))
+              for token in cast(list[dict[str, object]], data["tokens"])]
+    folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
+               for entry in cast(list[object], data["folders"])]
+    recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
+                            {int(group): identity for group, identity in groups.items()},
+                            folders, tokens, cast(str, data["rollback"]),
+                            cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
+    active = ACTIVE_GATE_RECOVERY.set(recovery)
+    try:
+        recovery.recover()
+    finally:
+        ACTIVE_GATE_RECOVERY.reset(active)
 
 
 @contextmanager
@@ -868,14 +910,16 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
         directory = gate_run_directory(repo)
         path = directory / f"{os.getpid()}-{token_hex(12)}.json"
         recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
-        recovery.save()
         token = ACTIVE_GATE_RECOVERY.set(recovery)
         try:
+            with cancellation.defer_cleanup_signals():
+                recovery.save()
             yield recovery
         finally:
-            ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.groups or recovery.tokens or recovery.rollback):
-                recovery.finish()
+            with cancellation.defer_cleanup_signals():
+                ACTIVE_GATE_RECOVERY.reset(token)
+                if not (recovery.groups or recovery.tokens or recovery.rollback):
+                    recovery.finish()
 
 
 @contextmanager
@@ -1130,6 +1174,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
     """Give a module a private build log and tripwires for tools and live memory."""
+    root = root.absolute()
     buildlog = root / "buildlog"
     buildlog.mkdir()
     tools = root / "build-tool-tripwires"
@@ -1148,9 +1193,11 @@ raise SystemExit(99)
         executable.chmod(0o755)
     cargo = str(root / "target")
     return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+            "MERGE_GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
+            GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
             session_folder.ROOT_ENV: str(root / "session"),
@@ -1186,8 +1233,10 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test read live memory {detail}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    shutil.rmtree(job.log.parent)
-    job.folder_cleanup.close()
+    try:
+        build_folders.remove_folder(job.log.parent)
+    finally:
+        job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -1432,6 +1481,16 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def _gate_job_parent() -> Path:
+    """Keep jobs below the module folder that the outer gate removes."""
+    root = build_folders.configured_gate_root()
+    if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
+        module = Path(inherited_module)
+        if module.is_dir() and (resolved := module.resolve()).is_relative_to(root.resolve()):
+            return resolved
+    return root
+
+
 def gate_test_parent(tmpfs: Path) -> Path:
     """Return the parent of the merge gate test fixtures."""
     return tmpfs / "merge-gate-tests"
@@ -1447,15 +1506,27 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+def gate_work_parent(machine: SharedMachine | WholeMachine) -> Path:
+    """Select the folder for gate recovery, state, and tests."""
+    if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
+        return machine.gate_parent.path
+    return _gate_job_parent()
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
-               selected: AllModules | SelectedModules = ALL_MODULES,
+               selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
+    named = isinstance(selected, NamedModules)
+    under_parent = shared and named and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
+    owns_place = shared and not under_parent
+    if under_parent:
+        max_running_jobs = 1
     if shared:
         recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
@@ -1465,7 +1536,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         raise GateRefused(str(error)) from error
     if isinstance(machine, WholeMachine):
         max_running_jobs = os.cpu_count() or 1
-    if module_time_limit_s <= 0:
+    if named:
+        module_time_limit_s = math.inf
+    elif module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
         raise GateRefused("running job limit must be positive")
@@ -1476,27 +1549,27 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not modules:
         raise GateRefused("the test list is empty")
     module_count = len(modules)
-    if isinstance(selected, SelectedModules):
+    if isinstance(selected, (SelectedModules, NamedModules)):
         paths = set(selected.paths)
         discovered = {str(path.relative_to(repo)) for _, path in modules}
         if not paths <= discovered:
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = build_folders.tmpfs_temporary_parent()
-    if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
-    report_retained_gate_test_folders(tmpfs)
-    hold = BuildHoldWait() if shared else None
+    gate_parent = gate_work_parent(machine)
+    if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
+        raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
+    report_retained_gate_test_folders(gate_parent)
+    hold = BuildHoldWait() if owns_place else None
     if hold is not None:
         hold.wait_until_free()
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
     reused = False
-    selection: AffectedSelection | FullSuite | SelectedModules = (
-        selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
-    if shared:
+    selection: AffectedSelection | FullSuite | SelectedModules | NamedModules = (
+        selected if isinstance(selected, (SelectedModules, NamedModules)) else FullSuite("whole machine"))
+    if shared and not named:
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1523,6 +1596,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1535,8 +1609,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused(str(error)) from error
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
-    scope_prefix = suite_scope_prefix() if shared else []
-    state_directory = gate_state_dir() if shared else tmpfs
+    scope_prefix = suite_scope_prefix() if owns_place else []
+    state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
     timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
     cpu_path = state_directory / "module_cpu_seconds.json"
@@ -1577,7 +1651,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or hold is None or admission is None:
+        if ledger is None or hold is None or admission is None or isinstance(selection, NamedModules):
             return
         waited = hold.waited_s()
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
@@ -1595,19 +1669,21 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    # Folder keys stay unchanged until chunk 6.
-    folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
+    folder_tool = "g" if mode is SuiteMode.GATE else "t"
+    module_number = 0
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+          gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+          (shared_cpu_pool() if owns_place else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
         deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
         initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
+        if reservation is not None:
+            environment = reservation.child_environment(environment)
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
         types_suite, types_module = gate_record.TYPE_CHECK_JOB
@@ -1756,7 +1832,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
+                    # Each attempt gets a short name in this gate's private folder.
+                    module_number += 1
+                    module_folder = build_folders.BuildFolderSpec(
+                        kind="tool", parent=temporary, purpose=f"m{module_number:04x}", suffix_length=0)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(module_folder))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1781,7 +1861,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:
                         admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
-                if not time_limit_report and (shared or isinstance(selected, SelectedModules)) and not pending and not running:
+                if (not time_limit_report and (shared or isinstance(selected, (SelectedModules, NamedModules)))
+                        and not pending and not running):
                     failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -1802,14 +1883,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if running or pending:
                     time.sleep(0.05)
         finally:
-            # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
+            # Reap this runner's groups before the gate folder cleanup.
             with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
-            if shared:
+            if shared and not named:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)
                 save_measures(types_peaks_path, types_peaks)
@@ -1862,7 +1943,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
-    if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
+    if run.passed and not reused and ledger is not None and isinstance(selection, (AffectedSelection, FullSuite)):
         ledger.record_pass(selection)
         if isinstance(required, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
@@ -3042,10 +3123,10 @@ def nightly(args: GateArguments) -> int:
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
+                            help="stop a module after this many seconds (default: 1800). Runs with --module have no time limit.")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
-                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
+                            help="run only this suite/module with shared admission or the parent's reservation")
 
 
 def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> GateRun:
@@ -3056,37 +3137,136 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
+@dataclass(frozen=True)
+class NoGateAssignment:
+    """The caller supplied no placement file."""
+
+
+class GateAssignmentRefused(GateRefused):
+    """The gate could not verify the placement supplied by the caller."""
+
+
+def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> str | NoGateAssignment:
+    """Return the target from the queue assignment for this gate."""
+    path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if path is None:
+        return NoGateAssignment()
+    if not path:
+        raise GateAssignmentRefused("BUILDLOG_PLACEMENT_FILE is empty")
+    try:
+        saved = admission_wire.read_assignment(Path(path)).assignment
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot read the gate placement file {path!r}: {error}") from error
+    if saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+        raise GateAssignmentRefused("The placement episode does not match BUILDLOG_PLACEMENT_EPISODE")
+    if not isinstance(gate_job, StepJob):
+        raise GateAssignmentRefused("The placement has no recorded gate job to verify")
+    owner = saved.owner
+    identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+    pid = os.getpid()
+    if owner.host != host_name() or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid):
+        raise GateAssignmentRefused("The placement owner is not this process or a live ancestor")
+    if (owner.pid != pid and gate_job != gate_job_from_process(
+            mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+        raise GateAssignmentRefused("The placement owner's command does not match this gate job")
+    try:
+        status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot query the gate placement status: {error}") from error
+    if isinstance(status, admission_wire.UnknownPlacementStatus):
+        raise GateAssignmentRefused("The queue does not know the gate placement attempt")
+    if status.assignment != saved:
+        raise GateAssignmentRefused("The queue assignment does not match the gate placement file")
+    if isinstance(status.state, placement.ClosedAssignment):
+        raise GateAssignmentRefused(f"The gate placement attempt is stale: {status.state.reason}")
+    return saved.destination.target
+
+
+class MacLinuxGateRefused(GateRefused):
+    """The assigned Mac Linux guest could not complete the gate."""
+
+
+class MacLinuxGateRoute(Protocol):
+    """Run the tests and type checks in the Mac Linux guest."""
+
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
+              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str]) -> GateRun | str: ...
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route gates through AWS. Split affected tests between natedev and the Mac."""
+    """Route the whole test selection to the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
-
-    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
-    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
-        if isinstance(outcome, str):
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
+    def finish_remote(outcome: GateRun) -> GateRun:
         if not type_dirs or outcome.time_limit_report:
             return outcome
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
+    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job)
+        if isinstance(outcome, str):
+            if not isinstance(target, NoGateAssignment):
+                raise GateRefused(f"AWS gate failed: {outcome}")
+            print('Cloud gate uses natedev: ' + outcome, flush=True)
+            return run_local(type_dirs)
+        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
+
+    def run_guest(selection: AllModules | TreeSelection) -> GateRun:
+        guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
+        outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job, type_dirs=type_dirs)
+        if isinstance(outcome, str):
+            raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+        if not outcome.passed:
+            print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
+            if outcome.time_limit_report:
+                print(outcome.time_limit_report, file=sys.stderr, flush=True)
+            for job in outcome.jobs:
+                if job.returncode:
+                    print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
+                          file=sys.stderr, flush=True)
+        return outcome
+
+    target = current_gate_target(mode, gate_job)
+    match target:
+        case "natedev":
+            return run_local(type_dirs)
+        case "mac-linux":
+            key = "enabled.mac-linux"
+            try:
+                enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
+            except conf.Unusable as error:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
+            if not enabled:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
+            run_selected = run_guest
+        case "aws":
+            if type_dirs:
+                raise GateRefused("The AWS gate route does not support type checks")
+            run_selected = run_cloud
+        case NoGateAssignment():
+            run_selected = run_cloud
+        case _:
+            raise GateRefused(f"The gate does not support the assigned target {target}")
+
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     if mode is SuiteMode.GATE:
-        return run_cloud(ALL_MODULES)
+        return run_selected(ALL_MODULES)
 
     selected: AllModules | TreeSelection = ALL_MODULES
     whole_suite = full
@@ -3099,14 +3279,19 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                        else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
         modules = discover_test_modules(repo)
         selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
-            return run_local(type_dirs)
+        unassigned = isinstance(target, NoGateAssignment)
+        if ledger.reuse(report=not unassigned and not type_dirs):
+            if unassigned:
+                return run_local(type_dirs)
+            if type_dirs:
+                return run_selected(TreeSelection((), tree))
+            return GateRun((), 0.0, 0.0, tests_reused=True)
         whole_suite = isinstance(selection, FullSuite)
         paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
         selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
         if isinstance(selection, AffectedSelection) and not selection.modules:
             if type_dirs:
-                return run_local(type_dirs)
+                return run_local(type_dirs) if unassigned else run_selected(selected)
             ledger.record_pass(selection)
             record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
                             hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
@@ -3114,7 +3299,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
     # Nate ordered the Mac split off on 2026-11-21.
-    return run_cloud(selected)
+    return run_selected(selected)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
     try:
@@ -3199,14 +3384,35 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
-def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Run only the named modules, as a merge red's check on its base.
-
-    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
-    """
-    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
-                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode) -> GateRun:
+    """Run the named modules through shared admission for a diagnostic check."""
+    return run_suites(repo, mode=mode, machine=SHARED_MACHINE,
+                      selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
+
+
+@contextmanager
+def unwind_tests_only_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default SIGTERM action."""
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
+        yield
+        return
+    terminated = False
+
+    def terminate(number: int, _frame: object) -> None:
+        nonlocal terminated
+        if not terminated:
+            terminated = True
+            raise SystemExit(128 + number)
+
+    try:
+        _ = signal.signal(signal.SIGTERM, terminate)
+        yield
+    finally:
+        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if terminated:
+            signal.raise_signal(signal.SIGTERM)
 
 
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
@@ -3214,7 +3420,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
+                run = (run_named_modules(repo, args.modules, mode) if args.modules else
                        run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
                                        mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
@@ -3234,13 +3440,16 @@ def _sweep_nightly_build_folders() -> None:
                     raise RuntimeError("the build folder sweep failed")
             else:
                 scripts = Path(__file__).resolve().parents[1]
-                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
-                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                    # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
-                                    "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
-                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
-                                   check=True, capture_output=True, text=True)
+                caller, lifetime = os.pipe()
+                with os.fdopen(caller, "rb"), os.fdopen(lifetime, "wb"):
+                    _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                        sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                        "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
+                                        # The queue requires a repository. Nightly runs from the home directory.
+                                        "--worktree", str(scripts.parent), "--caller-fd", str(caller), "--", "/bin/zsh", "-c",
+                                        '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
+                                       check=True, capture_output=True, text=True,
+                                       pass_fds=(caller,), start_new_session=True)
         except (Exception, KeyboardInterrupt) as error:
             detail = f"Nightly build folder sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
@@ -3312,7 +3521,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         with test_run_folder():
             return run_tests_only(args, SuiteMode.TARGETED)
     if args.tests_only:
-        return run_tests_only(args, SuiteMode.GATE)
+        with unwind_tests_only_on_sigterm():
+            return run_tests_only(args, SuiteMode.GATE)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)

@@ -22,6 +22,22 @@ from scripts.lib import conf
 
 Platform = Literal["linux", "macos"]
 
+# One wait for every machine that the queue sends a run to (build_targets.conf).
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+MAX_UNREACHABLE_WAIT_SECONDS = 86400
+
+
+def _unreachable_wait(value: str) -> int:
+    seconds = conf.positive_whole(value)
+    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
+        raise ValueError(f"expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds")
+    return seconds
+
+
+def unreachable_wait_seconds(registry: conf.ConfigRead) -> int:
+    """Read how long a machine may send nothing before its run ends as unreachable."""
+    return registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait, recover_invalid=False)
+
 
 @dataclass(frozen=True)
 class LocalTarget:

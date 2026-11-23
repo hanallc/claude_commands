@@ -2429,15 +2429,14 @@ def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[st
 
 
 def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
-    """Select admitted local producers without a pause or an exit request."""
+    """Select admitted local producers without a pause request."""
     from scripts.production import staff
 
     try:
         membership = staff.local_snapshot()
     except staff.StaffAbsent:
         return ()
-    members = eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
-    return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
+    return eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
 
 
 @dataclass(frozen=True)
@@ -2968,13 +2967,13 @@ class AccountPaneReader(Protocol):
 
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
-                 source_accounts: Mapping[str, str], batch_id: str = "",
+                 source_accounts: Mapping[str, str],
                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                  staff_members: Collection[staff.StaffId] = ()) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS, batch_id: str = "",
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
                   intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                   moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                   staff_members: tuple[staff.StaffRow, ...] = ()) -> tuple[SessionMoveOutcome, ...]:
@@ -3010,17 +3009,14 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
     if staff_members:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
-                        batch_id=batch_id, intent=intent, staff_members=frozenset(row.id for row in staff_members))
+                        intent=intent, staff_members=frozenset(row.id for row in staff_members))
     elif isinstance(intent, moves.FollowGroupAccount):
-        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
-                        batch_id=batch_id, intent=intent)
-    elif batch_id:
-        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, batch_id=batch_id)
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, intent=intent)
     else:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
-            if batch_id:
+            if isinstance(intent, moves.FollowGroupAccount) or cause != "by hand":
                 outcomes[identity] = SessionMoveRefused(identity, "no saved session was found")
             else:
                 account_anomaly(f"{identity}: no saved session was found")
@@ -3039,9 +3035,11 @@ def move_result_line(result: SessionMoveOutcome) -> str:
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending on {result.account}: {next(iter(result.reason.splitlines()), 'unknown error')}"
     if isinstance(result, moves.MoveInProgress):
-        return f"{result.session_id}: move to {result.account} already in progress"
+        line = f"{result.session_id}: move to {result.account} already in progress"
+        return f"{line}. Run again: {result.command}" if result.command else line
     if isinstance(result, moves.MoveWaitingForRow):
-        return f"{result.session_id}: move pending: {result.reason}"
+        line = f"{result.session_id}: move pending: {result.reason}"
+        return f"{line}. Run again: {result.command}" if result.command else line
     if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
     return stop_results.claude_up_line(result)
@@ -3466,13 +3464,13 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     reason = why or f"{group} moved by hand"
     transition = NoGroupTransition() if dry_run else group_transition(group)
     if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
-        transition = set_group_account(group, target, why=reason)
+        _ = set_group_account(group, target, why=reason)
     members = group_move_members(group)
     stopped = members.without_live_account
     selected = [member for member in members.live if not session_on_account(member.session, target)
                 or (not dry_run and member.row.id in members.busy)]
-    rows = (*(member.row for member in selected), *stopped)
-    ids = tuple(row.current_session for row in rows)
+    selected_rows = (*(member.row for member in selected), *stopped)
+    ids = tuple(row.current_session for row in selected_rows)
     if members.claude_registry_unreadable:
         notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
     else:
@@ -3493,10 +3491,15 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             *(move_preview_line(item.session, target) for item in selected),
             *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
               for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
-    assert isinstance(transition, GroupTransition)
+    rows = (*(member.row for member in members.live), *stopped)
     results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
-                            batch_id=transition.move_id, intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
-    names = {result.session_id: row.name for result, row in zip(results, rows)}
+                            intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
+    reported = [(row, result) for row, result in zip(rows, results)
+                if not isinstance(result, stop_results.ClaudeUp)
+                or result.start_state != stop_results.ClaudeStartState.ALREADY_RUNNING]
+    ids = tuple(dict.fromkeys((*ids, *(row.current_session for row, _ in reported))))
+    names = {result.session_id: row.name for row, result in reported}
+    results = tuple(result for _, result in reported)
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices), names=names)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(ids, target, stdout, stderr, code, outcomes=results)
@@ -3522,6 +3525,8 @@ def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: Mov
 
 def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
     """Skip an owner on the target; check quota before moving another owner."""
+    from scripts.production import staff
+
     account_config = read_account_settings(account_config)
     del alerts
     target = note_file.canonical_label(target)
@@ -3543,8 +3548,21 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             matches = [item for item in live if item.name == session]
         if len(matches) == 1 and session_account_label(matches[0]) == target:
             owner = matches[0]
-            line = f"{owner.name}: already on {target}"
-            return MoveDryRun(owner.session_id, (line,)) if dry_run else MoveStarted(owner.session_id, target, line + "\n", "", 0)
+            if dry_run:
+                return MoveDryRun(owner.session_id, (f"{owner.name}: already on {target}",))
+            session = owner.session_id
+            try:
+                with staff.session_operation(session, native_key=moves.native_row_key(session)):
+                    live = inventory.listing()
+                    matches = [item for item in live if item.session_id == session]
+                    if len(matches) == 1 and session_account_label(matches[0]) == target:
+                        moves.latest_request_path(session).unlink(missing_ok=True)
+                        return MoveStarted(session, target, f"{matches[0].name}: already on {target}\n", "", 0)
+            except staff.StaffRefused:
+                busy = moves.MoveWaitingForRow(session, "could not acquire the session and staff row locks",
+                                               moves.batch_move_command(session, target))
+                stdout, stderr, code = _move_output((busy,), (), names={session: owner.name})
+                return MoveStartFailed(session, target, stdout, stderr, code)
         checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
         if isinstance(checked, MoveRefused):
             return checked
@@ -4869,11 +4887,13 @@ def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
     return _colored_span(label, f"account.{label}", colors, kind="bold")
 
 
-def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
-    if not role:
-        return [_span("")]
+def board_role_span(role: str, colors: dict[str, str]) -> BoardSpan:
     key = ROLE_COLOR_KEYS.get(role)
-    return [_colored_span(role, key, colors) if key else _span(role), *([_span(" ✓")] if selected else [])]
+    return _colored_span(role, key, colors) if key else _span(role)
+
+
+def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
+    return [board_role_span(role, colors), *([_span(" ✓")] if role and selected else [])]
 
 
 def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
@@ -5042,10 +5062,12 @@ def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str,
     return orders
 
 
-def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
+def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+                 include_empty_total: bool = False) -> Board:
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
-    return _status_board(reading, account_config=account_config, colors=role_colors())
+    return _status_board(reading, account_config=account_config, colors=role_colors(),
+                         include_empty_total=include_empty_total)
 
 
 MODEL_COUNT_COLUMNS = (*MODEL_ROLES, "total")
@@ -5161,12 +5183,13 @@ def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
     return ModelsBoard(rows, orders)
 
 
-def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
+def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str],
+                  include_empty_total: bool = False) -> Board:
     rows = sorted(reading.rows, key=lambda row: row.label.casefold())
     # The reset text changes at the next local midnight.
     today = reading.checked_at.astimezone(reading.zone).date()
     stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
-    if not rows:
+    if not rows and not include_empty_total:
         return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
     lines = account_details_in_row_order([
         line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)])

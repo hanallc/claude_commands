@@ -1281,14 +1281,6 @@ def _publish_question(record: QuestionRecord, *, record_history: Callable[[], No
         return identity
 
 
-def question_review_id(record: QuestionRecord) -> str:
-    """Give a legacy Question its stored ID under the owner's lock."""
-    if identity := _numbered_question_id(record):
-        return identity
-    with _question_number_lock(record.owner):
-        return _publish_question(_current_legacy_question(record))
-
-
 def _numbered_question_id(record: QuestionRecord) -> str:
     identity = record.item.get("review_id", "")
     return identity if re.fullmatch(r"Q[1-9][0-9]*", identity) else ""
@@ -1321,9 +1313,9 @@ def _file_question(record: QuestionRecord,
             filed = replace(record, path=path, item={**record.item, "review_id": identity})
             text = _question_text(filed, new_record=True)
             assert text is not None
-            before_write(identity, path)
             try:
-                with numbers.write(path, identity, record.owner, new_record=True):
+                with numbers.write(path, identity, record.owner, new_record=True,
+                                   before_write=lambda: before_write(identity, path)):
                     try:
                         record_store.create_record_text(path, text)
                     except record_store.ReusedReviewRecord:
@@ -1338,12 +1330,15 @@ def _file_question(record: QuestionRecord,
             return filed
 
 
-def write_question_record(record: QuestionRecord, *, assign_id: bool = False) -> None:
+def write_question_record(record: QuestionRecord, *, assign_id: bool = False,
+                          before_write: Callable[[], None] | None = None) -> None:
     if assign_id and not _numbered_question_id(record):
         with _question_number_lock(record.owner):
-            _ = _publish_question(record)
+            _ = _publish_question(record, record_history=before_write)
         return
     text = _question_text(record)
+    if before_write is not None:
+        before_write()
     _write_question_text(record, text)
 
 

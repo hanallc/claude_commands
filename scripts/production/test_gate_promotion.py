@@ -17,9 +17,8 @@ from types import SimpleNamespace
 from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, gate, promotion, showrunners, staff
+from scripts.production import change_review, gate, promotion, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
-from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib import land_main, waiting_rows
@@ -117,16 +116,6 @@ class MergeGatePromotionTests(MergeGateFixture):
         super().setUp()
         _ = self.enterContext(mock.patch.object(
             showrunners, "SHOWRUNNER_STATE_DIR", Path(self.environment["SHOWRUNNER_STATE_DIR"])))
-
-    @override
-    def review_list(self) -> tuple[Path, Path]:
-        review, doc = super().review_list()
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            record = staff.snapshot()
-            owner = record.by_doc("natedev", doc)
-            assert owner is not None
-            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
-        return review, doc
 
     def test_failed_main_push_leaves_rows_unlisted_until_promote_only_succeeds(self) -> None:
         review, _ = self.review_list()
