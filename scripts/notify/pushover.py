@@ -148,10 +148,12 @@ def fields(keys: Keys, title: str, message: str, priority: str, key: str = "") -
     body = {
         "token": keys["token"],
         "user": keys["user"],
-        "title": title[:TITLE_MAX],
         "message": message[:MESSAGE_MAX],
         "priority": priority,
     }
+    if title:
+        # With no title, Pushover shows the app name.
+        body["title"] = title[:TITLE_MAX]
     if priority == "2":
         body |= {"retry": str(RETRY_S), "expire": str(EXPIRE_S)}
         if key:
@@ -316,6 +318,7 @@ def parse(argv: list[str]) -> Arguments | None:
         push_key = "question:" + reference["path"]
     session: NotificationSession = NO_SESSION_LINE
     header = True
+    one_line = False
     need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
@@ -331,16 +334,18 @@ def parse(argv: list[str]) -> Arguments | None:
             return None
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
-        positionals = [rendered.title, rendered.body]
+        one_line = rendered.one_line
+        positionals = [rendered.posted_title, rendered.posted_body]
         session = rendered.session
-        header = rendered.header
+        header = rendered.header and not one_line
     elif values:
         return None
     try:
         priority = decision_priority.priority(need, due)
     except ValueError:
         return None
-    if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
+    if (len(positionals) != 2 or (not one_line and not positionals[0].strip())
+            or (not text_id and not positionals[1].strip())):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])

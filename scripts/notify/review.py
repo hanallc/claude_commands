@@ -1506,7 +1506,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
-                          rendered.title, rendered.action, rendered.body, False, rendered.session)
+                          rendered.posted_title, rendered.action, rendered.posted_body, False, rendered.session)
             if timeout_seconds is None:
                 timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
@@ -1547,7 +1547,7 @@ def ask_text(text_id: str) -> int:
         print(f"review: cannot save the ask. {error}", file=sys.stderr)
         return 2
     for name, rendered in examples:
-        print(f"{entry.id}/{name}\n{rendered.title}\n{rendered.message}")
+        print(f"{entry.id}/{name}\n{push_texts.shown_title(rendered)}\n{rendered.message}")
     return 0
 
 
