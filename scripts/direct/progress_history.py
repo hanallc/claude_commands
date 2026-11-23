@@ -823,7 +823,7 @@ def _selected_phase(state: dict[str, object], args: argparse.Namespace, *, close
 
 
 def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float) -> float:
-    """A past moment an option names, for a phase recorded after the fact; now when absent."""
+    """A past moment an option names, for a phase or activity recorded after the fact; now when absent."""
     value = pass_recorder.optional_arg(args, name)
     if not value:
         return now
@@ -842,6 +842,13 @@ def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float
     return moment
 
 
+def _mark_backfilled(event: dict[str, object], at: float, now: float) -> None:
+    """Mark an event stamped at a past moment, so readers know it is out of time order."""
+    if at != now:
+        event["recorded_at"] = pass_recorder.iso_time(now)
+        event["backfilled"] = True
+
+
 def _close_active_activity(
     session_dir: Path,
     state: dict[str, object],
@@ -849,21 +856,23 @@ def _close_active_activity(
     status: str,
     result: str,
     now: float,
+    finished_at: float | None = None,
 ) -> None:
+    """Close the active activity at `finished_at`, or at now when absent or before the activity started."""
     activity = pass_recorder.object_dict(phase.get("activity"))
     if activity is None or pass_recorder.string(activity.get("status")) != "active":
         return
-    event = pass_recorder.record_event(state, "activity_finished", now, phase_record=phase, activity_record=activity)
+    started_at = pass_recorder.number(activity.get("started_at"), now)
+    at = now if finished_at is None or finished_at < started_at else finished_at
+    event = pass_recorder.record_event(state, "activity_finished", at, phase_record=phase, activity_record=activity)
     event["status"] = status
     event["activity_result"] = result
-    event["activity_elapsed_seconds"] = max(
-        0,
-        int(now - pass_recorder.number(activity.get("started_at"), now)),
-    )
+    event["activity_elapsed_seconds"] = max(0, int(at - started_at))
+    _mark_backfilled(event, at, now)
     pass_recorder.append_event(state, event)
     activity["status"] = status
     activity["result"] = result
-    activity["finished_at"] = now
+    activity["finished_at"] = at
     pass_recorder.write_state(session_dir, state)
 
 
@@ -876,18 +885,27 @@ def _start_activity(args: argparse.Namespace) -> None:
     if phase is None:
         raise SystemExit("Start a phase before starting an activity")
     now = pass_recorder.now_epoch()
-    _close_active_activity(session_dir, state, phase, "interrupted", "", now)
+    started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    phase_started_at = pass_recorder.number(phase.get("started_at"), started_at)
+    if started_at < phase_started_at:
+        raise SystemExit(
+            f"--started-at is before Phase {pass_recorder.string(phase.get('id'))} started "
+            + f"({pass_recorder.iso_time(phase_started_at)})"
+        )
+    _close_active_activity(session_dir, state, phase, "interrupted", "", now, started_at)
     pass_recorder.refresh_main_identity(session_dir, state)
     activity: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "label": pass_recorder.arg_string(args, "label", "Work") or "Work",
         "activity": pass_recorder.arg_string(args, "activity"),
-        "started_at": now,
+        "started_at": started_at,
         "status": "active",
     }
     phase["activity"] = activity
     pass_recorder.write_state(session_dir, state)
-    pass_recorder.append_event(state, pass_recorder.record_event(state, "activity_started", now, phase_record=phase, activity_record=activity))
+    event = pass_recorder.record_event(state, "activity_started", started_at, phase_record=phase, activity_record=activity)
+    _mark_backfilled(event, started_at, now)
+    pass_recorder.append_event(state, event)
 
 
 def _finish_activity(args: argparse.Namespace) -> None:
@@ -897,13 +915,24 @@ def _finish_activity(args: argparse.Namespace) -> None:
     if phase is None:
         return
     status = pass_recorder.arg_string(args, "status", "completed") or "completed"
+    now = pass_recorder.now_epoch()
+    finished_at = _optional_epoch(args, "finished_at", "--finished-at", now)
+    activity = pass_recorder.object_dict(phase.get("activity"))
+    if activity is not None and pass_recorder.string(activity.get("status")) == "active":
+        started_at = pass_recorder.number(activity.get("started_at"), finished_at)
+        if finished_at < started_at:
+            raise SystemExit(
+                f"--finished-at is before the activity {pass_recorder.string(activity.get('label'))!r} "
+                + f"started ({pass_recorder.iso_time(started_at)})"
+            )
     _close_active_activity(
         session_dir,
         state,
         phase,
         status,
         pass_recorder.arg_string(args, "result"),
-        pass_recorder.now_epoch(),
+        now,
+        finished_at,
     )
 
 
@@ -1105,9 +1134,7 @@ def _start_phase(args: argparse.Namespace) -> None:
                  repository=_phase_metadata_fields(source.repository))
     event["contract_revision"] = _contract_revision()
     event["wait_coverage"] = {"state": "Recorded", "version": 1}
-    if started_at != now:
-        event["recorded_at"] = pass_recorder.iso_time(now)
-        event["backfilled"] = True
+    _mark_backfilled(event, started_at, now)
     event.update(_work_order_metrics(pass_recorder.arg_string(args, "work_order_file")))
     phase["start_event"] = event
     pass_recorder.write_state(session_dir, state)
@@ -2349,6 +2376,7 @@ ROLE_WAVE_SECONDS = 30.0
 # The label the director opens an activity with while the UX helper judges the
 # phase's shots; review-trial counts that time as review time.
 UX_REVIEW_ACTIVITY_LABEL = "UX review"
+SUBAGENT_REVIEW_ACTIVITY_LABEL = "Subagent review"
 # What findings.py's `--lens both` stands for: the two lenses the broad review
 # ran before `craft` joined them.
 LEGACY_BOTH_LENS = "both"
@@ -6154,9 +6182,7 @@ def _finish_phase_with_wait_lock(
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
     event["phase_active_seconds"] = max(0, int(finished_at - started_at - paused))
-    if finished_at != now:
-        event["recorded_at"] = pass_recorder.iso_time(now)
-        event["backfilled"] = True
+    _mark_backfilled(event, finished_at, now)
     pass_recorder.append_event(state, event)
     phase["status"] = status
     phase["finished_at"] = finished_at
@@ -6301,7 +6327,8 @@ def _review_trial(args: argparse.Namespace) -> None:
     An unnamed command selects the only open phase or the last closed phase.
     Only the selected instance contributes to the line.
     Its ledger supplies the findings and dispatched rounds, including routed and closed findings.
-    Review-worker minutes count finished review passes and UX review activities.
+    Review-worker minutes count finished review passes, `UX review` activities and
+    `Subagent review` activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
@@ -6370,6 +6397,11 @@ def _review_trial(args: argparse.Namespace) -> None:
             elapsed = pass_recorder.integer(event.get("activity_elapsed_seconds"))
             review_seconds += elapsed
             ux_check_seconds += elapsed
+        elif (
+            event_type == "activity_finished"
+            and pass_recorder.string(event.get("activity_label")) == SUBAGENT_REVIEW_ACTIVITY_LABEL
+        ):
+            review_seconds += pass_recorder.integer(event.get("activity_elapsed_seconds"))
     # A fix pass carries the round the ledger dispatched (`fix_pass`), and the
     # dispatch names the findings that round covers.
     rounds = ledger.get("rounds")
@@ -6528,6 +6560,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_activity.add_argument("--phase-id", "--phase", default="")
     _ = start_activity.add_argument("--label", required=True)
     _ = start_activity.add_argument("--activity", required=True)
+    _ = start_activity.add_argument("--started-at", default="")
     start_activity.set_defaults(handler=_start_activity)
 
     finish_activity = subparsers.add_parser("finish-activity")
@@ -6543,6 +6576,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="short outcome for the stage table, such as pass, clean, or no change",
     )
+    _ = finish_activity.add_argument("--finished-at", default="")
     finish_activity.set_defaults(handler=_finish_activity)
 
     arm_review = subparsers.add_parser(
