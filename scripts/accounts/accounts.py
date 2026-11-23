@@ -4489,6 +4489,14 @@ class AccountSessionDocument(TypedDict):
     state: session_state.SessionState
 
 
+@dataclass(frozen=True)
+class NamedSession:
+    """One local session of a role by its staff name; the Accounts page names paused and exited ones."""
+
+    name: str
+    state: session_state.SessionState
+
+
 MODEL_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MODEL_ROLES = ("producers", "showrunners", "units", "workers")
 
@@ -4583,6 +4591,8 @@ class StatusRow:
     models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
     inherited_roles: tuple[ClaudeGroup, ...] = ()
     model_names_by_role: dict[str, dict[SessionModel, ModelSessionNames]] = field(default_factory=dict)
+    # Filled only for local sessions, and only when the read uses include_models=True; a peer sends counts without names.
+    named_sessions_by_role: dict[str, tuple[NamedSession, ...]] = field(default_factory=dict)
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -6917,8 +6927,10 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         members: dict[str, session_state.SessionState] = {}
         models: dict[str, Counter[ObservedSessionModel]] = {}
         model_names: dict[str, dict[SessionModel, ModelSessionNames]] = {}
+        named: dict[str, tuple[NamedSession, ...]] = {}
         for role in roles:
             role_models: Counter[ObservedSessionModel] = Counter()
+            role_named: list[NamedSession] = []
             for identity, state in observed.counts.get((directory, role), {}).items():
                 members[identity] = state
                 key = (directory, identity)
@@ -6927,12 +6939,16 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
                     role_models[model] += 1
                 if name := observed.model_session_names.get(key):
                     model_names.setdefault(role, {}).setdefault(model, ModelSessionNames()).names.append(name)
+                    role_named.append(NamedSession(name, state))
             models[role] = role_models
+            if role_named:
+                named[role] = tuple(role_named)
         counted.append(replace(row, roles=roles,
             sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
             selected_roles=tuple(role for role in row.roles if role != "spare"),
             models_by_role=models,
             model_names_by_role=model_names,
+            named_sessions_by_role=named,
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs

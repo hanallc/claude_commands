@@ -1,9 +1,10 @@
 """Render the accounts board on the Hana console Accounts page."""
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 import html
 import json
@@ -15,10 +16,12 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, next_moves
+from scripts.accounts import accounts, next_moves, role_activity
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 from scripts.whoami import mac_fallback_token, quota_alert, run_out, token_expiry
+# The alias keeps the module apart from this page's quota_state() path function.
+from scripts.whoami import quota_state as worker_quota_state
 
 PAGE_NAME = "accounts.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -306,7 +309,10 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     return "".join(parts)
 
 
-def _next_cell(row: accounts.BoardRow, move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"],
+NextMove = accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"]
+
+
+def _next_cell(row: accounts.BoardRow, move: NextMove,
                labels: dict[str, accounts.BoardSpan]) -> str:
     """Render the selected group's target or the reason this line has no target."""
     if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
@@ -337,7 +343,7 @@ def _next_text(move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailabl
     return '<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>'
 
 
-def _next_sort_value(move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"]) -> str | None:
+def _next_sort_value(move: NextMove) -> str | None:
     if isinstance(move, accounts.BoardNextMoveTarget):
         return move.label.casefold()
     if isinstance(move, accounts.NextMovesUnavailable):
@@ -378,8 +384,23 @@ ACCOUNT_COLUMNS = (
     ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
     ("resets", "right"), ("credits", "right"), ("enabled", "left"),
 )
-ROLE_COLUMNS = (("role", "left"), ("", "left"), ("account", "left"), ("next", "left"),
-                *((key, "right") for key in accounts.COUNT_COLUMNS))
+ROLE_COUNT_COLUMNS = ("busy", "idle", "total")
+# Paused and exited sessions are not running. They have no column: a warning icon after the role total names them.
+NOT_RUNNING_STATES: tuple[Literal["paused", "exited"], ...] = ("paused", "exited")
+BUSY_LINE_HEADING = "busy, last 24 h"
+ROLE_COLUMNS = (("role", "left"), ("", "left"), (BUSY_LINE_HEADING, "left"), ("account", "left"), ("next", "left"),
+                *((key, "right") for key in ROLE_COUNT_COLUMNS))
+# The busy line of each role, in SVG pixels: the line area, then the hour labels under it.
+BUSY_LINE_WIDTH = 288
+BUSY_LINE_HEIGHT = 22
+BUSY_LINE_TOTAL_HEIGHT = 35
+BUSY_LINE_LABEL_PX = 9
+BUSY_LINE_EDGE = 4
+BUSY_LINE_TICK = 4
+BUSY_LINE_LABEL_HOURS = 3
+# The statusline.conf key of the codex pair row tint, and the strength of that tint over the card.
+PAIR_TINT_KEY = "background.codex-pair"
+PAIR_TINT_PERCENT = 12
 ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,9,10,11"
 DASH = '<span class="next-muted">—</span>'
 
@@ -397,11 +418,12 @@ def _sort_orders(values: list[SortValues], descending: tuple[str, ...]) -> dict[
 
 def _split_card(title: str, name: str, default: str, columns: tuple[tuple[str, str], ...],
                 rows: list[str], orders: dict[str, list[int]] | dict[str, list[accounts.AccountRowPlacement]],
-                *, descending: tuple[str, ...] = (),
+                *, descending: tuple[str, ...] = (), unsorted: tuple[str, ...] = (),
                 sort_field: str = "", attributes: str = "", after: str = "") -> str:
-    head = "".join(_sort_heading(accounts.BoardColumn(key=key, heading=key,
-                                 align="right" if align == "right" else "left"),
-                                 default, descending, sort_field=sort_field) for key, align in columns)
+    head = "".join(f'<th class="{align}">{html.escape(key)}</th>' if key in unsorted
+                   else _sort_heading(accounts.BoardColumn(key=key, heading=key,
+                                      align="right" if align == "right" else "left"),
+                                      default, descending, sort_field=sort_field) for key, align in columns)
     orders_json = html.escape(json.dumps(orders), quote=True)
     return (f'<section class="card" data-sort-table="{name}" data-sort-default="{default}" '
             f'data-sort-orders="{orders_json}"{attributes}><h2>{title}</h2><div class="scroll">'
@@ -421,13 +443,68 @@ def _forecast_dash(reason: str) -> str:
     return f'<span title="{reason}">{DASH}</span>'
 
 
+def _shown_lines(lines: list[accounts.BoardRow]) -> list[accounts.BoardRow]:
+    """The role lines of one account; an account with no role but spare keeps its first line."""
+    return [line for line in lines if line["cells"]["roles"][0]["text"] != "spare"] or lines[:1]
+
+
+def _shown_moves(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
+                 facts: Mapping[str, accounts.StatusRow]) -> dict[str, list[NextMove]]:
+    """The next move of each shown line; while workers move by themselves, each workers or spare Codex line reads auto."""
+    moves: dict[str, list[NextMove]] = {
+        label: [accounts.account_board_next_move(line, reading.first_next_moves) for line in _shown_lines(lines)]
+        for label, lines in rows_by_account.items()}
+    # The selected Codex workers line reads auto when workers have no Claude next move; the spare Codex lines join it.
+    if any(facts[label].tool == "codex" and "auto" in row_moves for label, row_moves in moves.items()):
+        for label, row_moves in moves.items():
+            for index, line in enumerate(_shown_lines(rows_by_account[label])):
+                if (row_moves[index] == "unselected" and facts[label].tool == "codex"
+                        and line["cells"]["roles"][0]["text"] in (accounts.CODEX_ROLE, "spare")):
+                    row_moves[index] = "auto"
+    return moves
+
+
+def _joined(names: Sequence[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _pair_text(pair: Sequence[accounts.StatusRow]) -> str:
+    """The user's words for the Codex accounts that take the workers in turn."""
+    # Only a known 0% on every account says there is no availability; an unknown value makes no claim.
+    empty = all(isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent <= 0 for row in pair)
+    working = next((row.label for row in pair if accounts.CODEX_ROLE in row.selected_roles), None)
+    now = ("No account has availability. " if empty else f"{working} is working right now. " if working else "")
+    mode = "self-actualizing" if worker_quota_state.no_worker_mode() else "working workers"
+    return f"{_joined([row.label for row in pair])} alternate when available. {now}We are in {mode} mode."
+
+
+def _tip_target(target_id: str, css: str, attributes: str, content: str, text: str) -> str:
+    """A focusable target whose tooltip text is also its accessible description, in a hidden element next to it."""
+    target = html.escape(target_id, quote=True)
+    return (f'<span class="{css}" id="{target}"{attributes} tabindex="0" aria-describedby="{target}-tip" data-tip>'
+            f'{content}</span><span id="{target}-tip" hidden>{html.escape(text)}</span>')
+
+
+def _pair_tint(colors: Mapping[str, str]) -> str:
+    color = accounts.account_color(colors.get(PAIR_TINT_KEY, ""))
+    if not isinstance(color, accounts.AccountColor):
+        return ""
+    return f' style="background:color-mix(in srgb,{color.css} {PAIR_TINT_PERCENT}%,transparent)"'
+
+
 def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
-                    labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert]) -> str:
+                    labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
+                    colors: Mapping[str, str]) -> str:
     histories = run_out.read_readings(run_out.READINGS_LOG)
     rows: list[str] = []
     values: list[SortValues] = []
     labels_in_row_order: list[str] = []
     facts = {row.label: row for row in reading.rows}
+    moves = _shown_moves(reading, rows_by_account, facts)
+    pair = [facts[label] for label, row_moves in moves.items() if facts[label].tool == "codex" and "auto" in row_moves]
+    # One Codex account has nothing to take turns with, so it keeps the plain auto text.
+    pair_text = _pair_text(pair) if len(pair) > 1 else ""
+    pair_row = f' class="auto-pair"{_pair_tint(colors)}' if pair_text else ""
     targets: list[tuple[str, str, str, accounts.BoardTone]] = []
     for label, lines in rows_by_account.items():
         row, cells = facts[label], lines[0]["cells"]
@@ -472,17 +549,17 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         )
         account_end = (_cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
                        + _cell(_spans(cells["enabled"])))
-        role_lines = [line for line in lines if line["cells"]["roles"][0]["text"] != "spare"]
-        for index, line in enumerate(role_lines or lines[:1]):
+        for index, line in enumerate(_shown_lines(lines)):
             spans = line["cells"]["roles"]
-            visible_role = [span for span in spans if span["text"] != " ✓"] if role_lines else []
+            visible_role = [span for span in spans if span["text"] != " ✓"] if spans[0]["text"] != "spare" else []
             role = visible_role[0]["text"] if visible_role else ""
-            move = accounts.account_board_next_move(line, reading.first_next_moves)
-            rows.append(f'<tr data-account-row="{html.escape(label, quote=True)}">'
+            move = moves[label][index]
+            paired = pair_text and move == "auto"
+            rows.append(f'<tr{pair_row if paired else ""} data-account-row="{html.escape(label, quote=True)}">'
                         + (account_start if index == 0 else _cell("") + '<td class="left" data-account-name></td>'
                            + _cell("") + _cell("", "right") * 2 + _cell(""))
                         + _cell(_spans(visible_role)) + _cell(_swatch(visible_role))
-                        + _cell(_next_cell(line, move, labels), "left next-cell")
+                        + _cell(_tip_target(f"pair-auto-{label}", "next-muted", "", "auto", pair_text) if paired else _next_cell(line, move, labels), "left next-cell")
                         + (account_end if index == 0 else _cell("", "right") * 2 + _cell("")) + "</tr>")
             values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(move)})
             labels_in_row_order.append(label)
@@ -512,9 +589,9 @@ def _count_tooltip(cell_id: str, value: str, lines: Sequence[str],
 
 
 def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
-                     *, show_breakdown: bool) -> tuple[str, int | None]:
+                     *, show_breakdown: bool, after: str = "") -> tuple[str, int | None]:
     if not assignments:
-        return _cell("", "right"), None
+        return _cell(after, "right"), None
     counts = [(label, line["cells"][key][0]["text"]) for label, line in assignments]
     total = sum(int(value) for _, value in counts) if all(value.isdecimal() for _, value in counts) else None
     value = str(total) if total is not None else "unknown" if key == "total" else ""
@@ -522,20 +599,119 @@ def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]]
     if show_breakdown:
         lines = [f"{label}: {count or 'unknown'}" for label, count in counts]
         attributes = _count_tooltip(f"role-count-{role}-{key}", value or key, lines, "data-role-counts")
-    return f'<td class="right"{attributes}>{value}</td>', total
+    return f'<td class="right"{attributes}>{value}{after}</td>', total
+
+
+NotRunningNames = dict[str, list[str]]
+
+
+def _not_running(role: str, assignments: list[tuple[str, accounts.BoardRow]],
+                 facts: Mapping[str, accounts.StatusRow]) -> tuple[Counter[str], NotRunningNames]:
+    """The count of each not-running state of one role, and the local names in that state."""
+    counts: Counter[str] = Counter()
+    names: NotRunningNames = {state: [] for state in NOT_RUNNING_STATES}
+    for label, line in assignments:
+        named = facts[label].named_sessions_by_role.get(role, ()) if label in facts else ()
+        for state in NOT_RUNNING_STATES:
+            if (count := line["cells"][state][0]["text"]).isdecimal():
+                counts[state] += int(count)
+                names[state].extend(item.name for item in named if item.state == state)
+    return counts, names
+
+
+def _not_running_text(counts: Counter[str], names: NotRunningNames) -> str:
+    """For example "2 not running: 1 paused (tile), 1 exited (names unknown)"; no session not running gives ""."""
+    parts: list[str] = []
+    for state in NOT_RUNNING_STATES:
+        if not (count := counts[state]):
+            continue
+        known = sorted(names[state], key=lambda name: (name.casefold(), name))[:count]
+        unknown = count - len(known)
+        # A peer machine sends counts without names; never guess them.
+        missing = [] if not unknown else ["names unknown"] if not known else [
+            f"{unknown} {'name' if unknown == 1 else 'names'} unknown"]
+        parts.append(f"{count} {state} ({', '.join([*known, *missing])})")
+    return f"{counts.total()} not running: " + ", ".join(parts) if parts else ""
+
+
+def _not_running_slot(cell_id: str, text: str, icon: str) -> str:
+    """A fixed slot after the total keeps the totals aligned; it holds the icon when sessions are not running."""
+    content = _tip_target(cell_id, "not-running", ' role="img" aria-label="not running"', icon, text) if text else ""
+    return f'<span class="not-running-slot">{content}</span>'
+
+
+def _busy_line(role: str, color: str, samples: Sequence[role_activity.RoleBusySample],
+               now: datetime, zone: tzinfo) -> str:
+    """The role's busy count over the last 24 hours, one point per pixel column at most.
+
+    A sample without the role, or a time gap longer than role_activity.SAMPLE_GAP, breaks the line.
+    """
+    start = now - role_activity.WINDOW
+    window = role_activity.WINDOW.total_seconds()
+    column_time = role_activity.WINDOW / BUSY_LINE_WIDTH
+    top = max([1, *(sample.busy[role] for sample in samples if role in sample.busy)])
+    # Each segment holds (column, count) points; a column ends at its x, and it keeps its largest count.
+    segments: list[list[tuple[int, int]]] = []
+    gap = True
+    previous: datetime | None = None
+    for sample in samples:
+        count = sample.busy.get(role)
+        if previous is not None and sample.at - previous > role_activity.SAMPLE_GAP:
+            gap = True
+        previous = sample.at
+        if count is None:
+            gap = True
+            continue
+        column = min(BUSY_LINE_WIDTH, max(1, -(-(sample.at - start) // column_time)))
+        if gap:
+            segments.append([])
+            gap = False
+        points = segments[-1]
+        if points and points[-1][0] == column:
+            points[-1] = (column, max(points[-1][1], count))
+        else:
+            points.append((column, count))
+    lines = ""
+    for points in segments:
+        text = [f"{column:.1f},{BUSY_LINE_HEIGHT - 1 - count / top * (BUSY_LINE_HEIGHT - 2):.1f}" for column, count in points]
+        # A lone point repeats, so the round cap draws it as a dot.
+        lines += f'<polyline points="{" ".join(text * 2 if len(text) == 1 else text)}"/>'
+    marks: list[str] = []
+    hour = start.astimezone(zone).replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc) + timedelta(hours=1)
+    while hour <= now:
+        x = (hour - start).total_seconds() / window * BUSY_LINE_WIDTH
+        local = hour.astimezone(zone).hour
+        marks.append(f'<text x="{x:.1f}" y="{BUSY_LINE_TOTAL_HEIGHT - 3}">{local}</text>'
+                     if local % BUSY_LINE_LABEL_HOURS == 0 else
+                     f'<line class="busy-tick" x1="{x:.1f}" x2="{x:.1f}" y1="{BUSY_LINE_HEIGHT + 2}" '
+                     + f'y2="{BUSY_LINE_HEIGHT + 2 + BUSY_LINE_TICK}"/>')
+        hour += timedelta(hours=1)
+    return (f'<svg class="busy-line" width="{BUSY_LINE_WIDTH}" height="{BUSY_LINE_TOTAL_HEIGHT}" '
+            f'viewBox="{-BUSY_LINE_EDGE} 0 {BUSY_LINE_WIDTH + 2 * BUSY_LINE_EDGE} {BUSY_LINE_TOTAL_HEIGHT}" '
+            f'role="img" aria-label="{html.escape(role, quote=True)} busy sessions, last 24 hours">'
+            f'<line class="busy-base" x1="0" x2="{BUSY_LINE_WIDTH}" y1="{BUSY_LINE_HEIGHT - .5}" y2="{BUSY_LINE_HEIGHT - .5}"/>'
+            f'<g fill="none" stroke="{color or "currentColor"}" stroke-width="1.5" stroke-linejoin="round" '
+            f'stroke-linecap="round">{lines}</g>{"".join(marks)}</svg>')
 
 
 def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[str, accounts.BoardRow]]],
                  labels: dict[str, accounts.BoardSpan], selected: dict[str, tuple[str, ...]],
-                 total: accounts.BoardRow) -> str:
+                 total: accounts.BoardRow, colors: dict[str, str],
+                 samples: Sequence[role_activity.RoleBusySample]) -> str:
     rows: list[str] = []
     values: list[SortValues] = []
+    facts = {row.label: row for row in reading.rows}
     role_names = sorted(set(groups) | set(accounts.CLAUDE_GROUPS) | {accounts.CODEX_ROLE})
-    missing_colors = accounts.role_colors() if any(role not in groups for role in role_names) else {}
+    not_running = {role: _not_running(role, groups.get(role, []), facts) for role in role_names}
+    all_counts = sum((counts for counts, _ in not_running.values()), Counter[str]())
+    all_names = {state: [name for _, names in not_running.values() for name in names[state]]
+                 for state in NOT_RUNNING_STATES}
+    all_text = _not_running_text(all_counts, all_names)
+    icon = page_frame.icon_svg("triangle-alert") if all_text else ""
     for role in role_names:
         assignments = sorted(groups.get(role, []), key=lambda item: role not in selected[item[0]])
         role_span = (assignments[0][1]["cells"]["roles"][:1] if assignments
-                     else [accounts.board_role_span(role, missing_colors)])
+                     else [accounts.board_role_span(role, colors)])
         selected_assignment = next(((label, line) for label, line in assignments if role in selected[label]), None)
         move = (accounts.account_board_next_move(selected_assignment[1], reading.first_next_moves)
                 if selected_assignment else "unselected")
@@ -555,17 +731,24 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
         values.append({"role": role.casefold(), "account": account_value,
                        "next": _next_sort_value(move)})
         count_cells: list[str] = []
-        for key in accounts.COUNT_COLUMNS:
-            cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown)
+        for key in ROLE_COUNT_COLUMNS:
+            after = (_not_running_slot(f"role-not-running-{role}", _not_running_text(*not_running[role]), icon)
+                     if key == "total" else "")
+            cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown, after=after)
             count_cells.append(cell)
             values[-1][key] = count
-        rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span)) + _cell(name)
-                    + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
+        color = accounts.account_color(role_span[0].get("color", ""))
+        line_color = color.css if isinstance(color, accounts.AccountColor) else ""
+        rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span))
+                    + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
+                    + _cell(name) + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
     cells = total["cells"]
-    rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 3
-                + "".join(_cell(_spans(cells[key]), "right") for key in accounts.COUNT_COLUMNS) + "</tr>")
-    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, accounts.COUNT_COLUMNS),
-                       descending=accounts.COUNT_COLUMNS)
+    rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 4
+                + "".join(_cell(_spans(cells[key]) + (_not_running_slot("role-not-running-total", all_text, icon)
+                                                      if key == "total" else ""), "right")
+                          for key in ROLE_COUNT_COLUMNS) + "</tr>")
+    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, ROLE_COUNT_COLUMNS),
+                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,))
 
 
 def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
@@ -585,8 +768,10 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
         if role and role != "spare":
             groups.setdefault(role, []).append((label, line))
     selected = {row.label: row.selected_roles for row in reading.rows}
-    return (_accounts_table(reading, rows_by_account, labels, alerts or {})
-            + _roles_table(reading, groups, labels, selected, lines[-1]))
+    colors = accounts.role_colors()
+    samples = role_activity.read(reading.checked_at)
+    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors)
+            + _roles_table(reading, groups, labels, selected, lines[-1], colors, samples))
 
 
 def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> str:
@@ -737,6 +922,15 @@ h2{margin:16px 0 4px}
 scrollbar-color:var(--ink-2) var(--line);scrollbar-width:thin}
 .token-steps p{margin:0}
 .roles-table td{vertical-align:top}
+.busy-cell{padding-top:6px;padding-bottom:2px}
+.busy-line{display:block;overflow:visible}
+.busy-line text{font-size:""" + f"{BUSY_LINE_LABEL_PX}px" + """;fill:var(--ink-3);text-anchor:middle}
+.busy-base{stroke:var(--line)}.busy-tick{stroke:var(--ink-3)}
+.not-running-slot{display:inline-block;width:20px;text-align:right}
+.not-running{display:inline-grid;place-items:center;vertical-align:-2px;color:var(--warning);border-radius:4px;cursor:default}
+.not-running svg{width:14px;height:14px}
+/* The codex pair rows keep their tint in every sort; next to each other they show no line between them. */
+tr.auto-pair+tr.auto-pair td{border-top-color:transparent}
 .model-tooltip{position:fixed;width:max-content;padding:7px 11px;background:var(--model-tooltip-bg);
 color:var(--model-tooltip-ink);border-radius:6px;
 font-size:12px;font-weight:500;box-shadow:0 3px 12px #0002;z-index:5;white-space:pre;overflow:auto}
@@ -744,7 +938,10 @@ font-size:12px;font-weight:500;box-shadow:0 3px 12px #0002;z-index:5;white-space
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}}
 :root[data-theme="dark"]{--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}
 .model-tooltip.role-counts{text-align:right;font-variant-numeric:tabular-nums}
-:is([data-model-sessions],[data-role-counts]):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.model-tooltip.tip-text{white-space:normal;line-height:1.45}
+:is([data-model-sessions],[data-role-counts],[data-tip]):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* A tooltip word or icon is smaller than a cell, so its ring sits outside it. */
+span[data-tip]:focus-visible{outline-offset:1px;border-radius:3px}
 table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
 /* Let the last sort arrow use the right padding of the card. */
 .card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
@@ -850,7 +1047,9 @@ SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
 const modelTooltip=document.querySelector('.model-tooltip');
-const countCell=node=>node instanceof Element ? node.closest('[data-model-sessions],[data-role-counts]') : null;
+const countCell=node=>node instanceof Element ? node.closest('[data-model-sessions],[data-role-counts],[data-tip]') : null;
+// A sentence tooltip wraps at this width; a list tooltip keeps one line per item.
+const tipWidth=320;
 let hoveredCountCell=null, tooltipCountCell=null;
 function positionCountTooltip(){
  const cell=tooltipCountCell;
@@ -861,10 +1060,13 @@ function positionCountTooltip(){
  const left=Math.max(table.left,scroll.left,0), right=Math.min(table.right,scroll.right,innerWidth);
  const top=Math.max(table.top,scroll.top,0), bottom=Math.min(table.bottom,scroll.bottom,innerHeight);
  if(box.bottom<=top || box.top>=bottom || box.right<=left || box.left>=right) return;
- const roleCounts=cell.dataset.roleCounts;
+ const {roleCounts,modelSessions}=cell.dataset;
+ const tip=cell.hasAttribute('data-tip') ? document.getElementById(cell.getAttribute('aria-describedby'))?.textContent ?? '' : undefined;
  modelTooltip.classList.toggle('role-counts',roleCounts!==undefined);
- modelTooltip.textContent=roleCounts ?? cell.dataset.modelSessions;
- modelTooltip.style.maxWidth=(right-left)+'px';modelTooltip.style.maxHeight=(bottom-top)+'px';
+ modelTooltip.classList.toggle('tip-text',tip!==undefined);
+ modelTooltip.textContent=roleCounts ?? modelSessions ?? tip;
+ modelTooltip.style.maxWidth=Math.min(right-left,tip===undefined ? Infinity : tipWidth)+'px';
+ modelTooltip.style.maxHeight=(bottom-top)+'px';
  modelTooltip.hidden=false;
  const size=modelTooltip.getBoundingClientRect();
  const beside=box.right+size.width<=right ? box.right : box.left-size.width;

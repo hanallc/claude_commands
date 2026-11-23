@@ -623,8 +623,15 @@ The page shows forecast times in the user's time zone.
 
 The Roles table has one row per role.
 It shows the selected account for each role.
-Each role has a color swatch.
-Each count column shows the total for the role across all accounts.
+Each role has a color swatch and a line of its busy sessions over the last 24 hours.
+`scripts/accounts/role_activity.py` keeps those samples: the time and the busy count of each role.
+`role_activity.sample_now()` records one sample from the stored-usage status read, and the file keeps 24 hours.
+A gap longer than `role_activity.SAMPLE_GAP` (10 minutes) breaks the line. The notes job samples about every 2 minutes.
+The count columns are busy, idle and total. Each shows the total for the role across all accounts.
+A warning icon after the total names the paused and exited sessions of the role.
+`StatusRow.named_sessions_by_role` gives the staff name and state of each local session of a role.
+It is filled only for local sessions, and only when the read uses `include_models=True`.
+A peer count has no names, so the icon gives the count and `names unknown` for those sessions.
 The count tooltip lists counts by account when any observed sessions run outside the selected account.
 The tooltip also lists accounts outside the selected account when their counts are unknown.
 If the role has no selected account, the tooltip lists the count for each observed account.
@@ -644,6 +651,7 @@ The role column sorts by role name without regard to letter case.
 The next column sorts by its text without regard to letter case.
 `auto`, `none` and `unavailable` sort as words. Rows with no next move stay last.
 Role counts sort by the sum for the role, largest first.
+The busy line column has no sort.
 Missing values stay last in both directions.
 Select the active header again to reverse the order.
 Press Enter or Space to sort by a focused header.
@@ -681,6 +689,8 @@ The Accounts table shows each next move beside its role.
 Sorting keeps each next move with its role.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
 A selected Codex workers line shows its first target, or `auto`, without a button.
+While it shows `auto`, each spare Codex line also shows `auto`; together these lines are the codex pair.
+`background.codex-pair` in `config/statusline.conf` tints the pair rows on the Accounts page.
 Other assignments show a minus icon.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
 One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
