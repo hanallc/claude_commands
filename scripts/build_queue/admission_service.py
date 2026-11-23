@@ -3842,17 +3842,46 @@ done
         """Close the current attempt as lost when its owner asks again after the claim holder ended.
 
         The owner asks for a placement again only after its attempt ends, so no report comes for that
-        attempt. The episode goes back to its lines. The provider keeps the claim and any pending start
-        for cleanup: the next claim for the scope takes it over and settles the start before it runs.
+        attempt. The episode goes back to its lines. Only a mac_test claim closes this way: the provider
+        keeps the claim and any pending start, and the next claim for the scope takes it over and settles
+        the start before it runs.
         """
         saved = self.assignments.get(self.current_assignments.get(episode, ""))
         if (saved is None or not isinstance(saved.state, placement.CurrentAssignment)
                 or not isinstance(saved.terminal_report, placement.NoTerminalReport)
-                or not self._ended_claim_holder(saved)):
+                or not self._ended_claim_holder(saved) or not self._next_claim_takes_over(saved)):
             return
-        report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
-                                                 self.clock.now())
+        report = self._lost_report()
         self._close_for_report(replace(saved, terminal_report=report), report)
+
+    def _next_claim_takes_over(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A mac_test claim gives its kept claim and pending start to the next claim for its scope.
+
+        A Hana claim does not: only recovery of the current attempt settles its started command.
+        An unreadable target counts as no takeover, so the attempt stays current.
+        """
+        from scripts.aws_target import hana_placement
+
+        destination = saved.assignment.destination
+        if destination.provider != "ssh":
+            return destination.provider != "local"
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        settings = (placement.ConfiguredProviderSettings() if submitted is None
+                    else self._placement_settings(submitted, destination))
+        try:
+            with conf.report_key_changes():
+                configuration = _provider_configuration()
+                target = configuration.target(destination.target, settings)
+                if not isinstance(target, target_config.SshTarget):
+                    return False
+                transport = configuration.transport(target)
+        except (OSError, ValueError):
+            return False
+        return not isinstance(transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
+
+    def _lost_report(self) -> placement.TerminalAttemptReport:
+        return placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
+                                               self.clock.now())
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
@@ -4697,8 +4726,7 @@ done
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
                     continue
             if isinstance(report, placement.NoTerminalReport):
-                report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
-                    placement.DispatchPathSettled(), self.clock.now())
+                report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
 

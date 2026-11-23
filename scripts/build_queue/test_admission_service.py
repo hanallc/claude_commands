@@ -497,6 +497,16 @@ class PlacementStatusTests(unittest.TestCase):
                         waiting, = fixture.server.handle_request(request)
                         self.assertIsInstance(waiting, wire.PlacementWait)
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                        # Only recovery of the current attempt settles a started Hana command, so a request
+                        # after the claim holder ends keeps the attempt current.
+                        runner = fixture.proc.spawn()
+                        fixture.server.assignments[key] = replace(fixture.server.assignments[key],
+                            holder=placement.ClaimHolderIdentity(fixture.server.host, runner.pid, runner.start_time))
+                        fixture.proc.kill(runner)
+                        waiting, = fixture.server.handle_request(request)
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                        self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
                     if case == "fenced start refusal":
                         def release() -> hana_placement.HanaClaimRelease:
@@ -619,13 +629,19 @@ class PlacementStatusTests(unittest.TestCase):
                 status = self.read_only_status(fixture, assignment)
                 assert isinstance(status, status_wire.KnownPlacementStatus)
                 self.assertEqual(status.state, placement.CurrentAssignment())
-                # The owner asks again only after its attempt ends, so its replay closes the attempt as lost.
-                replay, = fixture.server.handle_request(request)
-                self.assertIsInstance(replay, wire.PlacementWait)
+                _ = fixture.run_pass()
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
                 self.assertFalse(release.is_set())
-                self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("lost"))
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
             finally:
                 release.set()
+            # The owner asks again only after its attempt ends, so its request closes the attempt as lost.
+            replay, = fixture.server.handle_request(request)
+            self.assertIsInstance(replay, wire.PlacementWait)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("lost"))
 
     def test_configuration_change_keeps_status_current_until_the_owner_asks_again(self) -> None:
         from scripts.build_queue.test_placement import (
@@ -633,6 +649,14 @@ class PlacementStatusTests(unittest.TestCase):
         )
 
         with PlacementFixture() as fixture:
+            entered, release = threading.Event(), threading.Event()
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the changed configuration probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private blocked probe")
+
             request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
@@ -657,8 +681,21 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertEqual(status.state, placement.CurrentAssignment())
             self.assertEqual(fixture.server.placement_host_keys[(request.episode, assignment.destination)], old_evidence.key)
             with mock.patch.object(fixture.server, "_request_host_evidence", return_value=old_evidence):
-                replay, = fixture.server.handle_request(request)
-            # The owner asks again only after its attempt ends, so its replay closes the attempt as lost.
+                _ = fixture.run_pass()
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            fixture.server.host_probe = probe
+            try:
+                _ = fixture.run_pass()
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                self.assertFalse(release.is_set())
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            finally:
+                release.set()
+            # The owner asks again only after its attempt ends, so its request closes the attempt as lost.
+            replay, = fixture.server.handle_request(request)
             self.assertIsInstance(replay, wire.PlacementWait)
             self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("lost"))
 
