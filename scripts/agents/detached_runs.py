@@ -140,8 +140,11 @@ class RunRecord(StopFields):
     slice_leftovers: NotRequired[Literal[True]]
     director_dir: str
     done_message_file: str
-    # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
+    # The twin key: the source key from --twin-key, else the tree key of cwd at start; "" when unknown.
+    # Records before 2026-10-21 have none.
     tree_key: NotRequired[str]
+    # A unit director's or showrunner's copies.py run. It has no worker environment and no live-run limit.
+    director_run: NotRequired[Literal[True]]
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
@@ -1203,15 +1206,17 @@ def _run_candidates(runs: Path, *, scan_records: bool, slice_units: Collection[s
     return paths
 
 
-def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
-    """A pending run for the same worker, command, folder and tree key.
+def live_twin(runs: Path, worker: str, command: list[str], tree_key: str, *, identity: str = "") -> RunRecord | None:
+    """A pending run for the same owner, command, folder and tree key; a staff ID matches across a rename.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
     on one tree; each run took memory, the cargo token and build time."""
     if not tree_key:
         return None
     for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
-        if (raw.get("worker") == worker and raw.get("command") == command and raw.get("tree_key") == tree_key
+        owner = (raw.get("staff_id") == identity if identity and raw.get("staff_id")
+                 else raw.get("worker") == worker)
+        if (owner and raw.get("command") == command and raw.get("tree_key") == tree_key
                 and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path))):
             return cast(RunRecord, cast(object, raw))
     return None
@@ -1480,16 +1485,31 @@ def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], b
     return LiveRunEvidence(tuple(found), tuple(errors))
 
 
-def resume_context(runs: Path, worker: str) -> str:
-    """Name live runs and their persistent result files for a resumed worker."""
-    lines: list[str] = []
-    for record in live_runs(runs, worker):
-        result = runs / f"{record['run_id']}.json"
-        command = shlex.join(["cat", "--", str(result), record["log"]])
-        lines.append(f"Detached run {record['run_id']} remains live. "
-                     + f"Result: {result}; log: {record['log']}. Read it with: `{command}`. "
-                     + "Its result follows this worker after the move.")
-    return "\n".join(lines)
+def resume_line(runs: Path, record: RunRecord) -> str:
+    """Name one live run and its persistent result file for a resumed session."""
+    result = runs / f"{record['run_id']}.json"
+    command = shlex.join(["cat", "--", str(result), record["log"]])
+    return (f"Detached run {record['run_id']} remains live. Result: {result}; log: {record['log']}. "
+            + f"Read it with: `{command}`. Its result follows you after the move.")
+
+
+def resume_context(runs: Path, worker: str, *, identity: str = "") -> str:
+    """Name the live runs of a resumed worker or director; a staff ID matches across a rename."""
+    return "\n".join(resume_line(runs, record) for record in live_runs(runs, worker, identity=identity))
+
+
+def director_resume_context(row: staff.StaffRow | None) -> str:
+    """Name the live runs of a resumed unit director or showrunner, so that it reads them before it runs again.
+
+    A move, a restart and a relaunch use this text. An unreadable run folder gives an anomaly and no text.
+    """
+    if row is None or row.kind not in ("unit", "showrunner") or not isinstance(row.run, staff.OpenRun):
+        return ""
+    try:
+        return resume_context(row.run.path / DETACHED_RUNS_DIR, row.name, identity=row.id)
+    except (OSError, ValueError) as error:
+        print(f"{row.name}: detached runs anomaly: {error}", file=sys.stderr)
+        return ""
 
 
 SCOPE_REFUSAL = ("detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
@@ -1546,6 +1566,7 @@ def command_start(args: argparse.Namespace) -> int:
     name = str(getattr(args, "to", "") or "")
     caller = caller_from_environment(dict(os.environ))
     reference = ""
+    director = False
     if isinstance(caller, PaneCaller):
         if name and name != caller.name:
             print(f"detached_runs: --to {name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
@@ -1553,6 +1574,7 @@ def command_start(args: argparse.Namespace) -> int:
         reference = caller.staff_id
     elif isinstance(caller, DirectorCaller) and session_dir and not name:
         name, reference = caller.name, caller.staff_id
+        director = bool(getattr(args, "director_run", False))
     else:
         if bool(session_dir) != bool(name):
             print("detached_runs: --session-dir and --to go together", file=sys.stderr)
@@ -1568,14 +1590,17 @@ def command_start(args: argparse.Namespace) -> int:
     runs = _runs_dir(session_dir).resolve()
     runs.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
-    tree_key = treekey.tree_key(cwd) or ""
+    twin_key = cast(str | None, getattr(args, "twin_key", None))
+    tree_key = (treekey.tree_key(cwd) or "") if twin_key is None else twin_key
     reaped = OrphanReapResult()
     try:
         with (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
             reaped = _reap_orphans_locked(runs)
-            if twin := live_twin(runs, name, command, tree_key):
+            identity = reference or _worker_reference(session_dir, name)
+            if twin := live_twin(runs, name, command, tree_key, identity=identity):
                 started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
+                # STARTED_RUN reads the run ID from this line and the line after the start.
                 print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
                       + f"log {twin['log']}); started nothing; its result arrives as your next message")
                 return 0
@@ -1584,7 +1609,9 @@ def command_start(args: argparse.Namespace) -> int:
             except conf.Unusable as error:
                 print(f"detached_runs: {error}", file=sys.stderr)
                 return 2
-            active = live_runs(runs, name)
+            # LIVE_RUN_LIMIT caps a worker and other director starts. A director's copies.py run queues in the build line,
+            # and the twin check stops a repeat.
+            active = [] if director else live_runs(runs, name)
             if len(active) >= limit:
                 details = "\n".join(f"  {run['run_id']}: {run['label']}" for run in active)
                 print(f"detached_runs: live-run limit {limit} reached for {name}; started nothing.\n"
@@ -1593,7 +1620,6 @@ def command_start(args: argparse.Namespace) -> int:
                       + "Or put more files in one run.", file=sys.stderr)
                 return LIVE_RUN_LIMIT_REACHED
             run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
-            identity = reference or _worker_reference(session_dir, name)
             if identity and not isinstance(caller, DirectorCaller):
                 run_id += f"@{identity}"
             record_path = runs / f"{run_id}.json"
@@ -1605,6 +1631,8 @@ def command_start(args: argparse.Namespace) -> int:
                 "log": str(log_path), "started_at": time.time(), "pid": 0,
                 "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
             }
+            if director:
+                record["director_run"] = True
             from scripts.direct import progress_history
 
             if isinstance(caller, DirectorCaller) and reference:
@@ -1622,11 +1650,7 @@ def command_start(args: argparse.Namespace) -> int:
             with record_lock(record_path):
                 write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
             with log_path.open("ab") as log:
-                supervisor = subprocess.Popen(
-                    [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True, cwd=cwd,
-                )
+                supervisor = _start_supervisor(run_id, record_path, log, cwd)
             record["pid"] = supervisor.pid
             _ = _write_record(record_path, record)
     finally:
@@ -1635,6 +1659,96 @@ def command_start(args: argparse.Namespace) -> int:
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
           + "its result arrives as your next message")
     return 0
+
+
+# The run ID in the line that `start` prints for a new run or a live twin.
+STARTED_RUN = re.compile(r"^run (\S+) (?:started detached|is already running) ", re.MULTILINE)
+# The observer reads the record and the log at this interval. A run takes minutes; one second is enough.
+OBSERVER_POLL_SECONDS = 1.0
+
+
+def director_run(environment: Mapping[str, str]) -> Path | None:
+    """The open run folder of a unit director or showrunner session that is not inside a detached run."""
+    identity = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
+    if not identity or environment.get("UNIT_DETACHED_RECORD"):
+        return None
+    try:
+        member = staff.local_by_current_session(identity)
+    except (OSError, ValueError):
+        return None
+    if member is None or member.kind not in ("unit", "showrunner") or not isinstance(member.run, staff.OpenRun):
+        return None
+    return member.run.path
+
+
+def _start_detached(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Start in a separate process: the supervisor then has no parent in the caller's process tree."""
+    script = Path(__file__).resolve()
+    return subprocess.run([str(script.parents[1] / "lib/py"), str(script), "start", *arguments],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=False)
+
+
+def start_and_observe(run: Path, command: Sequence[str], label: str, twin_key: str) -> int | None:
+    """Run a director's command as a detached run, or attach to its live twin, and observe it.
+
+    The run keeps its queue place when the session ends: the supervisor and the command are outside
+    the session's process tree. The twin key names the run's source; "" starts a new run each time.
+    None means that the caller runs the command attached.
+    """
+    started = _start_detached(["--session-dir", str(run), "--label", label, "--twin-key", twin_key, "--director-run",
+                               "--", *command])
+    if started.returncode == NOT_A_DETACHED_WORKER:
+        return None
+    found = STARTED_RUN.search(started.stdout)
+    if started.returncode or found is None:
+        _ = sys.stdout.write(started.stdout)
+        return started.returncode or 1
+    path = _runs_dir(str(run.resolve())).resolve() / f"{found.group(1)}.json"
+    script = Path(__file__).resolve()
+    stop = shlex.join([str(script.parents[1] / "lib/py"), str(script), "stop", "--reason", "<why>", str(path)])
+    action = "attached to the live run" if "is already running" in found.group(0) else "started detached run"
+    print(f"copies: {action} {found.group(1)}; it keeps its queue place through a session restart.\n"
+          + f"copies: record {path}\ncopies: to stop it: {stop}", flush=True)
+    return observe(path)
+
+
+def _print_log(log: Path, offset: int) -> int:
+    """Copy the log bytes after `offset` to stdout and return the new offset."""
+    try:
+        with log.open("rb") as source:
+            _ = source.seek(offset)
+            data = source.read()
+    except FileNotFoundError:
+        return offset
+    if data:
+        _ = sys.stdout.buffer.write(data)
+        _ = sys.stdout.buffer.flush()
+    return offset + len(data)
+
+
+def observe(path: Path) -> int:
+    """Print the run log as it grows, then return the command's exit status.
+
+    The observer only reads, so its end never ends the run. Delivery still sends the end notice.
+    """
+    _ = sys.stdout.flush()
+    offset = 0
+    while True:
+        record = _read_record(path)
+        offset = _print_log(Path(record["log"]), offset)
+        raw: dict[str, object] = dict(record)
+        if "exit_code" in record or not _run_is_pending(
+                path, raw, lambda pid: detached_run_process.supervises(pid, path)):
+            break
+        time.sleep(OBSERVER_POLL_SECONDS)
+    _ = _print_log(Path(record["log"]), offset)
+    if reason := record.get("stop_reason"):
+        print(f"Stop reason: {reason}", file=sys.stderr, flush=True)
+    result = command_result(record)
+    if isinstance(result, SupervisorLost):
+        print(ORPHAN_VERDICT, file=sys.stderr, flush=True)
+        return 1
+    return result.code
 
 
 def _exit_status(returncode: int) -> int:
@@ -2107,12 +2221,84 @@ def _command_scope_unit(kind: str, run_id: str) -> process_stop.ScopeUnit:
     return process_stop.ScopeUnit(_command_slice_unit(run_id), f"detached-{kind}-{scope_id}.scope")
 
 
+def _scope_available(environment: Mapping[str, str]) -> bool:
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    return (process_stop.supported() and environment.get("BUILDLOG_SCOPE", "1") != "0" and bool(runtime)
+            and Path(runtime, "systemd", "private").is_socket() and shutil.which("systemd-run") is not None)
+
+
+# The longest wait for systemd to put a new supervisor in its scope. It holds the start lock of one run folder only.
+SUPERVISOR_SCOPE_SECONDS = 5.0
+
+
+def supervisor_scope_unit(run_id: str) -> str:
+    return f"detached-supervisor-{run_id.partition('@')[0]}.scope"
+
+
+def supervisor_scope_prefix(run_id: str, environment: Mapping[str, str]) -> list[str]:
+    """Start the supervisor in its own user scope when a scope is available.
+
+    A stop of the caller's cgroup (a pane close or an OOM kill) then does not end the supervisor.
+    The scope is in the user manager's default slice, outside builds.slice and outside the run slice.
+    The build memory reads do not count the supervisor, and a run stop does not end it before it records the result.
+    """
+    if not _scope_available(environment):
+        return []
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+            f"--unit={supervisor_scope_unit(run_id)}", "--"]
+
+
+def _cgroup_name(pid: int) -> str:
+    """The last part of the process's cgroup v2 path, or an empty string."""
+    try:
+        lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    return next((line.rpartition("/")[2] for line in lines if line.startswith("0::")), "")
+
+
+def _entered_scope(process: subprocess.Popen[bytes], unit: str) -> bool:
+    """Wait until systemd puts the process in its scope. A process that exits first did not get the scope."""
+    deadline = time.monotonic() + SUPERVISOR_SCOPE_SECONDS
+    while process.poll() is None:
+        if _cgroup_name(process.pid) == unit:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)  # systemd moves the process in a few milliseconds; a short poll keeps the start fast.
+    return False
+
+
+def _start_supervisor(run_id: str, record_path: Path, log: IO[bytes], cwd: str) -> subprocess.Popen[bytes]:
+    """Start the supervisor in its scope. If the scope fails, start it again without the scope.
+
+    The caller holds the start lock, and the supervisor takes that lock first. A scoped attempt that is stopped
+    here has done no work.
+    """
+    script = Path(__file__).resolve()
+    command = [str(script.parents[1] / "lib/py"), str(script), "supervise", str(record_path)]
+    prefix = supervisor_scope_prefix(run_id, os.environ)
+    if prefix:
+        try:
+            scoped = subprocess.Popen([*prefix, *command], stdin=subprocess.DEVNULL, stdout=log,
+                                      stderr=subprocess.STDOUT, start_new_session=True, cwd=cwd)
+        except OSError as error:
+            _ = log.write(f"detached_runs: the supervisor scope did not start: {error}\n".encode())
+        else:
+            if _entered_scope(scoped, supervisor_scope_unit(run_id)):
+                return scoped
+            scoped.kill()
+            _ = scoped.wait()
+            _ = log.write(b"detached_runs: the supervisor scope did not start; the supervisor starts without it\n")
+        log.flush()
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True, cwd=cwd)
+
+
 def scope_prefix(log: Path, environment: dict[str, str], *,
                  kind: DetachedRunKind = DetachedRunKind.DETECT) -> list[str]:
     """Start the command in its own slice when a scope is available."""
-    runtime = environment.get("XDG_RUNTIME_DIR", "")
-    if (not process_stop.supported() or environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
-            or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
+    if not _scope_available(environment):
         return []
     scope = _command_scope_unit(kind, log.stem)
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
@@ -2245,6 +2431,22 @@ def _finish_command_slice(path: Path, run_slice: process_stop.RunSliceIdentity) 
         _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace, cleanup=not committed)
 
 
+def command_environment(record: RunRecord, record_path: Path, caller: Mapping[str, str]) -> dict[str, str]:
+    """The environment of a run's command: the caller's environment with the run's identity."""
+    environment = dict(caller)
+    _ = environment.pop(process_stop.DETACHED_SLICE_ENV, None)
+    environment["PYTHONPATH"] = startup_pythonpath(environment.get("PYTHONPATH", ""))
+    environment.update({
+        "UNIT_DETACHED_RUN": "1",
+        "UNIT_DETACHED_RECORD": str(record_path.resolve()),
+        "BUILDLOG_OWNER_STAFF_ID": record["staff_id"],
+    })
+    if not record.get("director_run"):
+        # Only a worker gets the run board, the verify cache, the phase waits and a team role.
+        environment.update({"UNIT_RUN_DIR": record["session_dir"], "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1]})
+    return environment
+
+
 def command_supervise(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", "")))
     with (record_path.parent / ".start.lock").open("a") as admission:
@@ -2253,16 +2455,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         if record["pid"] == 0:
             record["pid"] = os.getpid()
             record = _write_record(record_path, record)
-    environment = dict(os.environ)
-    _ = environment.pop(process_stop.DETACHED_SLICE_ENV, None)
-    environment["PYTHONPATH"] = startup_pythonpath(environment.get("PYTHONPATH", ""))
-    environment.update({
-        "UNIT_DETACHED_RUN": "1",
-        "UNIT_RUN_DIR": record["session_dir"],
-        "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
-        "UNIT_DETACHED_RECORD": str(record_path.resolve()),
-        "BUILDLOG_OWNER_STAFF_ID": record["staff_id"],
-    })
+    environment = command_environment(record, record_path, os.environ)
     log = Path(record["log"])
     try:
         kind = DetachedRunKind(record.get("kind", DetachedRunKind.DETECT))
@@ -2458,6 +2651,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--label", default="")
     _ = start.add_argument("--kind", type=DetachedRunKind, choices=list(DetachedRunKind), default=DetachedRunKind.DETECT)
     _ = start.add_argument("--done-message-file", default="")
+    _ = start.add_argument("--director-run", action="store_true",
+                           help="a director's copies.py run: no live-run limit, and the caller's environment")
+    _ = start.add_argument("--twin-key", default=None,
+                           help="the key of the run's source for the twin check; the default is the tree key of cwd")
     _ = start.add_argument("command", nargs=argparse.REMAINDER)
     start.set_defaults(handler=command_start)
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")

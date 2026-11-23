@@ -3070,6 +3070,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # A start with a scope would call systemd-run for the supervisor; these tests use no systemd.
+        self.enterContext(patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}))
         self.fixture = set_up_fixture(self.addCleanup, pane_support.WorkerPaneTests())
         self.inputs = []
         self.notices = []

@@ -13,8 +13,9 @@ Apply this contract after a director restarts, compacts, moves, or changes its n
 
 3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/worker.py restore`.
 4. Read each listed result that you did not act on yet.
-5. Check each operation's evidence before repeating it: commit, push receipt, gate record, or build artifact.
-6. Repeat only the work that the evidence proves incomplete.
+5. Read each live detached run that the resume message names. A `copies.py run` from a director is a detached run. Its result arrives as your next message.
+6. Check each operation's evidence before repeating it: commit, push receipt, gate record, or build artifact.
+7. Repeat only the work that the evidence proves incomplete. A repeated `copies.py run` for the same source and command attaches to its live run.
 
 Restore reaps detached orphans before it resumes workers.
 A full restore reaps once per held run folder.

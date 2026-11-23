@@ -633,6 +633,11 @@ def run_agent(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> RunAg
 
 def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> session_owner.OwningSession | session_owner.NoOwningSession:
     for item in (process, *ancestors):
+        # A detached run keeps the session id of its start. Its run folder or its staff row names the current owner.
+        if item.environment.get("BUILDLOG_OWNER_STAFF_ID"):
+            owner = session_owner.owning_session(item.environment)
+            if isinstance(owner, session_owner.OwningSession):
+                return owner
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
         if session_id:
             return session_owner.OwningSession(session_id)

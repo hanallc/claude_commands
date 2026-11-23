@@ -2233,8 +2233,13 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     remove_started(current)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
-            opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
-                       if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
+            if current.kind in ("unit", "showrunner"):
+                from scripts.agents import detached_runs
+
+                opening = herdr.OpeningPrompt(resume_message.resume_message(
+                    why, workers=resume_message.worker_mode(), detached=detached_runs.director_resume_context(current)))
+            else:
+                opening = NO_RESTART_MESSAGE
             launch_row = (start_row if success_report is RestartSuccessReport.START_ROW else
                           partial(start_row, success_report=success_report))
             if current.kind == "worker":

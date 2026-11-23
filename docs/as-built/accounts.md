@@ -508,6 +508,11 @@ A stopped worker with a held dispatch resumes in the same pane.
 A closed worker without an active dispatch has nothing to move.
 An active or refused pass receives resume text through the shared target check.
 A worker with a live detached run also receives resume text when its pass has ended.
+A director's `copies.py run` is also a detached run. A move ends the observer in its shell only.
+Only this run has no live-run limit and keeps the caller's environment. Other director starts keep the worker rules.
+The run keeps its queue place and sends its result to the director's stable staff ID.
+The resume text of a unit director or showrunner names each live run of its staff ID in its run folder.
+The mover's step wait still holds a director whose session owns a waiting or running queue place.
 Single moves, group moves, swaps, refusal moves, and shutdown recovery use the same run context formatter.
 `config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.

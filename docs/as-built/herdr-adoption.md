@@ -506,7 +506,7 @@ Every pane keeps its shell when its agent ends.
   The exec path prepares the target environment and removes conflicting account variables.
   Pane variables alone do not replace account admission.
   The [shutdown design](shutdown-and-restart.md) owns this shared move path.
-- A detached run is not a unit's second pane. The supervisor of a worker build that `detached_runs.py supervise` runs stays in its pane's scope (in the herdr service's cgroup when pane scopes are not available), so herdr places it in the session; the command itself runs in a `builds.slice` scope. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1.
+- A detached run is not a unit's second pane. The supervisor that `detached_runs.py supervise` runs has its own user scope `detached-supervisor-<run id>.scope`, so a pane stop does not end it. Without user systemd, or when that scope fails, it stays in its pane's cgroup. The command runs in a `builds.slice` scope. The supervisor and the command inherit the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Without that rule, a unit with a detached run reads as marked twice, and `roster.py` exits 1. The rule is still necessary: the inherited marks do not depend on the cgroup.
 - `herdr_place_of` reads every process for each call, so 40 calls took 10.7 s. `herdr_places()` places every pid in one read. `roster.py` uses it and takes about 1 s in total.
 
 **Mac.**

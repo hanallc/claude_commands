@@ -11,6 +11,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from importlib import import_module
 from datetime import datetime
 from enum import Enum, auto
 import json
@@ -2624,6 +2625,50 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         return command_exit
 
 
+def detached_source(args: CopyArguments, command: Sequence[str]) -> tuple[list[str], str]:
+    """Pin the run's source in its arguments, and give the key of that source for the twin check.
+
+    A revision name resolves now. A later call after the source moved then starts a new run and does not attach.
+    An `origin/<branch>` merge keeps its name, so a repeat call attaches although the branch moved.
+    The key ignores the environment: calls that differ only in their environment attach to one run.
+    An empty key means that the call has no twin.
+    """
+    repo = Path(args.repo or "").expanduser().resolve()
+    commit = commit_at(repo, args.commit)
+    pinned = ["run", "--repo", str(repo), "--commit", commit]
+    twin_key = commit
+    if args.apply_uncommitted:
+        worktree = Path(args.apply_uncommitted).expanduser().resolve()
+        pinned += ["--apply-uncommitted", str(worktree)]
+        twin_key = treekey.tree_key(str(worktree)) or ""
+    if args.merge:
+        # A remote branch resolves only when the run fetches it. The twin then matches on the branch name.
+        pinned += ["--merge", args.merge if args.merge.startswith("origin/") else commit_at(repo, args.merge)]
+    if args.targets:
+        pinned += ["--targets", args.targets]
+    for path in args.publish:
+        pinned += ["--publish", path]
+    return [*pinned, "--", *command], twin_key
+
+
+def run_detached(args: CopyArguments, command: Sequence[str]) -> int | None:
+    """Run a director's call as a detached run and observe it; None runs the call attached.
+
+    A session stop ends the session's background shells. The run and its queue place stay,
+    because the run's owner process is outside the session's process tree.
+    """
+    # detached_runs imports send, and send imports this module: load it at call time.
+    detached_runs = import_module("scripts.agents.detached_runs")
+    run = cast(Callable[[Mapping[str, str]], Path | None], detached_runs.director_run)(os.environ)
+    if run is None:
+        return None
+    pinned, twin_key = detached_source(args, command)
+    script = Path(__file__).resolve()
+    start_and_observe = cast(Callable[[Path, Sequence[str], str, str], int | None], detached_runs.start_and_observe)
+    return start_and_observe(run, [str(script.parents[1] / "lib/py"), str(script), *pinned],
+                             "copies.py run -- " + shlex.join(command), twin_key)
+
+
 def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     """Place and run a named gate in the caller's prepared checkout."""
     source = Path(args.repo or "").resolve()
@@ -3052,6 +3097,9 @@ def main(argv: list[str] | None = None) -> int:
             command = command_tail(args.command)
             if not command:
                 raise CopyError("run requires a command after --")
+            observed = run_detached(args, command)
+            if observed is not None:
+                return observed
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()

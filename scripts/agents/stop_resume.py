@@ -1934,6 +1934,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 workers = mode
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
+            if row is not None and row.kind in ("unit", "showrunner"):
+                from scripts.agents import detached_runs
+
+                detached = detached_runs.director_resume_context(row)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         if isinstance(own, worker.UnsubmittedAssignment):
