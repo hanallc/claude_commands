@@ -67,6 +67,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import build_folders, copy_record, unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
+from scripts.worktree import worktree_records
 
 from scripts.direct import recorder_state  # noqa: E402
 
@@ -441,27 +442,25 @@ def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
 
 def _require_model_worktree(
     root: Path, owner_unit: str, *,
-    fix: str = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>.",
+    fix: str = "Restore the recorded branch, or run worktree_records.py make <repo word> <unit> <new short name>.",
 ) -> None:
-    from scripts.worktree import worktrees
-
     try:
         model = _model_worktree_path(root)
         if isinstance(model, ValueError):
             raise model
         repo, unit, short_name, model_path = model
-        if unit != owner_unit and not worktrees.has_unit_word(owner_unit, unit):
+        if unit != owner_unit and not worktree_records.has_unit_word(owner_unit, unit):
             raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
-        record = worktrees.checkout_record(model_path)
-        if (record is None or record.stage is not worktrees.MakeStage.DONE
-                or not isinstance(record.layout, worktrees.RecordedWorktreeOutput)
+        record = worktree_records.checkout_record(model_path)
+        if (record is None or record.stage is not worktree_records.MakeStage.DONE
+                or not isinstance(record.layout, worktree_records.RecordedWorktreeOutput)
                 or (record.layout.unit, record.layout.short_name) != (unit, short_name)):
             raise ValueError("no completed worktree record matches the checkout")
-        main = worktrees.main_checkout_for_word(repo)
-        if Path(record.repo).resolve() != main or not worktrees.registered_checkout(root, main, record.branch):
+        main = worktree_records.main_checkout_for_word(repo)
+        if Path(record.repo).resolve() != main or not worktree_records.registered_checkout(root, main, record.branch):
             raise ValueError(
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
