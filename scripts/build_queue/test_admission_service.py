@@ -279,6 +279,53 @@ class PlacementStatusTests(unittest.TestCase):
             assert isinstance(reply, wire.Assignment)
             self.assertEqual(reply.assignment.destination, assignment.destination)
 
+    def test_an_owner_that_asks_again_after_its_claim_holder_ends_goes_back_to_its_lines(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        for case in ("holder ended", "holder ended, start pending", "holder live"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-runner", assignment, claim)),
+                    [wire.FirstAuthorization(assignment, claim)])
+                # The claim holder is a runner process below the owner, so the owner outlives it.
+                runner = fixture.proc.spawn()
+                holder = placement.ClaimHolderIdentity(assignment.owner.host, runner.pid, runner.start_time)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                fixture.server.assignments[key] = replace(fixture.server.assignments[key], holder=holder)
+                fixture.server.persist()
+                kept = placement.AdoptedProviderClaim(claim, holder, assignment.session,
+                                                      assignment.destination.host, "host-generation-a")
+                pending = offload.pending_start_path(assignment.destination.target,
+                    claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+                if case != "holder live":
+                    fixture.proc.kill(runner)
+                if case == "holder ended, start pending":
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    _ = pending.write_text("pending startup\n")
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=(kept,))
+                waiting, = fixture.server.handle_request(request)
+                self.assertIsInstance(waiting, wire.PlacementWait)
+                if case == "holder live":
+                    self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    continue
+                self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+                self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                self.assertEqual(pending.exists(), case == "holder ended, start pending")
+                fixture.clock.advance(181)
+                _ = publish_candidate(fixture, request, claims=(kept,))
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.Assignment)
+                self.assertEqual(reply.assignment.episode, assignment.episode)
+                self.assertNotEqual(reply.assignment.attempt, assignment.attempt)
+
     def test_an_unconfirmed_claim_holder_frees_its_assignment_after_its_owner_ends(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
@@ -450,6 +497,16 @@ class PlacementStatusTests(unittest.TestCase):
                         waiting, = fixture.server.handle_request(request)
                         self.assertIsInstance(waiting, wire.PlacementWait)
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                        # Only recovery of the current attempt settles a started Hana command, so a request
+                        # after the claim holder ends keeps the attempt current.
+                        runner = fixture.proc.spawn()
+                        fixture.server.assignments[key] = replace(fixture.server.assignments[key],
+                            holder=placement.ClaimHolderIdentity(fixture.server.host, runner.pid, runner.start_time))
+                        fixture.proc.kill(runner)
+                        waiting, = fixture.server.handle_request(request)
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                        self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
                     if case == "fenced start refusal":
                         def release() -> hana_placement.HanaClaimRelease:
@@ -533,7 +590,7 @@ class PlacementStatusTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
 
-    def test_expired_empty_evidence_keeps_status_current_and_replay_waiting(self) -> None:
+    def test_expired_empty_evidence_keeps_status_current_until_the_owner_asks_again(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
         )
@@ -572,8 +629,7 @@ class PlacementStatusTests(unittest.TestCase):
                 status = self.read_only_status(fixture, assignment)
                 assert isinstance(status, status_wire.KnownPlacementStatus)
                 self.assertEqual(status.state, placement.CurrentAssignment())
-                replay, = fixture.server.handle_request(request)
-                self.assertIsInstance(replay, wire.PlacementWait)
+                _ = fixture.run_pass()
                 self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
                 status = self.read_only_status(fixture, assignment)
                 assert isinstance(status, status_wire.KnownPlacementStatus)
@@ -582,8 +638,12 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
             finally:
                 release.set()
+            # The owner asks again only after its attempt ends, so its request closes the attempt as lost.
+            replay, = fixture.server.handle_request(request)
+            self.assertIsInstance(replay, wire.PlacementWait)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("lost"))
 
-    def test_configuration_change_keeps_status_current_and_replay_waiting(self) -> None:
+    def test_configuration_change_keeps_status_current_until_the_owner_asks_again(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
         )
@@ -621,13 +681,11 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertEqual(status.state, placement.CurrentAssignment())
             self.assertEqual(fixture.server.placement_host_keys[(request.episode, assignment.destination)], old_evidence.key)
             with mock.patch.object(fixture.server, "_request_host_evidence", return_value=old_evidence):
-                replay, = fixture.server.handle_request(request)
-                self.assertIsInstance(replay, wire.PlacementWait)
+                _ = fixture.run_pass()
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
             fixture.server.host_probe = probe
             try:
-                replay, = fixture.server.handle_request(request)
-                self.assertIsInstance(replay, wire.PlacementWait)
+                _ = fixture.run_pass()
                 self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
                 status = self.read_only_status(fixture, assignment)
                 assert isinstance(status, status_wire.KnownPlacementStatus)
@@ -636,6 +694,10 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
             finally:
                 release.set()
+            # The owner asks again only after its attempt ends, so its request closes the attempt as lost.
+            replay, = fixture.server.handle_request(request)
+            self.assertIsInstance(replay, wire.PlacementWait)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("lost"))
 
     def test_released_local_placement_requests_no_evidence_and_keeps_no_subscription(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
@@ -1687,6 +1749,24 @@ class ProcessRunEvidenceTests(unittest.TestCase):
 
 
 class ReplyPublicationTests(unittest.TestCase):
+    def test_view_captures_granted_local_reservations_and_verify_owners(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(need=0, step="test")
+            request = replace(request, identity=replace(request.identity, verify=records.VerifyCall("test", "verify test", 1, 1)))
+            grant = only_admitted(fixture.server.handle_request(request))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual(reply.reading.explanation.decided_from.reservations, ())
+            decoded = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(decoded, wire.ViewReply)
+            occupancy = decoded.reading.explanation.local_occupancy
+            assert occupancy is not None
+            row, = occupancy.reservations
+            self.assertEqual(row["pid"], request.owner.pid)
+            self.assertEqual(row.get("reservation_id"), grant.reservation)
+            owner = records.run_owner(request.owner.pid, request.owner.start_time)
+            self.assertEqual(occupancy.verify_run_owners, {"fixture": frozenset({owner})})
+
     def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.hold_starts()
@@ -1698,7 +1778,9 @@ class ReplyPublicationTests(unittest.TestCase):
             assert isinstance(policy, records.AdmissionPolicy)
             reading = replace(gate.queue_read_from_pass(inputs, policy, result), diagnostics=server.last_diagnostics)
             reading = replace(reading, view=replace(reading.view, move_line=server.move_line))
-            expected_view = wire.encode_reply(wire.ViewReply(reading)).encode()
+            view_reading = replace(reading, explanation=replace(reading.explanation,
+                local_occupancy=records.LocalAdmissionOccupancy((), {})))
+            expected_view = wire.encode_reply(wire.ViewReply(view_reading)).encode()
             expected_explain = wire.encode_reply(wire.ExplainReply(reading.explanation, reading.diagnostics)).encode()
             with mock.patch.object(wire, "encode_reply", wraps=wire.encode_reply) as encode:
                 _ = server.run_pass()
@@ -3585,6 +3667,8 @@ class CloudAdmissionTests(unittest.TestCase):
                             line = wire.encode_record({"v": version, "type": kind, "data": request}) + "\n"
                             reply, = fixture.connect(line).replies()
                             assert isinstance(reply, (wire.ViewReply, wire.MineReply))
+                            self.assertEqual(reply.reading.explanation.local_occupancy,
+                                             records.LocalAdmissionOccupancy((), {}))
                             message = cast(dict[str, object], json.loads(sent[-1]))
                             self.assertEqual(message["v"], version)
                             if version == 1:
@@ -5805,6 +5889,10 @@ class ServiceTests(unittest.TestCase):
                 expected = gate.queue_read_from(inputs, policy=policy)
                 viewed, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(viewed, wire.ViewReply)
+                occupancy = viewed.reading.explanation.local_occupancy
+                assert occupancy is not None
+                self.assertEqual([row.get("reservation_id") for row in occupancy.reservations],
+                                 [record.reservation_id for record in committed])
                 line = viewed.reading.view.move_line
                 assert isinstance(line, records.QueueMoveLine)
                 started = {row.owner for row in starts}
@@ -5812,7 +5900,8 @@ class ServiceTests(unittest.TestCase):
                     records.QueueMoveMember(row.get("move_id", ""), movable=records.waiter_owner(row) not in started)
                     for _, row in expected.ordered))
                 self.assertTrue(line.revision)
-                self.assertEqual(viewed, wire.ViewReply(replace(expected, view=replace(expected.view, move_line=line))))
+                self.assertEqual(viewed, wire.ViewReply(replace(expected, view=replace(expected.view, move_line=line),
+                    explanation=replace(expected.explanation, local_occupancy=occupancy))))
                 explained = fixture.server.handle_request(wire.ExplainRequest())[0]
                 assert isinstance(explained, wire.ExplainReply)
                 self.assertEqual(explained.explanation.decided_from, inputs)
@@ -5841,7 +5930,9 @@ class ServiceTests(unittest.TestCase):
             assert isinstance(line, records.QueueMoveLine)
             self.assertEqual(line.members, (records.QueueMoveMember(fixture.server.waiters[request.episode].row.get("move_id", "")),))
             self.assertTrue(line.revision)
-            self.assertEqual(viewed, wire.ViewReply(replace(projected, view=replace(projected.view, move_line=line))))
+            expected_view = replace(projected, view=replace(projected.view, move_line=line), explanation=replace(
+                projected.explanation, local_occupancy=records.LocalAdmissionOccupancy((), {})))
+            self.assertEqual(viewed, wire.ViewReply(expected_view))
             self.assertEqual(explained, [wire.ExplainReply(projected.explanation)])
             own = mine[0]
             assert isinstance(own, wire.MineReply)
