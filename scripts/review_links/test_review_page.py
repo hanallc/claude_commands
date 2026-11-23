@@ -3779,8 +3779,8 @@ window.fetch=async(url,options)=>{
   show('all').click();await flush();await flush();
   chooseOwner(builder);
   check(counts('[data-show-chip]')==='1|0|1|0|0','Show counts use the selected owner.');
-  check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
-   'Type counts use the selected owner.');
+  check(type('change').querySelector('b').textContent==='2' && type('investigation').querySelector('b').textContent==='1',
+   'Type counts include the rows that appear if the Owner filter returns to All.');
   type('change').click();
   check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|2|0|0|0',
    'F007: an owner without the selected type resets to All.');
@@ -3951,6 +3951,95 @@ window.fetch=async(url,options)=>{
             'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_each_review_chip_counts_the_rows_after_its_click(self) -> None:
+        question = self.question()
+        other_question = self.question('What should the other owner check?')
+        _ = self.investigation(False)
+        _ = self.file_response(self.ready_submission_recipient().id)
+        opened = for_you.ForYouRow(f'action/{uuid4()}', 'action', 'Restore access', '', 'natedev',
+                                  '/tmp', 'builder-unit', '', '', '2026-11-17T15:00:00+00:00',
+                                  'open', 'manual', '')
+        completed = replace(opened, key=f'action/{uuid4()}', title='Completed action', status='done')
+        other = fixture_member('showrunner', name='other-owner')
+        records = [replace(item, owner=other.id)
+                   if item.key == other_question or item.type == review_items.ReviewType.CHANGE else item
+                   for item in review_items.read(self.root)]
+        with (patch.object(review_items, 'read', return_value=records),
+              patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed), ()))):
+            markup = browser_markup(self.root, show='all')
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const review=document.querySelector('[data-review]');
+ const rows=()=>[...review.querySelectorAll('[data-list-item]:not([hidden])')];
+ const chip=(group,value)=>review.querySelector('[data-'+group+'-chip="'+value+'"]');
+ const question=QUESTION,owner=question.split('/')[1];
+ const place=(type='question',show='all')=>{
+  history.replaceState({recordTable:{opened:[]}},'','#'+new URLSearchParams({show,type,owner}));
+  dispatchEvent(new HashChangeEvent('hashchange'));
+ };
+ const clickAndCheck=button=>{
+  const label=button.textContent.trim(),count=Number(button.querySelector('b').textContent);
+  button.click();
+  check(rows().length===count,label+' shows '+rows().length+' rows after the click.');
+ };
+ const fetchPage=window.fetch;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && options.body.get('row')===question && options.body.get('outcome')==='later')
+   return Promise.resolve(Response.json({answer:'later',state:'Open',later:Date.now()+3600000}));
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('version') && !params.has('body'))
+   return Promise.resolve(Response.json({version:review.dataset.version,facts:pageRefreshFacts()}));
+  return fetchPage(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='900px';
+  window.matchMedia=()=>({matches:true});
+  place();
+  check(rows().length===1 && rows()[0].dataset.key===question,'The Question starts in the selected view.');
+  const buttons=[...review.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip]')]
+   .filter(button=>!button.hidden);
+  for(const button of buttons){place();clickAndCheck(button);}
+  place('investigations');clickAndCheck(chip('type','investigations'));
+  place();
+  clickAndCheck(chip('type','for-you'));
+  check(review.dataset.show==='open' && rows().length===1 && rows()[0].dataset.state==='Open',
+   'For you opens the single Open action from All.');
+  clickAndCheck(chip('show','all'));
+  check(rows().length===2,'For you in All shows both actions.');
+  clickAndCheck(chip('type','for-you'));
+  check(review.dataset.show==='all','The selected For you chip keeps All.');
+  place('question','Validating');
+  clickAndCheck(chip('type','response'));
+  check(review.dataset.show==='open' && rows().length===1 && rows()[0].dataset.type==='response',
+   'Responses opens the single response from Validating.');
+  place();
+  const [row]=rows();
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!form.dataset.sending){observer.disconnect();resolve();}
+   });
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-preset="soon"]').click();
+  if(!form.dataset.sending) throw new Error('Later did not start.');
+  await saved;
+  check(rows().length===0 && !review.querySelector('[data-empty]').hidden,'Later empties the selected Question view.');
+  for(const button of [chip('type','question'),chip('show','all'),chip('owner',owner)]){
+   check(button.getAttribute('aria-pressed')==='true' && button.querySelector('b').textContent==='0',
+    'The selected chip displays zero in the empty view.');
+   clickAndCheck(button);
+  }
+  for(const button of buttons){place();if(!button.hidden) clickAndCheck(button);}
+ }catch(error){failures.push(String(error));}
+ await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('QUESTION', json.dumps(question))
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:

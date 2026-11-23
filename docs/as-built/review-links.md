@@ -566,7 +566,9 @@ Each row becomes a card at phone width.
 The Type, Show and Owner rows use native buttons with a count and a pressed state.
 The Owner row shows the selected owner and owners with the selected type and words in any Show state.
 It hides the other Owner chips.
-Each Owner count uses the selected type, Show and words across all sources.
+Each selected chip counts the rows in the current view.
+Each other chip counts the rows that a click on it would show.
+Click another Owner to clear the source filter.
 An explicit filter change can return the Owner filter to All when no items match the type and words.
 An owner with matching rows in another Show stays selected with a zero count.
 All stays first and counts every matching row.
@@ -579,9 +581,11 @@ All appears first, followed by Open, Waiting, Done, and Validating.
 The Validating chip is hidden when Responses or For you is selected.
 The Owner row follows the State row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
-Each type count uses the selected owner, Show and words.
-Each Show count uses the selected type, owner and words.
-One typed `ReviewIndexEntry` record defines the index for counts, filters and column sorting.
+Type and Show counts include an Owner reset if the click would return Owner to All.
+Type counts use Open when a click selects For you or switches from Validating to Responses.
+The table and the three chip rows use the same row data and filter rules.
+The browser counts all matching rows, including rows outside the current scroll window.
+One typed `ReviewIndexEntry` record defines the row data for counts, filters and column sorting.
 The shell carries the active index, including states outside the selected view.
 Each changed version supplies a complete replacement index.
 The index contains the key, ID, type, owner, source owner, owner name, title, state, filed time and update time.
@@ -595,7 +599,6 @@ The server sends card bodies on demand.
 The server sends gzip when the browser accepts it with a positive quality.
 Each body response carries its snapshot version.
 If the versions differ, the browser refreshes the index before it displays the body.
-The browser uses the index for every count and filter.
 The Show chips replace the right count text.
 All includes active Review records and all For you actions.
 Done shows completed For you actions.
