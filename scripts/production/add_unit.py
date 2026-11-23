@@ -769,7 +769,8 @@ def ensure_worktree(request: UnitLaunch) -> None:
     try:
         _ = worktrees.create_checkout(
             worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch),
-            layout, owner=request.identity.unit, merge_branch=production.merge_branch, allow_existing=True)
+            layout, owner=request.identity.unit, merge_branch=production.merge_branch,
+            allow_existing=True, record_adoption=True)
     except worktrees.Refused as error:
         raise Refusal(str(error)) from error
     if isinstance(request.plan, PlanGiven):
