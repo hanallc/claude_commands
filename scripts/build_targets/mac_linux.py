@@ -20,6 +20,8 @@ import math
 from pathlib import Path
 import os
 import re
+from select import PIPE_BUF
+from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import shlex
 import shutil
 import signal
@@ -27,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+from threading import Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
@@ -42,7 +45,7 @@ from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, Mod
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
+    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -179,7 +182,8 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
+def consume_launch_permission(claim: claim_state.ClaimIdentity,
+                              assignment: PlacementAssignment) -> ProviderClaimReference:
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
@@ -203,6 +207,15 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: Plac
         raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
         raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+    return reference
+
+
+@dataclass(frozen=True)
+class GuestGateDispatch:
+    """The guest gate holds the queue's launch permission for this claim."""
+
+    assignment: PlacementAssignment
+    claim: ProviderClaimReference
 
 
 class GuestRunRequest(TypedDict):
@@ -997,12 +1010,100 @@ def guest_link() -> Generator[int]:
         os.close(link)
 
 
+def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch) -> None:
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    assignment = dispatch.assignment
+    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    try:
+        response = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), assignment,
+            dispatch.claim, execution_identity.ObservedExecution(execution)))
+        if (response.assignment != assignment or not isinstance(response.state, placement.CurrentAssignment)
+                or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
+            raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
+    except (OSError, wire.AdmissionUnavailable) as error:
+        print(f'Mac Linux guest queue report failed: {error}', file=sys.stderr, flush=True)
+
+
+def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
+                             armed: ArmedGuestAttempt, dispatch: GuestGateDispatch) -> tuple[bytes, bytes]:
+    """Transfer the bootstrap and collect both streams while reading guest progress."""
+    from scripts.aws_target import cloud_gate
+    from scripts.build_queue import progress_profile
+
+    assert stream.stdin is not None and stream.stdout is not None and stream.stderr is not None
+    deadline = monotonic() + timeout
+    start_line = run_start_line(armed.attempt).encode()
+    sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR', '')
+    stdout, stderr = bytearray(), bytearray()
+    progress_lines: list[str] = []
+    last_counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
+    started = False
+
+    def observe(line: bytes) -> None:
+        nonlocal started, last_counter
+        if not started and line == start_line:
+            started = True
+            # A slow queue must not block the SSH stream or change its exit status.
+            try:
+                Thread(target=report_guest_start, args=(armed, dispatch), daemon=True).start()
+            except RuntimeError as error:
+                print(f'Mac Linux guest queue report failed: {error}', file=sys.stderr, flush=True)
+        elif started and sidecar and (line.startswith(b'Runner: ') or b' exit=' in line):
+            progress_lines.append(line.decode(errors='replace'))
+            counter = cloud_gate.log_progress('\n'.join(progress_lines))
+            if isinstance(counter, progress_profile.ProgressCounter) and counter != last_counter:
+                with suppress(OSError):
+                    progress_profile.publish_counter(Path(sidecar), counter)
+                    last_counter = counter
+
+    input_fd, output_fd, error_fd = stream.stdin.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
+    sent = parsed = 0
+    with DefaultSelector() as ready:
+        if bootstrap:
+            _ = ready.register(input_fd, EVENT_WRITE)
+        else:
+            stream.stdin.close()
+        _ = ready.register(output_fd, EVENT_READ)
+        _ = ready.register(error_fd, EVENT_READ)
+        while ready.get_map():
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(stream.args, timeout)
+            for key, _events in ready.select(remaining):
+                if key.fd == input_fd:
+                    try:
+                        sent += os.write(input_fd, bootstrap[sent:sent + PIPE_BUF])
+                    except BrokenPipeError:
+                        sent = len(bootstrap)
+                    if sent == len(bootstrap):
+                        _ = ready.unregister(input_fd)
+                        stream.stdin.close()
+                    continue
+                data = os.read(key.fd, 65536)
+                if not data:
+                    _ = ready.unregister(key.fd)
+                    if key.fd == error_fd and parsed < len(stderr):
+                        observe(bytes(stderr[parsed:]).rstrip(b'\r'))
+                elif key.fd == output_fd:
+                    stdout.extend(data)
+                else:
+                    offset = len(stderr)
+                    stderr.extend(data)
+                    while (line_end := stderr.find(b'\n', offset)) >= 0:
+                        observe(bytes(stderr[parsed:line_end]).rstrip(b'\r'))
+                        parsed = offset = line_end + 1
+    _ = stream.wait(timeout=max(0, deadline - monotonic()))
+    return bytes(stdout), bytes(stderr)
+
+
 def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int) -> subprocess.CompletedProcess[bytes]:
+                        link: int, armed: ArmedGuestAttempt, dispatch: GuestGateDispatch
+                        ) -> subprocess.CompletedProcess[bytes]:
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
         try:
-            output, errors = stream.communicate(bootstrap, timeout=timeout)
+            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch)
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
@@ -1026,7 +1127,7 @@ def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-               prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
+               prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> GuestReply:
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
@@ -1051,7 +1152,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
                                                          count=True, link=link)
                             stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link)
+                                                         settings.transfer_timeout_seconds, link, armed, dispatch)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1137,10 +1238,11 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
     return DeltaBundle(guest.commit)
 
 
-def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
+def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
+                    dispatch: GuestGateDispatch) -> GuestReply:
     bundle = guest_bundle(repo, settings)
     with bundle_refs(repo, source, request['attempt']) as prefix:
-        return run_remote(repo, settings, source, request, prefix, bundle)
+        return run_remote(repo, settings, source, request, prefix, bundle, dispatch)
 
 
 @dataclass
@@ -1365,18 +1467,21 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
+        dispatch = None
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
-                consume_launch_permission(claim, assignment)
-                reply = transfer_source(repo, settings, source, request)
+                dispatch = GuestGateDispatch(assignment, consume_launch_permission(claim, assignment))
+                reply = transfer_source(repo, settings, source, request, dispatch)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
+            if dispatch is None:
+                raise
             request = request.copy()
             request['attempt'] = uuid4().hex
             with (mac_linux_reservation(repo, mode, gate_job),
                   bundle_refs(repo, source, request['attempt']) as prefix):
                 reply = run_remote(repo, settings, source, request, prefix,
-                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE))
+                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')

@@ -34,7 +34,13 @@ For a run with type checks, the guest checks for `basedpyright` and `uv` before 
 If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
-If the guest run fails before that line, the route returns `GuestNotStarted` with the cause, and the queue gives the gate to the next named target, for example natedev.
+The caller reads guest standard error while the run is active and keeps all its bytes for the result.
+The start line for the current guest attempt triggers one execution report for its queue assignment.
+A report failure prints a warning and leaves the guest run active.
+If the placement caller supplies `BUILDLOG_PLACEMENT_SIDECAR`, it names the placement request's progress sidecar.
+The route publishes the module count there when the guest log shows a change.
+If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
+The queue can then give the gate to the next named target.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
 A reply that the route cannot read also names its first 200 characters.
