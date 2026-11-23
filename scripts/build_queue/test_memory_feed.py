@@ -778,7 +778,7 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
-    def test_parentless_owner_keeps_its_name_and_uses_the_repository_for_steps(self) -> None:
+    def test_parentless_owner_keeps_its_name_and_names_its_steps(self) -> None:
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         labels = {step.session_id: unit_labels.UnitLabels("solo")
                   for step in (*reading.view.running, *reading.view.waiting)}
@@ -790,7 +790,7 @@ process.stdout.write(JSON.stringify({
         for row in (running, waiting):
             self.assertEqual(row.get("showrunner"), "solo")
             self.assertEqual(row["unit"], "—")
-            self.assertTrue(row["name"].startswith("fixture-project "))
+            self.assertTrue(row["name"].startswith("solo: "))
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
         gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
@@ -952,7 +952,7 @@ process.stdout.write(JSON.stringify({
             page = memory_feed.reading()
         row = cast(memory_feed.MacBuildRow, next(row for row in page["walk"] if row["pid"] == 710001))
         self.assertEqual(row["kind"], "mac-build")
-        self.assertEqual(row["name"], "hana nextest")
+        self.assertEqual(row["name"], "trunk: nextest")
         self.assertEqual(row["repository"], "hana")
         self.assertEqual(row["showrunner"], "—")
         self.assertEqual(row["machine"], "mac")
@@ -993,7 +993,7 @@ process.stdout.write(JSON.stringify({
         wait, = page["waiters"]
         for row, pid in ((run, 50), (wait, 200)):
             with self.subTest(pid=pid):
-                self.assertEqual((row["pid"], row["name"]), (pid, "CI nextest"))
+                self.assertEqual((row["pid"], row["name"]), (pid, "hana CI: nextest"))
                 self.assertEqual(row.get("ci_label"), "hana CI")
                 self.assertEqual(row["title"], {"unit": "", "step": "hana CI"})
 
@@ -1005,20 +1005,17 @@ process.stdout.write(JSON.stringify({
                 with self.subTest(template=template, job=job):
                     self.assertEqual(memory_feed.ci_step_label("hana-linux-2", job), expected)
 
-    def test_current_step_parts_check_the_configured_step_and_owner(self) -> None:
-        step = reservation_reading().view.running[0]
-        for unit, shown, expected in (("panes", "tests", "panes tests"),
-                                      ("panes", "—", "panes"),
-                                      ("—", "tests", "tests"),
-                                      ("—", "—", "unregistered session")):
-            with self.subTest(unit=unit, shown=shown):
-                identity = unit_labels.UnitLabels("caller", "", unit)
-                row = replace(step, unit=unit, project="")
-                names = StepNames({f"names.{row.step}": shown})
-                parts = memory_feed.current_step_parts(row, names, identity, {row.session_id: identity})
+    def test_row_parts_mark_the_staff_unit_owner(self) -> None:
+        for owner, what, unit, expected in (("panes", "tests", "panes", "panes: tests"),
+                                            ("panes", "—", "panes", "panes"),
+                                            ("caller", "tests", "panes", "caller: tests"),
+                                            ("—", "tests", "—", "unregistered session: tests"),
+                                            ("—", "—", "—", "unregistered session")):
+            with self.subTest(owner=owner, what=what):
+                parts = staff_names.row_parts(owner, what, unit)
                 self.assertEqual(staff_names.parts_text(parts), expected)
                 self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
-                                 ["panes"] if unit == "panes" else [])
+                                 ["panes"] if owner == unit == "panes" else [])
 
     def test_mac_work_uses_the_caller_after_an_unknown_owner(self) -> None:
         build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
@@ -1026,7 +1023,21 @@ process.stdout.write(JSON.stringify({
         row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
                                       names=read_step_names(), slot_roots={}, slot_machine="private-mac-host")
         self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
-        self.assertEqual(row["name"], "hana nextest")
+        self.assertEqual(row["name"], "mac caller: nextest")
+
+    def test_a_placed_mac_run_keeps_its_stored_owner_and_what(self) -> None:
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement="episode/attempt")
+        for unit, name in (("cargo-liner", ""), ("", "cargo-liner")):
+            with self.subTest(unit=unit, name=name):
+                placed = admission_records.RunningStep("", name, "run", "/private/hana", 0,
+                    admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+                    pid=admission_records.PidNotRecorded(), unit=unit, mac_placement="episode/attempt",
+                    what="run 6 installs")
+                row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
+                                              unit_labels.UnitLabels(""), names=read_step_names(),
+                                              slot_roots={}, slot_machine="private-mac-host", placed_step=placed)
+                self.assertEqual(row["name"], "cargo-liner: run 6 installs")
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
@@ -1053,7 +1064,7 @@ process.stdout.write(JSON.stringify({
                 run = next(row for row in page["walk"] if row.get("queued"))
                 self.assertEqual(run.get("showrunner"), "")
                 self.assertEqual(run.get("ci_label"), "unrelated display name")
-                self.assertEqual(run["name"], "CI nextest")
+                self.assertEqual(run["name"], "hana CI: nextest")
                 self.assertEqual(page["waiters"][0]["showrunner"], "")
                 self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
                 self.assertEqual(run["unit"], "")
@@ -1627,12 +1638,12 @@ process.stdout.write(JSON.stringify({
         memory = step.measured
         assert isinstance(memory, admission_records.MeasuredMemory)
         step = replace(step, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
-        for unit, shown, expected in (("widget", "tests", "widget tests"),
+        for unit, shown, expected in (("widget", "tests", "widget: tests"),
                                       ("widget", "—", "widget"),
-                                      ("—", "tests", "tests"),
+                                      ("—", "tests", "unregistered session: tests"),
                                       ("—", "—", "unregistered session")):
             with self.subTest(unit=unit, shown=shown):
-                row = replace(step, unit="", project=unit)
+                row = replace(step, unit="", project=unit, session_name="")
                 reading = memory_feed.read_swap((row,), {}, 6, StepNames({f"names.{row.step}": shown}))
                 assert isinstance(reading, memory_feed.SwapReading)
                 self.assertEqual([item["name"] for item in reading.rows if item["kind"] == "owner"], [expected])
@@ -2064,7 +2075,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
-            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler · nextest", True),
+            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler: nextest", True),
         )
         for reason, expected, has_blocker in reasons:
             with self.subTest(reason=reason):
@@ -2081,7 +2092,7 @@ process.stdout.write(JSON.stringify({
                 row = page["waiters"][-1 if has_blocker else 0]
                 self.assertIn(expected, row["reason"])
                 if isinstance(reason, placement.CargoFolderWait):
-                    self.assertEqual(row["name"], "fixture-project nextest")
+                    self.assertEqual(row["name"], "fixture: nextest")
                 if has_blocker:
                     self.assertNotIn("first step in line", row["reason"])
                 self.assertTrue(page["walk"])
@@ -2269,15 +2280,15 @@ process.stdout.write(JSON.stringify({
         slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
             wire.Identity("", "", "", ""), known.since + 1, "fixture",
             wire.RepositorySlotWaiting("", (1,), 1, "fixture"))
-        for step, folder, names in (("", "", []), (parse.step_name(["bash", "-c", ":"]), "/", ["bash"]),
-                                    ("unknown", "/", ["unknown"])):
+        for step, folder, names in (("", "", []), (parse.step_name(["bash", "-c", ":"]), "/", ["fixture: bash"]),
+                                    ("unknown", "/", ["fixture: unknown"])):
             with self.subTest(step=step, folder=folder):
                 missing = replace(known, pid=known.pid + 1, step=step, project="", folder=folder)
                 reading = cloud_reading(replace(base, view=replace(base.view, waiting=(missing, known))))
                 with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(slot,))):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["waiters"]],
-                                 [*names, "fixture-project check", "route-two"])
+                                 [*names, "fixture: check", "route-two"])
 
     def test_blank_or_unrelated_configured_name_uses_the_verb(self) -> None:
         for text in ("", "umask"):
@@ -2321,8 +2332,9 @@ process.stdout.write(JSON.stringify({
                 with (mock.patch.object(admission_client, "view", return_value=cloud),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(inputs.now, (build,)))):
                     page = memory_feed.reading()
-                by_pid = {row["pid"]: row["name"] for row in (*page["walk"], *page["waiters"])
-                          if isinstance(row["pid"], int)}
+                # Each row shows `<owner>: <what>`; this test checks the "what" part.
+                by_pid = {row["pid"]: row["name"].rpartition(codec.ROW_SEPARATOR)[2]
+                          for row in (*page["walk"], *page["waiters"]) if isinstance(row["pid"], int)}
                 if not repository:
                     expected_names = {pid: step for pid in (50, 101, 200, 201, 900)}
                     for pid, name in expected_names.items():
@@ -2985,8 +2997,8 @@ process.stdout.write(JSON.stringify({
     def gate_job_page(self, step: str, argv: tuple[str, ...], *,
                       running_pid: int | admission_records.PidNotRecorded = 700000,
                       showrunner: bool = False, unit_known: bool = True,
-                      job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
-                      ) -> memory_feed.MemoryPage:
+                      job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
+                      owner: unit_labels.UnitLabels | None = None) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
         config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
         _ = shutil.copyfile(config, self.root / "build_steps.conf")
@@ -3005,7 +3017,7 @@ process.stdout.write(JSON.stringify({
                     _ = cmdline.write_bytes(("\0".join(argv) + "\0").encode())
                 else:
                     cmdline.unlink(missing_ok=True)
-        owner = (unit_labels.make_labels("sdlc", unit_labels.RunsProduction("sdlc"), unit_labels.NoDirector())
+        owner = owner or (unit_labels.make_labels("sdlc", unit_labels.RunsProduction("sdlc"), unit_labels.NoDirector())
                  if showrunner else unit_labels.make_labels("impl", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                                             unit_labels.UnderDirector("devtools", "devtools", "")))
         labels = {session: owner for session in
@@ -3013,6 +3025,18 @@ process.stdout.write(JSON.stringify({
         with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             return memory_feed.reading()
+
+    def test_unreadable_gate_rows_strip_the_showrunner_prefix_on_local_and_cloud_rows(self) -> None:
+        merge_staff = unit_labels.make_labels("sdlc-merge-gate", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                             unit_labels.DirectsUnit("sdlc-merge-gate"))
+        page = self.gate_job_page("gate", (), owner=merge_staff)
+        rows = [*(row for row in page["walk"] if row.get("queued") or row.get("kind") == "cloud"),
+                *(row for row in page["waiters"] if row.get("kind") in (None, "cloud"))]
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            with self.subTest(pid=row["pid"]):
+                self.assertEqual(row["name"], "merge-gate")
+                self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), "merge-gate")
 
     def test_gate_modes_and_jobs_show_approved_names_on_local_and_cloud_rows(self) -> None:
         approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
@@ -3039,7 +3063,7 @@ process.stdout.write(JSON.stringify({
                     local_wait, = [row for row in page["waiters"] if not row.get("kind")]
                     cloud_wait, = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                     for row in (local_run, cloud_run, local_wait, cloud_wait):
-                        self.assertEqual(row["name"], "devtools " + named if named else "devtools")
+                        self.assertEqual(row["name"], "devtools: " + named if named else "devtools")
                         self.assertEqual(row["title"]["step"], named or "devtools")
                         self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
                         about = names.about(job) if isinstance(job, StepJob) else "Runs a merge or test job"
@@ -3055,14 +3079,14 @@ process.stdout.write(JSON.stringify({
                 waiting, = [row for row in page["waiters"] if not row.get("kind")]
                 for row in (local, waiting):
                     self.assertIn(row["title"]["step"], approved)
-                    self.assertEqual(row["name"], "devtools test all")
+                    self.assertEqual(row["name"], "devtools: test all")
                     self.assertEqual(row.get("about"), "Runs every test module")
 
         page = self.gate_job_page("gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
         waiting, = [row for row in page["waiters"] if not row.get("kind")]
         for row in (local, waiting):
-            self.assertEqual(row["name"], "devtools test all")
+            self.assertEqual(row["name"], "devtools: test all")
             self.assertEqual(row.get("about"), "Runs every test module")
 
         base = captured_reading()
@@ -3087,25 +3111,27 @@ process.stdout.write(JSON.stringify({
 
         from scripts.aws_target.aws_trial import PAIRED_TRIAL_JOB
 
-        for unit_known, name in ((True, "devtools test named"), (False, "test named")):
+        # Without a staff unit the stored caller name is the owner, and the title shows the whole name.
+        for unit_known, name, title in ((True, "devtools: test named", "test named"),
+                                        (False, "{caller}: test named", "{caller}: test named")):
             with self.subTest(paired_trial_unit_known=unit_known):
                 trial = self.gate_job_page(PAIRED_TRIAL_JOB.step, (), unit_known=unit_known, job=PAIRED_TRIAL_JOB)
-                for rows in (trial["walk"], trial["waiters"]):
+                for rows, caller in ((trial["walk"], "route-one"), (trial["waiters"], "route-two")):
                     row, = [row for row in rows if row.get("kind") == "cloud"]
-                    self.assertIn(row["title"]["step"], approved)
-                    self.assertEqual(row["name"], name)
+                    self.assertEqual(row["title"]["step"], title.format(caller=caller))
+                    self.assertEqual(row["name"], name.format(caller=caller))
                     self.assertEqual(row.get("about"), "Runs 1 named test modules")
                     self.assertEqual(row.get("changes"), "no branch")
 
         integration = self.gate_job_page("gate", ("python3", "gate.py"), showrunner=True)
         for rows in (integration["walk"], integration["waiters"]):
             row, = [row for row in rows if row.get("kind") == "cloud"]
-            self.assertEqual(row["name"], "showrunner integrate")
+            self.assertEqual(row["name"], "sdlc: integrate")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
         page = self.gate_job_page("gate", ("python3", "scripts/production/gate.py", "--tests-only", "--full"))
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
-        self.assertEqual(row["name"], "devtools test all")
+        self.assertEqual(row["name"], "devtools: test all")
         self.assertEqual(row.get("about"), "Runs every test module")
         self.assertEqual(row.get("changes"), "no branch")
         self.assertEqual(row.get("call"), "gate.py --tests-only --full")
@@ -3132,9 +3158,9 @@ process.stdout.write(JSON.stringify({
     def test_step_owners_name_every_machine_and_both_tables(self) -> None:
         for owner, name in (
             (unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
-                unit_labels.UnderDirector("research", "research", "")), "research nextest"),
+                unit_labels.UnderDirector("research", "research", "")), "research: nextest"),
             (unit_labels.make_labels("hana", unit_labels.RunsProduction("hana"), unit_labels.NoDirector()),
-                "showrunner nextest"),
+                "hana: nextest"),
         ):
             with self.subTest(role=owner.role):
                 page = self.owner_machine_page(owner)
@@ -3166,7 +3192,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(len({row.get("key") for row in (*running, *waiting)}), 8)
                 self.assertEqual(page["reserved"], 11.0)
                 self.assertEqual((running[1]["name"], running[1].get("ci_label")),
-                                 ("CI nextest", "hana CI"))
+                                 ("hana CI: nextest", "hana CI"))
                 self.assertEqual((running[2].get("caller"), running[2].get("owner_text")), (held, held))
                 for row in (running[0], *waiting):
                     with self.subTest(pid=row["pid"]):
@@ -3175,7 +3201,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(waiting[0]["name"], "fixture unit")
                 self.assertEqual(waiting[0]["title"]["step"], "fixture unit")
                 for cloud_row in (running[0], *waiting[1:]):
-                    self.assertEqual(cloud_row["name"], "fixture unit nextest")
+                    self.assertEqual(cloud_row["name"], "fixture unit: nextest")
                     self.assertEqual(cloud_row["title"], {"unit": "fixture unit", "step": "nextest"})
 
     def caller_selection_page(self, *, stored_caller: str | None = None,
@@ -3243,7 +3269,7 @@ process.stdout.write(JSON.stringify({
         _ = (self.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown"), ci=True)
         mac, = [row for row in page["walk"] if row.get("kind") == "mac-build"]
-        self.assertEqual(mac["name"], "CI nextest")
+        self.assertEqual(mac["name"], "hana CI: nextest")
         self.assertEqual(mac.get("ci_label"), "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac["title"]["step"], "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac.get("showrunner"), "")
@@ -3256,15 +3282,15 @@ process.stdout.write(JSON.stringify({
                 row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
                                               unit_labels.UnitLabels("unknown"), names=read_step_names(),
                                               slot_roots={}, slot_machine="private-mac-host")
-                self.assertEqual(row["name"], "CI nextest")
+                self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
 
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["hana nextest"])
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["unknown: nextest"])
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["route-one: nextest"])
         local, = [row for row in page["walk"] if not row.get("kind")]
-        self.assertEqual(local["name"], "fixture-project nextest")
+        self.assertEqual(local["name"], "fixture: nextest")
         for row in (*page["walk"], *page["waiters"]):
             self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
 
@@ -3289,9 +3315,9 @@ process.stdout.write(JSON.stringify({
         stat = process / "stat"
         # The feed reads no tty. Only the client stores a terminal name, so an empty stored name stays unknown.
         for members, tty, name, unit, showrunner, caller in (
-            ((), 34816, "hana build", "", "", "unregistered session"),
-            ((), 0, "hana build", "", "", "unregistered session"),
-            ((runner, director), 34816, "startup build", "startup", "hana", "startup"),
+            ((), 34816, "hana: build", "", "", "unregistered session"),
+            ((), 0, "hana: build", "", "", "unregistered session"),
+            ((runner, director), 34816, "startup: build", "startup", "hana", "startup"),
         ):
             with self.subTest(tty=tty, unit=unit):
                 fields = ["S", "1", str(pid), str(pid), str(tty), *(["0"] * 14), str(pid)]
@@ -3318,7 +3344,7 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
               mock.patch.object(staff, "snapshot", return_value=record)):
             row, = memory_feed.reading()["waiters"]
-        self.assertEqual(row["name"], "organon nextest")
+        self.assertEqual(row["name"], "organon: nextest")
         self.assertEqual(row["unit"], "organon")
 
     def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
@@ -3334,11 +3360,11 @@ process.stdout.write(JSON.stringify({
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
             ("test-affected", director, "panes"),
-            ("build", director, "panes build"),
-            ("literal{step}", director, "panes literal{step}"),
+            ("build", director, "panes: build"),
+            ("literal{step}", director, "panes: literal{step}"),
             ("gate", runner, "builds"),
             ("gate", director, "panes"),
-            ("gate", merge_staff, "sdlc-merge-gate"),
+            ("gate", merge_staff, "merge-gate"),
             ("gate", unit_worker, "panes"),
             ("gate", runner_worker, "builds"),
             ("test-affected", unknown, "unknown"),
@@ -3355,35 +3381,29 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
 
-        config = self.root / "build_steps.conf"
-        _ = config.write_text(config.read_text().replace("owned.test-affected={unit} {step}",
-                                                         "owned.test-affected=targeted for {unit}"))
         step = "test-affected"
-        for owner, expected in ((director, "targeted for panes"), (None, "unregistered session")):
+        for owner, expected in ((director, "panes"), (None, "unregistered session")):
             with self.subTest(owner=owner, expected=expected):
                 page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
                 self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
                 self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
 
-    def test_cloud_gate_uses_the_configured_template_after_an_unknown_caller(self) -> None:
+    def test_cloud_gate_names_the_owner_after_an_unknown_caller(self) -> None:
         with isolated_staff_file(self.root / "staff.json", {}):
             runner = fixture_member("showrunner", name="sdlc")
             unit = fixture_member("unit", name="panes", parent=runner.id)
             director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                                unit_labels.DirectsUnit("panes"))
-            config = self.root / "build_steps.conf"
-            _ = config.write_text(config.read_text().replace("owned.test-affected={unit} {step}",
-                                                             "owned.test-affected=targeted for {unit}"))
             identity = wire.Identity(unit.current_session, "unregistered session", "test-affected", "")
             page = self.cloud_owner_page(identity.step, director, identity=identity)
             for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
                 row, = [row for row in table if row.get("kind") == "cloud"]
-                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "targeted for panes", "panes"))
+                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "panes", "panes"))
 
-    def test_cloud_owner_templates_check_the_configured_step_and_unit(self) -> None:
+    def test_unknown_cloud_gate_rows_show_only_the_owner_for_any_step_name(self) -> None:
         config = self.root / "build_steps.conf"
         original = config.read_text()
-        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes selected tests"),
+        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes"),
                                                   ("panes", "sdlc", "—", "panes"),
                                                   ("—", "sdlc", "selected tests", "sdlc"),
                                                   ("—", "—", "—", "unregistered session")):
@@ -3584,20 +3604,22 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual([row["pid"] for row in queued], [waiting.owner.pid])
 
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
+        # With no session name, the project is the owner; a folder never is.
         for raw_step, project, folder, expected in (
-            ("nextest", "known-project", "/fixture", "known-project nextest"),
-            ("nextest", "", "/fixture", "nextest"),
-            ("nextest", "", "/absolute/repository", "nextest"),
-            ("integrate", "", "/fixture", "integrate"),
+            ("nextest", "known-project", "/fixture", "known-project: nextest"),
+            ("nextest", "", "/fixture", "unregistered session: nextest"),
+            ("nextest", "", "/absolute/repository", "unregistered session: nextest"),
+            ("integrate", "", "/fixture", "unregistered session: integrate"),
         ):
             with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
-                step = replace(reading.view.running[0], step=raw_step, folder=folder)
+                step = replace(reading.view.running[0], step=raw_step, folder=folder, session_name="")
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
                 reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
-                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder)
+                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder,
+                                 session_name="")
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
                 with (mock.patch.object(admission_client, "view", return_value=reading),
                       mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
@@ -4520,14 +4542,12 @@ def write_browser_fixture(folder: Path) -> None:
         pages: dict[str, object] = {}
         pages["caller_selection"] = json.loads(memory_feed.page_json(fixture.caller_selection_page()))
         reports: dict[str, memory_feed.ReportFile] = {}
-        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
-                                          unit_labels.DirectsUnit("panes"))
-        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
         names = read_step_names()
         for version in ("before", "after"):
             named_pages: list[memory_feed.MemoryPage] = []
-            for step, label in (("test-affected", director), ("gate", runner)):
-                name = names.shown(step) if version == "before" else names.for_owner(step, label.unit, label.role)
+            # The stored caller names before and after the owner names: a unit, then a showrunner.
+            for step, prefix in (("test-affected", "panes"), ("gate", "showrunner")):
+                name = names.shown(step) if version == "before" else f"{prefix} {names.shown(step)}"
                 named_pages.append(fixture.cloud_owner_page(step, identity=wire.Identity("", name, step, "")))
             comparison = named_pages[0]
             comparison["walk"] = [row for page in named_pages for row in page["walk"] if row.get("kind") == "cloud"]

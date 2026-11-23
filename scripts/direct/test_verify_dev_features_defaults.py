@@ -19,7 +19,7 @@ class VerifyDevFeatureDefaultsTests(DevFeatureFixture):
                     self.clear_calls()
                     result = self.verify("check", "sample", *extra)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(self.calls.read_text(), f"check --workspace --lib --bins{suffix}\n")
+                    self.assertEqual(self.calls.read_text(), f"check --workspace --all-targets{suffix}\n")
 
 
 if __name__ == "__main__":
