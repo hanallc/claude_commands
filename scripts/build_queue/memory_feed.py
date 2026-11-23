@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, overload
 
 
 class CodeRootArguments(argparse.Namespace):
@@ -74,6 +74,7 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
+from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
 
@@ -468,6 +469,11 @@ def call_notes(verify: admission_records.VerifyStep, step: str, call: str = "") 
     return {"call": call} if call else {}
 
 
+class ConfirmedGuestRun(TypedDict):
+    target: Literal["mac-linux"]
+    attempt: str
+
+
 class RowQueueNotes(CallNotes):
     caller: NotRequired[str]
     owner_text: NotRequired[str]
@@ -488,6 +494,7 @@ class RowQueueNotes(CallNotes):
     because: NotRequired[str]
     mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
+    guest_run: NotRequired[ConfirmedGuestRun]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
@@ -511,7 +518,7 @@ TARGET_WORDS = {MAC_TARGET: "Mac"}
 
 @dataclass(frozen=True)
 class RunsOn:
-    """The machines that can take a natedev queue step, and why it is limited to them."""
+    """The machines in the route and the recorded reason for a restriction."""
 
     targets: tuple[str, ...]
     reason: str = ""
@@ -587,6 +594,42 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
 
 
 NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
+
+
+def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
+    """Use the placement candidates for a route that names the Mac Linux guest."""
+    # Older queue readings have no placement candidates.
+    recorded: object = getattr(step, "placement_candidates", ())
+    if not isinstance(recorded, tuple):
+        return None
+    candidates = tuple(row for row in cast(tuple[object, ...], recorded)
+                       if isinstance(row, placement.CandidateEligibility))
+    guest = tuple(candidate.eligibility for candidate in candidates if candidate.destination.target == MAC_LINUX_TARGET)
+    if not guest:
+        return None
+    reason = ""
+    if not any(isinstance(state, placement.AllowedHost) for state in guest):
+        reason = next((state.reason for state in guest if not isinstance(state, placement.AllowedHost)), "")
+    named = RunsOn(tuple(dict.fromkeys(candidate.destination.target for candidate in candidates)))
+    return {"runs_on": named.text(), "targets": list(named.targets), "mac_text": "",
+            "because": f"{MAC_LINUX_TARGET}: {reason}" if reason else ""}
+
+
+def step_target_notes(step: admission_records.WaitingStep | admission_records.RunningStep,
+                      routes: target_availability.MacRoutes) -> TargetNotes:
+    return gate_placement_notes(step) or target_notes(step.route, routes, step.step, step.folder, step.package)
+
+
+def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRun | None:
+    """Read the guest's confirmed attempt from the queue record."""
+    recorded: object = getattr(step, "confirmed_guest_run", None)
+    if not isinstance(recorded, dict):
+        return None
+    fields = cast(dict[str, object], recorded)
+    attempt = fields.get("attempt")
+    if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
+        return {"target": MAC_LINUX_TARGET, "attempt": attempt}
+    return None
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -844,6 +887,8 @@ def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | Cl
     # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
                 row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+    if guest := row.get("guest_run"):
+        identity.append(guest["attempt"])
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
@@ -1424,8 +1469,8 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
         elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
               not any(contains(claim["worktree"], build.folder) for claim in claims)):
             repository_claims = [claim for claim in held_claims
-                                 if isinstance(claim.scope, claim_state.RepositoryScope) and
-                                 claim.scope.name == build.repository]
+                                 if (claim.scope.name if isinstance(claim.scope, claim_state.RepositoryScope)
+                                     else claim.record.get("repo_name")) == build.repository]
             if len(repository_claims) == 1:
                 session = repository_claims[0].record["submitting_session"]
                 if session in labels:
@@ -1497,6 +1542,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
     unit = staff_unit(identity, missing="—")
     verify = placed_step.verify if placed_step is not None else admission_records.NotVerifyCall()
+    placement_notes = gate_placement_notes(placed_step) if placed_step is not None else None
     call = ""
     if not isinstance(verify, admission_records.VerifyCall):
         try:
@@ -1505,7 +1551,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             pass
     caller = "" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
         public_owner_name(identity.session, build.session))
-    return {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
+    row: MacBuildRow = {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
             **call_notes(verify, placed_step.step if placed_step is not None else verb, call),
             **job_notes(NotGateStep(), names, step=verb, verify=verify, ci=ci),
             "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
@@ -1519,6 +1565,17 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
                          if isinstance(build.counter, progress.ProgressCounter) else
                          {"kind": "NoProgress", "reason": build.counter.reason})}
+    if placement_notes is not None:
+        row["runs_on"] = placement_notes["runs_on"]
+        row["targets"] = placement_notes["targets"]
+        row["mac_text"] = placement_notes["mac_text"]
+        if "because" in placement_notes:
+            row["because"] = placement_notes["because"]
+        if "mac_state" in placement_notes:
+            row["mac_state"] = placement_notes["mac_state"]
+        if "because_parts" in placement_notes:
+            row["because_parts"] = placement_notes["because_parts"]
+    return row
 
 
 def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
@@ -1942,9 +1999,10 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
               ) -> SwapReading | SwapUnavailable:
     """Account for host swap in two pools, with disjoint cgroup owners and an explicit difference in each pool."""
     owners: dict[Path, SwapOwner] = {}
+    builds = gate.builds_slice_cgroup()
     for step in steps:
         memory = step.measured
-        if not isinstance(memory, admission_records.MeasuredMemory):
+        if not isinstance(memory, admission_records.MeasuredMemory) or gate.detached_tool_memory(memory, builds):
             continue
         source = memory.anonymous_source
         path: Path
@@ -2568,7 +2626,8 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
                 charged.update(item.pid for item in source.processes)
         if isinstance(memory, admission_records.CompilerServiceMemory):
             path = builds / "sccache.service"
-        elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup and not memory.diagnostic:
+        elif (isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup
+              and not memory.diagnostic and not gate.detached_tool_memory(memory, builds)):
             path = Path(memory.cgroup)
         else:
             continue
@@ -2764,8 +2823,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     break
         return call_notes(step.verify, step.step, call)
 
+    builds = gate.builds_slice_cgroup()
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
+        if gate.detached_tool_memory(memory, builds):
+            continue
         identity = labels.get(activity.session_id)
         label = public_owner_name(identity.session, activity.session_id) if identity is not None else ""
         owner = label or recorded_caller_name(activity.session_id, activity.session_name, activity.folder)
@@ -2849,7 +2911,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
                      "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
-                     **(target_notes(step.route, routes, step.step, step.folder, step.package)
+                     **(step_target_notes(step, routes)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
                      **(local_call_notes(step) if step is not None else CallNotes()),
                      **(job_notes(job, names, step=step.step, verify=step.verify,
@@ -2857,11 +2919,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         if step is not None else job_notes(job, names, kind="between-steps"))})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
+    guest_placements: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
-        if not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
-                                   admission_records.CompilerServiceMemory)):
+        if (not isinstance(memory, (admission_records.RemoteMemoryUnavailable, admission_records.UnownedSliceMemory,
+                                    admission_records.CompilerServiceMemory))
+                or gate.detached_tool_memory(memory, builds)):
             continue
         owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=recorded_ci_label(step, ci_runners))
         identity = owner.labels
@@ -2869,7 +2933,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         name, detail = "", identity.unit
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
-            key = admission_records.execution_group(step, entry.owner)
+            guest = confirmed_guest_run(step)
+            key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
             verb = step.step
@@ -2885,17 +2950,26 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit, caller=owner.caller),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
-                "state": "running" if isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
+                "state": "running" if guest or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
+                "machine": guest["target"] if guest else admission_records.execution_host(step, machine),
+                "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(local_job(step), names, step=step.step, verify=step.verify,
                             ci=step.unit in ci_runners),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
+            if placed := gate_placement_notes(step):
+                remote_row["runs_on"] = placed["runs_on"]
+                remote_row["targets"] = placed["targets"]
+                remote_row["because"] = placed.get("because", "")
+            if guest:
+                remote_row["guest_run"] = guest
+                if step.mac_placement:
+                    guest_placements.add(step.mac_placement)
             walk.append(remote_row)
             continue
         service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -3019,7 +3093,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(named, NoNamedStep):
             continue
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
-            NO_TARGET_NOTES if ci_label else target_notes(waiter.route, routes, waiter.step, waiter.folder, waiter.package))
+            NO_TARGET_NOTES if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
@@ -3057,6 +3131,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
         mac_steps = {step.mac_placement: step for step in parsed.view.running if step.mac_placement}
         for build in mac_reading.builds:
+            if build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in guest_placements:
+                continue
             current = members.labels_for(build.session, mac_machine, Path(build.folder))
             claim = mac_units.get(build.pid)
             identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (

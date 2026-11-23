@@ -525,7 +525,28 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The provider keeps its existing repository scopes and cleanup policy.
+The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
+The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
+Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
+The Mac resolves the repository before it takes the claim lock.
+The key follows local clone origins to the upstream repository. Git alternates supply objects only.
+The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
+The Mac runner uses the shared origin to find the mirror and set the claim key.
+Each new work claim saves its claim key, history key, claim file, mirror name, and start fence directory.
+The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
+The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
+A handoff can adopt an exact cleanup claim after the checkout is gone.
+A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
+A claim without a proven mirror or history key authorizes cleanup only.
+The runner takes the execution lease before it replaces an incomplete local reservation.
+The claim child publishes the replacement and removes the old reservation under one provider lock.
+The runner keeps the execution lease through the run.
+Cleanup uses the saved mirror lease when the claim identifies the mirror. Otherwise, it takes the host lease and counts processes in all mirrors.
+The idle watcher reads an expired remote claim again under its cleanup lease before release.
+If a cleanup lease cannot open or its mirror root is invalid, the watcher skips that claim for the current pass.
+Shell and Python runners take a shared host lease before they take a mirror lease.
+The host-wide count sends no process signals. Unrelated mirror work can keep the claim pending.
+The Mac build log and the queue use the same Git root key for history when a repository has no origin.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.

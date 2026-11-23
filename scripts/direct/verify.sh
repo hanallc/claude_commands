@@ -2465,6 +2465,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
+    if [[ "$selected_is_mac" == 1 && "$result_usable" == 0 ]]; then
+        local launch
+        launch=$(verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" placement-status --launch-only \
+            --episode "$PLACEMENT_EPISODE" --attempt "$PLACEMENT_ATTEMPT") || launch=unknown
+        # not_started: the runner reported a settled refusal: no test started and no Mac cleanup is open.
+        if [[ "$launch" != available && "$launch" != not_started ]]; then
+            result_word=lost result_reason=cleanup_unconfirmed result_usable=1
+        fi
+    fi
     if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
@@ -2505,6 +2514,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
+            if [[ "$selected_is_mac" == 1 && "$result_word" == lost \
+                    && "$result_reason" == cleanup_unconfirmed ]]; then
+                echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
+                exit 2
+            fi
             if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;

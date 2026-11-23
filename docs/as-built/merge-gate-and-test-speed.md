@@ -75,9 +75,24 @@ Queue placement will read the backoff when item 191 B3 registers `mac-linux` for
 After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
 This one setting is for every machine. The `mac-linux` and AWS routes read it.
 The setting accepts whole numbers from 1 to 86400 seconds.
-The Mac claim is a placeholder until item 191 B3. The guest run holds a separate lock.
+The route takes the Mac repository claim before the first SSH request.
+The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
-The route sends no more cleanup requests. The guest run keeps its lock until it ends.
+The route sends no more cleanup requests.
+The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
+The queue's guestkeep change will retain the Mac claim until a later proof.
+If the guest starts no test run, the route returns `GuestNotStarted`.
+This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The new assignment goes into the same file, and the gate runs again on the assigned machine.
+The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
+If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
+A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
+If no named machine remains, the gate step stops with "Gate placement blocked".
+A refused placement during the retry stops the gate step with "Gate placement blocked".
+A failure after the guest armed the run is not placed again: the gate fails.
+`copies.py run` with named gate targets does not place the gate again yet.
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
@@ -293,6 +308,10 @@ The gate keeps that record and checks the remaining records.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
+A descriptor variable name ends in `_FD` or `_FDS`, or contains `_FD_`.
+Gate jobs keep only the descriptor numbers that the gate passes to the child.
+Gate jobs drop the systemd socket count `LISTEN_FDS`.
+On Linux, the gate passes its source descriptor to test modules for interpreter startup.
 After the parallel pass, up to eight failed modules run once more, alone.
 The final test results decide the gate.
 On Linux, `module_run.py` adopts orphaned test processes in a separate parent before it imports test code.
@@ -356,7 +375,7 @@ Queue tables and cards use `[names]`; `test-affected` has the shown name `test a
 Other step IDs keep their display text.
 Sentences use `[prose]`, then the shown name as a fallback.
 The step column fits `test affected`.
-Build holds apply to both entries. Their test children keep the same hold rules.
+Build holds apply to both entries, with the configured exemption for named module runs.
 Temporary folders use each step's prefix from `config/build_folders.conf`.
 
 Each `gate_run` record carries `step`. Old records retain an empty step in the index.
@@ -371,6 +390,7 @@ The six merge flags are required unless `--tests-only`, `--promote-only`, or `--
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
 Use the module names that the gate prints.
 A standalone named run waits for the build hold to clear and takes one local admission reservation.
+The named run of the unit in `max_runs.exempt_unit` does not wait for the build hold.
 A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
 It reads the reservation from the state folder in the grant and checks that release has not started.
 The child runs one module at a time and takes no additional CPU slot.
@@ -568,9 +588,10 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 **Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE, machine=SharedMachine()) -> GateRun`):
 
 `SharedMachine` is the default and keeps the existing shared scheduling behavior.
+`HoldExemptNamedModuleMachine` uses shared scheduling and skips the build hold.
 `WholeMachine` uses one job per CPU and runs every discovered module without reruns.
 It uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
-Both modes use one launch loop with the same commands, test environments, timeouts, tripwires, and process cleanup.
+All three modes use the same launch loop, commands, test environments, module timeouts, tripwires, and process cleanup.
 `WholeMachine` prints each completed job's name, exit status, and seconds.
 `WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
@@ -591,12 +612,13 @@ The guest timeline records CPU busy percent between samples from the aggregate `
 The guest result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
 CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
 The trial text table shows CPU use percent for each size and run.
-The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
+The admission, scheduling caches, and rerun rules below apply to `SharedMachine` and `HoldExemptNamedModuleMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
-- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `gate` reservation through `queue_place`.
+- **Shared admission.** `gate_reservation` obtains one `gate` reservation through `queue_place`.
+  `SharedMachine` waits for the build hold to end before it requests admission.
   Targeted tests use step `test-affected` through the same reservation path.
   It reads `program_first_peak_gib.gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
@@ -620,7 +642,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Stop signals interrupt the wait without a masked blocking read.
   Cleanup returns all registered slots.
   Steve recovers a byte at process exit if a signal interrupts its registration after the read.
-  The gate checks holds again after the blocking read.
+  `SharedMachine` checks holds again after the blocking read.
   If a hold prevents admission, the gate returns the slot before it waits for the hold.
   An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
   Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
@@ -634,8 +656,18 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
+  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  On Linux, the bootstrap first checks for a verified gate parent.
+  It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
+  If neither check proves a gate launch, it reads the cgroup name once.
+  For a matching direct test scope, one systemd query checks for a finite runtime limit and SIGKILL.
+  A process with an existing limit keeps its current folder and reads no test limit configuration.
+  A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
+  Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
+  Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
+  At the deadline the watchdog stops the test first and then prints the limit line. The watchdog stops only the test process, not its children.
+  Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
+  The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
   These folders use `<inherited TMPDIR>/test-runs/r*`.

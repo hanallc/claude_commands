@@ -519,14 +519,28 @@ class PlacementStatusRequest(CallerCode):
     """The request asks for the status of an episode and attempt."""
     episode: str
     attempt: str
+    include_permission: bool = False
+
+
+@dataclass(frozen=True)
+class LaunchPermissionNotReported:
+    """The status reply does not identify the launch permission."""
+
+
+LAUNCH_PERMISSION_NOT_REPORTED = LaunchPermissionNotReported()
 
 
 @dataclass(frozen=True)
 class KnownPlacementStatus:
-    """The status holds a known assignment, its state, and provider claim."""
+    """The status holds a known assignment, its state, and provider claim.
+
+    A permission request also gets the final report. A reply from an older service has no report.
+    """
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
+    permission: placement.LaunchPermission | LaunchPermissionNotReported = LAUNCH_PERMISSION_NOT_REPORTED
+    report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 
 @dataclass(frozen=True)
