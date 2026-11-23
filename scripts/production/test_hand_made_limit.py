@@ -1,7 +1,10 @@
 """Tests of the natedev read limit of hand made runs; each run uses the real bwrap."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+import contextlib
+from contextlib import ExitStack
+import fcntl
 import glob
 import importlib.util
 import io
@@ -11,15 +14,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import override
+from typing import Unpack, override
 import unittest
 from unittest import mock
 
 from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
+from scripts.build_queue.queue_place import PopenArguments
+from scripts.buildlog import store
+from scripts.lib import build_folder_lock, build_folders
 from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import Program, Refused
 from scripts.production.test_hand_made import FakePlace, clear_build_variables, namespace_members
+from scripts.worktree import worktrees
 
 BWRAP = shutil.which("bwrap")
 NOT_ASSIGNED = "its link does not name the build folder of this checkout"
@@ -174,6 +181,11 @@ class LimitTests(unittest.TestCase):
         status, output, _ = self.limited(["sh", "-c", "echo ${SSH_AUTH_SOCK:-none}"])
         self.assertEqual((status, output), (0, "none\n"))
 
+    # The natedev route is the only one that starts the private sccache server, so natedev must run this test.
+    # Another host without sccache, such as the Mac Linux guest, skips it.
+    @unittest.skipIf(store.host_name() != hand_made.LOCAL_MACHINE
+                     and shutil.which("sccache", path=program_path()) is None,
+                     "sccache is not on PATH, and this host is not natedev")
     def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
         # A C compile: the merge gate fails a module that starts cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
@@ -220,17 +232,19 @@ class LimitTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertTrue((build / "built").exists())
 
-    def test_the_build_hold_cargo_wrapper_folder_and_its_lib_are_read_only(self) -> None:
-        hold, path = self.root / "scripts" / "build_hold", self.root / "bin"
-        for folder in (hold, self.root / "scripts" / "lib", path):
+    def test_the_build_hold_cargo_wrapper_folder_and_its_lib_are_not_bound(self) -> None:
+        hold, lib, path = self.root / "scripts" / "build_hold", self.root / "scripts" / "lib", self.root / "bin"
+        for folder in (hold, lib, path):
             folder.mkdir(parents=True)
         _ = (hold / "cargo").write_text("#!/bin/sh\n")
         (hold / "cargo").chmod(0o755)
         (path / "cargo").symlink_to(hold / "cargo")
-        words = " ".join(hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
-                                                    {"HOME": os.environ["HOME"], "PATH": str(path)}, 3))
-        for folder in (path, hold, self.root / "scripts" / "lib"):
-            self.assertIn(f"--ro-bind {folder} {folder}", words)
+        words = hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
+                                           {"HOME": os.environ["HOME"], "PATH": str(path)}, 3)
+        bound = [words[index + 1] for index, word in enumerate(words) if word == "--ro-bind"]
+        self.assertIn(str(path), bound)
+        self.assertNotIn(str(hold), bound)
+        self.assertNotIn(str(lib), bound)
 
     def test_a_bind_with_a_link_in_its_path_or_that_holds_the_home_folder_is_not_bound(self) -> None:
         home = Path(os.environ["HOME"])
@@ -332,16 +346,18 @@ class NatedevRunTests(unittest.TestCase):
         with self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(io.BytesIO(), None))
         self.assertEqual(str(caught.exception), hand_made_limit.OUTPUT_REFUSAL.format(
-            place=self.program.repo / "target", reason=NOT_ASSIGNED))
+            place=self.program.repo / "target", reason=NOT_ASSIGNED, advice=hand_made_limit.TARGET_LINK_ADVICE))
         self.assertEqual(place.started, [])
 
-    def run_script(self, argv: tuple[str, ...], script: str) -> tuple[bytes, Refused | int]:
+    def run_script(self, argv: tuple[str, ...], script: str,
+                   place: FakePlace | None = None) -> tuple[bytes, Refused | int]:
         """Run the script as the start file of argv under the limit: the output, and the refusal or the status."""
         start = self.program.repo / "start"
         _ = start.write_text(f"#!/bin/sh\n{script}\n")
         start.chmod(0o755)
         output = io.BytesIO()
-        run = hand_made.NatedevRun(FakePlace(), Program(argv, self.program.repo, start, ()), self.root / "tmp")
+        run = hand_made.NatedevRun(place or FakePlace(), Program(argv, self.program.repo, start, ()),
+                                   self.root / "tmp")
         result: Refused | int
         try:
             result = run.run(hand_made.OutputCopy(output, None))
@@ -349,7 +365,189 @@ class NatedevRunTests(unittest.TestCase):
             result = refused
         return output.getvalue(), result
 
+    def assigned_cargo(self, unassigned: cargo_folder.UnassignedWorkspace | None = None, *,
+                       enforce: bool = True) -> Path:
+        """Make the checkout a cargo workspace whose build folder model gives a new build folder, or unassigned,
+        and enforce the model or only report; the build folder, which does not exist yet. The variables of an
+        outer step that did the folder steps go until the test ends."""
+        checkout = self.program.repo
+        _ = subprocess.run(["git", "-C", str(checkout), "init", "-q"], check=True, capture_output=True)
+        _ = (checkout / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+        root = self.root / "build"
+        output = root / "repo" / "unit" / "short"
+        for name in ("CARGO_FOLDER_CHECKED", "BUILDLOG_STEP_SCOPE"):
+            _ = os.environ.pop(name, None)
+        _ = self.enterContext(mock.patch.object(build_folders, "build_root", return_value=root))
+        _ = self.enterContext(mock.patch.object(worktrees, "enforce_build_folders", return_value=enforce))
+        _ = self.enterContext(mock.patch.object(cargo_folder, "assigned_output",
+                                                return_value=unassigned or cargo_folder.LinkedOutput(output)))
+        return output
+
+    def recorded_locks(self) -> list[tuple[int, int]]:
+        """Each lock descriptor that held_output gives the program, with the inode of its lock file."""
+        locks: list[tuple[int, int]] = []
+        original = hand_made_limit.held_output
+
+        def recorded(argv: Sequence[str], checkout: Path, environment: Mapping[str, str],
+                     held: ExitStack) -> tuple[int, ...]:
+            lock = original(argv, checkout, environment, held)
+            locks.extend((descriptor, os.fstat(descriptor).st_ino) for descriptor in lock)
+            return lock
+
+        _ = self.enterContext(mock.patch.object(hand_made_limit, "held_output", side_effect=recorded))
+        return locks
+
+    def lock_state(self, output: Path) -> str:
+        """held or free: the state of the build folder lock."""
+        return build_folder_lock.probe(output, self.root / "build", lambda: build_folder_lock.ProbeTiming(0, 0))
+
+    def shared_lock(self, output: Path) -> str:
+        """taken or busy: a second shared lock on the build folder lock file, as a parallel cargo step takes it."""
+        with open(output.with_name(output.name + ".lock"), "rb") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return "busy"
+        return "taken"
+
+    def probed_place(self, probe: Callable[[], str], states: list[str]) -> FakePlace:
+        """A place that adds the probe result to states as it starts the program."""
+        place = FakePlace()
+        start = place.popen
+
+        def probed(argv: Sequence[str], **arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
+            states.append(probe())
+            return start(argv, **arguments)
+
+        _ = self.enterContext(mock.patch.object(place, "popen", side_effect=probed))
+        return place
+
+    def test_a_cargo_run_with_no_target_link_gets_the_link_to_its_build_folder_before_the_start(self) -> None:
+        output = self.assigned_cargo()
+        target = self.program.repo / "target"
+        self.assertFalse(target.is_symlink())
+        written, result = self.run_script(("cargo", "build"), "readlink target; touch target/built")
+        self.assertEqual((written, result), (f"{output}\n".encode(), 0))
+        self.assertEqual(target.readlink(), output)
+        self.assertTrue((output / "built").exists())
+
+    def test_the_build_folder_lock_is_held_while_cargo_runs_and_free_after_it_ends_or_fails(self) -> None:
+        output = self.assigned_cargo()
+        for argv, expected in ((("cargo", "build"), 0), (("cargo", "test"), 1)):
+            with self.subTest(argv=argv):
+                states: list[str] = []
+                written, result = self.run_script(argv, 'test "$1" = build', self.probed_place(lambda: self.lock_state(output), states))
+                self.assertEqual(result, expected, written)
+                self.assertEqual(states, ["held"])
+                self.assertEqual(self.lock_state(output), "free")
+
+    def test_a_parallel_cargo_step_takes_a_shared_lock_after_the_run_makes_the_target_link(self) -> None:
+        output = self.assigned_cargo()
+        self.assertFalse((self.program.repo / "target").is_symlink())
+        states: list[str] = []
+        written, result = self.run_script(("cargo", "build"), "true",
+                                          self.probed_place(lambda: self.shared_lock(output), states))
+        self.assertEqual((result, states), (0, ["taken"]), written)
+
+    def test_a_stale_or_a_dangling_target_link_gets_the_repair_and_the_run_starts(self) -> None:
+        output = self.assigned_cargo()
+        target, old = self.program.repo / "target", output.with_name("old")
+        old.mkdir(parents=True)
+        for named in (old, output):
+            with self.subTest(named=named):
+                shutil.rmtree(output, ignore_errors=True)
+                target.unlink(missing_ok=True)
+                target.symlink_to(named)
+                program = Program(("cargo", "build"), self.program.repo, None, ())
+                self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(program), "")
+                self.assertEqual(target.readlink(), output)
+                written, result = self.run_script(("cargo", "build"), "readlink target; touch target/built")
+                self.assertEqual((written, result), (f"{output}\n".encode(), 0))
+                self.assertTrue((output / "built").exists())
+
+    def test_a_cargo_run_writes_the_use_stamp_of_its_build_folder(self) -> None:
+        output = self.assigned_cargo()
+        written, result = self.run_script(("cargo", "build"), "true")
+        self.assertEqual(result, 0, written)
+        self.assertEqual((output / build_folders.COPY_USE_STAMP).read_text(), f"{self.program.repo}\n")
+
+    def test_a_refusal_of_the_cargo_folder_check_starts_nothing_and_names_the_reason(self) -> None:
+        reason = f"{self.program.repo}: no build folder. Use worktrees.py make <repo> <unit> <short-name>"
+        _ = self.assigned_cargo(cargo_folder.UnassignedWorkspace(reason))
+        place = FakePlace()
+        written, result = self.run_script(("cargo", "build"), "touch ran", place)
+        self.assertIsInstance(result, Refused, written)
+        self.assertEqual(str(result), hand_made_limit.FOLDER_STEP_REFUSAL.format(reason=reason))
+        self.assertEqual(place.started, [])
+        self.assertFalse((self.program.repo / "ran").exists())
+
+    def test_the_program_holds_the_lock_descriptor_and_sees_the_lock_held_while_it_runs(self) -> None:
+        _ = self.assigned_cargo()
+        locks = self.recorded_locks()
+        written, result = self.run_script(("cargo", "build"), "grep -Hs FLOCK /proc/self/fdinfo/* || true")
+        self.assertEqual(result, 0, written)
+        [(descriptor, inode)] = locks
+        self.assertRegex(written.decode(), rf"/proc/self/fdinfo/{descriptor}:lock:.*FLOCK.*:{inode} ")
+
+    def test_the_build_folder_lock_is_free_after_a_refusal_that_comes_after_the_lock_is_taken(self) -> None:
+        output = self.assigned_cargo()
+        states: list[str] = []
+
+        def limit_refused(*_: object) -> str:
+            states.append(self.lock_state(output))
+            return "refused by the limit"
+
+        with self.subTest(refusal="limit"), mock.patch.object(hand_made_limit, "limit_refusal",
+                                                              side_effect=limit_refused):
+            _, result = self.run_script(("cargo", "build"), "true")
+            self.assertEqual((str(result), states), ("refused by the limit", ["held"]))
+            self.assertEqual(self.lock_state(output), "free")
+        with self.subTest(refusal="offline"):
+            states.clear()
+            _, result = self.run_script(("cargo", "build"), "echo '--offline was specified'; exit 101",
+                                        self.probed_place(lambda: self.lock_state(output), states))
+            self.assertEqual((str(result), states), (hand_made_limit.NO_NETWORK, ["held"]))
+            self.assertEqual(self.lock_state(output), "free")
+        with self.subTest(refusal="folder check"), mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "elsewhere"}):
+            (self.program.repo / "target").unlink()
+            _, result = self.run_script(("cargo", "build"), "touch ran")
+            self.assertIsInstance(result, Refused)
+            self.assertIn("Cargo must use", str(result))
+            self.assertEqual((self.program.repo / "target").readlink(), output)
+            self.assertFalse((self.program.repo / "ran").exists())
+            self.assertEqual(self.lock_state(output), "free")
+
+    def test_in_report_mode_an_unassigned_checkout_runs_with_a_note_and_no_lock(self) -> None:
+        reason = f"{self.program.repo}: no build folder. Use worktrees.py make <repo> <unit> <short-name>"
+        _ = self.assigned_cargo(cargo_folder.UnassignedWorkspace(reason), enforce=False)
+        locks = self.recorded_locks()
+        note = io.StringIO()
+        with contextlib.redirect_stderr(note):
+            written, result = self.run_script(("cargo", "build"), "touch ran; ! grep -qs FLOCK /proc/self/fdinfo/*")
+        self.assertEqual((result, note.getvalue(), locks), (0, f"cargo: {reason}\n", []), written)
+        self.assertTrue((self.program.repo / "ran").exists())
+
+    def test_a_cargo_run_does_the_folder_steps_only_when_the_wrapper_does(self) -> None:
+        clear = {"CARGO_FOLDER_CHECKED": "", "BUILDLOG_STEP_SCOPE": ""}
+        for argv, variables, due in (
+                (("cargo", "build"), clear, True), (("cargo", "+nightly", "--config", "x", "test"), clear, True),
+                (("cargo", "clippy", "--build-info"), clear, True), (("cargo", "test", "--", "--help"), clear, True),
+                (("cargo", "install", "x"), clear, False), (("cargo", "build", "--help"), clear, False),
+                (("cargo", "test", "-h"), clear, False), (("cargo", "check", "-V"), clear, False),
+                (("cargo", "nextest", "--version"), clear, False), (("cargo", "mend", "--build-info"), clear, False),
+                (("cargo", "metadata"), clear, False), (("cargo", "--color", "build", "tree"), clear, False),
+                (("cargo", "build"), {**clear, "CARGO_FOLDER_CHECKED": "1"}, False),
+                (("cargo", "build"), {**clear, "BUILDLOG_STEP_SCOPE": "/step.scope"}, False)):
+            with (self.subTest(argv=argv, variables=variables), mock.patch.dict(os.environ, variables),
+                  mock.patch.object(cargo_folder, "checked_step", return_value=cargo_folder.NoOutputLock()) as step,
+                  ExitStack() as held):
+                self.assertEqual(hand_made_limit.held_output(argv, self.program.repo, {"HOME": "/home"}, held), ())
+                self.assertEqual(step.called, due)
+                if due:
+                    step.assert_called_once_with(list(argv[1:]), self.program.repo, held, {"HOME": "/home"})
+
     def test_a_cargo_failure_with_an_offline_text_in_colour_is_the_no_network_refusal(self) -> None:
+        _ = self.assigned_cargo()
         output, result = self.run_script(("cargo", "build"), "printf '\\033[1m\\033[91merror\\033[0m: failed to "
                                          + "download\\n  but \\033[1m--offline\\033[0m was specified\\n'; exit 101")
         self.assertIsInstance(result, Refused)
@@ -420,17 +618,20 @@ class OutputFolderTests(unittest.TestCase):
         (root / "link").symlink_to(root / "elsewhere")
         self.assertEqual(hand_made_limit.output_refusal(("make",), root, {"HOME": str(home), "CARGO_TARGET_DIR": "link"}),
                          hand_made_limit.OUTPUT_REFUSAL.format(place=root / "link",
-                                                               reason="a part of its path is a symbolic link"))
+                                                               reason="a part of its path is a symbolic link",
+                                                               advice=hand_made_limit.NAMED_OUTPUT_ADVICE))
         self.assertEqual(hand_made_limit.output_refusal(("make",), root, {"HOME": str(home),
                                                                           "CARGO_TARGET_DIR": str(home.parent)}),
-                         hand_made_limit.OUTPUT_REFUSAL.format(place=home.parent, reason="it holds the home folder"))
+                         hand_made_limit.OUTPUT_REFUSAL.format(place=home.parent, reason="it holds the home folder",
+                                                               advice=hand_made_limit.NAMED_OUTPUT_ADVICE))
 
     def test_a_target_link_to_another_build_folder_or_to_the_home_folder_is_refused(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout, build = root / "checkout", root / "build" / "repo" / "unit"
         for folder in (checkout, build / "short", build / "other"):
             folder.mkdir(parents=True)
-        refused = hand_made_limit.OUTPUT_REFUSAL.format(place=checkout / "target", reason=NOT_ASSIGNED)
+        refused = hand_made_limit.OUTPUT_REFUSAL.format(place=checkout / "target", reason=NOT_ASSIGNED,
+                                                        advice=hand_made_limit.TARGET_LINK_ADVICE)
         assigned = cargo_folder.LinkedOutput(build / "short")
         for named in (build / "other", Path(os.environ["HOME"])):
             with self.subTest(named=named), mock.patch.object(cargo_folder, "assigned_output", return_value=assigned):
@@ -445,8 +646,9 @@ class OutputFolderTests(unittest.TestCase):
         hold.mkdir(parents=True)
         (hold / "cargo").touch(mode=0o755)
         checker = Path(hand_made_limit.__file__).resolve().parents[2]
+        # A fixture home outside the checker: a home in the checkout, as on the guest, makes the output refusal first.
         for checkout in (checker, checker / "scripts"):
-            with self.subTest(checkout=checkout):
+            with self.subTest(checkout=checkout), mock.patch.dict(os.environ, {"HOME": str(root / "home")}):
                 self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(Program(("true",), checkout, None, ())),
                                  hand_made_limit.TOOLS_REFUSAL.format(bind=checkout))
         refused = hand_made_limit.TOOLS_REFUSAL.format(bind=root)
@@ -473,7 +675,8 @@ class OutputFolderTests(unittest.TestCase):
 
     def test_natedev_takes_no_run_that_names_another_output_folder(self) -> None:
         program = Program(("cargo", "build", "--target-dir", "other"), Path("/fixture/checkout"), None, ())
-        with mock.patch.dict(os.environ, {}, clear=False):
+        # An outer step did the folder steps, so only the output words decide.
+        with mock.patch.dict(os.environ, {"CARGO_FOLDER_CHECKED": "1"}):
             _ = os.environ.pop("CARGO_TARGET_DIR", None)
             self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(program),
                              hand_made_limit.TARGET_REFUSAL.format(place="/fixture/checkout/target"))
