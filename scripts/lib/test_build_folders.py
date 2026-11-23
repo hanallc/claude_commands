@@ -870,7 +870,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.addCleanup(_release_folder, held)
         _ = (held / "output").write_text("held output")
         result = self.command("remove", str(held))
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((result.returncode, result.stderr), (1, f"build folders: {held}: the folder lock is held\n"))
         self.assertEqual((held / "output").read_text(), "held output")
         self.assertTrue(held.with_name(held.name + ".lease.json").is_file())
         self.assertTrue(held.with_name(held.name + ".lock").is_file())
@@ -888,6 +888,21 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertFalse(local.with_name(local.name + ".lock").exists())
         with self.assertRaises(StopIteration):
             _ = folders.build_folder_lock_fd(local)
+
+    def test_cli_call_releases_the_locks_it_took_and_keeps_the_callers(self) -> None:
+        kept = folders.create_build_folder(folders.UniqueBuildFolder("kept-cli-"))
+        self.addCleanup(_release_folder, kept)
+        locks = cast(dict[int, Path], getattr(folders, "_locks"))
+        before = dict(locks)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(folders.main(["unique", "--prefix", "main-cli-"]), 0)
+        created = Path(output.getvalue().strip())
+        self.assertTrue(created.is_dir())
+        self.assertEqual(locks, before)
+        self.assertEqual(folders.build_folder_state(created), "free")
+        self.assertEqual(folders.build_folder_state(kept), "held")
+        self.assertEqual(folders.main(["remove", str(created)]), 0)
+        self.assertFalse(created.exists())
 
     def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
@@ -1194,7 +1209,7 @@ def interrupt():
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
 flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
+unlink, remove_folder = os.unlink, f.remove_folder
 def lock_step(fd, mode):
     result = flock(fd, mode)
     if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
@@ -1236,7 +1251,7 @@ patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}

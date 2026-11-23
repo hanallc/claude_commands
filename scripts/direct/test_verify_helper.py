@@ -20,6 +20,7 @@ from scripts.lib import process_start
 
 
 DIRECT = Path(__file__).resolve().parent
+BUILD_FOLDERS = DIRECT.parent / "lib" / "build_folders.py"
 
 
 class VerifyHelperTests(unittest.TestCase):
@@ -66,9 +67,14 @@ if __name__ == "__main__":
             process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None) -> bytes:
+    def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None,
+               program: Path | None = None, temporary: Path | None = None) -> bytes:
         environment = {**verify_test_environment(), "VALUE": value}
-        fields = [str(self.program), str(directory or self.root), str(len(arguments)), *arguments,
+        if temporary is not None:
+            # A build_folders call reads its settings from an empty folder, not from the live home.
+            environment["TMPDIR"] = str(temporary)
+            environment["CONF_DIR"] = str(temporary)
+        fields = [str(program or self.program), str(directory or self.root), str(len(arguments)), *arguments,
                   *(f"{name}={value}" for name, value in environment.items()), "", text, ""]
         return b"\0".join(os.fsencode(value) for value in fields) + b"\0"
 
@@ -80,12 +86,22 @@ if __name__ == "__main__":
         return self.reply(process)
 
     def reply(self, process: subprocess.Popen[bytes]) -> tuple[int, dict[str, object], str]:
+        status, output, errors = self.text_reply(process)
+        if not output:
+            self.fail(errors)
+        return status, cast(dict[str, object], json.loads(output)), errors
+
+    def text_reply(self, process: subprocess.Popen[bytes]) -> tuple[int, str, str]:
         assert process.stdout is not None
-        replies = list(map(self.read_field, (cast(BinaryIO, process.stdout),) * 3))
-        if not replies[1]:
-            self.fail(replies[2])
-        decoded = cast(dict[str, object], json.loads(replies[1]))
-        return int(replies[0]), decoded, replies[2]
+        status, output, errors = map(self.read_field, (cast(BinaryIO, process.stdout),) * 3)
+        return int(status), output, errors
+
+    def build_folders_request(self, process: subprocess.Popen[bytes], temporary: Path,
+                              *arguments: str) -> tuple[int, str, str]:
+        assert process.stdin is not None
+        _ = process.stdin.write(self.encode("", "", *arguments, program=BUILD_FOLDERS, temporary=temporary))
+        process.stdin.flush()
+        return self.text_reply(process)
 
     def read_field(self, source: BinaryIO) -> str:
         value = bytearray()
@@ -145,6 +161,49 @@ def main():
                 status, output, errors = self.request(process, "second", "", "newer")
                 self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
 
+    def test_a_tool_folder_from_an_unloaded_tree_can_be_removed(self) -> None:
+        # verify.sh creates its tree-watch folder through the helper and removes it after the run.
+        # A changed source between the two calls drops the module that created the folder.
+        temporary = self.root / "tmp"
+        temporary.mkdir()
+        process = self.start_helper()
+        status, output, errors = self.build_folders_request(
+            process, temporary, "tool", "--tool", "verify-tree", "--owner-pid", str(os.getpid()))
+        self.assertEqual((status, errors), (0, ""))
+        folder = Path(output.strip())
+        self.assertTrue(folder.is_dir())
+        status, _, _ = self.request(process, "load", "", "pid")
+        self.assertEqual(status, 0)
+        replacement = self.program.with_suffix(".new")
+        _ = replacement.write_text(self.program.read_text() + "# changed\n")
+        os.replace(replacement, self.program)
+        status, output, errors = self.build_folders_request(process, temporary, "remove", str(folder))
+        self.assertEqual((status, output, errors), (0, "", ""))
+        for path in (folder, folder.with_name(folder.name + ".lock"), folder.with_name(folder.name + ".lease.json")):
+            with self.subTest(path=path.name):
+                self.assertFalse(path.exists())
+
+    def test_a_tree_update_rebinds_a_namespace_package_member(self) -> None:
+        # A namespace package has no source file, so it stays loaded across a tree update.
+        package = self.root / "fixturens"
+        package.mkdir()
+        _ = (package / "base.py").write_text("OLD = 'old'\n")
+        self.program = self.root / "namespace_program.py"
+        _ = self.program.write_text('''import json, os, sys
+from pathlib import Path
+def main():
+    from fixturens import base
+    if sys.argv[1:] == ["update"]:
+        package = Path(__file__).parent / "fixturens"
+        (package / "base.py.new").write_text("OLD = 'old'\\nNEW = 'new'\\n")
+        os.replace(package / "base.py.new", package / "base.py")
+    print(json.dumps(dict(value=getattr(base, "NEW", base.OLD))))
+    return 0
+''')
+        process = self.start_helper()
+        self.assertEqual(self.request(process, "first", "", "update"), (0, dict(value="old"), ""))
+        self.assertEqual(self.request(process, "second", "", "read"), (0, dict(value="new"), ""))
+
     def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
         process = self.start_helper()
         assert process.stdin is not None
@@ -155,6 +214,39 @@ def main():
                 status, output, _ = self.reply(process)
                 self.assertEqual(status, 0)
                 self.assertEqual((output["value"], output["stdin"], output["args"]), (value, text, [text]))
+
+    def test_an_exit_at_import_returns_the_fallback_and_keeps_the_helper_ready(self) -> None:
+        exiting = self.root / "exit_at_import.py"
+        imports = self.root / "imports"
+        _ = exiting.write_text(f"with open({str(imports)!r}, 'a') as imports:\n    imports.write('import\\n')\n"
+                               + "raise SystemExit(3)\ndef main():\n    return 0\n")
+        process = self.start_helper()
+        assert process.stdin is not None and process.stdout is not None
+        for attempt in ("first", "second"):
+            with self.subTest(attempt=attempt):
+                _ = process.stdin.write(self.encode("exit", "", program=exiting))
+                process.stdin.flush()
+                self.assertEqual(self.read_field(cast(BinaryIO, process.stdout)), "fallback")
+                _ = [self.read_field(cast(BinaryIO, process.stdout)) for _ in range(2)]
+        # The second call uses the recorded fallback and does not import the module again.
+        self.assertEqual(imports.read_text(), "import\n")
+        status, output, _ = self.request(process, "after", "")
+        self.assertEqual((status, output["value"]), (0, "after"))
+
+    def test_each_call_starts_with_the_default_context_value(self) -> None:
+        self.program = self.root / "context_program.py"
+        _ = self.program.write_text('''import json
+from contextvars import ContextVar
+calls: ContextVar[int] = ContextVar("calls", default=0)
+def main():
+    print(json.dumps(dict(calls=calls.get())))
+    calls.set(calls.get() + 1)
+    return 0
+''')
+        process = self.start_helper()
+        for value in ("first", "second"):
+            with self.subTest(value=value):
+                self.assertEqual(self.request(process, value, ""), (0, dict(calls=0), ""))
 
     def test_nonzero_exit_keeps_its_status_and_output(self) -> None:
         process = self.start_helper()

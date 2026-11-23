@@ -23,13 +23,14 @@ under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are ap
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone.
-Style-sync lint uses `copies.standing` in a repository slot under the machine's configured slot root.
-The `roots.slots` settings in `build_folders.conf` select that root.
+Style-sync lint uses `copies.standing`, which takes a numbered copy under `roots.build`.
+The `roots.slots` settings in `build_folders.conf` select the slot root for slot trust.
+natedev sets no slot root, so no folder there gets slot trust. The Mac sets one.
 Slot trust requires a registered worktree and an `.envrc` that matches `HEAD`.
 Forged links still require explicit approval.
 
-Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev,
-`/tmp/claude/copies` on the Mac) at `<pair>/<copy>` also qualify.
+Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev
+and on the Mac) at `<pair>/<copy>` also qualify.
 Task clones from `copies.py clone` qualify with the same proof. A clone is its task folder, `<scratch root>/<task>`.
 The `.envrc` must be a regular file at the checkout root.
 `copy_record.record_path` finds a standing copy's record inside the copy.
@@ -37,12 +38,18 @@ For a task clone, it finds the parent's record and requires `test_hana_clone: tr
 `copies.py clone` records the checkout HEAD as `source_commit` after its Git reset.
 `registered_copy` requires a readable `copy_record.Registered` record.
 Its `source_path` must resolve to a directory under a trusted root.
+A `copies.py run` snapshot qualifies with the same proof, at any location. Its checkout is `<tool folder>/source`.
+`copy_record.snapshot_source` reads the `snapshot-origin.json` binding beside the checkout.
+The folder that holds the binding must belong to the user, and no group or other user can write in it.
+The binding must name that checkout and a full commit id.
+Its `repository` and `source_commit` take the place of the record fields.
+A snapshot whose `.envrc` differs from `source_commit`, from a worktree edit or a merge, requires explicit approval.
 Git resolves `.envrc` at `source_commit` and hashes the copy's file with `hash-object --no-filters`.
 Approval requires equal blob hashes.
 Both Git commands run in the trusted source repository without `GIT_*` environment variables.
 The copy supplies no Git configuration or filters.
 Missing, malformed, unreadable or mismatching evidence requires explicit approval.
-Older clones without `source_commit` and folders outside the configured copy locations do not qualify.
+Older clones without `source_commit` do not qualify. Copies and clones outside the configured copy locations do not qualify.
 `scripts/lib/copy_record.py` uses only the standard library.
 Importing it does not reach scratch or herdr.
 The helper imports it only when it checks a copy.

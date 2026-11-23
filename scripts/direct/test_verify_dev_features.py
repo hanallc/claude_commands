@@ -14,14 +14,14 @@ class VerifyDevFeatureTests(DevFeatureFixture):
         add_dev_features(self.root)
         result = self.verify("check", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.calls_made(), [f"check --workspace --lib --bins --features {DEV_ARGUMENTS}"])
+        self.assertEqual(self.calls_made(), [f"check --workspace --all-targets --features {DEV_ARGUMENTS}"])
 
     def test_work_order_features_join_repo_features_once_after_qualification(self) -> None:
         add_dev_features(self.root, '["bevy/dynamic_linking", "sample/extra", "sample/extra"]')
         result = self.verify("check", "sample", "--features", "extra,bevy/dynamic_linking")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.calls_made(), [
-            "check --workspace --lib --bins --features sample/extra,bevy/dynamic_linking",
+            "check --workspace --all-targets --features sample/extra,bevy/dynamic_linking",
         ])
 
     def test_malformed_repo_features_refuse_before_any_cargo_call(self) -> None:

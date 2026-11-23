@@ -65,12 +65,15 @@ from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
+from scripts.whoami import token_expiry
 
 API_URL = "https://api.pushover.net/1/messages.json"
 CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
+TOKEN_ALERT_IDS = token_expiry.ALERT_IDS | {token_expiry.LEGACY_MAC_EXPIRY_ID}
+TOKEN_APPROVAL_REQUIRED = "Token alert template needs current approval"
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
@@ -148,10 +151,12 @@ def fields(keys: Keys, title: str, message: str, priority: str, key: str = "") -
     body = {
         "token": keys["token"],
         "user": keys["user"],
-        "title": title[:TITLE_MAX],
         "message": message[:MESSAGE_MAX],
         "priority": priority,
     }
+    if title:
+        # With no title, Pushover shows the app name.
+        body["title"] = title[:TITLE_MAX]
     if priority == "2":
         body |= {"retry": str(RETRY_S), "expire": str(EXPIRE_S)}
         if key:
@@ -316,6 +321,7 @@ def parse(argv: list[str]) -> Arguments | None:
         push_key = "question:" + reference["path"]
     session: NotificationSession = NO_SESSION_LINE
     header = True
+    one_line = False
     need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
@@ -331,16 +337,18 @@ def parse(argv: list[str]) -> Arguments | None:
             return None
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
-        positionals = [rendered.title, rendered.body]
+        one_line = rendered.one_line
+        positionals = [rendered.posted_title, rendered.posted_body]
         session = rendered.session
-        header = rendered.header
+        header = rendered.header and not one_line
     elif values:
         return None
     try:
         priority = decision_priority.priority(need, due)
     except ValueError:
         return None
-    if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
+    if (len(positionals) != 2 or (not one_line and not positionals[0].strip())
+            or (not text_id and not positionals[1].strip())):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
@@ -436,6 +444,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     approved = push_texts.approval_date(arguments["text_id"]) if registered_text else ""
     if arguments["text_id"] == "quota.claude_expiry" and not approved:
         return refuse(source, priority, title, message, "Claude expiry template needs current approval")
+    if arguments["text_id"] in TOKEN_ALERT_IDS and not approved:
+        return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
     if user_asked:
         detail = "user asked"
         outcome: review.ReviewOutcome = review.Unreviewed(detail)
@@ -576,7 +586,7 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail = push["detail"]
-    if push["text_id"] == "quota.claude_expiry":
+    if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
         if silence.active():
             return refuse(source, priority, title, message, "silence is active")
     elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
@@ -592,6 +602,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
     reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
+        reason = TOKEN_APPROVAL_REQUIRED
     if reference["kind"] == "question":
         try:
             opening = push_reference.read_question(Path(reference["path"]))
@@ -622,6 +634,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
 def post_message(source: str, priority: str, title: str, message: str,
                  keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
     """Every push to the phone goes out here, with its sender and template on one last line."""
+    if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+        return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
     suffix = f", {detail}" if detail else ""
     sender = sender_name(source)
     if not sender:
@@ -631,8 +645,9 @@ def post_message(source: str, priority: str, title: str, message: str,
     message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
     keys = read_keys(keys_file)
     if keys is None:
-        log(source, priority, title, message, "keys missing" + suffix)
-        print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
+        outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}. Set PUSHOVER_USER and PUSHOVER_TOKEN in {keys_file}.", file=sys.stderr)
         return 2
     data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
     try:

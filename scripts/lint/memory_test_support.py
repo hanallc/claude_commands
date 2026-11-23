@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -36,6 +37,11 @@ def _template(name: str) -> Path:
     if name == ADMISSION_CONFIG_FIXTURE.name:
         return ADMISSION_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
+
+
+# Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
+UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
+UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
@@ -144,6 +150,11 @@ def config_environment(root: Path) -> dict[str, str]:
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
+
+
 def gate_isolation_environment(root: Path) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     return {
@@ -154,6 +165,9 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+        # The fixture names its own owner and drops the caller's, so a test never reads the owner around it.
+        "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "BUILDLOG_OWNER_STAFF_ID": "",
+        "CLAUDE_SESSION_NAME": FIXTURE_OWNER,
     }
 
 

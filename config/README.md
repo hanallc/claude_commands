@@ -554,6 +554,16 @@ The configured platform selects the mirror layout and slot protocol.
 Each SSH target names its platform and settings file.
 Natedev reads the SSH host from each active target's settings file before each record exchange.
 
+`unreachable_wait_seconds` is one value for every machine that the queue sends a run to.
+A run on a machine that does not answer for this many seconds ends as failed with the reason `unreachable`.
+The `mac-linux` route, the AWS route and the offload route read it. Every SSH build target on the offload route sets the SSH
+keepalive count from it: a routed command ends as lost after this many seconds with no answer.
+The allowed whole numbers are 1 through 86400.
+On AWS the wait starts when the box launches, so it includes EC2 start and boot.
+A value below the boot time ends every AWS box before its first log.
+An AWS run assigned by the queue then fails. An AWS run with no assignment runs again on natedev.
+A paired AWS trial pauses its log while it measures, so the AWS route does not apply the wait to it.
+
 `sync.hosts.<target>` lists host directory names for synchronized records.
 This mapping supplies all allowed host names, including recorder health aliases.
 The Mac mapping includes its explicit legacy host aliases, including `macbook`.
@@ -850,6 +860,7 @@ The command edits no tracked file.
 ### Cloud gate regions
 
 `cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`enabled=off` also refuses the pinned `hana-gpu` route and stops the hourly placement-score reads.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.

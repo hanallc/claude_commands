@@ -471,7 +471,8 @@ class AffectedModulesTests(unittest.TestCase):
                       mock.patch.object(cloud_gate, "working_tree", return_value=("tree", {"docs/guide.md"})),
                       mock.patch.object(cloud_gate, "route", return_value=cloud_result) as route,
                       redirect_stdout(io.StringIO())):
-                    self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED), cloud_result)
+                    self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED,
+                                                          target=gate.NO_GATE_ASSIGNMENT), cloud_result)
                 selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
                 self.assertEqual(set(selection.paths), expected)
 

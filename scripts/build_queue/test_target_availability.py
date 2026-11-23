@@ -21,6 +21,7 @@ from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.lib import process_start as process_identity
 from scripts.message import unit_labels
 from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 MAC = SshTarget("mac", "macos", Path("/fixture/mac.conf"))
 NATEDEV = LocalTarget("natedev", "linux")
@@ -119,7 +120,7 @@ class MacRouteTests(unittest.TestCase):
         _ = (root / "build_targets.conf").write_text(
             "targets=mac,natedev\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n",
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE,
             encoding="utf-8",
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root)})))

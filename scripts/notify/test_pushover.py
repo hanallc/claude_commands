@@ -551,9 +551,11 @@ class PushoverTests(unittest.TestCase):
 
     def test_missing_keys_send_nothing(self) -> None:
         _ = self.keys.write_text("PUSHOVER_USER=u123\nPUSHOVER_TOKEN=\n")
-        code, form = self.run_send(["--no-action", "t", "m"])
+        with redirect_stderr(io.StringIO()) as errors:
+            code, form = self.run_send(["--no-action", "t", "m"])
         self.assertEqual((code, form), (2, {}))
-        self.assert_log("0", "t", footed("No action needed.\nm"), "keys missing")
+        self.assertIn("pushover: refused before sending: keys missing", errors.getvalue())
+        self.assert_log("0", "t", footed("No action needed.\nm"), "refused before sending: keys missing")
 
     def test_bad_usage_sends_nothing(self) -> None:
         for argv in (["--priority", "3", "t", "m"], ["only title"], ["t", " "]):
@@ -925,6 +927,20 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(self.reviews()[0]["detail"], detail)
         self.assertEqual(self.log_lines()[-1]["outcome"], "sent, " + detail)
         self.assertNotIn("failed review", output.getvalue())
+
+    def test_one_line_text_posts_no_title_and_only_its_line(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "codex1 has {left} left; units work alone next",
+                                    push_texts.NoActionNeeded(), "", (push_texts.PushExample("typical", {"left": "1%"}),),
+                                    purpose="Test.", one_line=True)
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO())):
+            code, form = self.run_send(["--text-id", "test", "--value", "left=1%"])
+        self.assertEqual(code, 0)
+        self.assertEqual(cast(review.Draft, read.call_args.args[0]).title, "")
+        self.assertNotIn("title", form)
+        self.assertEqual(form["message"], [footed("codex1 has 1% left; units work alone next", "script", "test")])
+        self.assertEqual(self.log_lines()[-1]["title"], "")
 
     def test_unapproved_registered_text_is_still_reviewed(self) -> None:
         entry = push_texts.PushText("test", "script", "decision", "Choose retry", push_texts.ActionTemplate("Choose retry."),
