@@ -67,7 +67,7 @@ def direct_launcher_helpers() -> Generator[None]:
 
     def fixture_command(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
         if len(command) < 2 or Path(command[1]).name not in {
-                "progress_history.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
+                "progress_history.py", "pass_record.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
             return real_run(command, **options)
         script = command[1]
         module = ModuleType("launcher_helper")
@@ -285,7 +285,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                 "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
                 "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
                 "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3", "# whole: 1..", "STALLED_ROUNDS=3",
+                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3",
+                "# whole: 2..", "STALLED_ROUNDS=3",
                 "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
                 "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
@@ -349,13 +350,14 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         child_source = "\n".join((
             "assign.SCRIPTS = assign_claude.SCRIPTS = Path(__file__).resolve().parent",
             "assign.PYTHON = assign_claude.PYTHON = str(assign.SCRIPTS.parent / 'lib/py')",
+            "assign.PASS_RECORD = str(assign.SCRIPTS / 'pass_record.py')",
             "args = assign.parse_arguments()",
             "env = dict(os.environ)",
             "cwd, prompt = Path(args.cwd).resolve(), Path(args.prompt).resolve()",
             "run, phase = assign.prepare_run(args, cwd, prompt, env)",
             "role = 'impl' if args.role == 'implement' else args.role",
             "model = assign.resolve_model(args, role, env)",
-            "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
+            "check = assign.call([assign.PYTHON, assign.PASS_RECORD, 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
             "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
             "slot = args.to or args.new_worker or role",
             "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
@@ -556,7 +558,7 @@ printf '%s\\n' '{answer}'
         """Record the status each copied helper sees before it updates its ledger."""
         direct_dir = self.root / "scripts" / "direct"
         for name, commands in (
-            ("progress_history.py", ("finish-pass",)),
+            ("pass_record.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),
         ):
             script = direct_dir / name

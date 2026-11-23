@@ -33,20 +33,26 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
+    if name == ADMISSION_CONFIG_FIXTURE.name:
+        return ADMISSION_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
-# Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+# Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
+UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
+UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    """Merge the template, existing settings, and explicit overrides in that order.
+
+    Keep each setting's explicit limit.
+    """
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (TEST_CONFIG_DEFAULTS.get(source.name, ""), existing, overrides):
+    for layer in (existing, overrides):
         previous = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -139,11 +145,13 @@ def config_environment(root: Path) -> dict[str, str]:
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if name in TEST_CONFIG_DEFAULTS:
-                _ = write_config_fixture(destination)
-            else:
-                _ = destination.write_bytes(_template(name).read_bytes())
+            _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
+
+
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

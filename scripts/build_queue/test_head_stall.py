@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
-from scripts.buildlog import cli, mac_idle, sample
+from scripts.buildlog import cli, mac_idle, machine_facts, sample
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
 
 GIB = records.GIB
@@ -186,7 +186,7 @@ class FindStallTests(unittest.TestCase):
                 self.assertEqual(head_stall.find_stall(queue, admitted, NOW, LIMIT), head_stall.NoStall())
 
     def test_a_recent_zero_need_start_does_not_hide_the_stall(self) -> None:
-        gate = replace(holder(NOW - 60), step="merge-gate", promise=0)
+        gate = replace(holder(NOW - 60), step="gate", promise=0)
         stall = head_stall.find_stall(snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), gate)), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual([row.step for row in stall.holders], ["check"])
@@ -398,6 +398,7 @@ class WatchTests(unittest.TestCase):
         with (mock.patch.object(sample, "sample", return_value=sample.SampleTaken(NOW, "natedev")),
               mock.patch.object(mac_idle, "watch_once"),
               mock.patch.object(mac_idle, "watch_paths"),
+              mock.patch.object(machine_facts, "sample_once"),
               mock.patch.object(head_stall, "default_paths", return_value=self.paths),
               mock.patch.object(head_stall, "write_text_atomic", side_effect=fail_write),
               redirect_stderr(diagnostics)):

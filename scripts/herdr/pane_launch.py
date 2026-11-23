@@ -1045,11 +1045,18 @@ CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--setting
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
-def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
+LaunchArguments = list[str] | tuple[str, ...]
+
+
+def parse_claude_arguments(arguments: LaunchArguments) -> ClaudeArguments:
+    return parse_claude_flags(arguments[1:])
+
+
+def parse_claude_flags(arguments: Sequence[str]) -> ClaudeArguments:
     values: dict[str, str] = {}
     prompt = False
     plugin_directories: list[str] = []
-    index = 1
+    index = 0
     while index < len(arguments):
         argument = arguments[index]
         index += 1
@@ -1071,7 +1078,7 @@ def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
-           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> CurrentLaunch:
+           arguments: LaunchArguments, *, kind: Literal["claude", "codex"] = "claude") -> CurrentLaunch:
     config_dir = (environment.get("CODEX_HOME") or str(Path.home() / ".codex") if kind == "codex"
                   else environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
     parsed = parse_claude_arguments(arguments)

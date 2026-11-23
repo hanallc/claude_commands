@@ -1,6 +1,7 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,71 @@ from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    def test_dispatch_and_poll_report_the_run_or_error(self) -> None:
+        self.seed()
+        _ = self.git("switch", "-c", "ci-delay")
+        _ = self.git("push", "origin", "ci-delay")
+        published = self.git("rev-parse", "HEAD").stdout.strip()
+        repo = "github.com/example/example"
+        self.environment.update(CI_PUSH_ORIGIN=str(self.remote), CI_PUSH_REPO=repo, CANCEL_PRIOR="false")
+        calls = self.root / "gh-calls"
+        lookup_error = self.root / "lookup-error"
+        listings = self.root / "poll-runs.json"
+        _ = self.stub("gh", f'''import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path({str(calls)!r}).open("a") as log:
+    log.write(json.dumps(args[:2]) + "\\n")
+if args[:2] == ["workflow", "run"]:
+    print("Dispatch was refused", file=sys.stderr)
+    raise SystemExit(9)
+if args[:2] != ["run", "list"]:
+    raise SystemExit("Unexpected gh command")
+if Path({str(lookup_error)!r}).exists():
+    print("Could not list runs", file=sys.stderr)
+    raise SystemExit(8)
+print(Path({str(listings)!r}).read_text())
+''')
+        _ = self.stub("sleep", 'raise SystemExit("No eligible run in the first poll")\n')
+        created_at = "2026-10-30T00:01:00Z"
+        at_bound = (123, "queued", "")
+        queued = (124, "queued", "")
+        failed = (125, "completed", "failure")
+        dispatch_args = ("--dispatch-published", published, "ci.yml")
+        follow_args = ("--follow-published", published, "pushed", "ci.yml", "workflow_dispatch")
+        poll_args = (*follow_args, f"dispatched 123 {created_at}")
+        list_call = '["run", "list"]'
+
+        for outcome, args, runs, exit_code, message, gh_calls in (
+            ("lookup error", dispatch_args, (), 8, "Could not list runs", [list_call]),
+            ("poll error", (*follow_args, "dispatched 0"), (), 8, "Could not list runs", [list_call]),
+            ("refused", dispatch_args, (), 9, "Dispatch was refused", [list_call, '["workflow", "run"]']),
+            ("queued and failed", poll_args, (at_bound, queued, failed), 0, "run_id:  124", [list_call]),
+            ("failed before first poll", poll_args, (at_bound, failed), 1,
+             f"CI run 125 completed with failure (https://{repo}/actions/runs/125)", [list_call]),
+            ("moved", dispatch_args, (), 1, f"origin/ci-delay moved before dispatch of {published}", [list_call]),
+        ):
+            with self.subTest(outcome=outcome):
+                if outcome in ("lookup error", "poll error"):
+                    lookup_error.touch()
+                else:
+                    lookup_error.unlink(missing_ok=True)
+                if outcome == "moved":
+                    _ = self.git("commit", "--allow-empty", "-m", "Advance the published branch")
+                    _ = self.git("push", "origin", "ci-delay")
+                _ = calls.write_text("")
+                _ = self.write(listings, json.dumps([
+                    {"databaseId": run_id, "status": status, "conclusion": conclusion,
+                     "createdAt": created_at, "headSha": published}
+                    for run_id, status, conclusion in runs
+                ]))
+
+                result = self.script("validate_and_push/push_direct.sh", *args)
+
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr if exit_code else result.stdout)
+                self.assertEqual(calls.read_text().splitlines(), gh_calls)
+
     def install_gh(self) -> None:
         _ = self.stub("gh", '''import subprocess, sys
 args = sys.argv[1:]

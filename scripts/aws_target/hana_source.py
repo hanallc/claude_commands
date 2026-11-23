@@ -1,23 +1,20 @@
-"""Verify exact Git source and hold its shared guest slot."""
+"""Verify exact Git source and hold its numbered guest copy."""
 from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+from functools import partial
 import hashlib
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 
 from scripts.aws_target import hana_protocol
+from scripts.aws_target.hana_protocol import MissingBasis as MissingBasis
 from scripts.lib import build_folders, build_slots, conf
-
-# Match the control protocol without importing controller or AWS modules.
-SOURCE_ROOT = Path('/var/lib/hana')
-
 
 def read_limits(configuration: conf.ConfigRead) -> hana_protocol.SourceLimits:
     return hana_protocol.SourceLimits(configuration.whole('source_git_timeout_s'),
@@ -25,30 +22,25 @@ def read_limits(configuration: conf.ConfigRead) -> hana_protocol.SourceLimits:
 
 
 @dataclass(frozen=True)
-class MissingBasis:
-    repository: str
-    commits: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class LeasedSource:
-    slot: build_slots.Slot
+    copy: build_slots.LeasedCopy
     identity: hana_protocol.SourceIdentity
 
     @property
     def path(self) -> Path:
-        return self.slot.path
+        return self.copy.path
 
     @property
     def descriptors(self) -> tuple[int, ...]:
-        """Retain the mirror and slot leases in every command child."""
-        return build_folders.held_build_folder_descriptors()
+        """Retain the copy lease in every command child."""
+        return self.copy.pass_fds
 
 
-def git(repository: Path, limits: hana_protocol.SourceLimits, *arguments: str, accepted: tuple[int, ...] = (0,)) -> str:
+def git(repository: Path, limits: hana_protocol.SourceLimits, *arguments: str, accepted: tuple[int, ...] = (0,),
+        descriptors: tuple[int, ...] = ()) -> str:
     command = ['git', '-C', str(repository), *arguments]
     result = subprocess.run(command, capture_output=True, text=True, timeout=limits.git_timeout_s,
-                            pass_fds=build_folders.held_build_folder_descriptors())
+                            pass_fds=(*build_folders.held_build_folder_descriptors(), *descriptors))
     if result.returncode not in accepted:
         error = subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
         raise hana_protocol.SourceRefused(f'GitSourceRefused: {error}') from error
@@ -102,62 +94,56 @@ def bundle_prerequisites(bundle: Path) -> tuple[str, ...]:
                 prerequisites.append(commit)
 
 
-def admit_slot_keys(repository: str) -> None:
-    """Require the user's explicit guest pool activation and capacity values."""
-    machine = socket.gethostname().split('.')[0]
-    configuration = conf.read_or_repository('build_folders')
-    if not configuration.values().get(f'roots.slots.{machine}'):
-        raise build_slots.SlotsNotConfigured(machine)
-    _ = configuration.whole(f'slots.{machine}.{repository}.max')
-    _ = configuration.whole(f'slots.{machine}.{repository}.max_bytes')
-
-
 @contextmanager
 def materialize(manifest: hana_protocol.SourceManifest, limits: hana_protocol.SourceLimits,
-                verified_bundle: VerifiedGitBundle, *, showrunner: str, unit: str, work: str,
-                root: Path = SOURCE_ROOT,
-                selection: build_slots.SlotSelection = build_slots.LOWEST_FREE_SLOT) -> Generator[LeasedSource | MissingBasis]:
-    """Verify a bundle and retain the slot lease through the caller's command."""
+                verified_bundle: VerifiedGitBundle, *, number: int, work: str) -> Generator[LeasedSource | MissingBasis]:
+    """Fetch a verified bundle and retain the assigned copy through the command."""
     hana_protocol.validate_manifest(manifest, limits)
-    repository_name = manifest.repository.rsplit('-', 1)[0]
-    admit_slot_keys(repository_name)
-    mirrors = root / 'mirrors' / manifest.repository
-    mirrors.mkdir(parents=True, exist_ok=True)
-    spec = build_folders.BuildFolderSpec(kind='mirror', parent=root / 'mirrors', suffix_length=0,
-                                         repository=manifest.repository, owner='hana', slot=0)
-    with build_folders.leased_build_folder(spec) as mirror, (mirrors / 'source.lock').open('a') as lock:
+    repository = hana_protocol.REPOSITORY
+    if manifest.repository.rsplit('-', 1)[0] != repository:
+        raise hana_protocol.SourceRefused('The manifest does not name the Hana repository')
+    configuration = conf.read_or_repository('build_folders')
+    capacity = configuration.whole('slots.aws-hana.hana.max')
+    size_limit = configuration.whole('slots.aws-hana.hana.max_bytes')
+    if type(number) is not int or not 1 <= number <= capacity:
+        raise ValueError('The assigned slot exceeds the configured capacity')
+    main = hana_protocol.main_checkout(Path.home())
+    metadata = main / '.git'
+    if main.is_symlink() or metadata.is_symlink():
+        raise hana_protocol.SourceRefused('The Hana main checkout must use local Git metadata')
+    metadata.mkdir(parents=True, exist_ok=True)
+    with (metadata / 'hana-source.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not (mirror / '.git/HEAD').exists():
-            _ = git(mirror, limits, 'init', '--bare', '--quiet',
-                    '--object-format=' + ('sha256' if len(manifest.commit) == 64 else 'sha1'), '.git')
-        # Keep bare state on the mirror while linked slots inherit normal worktree state.
-        _ = git(mirror, limits, 'config', 'extensions.worktreeConfig', 'true')
-        _ = git(mirror, limits, 'config', '--local', 'core.bare', 'false')
-        _ = git(mirror, limits, 'config', '--worktree', 'core.bare', 'true')
-        _ = git(mirror, limits, 'config', '--worktree', 'core.worktree', str(mirror))
-        _ = git(mirror, limits, 'config', 'remote.origin.url', repository_name)
-        with build_folders.tool_folder('hana-bundle') as temporary:
+        source_git = partial(git, main, limits, descriptors=(lock.fileno(),))
+        if not (metadata / 'HEAD').exists():
+            _ = source_git('init', '--quiet',
+                           '--object-format=' + ('sha256' if len(manifest.commit) == 64 else 'sha1'))
+        if not source_git('config', '--local', '--get', 'remote.origin.url', accepted=(0, 1)):
+            _ = source_git('config', '--local', 'remote.origin.url', repository)
+        if build_folders.repo_word(main) != repository:
+            raise hana_protocol.SourceRefused('The Hana main checkout has a different repository name')
+        with build_folders.tool_folder('hana-bundle', parent=metadata) as temporary:
             bundle = temporary / 'source.bundle'
             verified_bundle.copy_to(bundle)
             prerequisites = tuple(dict.fromkeys((*manifest.basis_commits, *bundle_prerequisites(bundle))))
             missing = tuple(commit for commit in prerequisites
-                            if not git(mirror, limits, 'rev-parse', '--verify', '--quiet', commit + '^{commit}', accepted=(0, 1)))
+                            if not source_git('rev-parse', '--verify', '--quiet', commit + '^{commit}', accepted=(0, 1)))
             if missing:
                 yield MissingBasis(manifest.repository, missing)
                 return
-            _ = git(mirror, limits, 'bundle', 'verify', str(bundle))
-            heads = git(mirror, limits, 'bundle', 'list-heads', str(bundle)).splitlines()
+            _ = source_git('bundle', 'verify', str(bundle))
+            heads = source_git('bundle', 'list-heads', str(bundle)).splitlines()
             if heads != [manifest.commit + ' refs/heads/hana-source']:
                 raise hana_protocol.SourceRefused('BundleCommitMismatch: bundle head differs from the manifest')
-            _ = git(mirror, limits, '-c', 'fetch.fsckObjects=true', 'fetch', '--quiet', '--no-tags', str(bundle),
-                    '+refs/heads/hana-source:refs/heads/hana-source')
-            actual = git(mirror, limits, 'rev-parse', 'refs/heads/hana-source^{commit}')
+            _ = source_git('-c', 'fetch.fsckObjects=true', 'fetch', '--quiet', '--no-tags', str(bundle),
+                           '+refs/heads/hana-source:refs/hana/source')
+            actual = source_git('rev-parse', 'refs/hana/source^{commit}')
             if actual != manifest.commit:
                 raise hana_protocol.SourceRefused('SourceCommitMismatch: fetched commit differs from the manifest')
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        with build_slots.take_slot(mirror, manifest.commit, showrunner=showrunner, unit=unit, work=work,
-                                  purpose='hana-source', wait_policy=build_slots.SlotWaitPolicy.REFUSE,
-                                  selection=selection) as slot:
-            if toolchain_identity(slot.path) != manifest.toolchain:
-                raise hana_protocol.SourceRefused('ToolchainMismatch: slot toolchain differs from the manifest')
-            yield LeasedSource(slot, hana_protocol.SourceIdentity(manifest.repository, manifest.commit, manifest.toolchain))
+        _ = source_git('checkout', '--quiet', '--detach', manifest.commit)
+    with build_slots.take_copy(main, manifest.commit, showrunner='hana', unit=hana_protocol.COPY_UNIT, work=work,
+                               purpose='hana-source', selection=build_slots.ExactSlotRequest(number)) as copy:
+        if toolchain_identity(copy.path) != manifest.toolchain:
+            raise hana_protocol.SourceRefused('ToolchainMismatch: copy toolchain differs from the manifest')
+        build_slots.limit_copy_size(copy, size_limit)
+        yield LeasedSource(copy, hana_protocol.SourceIdentity(manifest.repository, manifest.commit, manifest.toolchain))

@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_lint_diagnostics_test_support import (
@@ -37,7 +38,7 @@ class FirstJudgmentRepairTests(unittest.TestCase):
             script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILLED=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
             return subprocess.run(
                 ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), str(killed)],
-                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                env=verify_test_environment(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )
 
     def test_nonlint_status_never_permits_repair(self) -> None:
@@ -126,7 +127,8 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         functions = shell_functions(
             VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
             "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
-            "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
+            "remove_tool_folder", "remove_tree_watch", "start_tree_watch", "finish_tree_watch",
+            "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         functions += shell_functions(SCRIPTS / "lint/invoke.sh", "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend")

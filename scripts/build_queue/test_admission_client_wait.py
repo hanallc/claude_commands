@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+from selectors import DefaultSelector, SelectorKey
 import subprocess
 import sys
 import time
@@ -21,6 +22,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import queue_place as shell_place
 from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 
 class CheckerCall(TypedDict):
@@ -36,6 +38,15 @@ def wait_client_main() -> int:
     actions = os.environ["TEST_CHECKER_ACTIONS"].split(",")
     clock = FakeClock()
     clock.epoch = time.time()
+
+    class CheckerSelector(DefaultSelector):
+        @override
+        def select(self, timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
+            ready = super().select(timeout)
+            if not ready and timeout is not None and timeout > 0:
+                clock.advance(timeout)
+            return ready
+
     def estimate(argv: list[str], cwd: str, profile: admission_records.InferFromArgv | admission_records.StepProfile | admission_records.ProgramProfile,
                  now: datetime | Callable[[], datetime], root: Path, policy: admission_records.AdmissionPolicy, *,
                  first_peak_bytes: int,
@@ -58,7 +69,9 @@ def wait_client_main() -> int:
             cast(admission_records.NeedSource, "future-source") if action == "unknown" else "measured", 5)
         return step_estimator.StepEstimate(admission_records.StepProfile("fixture", "nextest", "tree", peak,
             estimated_at=clock.now()), step_estimator.ReusableEstimate())
-    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
+    with (mock.patch.object(client, "CLOCK", clock),
+          mock.patch.object(client, "DefaultSelector", CheckerSelector),
+          mock.patch.object(step_estimator, "step_estimate", side_effect=estimate)):
         with mock.patch.object(sys, "argv", ["queue_place.py", *sys.argv[2:]]):
             return shell_place.main()
 
@@ -79,7 +92,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
-        self.environment = {**os.environ,
+        self.environment = {**memory_gate_shell_environment(),
             "TEST_WAIT_ROOT": str(self.root), "BUILDLOG_MEM_CHECK_RETRY_S": "2",
             "BUILDLOG_MEM_WAIT_SINCE": str(int(time.time()) - 1200),
             "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "",
@@ -101,7 +114,9 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
                     for record in self.admission.server.reservations.values()))
             if isinstance(reply, wire.Wait):
-                return replace(reply, reason=admission_records.EstimateExpired(self.admission.clock.now()))
+                waiting, = self.admission.server.waiters.values()
+                assert "estimated_at" in waiting.row
+                return replace(reply, reason=admission_records.EstimateExpired(waiting.row["estimated_at"]))
             return reply
         self.admission.server.reply_filter = reply_filter
         _ = self.enterContext(self.admission.serving())

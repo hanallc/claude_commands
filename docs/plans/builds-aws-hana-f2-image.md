@@ -28,10 +28,13 @@ The receiver invokes `hana_guest.admit_command` before it starts the unit.
 The unit runs `/var/lib/hana-runtime/runner.py` as `hana-runner` inside `hana-work.slice`.
 The unit acquires the assigned slot after systemd starts the unit.
 The unit retains maker descriptors through source preparation, shell preparation, Cargo, and result capture.
-`ExitType=cgroup` keeps the unit active while command descendants remain.
+`ExitType=main` sets the unit lifetime to the payload process.
+When the runner observes Cargo exit, it measures and reads the bytes pending on each pipe.
+It closes both pipes and returns the Cargo status.
+When the payload exits, `KillMode=control-group` lets systemd stop the remaining descendants.
 The watchdog can kill these processes during source or shell preparation.
 `RuntimeMaxSec` bounds the whole unit, including source and shell preparation.
-The guest also bounds command output reads and the final process wait with a monotonic deadline.
+The runner uses a monotonic deadline to bound the wait for Cargo exit.
 The deadline ends the command cgroup even when the controller continues permit renewal.
 The receiver reports a terminal loss after the cgroup and exact slot lease end.
 

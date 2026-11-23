@@ -23,13 +23,14 @@ under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are ap
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone.
-Style-sync lint uses `copies.standing` in a repository slot under the machine's configured slot root.
-The `roots.slots` settings in `build_folders.conf` select that root.
+Style-sync lint uses `copies.standing`, which takes a numbered copy under `roots.build`.
+The `roots.slots` settings in `build_folders.conf` select the slot root for slot trust.
+natedev sets no slot root, so no folder there gets slot trust. The Mac sets one.
 Slot trust requires a registered worktree and an `.envrc` that matches `HEAD`.
 Forged links still require explicit approval.
 
-Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev,
-`/tmp/claude/copies` on the Mac) at `<pair>/<copy>` also qualify.
+Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev
+and on the Mac) at `<pair>/<copy>` also qualify.
 Task clones from `copies.py clone` qualify with the same proof. A clone is its task folder, `<scratch root>/<task>`.
 The `.envrc` must be a regular file at the checkout root.
 `copy_record.record_path` finds a standing copy's record inside the copy.
@@ -82,7 +83,6 @@ resolver before calling `exec`.
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
 | `agents/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
 | `agents/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
-| `agents/pane_restore.py` | Staff rows use `restart.start_row`. Saved panes without staff rows use `launch_agent`. Both routes preserve live conversations and retained accounts. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `direct/claude_worker.py` | Calls `nix_env.ensure` once in the assign process. The settings and the Claude start use the same loaded environment. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |

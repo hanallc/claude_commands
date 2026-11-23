@@ -167,29 +167,32 @@ class ConfigRead:
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-                 recover_invalid: bool = True
+                 recover_invalid: bool = True, use_file_limits: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
-        def read_key(settings: dict[str, Setting]) -> Result:
+        def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
             try:
                 setting = _setting(settings, key)
             except _MissingKey:
                 if isinstance(default, UseConfiguredValue):
                     raise
-                return default
+                return default, None
             bad = setting.value
+            if not use_file_limits:
+                return convert(setting.value), setting.value
             if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
-                return convert("")
-            return _converted(setting, convert)
+                return convert(""), setting.value
+            return _converted(setting, convert), setting.value
 
         repository_allowed = False
         try:
             if isinstance(self.settings, _UnreadableFile):
                 repository_allowed = self.settings.missing
                 raise ValueError(self.settings.reason)
-            return UsableLiveValue(read_key(self.settings))
+            value, _ = read_key(self.settings)
+            return UsableLiveValue(value)
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
             repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
@@ -199,23 +202,40 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    return RecoveredValue(read_key(_parse(repository.read_text(encoding="utf-8"))), reason)
+                    value, _ = read_key(_parse(repository.read_text(encoding="utf-8")))
+                    return RecoveredValue(value, reason)
                 except (OSError, UnicodeError, ValueError, ArithmeticError):
                     pass
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
+        current_limit = ""
+        if use_file_limits and isinstance(self.settings, dict):
+            current = self.settings.get(self.effective_key(key))
+            if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
+                current_limit = current.limit
+        fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
             try:
-                value = read_key(_parse(committed))
+                value, raw_value = read_key(_parse(committed))
+            except (ValueError, ArithmeticError):
+                continue
+            if not current_limit:
+                return RecoveredValue(value, reason)
+            if fallback is None:
+                fallback = RecoveredValue(value, reason)
+            if raw_value is None:
+                continue
+            try:
+                _limits(current_limit, raw_value)
             except (ValueError, ArithmeticError):
                 continue
             return RecoveredValue(value, reason)
-        return UnavailableValue(reason)
+        return fallback if fallback is not None else UnavailableValue(reason)
 
-    def origin(self, key: str, convert: Callable[[str], Result]
+    def origin(self, key: str, convert: Callable[[str], Result], *, use_file_limits: bool = True
                ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-        """Distinguish live values from recovered values without a warning."""
-        return self._resolve(key, convert, warn=False)
+        """Read a live or recovered value. The converter can supply all validation."""
+        return self._resolve(key, convert, warn=False, use_file_limits=use_file_limits)
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
@@ -267,7 +287,7 @@ class ConfigRead:
                 result[key] = setting.value
                 continue
             try:
-                _limits(setting)
+                _limits(setting.limit, setting.value)
                 result[key] = setting.value
             except ValueError:
                 result[key] = self.text(key)
@@ -392,13 +412,12 @@ def _setting(settings: dict[str, Setting], key: str) -> Setting:
         raise _MissingKey("key is missing") from None
 
 
-def _limits(setting: Setting) -> None:
-    if not setting.value.strip():
+def _limits(limit: str, value: str) -> None:
+    if not value.strip():
         raise ValueError("value is empty")
-    limit = setting.limit
     if limit.startswith("# one of:"):
         choices = tuple(word.strip() for word in limit.removeprefix("# one of:").split(","))
-        if setting.value not in choices:
+        if value not in choices:
             raise ValueError(f"expected one of {', '.join(choices)}")
     elif limit.startswith(("# whole:", "# range:")):
         form = "# whole:" if limit.startswith("# whole:") else "# range:"
@@ -406,9 +425,9 @@ def _limits(setting: Setting) -> None:
         if len(bounds) != 2:
             raise ValueError(f"invalid limit {limit}")
         convert = _whole if form == "# whole:" else decimal
-        value = convert(setting.value)
+        number = convert(value)
         low, high = (bound.strip() for bound in bounds)
-        if (low and value < convert(low)) or (high and value > convert(high)):
+        if (low and number < convert(low)) or (high and number > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
 
 
@@ -481,7 +500,7 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
     if convert is _number and not setting.limit.startswith("# range:"):
         raise ValueError("expected a # range: limit")
     result = convert(setting.value)
-    _limits(setting)
+    _limits(setting.limit, setting.value)
     return result
 
 
@@ -561,7 +580,7 @@ def check(file: str | Path, key: str, value: str) -> None:
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
-        _limits(Setting(value, setting.limit, setting.line))
+        _limits(setting.limit, value)
     except (OSError, UnicodeError, ValueError) as error:
         raise Unusable(f"{source}: {key}={value!r}: {error}") from error
 

@@ -19,7 +19,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger
@@ -28,7 +28,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import eligibility, mac_test, offload, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
@@ -37,10 +37,10 @@ VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
 
 class FailedProbeTests(OffloadCommandFixture):
     linux_settings: Path = Path()
-    identity: eligibility.KnownRepository = eligibility.KnownRepository("hana")
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
@@ -49,10 +49,18 @@ class FailedProbeTests(OffloadCommandFixture):
             + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n"
+            + UNREACHABLE_WAIT_FIXTURE)
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+
+    @property
+    def identity(self) -> eligibility.KnownRepository:
+        identity = eligibility.repository_identity(self.repository)
+        if not isinstance(identity, eligibility.KnownRepository):
+            self.fail(f"The fixture repository has no identity: {self.repository}")
+        return identity
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
@@ -284,7 +292,10 @@ class FailedProbeTests(OffloadCommandFixture):
             + 'source = Path(sys.argv[1])\n'
             + 'destination = Path.home() / shlex.split(sys.argv[2].split(":", 1)[1])[0]\n'
             + 'destination.mkdir(parents=True, exist_ok=True)\n'
-            + 'subprocess.run(["cp", "-a", str(source) + "/.", str(destination)], check=True)\n'
+            # The real copy excludes /.git, and the fixture's Git objects are read-only.
+            + 'for entry in source.iterdir():\n'
+            + '    if entry.name != ".git":\n'
+            + '        subprocess.run(["cp", "-a", str(entry), str(destination)], check=True)\n'
             + 'copies.mark_mirror(destination, "verify", "hana", "fixture")\n')
         source = source.replace('    exit "$rsync_status"',
             '    if [[ " $* " != *" --files-from="* ]]; then\n'
@@ -639,7 +650,7 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         state = self.root / "mac-state"
         state.mkdir()
         _ = (state / "failed_probe").write_text("failed\n")
@@ -687,7 +698,8 @@ class StepRecoveryTests(VerifyLintScopeFixture):
             + "parity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+            + UNREACHABLE_WAIT_FIXTURE)
         state = Path(self.environment["HOME"]) / ".local/state/build-targets/linux"
         state.mkdir(parents=True)
         book = ledger.CostLedger(state)
@@ -741,7 +753,7 @@ raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
         admission = caller_admission(self, self.root, self.environment)
         admission.server.host_probe = admission.server.read_provider_evidence
         result = self.verify("lint", "sample")

@@ -5,19 +5,18 @@ from decimal import Decimal
 
 from scripts.aws_target import ledger_test_support, run_cost
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class GateRunPricingTests(ledger_test_support.CostFixture):
     def test_ranked_cost_includes_transfer_and_wait(self) -> None:
         config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config,
+        ledger_test_support.override_fixture_settings(config,
             'remote_region_transfer_usd=0.01\n'
             + 'region_transfer_usd={"us-west-2":0.03}\n'
             + 'gate_wait_usd_per_minute=0.06\n'
             + 'region_extra_gate_seconds={"us-west-2":60}\n'
             + 'unmeasured_region_extra_seconds={"us-east-2":120}\n')
-        size, home, west, mode = 'c7a.4xlarge', 'us-east-2', 'us-west-2', 'merge-gate'
+        size, home, west, mode = 'c7a.4xlarge', 'us-east-2', 'us-west-2', 'gate'
         seconds = [Decimal(600)]
         evidence = run_cost.RunEvidence({(size, west, mode): seconds}, {(size, mode): seconds}, {mode: seconds},
                                         {(size, west, mode): 2}, {(size, west, mode): 1}, Decimal(30))

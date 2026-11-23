@@ -14,7 +14,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable
-from contextlib import AbstractContextManager, chdir, redirect_stderr
+from contextlib import AbstractContextManager, chdir, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -24,7 +24,9 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
-from scripts.agents import shutdown, stop_resume, restart_support
+from scripts.accounts import role_map
+from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_support
+from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
@@ -1031,7 +1033,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
-        from scripts.production import merge_gate
+        from scripts.production import gate
 
         inherited_state = self.root / "inherited-state"
         inherited_staff = inherited_state / "staff"
@@ -1048,7 +1050,7 @@ class StaffTests(StaffCommandTestCase):
         before = folder_bytes(inherited_staff), folder_bytes(inherited_launches)
         module_root = self.root / "gate-module"
         module_root.mkdir()
-        environment = merge_gate.test_module_environment(module_root, {
+        environment = gate.test_module_environment(module_root, {
             **os.environ,
             "STAFF_FILE": str(inherited_staff / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(inherited_launches),
@@ -1209,6 +1211,18 @@ class StaffTests(StaffCommandTestCase):
         for flag, value in (("--expected-state", "present"), ("--expected-machine", "natedev"),
                             ("--expected-path", str(initial.path))):
             self.assertEqual(command[command.index(flag) + 1], value)
+
+    def test_remote_worktree_probe_reports_locks_on_the_staff_owner(self) -> None:
+        self.staff_file.parent.mkdir(parents=True, exist_ok=True)
+        locks = (self.staff_file.with_suffix(".json.lock"), self.staff_file.with_name("operation.lock"))
+        with self.machine("mac"):
+            self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
+            self.assertTrue(all(not lock.exists() for lock in locks))
+            for path in locks:
+                with self.subTest(path=path), path.open("wb") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteLockHeld(path))
+            self.assertEqual(staff.worktree_write_lock_status(), staff.StaffWorktreeWriteAvailable())
 
     def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
         parent = fixture_member("showrunner", name="sdlc")
@@ -2463,6 +2477,48 @@ class StaffTests(StaffCommandTestCase):
         self.assertIsNotNone(staff.snapshot().by_path("sdlc/panes"))
         with self.assertRaises(FrozenInstanceError):
             setattr(record, "rows", ())
+
+        roles = role_map.RoleMap({"units": "claude2"}, "codex1")
+        owner_roles = role_map.RoleMap({"units": "claude3"}, "codex2")
+        authority = staff.PeerStatusAuthority(record, roles)
+        anomalous_roles = json.dumps({
+            "groups": {"units": {"label": "claude2", "move_id": [], "cause": "by hand", "window": "weekly"}},
+            "workers": "codex1",
+        })
+        with self.machine("mac"):
+            for case, payload, expected_name, supplied_roles in (
+                ("valid", authority.encode(), "models", True),
+                ("empty", "", "panes", False),
+                ("invalid map", json.dumps({"staff": record.encode(), "role_map": "[]"}), "panes", False),
+                ("map anomaly", json.dumps({"staff": record.encode(), "role_map": anomalous_roles}), "panes", False),
+                ("closed stdin", None, "panes", False),
+            ):
+                with self.subTest(case=case):
+                    _ = self.ssh_log.write_text("")
+                    role_reads: list[tuple[str, ...]] = []
+
+                    def read_owner_roles(arguments: tuple[str, ...]) -> str:
+                        role_reads.append(arguments)
+                        return role_map.encode_role_map(owner_roles)
+
+                    def observed_inventory(login: str) -> Inventory:
+                        self.assertEqual(role_map.read_role_map(), roles if supplied_roles else owner_roles)
+                        supplied = staff.snapshot()
+                        self.assertTrue(supplied.production)
+                        self.assertEqual(supplied.by_path(f"sdlc/{expected_name}/impl1"), worker)
+                        return {"machine": "mac", "login": login, "label": "claude2",
+                                "sessions": [], "unattributed": []}
+
+                    stdin = io.StringIO(payload) if payload is not None else None
+                    with (mock.patch.dict(os.environ, {remote.STATUS_STAFF_STDIN: "1"}),
+                          mock.patch.object(sys, "stdin", stdin),
+                          mock.patch.object(role_map, "is_role_map_host", return_value=False),
+                          mock.patch.object(role_map, "ssh_role_map", read_owner_roles),
+                          mock.patch.object(status_entry, "inventory", side_effect=observed_inventory),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(shutdown.main(["status", "owner@example.com", "--here", "--json"]), 0)
+                    self.assertEqual(self.ssh_commands(), [] if supplied_roles else [["show", "--snapshot", "--json"]])
+                    self.assertEqual(role_reads, [] if supplied_roles else [("role-map-read",)])
 
     def test_local_snapshot_reads_retained_membership_without_contacting_the_owner(self) -> None:
         _, unit, _ = self.tree()

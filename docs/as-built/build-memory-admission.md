@@ -91,6 +91,20 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Build filesystem space
+
+The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
+The service measures available space at the build root (`build_folders.conf` `roots.build`, `/build` on natedev) once per pass.
+If space is below the floor or the reading fails, new local steps wait in order.
+Running steps continue.
+Eligible remote steps can start on a remote target.
+The Builds page and the queue head alert show the measured GiB and the floor or the read error.
+Older clients read the disk wait as a wait behind the build space floor.
+Waiters can refresh expired estimates during the hold.
+The next pass can start local steps when a successful reading reaches the floor.
+A missing floor leaves the space check disabled.
+If a reading fails, the service logs the error.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.
@@ -130,7 +144,7 @@ Local placements release their reader subscriptions when their reservations end.
 `AdmitRequest.place` defaults to `LocalPlace()`.
 This tree supplies the queue API and the cloud progress file.
 The aws route integration belongs to a separate tree.
-That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+That route calls this API with `CloudPlace("aws")` for a `gate` or `test-affected` step.
 The route process owns the reservation.
 The service releases the cloud slot when that process ends.
 An explicit release also ends the reservation.
@@ -360,6 +374,7 @@ The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
 Durable waiter records retain only the step arrival time.
+An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
@@ -391,7 +406,7 @@ The first two minutes use the same calculation. A run never counts its use twice
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
-Waiting runs follow priority, first run arrival, and PID order.
+Waiting steps follow priority, first run arrival, step arrival, and PID order.
 A younger run starts only when its need fits after the first run's need remains protected.
 The first run can start despite insufficient room when no admitted run or held slot remains.
 Readable host memory, clear readable pressure, and a current estimate remain necessary.
@@ -429,8 +444,20 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
 The Builds page shows the saved Mac idle alert first, in red.
-The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
+The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
+The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
+`limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
+Examples: natedev `load 52.7/32 · battery 100% charged · not in use`, Mac `link 3 ms · load 19.6/12 · battery 85% · in use`, AWS `no box running`.
+natedev has no link part. A machine without a battery has no battery part.
+On mains a battery is `not in use`, and a full one shows `battery 100% charged · not in use`. Without mains it shows `battery 54% · in use`.
+A failed TCP connect shows `link unreachable`. A failed SSH command after a good connect shows `link 3 ms · load unreadable`.
+A UPS that `upsc` cannot read shows `battery unreadable`. A Mac without an `InternalBattery` line in `pmset`, or a machine with no UPS tool, shows no battery part.
+A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.
+A probe that cannot start shows `facts unreadable`.
+A missing or invalid file reads as `machine_facts.FactsUnread.VALUE` and shows `facts not sampled`.
+Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
 `can run on` is one line that names the targets that can take the step now.
@@ -510,7 +537,28 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The provider keeps its existing repository scopes and cleanup policy.
+The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
+The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
+Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
+The Mac resolves the repository before it takes the claim lock.
+The key follows local clone origins to the upstream repository. Git alternates supply objects only.
+The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
+The Mac runner uses the shared origin to find the mirror and set the claim key.
+Each new work claim saves its claim key, history key, claim file, mirror name, and start fence directory.
+The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
+The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
+A handoff can adopt an exact cleanup claim after the checkout is gone.
+A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
+A claim without a proven mirror or history key authorizes cleanup only.
+The runner takes the execution lease before it replaces an incomplete local reservation.
+The claim child publishes the replacement and removes the old reservation under one provider lock.
+The runner keeps the execution lease through the run.
+Cleanup uses the saved mirror lease when the claim identifies the mirror. Otherwise, it takes the host lease and counts processes in all mirrors.
+The idle watcher reads an expired remote claim again under its cleanup lease before release.
+If a cleanup lease cannot open or its mirror root is invalid, the watcher skips that claim for the current pass.
+Shell and Python runners take a shared host lease before they take a mirror lease.
+The host-wide count sends no process signals. Unrelated mirror work can keep the claim pending.
+The Mac build log and the queue use the same Git root key for history when a repository has no origin.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
@@ -544,7 +592,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
+The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -618,7 +666,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+The merge gate reads `program_first_peak_gib.gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -630,7 +678,7 @@ The gate reports its first need as a fallback and explains any matching anonymou
 The queue model reads the step names once from `config/build_steps.conf`.
 Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
-The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
+The Builds page uses the configured step name, including `test affected` for `test-affected`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -935,12 +983,49 @@ BRP launches use `launch`; launch permission creates no reservation.
 
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
+The client checks the staff name, the exported name, and the session folder name in that order.
+A caller with no session and no staff reference gets its exported name from `family_owner_name(pid, proc_root)`.
+That function reads the process and its parents in `/proc` once.
+The read stops at the first `claude` or `codex` process, so a session launcher never names the work.
+A read error stops the read, and the next rule applies.
+The script of a process is its first argument that is not an option and ends in `.py`, `.sh`, `.zsh` or `.bash`.
+The read skips the value of `-X`, `-W`, `-o`, `+o`, `-O` and `+O`.
+A relative script path starts at the `/proc/<pid>/cwd` folder of that process.
+The function uses the first rule that matches:
+1. No process can be read, for example on macOS, which has no `/proc`. The name stays `terminal · <folder>`.
+2. A family process runs a script under the showrunner state root, in `<root>/<id>/...`.
+   The name is `<staff name> · <script file>`, for example `cargo-liner · install_rest.sh`.
+   When no staff member has that id, the name uses the first 8 characters of the id.
+   `scripts/lib/showrunner_state.py` `state_root()` gives the root for this rule, `record_store` and `showrunners`.
+3. A family process has a tty, and the read did not stop at an agent: the user's terminal.
+   The client then uses `terminal · <folder>` for a direct command with a known folder.
+4. The process runs in a unit that `systemd-run` made (`run-*.service`).
+   The name is `systemd · <outermost script file>`, else `systemd · <folder of the process cwd>`.
+5. The process runs in another systemd `.service` unit: `systemd · <unit>`.
+6. Other callers: `script · <outermost script file>`, else `script · <command of the process>`.
+The service uses the same function for a scope with no recorded caller.
+It reads the family of the oldest scope process.
+The Builds page and the queue evidence lines never make a `terminal ·` name from a folder alone.
+When the stored name is empty, they show the staff name or `unregistered session`.
+On Linux, a caller with no tty gets a `terminal ·` name only when its family cannot be read, for example when its process ended during the read.
+The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
+The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
+It returns `unregistered session` when no candidate is usable.
+A later read can replace this fallback with a usable name.
+The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
+A staff unit uses its own name for priority. A worker uses its parent unit.
+A showrunner keeps its caller name and has an empty unit.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
 A first checker failure or explicit refusal stops at once. A launch deadline applies during transport and checker retries.
 A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
 `detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
+It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
+The scope name omits the worker suffix from the run ID.
+The Builds page reads the kind from the scope name.
+For a `detect` scope or an unmarked scope, the page estimates memory use from live Python test processes and their descendants.
 Orphan reaping uses the same runs-folder lock as start, including the `reap` verb and launcher reaping.
 The reaper cannot finish a record while start publishes its supervisor PID.
 Only running records with their matching supervisor hold a place.
@@ -999,6 +1084,9 @@ A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+The service logs the changed source paths before `execv`.
+The replacement sends `READY=1`, then hashes the Python sources under `scripts` and logs the hash.
+The hash includes sources that load only after startup.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
@@ -1249,13 +1337,25 @@ It captures outermost gates that work, CI `Runner.Worker` processes, and builds 
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
 `remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
-A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+A drain does not keep a routed gate. A later natedev step of that call waits for the release, unless its run took natedev.
 An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
-A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
+The drain also keeps each run that natedev took, also between its steps (`hold_enforcer.taken_runs`).
+A kept run is its run controller process. A later step under that process is kept.
+A taken run is one of these:
+- the owner of a verify run slot, which holds natedev from the first local grant to the end of the outer verify call;
+- the run of a live local reservation;
+- the owner of a live local reservation with no run.
+The drain keeps the run and the outermost working process of its step, so a step stays kept when its run controller exits.
+A run that only waits has no slot and no reservation, so the drain does not keep it.
+A gate that only waits, under no taken run, is not kept. It waits for the release like new work, and the drain does not wait for it.
+Work under no taken run is kept by its own identity.
 Unreadable claims or admission state keep every outermost gate.
+With unreadable admission state, the drain reads each run from `BUILDLOG_RUN` (`pid:start`) of the working process or an ancestor, and keeps it when that run is a live ancestor.
+The unit in `max_runs.exempt_unit` gets no verify run slot, so the drain keeps its run only while a step has a local reservation.
+Between its steps the drain does not keep it. A slot for exempt runs is a queue change.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
-A second scan adds only identities whose start ticks do not exceed that bound.
+A second scan adds only identities that started before that bound.
 The command merges those identities under the release lock before starting the enforcer.
 If release removes the holder file during discovery, the command ends without restoring the file.
 Each keep entry has a PID and a start time.
@@ -1271,13 +1371,46 @@ Status derives `draining (N runs left)` or `held` from matching live keep entrie
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
-Legacy CI cargo requests use the same hold and lineage check before memory admission.
-CI requests outside the keep list remain queued until release.
-A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
-Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+On natedev, each admission pass applies the same hold and lineage check to every local step waiter (`AdmitRequest`), CI requests included.
+App launches (`LaunchRequest`) are not held; the enforcer does not stop them either.
+The check uses the waiter's process lineage and the session that owns its run, so the holder's own steps and kept runs still start.
+The client sends that owning session (`owning_session()`) in `AdmitRequest.session`; a worker in the holder's run is not held.
+A request from an older client has `SessionNotSent` and falls back to the session in its queue row.
+The service finds the own hold key once for each session in a pass.
+An unreadable staff record gives no own hold key for that pass, so the step waits.
+A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
+A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
+A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.
+View and explain replies between passes show the holds of the last pass.
+Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
+Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.
+Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.conf`.
+An absent key sets no repository run limit.
+A value of zero holds new runs on that machine.
+`max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
+`max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
+Verify asks for placement first and takes no slot before it.
+A Verify run takes its natedev repository slot with its first local memory grant, in the same admission decision.
+The slot belongs to the outer Verify process.
+If the caller returns all local grants before any step starts, the service releases the slot.
+After a local step starts, the run keeps its natedev slot until the outer Verify process exits.
+The run keeps the slot between steps and during later Mac or AWS steps.
+Later local steps of the run reuse the slot.
+A child Verify uses a live ancestor Verify's slot for the same repository.
+The service verifies each process in that chain by PID, start time, and parent PID.
+A run that never receives a local grant takes no natedev slot.
+The exempt unit takes no natedev slot.
+A run that waits only for its repository limit holds back no step of another repository.
+The service saves slots with their local grant and restores the owner watches after restart.
+Local `gate` and `test-affected` runs count while they hold a reservation.
+`max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
+The admission service uses the Git repository name when a gate profile supplies an absolute path.
+The unit in `max_runs.exempt_unit` can start above the limit. Its gate reservations count toward the limit.
+The Builds page shows the count, limit, repository, and machine for a run-limit wait, and each machine the run can use.
+The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
@@ -1420,7 +1553,7 @@ Those workers may build.
 
 | Command | Behavior |
 | --- | --- |
-| `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Each stopped session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
+| `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Registers each stopped session for release. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
 | `drain [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Requires the same future ETA as clear. Keeps existing work and holds new work until explicit release. |
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
@@ -1465,19 +1598,29 @@ These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
-After the file is gone, `notify_release` sends one notice to each recorded recipient.
+After the file is gone, `notify_release` checks each recorded recipient before it sends.
 The notice says to start builds and BRP launches now; the memory gate orders them.
 No answer is needed.
 Claude session keys use `socket_for`, which returns `RecipientLive | RecipientGone | RecipientLookupFailed`.
-Lookup exit 1 means gone; other lookup failures retry three times with one second between tries.
-`codex:` keys bypass socket lookup and use `session_send.send_argv` with `send.py --to codex:<thread> --text <notice>`.
+Lookup exit 1 means the session is gone. Other lookup failures retry up to three times, one second apart.
+Release reads one staff snapshot per cycle with notices to send.
+Release sends Codex notices through `send.py --skip-closed --to codex:<thread> --text <notice>`.
+The sender checks both machines for a route when it has no usable local route.
+With `--skip-closed`, a complete search with no match returns `ABSENT` with exit 8.
+An unknown Codex thread identity prevents the sender from confirming absence.
+After automatic forwarding, the sender accepts a peer's `ABSENT` result only if its local search also proved absence.
+When the roster shows only closed or stopped worker panes, send returns `CLOSED` with exit 7.
+Release records `WorkerClosed`. The next assignment resumes the worker.
+Release records a confirmed missing session as `RecipientGone`.
+If the staff row is also absent, release removes the recipient from the cycle's recipient list.
+Release recovery uses each session's first saved outcome to decide whether to restore a removed recipient.
 Both routes use the same notice text.
-The sender handles a closed worker pane through its holder.
-Send exit 0 gives `Delivered`; exit 1 gives `QueuedUnconfirmed`; other exits give `DeliveryFailed`.
+Send exit 0 gives `Delivered`. Exit 1 gives `QueuedUnconfirmed`. Other failures give `DeliveryFailed`.
 A failed Codex send prints the sender's error detail on stderr.
 The cycle saves the outcome after the sender returns.
 A stopped send stays pending and can repeat the notice on retry.
-`Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries.
+`Not reached, tell them yourself: <session name> (<reason>)` names failed and unconfirmed deliveries.
+It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
 
@@ -1612,8 +1755,7 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 The folder stays with its hold marked ended.
 
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
-The scratch root is `build_folders.conf` `roots.scratch`: `/build/claude/scratch` on natedev and `/tmp/claude/scratch` on the Mac.
-On natedev, cargo builds a scratch workspace in `/build/cargo/scratch/<folder>`.
+The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
@@ -2008,7 +2150,7 @@ Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
-The first eligible run follows queue priority, first run arrival, and PID.
+The first eligible step follows queue priority, first run arrival, step arrival, and PID.
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
@@ -2027,7 +2169,21 @@ CI and ownerless scopes do not count as admitted runs for this exception.
 Each new start sets the next start time through `start_spacing_after`.
 The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
 A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
-A continuation within the slot bypasses order, spacing, and pressure.
+The slot keeps the caller name from the reservation, including when a continuation claims the slot.
+The snapshot decoder restores a missing caller name from the matching reservation.
+If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
+If the decoder finds no usable name, it supplies the label `unregistered session`.
+The feed uses separate rules for caller names, step labels, and CI labels.
+The client and service use the same formatter for wait names.
+The formatter selects the unit, caller, or folder name in that order.
+It adds the step when the step name is usable.
+The client also accepts the head name from older replies.
+The service and feed require a usable value for every field in a CI label template.
+An incomplete CI template uses the generic CI label.
+The feed omits unusable parts from step titles.
+The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
+The Builds page uses the names and hover titles from the feed.
+A continuation within the slot bypasses spacing and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
 Repeated release cannot recreate a slot. A standalone request has no reusable slot.
@@ -2119,7 +2275,7 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 ### Progress memory profiles
 
 Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
-Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Without history, they use `program_first_peak_gib.gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
@@ -2294,3 +2450,59 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+### Move a waiting step
+
+A drag acts like a bump: main's claim rules run on the shared order.
+
+Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
+To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
+Press Escape to cancel.
+The numbers show queue positions.
+The policy still checks eligibility before each start.
+Cloud waits have their own order.
+
+The admission service gives each wait an ID when it enters the queue.
+The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
+A refresh keeps the ID.
+The service saves pins in `state.json` when a move completes.
+A pin records the wait ID and an anchor.
+The anchor identifies the row directly ahead or the head of the queue.
+The service applies the usual priority and arrival rules to all saved waits.
+It then places each pinned wait directly after its anchor.
+A move gives the moved row a new anchor and keeps its former successor in place.
+Absent and unnamed waits stay in the full order.
+The page omits waits with no name source.
+Placement, memory admission, and continuation claims use the eligible rows in this order.
+The head-stall snapshot uses the order of local waits.
+The grant pass shows a newly granted row in Waiting without a move handle.
+The first pass that counts its reservation shows the row in Running and includes the memory charge.
+When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
+A confirmed move or Undo changes queue order only.
+A drag can return a waiting row's unstarted slot claim, as a bump does.
+A departing row loses its pin.
+A row anchored to the departing row inherits its anchor or its predecessor in the full order.
+A local reservation keeps its saved place until the service sees processes in its scope.
+The first reading clears the saved place for a direct reservation without a scope file.
+A placement retry before launch keeps its place.
+Both hosts use the visible order for normal steps.
+When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
+The table includes remote-only waits in queue order.
+The table identifies waits that a build hold blocks.
+Speculative Mac copy rows show the newest-first rule.
+A speculative Mac copy waits for placement outside the table while its parent holds local memory.
+A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
+
+The service checks the order revision for all rows, including rows without handles.
+The replay ledger records the reply and the anchor from before the move.
+Undo restores the step to that anchor in the full order.
+The anchor is the head or the row that directly preceded the step.
+If that row left the full order, the service refuses Undo.
+Undo saves pins as a new move.
+A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
+A move sends the drop target.
+A drop above the first shown row uses the head anchor, ahead of unnamed and absent waits.
+Other drops use their neighbor in the full order.
+An Undo request identifies the move to restore. The service reads the saved anchor from the replay ledger.
+The page applies the confirmed order to the rows it shows.
+The confirmation uses the table numbers, including the places of waits without handles.

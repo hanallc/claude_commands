@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.aws_target import hana_placement_adapter as hana
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
+from scripts.direct.verify_dev_features_test_support import add_dev_features
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.mac_test import claim_state, mac_test
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 class VerifySshRoutingTests(VerifySshTargetsFixture):
@@ -248,8 +251,9 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         from scripts.buildlog import record, store
 
         self.configure("natedev,linux")
-        with mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
-                                         "BUILDLOG_PINNED_TARGET": "linux"}), \
+        with self.admission.loop_turn(), \
+             mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_TARGET": "linux",
+                                         "BUILDLOG_PINNED_TARGET": "linux"}, clear=True), \
              mock.patch.object(store, "host_name", return_value="linux-build"), \
              mock.patch.object(os, "getcwd", return_value=str(self.root)):
             record.step(["0", "100", "101", "0", "", "", "cargo", "nextest", "run"])
@@ -363,6 +367,103 @@ raise SystemExit(75)
                 self.assertEqual(output.count(cause), 1)
                 self.assertEqual(attempts.read_text().splitlines(), ["attempt"])
                 self.assertEqual(self.local_runs(), [])
+
+    def configure_hana_gpu(self) -> None:
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n"
+            + "settings.hana-gpu=cloud_gate.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+        _ = (self.root / "cloud_gate.conf").write_text(
+            "execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
+            + "hana_gpu_repository=https://example.com/team/hana\n"
+            + "hana_gpu_instance_types=g6.2xlarge\nhana_gpu_selections=sample:shader_variants\n")
+        account = self.target_state("aws")
+        account.mkdir(parents=True, exist_ok=True)
+        _ = (account / "gate-deployment.json").write_text('{"gpu_instance_types":["g6.2xlarge"]}')
+
+    def test_pinned_gpu_omits_workspace_dev_features_only_for_test(self) -> None:
+        self.configure_hana_gpu()
+        add_dev_features(self.root, '["hana/dynamic_linking"]')
+        requests: list[wire.PlacementRequest] = []
+        reason = "The fixture closed placement before launch"
+        previous = self.admission.server.handle_request
+
+        def close_placement(request: wire.Request,
+                            connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                            ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                requests.append(request)
+                return [wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
+                    placement.ClosedAssignment(reason), placement.NoLaunchPermission(reason))]
+            return previous(request, connection)
+
+        with mock.patch.object(self.admission.server, "handle_request", side_effect=close_placement):
+            result = self.verify("test", "sample", "--test", "shader_variants", "--target", "hana-gpu")
+            check = self.verify("check", "sample", "--target", "hana-gpu")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, output)
+        self.assertEqual(check.returncode, 2, check.stdout + check.stderr)
+        request, check_request = requests
+        self.assertEqual(check_request.constraints.command, (
+            "cargo", "check", "--workspace", "--lib", "--bins", "--features", "hana/dynamic_linking"))
+        self.assertEqual(request.constraints.command, (
+            "cargo", "nextest", "run", "--no-fail-fast", "--workspace", "--test", "shader_variants",
+            "-E", "package(sample)"))
+        candidate, = request.constraints.candidates
+        self.assertEqual(candidate.destination.target, "hana-gpu")
+        self.assertIsInstance(candidate.eligibility, placement.AllowedHost)
+        self.assertEqual(output.count(f"verify.sh: target hana-gpu refused: {reason}\n"), 1, output)
+        self.assertEqual(self.local_runs(), [])
+
+    def test_pinned_gpu_prints_the_placement_exclusion_once(self) -> None:
+        self.configure_hana_gpu()
+        previous = self.admission.server.handle_request
+
+        def block_wait_cleanup(request: wire.Request,
+                               connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                               ) -> list[wire.Reply]:
+            replies = previous(request, connection)
+            if isinstance(request, wire.PlacementRequest) and any(
+                    isinstance(reply, wire.DispatchStatus) for reply in replies):
+                reply_path, = (self.root / "tmp").glob("verify*/placement-reply")
+                reply_path.with_name(f"placement-{request.episode}.json.wait").mkdir()
+            return replies
+
+        for arguments, cleanup_error in (
+                (("--test", "unlisted"), False),
+                (("--test", "shader_variants", "--features", "hana/dynamic_linking"), False),
+                (("--test", "unlisted"), True)):
+            with self.subTest(arguments=arguments, cleanup_error=cleanup_error):
+                handler = block_wait_cleanup if cleanup_error else previous
+                with mock.patch.object(self.admission.server, "handle_request", side_effect=handler):
+                    result = self.verify("test", "sample", *arguments, "--target", "hana-gpu")
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertEqual([line for line in output.splitlines() if line.startswith("verify.sh: target hana-gpu refused:")],
+                                 [f"verify.sh: target hana-gpu refused: {hana.GPU_SELECTION_REQUIRED}"], output)
+                if cleanup_error:
+                    self.assertRegex(result.stderr, r"(?m)^\[Errno 21\] Is a directory: .*placement-.+-step-1\.json\.wait'")
+                self.assertEqual(self.local_runs(), [])
+
+    def test_pinned_gpu_prints_the_service_error_once(self) -> None:
+        self.configure_hana_gpu()
+        reason = "The fixture cannot place this step"
+        previous = self.admission.server.handle_request
+
+        def reject_request(request: wire.Request,
+                           connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                           ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                return [wire.Refused(reason)]
+            return previous(request, connection)
+
+        with mock.patch.object(self.admission.server, "handle_request", side_effect=reject_request):
+            result = self.verify("test", "sample", "--test", "shader_variants", "--target", "hana-gpu")
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, output)
+        self.assertEqual([line for line in output.splitlines() if reason in line],
+                         [f"verify.sh: target hana-gpu refused: admission service unavailable: {reason}"], output)
+        self.assertEqual(self.local_runs(), [])
 
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
         from scripts.mac_test import eligibility, offload

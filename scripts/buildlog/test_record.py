@@ -42,11 +42,12 @@ from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_count
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -170,7 +171,7 @@ class RecordTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
             name: value
-            for name, value in os.environ.items()
+            for name, value in memory_gate_shell_environment().items()
             if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
@@ -1438,11 +1439,12 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual([record[key] for key in ("repo_path", "worktree", "branch", "sha")], [None] * 4)
 
     def test_call_record_fields(self) -> None:
+        session = staff.caller_identity() or "session-1"
         board = {"UNIT_TEAM_ROLE": "impl2", "UNIT_RUN_DIR": "/x/boards/run-7/"}
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": "session-1", **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
@@ -1465,7 +1467,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             "branch": "main",
             "worker": "impl2",
             "unit_session": "run-7",
-            "session": "session-1",
+            "session": session,
             "backfilled": False,
         }
         self.assertEqual({key: record[key] for key in expected}, expected)

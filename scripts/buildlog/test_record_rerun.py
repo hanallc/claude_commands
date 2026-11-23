@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.buildlog import index
 from scripts.buildlog import health, launches
 from scripts.buildlog import record
@@ -33,6 +34,7 @@ from scripts.buildlog.test_launches import CLI
 from scripts.buildlog.test_memory_window import configured_host_cli, configured_local_host
 
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC
+from scripts.production.staff_test_support import build_fixture_sessions
 
 
 class RecorderStopped(BaseException):
@@ -77,13 +79,13 @@ class RecordRerunTests(unittest.TestCase):
     peak: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     output: bytes = b""
     peak_contents: bytes = b""
+    runner_sessions: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
+        self.runner_sessions = build_fixture_sessions("different-parent-session")
         # Reuse the real recorder fixture's Git, tool and isolated-root setup.
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=configured_local_host))
         environment = self.fixture.environment(
             **mac_natedev_environment(self.fixture.base / "config"),
@@ -127,8 +129,7 @@ class RecordRerunTests(unittest.TestCase):
             BUILDLOG_CALL_ID="different-call",
             BUILDLOG_MEM_WAIT_S="999",
             BUILDLOG_TREE_START="different-tree",
-            CODEX_THREAD_ID="different-step-worker",
-            CLAUDE_CODE_SESSION_ID="different-parent-session",
+            **self.runner_sessions,
             UNIT_TEAM_ROLE="different-role",
             UNIT_RUN_DIR=str(self.fixture.base / "different-unit-run"),
             USER_ZONE="UTC",
@@ -193,9 +194,7 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(gzip.decompress(self.saved_logs()[0].read_bytes()), self.output)
 
     def launch_fixture(self) -> launch_tests.LaunchRecordingTests:
-        fixture = launch_tests.LaunchRecordingTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
+        fixture = set_up_fixture(self.addCleanup, launch_tests.LaunchRecordingTests())
         # Keep the recorder's root and two-machine configuration for the launch source.
         point_root_at(self, self.fixture.root)
         _ = self.enterContext(mock.patch.dict(  # pyright: ignore[reportAny]

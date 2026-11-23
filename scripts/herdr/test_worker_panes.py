@@ -1,6 +1,8 @@
 """Worker operations preserve native identity and proved pane ownership."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import io
 import json
 import fcntl
@@ -136,8 +138,9 @@ class PaneWorld(herdr.Herdr):
                           + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
-        write_text_atomic(config / "codex_daemon.conf", (Path(__file__).resolve().parents[2] / "config/codex_daemon.conf").read_text())
-        write_text_atomic(config / "script_prompts.conf", (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
+        write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
+                          + "agents_slice=app-agents.slice\n")
+        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -2114,7 +2117,7 @@ class WorkerPaneTests(StaffTestCase):
         self.dispatch(opened.row, "impl")
         run = self.root / "run"
         progress_history.save_dispatch_delivery(run, "dispatch-" + opened.row.name,
-            progress_history.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
+            pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
                                               progress_history.NO_COMPLETION_ACTIONS))
         with patch("scripts.agents.detached_runs.live_runs", return_value=[]):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
@@ -2581,7 +2584,7 @@ class WorkerPaneTests(StaffTestCase):
                 if unfinished:
                     self.dispatch(row, "impl")
                     progress_history.save_dispatch_delivery(self.root / "run", "dispatch-" + row.name,
-                        progress_history.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
+                        pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
                                                           progress_history.NO_COMPLETION_ACTIONS))
                 else:
                     self.completed_dispatch(row, "impl")

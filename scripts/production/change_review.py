@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, main_push_lock, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -617,29 +617,30 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
-        blobs = [(str(path.resolve().relative_to(root)),
-                  checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
-                 for path in paths]
-        subject = f"change-review: {what}"
-        with build_folders.tool_folder("change-review-index") as temporary:
-            index = temporary / "index"
-            environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
-            for attempt in range(5):
-                head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
-                _ = checked("read-tree", head if head else "--empty", env=environment)
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
-                tree = checked("write-tree", env=environment)
-                if head and tree == checked("rev-parse", head + "^{tree}"):
-                    return
-                for name, blob in blobs:
-                    _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
-                commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
-                updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
-                if not updated.returncode:
-                    return
-                if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
-                    raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
+        with main_push_lock.main_push_lock(root, "change-review", wait=False):
+            blobs = [(str(path.resolve().relative_to(root)),
+                      checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
+                     for path in paths]
+            subject = f"change-review: {what}"
+            with build_folders.tool_folder("change-review-index") as temporary:
+                index = temporary / "index"
+                environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+                for attempt in range(5):
+                    head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
+                    _ = checked("read-tree", head if head else "--empty", env=environment)
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
+                    tree = checked("write-tree", env=environment)
+                    if head and tree == checked("rev-parse", head + "^{tree}"):
+                        return
+                    for name, blob in blobs:
+                        _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+                    commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
+                    updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
+                    if not updated.returncode:
+                        return
+                    if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
+                        raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
         reason = next(iter(str(error).splitlines()), type(error).__name__)
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
@@ -1536,24 +1537,18 @@ _held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks"
 
 
 @contextmanager
-def _list_lock(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
+def _list_lock(path: Path) -> Generator[None]:
     folder = path.parent.resolve()
     held = _held_review_locks.get()
     if folder in held:
-        yield file_lock.LockResult.ACQUIRED
+        yield
         return
     descriptor = os.open(folder, os.O_RDONLY)
     try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        except BlockingIOError:
-            if wait:
-                raise
-            yield file_lock.LockResult.BUSY
-            return
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
         token = _held_review_locks.set(held | {folder})
         try:
-            yield file_lock.LockResult.ACQUIRED
+            yield
         finally:
             _held_review_locks.reset(token)
     finally:
@@ -1583,17 +1578,6 @@ def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) ->
     """Check a Review card while holding its list and delivery locks."""
     with review_delivery_lock(root), _list_lock(path):
         yield check()
-
-
-@contextmanager
-def try_review_write(path: Path, root: Path) -> Generator[file_lock.LockResult]:
-    """Try the Review delivery lock, then the change list lock."""
-    with review_delivery_lock(root, wait=False) as result:
-        if result is file_lock.LockResult.BUSY:
-            yield result
-            return
-        with _list_lock(path, wait=False) as result:
-            yield result
 
 
 @contextmanager
@@ -1803,7 +1787,7 @@ def _verdict_write(
             removed_image = image
             cells[IMAGE] = ""
         if superseded:
-            append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
+            append_row_review_log(cells, review_events.ReviewLog(datetime.now(user_zone()), "nate", superseded))
         _move_to_reviewed(path, lines, cells, verdict, day)
         return VerdictRecorded(row_merge(cells))
 
@@ -1970,9 +1954,8 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
-def append_row_review_log(cells: dict[str, str], words: str, who: str, now: datetime) -> None:
+def append_row_review_log(cells: dict[str, str], event: review_events.ReviewLog) -> None:
     events = review_events.decode(_plain(cells.get("Review log", "")))
-    event = review_events.ReviewLog(now, who, words)
     cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
 
 
@@ -1987,15 +1970,16 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
         columns, first, end = _table(path, lines, section)
         index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
         cells = dict(zip(columns, _cells(lines[index])))
-        append_row_review_log(cells, event.words, event.who, event.time)
+        append_row_review_log(cells, event)
         lines[index] = _row(path, columns, cells)+"\n"
         return
 
 
-def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
+def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate", *,
+                      feedback_request_id: str = "") -> None:
     """Keep the user's Review action in the authoritative table row."""
     now = datetime.now().astimezone(user_zone())
-    event = review_events.ReviewLog(now, who, words)
+    event = review_events.ReviewLog(now, who, words, feedback_request_id)
     _edit(path, production, now.date(), lambda lines: _append_review_log(path, lines, row, event),
           lambda _: f"review {row}")
 
@@ -2017,14 +2001,13 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """Remove the scratch folders of `row` on the list at `path`; return one line per folder.
+    """End the scratch task of `row` and return any error.
 
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
-        result = scratch.end(f"row:{_owner(path)}-{row}")
-        return ([f"removed {folder}" for folder in result]
-                + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
+        _ = scratch.end(f"row:{_owner(path)}-{row}")
+        return []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 

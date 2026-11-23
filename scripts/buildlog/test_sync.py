@@ -24,6 +24,7 @@ from scripts.buildlog import index
 from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import rust_release
+from scripts.buildlog import sample
 from scripts.buildlog import store
 from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
@@ -331,6 +332,7 @@ class SyncTests(unittest.TestCase):
     def test_hourly_still_polls_ci_while_sync_is_paused(self) -> None:
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)
         with (
+            mock.patch.object(sample, "sccache_sample", return_value=0) as cache,
             mock.patch.object(ci, "ci", return_value=0) as poll,
             mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
             mock.patch.object(cli, "aws_snapshot", return_value=0) as snapshot,
@@ -340,6 +342,7 @@ class SyncTests(unittest.TestCase):
         ):
             self.assertEqual(cli.hourly(), 0)
 
+        cache.assert_called_once_with()
         poll.assert_called_once_with()
         screenshots.assert_called_once_with()
         release.assert_called_once_with()
@@ -348,7 +351,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
-        jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
+        jobs = ((sample, "sccache_sample", "sccache"), (sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
                 (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
                 (cli, "aws_page", "AWS page"), (index, "update", "index"))
@@ -386,7 +389,7 @@ class SyncTests(unittest.TestCase):
               mock.patch.object(aws_target, "hourly", return_value=1) as read):
             self.assertEqual(cli.aws_snapshot(), 1)
         state.assert_called_once_with("aws")
-        read.assert_called_once_with(conf.path("aws_target"), folder)
+        read.assert_called_once_with(conf.path("aws_target"), folder, allow_aws_unavailable=True)
 
     def test_aws_page_publishes_from_the_installed_settings_and_state_directory(self) -> None:
         from scripts.aws_target import aws_page

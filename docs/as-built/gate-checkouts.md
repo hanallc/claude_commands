@@ -1,7 +1,7 @@
 # Standing gate checkouts
 
 `scripts/copies/copies.py` prepares gate, review, merge, and landing checkouts.
-`copies.standing` leases a reusable repository slot through `build_slots.take_slot()`.
+`copies.standing` takes a numbered copy under `roots.build` through `take_copy`.
 
 ## Configuration, place, and names
 
@@ -13,7 +13,6 @@ below is required; the implementation has no fallback values.
 
 | Key | Shipped value | Meaning |
 | --- | --- | --- |
-| `wait_seconds` | `1` | Required positive, finite value. The slot wait uses `slots.wait_seconds` in `build_folders.conf`. |
 | `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
 | `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
 
@@ -25,7 +24,9 @@ paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
 `config/build_folders.conf` sets the slot root and pool limits.
+The `slots.wait_seconds` setting limits the wait for a slot.
 The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
+`config/build_folders.conf` sets no slot root for natedev.
 The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
 Owners on the same machine share the pool for a repository.
 Each checkout uses `<slot-root>/<repository>-slot<N>`. The lease records the owner.
@@ -245,12 +246,13 @@ Callers must finish all checkout access before the context ends.
 `CopyError` represents a refusal.
 `PreparationError` represents an application or merge failure.
 
-`hold --repo R` holds a staged checkout until its standard input closes.
-It computes the staged tree through a private index before it prepares the checkout.
-It accepts no staged-tree argument.
-It prints the tree identity first and the checkout path second.
+`hold --repo R --tree T --scratch` holds a checkout of staged tree `T` until its standard input closes.
+It prints the checkout path.
+`hold --repo R --tree T` without `--scratch` runs one slot step in that tree.
+`hold` without `--tree` exits with status 2 and prints `copies: hold requires --tree. Run verify.sh again.` before it opens a checkout.
+That message reaches a `verify.sh` run that started before the `--tree` change.
 It reads the source owner, including the owner in a standing checkout's `.gate.json`.
-`verify.sh doc` reads both lines and retains the lease through descriptor 8.
+`verify.sh doc` reads the path line and retains the lease through a free descriptor.
 The source index and unchanged file modification times remain unchanged.
 `run` requires `--commit` and accepts no staged-source flags.
 
@@ -259,7 +261,8 @@ The source index and unchanged file modification times remain unchanged.
 `scripts/copies/copy_guard.py` owns the creation rule; `config/copies.conf` owns
 the allow list. The
 PreToolUse Bash dispatcher refuses direct repository cloning, worktree
-creation, and recursive repository copying. Its refusal gives a `copies.py run` example and the `make_worktree.sh <path> <branch>` command for a lasting phase tree.
+creation, and recursive repository copying. Its refusal gives a `copies.py run` example.
+Use `make_worktree.sh <repo-word> <unit> <short-name>` for a lasting phase tree.
 Run that command from the source repository. The repository scan applies the same allow list to script code.
 
 The guard distinguishes a detected tree-making operation from an unresolved relevant input and an allowed operation.
@@ -377,7 +380,25 @@ An unmarked probe keeps the existing path check and metadata creation.
 
 ## Original worktrees and landing
 
-`make_worktree.sh <path> <branch>` calls `worktrees.py make` from the source repository.
+`make_worktree.sh <repo-word> <unit> <short-name>` creates a worktree from the main checkout for the repo word.
+It refuses a new checkout if the same unit has a finished linked worktree.
+A finished worktree has a HEAD on the local `origin/main` history, a clean Git status, and no untracked files.
+The guard checks the current user's processes for working directories in the worktree.
+On Linux, it treats a thread with `EACCES` or `EPERM` on its working directory as a privileged daemon.
+On macOS, it applies the same rule to processes that `lsof` omits.
+The guard counts these processes as outside every worktree.
+Other scan failures let worktree creation proceed.
+It skips the main checkout, staff home worktrees, other units' checkouts, and checkouts with unreadable ownership records.
+A retry for a registered checkout can proceed.
+The refusal lists the finished paths and the manual removal steps.
+
+1. Get the showrunner's approval for each exact path.
+2. Write each removal record in `~/.local/state/removal-lists/by-hand.log`.
+3. Run the printed `git worktree remove` command for each path.
+
+The [removal procedure](removal-by-hand.md) supplies a separate process check.
+Record its result before you remove the worktree.
+
 `config/copies.conf` permits both original-worktree helpers.
 The helper creates the Git worktree and records it under `~/.local/state/worktrees/made/<path hash>.json`.
 The path hash uses SHA-256.

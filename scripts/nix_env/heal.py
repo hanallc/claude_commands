@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +32,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.lib import atomic_file, conf, nix_env
-from scripts.herdr import pane_launch
+from scripts.herdr import herdr, pane_launch
 from scripts.production import staff
 from scripts.message import send_result, session_records, sessions
 from scripts.message import send_budget
@@ -466,18 +467,24 @@ def resume_pending(directory: Path, limits: HealLimits, session: HealSession, pe
     if held:
         log(directory, session, history, "pending", held)
         return
-    # Keep the stopped session recoverable even if the command times out or the
-    # healer dies. A launching reservation is observed, never blindly retried.
-    pending["kind"] = "launching"
-    history["restart_at"] = time.time()
-    save_history(directory, histories)
     from scripts.agents import stop_resume
-    try:
-        result = stop_resume.resume(session.session_id, why="nix shell heal")
-    except (OSError, subprocess.TimeoutExpired) as error:
-        log(directory, session, history, "refused", str(error))
-        alert(directory, limits, session, history, str(error))
-        return
+
+    with ExitStack() as start:
+        try:
+            start.enter_context(herdr.reboot_lock())
+        except herdr.RebootLockBusy as error:
+            log(directory, session, history, "pending", str(error))
+            return
+        # Save the launch reservation before the command can start a session.
+        pending["kind"] = "launching"
+        history["restart_at"] = time.time()
+        save_history(directory, histories)
+        try:
+            result = stop_resume.resume(session.session_id, why="nix shell heal")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log(directory, session, history, "refused", str(error))
+            alert(directory, limits, session, history, str(error))
+            return
     if not isinstance(result, stop_resume.ClaudeUp):
         reason = (result.reason
                   if isinstance(result, stop_resume.ResumeFailed)

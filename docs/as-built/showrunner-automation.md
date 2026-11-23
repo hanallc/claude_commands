@@ -101,7 +101,13 @@ Other options include `--permanent`, `--account`, `--model`, `--port`, `--resume
   A failed trust write prints one anomaly and prevents the start.
 
 - **Steps**, each skipped when already done: the brief stub beside the production doc at `<its directory>/<branch>.md` (`## Source`, a zone stamp and the user's words); the unit staff row and its `.unit.toml`; commit `production(<showrunner name>): add unit <unit> (<plan|brief|standby|permanent>)` on the merge branch for a brief stub or a brief-to-plan switch, which is not pushed here and goes out with the next merge push (user, 2026-10-08); `git worktree add` from the local merge branch, with no push of the unit branch (the unit's first checkpoint push sets its upstream), plus `branch.<branch>.cargoBerthTarget` when the repo has `.claude/config/berth.toml`; the herdr session (Launch below); the wait for `/remote-control is active` (default 90 s, last 15 pane lines on timeout); one LOG line `added <unit> (<mode>), worktree <path>`. It prints `<unit> started: herdr session attach <name>`. Shutdown restart resumes the staff session directly.
- New units select the configured units account through `accounts.account_for_group_launch("unit", ...)`. Resumes use the pane launch’s account when available, else the configured units account. `--source-fallback` must name the pane launch’s account. Resume model selection uses explicit `--model`, then the pane launch, then the last assistant model from the unit session (`transcript_model`); otherwise it uses the director model.
+ New units use the configured units account through `accounts.account_for_group_launch("unit", ...)`.
+ Resumes use the pane launch's account when available and the configured units account otherwise.
+ `--source-fallback` must name the pane launch's account.
+ A resume uses the model and effort from the latest real assistant turn across the Claude homes.
+ An explicit `--model` overrides the turn's model.
+ If no turn supplies a model, the pane launch supplies the fallback model.
+ The director settings supply any model or effort that remains unset.
 
 - **Launch.** `launch_session` starts the shared herdr server and opens the unit's tab in its production workspace.
   The tab title uses the unit name. The agent name uses the production and unit names.
@@ -136,6 +142,7 @@ A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 No usable value raises `conf.Unusable` with the source, key, and reason.
 `ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
 The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.
@@ -203,7 +210,11 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `[assignments]` has `production=claude`; `[production.claude]` has `director=opus:xhigh`. There is no `[production.codex]`: unit directors launch only on Claude, and the showrunner is whichever session runs `/showrunner:produce`. The header Consumers list names `production unit directors (add_unit.py)`.
 - `director_agent(request) -> DirectorAgent(model, effort: DefaultEffort | Effort(value))` runs `bash -c 'source "$1" && agents_resolve production.director && printf …'` with the `models_config.sh` from the script's own checkout (`Path(__file__).resolve().parents[1] / "agents/models_config.sh"`); `MODELS_CONFIG_FILE` comes from the caller (default `~/.claude/config/models.conf`). A resolver failure is exit 2 with its first `ERROR:` line; a family other than `claude` is exit 2 with `unit directors launch only on claude; production.director resolves to <family> (<model>)`. Both happen in `preflight`, so `--check` refuses too. `--effort` is passed only for `Effort(value)`.
 - **One-family pinning** (`scripts/agents/models_config.sh`): a function with exactly one family set is pinned to it (`_agents_pinned_family`). Every-function switches (`agents_set_all_assignments <family>`, `agents_set_model <agent>` with no function) leave it as it is and add it to `AGENT_KEPT_FUNCTIONS`; `default_models.sh` prints `# kept production on claude: its only set`. A switch aimed at it (`agents_set_assignment production codex`, `agents_set_model <codex agent> production`, `agents_set_row production.director <codex agent>`) prints `ERROR: 'production' runs only on claude: [production.claude] is its only set.`, returns 1 and leaves the file untouched. `/default_models production.director <model>:<effort>` changes the row.
-- **Resume** in `<LaunchUnits/>` uses add_unit’s live session and pane launch checks. Its Claude arguments come from `models_config.sh`, `agents_resolve production.director` and `agents_claude_args`, then `--resume <session-id> --remote-control <session> -n <session>`. No shutdown hold is read.
+- **Resume** in `<LaunchUnits/>` uses `add_unit.py` and checks the live session and pane launch.
+  It uses the model and effort from the latest real assistant turn.
+  An explicit `--model` overrides the turn's model.
+  The pane launch supplies the fallback model.
+  The director role supplies any missing model or effort.
 
 ### Phase end on the unit side
 
@@ -224,7 +235,10 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
 
-`produce.md` `<MergeCheckpoint/>` runs the command in the background after the showrunner's judgments.
+`produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
+Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.
@@ -276,7 +290,7 @@ Each local Promote checkout must exist before the command pushes.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
   The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
-- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands.
+- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
@@ -318,19 +332,15 @@ Each local Promote checkout must exist before the command pushes.
      A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
      A command that cannot start on the base, and a main conflict, also leave the red with the unit.
      A resumed merge whose restored tip already holds the checkpoint runs no base check.
-     A batch runs the base check before its bisect. A base red holds every item, and the bisect runs only the units' own red names.
+     A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
-     Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
-     Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
-     The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
-     Clean items can land in the same run.
-     If every item is clean, the combined merge conflict keeps the batch held.
-     Each notice then says the checkpoint is clean against main and can land alone.
+     A conflict with main ends a batch and sends the conflicting paths to every requester.
+     The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
@@ -489,7 +499,7 @@ Each local Promote checkout must exist before the command pushes.
   It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
-  Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
+  Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
   After the parallel pass, up to eight failed test modules run once more, alone.
@@ -532,12 +542,12 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
 The CLI requires a producer staff row for the current session.
-Morty's fixed staff ID selects the folder for every caller.
+Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
 Old records without the field default to morty.
-`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+`record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
 Investigations retain their existing format and command behavior.
@@ -551,9 +561,11 @@ The Added line preserves initial field values, including state, ETA, next step, 
 Quoted log values preserve line endings as JSON escapes.
 
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
-Parking sets a time without changing the state.
+Parking stores a time or a delivery condition and keeps the current item state.
+The List ends a delivery park automatically when the producer sets the item state to Delivered.
+Linked changes supply review information on the List.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
@@ -573,9 +585,10 @@ Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
-2. Preserve an existing item number with `add --number <n>`.
+2. Use `add --number <n>` as morty to advance the sequence to a specified number.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
-4. Park or unpark an item with `park --id L<n> --until <time-or-empty> --source <source>`.
+4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
+   Use a time or `delivered` to park. Use an empty condition to unpark.
 5. Close an item with `close --id L<n> --words <closing words> --source <source>`.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
@@ -588,6 +601,8 @@ They include the date for updates from another day.
 The page shows the time of each log entry beside its source.
 The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
+Other producers can add items assigned to themselves.
+The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
@@ -596,7 +611,7 @@ Only morty can close an item.
 Their updates use the caller's staff name as the log source.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-New items default to morty.
+Morty's new items default to morty.
 Changing the producer to someone other than morty sends two notices after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
@@ -614,15 +629,21 @@ They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in the same producer folder.
+References use numbers in morty's List folder.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
 Closing a prerequisite preserves its dependents' conditions.
 
-Closed records remain on disk with their time and closing words.
-Automatic numbering includes invalid records and Closed records.
-An explicit number must name an unused path.
+Closed and removed records remain on disk with their time, closing words, and log.
+The `.next-number` record in morty's List folder stores the next number.
+The sequence is per machine, and the List's machine is the one source.
+If the counter is missing, the allocator reads the record names and the migration log in all existing List folders.
+This scan includes invalid and Closed records and the migration entries for removed records.
+The first number is one more than the highest recorded number.
+The allocator advances the counter under the List store lock before it publishes the item.
+An explicit number must be at or above the next available number.
+A failed write after reservation leaves a gap in the sequence.
 Exact repeated operations change nothing.
 An update appends a log line and marks the item unread if it is not Closed.
 Closing clears the unread time.
@@ -633,11 +654,12 @@ Update and park refuse Closed items until reopen restores them.
 The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
-Future parked items and Closed items remain hidden by default.
+Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
-`create_records` validates a complete typed batch before writing into an empty list folder.
+`create_records` validates a complete typed batch before writing into morty's empty List folder without a counter.
+It reserves the highest number in the batch before it writes any records.
 It checks forward references and cycles under the same lock as other writes.
 The one-off converter lives outside the repository and uses this API.
 It preserves item numbers, source sections, and each item's JSON data in Evidence.
@@ -872,7 +894,15 @@ Pane labels do not identify a consultation.
 `ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
-- `ci start`: `bash validate_and_push.sh --to <merge branch> --fix-commit "ci(<showrunner name>): validation fixes after <unit> phase <N>|production wrap" [--cancel-prior]`; reads `repo`, `sha` and `run_id` from the `=== CI HANDOFF TO AGENT ===` block (`run_id: none` fails); the sha must be the merge-branch tip; writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`.
+- `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
+  - Trigger: before validation it reads every workflow file at the tip and keeps the ones that run the `Test Suite` job. It reads all workflow registrations of the push repository (`gh api …/actions/workflows`).
+    1. Exactly one such workflow has a push trigger that covers the merge branch (no `paths` or `paths-ignore` filter), and its registration is active or absent: CI starts on push.
+    2. None covers the branch, and exactly one has `workflow_dispatch` and an active registration: `ci start` dispatches it after the push.
+    3. Otherwise it refuses before validation with one line: no trigger, a disabled registration, or several candidates.
+  - Validation reuse: `ci_validation.json` holds `input_tip` and `validated_commit`. A rerun whose tip equals either one skips validation.
+  - Dispatch: under the merge lock, `push_direct.sh --dispatch-published` checks that origin's branch tip is the published commit. It lists `workflow_dispatch` runs of the workflow on that branch and commit (`--repo`, at most 100). It follows the newest unfinished run, reuses the newest completed run when it succeeded, and otherwise dispatches once. The follow step polls outside the lock with the same selection and never dispatches. A run list that lags can let a later retry start a second run on the same commit.
+  - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
+  - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
 - `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` requires the code merge.
@@ -1123,17 +1153,6 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Numbers use thousands commas; times and the date use the production zone.
   - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
 
-- **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
-  Staff supplies the current unit folder.
-  Each candidate `run_started` event resolves its owner through staff before the reader compares that folder.
-  The newest numeric start wins; sorted file order settles equal starts.
-  Invalid or unreadable files are skipped.
-  The scan stops after the first valid run-start event in each file.
-  `--root` selects the history root, then `UNIT_HISTORY_DIR`, then the configured history default.
-  With no local match, the reader queries the Mac unless `--no-mac` is present.
-  An unavailable Mac prints its cause.
-  No matching run exits 1 with the unit and folder in the diagnostic.
-
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.
   - **The plan backlog**: each line ending `proposed` or `deferred` of the ledger the `- **Improvement queue:**` line names (`proposals_folder.ledger`), for the doc only (user 2026-10-27); a production with no such line has no backlog rows. A file a line names is beside its ledger. The proposer is the `Proposed <date> by <who>` words of the file the line names, else `plan backlog`. Proposed lines join the issues waiting for review in `/next proposal` and the For-you proposals count; accepted and deferred lines do not count.
@@ -1324,7 +1343,7 @@ An unreadable registry preserves `ClaudeUnknown(reason)`.
 A registered Claude without its messaging socket also remains unknown.
 
 Units launch in herdr and restore through `add_unit.py --host-session`.
-Resume models come from transcripts.
+Resumes use the latest assistant turn's settings with the overrides and fallbacks described above.
 Native runtime ids select staff rows.
 New launches carry no copied staff identity.
 Promotion waits for Claude to exit before it starts the replacement.

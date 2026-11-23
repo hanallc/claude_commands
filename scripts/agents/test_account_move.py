@@ -29,7 +29,7 @@ from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
-from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
+from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
 from scripts.agents.test_restart import showrunner, top_level, unit
 from scripts.agents.test_support import ShutdownTestCase
@@ -159,6 +159,7 @@ class AccountMoveTests(ShutdownTestCase):
         _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": login},
         }), encoding="utf-8")
+        write_claude_move_credentials(accounts.account_dir(label))
 
 
     def live_registry(self) -> list[sessions.SessionRecord]:
@@ -306,7 +307,7 @@ class AccountMoveTests(ShutdownTestCase):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
-        self.assertEqual(self.moves.batches, [["first", "second"]])
+        self.assertEqual(self.moves.batches, [["first", "second", "already"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
         self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)

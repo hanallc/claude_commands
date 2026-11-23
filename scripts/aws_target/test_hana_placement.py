@@ -31,10 +31,11 @@ from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.build_hold.owning_session import OwningSession
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-KEY = 'https://github.com/natepiano/hana'
+KEY = 'https://github.com/hanallc/hana'
 PREVIEW_SECONDS = 2
 
 
@@ -648,7 +649,7 @@ class HanaGpuPlacementTests(CostFixture):
         _ = (self.root / 'build_targets.conf').write_text(
             'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
             + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
-            + f'settings.hana-gpu={gpu_target.settings}\n')
+            + f'settings.hana-gpu={gpu_target.settings}\n' + UNREACHABLE_WAIT_FIXTURE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(self.root)})))
         _ = self.enterContext(mock.patch.object(eligibility, 'repository_identity',
             return_value=eligibility.KnownRepository('hana', KEY)))

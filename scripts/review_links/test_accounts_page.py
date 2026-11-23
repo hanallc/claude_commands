@@ -19,14 +19,17 @@ import time
 import unittest
 from typing import cast, override
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.accounts import accounts, next_moves, role_map
+from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
-from scripts.whoami import agent_accounts
+from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
+from scripts.whoami.account_test_support import create_claude_account, stored_room
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
 ACCOUNT_SETTINGS = "next_move_percent=1\nusage_stale_minutes=10\n"
@@ -63,9 +66,31 @@ def sort_reading() -> accounts.StatusReading:
         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3", "showrunners": "claude1"}))
 
 
+def rendered_sort_orders(markup: str, table: str) -> dict[str, list[int]]:
+    encoded = re.search(rf'data-sort-table="{re.escape(table)}" [^>]*data-sort-orders="([^"]+)"', markup)
+    assert encoded is not None
+    orders = cast(dict[str, list[int | accounts.AccountRowPlacement]], json.loads(html.unescape(encoded[1])))
+    return {key: [place if isinstance(place, int) else place["index"] for place in places]
+            for key, places in orders.items()}
+
+
+def use_fixture_history(case: unittest.TestCase, scratch: Path) -> None:
+    """Keep the run-out, busy-line and no-worker mode reads in the scratch folder."""
+    _ = case.enterContext(patch.object(run_out, "READINGS_LOG", scratch / "readings.jsonl"))
+    _ = case.enterContext(patch.object(role_activity, "history_path", return_value=scratch / "role_activity.jsonl"))
+    _ = cast(object, case.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(scratch / "state")})))
+
+
+# The fixed slot after each role total, with the warning icon when sessions are not running.
+NOT_RUNNING_SLOT = re.compile(
+    r'<span class="not-running-slot">(?:<span class="not-running".*?</svg>\s*</span><span id="[^"]+" hidden>[^<]*</span>)?</span>',
+    re.S)
+
+
 class ProducerRoleColorTests(unittest.TestCase):
     def test_the_producer_role_uses_its_color_and_account_names_keep_account_colors(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        use_fixture_history(self, configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "statusline.conf", "role.producer=pink\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
@@ -94,12 +119,12 @@ MENU_PROBE = '''<script>
  const open=()=>button().click();
  const activate=name=>button().dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
  const key=name=>menu.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
- const groupRow=()=>document.querySelector('tr[data-move-group]');
+ const groupRow=()=>button().closest('tr');
  try{
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   frameElement.style.width='800px';frameElement.style.height='480px';await flush();
-  check(document.querySelectorAll('tr[data-move-group]').length===1 && groupRow().dataset.moveAccount==='claude1'
-   && groupRow().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
+  check(document.querySelectorAll('[data-move-group]').length===1 && button().dataset.moveAccount==='claude1'
+   && button().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
   check(document.querySelectorAll('[data-next-button]').length===1,'only the selected Claude line has a button');
   const keepsBrowserMenu=cell=>cell.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})) && menu.hidden;
   const unselected=document.querySelector('[data-color-key="account.claude2"]').closest('tr');
@@ -221,8 +246,10 @@ class AccountsPageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        use_fixture_history(self, scratch)
         configuration = scratch / "config"
         self.review_root = scratch / "review"
+        _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
@@ -242,6 +269,172 @@ class AccountsPageTests(unittest.TestCase):
               patch.object(accounts_page, "cleared_quotas", return_value={}) as cleared):
             _ = accounts_page.page()
         cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
+
+    def test_page_shows_token_states_and_renewal_steps_below_models(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=335)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\naccount: claude9\nmade: {made.isoformat()}\nchecked_at: {AT.isoformat()}\n"
+            + f"last_good_use: {(AT - timedelta(minutes=1)).isoformat()}\n"
+            + f"last_login_failure: {AT.isoformat()}\n---\n", encoding="utf-8")
+        config = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        dates = ("token_expiry.lead_days=30 7\n"
+                 + "token_expiry.hana_linux_runners.ends=2026-11-22\n"
+                 + "token_expiry.hana_macos_runner_query.ends=2026-11-14\n")
+        _ = config.write_text("mac_token.account=\n" + dates, encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+            mac_section = page.split(b'<details class="token-steps" data-token="mac_fallback">', 1)[1].split(b"</details>", 1)[0]
+            self.assertIn(b"<p>Set <code>mac_token.account</code> first.</p>", mac_section)
+            self.assertNotIn(b"<ol>", mac_section)
+            _ = config.write_text("mac_token.account=claude2\n" + dates, encoding="utf-8")
+            page = accounts_page.page()
+        self.assertLess(page.index(b'aria-label="Models"'), page.index(b'aria-label="Tokens"'))
+        table = page.split(b'aria-label="Tokens"', 1)[1].split(b"</table>", 1)[0]
+        rows = [match[1] for match in re.finditer(rb"<tr>(<td.*?)</tr>", table)]
+        self.assertEqual(len(rows), 3)
+        for row, expected in zip(rows, (
+            (b"Mac fallback token", b"for claude2.", b">2026-12-15</time>", b">30</td>",
+             b'<span class="error">Login failed</span><br><span class="warning">Renew soon</span>'),
+            (b"hana-linux-runners", b"Registers the Hana Linux CI runners.", b">2026-11-22</time>", b">7</td>",
+             b'<span class="warning">Renew soon</span>'),
+            (b"hana-macos-runner-query", b"Checks runner availability", b">2026-11-14</time>", b">0</td>",
+             b'<span class="error">Expired</span>'),
+        )):
+            for value in expected:
+                self.assertIn(value, row)
+        sections = [section.split(b"</details>", 1)[0].decode()
+                    for section in page.split(b'<details class="token-steps" ')[1:]]
+        self.assertEqual([section.split("<ol>", 1)[0] for section in sections], [
+            'data-token="mac_fallback"><summary>Replace the token on the Mac</summary>',
+            'data-token="token_expiry.hana_linux_runners.ends"><summary>Renew hana-linux-runners</summary>',
+            'data-token="token_expiry.hana_macos_runner_query.ends"><summary>Renew hana-macos-runner-query</summary>',
+        ])
+        renewal, linux, macos = sections
+        steps = [match[1] for match in re.finditer(r"<li>(.*?)</li>", renewal)]
+        self.assertEqual(steps, [
+            "In a plain Terminal or iTerm window, not in a herdr pane, run <code>mac-token-renew</code>.",
+            "Approve access in the browser while signed in to claude2.",
+            "Copy the token that setup-token shows, then paste it at the hidden prompt and press Enter.",
+        ])
+        self.assertNotIn("<pre>", renewal)
+        self.assertNotIn('class="token-command"', renewal)
+        self.assertEqual(linux.count("<li>"), 5)
+        self.assertIn("Keep Administration read and write. Set 366 days.", linux)
+        self.assertIn(
+            'Run this command in a plain natedev terminal.<code class="token-command" tabindex="0">'
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/whoami/hana_runner_token.py reseal</code>", linux)
+        self.assertNotIn("systemd-creds", linux)
+        self.assertIn("/tune showrunners token_expiry.hana_linux_runners.ends &lt;YYYY-MM-DD&gt;</code>", linux)
+        self.assertEqual(macos.count("<li>"), 3)
+        self.assertIn("Keep Administration read only.", macos)
+        self.assertIn('class="token-command" tabindex="0">gh secret set MACOS_RUNNER_QUERY_TOKEN --repo hanallc/hana</code>', macos)
+        self.assertIn("/tune showrunners token_expiry.hana_macos_runner_query.ends &lt;YYYY-MM-DD&gt;</code>", macos)
+        self.assertIn(b".token-command{display:block;white-space:pre;overflow-x:auto;", page)
+        self.assertIn(b"tbody tr td{border-top:1px solid var(--line)}", page)
+        self.assertIn(b".roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}", page)
+        self.assertNotIn(b"tbody tr:last-child td{border-top:", page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_open_renewal_steps_stay_open_through_refresh(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        _ = config.write_text("mac_token.account=claude2\ntoken_expiry.lead_days=30 7\n"
+                              + "token_expiry.hana_linux_runners.ends=2026-11-22\n"
+                              + "token_expiry.hana_macos_runner_query.ends=2026-11-14\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.review_root.parent / "agents")}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
+        setup = '''<script>
+Date.now=()=>200000;
+const realFetch=fetch;let reads=0;
+window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PAGE});};
+</script>'''.replace("FRESH_PAGE", json.dumps(rendered).replace("</", "<\\/"))
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const steps=()=>[...document.querySelectorAll('.tokens-card details.token-steps')];
+ const opened=()=>steps().filter(node=>node.open).map(node=>node.dataset.token).join(',');
+ try{
+  check(steps().length===3 && opened()==='','each token has closed renewal steps');
+  const linux=steps().find(node=>node.dataset.token==='token_expiry.hana_linux_runners.ends');
+  const summary=linux.querySelector('summary');
+  check(getComputedStyle(summary).cursor==='pointer','the summary shows a pointer');
+  check(!linux.querySelector('ol').checkVisibility(),'closed steps are hidden');
+  summary.click();await flush();
+  check(opened()==='token_expiry.hana_linux_runners.ends' && linux.querySelector('ol').checkVisibility(),
+   'a click opens one token');
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(reads>0 && !linux.isConnected,'refresh replaces the steps');
+  check(opened()==='token_expiry.hana_linux_runners.ends','refresh keeps the open steps open and the others closed');
+  const fresh=()=>steps().find(node=>node.dataset.token==='token_expiry.hana_linux_runners.ends');
+  const oldSummary=fresh().querySelector('summary');oldSummary.focus();
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(!oldSummary.isConnected && document.activeElement===fresh().querySelector('summary'),
+   'refresh keeps focus on the summary');
+  const oldCommand=fresh().querySelector('.token-command');oldCommand.focus();
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(!oldCommand.isConnected && document.activeElement===fresh().querySelector('.token-command'),
+   'refresh keeps focus on the command');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    def test_page_marks_old_mac_token_metadata_stale(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=2)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\nmade: {made.isoformat()}\nchecked_at: {made.isoformat()}\n---\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+        self.assertIn(b">Stale token data</td>", page)
+
+    def test_next_accounts_response_shows_nav_quota_from_the_same_store(self) -> None:
+        home = self.review_root.parent / "home"
+        home.mkdir()
+        (home / ".claude").mkdir()
+        _ = (home / ".claude.json").write_text("{}")
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        cache = serve.AccountsPageCache()
+        login = "warning-fixture@example.invalid"
+        marker = b'data-quota-level="warning" data-quota-account="claude4"'
+        resets_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+        def render_fixture() -> accounts_page.AccountsRender:
+            return accounts_page.AccountsRender(accounts_page.page(), .5, time.time())
+
+        with (scratch_account_home(home, {"REVIEW_LINKS_ROOT": str(self.review_root),
+                  "AGENT_NOTES_DIR": str(home / "notes"), "USER_ZONE": "UTC"}),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected SSH")),
+              patch.object(accounts, "_read_local_role_sessions",
+                           return_value=accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset())),
+              patch.object(accounts, "_start_session_counts_fetch", return_value=False),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")),
+              patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", side_effect=render_fixture)):
+            create_claude_account("claude4", login)
+            self.assertTrue(usage_store.store_file().is_relative_to(home))
+            stored_room(login, 11, resets_at)
+            self.assertFalse(marker in cache.get())
+            self.assertEqual(accounts_page.nav_quota(self.review_root)["level"], accounts_page.QuotaLevel.NONE)
+
+            stored_room(login, 10, resets_at)
+            self.assertEqual(accounts_page.nav_quota(self.review_root),
+                             {"level": accounts_page.QuotaLevel.WARNING, "name": "Warning: 10% left"})
+            reply = cache.get()
+            with cache.condition:
+                self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+            self.assertTrue(marker in reply)
 
     def test_quota_clear_survives_reset_time_drift_until_the_next_week(self) -> None:
         reset = AT + timedelta(days=1, microseconds=299911)
@@ -356,107 +549,487 @@ window.fetch=(url,options)=>options?.method==='POST'
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
                                          upcoming_moves=("Upcoming moves:", "units → claude1"))
         markup = accounts_page.board(reading)
-        table = accounts.status_board(reading)
-        self.assertEqual([column["key"] for column in table["columns"]][1:4], ["label", "left", "roles"])
-        self.assertIn('<thead><tr><th class="left"></th>'
-                      + '<th class="left" data-account-sort="account" tabindex="0" aria-sort="ascending">'
-                      + '<span class="sort-label">account<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
-                      + '<th class="left"></th>'
-                      + '<th class="right" data-account-sort="left" tabindex="0" aria-sort="none">'
-                      + '<span class="sort-label"><span class="sort-arrow" aria-hidden="true">▲</span>left</span></th>'
-                      + '<th class="left" data-account-sort="role" tabindex="0" aria-sort="none">'
-                      + '<span class="sort-label">role<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
-                      + '<th class="left"></th>'
-                      + '<th class="left" data-account-sort="next" tabindex="0" aria-sort="none">'
-                      + '<span class="sort-label">next<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
-                      + '<th class="right" data-account-sort="busy" tabindex="0" aria-sort="none" data-sort-descending>'
-                      + '<span class="sort-label"><span class="sort-arrow" aria-hidden="true">▲</span>busy</span></th>', markup)
-        self.assertNotIn(">Color<", markup)
-        self.assertEqual(markup.count('<tr class="account">'), 2)
-        self.assertEqual(markup.count("<tr>"), 1)
-        self.assertIn('<td class="left" data-account-name><span class="default bold" style="color:#af875f" '
-                      + 'data-color-text="account.claude1">claude1</span></td><td class="left"><button type="button" class="color-swatch" data-color-key="account.claude1" '
-                      + 'data-color-name="claude1" data-saved-color="#af875f" style="background:#af875f" '
-                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td>'
-                      + '<td class="right"><span class="default">60%</span></td>', markup)
-        self.assertIn('<td class="left"><span class="default" style="color:#808000" data-color-text="role.unit-director">units</span></td>'
-                      + '<td class="left"><button type="button" class="color-swatch" data-color-key="role.unit-director" '
-                      + 'data-color-name="units" data-saved-color="#808000" style="background:#808000" '
-                      + 'aria-label="Change units color" aria-haspopup="dialog"></button></td>'
-                      + '<td class="left next-cell"><span class="next-muted next-minus" title="Not the selected account for a role">'
-                      + page_frame.icon_svg("minus") + '</span></td><td class="right"><span class="default">1</span></td>', markup)
-        self.assertIn('<td class="left" data-account-name><span class="default bold">total</span></td>', markup)
-        self.assertIn('<td class="left"></td>', markup)
-        self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
+        account_table, roles_table = markup.split('<h2>Roles</h2>')
+        self.assertIn('<h2>Accounts</h2>', account_table)
+        self.assertIn('aria-label="Accounts"', account_table)
+        self.assertIn('aria-label="Roles"', roles_table)
+        self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', account_table)
+        self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', roles_table)
+        self.assertIn('style="color:#af875f" data-color-text="account.claude1">claude1</span>', account_table)
+        self.assertIn('data-color-key="account.claude1"', account_table)
+        self.assertIn('<td class="right"><span class="default">60%</span></td>', account_table)
+        self.assertIn('data-color-text="role.unit-director">units</span>', roles_table)
+        self.assertIn('data-color-key="role.unit-director"', roles_table)
+        self.assertIn('title="Not the selected account for a role"', account_table)
+        self.assertIn(page_frame.icon_svg("minus"), account_table)
+        self.assertIn('<span class="inactive">no account</span>', roles_table)
+        self.assertIn('<tr data-summary><td class="left"><span class="default bold">total</span>', roles_table)
+        self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', account_table)
         self.assertNotIn('Upcoming moves:', markup)
         self.assertNotIn('units → claude1', markup)
-        self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', markup)
-        multiple_roles = replace(reading, rows=(replace(status_row("claude1"), roles=("units", "workers", "spare"),
-            role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),) * 2 + (accounts.NoRoleCount(),)),))
-        markup = accounts_page.board(multiple_roles)
-        self.assertEqual(markup.count('class="color-swatch"'), 3)
-        self.assertIn('data-color-key="role.worker" data-color-name="workers" data-saved-color="#c0c0c0"', markup)
-        self.assertIn('<td class="left"><span class="default">spare</span></td><td class="left"></td>', markup)
-        self.assertNotIn('data-color-name="total"', markup)
-        table = accounts.status_board(multiple_roles)
-        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 3))
 
-    def test_all_account_sort_orders_include_ties_and_missing_values(self) -> None:
+    def test_account_and_role_sort_orders_use_full_values_and_keep_missing_values_last(self) -> None:
         reading = sort_reading()
-        table = accounts.status_board(reading)
-        orders = accounts.account_board_sort_orders(reading, table)
-        expected = {"account": [0, 1, 2, 3, 4, 5, 6], "left": [5, 0, 1, 2, 3, 4, 6],
-                    "role": [3, 5, 2, 6, 0, 1, 4], "busy": [0, 2, 3, 1, 5, 4, 6],
-                    "next": [2, 0, 1, 3, 4, 5, 6], "idle": [1, 2, 3, 0, 5, 4, 6],
-                    "paused": [0, 2, 1, 3, 5, 4, 6], "exited": [2, 1, 3, 0, 5, 4, 6],
-                    "total": [1, 0, 2, 3, 5, 4, 6], "resets": [5, 6, 2, 3, 0, 1, 4],
-                    "credits": [6, 2, 3, 0, 1, 5, 4], "enabled": [6, 0, 1, 2, 3, 4, 5]}
-        for column, indices in expected.items():
-            with self.subTest(column=column):
-                self.assertEqual([place["index"] for place in orders[column]], indices)
-        precise = replace(reading, rows=tuple(replace(row, weekly_left_percent=10.1 if row.label == "claude2" else 10.2)
-                          if row.label in ("claude1", "claude2") else row for row in reading.rows))
-        self.assertEqual([place["index"] for place in accounts.account_board_sort_orders(precise, accounts.status_board(precise))["left"]],
-                         [5, 2, 3, 0, 1, 4, 6])
-        table["rows"][4]["cells"]["roles"] = []
-        self.assertEqual(accounts.account_board_sort_orders(reading, table)["role"], orders["role"])
-
-    def test_reversed_account_sort_orders_keep_missing_values_last(self) -> None:
-        reading = sort_reading()
-        orders = accounts.account_board_sort_orders(reading, accounts.status_board(reading))
-        expected = {"account-reverse": [6, 5, 4, 3, 2, 1, 0], "left-reverse": [3, 2, 1, 0, 5, 6, 4],
-                    "role-reverse": [1, 0, 6, 2, 5, 3, 4], "busy-reverse": [5, 1, 2, 3, 0, 6, 4],
-                    "next-reverse": [0, 2, 6, 5, 4, 3, 1], "idle-reverse": [5, 0, 2, 3, 1, 6, 4],
-                    "paused-reverse": [5, 3, 1, 2, 0, 6, 4], "exited-reverse": [5, 0, 3, 1, 2, 6, 4],
-                    "total-reverse": [5, 3, 2, 0, 1, 6, 4], "resets-reverse": [0, 1, 2, 3, 6, 5, 4],
-                    "credits-reverse": [5, 0, 1, 2, 3, 6, 4], "enabled-reverse": [6, 5, 4, 2, 3, 0, 1]}
-        for column, indices in expected.items():
-            with self.subTest(column=column):
-                self.assertEqual([place["index"] for place in orders[column]], indices)
-
-    def test_sort_details_repeat_for_split_accounts_and_preserve_the_total(self) -> None:
-        reading = sort_reading()
-        table = accounts.status_board(reading)
-        before = json.dumps(table)
-        orders = accounts.account_board_sort_orders(reading, table)
-        self.assertEqual([place["details"] for place in orders["role"]], [True, True, True, True, True, False, True])
-        self.assertEqual([place["details"] for place in orders["account"]], [True, False, True, False, True, True, True])
-        self.assertTrue(all(len(order) == len(table["rows"]) - 1 for order in orders.values()))
-        self.assertEqual(json.dumps(table), before)
-        self.assertEqual(table["rows"][-1]["cells"]["label"][0]["text"], "total")
-
-    def test_default_account_sort_uses_the_role_order_and_named_headers_are_focusable(self) -> None:
-        reading = sort_reading()
-        table = accounts.status_board(reading)
-        self.assertEqual([row["cells"]["roles"][0]["text"] for row in table["rows"][:-1]],
-                         ["units", "workers", "showrunners", "producers", "", "producers", "spare"])
+        reading = replace(reading, rows=tuple(
+            replace(row, weekly_left_percent=10.1 if row.label == "claude2" else 10.2)
+            if row.label in ("claude1", "claude2") else row for row in reading.rows))
         markup = accounts_page.board(reading)
+        accounts_order = rendered_sort_orders(markup, "accounts")
+        roles_order = rendered_sort_orders(markup, "roles")
+        for key, order in {
+            "account": [0, 1, 2, 3, 4, 5, 6], "account-reverse": [6, 5, 4, 2, 3, 0, 1],
+            "left": [5, 2, 3, 0, 1, 4, 6], "left-reverse": [0, 1, 2, 3, 5, 4, 6],
+            "credits": [6, 2, 3, 0, 1, 5, 4], "credits-reverse": [5, 0, 1, 2, 3, 6, 4],
+            "resets": [5, 6, 2, 3, 0, 1, 4], "resets-reverse": [0, 1, 2, 3, 6, 5, 4],
+            "enabled": [6, 0, 1, 2, 3, 4, 5], "enabled-reverse": [6, 0, 1, 2, 3, 4, 5],
+        }.items():
+            with self.subTest(key=key):
+                self.assertEqual(accounts_order[key], order)
+        for key, order in {
+            "role": [0, 1, 2, 3], "role-reverse": [3, 2, 1, 0],
+            "busy": [0, 1, 2, 3], "busy-reverse": [3, 0, 1, 2],
+            "idle": [3, 0, 1, 2], "idle-reverse": [2, 1, 0, 3],
+        }.items():
+            with self.subTest(key=key):
+                self.assertEqual(roles_order[key], order)
+
+    def test_shared_account_renders_one_details_row_and_one_added_role_row(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("units", "producers"), selected_roles=("units", "producers")),
+            replace(status_row("codex1"), tool="codex", roles=("spare",)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
+        lines = cast(list[str], re.findall(r'<tr data-account-row="[^"]+">(.*?)</tr>', table, re.S))
+        first, added, spare = (cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines)
+        self.assertIn(">claude1</span>", first[1])
+        self.assertIn('data-color-text="role.unit-director">units</span>', first[6])
+        self.assertIn(">producers</span>", added[6])
+        self.assertIn('data-move-account="claude1" data-move-group="producers"', added[8])
+        self.assertEqual(added[:6] + added[9:], [""] * 9)
+        self.assertIn(">codex1</span>", spare[1])
+        self.assertEqual(spare[6:8], ["", ""])
+        self.assertNotIn("spare", markup)
+        self.assertNotIn("✓", markup)
+        orders = rendered_sort_orders(markup, "accounts")
+        self.assertEqual(orders["role"], [1, 0, 2])
+        self.assertEqual(orders["role-reverse"], [0, 1, 2])
+
+    def test_roles_shows_the_selected_account_and_totals_with_account_details(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("units", "producers"),
+                    role_counts=(accounts.RoleSessionCounts(7, 0, 2, 1), accounts.RoleSessionCounts(0, 0, 0, 0))),
+            replace(status_row("claude2"), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(2, 3, 0, 4),)),
+            replace(status_row("claude3"), roles=("producers",), selected_roles=("producers",),
+                    role_counts=(accounts.RoleSessionCounts(8, 0, 0, 0),)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        roles_table = markup.split('<h2>Roles</h2>', 1)[1]
+        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
+        self.assertIn(">claude2</span></td>", units)
+        self.assertNotIn(">claude1</span>", units)
+        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([0-9]+)</td>', NOT_RUNNING_SLOT.sub("", units))
+        self.assertEqual(cells, [
+            (f"claude2: {selected}\nclaude1: {observed}", str(selected + observed))
+            for selected, observed in ((2, 7), (3, 0), (9, 10))
+        ])
+        orders = rendered_sort_orders(markup, "roles")
+        self.assertEqual(orders["busy"][:2], [2, 0])
+        self.assertEqual(orders["busy-reverse"][:2], [0, 2])
+        producers = roles_table.split(">producers</span>", 1)[1].split("</tr>", 1)[0]
+        self.assertNotIn("data-role-counts", producers)
+
+    def test_unassigned_role_keeps_observed_counts(self) -> None:
+        reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
+        roles_table = accounts_page.board(reading).split('aria-label="Roles"', 1)[1]
+        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
+        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([0-9]+)</td>', NOT_RUNNING_SLOT.sub("", units))
+        self.assertIn('<td class="left"><span class="inactive">no account</span></td>', units)
+        self.assertEqual(cells, [(f"claude1: {count}", str(count)) for count in (1, 0, 1)])
+
+    def test_roles_tooltip_names_accounts_with_unknown_counts(self) -> None:
+        rows = (
+            replace(status_row("claude1"), role_counts=(accounts.UnknownRoleCounts(),)),
+            replace(status_row("claude2"), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(2, 0, 1, 0),)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        roles_table = markup.split('aria-label="Roles"', 1)[1]
+        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
+        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([^<]*)</td>', NOT_RUNNING_SLOT.sub("", units))
+        self.assertEqual(cells, [
+            (f"claude2: {count}\nclaude1: unknown", value)
+            for count, value in ((2, ""), (0, ""), (3, "unknown"))
+        ])
+
+    def test_roles_next_column_shows_each_target_as_text_without_a_control(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("showrunners", "units"), selected_roles=("units", "showrunners")),
+            replace(status_row("claude2"), roles=("producers",), selected_roles=()),
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
+        )
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
+        markup = accounts_page.board(reading)
+        account_table, roles_table = markup.split('aria-label="Roles"', 1)
+        self.assertIn('data-next-button', account_table)
+        self.assertNotIn('data-next-button', roles_table)
+        heads = re.findall(r'<th class="[a-z]+"(?: data-role-sort="([^"]*)")?', roles_table.split("</thead>", 1)[0])
+        self.assertEqual(heads[:5], ["role", "", "", "account", "next"])
+        def next_cell(role: str) -> str:
+            row = roles_table.split(f">{role}</span>", 1)[1].split("</tr>", 1)[0]
+            match = re.search(r'<td class="left next-cell">(.*?)</td>', row)
+            assert match is not None
+            return match.group(1)
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("units")), "claude2")
+        self.assertIn('class="default bold"', next_cell("units"))
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("showrunners")), "none")
+        self.assertEqual(next_cell("producers"), accounts_page.DASH)
+        self.assertEqual(re.sub(r"<[^>]+>", "", next_cell("workers")), "auto")
+        orders = rendered_sort_orders(markup, "roles")
+        self.assertEqual(orders["next"], [3, 2, 1, 0])
+
+    def test_roles_shows_a_total_without_accounts(self) -> None:
+        reading = accounts.StatusReading((), (), (), timezone.utc, AT)
+        roles_table = accounts_page.board(reading).split('aria-label="Roles"', 1)[1]
+        self.assertEqual(roles_table.count('<span class="inactive">no account</span>'), 4)
+        total = roles_table.split('<tr data-summary>', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('<span class="default bold">total</span>', total)
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', total),
+                         ['<span class="default">0</span>'] * 2 + ['<span class="default">0</span><span class="not-running-slot"></span>'])
+
+    def busy_lines(self, samples: list[role_activity.RoleBusySample], zone: ZoneInfo | None = None,
+                   now: datetime = AT) -> dict[str, str]:
+        """Render the board with the samples in the zone (New York when none) and return each role's busy line SVG."""
+        zone = zone or ZoneInfo("America/New_York")
+        reading = accounts.StatusReading((status_row("claude1"),), (), (), zone, now)
+        with patch.object(role_activity, "read", return_value=samples) as read:
+            roles_table = accounts_page.board(reading).split('aria-label="Roles"', 1)[1]
+        read.assert_called_once_with(now)
+        return {role: line for line, role in cast(list[tuple[str, str]], re.findall(
+            r'(<svg class="busy-line" [^>]*aria-label="([a-z]+) busy sessions, last 24 hours">.*?</svg>)', roles_table))}
+
+    def test_roles_table_shows_the_busy_line_column_and_no_paused_or_exited_column(self) -> None:
+        roles_table = accounts_page.board(sort_reading()).split('aria-label="Roles"', 1)[1]
+        heads = cast(list[str], re.findall(r'<th class="[a-z]+"[^>]*>(.*?)</th>', roles_table.split("</thead>", 1)[0]))
+        self.assertEqual([re.sub(r"<[^>]+>|▲", "", head) for head in heads],
+                         ["role", "", "busy, last 24 h", "account", "next", "busy", "idle", "total"])
+        self.assertNotIn("paused", roles_table.split("</thead>", 1)[0])
+        self.assertNotIn("exited", roles_table.split("</thead>", 1)[0])
+        rows = cast(list[str], re.findall(r"<tr(?: data-summary)?>(.*?)</tr>", roles_table.split("<tbody>", 1)[1], re.S))
+        for row in rows[:-1]:
+            cells = cast(list[str], re.findall(r"<td[^>]*>(.*?)</td>", row, re.S))
+            self.assertEqual(len(cells), 8)
+            self.assertTrue(cells[2].startswith('<svg class="busy-line" width="288" height="35" viewBox="-4 0 296 35" role="img"'))
+        summary = cast(list[str], re.findall(r'<td class="[^"]+">(.*?)</td>', rows[-1], re.S))
+        self.assertEqual(len(summary), 8)
+        self.assertEqual(summary[1:5], [""] * 4)
+
+    def test_busy_line_joins_close_samples_and_breaks_at_a_missing_role_or_a_time_gap(self) -> None:
+        def sample(minutes_ago: int, **busy: int) -> role_activity.RoleBusySample:
+            return role_activity.RoleBusySample(AT - timedelta(minutes=minutes_ago), busy)
+
+        def points(line: str) -> list[str]:
+            return cast(list[str], re.findall(r'<polyline points="([^"]+)"/>', line))
+
+        # A pixel column is 5 minutes, and a point sits at the end of its column.
+        lines = self.busy_lines([sample(6, units=2), sample(0, units=4, workers=1)])
+        self.assertEqual(points(lines["units"]), ["287.0,11.0 288.0,1.0"])
+        self.assertIn('stroke="#d7af00"', lines["units"])
+        # One sample has no line to draw, so the round cap shows it as a dot; the scale is at least 1.
+        self.assertEqual(points(lines["workers"]), ["288.0,1.0 288.0,1.0"])
+        self.assertNotIn("<polyline", lines["producers"])
+        missing = self.busy_lines([sample(25, units=1), sample(17, workers=1), sample(9, units=2), sample(0, units=2)])
+        self.assertEqual(points(missing["units"]), ["283.0,11.0 283.0,11.0", "287.0,1.0 288.0,1.0"])
+        # Samples at the SAMPLE_GAP limit join; a longer gap breaks the line.
+        self.assertEqual(role_activity.SAMPLE_GAP, timedelta(minutes=10))
+        late = self.busy_lines([sample(40, units=1), sample(30, units=1), sample(15, units=2)])
+        self.assertEqual(points(late["units"]), ["280.0,11.0 282.0,11.0", "285.0,1.0 285.0,1.0"])
+
+    def test_busy_line_keeps_the_largest_count_of_each_pixel_column(self) -> None:
+        def sample(minutes_ago: int, units: int) -> role_activity.RoleBusySample:
+            return role_activity.RoleBusySample(AT - timedelta(minutes=minutes_ago), {"units": units})
+
+        peak = self.busy_lines([sample(8, 1), sample(6, 0), sample(4, 3), sample(2, 1), sample(0, 2)])
+        self.assertEqual(re.findall(r'<polyline points="([^"]+)"/>', peak["units"]), ["287.0,14.3 288.0,1.0"])
+        # A sample every two minutes for a full day gives one point for each of the 288 columns.
+        day = self.busy_lines([sample(minutes, minutes % 7) for minutes in range(24 * 60, -1, -2)])["units"]
+        line = cast(list[str], re.findall(r'<polyline points="([^"]+)"/>', day))
+        self.assertEqual(len(line), 1)
+        columns = [float(point.split(",")[0]) for point in line[0].split()]
+        self.assertEqual(columns, [float(column) for column in range(1, 289)])
+
+    def hour_marks(self, line: str) -> list[tuple[float, str]]:
+        """Each hour mark as its x and its label; a tick has no label."""
+        return [(float(x), label) for x, label in cast(list[tuple[str, str]], re.findall(
+            r'<(?:text|line class="busy-tick") x1?="([0-9.]+)"[^>]*?(?:/>|>([0-9]+)</text>)', line))]
+
+    def test_busy_line_labels_every_third_hour_of_the_zone_and_ticks_the_others(self) -> None:
+        for zone, labels in ((ZoneInfo("America/New_York"), ["12", "15", "18", "21", "0", "3", "6", "9"]),
+                             (ZoneInfo("UTC"), ["18", "21", "0", "3", "6", "9", "12", "15"])):
+            with self.subTest(zone=zone):
+                line = self.busy_lines([], zone)["units"]
+                self.assertEqual(re.findall(r"<text [^>]*>([0-9]+)</text>", line), labels)
+                self.assertEqual(len(re.findall(r'<line class="busy-tick"', line)), 16)
+                self.assertIn('<line class="busy-base" x1="0" x2="288" y1="21.5" y2="21.5"/>', line)
+                self.assertNotIn("<polyline", line)
+        first = self.busy_lines([], ZoneInfo("America/New_York"))["units"]
+        # 12:00 EST is two hours after the window start at 10:00 EST.
+        self.assertIn('<text x="24.0" y="32">12</text>', first)
+        self.assertIn('<line class="busy-tick" x1="12.0" x2="12.0" y1="24" y2="28"/>', first)
+
+    def test_busy_line_marks_follow_the_hour_when_now_is_not_on_the_hour(self) -> None:
+        # The window starts at 10:20 EST, so 11:00 is 40 minutes (8 px) in and 12:00 is 20 px in.
+        marks = self.hour_marks(self.busy_lines([], ZoneInfo("America/New_York"), AT + timedelta(minutes=20))["units"])
+        self.assertEqual(marks[:2], [(8.0, ""), (20.0, "12")])
+        self.assertEqual([x for x, _ in marks], [8.0 + 12 * index for index in range(24)])
+        self.assertEqual([label for _, label in marks if label], ["12", "15", "18", "21", "0", "3", "6", "9"])
+
+    def test_busy_line_marks_stay_one_hour_apart_on_a_daylight_saving_day(self) -> None:
+        zone = ZoneInfo("America/New_York")
+        # Each window ends at 12:00 local time on the day the clock changes.
+        for now, labels in ((datetime(2026, 11, 1, 12, tzinfo=zone), ["15", "18", "21", "0", "3", "6", "9", "12"]),
+                            (datetime(2026, 3, 8, 12, tzinfo=zone), ["12", "15", "18", "21", "0", "3", "6", "9", "12"])):
+            with self.subTest(now=now):
+                marks = self.hour_marks(self.busy_lines([], zone, now.astimezone(timezone.utc))["units"])
+                self.assertEqual([x for x, _ in marks], [12.0 * index for index in range(1, 25)])
+                self.assertEqual([label for _, label in marks if label], labels)
+
+    def test_warning_icon_names_paused_and_exited_sessions_and_the_total_sums_them(self) -> None:
+        rows = (
+            replace(status_row("claude1"), selected_roles=("units",), role_counts=(accounts.RoleSessionCounts(2, 1, 1, 1),),
+                    named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),
+                                                      accounts.NamedSession("fix2", "exited"),
+                                                      accounts.NamedSession("busy-unit", "busy"))}),
+            replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
+            # The Mac sends counts without names.
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",),
+                    role_counts=(accounts.RoleSessionCounts(0, 0, 2, 0),)),
+        )
+        roles_table = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT)).split('aria-label="Roles"', 1)[1]
+
+        def warning(row: str) -> str:
+            match = re.search(r'<span class="not-running" id="([^"]+)" role="img" aria-label="not running" tabindex="0" '
+                              + r'aria-describedby="\1-tip" data-tip><svg[^>]*lucide-triangle-alert.*?</svg>\s*</span>'
+                              + r'<span id="\1-tip" hidden>([^<]+)</span>', row, re.S)
+            assert match is not None
+            return html.unescape(match[2])
+
+        def row(role: str) -> str:
+            return roles_table.split(f">{role}</span>", 1)[1].split("</tr>", 1)[0]
+
+        self.assertEqual(warning(row("units")), "2 not running: 1 paused (tile), 1 exited (fix2)")
+        self.assertEqual(warning(row("workers")), "2 not running: 2 paused (names unknown)")
+        for role in ("showrunners", "producers"):
+            self.assertNotIn('class="not-running"', row(role))
+            self.assertIn('<span class="not-running-slot"></span></td>', row(role))
+        total = roles_table.split("<tr data-summary>", 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(warning(total), "4 not running: 3 paused (tile, 2 names unknown), 1 exited (fix2)")
+        self.assertEqual(roles_table.count('<span class="not-running" id="role-not-running-'), 3)
+
+    def test_codex_pair_rows_carry_the_tint_and_the_hover_text(self) -> None:
+        statusline = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        base = statusline.read_text(encoding="utf-8")
+        rows = (replace(status_row("claude1"), selected_roles=("units",)),
+                replace(status_row("codex1"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),),
+                        weekly_left_percent=30),
+                replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",),
+                        weekly_left_percent=20))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+
+        def left(*percents: float | accounts.StatusUnavailable) -> accounts.StatusReading:
+            return replace(reading, rows=(rows[0], *(replace(row, weekly_left_percent=percent)
+                                                     for row, percent in zip(rows[1:], percents, strict=True))))
+
+        def pair(reading: accounts.StatusReading, color: str = "#7896ff", *,
+                 no_workers: bool = False) -> list[tuple[str, str, str]]:
+            _ = statusline.write_text(base + f"background.codex-pair={color}\n", encoding="utf-8")
+            with patch.object(quota_state, "no_worker_mode", return_value=no_workers):
+                table = accounts_page.board(reading).split('aria-label="Roles"', 1)[0]
+            return [(style, label, html.unescape(tip)) for style, label, tip in cast(list[tuple[str, str, str]], re.findall(
+                r'<tr class="auto-pair"((?: style="[^"]+")?) data-account-row="([^"]+)">.*?'
+                + r'<td class="left next-cell"><span class="next-muted" id="pair-auto-\2" tabindex="0" '
+                + r'aria-describedby="pair-auto-\2-tip" data-tip>auto</span><span id="pair-auto-\2-tip" hidden>([^<]+)</span></td>',
+                table, re.S))]
+
+        def words(now: str, mode: str) -> str:
+            return f"codex1 and codex2 alternate when available. {now}We are in {mode} mode."
+
+        tint = ' style="background:color-mix(in srgb,#7896ff 12%,transparent)"'
+        working = words("codex2 is working right now. ", "working workers")
+        self.assertEqual(pair(reading), [(tint, "codex1", working), (tint, "codex2", working)])
+        # The mode and the quota are separate facts: quota left with no-worker mode on, then no quota with it off.
+        self.assertEqual({tip for _, _, tip in pair(reading, no_workers=True)},
+                         {words("codex2 is working right now. ", "self-actualizing")})
+        self.assertEqual({tip for _, _, tip in pair(left(0, 0))},
+                         {words("No account has availability. ", "working workers")})
+        # An unknown value makes no claim, so the workers account stays the working account.
+        self.assertEqual({tip for _, _, tip in pair(left(accounts.StatusUnavailable("fixture"), 0))}, {working})
+        # With no selected workers account, the text leaves out the working sentence and does not fail.
+        self.assertEqual(accounts_page._pair_text([replace(row, selected_roles=()) for row in rows[1:]]),  # pyright: ignore[reportPrivateUsage]
+                         words("", "working workers"))
+        named = ' style="background:color-mix(in srgb,#af87ff 12%,transparent)"'
+        self.assertEqual([style for style, _, _ in pair(reading, "purple")], [named, named])
+        for invalid in ("#12345", "not-a-color", ""):
+            with self.subTest(color=invalid):
+                self.assertEqual([style for style, _, _ in pair(reading, invalid)], ["", ""])
+        targeted = replace(reading, first_next_moves=accounts.FirstNextMoveTargets({"workers": "claude1"}))
+        self.assertNotIn("auto-pair", accounts_page.board(targeted))
+        self.assertIn("tr.auto-pair+tr.auto-pair td{border-top-color:transparent}", accounts_page.STYLE)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_warning_icon_and_pair_auto_show_their_text_on_hover_and_focus(self) -> None:
+        statusline = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        _ = statusline.write_text(statusline.read_text(encoding="utf-8") + "background.codex-pair=#7896ff\n", encoding="utf-8")
+        rows = (replace(status_row("claude1"), selected_roles=("units",), role_counts=(accounts.RoleSessionCounts(3, 0, 1, 0),),
+                        named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),)}),
+                replace(status_row("codex1"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),)),
+                replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",)))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        with patch.object(accounts, "read_status", return_value=reading):
+            page = accounts_page.page().decode()
+        # The refreshed reading drains both Codex accounts, so the pair text changes.
+        drained = replace(reading, rows=(rows[0], *(replace(row, weekly_left_percent=0) for row in rows[1:])))
+        with patch.object(accounts, "read_status", return_value=drained):
+            fresh = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
+        setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
+        probe = r"""<script>
+(async()=>{
+const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+try{
+ if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+ frameElement.style.width='1100px';frameElement.style.height='700px';await flush();
+ const tooltip=document.querySelector('.model-tooltip'), icon=document.querySelector('#role-not-running-units');
+ icon.scrollIntoView({block:'center'});
+ icon.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+ check(!tooltip.hidden && tooltip.textContent==='1 not running: 1 paused (tile)','hover on the icon shows the names');
+ icon.dispatchEvent(new PointerEvent('pointerout',{bubbles:true}));
+ check(tooltip.hidden,'leaving the icon hides its tooltip');
+ icon.focus({preventScroll:true});icon.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(document.activeElement===icon && !tooltip.hidden && tooltip.textContent==='1 not running: 1 paused (tile)',
+  'focus on the icon shows the same text');
+ const description=target=>document.getElementById(target.getAttribute('aria-describedby'));
+ check(icon.getAttribute('role')==='img' && icon.getAttribute('aria-label')==='not running' &&
+  description(icon)?.hidden && description(icon)?.textContent==='1 not running: 1 paused (tile)',
+  'the icon is a named image with the tooltip text as its description');
+ const slots=[...document.querySelectorAll('.roles-table .not-running-slot')].map(slot=>slot.getBoundingClientRect().width);
+ check(slots.length===5 && slots.every(width=>width===slots[0]),'every total keeps the same slot width');
+ const auto=document.querySelector('#pair-auto-codex2');
+ auto.scrollIntoView({block:'center'});
+ auto.focus({preventScroll:true});auto.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ const words='codex1 and codex2 alternate when available. codex2 is working right now. We are in working workers mode.';
+ check(!tooltip.hidden && tooltip.textContent===words,'focus on auto shows the pair text');
+ check(!auto.hasAttribute('role') && !auto.hasAttribute('aria-label') && description(auto)?.textContent===words,
+  'auto keeps its own text and takes the pair text as its description');
+ check(getComputedStyle(tooltip).whiteSpace==='normal' && tooltip.getBoundingClientRect().width<=320,
+  'the pair text wraps in a narrow tooltip');
+ const pairRows=[...document.querySelectorAll('tr.auto-pair')];
+ check(pairRows.length===2 && pairRows.every(row=>getComputedStyle(row).backgroundColor!=='rgba(0, 0, 0, 0)'),
+  'both pair rows are tinted');
+ const between=()=>getComputedStyle(document.querySelector('tr.auto-pair+tr.auto-pair').cells[0]).borderTopColor;
+ check(between()==='rgba(0, 0, 0, 0)','no line between the pair rows');
+ document.querySelector('[data-account-sort="account"]').click();await flush();
+ check(document.querySelectorAll('tr.auto-pair').length===2 && between()==='rgba(0, 0, 0, 0)',
+  'the reverse sort keeps the tint and no line between the pair rows');
+ const focused=document.querySelector('#pair-auto-codex1');
+ focused.scrollIntoView({block:'center'});
+ focused.focus({preventScroll:true});focused.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ document.dispatchEvent(new Event('visibilitychange'));await flush();
+ const restored=document.querySelector('#pair-auto-codex1');
+ const drained='codex1 and codex2 alternate when available. No account has availability. We are in working workers mode.';
+ check(!focused.isConnected && document.activeElement===restored && !tooltip.hidden && tooltip.textContent===drained,
+  'a refresh keeps focus on auto and shows the new pair text');
+}catch(error){failures.push(String(error));}
+realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
+        markup = accounts_page.board(sort_reading())
         self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
-                         ["account", "left", "role", "next", "busy", "idle", "paused", "exited",
-                          "total", "resets", "credits", "enabled"])
-        self.assertEqual(markup.count('tabindex="0"'), 12)
-        self.assertEqual(markup.count('class="sort-arrow"'), 12)
+                         ["account", "left", "used / hour", "empty at", "role", "next", "resets", "credits", "enabled"])
+        self.assertEqual(re.findall(r'data-role-sort="([^"]+)"', markup),
+                         ["role", "account", "next", "busy", "idle", "total"])
+        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 15)
+        self.assertEqual(markup.count('class="sort-arrow"'), 15)
+        self.assertIn('<th class="left">busy, last 24 h</th>', markup)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
+        self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', markup)
+
+    def test_next_sort_uses_the_displayed_values_in_both_directions(self) -> None:
+        rows = (
+            replace(status_row("claude1"), roles=("showrunners",), selected_roles=("showrunners",)),
+            replace(status_row("claude2"), selected_roles=("units",)),
+            replace(status_row("claude3"), roles=("spare",)),
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
+        )
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3"}))
+        orders = rendered_sort_orders(accounts_page.board(reading), "accounts")
+
+        self.assertEqual(orders["next"], [3, 1, 0, 2])
+        self.assertEqual(orders["next-reverse"], [0, 1, 3, 2])
+
+    def test_weekly_forecast_columns_use_recent_history_for_both_tools(self) -> None:
+        def history(used: float, rate: float, age_minutes: int = 0) -> list[run_out.Reading]:
+            return [run_out.Reading(AT - timedelta(minutes=age_minutes + 10 * step), used - rate * step / 6)
+                    for step in range(12, -1, -1)]
+
+        rows = (
+            status_row("claude1"),
+            replace(status_row("claude2"), resets_at=AT + timedelta(hours=3)),
+            status_row("claude3"),
+            status_row("claude4"),
+            replace(status_row("codex1"), tool="codex"),
+            replace(status_row("codex2"), tool="codex", resets_at=accounts.StatusUnavailable()),
+        )
+        histories = {"claude1": history(40, 10), "claude2": history(40, 10),
+                     "claude4": history(40, 10, 16),
+                     "codex1": history(40, 15), "codex2": history(40, 5)}
+        reading = accounts.StatusReading(rows, (), (), ZoneInfo("America/New_York"), AT)
+        with (patch.object(run_out, "read_readings", return_value=histories) as read,
+              patch.object(accounts, "read_status", return_value=reading)):
+            markup = accounts_page.page().decode()
+        read.assert_called_once_with(run_out.READINGS_LOG)
+
+        table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
+        lines = table.split("<tbody>", 1)[1].split("</tr>")[:-1]
+        expected = (("10.0%", "Sun 11-15 16:00 EST"), ("10.0%", "—"), ("—", "—"), ("—", "—"),
+                    ("15.0%", "Sun 11-15 14:00 EST"), ("5.0%", "—"))
+        for row, line, (rate, empty) in zip(rows, lines, expected, strict=True):
+            with self.subTest(account=row.label):
+                cells = cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S))
+                self.assertIn(f">{row.label}</span>", cells[1])
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[4]), rate)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), empty)
+                if row.label == "claude2":
+                    self.assertIn('title="Quota lasts until the weekly reset."', cells[5])
+                if rate == "—":
+                    for cell in cells[4:6]:
+                        self.assertIn('title="No usage rate is available."', cell)
+        order = rendered_sort_orders(markup, "accounts")
+        self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
+        self.assertEqual(order["empty at"], [4, 0, 1, 2, 3, 5])
+
+    def test_weekly_forecast_excludes_history_before_a_scheduled_reset_or_refill(self) -> None:
+        rows = (
+            replace(status_row("claude1"), weekly_left_percent=98,
+                    resets_at=AT + timedelta(days=7, minutes=-1)),
+            replace(status_row("claude2"), weekly_left_percent=98),
+        )
+        history = [run_out.Reading(AT - timedelta(minutes=2 + 10 * step), 99 - step)
+                   for step in range(12, -1, -1)]
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        with patch.object(run_out, "read_readings", return_value={row.label: history for row in rows}):
+            markup = accounts_page.board(reading)
+
+        table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
+        self.assertNotIn("<time", table)
+        self.assertEqual(table.count('title="No usage rate is available."'), 4)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
@@ -472,107 +1045,63 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- const header=key=>document.querySelector('[data-account-sort="'+key+'"]');
- const bounds=node=>{
-  const range=document.createRange();
-  range.selectNodeContents(node);
-  return range.getBoundingClientRect();
- };
- const labelText=span=>[...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE);
- const checkAlignment=(key,direction)=>{
-  const cell=header(key),arrow=cell.querySelector('.sort-arrow');
-  const label=labelText(cell.querySelector('.sort-label'));
-  const value=[...document.querySelector('tbody').rows].slice(0,-1)
-   .map(row=>row.cells[cell.cellIndex]).find(candidate=>candidate.textContent.trim());
-  const name=key+' '+direction+' at '+getComputedStyle(document.documentElement).fontSize;
-  const text=bounds(label),right=cell.classList.contains('right'),edge=right ? 'right' : 'left';
-  check(Math.abs(text[edge]-bounds(value)[edge])<=1,name+': the header and value align');
-  check(cell.getAttribute('aria-sort')===direction,name+': the header has the expected sort state');
-  check(getComputedStyle(arrow).visibility===(direction==='none' ? 'hidden' : 'visible'),name+': the arrow visibility matches the sort state');
-  if(direction!=='none'){
-   const icon=arrow.getBoundingClientRect();
-   check(right ? icon.right<text.left : icon.left>text.right,name+': the arrow fits beside the text');
-   const labels=[...cell.closest('table').querySelectorAll('.sort-label')].map(labelText);
-   check(labels.every(other=>{
-    const box=bounds(other);
-    return icon.right<=box.left || icon.left>=box.right;
-   }),name+': the arrow does not overlap any header label');
-  }
- };
- const checkTableFits=label=>{
-  const scroll=document.querySelector('.card .scroll');
-  check(scroll.scrollWidth===scroll.clientWidth,label+': the table fits the card without horizontal scrolling');
- };
- const keys=()=>{let account='';return [...document.querySelector('tbody').rows].slice(0,-1).map(row=>{
-  account=row.cells[1].textContent || account;return account+':'+row.cells[4].textContent.replace(' ✓','');
- });};
- const click=key=>header(key).click();
+ const table=name=>document.querySelector('[data-sort-table="'+name+'"] table');
+ const header=(name,key)=>[...table(name).querySelectorAll('th[aria-sort]')]
+  .find(node=>node.querySelector('.sort-label').textContent.replace(/[▲▼]/g,'')===key);
+ const rows=name=>[...table(name).tBodies[0].rows];
+ const labels=(name,index)=>rows(name).filter(row=>!row.hasAttribute('data-summary'))
+  .map(row=>row.cells[index].textContent).filter(Boolean).join(',');
+ const direction=node=>node.getAttribute('aria-sort');
+ const activate=(node,key)=>node.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true}));
  try{
   frameElement.style.width='1280px';frameElement.style.height='520px';await flush();
-  const original=keys(),total=document.querySelector('tbody').lastElementChild.outerHTML;
-  const geometry=()=>[...document.querySelectorAll('th')].map(node=>[node.getBoundingClientRect().x,node.getBoundingClientRect().width]);
-  const initialGeometry=geometry();
-  const sameGeometry=()=>geometry().every((box,index)=>box.every((value,side)=>Math.abs(value-initialGeometry[index][side])<.5));
-  const same=(indices,label)=>{
-   check(JSON.stringify(keys())===JSON.stringify(indices.map(index=>original[index])),label);
-   check(document.querySelector('tbody').lastElementChild.outerHTML===total,'the total stays last and unchanged: '+label);
-   check(sameGeometry(),'columns keep their positions: '+label);
-  };
-  checkTableFits('the default sort at 1280px');
-  const arrows=[...document.querySelectorAll('.sort-arrow')];
-  arrows.forEach(arrow=>{arrow.style.display='none';});
-  check(sameGeometry(),'arrows add no width to the table');
-  arrows.forEach(arrow=>arrow.style.removeProperty('display'));
-  check(original[0]==='claude1:units' && original[1]==='claude1:workers','the default account order');
-  const added=[['next','ascending'],['idle','descending'],['paused','descending'],['exited','descending'],
-   ['total','descending'],['resets','ascending'],['credits','descending'],['enabled','descending']];
-  for(const key of ['left','role','busy',...added.map(([key])=>key)]) checkAlignment(key,'none');
-  checkAlignment('account','ascending');
-  check(document.querySelectorAll('[data-account-sort]').length===12,'every named header sorts');
-  check([...document.querySelectorAll('[data-account-sort]')].every(node=>node.tabIndex===0 && getComputedStyle(node).cursor==='pointer'),
-   'the sort headers support focus and show a pointer');
-  click('account');same([6,5,4,3,2,1,0],'a second account choice reverses');
-  check(header('account').getAttribute('aria-sort')==='descending','the account arrow reverses');
-  checkAlignment('account','descending');
-  click('account');same([0,1,2,3,4,5,6],'account ascending');
-  click('left');same([5,0,1,2,3,4,6],'left ascending');
-  checkTableFits('left sorted at 1280px');
-  checkAlignment('left','ascending');
-  click('left');same([3,2,1,0,5,6,4],'left descending');
-  checkAlignment('left','descending');
-  header('role').focus();header('role').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
-  same([3,5,2,6,0,1,4],'Enter selects role ascending');
-  checkAlignment('role','ascending');
-  const roleRows=[...document.querySelector('tbody').rows];
-  check(roleRows[0].cells[1].textContent==='claude2' && roleRows[2].cells[1].textContent==='claude2',
-   'split accounts repeat details');
-  check(roleRows[4].cells[1].textContent==='claude1' && roleRows[5].cells[1].textContent==='',
-   'a consecutive account run shows details once');
-  click('role');same([1,0,6,2,5,3,4],'role descending');
-  checkAlignment('role','descending');
-  click('busy');same([0,2,3,1,5,4,6],'busy descending');
-  checkAlignment('busy','descending');
-  check(header('busy').getAttribute('aria-sort')==='descending' && header('busy').querySelector('.sort-arrow').textContent==='▼',
-   'busy starts with the descending arrow');
-  click('busy');same([5,1,2,3,0,6,4],'busy ascending');
-  checkAlignment('busy','ascending');
-  check(JSON.parse(localStorage.getItem('accounts-sort')).reverse===true,'the choice enters viewer storage');
-  const oldTable=document.querySelector('table');
-  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
-  check(reads>0 && document.querySelector('table')!==oldTable,'a live refresh replaces the table');
-  same([5,1,2,3,0,6,4],'a live refresh keeps the sort');
-  const orders=JSON.parse(document.querySelector('[data-sort-orders]').dataset.sortOrders);
-  for(const [key,direction] of added){
-   click(key);checkAlignment(key,direction);
-   checkTableFits(key+' sorted at 1280px');
-   same(orders[key].map(place=>place.index),key+' first click');
-   click(key);checkAlignment(key,direction==='ascending' ? 'descending' : 'ascending');
-   same(orders[key+'-reverse'].map(place=>place.index),key+' second click');
+  const cards=['accounts','roles','models'];
+  for(const name of cards){
+   const scroll=table(name).parentElement;
+   check(scroll.scrollWidth<=scroll.clientWidth+1,name+' fits at 1280px');
+   const headings=[...table(name).querySelectorAll('th[aria-sort]')];
+   check(headings.every(node=>node.tabIndex===0 && getComputedStyle(node).cursor==='pointer'),
+    name+' headers support focus and display a pointer');
+   check(headings.filter(node=>direction(node)!=='none').length===1,name+' has one active sort');
   }
-  document.documentElement.style.fontSize='24px';
-  checkAlignment('paused','none');
-  click('paused');checkAlignment('paused','descending');
-  click('paused');checkAlignment('paused','ascending');
+  const defaultAccounts='claude1,claude2,claude3,codex1,codex2';
+  check(labels('accounts',1)===defaultAccounts,'the default shows each account label once');
+  const account=header('accounts','account');
+  account.click();
+  check(direction(account)==='descending' && labels('accounts',1)==='codex2,codex1,claude3,claude2,claude1',
+   'the account header reverses the label order');
+  account.click();
+  check(labels('accounts',1)===defaultAccounts,'the account header restores the label order');
+  const left=header('accounts','left');
+  left.focus();activate(left,'Enter');
+  check(direction(left)==='ascending' && labels('accounts',1)==='codex1,claude1,claude2,claude3,codex2',
+   'Enter sorts by remaining quota and keeps missing readings last');
+  check(!activate(left,' '),'Space prevents scrolling while sorting');
+  const sortedAccounts='claude1,claude2,codex1,claude3,codex2';
+  check(direction(left)==='descending' && labels('accounts',1)===sortedAccounts,'Space reverses the sort and keeps missing quota last');
+  const busy=header('roles','busy'), total=rows('roles').at(-1);
+  busy.click();
+  check(direction(busy)==='descending' && busy.querySelector('.sort-arrow').textContent==='▼',
+   'busy starts with a descending arrow');
+  busy.click();
+  check(direction(busy)==='ascending' && rows('roles').at(-1)===total,'the roles summary remains last');
+  const saved=name=>JSON.parse(localStorage.getItem(name+'-sort'));
+  check(saved('accounts').column==='left' && saved('roles').column==='busy','the tables store independent choices');
+  const oldTable=table('accounts');
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(reads>0 && table('accounts')!==oldTable,'refresh replaces the tables');
+  check(labels('accounts',1)===sortedAccounts && direction(header('roles','busy'))==='ascending',
+   'refresh preserves the sort in both tables');
+  for(const name of ['accounts','roles']){
+   for(const node of table(name).querySelectorAll('th[aria-sort]')){
+    node.click();
+    const first=direction(node);
+    node.click();
+    check(first!=='none' && first!==direction(node),name+' header reverses');
+    const tables=[...table(name).querySelectorAll('th[aria-sort]')];
+    check(tables.filter(other=>direction(other)!=='none').length===1,name+' keeps one active sort');
+   }
+  }
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -590,7 +1119,8 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                           models_by_role={"units": Counter({model: 3, high: 1})},
                           model_names_by_role={"units": {model: accounts.ModelSessionNames(names[::-1]),
                                                          high: accounts.ModelSessionNames(["high-unit"])}})
-        reading = accounts.StatusReading((fixture,), (), (), timezone.utc, AT)
+        observed = replace(status_row("claude2"), role_counts=(accounts.RoleSessionCounts(7, 0, 0, 0),))
+        reading = accounts.StatusReading((fixture, observed), (), (), timezone.utc, AT)
         with patch.object(accounts, "read_status", return_value=reading):
             page = accounts_page.page().decode()
         refreshed = replace(fixture,
@@ -599,7 +1129,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                             model_names_by_role={"units": {**fixture.model_names_by_role["units"],
                                 earlier: accounts.ModelSessionNames(["fable-unit"]),
                                 high: accounts.ModelSessionNames(["high-unit", "new-unit"])}})
-        with patch.object(accounts, "read_status", return_value=replace(reading, rows=(refreshed,))):
+        with patch.object(accounts, "read_status", return_value=replace(reading, rows=(refreshed, observed))):
             fresh = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
         probe = r"""<script>
@@ -647,6 +1177,13 @@ try{
  check(!other.isConnected && restored.textContent==='2' && document.activeElement===restored &&
    !tooltip.hidden && tooltip.textContent==='high-unit\nnew-unit',
    'refresh restores focus and the tooltip for the same model, effort and column');
+ const busy=document.querySelector('#role-count-units-busy');
+ busy.scrollIntoView({block:'center'});
+ busy.focus({preventScroll:true});
+ busy.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(busy.textContent==='13' && !tooltip.hidden && tooltip.textContent==='claude1: 6\nclaude2: 7',
+   'focus shows the count for each account');
+ check(getComputedStyle(tooltip).textAlign==='right','account counts align to the right');
 }catch(error){failures.push(String(error));}
 realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -702,8 +1239,8 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
   check(rows().map(row=>cellText(row).slice(0,3).join(':')).join(',')===
    'claude-fable-5-1::max,claude-opus-5-5::low,::high,gpt-6.2-sol::medium,unknown::-,total::',
    'model IDs and efforts are grouped');
-  check(rows().at(-1).cells[7].textContent===document.querySelector('[data-sort-table=accounts] tbody')
-   .lastElementChild.cells[11].textContent,'both tables show the same total');
+  check(rows().at(-1).cells[7].textContent===document.querySelector('[data-sort-table=roles] tbody')
+   .lastElementChild.cells[7].textContent,'both tables show the same total');
   check(rows()[0].cells[4].querySelector('.inactive').textContent==='0','zero has a muted tone');
   check(table().querySelectorAll('[data-color-key="model.claude-opus-5-5"]').length===1,'each model has one swatch');
   check(header('model').getAttribute('aria-sort')==='ascending','model ascending is the default');
@@ -829,26 +1366,26 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const rows=()=>[...document.querySelector('tbody').rows];
+ const table=()=>document.querySelector('[data-sort-table=accounts] table');
+ const rows=()=>[...table().tBodies[0].rows];
  const next=row=>row.querySelector('.next-cell');
  const target=row=>next(row).textContent.trim();
- const details=row=>[...row.cells].slice(-3).map(cell=>cell.textContent);
- const group=name=>document.querySelector('tr[data-move-account="claude1"][data-move-group="'+name+'"]');
+ const group=name=>table().querySelector('[data-move-account="claude1"][data-move-group="'+name+'"]').closest('tr');
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  try{
   const original=rows(), cells=new Map(original.map(row=>[row,next(row)]));
   const units=group('units'), showrunners=group('showrunners');
-  const accountDetails=details(units);
-  check(target(units)==='claude2' && target(showrunners)==='claude3','the two role rows have distinct next targets');
-  check(!showrunners.cells[1].textContent,'the second role keeps its next target with hidden account details');
-  check(accountDetails[1]==='123' && accountDetails[2]==='yes','the first row has credits and their setting');
-  const nextHeader=document.querySelector('[data-account-sort="next"]');
-  const sameRows=()=>rows().every((row,index)=>row===original[index]);
+  check(target(units)==='claude2' && target(showrunners)==='claude3','the two roles have distinct next targets');
+  const nextHeader=table().querySelector('[data-account-sort="next"]');
+  const details=row=>[...row.cells].filter(cell=>cell.cellIndex<6 || cell.cellIndex>8).map(cell=>cell.innerHTML);
+  const shown=details(units);
+  const empty=Array(shown.length).fill('');
+  check(JSON.stringify(details(showrunners))===JSON.stringify(empty),'the added row starts with no account data');
   const button=next(units).querySelector('[data-next-button]');
   button.click();
   const menu=document.querySelector('[data-move-menu]');
-  check(!menu.hidden && nextHeader.getAttribute('aria-sort')==='none' && sameRows(),
-   'the next cell button opens the menu and preserves the sort');
+  check(!menu.hidden && nextHeader.getAttribute('aria-sort')==='none'
+   && rows().every((row,index)=>row===original[index]),'the next button preserves the sort');
   menu.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   nextHeader.click();
   check(nextHeader.tabIndex===0 && nextHeader.getAttribute('aria-sort')==='ascending'
@@ -856,26 +1393,27 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   nextHeader.click();
   check(nextHeader.getAttribute('aria-sort')==='descending' && rows()[0]===showrunners && rows()[1]===units,
    'the next header reverses the target order');
-  const markup=new Map(original.map(row=>[row,next(row).innerHTML]));
-  for(const column of ['account','left','role','next','idle','paused','exited','total','resets','credits','enabled','busy']){
-   const header=document.querySelector('[data-account-sort="'+column+'"]');
+  check(JSON.stringify(details(showrunners))===JSON.stringify(shown) &&
+   JSON.stringify(details(units))===JSON.stringify(empty),'the account data moves to the first row of the group');
+  const markup=new Map(original.map(row=>[row,next(row)?.innerHTML]));
+  for(const column of ['account','role','next','left','used / hour','empty at','resets','credits','enabled']){
+   const header=table().querySelector('[data-account-sort="'+column+'"]');
    for(let direction=0;direction<2;direction++){
     header.click();
-    check(rows().every(row=>next(row)===cells.get(row) && next(row).innerHTML===markup.get(row)),
+    check(rows().every(row=>next(row)===cells.get(row) && next(row)?.innerHTML===markup.get(row)),
      column+' keeps the next cells on their rows in direction '+direction);
-    for(const row of [units,showrunners]){
-     const expected=row.cells[1].textContent ? accountDetails : ['','',''];
-     check(JSON.stringify(details(row))===JSON.stringify(expected),column+' keeps the trailing account details together');
-    }
    }
   }
-  check(rows().at(-1)===original.at(-1) && target(rows().at(-1))==='','the total keeps its empty next cell');
+  table().querySelector('[data-account-sort="role"]').click();
+  check(Math.abs(rows().indexOf(units)-rows().indexOf(showrunners))>1 &&
+   [units,showrunners].every(row=>JSON.stringify(details(row))===JSON.stringify(shown)),
+   'separated groups each show the account details');
   const before=rows();
   document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
-  check(rows()[0]!==before[0] && document.querySelector('[data-account-sort="busy"]').getAttribute('aria-sort')==='ascending',
-   'the live refresh replaces the rows and keeps busy ascending');
+  check(rows()[0]!==before[0] && table().querySelector('[data-account-sort="role"]').getAttribute('aria-sort')==='ascending',
+   'refresh replaces the rows and keeps the role sort');
   check(target(group('units'))==='claude3' && target(group('showrunners'))==='none',
-   'the live refresh shows the new targets on their role rows');
+   'refresh shows the new targets on their role rows');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -886,7 +1424,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        for saved, denied in (("role", False), ("unknown", False), ("role", True)):
+        for saved, denied in (("left", False), ("unknown", False), ("left", True)):
             with self.subTest(saved=saved, denied=denied):
                 setup = '''<script>
 Date.now=()=>200000;const realFetch=fetch;
@@ -898,12 +1436,12 @@ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 try{
  const selected=document.querySelector('th[aria-sort="ascending"]');
  check(selected?.dataset.accountSort===EXPECTED_COLUMN,'the stored choice or default renders');
- document.querySelector('[data-account-sort="busy"]').click();
- check(document.querySelector('[data-account-sort="busy"]').getAttribute('aria-sort')==='descending',
+ document.querySelector('[data-role-sort="busy"]').click();
+ check(document.querySelector('[data-role-sort="busy"]').getAttribute('aria-sort')==='descending',
   'sorting works when the storage write fails');
 }catch(error){failures.push(String(error));}
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-</script>'''.replace("EXPECTED_COLUMN", json.dumps("role" if saved == "role" and not denied else "account"))
+</script>'''.replace("EXPECTED_COLUMN", json.dumps("left" if saved == "left" and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
                 self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
@@ -924,7 +1462,8 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 self.assertEqual(table["rows"][index]["cells"][key], [])
         markup = accounts_page.board(reading)
         self.assertEqual(markup.count('data-color-key="account.claude1"'), 1)
-        self.assertEqual(markup.count('data-account-name></td><td class="left"></td><td class="right"></td>'), 2)
+        self.assertEqual(markup.count("data-account-name"), 4)
+        self.assertEqual(markup.count(">producers</span>"), 3)
 
     def test_account_details_follow_supplied_row_order(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), roles=("units", "producers")),
@@ -1031,10 +1570,10 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 replace(status_row("codex1"), tool="codex", selected_roles=("units",)))
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
         markup = accounts_page.board(reading)
-        self.assertIn('<tr class="account" data-move-account="claude1" data-move-group="units">', markup)
+        self.assertIn('data-move-account="claude1" data-move-group="units"', markup)
         self.assertEqual(markup.count("data-move-group="), 1)
         targets = json.dumps([["claude1", "60%", "#af875f", "default"], ["claude2", "12%", "#b294bb", "warning"]])
-        self.assertIn('<section class="card" data-move-percent="1" ', markup)
+        self.assertIn('data-move-percent="1"', markup)
         self.assertIn(f'data-move-targets="{html.escape(targets, quote=True)}">', markup)
         settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
         _ = write_config_fixture(settings, "next_move_percent=2.5\n")
@@ -1048,7 +1587,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             first_next_moves=accounts.FirstNextMoveTargets({"producers": "claude2"}))
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
-        self.assertIn('data-next-target="claude2" aria-label="Choose the next account for producers"', markup)
+        self.assertIn('data-next-target="claude2" data-move-account="claude1" data-move-group="producers"', markup)
         self.assertEqual(markup.count("data-move-group="), 1)
 
     def test_inherited_claude_producers_have_an_editable_next_cell(self) -> None:
@@ -1059,7 +1598,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
         self.assertIn('> (inherited)</span>', markup)
-        self.assertIn('data-next-target="" aria-label="Choose the next account for producers"', markup)
+        self.assertIn('data-next-target="" data-move-account="claude1" data-move-group="producers"', markup)
 
     def test_next_cells_show_first_targets_empty_groups_unselected_roles_and_unavailable_reads(self) -> None:
         rows = (replace(status_row("claude1"), roles=("units", "showrunners"), selected_roles=("units", "showrunners")),
@@ -1070,30 +1609,38 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                       accounts.FirstNextMoveTargets(), accounts.NextMovesUnavailable("fixture damaged log")):
             with self.subTest(first=first):
                 markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=first))
-                cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', markup, re.S))
-                self.assertEqual(len(cells), 7)
-                self.assertEqual(cells[-1], "")
-                for index in (2, 3, 5):
-                    self.assertIn('title="Not the selected account for a role"', cells[index])
-                    self.assertIn('lucide-minus', cells[index])
-                for index, group in ((0, "units"), (1, "showrunners")):
-                    self.assertIn(f'aria-label="Choose the next account for {group}"', cells[index])
-                    self.assertIn('aria-haspopup="menu" aria-expanded="false"', cells[index])
-                    self.assertIn('lucide-chevron-down', cells[index])
-                self.assertNotIn('<button', cells[4])
+                account_table, roles_table = markup.split('aria-label="Roles"', 1)
+                role_cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', roles_table, re.S))
+                self.assertFalse(any('<button' in cell for cell in role_cells))
                 if isinstance(first, accounts.NextMovesUnavailable):
-                    for index in (0, 1, 4):
-                        self.assertIn('>unavailable</span>', cells[index])
-                        self.assertIn('fixture damaged log', cells[index])
+                    self.assertEqual(sum('>unavailable</span>' in cell for cell in role_cells), 3)
+                cells = cast(list[str], re.findall(r'<td class="left next-cell">(.*?)</td>', account_table, re.S))
+                self.assertEqual(len(cells), 6)
+                units, showrunners, unselected, spare, workers, codex_spare = cells
+                # With no Claude target for workers, the spare Codex account takes workers in turn and reads auto.
+                workers_auto = isinstance(first, accounts.FirstNextMoveTargets) and "workers" not in first.targets
+                for cell in (unselected, spare, *(() if workers_auto else (codex_spare,))):
+                    self.assertIn('title="Not the selected account for a role"', cell)
+                    self.assertIn('lucide-minus', cell)
+                for cell, group in ((units, "units"), (showrunners, "showrunners")):
+                    self.assertIn(f'aria-label="Choose the next account for {group}"', cell)
+                    self.assertIn('aria-haspopup="menu" aria-expanded="false"', cell)
+                    self.assertIn('lucide-chevron-down', cell)
+                self.assertNotIn('<button', workers)
+                if isinstance(first, accounts.NextMovesUnavailable):
+                    for cell in (showrunners, units, workers):
+                        self.assertIn('>unavailable</span>', cell)
+                        self.assertIn('fixture damaged log', cell)
                 else:
-                    self.assertIn('>none</span>', cells[1])
+                    self.assertIn('>none</span>', showrunners)
                     if first.targets:
-                        self.assertIn('class="default bold" style="color:#b294bb" data-color-text="account.claude2">claude2</span>', cells[0])
-                        self.assertIn('class="default bold"', cells[4])
-                        self.assertIn('style="color:#123456" data-color-text="account.codex2">codex2</span>', cells[4])
+                        self.assertIn('data-color-text="account.claude2">claude2</span>', units)
+                        self.assertIn('style="color:#123456" data-color-text="account.codex2">codex2</span>', workers)
                     else:
-                        self.assertIn('>none</span>', cells[0])
-                        self.assertIn('title="Codex workers move between the Codex accounts by themselves">auto</span>', cells[4])
+                        self.assertIn('>none</span>', units)
+                        for cell in (workers, codex_spare):
+                            self.assertIn('hidden>codex1 and codex2 alternate when available.', cell)
+                            self.assertIn('>auto</span>', cell)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser contrast")
     def test_muted_next_cells_meet_the_contrast_floors_in_both_themes(self) -> None:
@@ -1247,10 +1794,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             content = accounts_page.page()
         content = content.replace(b'<div data-accounts>', b'<div data-accounts><p>board</p>')
         cache = serve.AccountsPageCache()
-        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time())):
-            good = cache.replace()
-        with patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")):
-            failed = cache.replace()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time()))):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure"))):
+            failed = cache.get()
         self.assertIn(b'data-read-error="The Accounts render failed."', failed)
         self.assertNotIn(b'private failure', failed)
         self.assertEqual(cache.page, good)
@@ -1263,10 +1813,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             content = accounts_page.page()
         content = content.replace(b'<div data-accounts>', b'<div data-accounts><p>board</p>')
         cache = serve.AccountsPageCache()
-        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time())):
-            good = cache.replace()
-        with patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure")):
-            failed = cache.replace()
+        refresh = conf.read("review_links").number("page_refresh_seconds")
+        with (patch.object(time, "monotonic", return_value=100),
+              patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(content, .1, time.time()))):
+            good = cache.get()
+        with (patch.object(time, "monotonic", return_value=101 + refresh),
+              patch.object(accounts_page, "render_with_facts", side_effect=OSError("private failure"))):
+            failed = cache.get()
         assert_status_states(self, good.decode(), 15, failed_markup=failed.decode())
 
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:
@@ -1336,15 +1889,18 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const action=name=>popup.querySelector('[data-color-'+name+']');
   const original=label().style.color, originalSwatch=swatch.style.background;
   const row=swatch.closest('tr'), cell=swatch.closest('td');
-  const heads=[...document.querySelectorAll('thead th')].map(head=>{
+  const headings=table=>[...document.querySelectorAll('table[aria-label="'+table+'"] thead th')].map(head=>{
    const copy=head.cloneNode(true);
    copy.querySelector('.sort-arrow')?.remove();
    return copy.textContent;
   });
+  const heads=headings('Accounts'), roleHeads=headings('Roles');
   check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
    'the swatch column without a heading sits between account and left');
-  check(heads[4]==='role' && heads[5]==='' && heads[6]==='next' && heads[7]==='busy',
-   'the next column follows the role swatch and precedes busy');
+  check(heads.slice(4,10).join(',')==='used / hour,empty at,role,,next,resets',
+   'Accounts puts role and next after the forecast');
+  check(roleHeads.join(',')==='role,,busy, last 24 h,account,next,busy,idle,total',
+   'Roles shows the role, its busy line, account, next and counts');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
    Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
    'the swatch aligns with the cell content on the left');
@@ -1524,9 +2080,11 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
   const roles=[...document.querySelectorAll('[data-color-key="role.unit-director"]')];
   const roleWords=[...document.querySelectorAll('[data-color-text="role.unit-director"]')];
-  check(roles.length===2 && roleWords.length===2 && roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)'),
-   'each units row shows the unit color swatch and word');
-  roles[1].click();
+  check(roles.length===3 && roleWords.length===3 &&
+   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)') &&
+   new Set(roleWords.map(word=>word.closest('table'))).size===2,
+   'both tables show the units swatch and label');
+  roles[0].click();
   check(popup.open && picker.value==='#d7af00' && popup.querySelector('#color-title').textContent==='Change units color',
    'a role swatch opens the picker with the role color');
   pick('#102030');action('try').click();

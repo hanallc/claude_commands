@@ -7,12 +7,16 @@ import shutil
 import subprocess
 import sys
 import unittest
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
+from uuid import UUID
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
@@ -112,6 +116,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         calls = self.failing_worker()
         result = self.launch()
         self.assert_run_active(result)
+        self.assertIn("The worker command failed at launch.", result.stderr.splitlines())
         self.assertEqual([event for event in self.events() if event.get("event_type") in (
             "pass_started", "pass_finished", "phase_finished")], [])
         command = cast(list[str], json.loads(calls.read_text()))
@@ -319,8 +324,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.fixture.fixture.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.fixture.fixture.root)})))
         _ = self.enterContext(assignment_helpers(bytecode_setting))
@@ -350,12 +354,42 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertTrue(reply.read_text().startswith(self.fixture.agent.final))
         self.assertEqual(len(self.fixture.agent.submitted), 1)
 
-    def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
+    def test_astra_launch_refusals_do_not_start_a_pane(self) -> None:
+        parent = self.fixture.fixture.parent
+        member = fixture_worker("TEST-reviewer", parent.id)
+        world = self.fixture.fixture.world
+        launches = world.launches.copy()
+        before = staff.snapshot().rows
+        durable = ["--target", "durable-design-role", "--policy", "astra-reviewer", "--parent", parent.id]
+        with self.subTest(refusal="missing name"):
+            result = invoke_cli(assign, assign.main, ["--role", "review", *durable], os.environ.copy(), ROOT)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("durable-design-role requires --to or --new-worker", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        for locked in (parent, member):
+            run = self.fixture.fixture.root / f"busy-astra-{locked.name}"
+            base = ["--role", "review", "--new-worker", member.name, "--session-dir", str(run)]
+            one_shot = ["--operation", "astra-review", "--cwd", str(self.fixture.fixture.root),
+                        "--prompt", str(self.fixture.prompt), "--reply-file", str(run / "astra-review.md")]
+            with patch.object(sys, "argv", ["holder", "first part\nlast part"]), staff.row_operation(locked.id):
+                env = staff.child_environment(os.environ)
+                for target, options in (("durable", durable), ("one-shot", one_shot)):
+                    with self.subTest(locked=locked.name, target=target):
+                        result = invoke_cli(assign, assign.main, [*base, *options], env, ROOT)
+                        self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
+                        lines = result.stderr.splitlines()
+                        self.assertEqual(len(lines), 1, lines)
+                        self.assertIn(f"{locked.name}: another operation holds this row", lines[0])
+                        self.assertIn("first part last part", lines[0])
+        self.assertEqual(world.launches, launches)
+        self.assertEqual(staff.snapshot().rows, before)
+        self.assertEqual(self.fixture.agent.submitted, [])
+
+    def test_completed_astra_review_rerun_keeps_its_notice_and_reply(self) -> None:
         for changed_session in (False, True):
             with self.subTest(changed_session=changed_session):
-                case = PaneReviewLauncherTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, PaneReviewLauncherTests("runTest"))
                     write_text_atomic(case.fixture.prompt, "Phase astra-review — Astra review\nReview the assigned change.\n")
                     case.fixture.run_dir = case.fixture.fixture.root / f"astra-run-{changed_session}"
                     reply = case.fixture.run_dir / "astra-review.md"
@@ -389,13 +423,11 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         launches = case.fixture.fixture.world.launches.copy()
                         repeated = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
                     self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-                    self.assertEqual(case.fixture.agent.notices, [notice, notice])
-                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))] * 2)
+                    self.assertEqual(case.fixture.agent.notices, [notice])
+                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))])
                     self.assertEqual(case.fixture.agent.submitted, submitted)
                     self.assertEqual(case.fixture.fixture.world.launches, launches)
                     self.assertEqual((reply.read_bytes(), reply.stat().st_mtime_ns), saved)
-                finally:
-                    case.doCleanups()
 
     def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
         summary = self.phase / "review_summary_1.txt"
@@ -434,8 +466,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         saved = summary.read_bytes(), (self.phase / "review_status_1").read_bytes()
         notices = self.fixture.agent.notices.copy()
         self.fixture.agent.notice_failures = 1
-        failed = self.launch_review()
-        self.assertNotEqual(failed.returncode, 0)
+        settled = self.launch_review()
+        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
+        self.assertEqual(self.fixture.agent.notice_failures, 1)
         self.assertEqual((self.phase / "review_status_1").read_bytes(), saved[1])
         self.assertEqual(summary.read_bytes(), saved[0])
         self.assertEqual(self.fixture.agent.submitted, [first, second])
@@ -443,7 +476,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
-        self.assertEqual(self.fixture.agent.notices, [*notices, notices[-1]])
+        self.assertEqual(self.fixture.agent.notices, notices)
         self.assertEqual((summary.read_bytes(), (self.phase / "review_status_1").read_bytes()), saved)
         self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
 
@@ -510,9 +543,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
         for sole_worker in (False, True):
             with self.subTest(sole_worker=sole_worker):
-                case = PaneReviewLauncherTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, PaneReviewLauncherTests("runTest"))
                     name = "impl" if sole_worker else "review"
                     opened = case.fixture.opened(name, "impl")
                     _ = progress_history.begin_dispatch(case.fixture.run_dir, slot=name, phase="8", role="impl",
@@ -562,8 +594,6 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         self.assertEqual(case.fixture.finish(name), turn_end.TurnOutcome.DONE)
                         self.assertEqual(worker_panes.worker_pass(opened.row, case.fixture.run_dir)["status"], "completed")
                         self.assertNotIn(opened.pane, case.fixture.fixture.world.locations)
-                finally:
-                    case.doCleanups()
 
 
 @final
@@ -1078,7 +1108,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.turn_starts, 1)
         prompt = (self.session_dir / f"phases/7/{name}_prompt.txt").read_text()
         self.assertIn(self.prompt.read_text().strip(), prompt)
-        for text in ("detached_runs.py start", "Simple, Fast and Beautiful", "poll"):
+        for text in ("detached_runs.py start", "--kind python-tests before --", "Simple, Fast and Beautiful", "poll"):
             self.assertIn(text, prompt)
         manifest = self.session_dir / "phases/7/dispatch_1_paths.json"
         self.assertEqual(read_object(manifest), {"worker": name, "round": 1,
@@ -1253,7 +1283,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(ended[0].get("status"), "error")
         self.assertNotIn("launcher_pid", next(iter(self.assignment_records().values())))
 
-    def test_confirmed_retry_restores_running_status_for_the_same_pass(self) -> None:
+    def test_confirmed_retry_keeps_running_status_after_a_delayed_launch_failure(self) -> None:
         opened = self.native.opened()
         self.native.agent.error = "agent_prompt_stalled"
         failed = self.launch()
@@ -1265,13 +1295,80 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.native.agent.error = ""
         _ = self.successful()
         self.assertEqual(self.turn_starts, 1)
-        self.assertEqual(worker_panes.worker_pass(opened.row, self.session_dir)["instance_id"], passed["instance_id"])
+        confirmed = worker_panes.worker_pass(opened.row, self.session_dir)
+        self.assertEqual(confirmed["instance_id"], passed["instance_id"])
+        self.assertEqual(confirmed["status"], "active")
+        events = self.events()
+        recorded = progress_history.record_assignment_launch_exit(
+            self.session_dir, UUID(str(confirmed["instance_id"])), progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS,
+        )
+        self.assertEqual(recorded, progress_history.RecordedAssignmentLaunch("impl", failure_recorded=False))
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.session_dir), confirmed)
+        self.assertEqual(self.events(), events)
         self.assertEqual(status.read_text(), "running\n")
         self.native.agent.complete(opened.pane)
         self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
         self.assertEqual(status.read_text(), "done\n")
 
+    def test_failed_launcher_waits_for_the_selected_worker_to_confirm_submission(self) -> None:
+        self.assert_failed_launcher_waits_for_confirmation("impl2")
+
+    def test_failed_launcher_waits_for_the_renamed_worker_to_confirm_submission(self) -> None:
+        self.assert_failed_launcher_waits_for_confirmation("impl3")
+
+    def assert_failed_launcher_waits_for_confirmation(self, current_name: str) -> None:
+        opened = self.native.opened("impl2")
+        parent = self.native.fixture.parent.id
+        name = staff.WorkerName.parse(opened.row.name)
+        status = self.session_dir / "impl2_status"
+        with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}):
+            instance = progress_history.begin_dispatch(self.session_dir, slot=name.value, phase="7", role="impl",
+                worker_name=name.value, worker_id=opened.row.id, launcher_command=["assign.sh"],
+                prompt=self.prompt, kind="assign", lens="")
+        row = opened.row
+        if current_name != name.value:
+            with patch.object(herdr.Herdr, "retitle_row"):
+                row = staff.rename(row.id, current_name)
+        events = self.events()
+        acquire = worker_panes.worker_id_lock
+
+        with ExitStack() as submission:
+            held = submission.enter_context(worker_panes.worker_lock(parent, staff.WorkerName.parse(row.name)))
+            assert isinstance(held, worker_panes.WorkerLockHold)
+            self.assertTrue(held.owns(row))
+
+            @contextmanager
+            def finish_submission_before_acquiring(identity: staff.StaffId, *,
+                                                   blocking: bool = False) -> Generator[None]:
+                self.assertEqual((identity, blocking), (row.id, True))
+                with self.assertRaises(BlockingIOError), acquire(identity):
+                    self.fail("The retry must hold the fixed-ID lock.")
+                self.assertEqual(self.events(), events)
+                progress_history.confirm_assignment_submission(self.session_dir, instance, instance)
+                submission.close()
+                with acquire(identity):
+                    yield
+
+            with patch.object(worker_panes, "worker_id_lock", new=finish_submission_before_acquiring):
+                recorded = assign.record_worker_launch_exit(
+                    self.session_dir, UUID(instance), progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS,
+                )
+            self.assertFalse(held.active)
+
+        self.assertEqual(recorded, progress_history.RecordedAssignmentLaunch(name.value, failure_recorded=False))
+        passed = worker_panes.worker_pass(row, self.session_dir)
+        self.assertEqual((passed["instance_id"], passed["status"], passed["confirmed_delivery_ids"]),
+                         (instance, "active", [instance]))
+        self.assertEqual(status.read_text(), "running\n")
+        self.assertEqual(self.events(), events)
+
     def test_retry_saves_the_remapped_status_path_for_an_older_pass_without_delivery(self) -> None:
+        self.assert_retry_saves_remapped_status_path("active")
+
+    def test_retry_saves_the_remapped_status_path_for_a_refused_pass_without_delivery(self) -> None:
+        self.assert_retry_saves_remapped_status_path("refused")
+
+    def assert_retry_saves_remapped_status_path(self, pass_status: Literal["active", "refused"]) -> None:
         opened = self.native.opened("impl2")
         arguments = ["--role", "implement", "--cwd", str(self.project), "--phase", "7",
                      "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
@@ -1285,12 +1382,14 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertNotIn("delivery", passed)
         status = Path(str(passed.pop("assign_status_file")))
         self.assertEqual(status, self.session_dir / "phases/7/impl2_status")
+        passed["status"] = pass_status
         write_text_atomic(state_path, json.dumps(state))
         write_text_atomic(status, "running\n")
         retried = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         saved = worker_panes.worker_pass(opened.row, self.session_dir)
         self.assertEqual(saved["instance_id"], passed["instance_id"])
+        self.assertEqual(saved["assign_status_file"], str(status))
         self.assertEqual(progress_history.dispatch_delivery(saved).actions.status_file, str(status))
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         self.assertEqual(status.read_text(), "done\n")

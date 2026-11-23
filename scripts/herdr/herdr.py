@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 import base64
+import fcntl
 import secrets
 import struct
 import json
@@ -39,7 +40,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from threading import RLock
+from threading import Lock, RLock
 from functools import cache, cached_property
 from importlib import import_module
 from dataclasses import dataclass, field, replace
@@ -47,7 +48,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TextIO, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -62,6 +63,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
@@ -77,6 +79,66 @@ START_RETRY_MAX_SECONDS = 1.0
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
+
+
+class RebootLockBusy(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__("A reboot is running; wait for it to end.", "reboot_in_progress")
+
+
+@dataclass
+class _HeldRebootLock:
+    handle: TextIO
+    exclusive: bool
+    users: int = 1
+
+
+_reboot_locks: dict[tuple[int, Path], _HeldRebootLock] = {}
+_reboot_locks_guard = Lock()
+
+
+def reboot_state_directory() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return state / "agents" / "reboot"
+
+
+def reboot_lock_path() -> Path:
+    """Use the directory of the server that agents reboot stops."""
+    return _session_socket(SHARED_SESSION).with_name("reboot.lock")
+
+
+@contextmanager
+def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
+    """Hold the lock without waiting. Share the descriptor within the process."""
+    path = reboot_lock_path().resolve()
+    key = os.getpid(), path
+    with _reboot_locks_guard:
+        held = _reboot_locks.get(key)
+        if held is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a")
+            try:
+                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.flock(handle, mode | fcntl.LOCK_NB)
+            except BaseException as error:
+                handle.close()
+                if isinstance(error, BlockingIOError):
+                    raise RebootLockBusy() from error
+                raise
+            held = _HeldRebootLock(handle, exclusive)
+            _reboot_locks[key] = held
+        else:
+            if exclusive and not held.exclusive:
+                raise RebootLockBusy()
+            held.users += 1
+    try:
+        yield
+    finally:
+        with _reboot_locks_guard:
+            held.users -= 1
+            if not held.users:
+                del _reboot_locks[key]
+                held.handle.close()
 
 
 @dataclass(frozen=True)
@@ -591,6 +653,31 @@ def _prepare_prompt(pane: str, text: str) -> str:
     return text
 
 
+_PRINTABLE_KEY_NAMES = {
+    "space": " ", "minus": "-", "comma": ",", "period": ".", "slash": "/",
+    "backslash": "\\", "quote": "'", "double_quote": '"', "double-quote": '"',
+    "semicolon": ";", "colon": ":", "percent": "%", "ampersand": "&",
+    "backtick": "`", "plus": "+",
+}
+
+
+def _printable_key(key: str) -> str:
+    key = key.strip()
+    if key == "+":
+        return key
+    if key.endswith("++"):
+        key = key[:-1] + "plus"
+    parts = [part.strip() for part in key.split("+")]
+    characters = [part for part in parts if part.lower() != "shift"]
+    if len(characters) != 1:
+        return ""
+    name = characters[0]
+    char = _PRINTABLE_KEY_NAMES.get(name.lower(), name)
+    if len(char) != 1 or not char.isprintable():
+        return ""
+    return char.upper() if len(parts) > 1 and char.isascii() else char
+
+
 @dataclass(frozen=True)
 class ComposerInput:
     text: str
@@ -612,6 +699,19 @@ class ComposerInput:
 @dataclass(frozen=True)
 class NoComposer:
     """The visible screen has no current input box."""
+
+
+@dataclass(frozen=True)
+class ComposerRegion:
+    start: int
+    end: int
+    input: ComposerInput
+
+
+@dataclass(frozen=True)
+class CommandScreen:
+    history: tuple[str, ...]
+    footer: tuple[str, ...]
 
 
 class _OpeningComposer(Enum):
@@ -657,13 +757,27 @@ def _typed_text(screen: str) -> str:
     return "".join(kept)
 
 
-def _composer_input(screen: str) -> ComposerInput | NoComposer:
+def _composer_region(screen: str, *, codex: bool = False) -> ComposerRegion | NoComposer:
     """Parse the final live composer, excluding old input and its footer.
 
     An ANSI screen (`--format ansi`) lets faint placeholder text such as `Try "fix lint errors"` read as empty.
     """
     lines = _prompt_screen(screen).splitlines()
     typed = _typed_text(screen).splitlines()
+    if codex:
+        prompt = re.compile(r"^ {0,2}[›»](?:[ \xa0]|$)")
+        for index in range(len(lines) - 1, -1, -1):
+            if marker := prompt.match(lines[index]):
+                end = index + 1
+                while end < len(lines) and lines[end].strip() and lines[end].startswith("   "):
+                    end += 1
+                if (index >= len(typed) or not prompt.match(typed[index])
+                        or any(line.rstrip().endswith(("↑", "↓")) for line in lines[index:end])
+                        or any(line.strip() and not line.startswith("  ") for line in lines[end:])):
+                    break
+                draft = "\n".join((typed[index][marker.end():], *typed[index + 1:end])).rstrip("\xa0")
+                return ComposerRegion(index, end, ComposerInput(draft))
+        return NoComposer()
     closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
     if not closing_borders:
         return NoComposer()
@@ -677,9 +791,28 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
     # Column-zero output below the last box makes that box scrollback.
     if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
         return NoComposer()
-    region = typed[top_borders[-1] + 1:closing]
-    region[0] = re.sub(r"^[❯>]\s*", "", region[0])
-    return ComposerInput("\n".join(line.strip() for line in region))
+    start = top_borders[-1]
+    region = typed[start + 1:closing]
+    if not region:
+        return NoComposer()
+    region[0] = re.sub(r"^[❯>][ \xa0]?", "", region[0])
+    return ComposerRegion(start, closing + 1, ComposerInput("\n".join(region).rstrip("\xa0")))
+
+
+def _composer_input(screen: str) -> ComposerInput | NoComposer:
+    region = _composer_region(screen)
+    if isinstance(region, NoComposer):
+        return region
+    return ComposerInput("\n".join(line.strip() for line in region.input.text.split("\n")))
+
+
+def _command_history(recent: str, *, codex: bool) -> tuple[str, ...]:
+    region = _composer_region(recent, codex=codex)
+    lines = recent.splitlines()
+    history = lines[:region.start] if isinstance(region, ComposerRegion) else lines
+    while history and not history[-1].strip():
+        _ = history.pop()
+    return tuple(history)
 
 
 def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
@@ -2692,6 +2825,11 @@ class Herdr:
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         """Start once, then prove the opening prompt arrived as this session's user turn."""
+        with reboot_lock():
+            return self._start_agent(name, pane, kind, agent_arguments, opening, timeout_ms)
+
+    def _start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         forget_pane_evidence(self.session, pane)
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
@@ -2999,7 +3137,63 @@ class Herdr:
 
     def composer(self, pane: str) -> ComposerInput | NoComposer:
         """Read the visible input region."""
-        return _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
+        return _composer_input(self._visible_screen(pane))
+
+    def _visible_screen(self, pane: str) -> str:
+        return self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+
+    def command_terminal(self, pane: str) -> str:
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane) or not (terminal := row.get("terminal_id")):
+            raise HerdrFailure(f"{pane}: the terminal is unknown")
+        return terminal
+
+    def check_command_target(self, pane: str, terminal: str, *, target: str, codex: bool) -> None:
+        """Verify the native conversation and terminal."""
+        kind = "codex" if codex else "claude"
+        if self.native_session(pane, kind, operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)) != target:
+            raise HerdrFailure(f"{pane}: the conversation changed", "wrong_target")
+        if self.command_terminal(pane) != terminal:
+            raise HerdrFailure(f"{pane}: the terminal changed", "wrong_target")
+
+    def command_screen(self, pane: str, terminal: str, *, target: str) -> CommandScreen:
+        recent = self.read(pane, 60, joined=True, ansi=False)
+        visible = self._visible_screen(pane)
+        self.check_command_target(pane, terminal, target=target, codex=False)
+        active = _composer_region(visible)
+        footer = tuple(_prompt_screen(visible).splitlines()[active.end:]) if isinstance(active, ComposerRegion) else ()
+        return CommandScreen(_command_history(recent, codex=False), footer)
+
+    def idle_command(self, pane: str, terminal: str, text: str, *, target: str, codex: bool) -> tuple[str, ...]:
+        """Submit to an empty composer and return the history before submission."""
+        record = (script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
+                  if script_prompts.needs_record(text) else None)
+        if record is not None:
+            record.publish()
+        sent = False
+        try:
+            ready = self.readiness(pane)
+            if not ready["interactive_ready"] or not ready["agent_status"].idle:
+                raise HerdrFailure(f"{pane}: the pane is not idle", "wrong_target")
+            history = _command_history(self.read(pane, 60, joined=True, ansi=False), codex=codex)
+            self.check_command_target(pane, terminal, target=target, codex=codex)
+            region = _composer_region(self._visible_screen(pane), codex=codex)
+            if isinstance(region, NoComposer):
+                raise HerdrFailure(f"{pane}: the native composer is unknown", "wrong_target")
+            if region.input.text:
+                raise HerdrFailure("has unsent text", "wrong_target")
+            sent = True
+            self._prompt(pane, text)
+        except HerdrCommandNotStarted:
+            sent = False
+            raise
+        finally:
+            if record is not None:
+                if sent:
+                    record.trim()
+                else:
+                    record.path.unlink(missing_ok=True)
+        return history
 
     def _wait_for_submit(self, receipt: Callable[[], PromptSubmitted | TranscriptReadable | TranscriptUnreadable],
                          deadline: float) -> PromptSubmitted | None:
@@ -3052,7 +3246,7 @@ class Herdr:
             nonlocal terminal, recipient, typed, draft_pending
             with operation_deadline.within(deadline):
                 record = (script_prompts.prepare_record(pane, text, deadline=deadline)
-                           if action is _OpeningComposer.EMPTY and text.lstrip().startswith("/") else None)
+                          if action is _OpeningComposer.EMPTY and script_prompts.needs_record(text) else None)
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
@@ -3270,6 +3464,18 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
                             pane_info=row, client=self, text=expected_text):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        characters = tuple(_printable_key(key) for key in keys)
+        text = ""
+        for char in characters:
+            if char:
+                text += char
+            elif text:
+                script_prompts.record(pane, text)
+                text = ""
+        if text:
+            script_prompts.record(pane, text)
+        if any(characters):
+            script_prompts.mark_keys(pane)
         self._send_keys(pane, *keys)
 
     def answer_question(self, pane: str, text: str, *, target: str) -> None:
@@ -3283,6 +3489,7 @@ class Herdr:
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
             self._send_keys(pane, key)
             if index == 0:
+                script_prompts.record(pane, text)
                 _ = self.run("pane", "send-text", pane, text)
 
     def _send_keys(self, pane: str, *keys: str) -> None:
@@ -4398,6 +4605,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
     return ServerCreated()
 
 
+@reboot_lock()
 def start_server(name: str, timeout_ms: int, *,
                  session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _timeout(timeout_ms)
@@ -4429,6 +4637,7 @@ def start_server(name: str, timeout_ms: int, *,
             time.sleep(min(PANE_POLL_SECONDS, remaining))
 
 
+@reboot_lock()
 def restore_server(name: str, timeout_ms: int, *,
                    session_kind: SecuritySession) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
@@ -4712,18 +4921,28 @@ class NativeAgentProcess:
         return self.identity.id
 
 
+def process_exit_reason(pid: int) -> str:
+    return f"pid {pid}: process exited"
+
+
+def exited_process_pid(reason: str) -> int | None:
+    """Return the PID from an exact process exit reason."""
+    match = re.fullmatch(r"pid ([1-9][0-9]{0,9}): process exited", reason)
+    return int(match[1]) if match else None
+
+
 def _process_birth(pid: int) -> str:
     # A pane process can exit after herdr lists it; that process starts or exits, its pane is not unknown.
     if _platform() == "darwin":
         try:
             started = darwin_process_identity(pid).started
         except _DarwinProcessGone as error:
-            raise NativeRegistryChanging(f"pid {pid}: process exited") from error
+            raise NativeRegistryChanging(process_exit_reason(pid)) from error
     else:
         started = runtime_sessions.process_start(pid)
     if not started:
         if _platform() != "darwin" and not Path(f"/proc/{pid}").exists():
-            raise NativeRegistryChanging(f"pid {pid}: process exited")
+            raise NativeRegistryChanging(process_exit_reason(pid))
         raise ValueError(f"pid {pid}: process start is unavailable")
     return started
 
@@ -5572,7 +5791,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 
@@ -6284,7 +6503,7 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
             except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 
@@ -6728,6 +6947,19 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    prepared = replace(prepared, env={**prepared.env, "PYTHONPATH": startup_pythonpath(prepared.env.get("PYTHONPATH", ""))},
+                       unset_environment=prepared.unset_environment - {"PYTHONPATH"})
+    with reboot_lock():
+        return _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+                                      agent=agent, reported_unknown=reported_unknown, agent_name=agent_name,
+                                      codex=codex, client=client)
+
+
+def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                           timeout_ms: int, *, agent: str, reported_unknown: str,
+                           agent_name: str | AgentNameSource, codex: CodexConversations | CodexLaunchRead,
+                           client: Herdr | LaunchClientSource) -> AgentLaunched:
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":

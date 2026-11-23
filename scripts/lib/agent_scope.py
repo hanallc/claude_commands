@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 
-from scripts.lib import conf
+from scripts.lib import conf, process_stop
 
 _PANE_SCOPE_PROBE_SECONDS = 5.0
 
@@ -19,7 +19,7 @@ def agent_scope_prefix() -> tuple[list[str], str]:
     systemd_run = os.environ.get("SYSTEMD_RUN", "systemd-run")
     try:
         prefix = [shutil.which(systemd_run) or systemd_run, "--user", "--scope", "--quiet", "--collect",
-                  f"--slice={agents_slice()}", "--"]
+                  *process_stop.scope_slice_args(agents_slice()), "--"]
         probe = subprocess.run([*prefix, "true"], capture_output=True, text=True,
                                check=False, timeout=_PANE_SCOPE_PROBE_SECONDS)
     except (OSError, subprocess.TimeoutExpired, conf.Unusable) as error:

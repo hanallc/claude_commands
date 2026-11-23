@@ -148,7 +148,10 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole,
         return HoldWorkerUnavailable(reason)
     current_role = staff.KnownWorkerRole("astra-reviewer" if role == "reviewer" else "astra-designer")
     if member.role != current_role:
-        member = staff.set_worker_role(member.id, current_role)
+        try:
+            member = staff.set_worker_role(member.id, current_role)
+        except (staff.StaffRefused, staff.StaffNotFound) as error:
+            raise ValueError(" ".join(str(error).splitlines())) from error
         membership = replace(membership, rows=tuple(member if row.id == member.id else row for row in membership.rows))
     now = datetime.now(timezone.utc)
     dated_role = "review" if role == "reviewer" else "impl"

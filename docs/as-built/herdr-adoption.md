@@ -211,6 +211,12 @@ Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
 Run events retain the last worker reply while a result awaits a reply.
+Delivery records a drop for different known pass IDs before it selects a route or sends pane input.
+Delivery defers a linked result if the pass read fails during a new delivery attempt.
+Without the worker lock, the pass can change between the final read and pane input.
+The receipt ignores known results from other passes and keeps the current pass's matching DONE.
+Receipt recovery can miss results delivered before this change from a different run directory.
+A reply to an earlier pass's result delivered before this change can replace DONE if the reply repeats the current DONE marker.
 `reap_orphans` retries a pending completion only after its supervisor is gone.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A turn without DONE sends one `no DONE` notice when no pending work explains it.
@@ -287,7 +293,7 @@ An existing unit resumes its recorded plan without requiring a Production header
 Its requested directory must match the worktree in its staff row.
 A different recorded plan refuses reuse.
 
-A restore uses the script prompt envelope and the transcript's last assistant model unless `--model` overrides it.
+A restore uses the script prompt envelope. It uses the model and effort from the latest real assistant turn. An explicit `--model` overrides the model. The pane launch supplies the fallback model. The director role supplies any missing model or effort.
 A new unit waits for Remote Control readiness.
 The launcher prints the unit's attach hint after launch.
 `AgentNotReady` and other failures exit 1; a refusal exits 2.

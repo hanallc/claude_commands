@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -55,7 +56,9 @@ class TheListTests(unittest.TestCase):
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": rows}))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
-            "CLAUDE_CODE_SESSION_ID": MORTY.current_session}))
+            "CLAUDE_CODE_SESSION_ID": MORTY.current_session,
+            # Each date this file expects is a New York date; the live zone setting must not move it.
+            "USER_ZONE": "America/New_York"}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
@@ -74,9 +77,83 @@ class TheListTests(unittest.TestCase):
         return the_list.add(MORTY.id, title, owner=RUNNER.id, source="nate", number=number,
                             changes=changes if changes is not None else {})
 
+    def test_log_field_changes_replays_linked_delivery(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        delivered = the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered("sdlc/C1"))
+        update = the_list.FieldChange("Updated", {"state": the_list.ItemState.DELIVERED, "next_step": "Read the page."})
+        item = replace(item, log=(*item.log, the_list.ItemChange(START, delivered, "the List"),
+                                  the_list.ItemChange(START, update, "morty")))
+        self.assertEqual(list(the_list.log_field_changes(item))[-2:], [{}, {"next_step": "Read the page."}])
+
+    def test_log_field_changes_replays_legacy_reopened(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + '\n- 2026-11-16 18:10:00+00:00 Closed: Done. — nate\n'
+            + '- 2026-11-16 18:20:00+00:00 Reopened — nate\n'
+            + '- 2026-11-16 18:30:00+00:00 Updated state: "New"; next_step: "Read the page." — morty\n')
+        restored = the_list.load(MORTY.id, item.id)
+        self.assertEqual(list(the_list.log_field_changes(restored))[-1], {"next_step": "Read the page."})
+
+    def test_log_field_changes_replays_the_saved_requester(self) -> None:
+        for requester in the_list.RequestedBy:
+            with self.subTest(requester=requester):
+                item = the_list.add(MORTY.id, "Track the requester", owner=RUNNER.id, source="nate",
+                                    requested_by=requester, changes={})
+                _ = the_list.update(MORTY.id, item.id, {"requested_by": requester, "next_step": "Read the page."},
+                                    source="morty")
+                added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+                self.assertEqual(added["requested_by"], requester)
+                self.assertEqual(updated, {"next_step": "Read the page."})
+
+    def test_log_field_changes_uses_defaults_for_fields_that_legacy_added_omits(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated evidence: "" — morty\n')
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added, {"title": item.title})
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_only_the_append_after_legacy_evidence_cleanup(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nMigration copy."})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + "\n- 2026-11-16 18:10:00+00:00 Removed the migration copy of checkins.json from Evidence — morty\n"
+            + r'- 2026-11-16 18:20:00+00:00 Updated evidence: "Keep this line.\nAppended line." — morty' + "\n")
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{}, {"evidence": "Appended line."}])
+
+    def test_log_field_changes_shows_only_added_evidence_lines_in_order(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nRemove this line."})
+        _ = the_list.update(MORTY.id, item.id,
+                            {"evidence": "First addition.\nKeep this line.\nSecond addition."}, source="morty")
+        updated = the_list.update(MORTY.id, item.id, {"evidence": "Keep this line."}, source="morty")
+        changes = list(the_list.log_field_changes(updated))
+        self.assertEqual(changes[1:], [{"evidence": "First addition.\nSecond addition."}, {}])
+
+    def test_log_field_changes_ignores_evidence_line_ending_changes(self) -> None:
+        item = self.add(changes={"evidence": "First line.\r\nSecond line.\r\n"})
+        _ = the_list.update(MORTY.id, item.id, {"evidence": "First line.\nSecond line.\n"}, source="morty")
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added["evidence"], "First line.\r\nSecond line.\r\n")
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_the_first_requester_after_legacy_added_omits_it(self) -> None:
+        item = self.add(changes={"requested_by": the_list.RequestedBy.DWIGHT})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated requested_by: "nate" — morty\n'
+            + '- 2026-11-16 18:20:00+00:00 Updated requested_by: "nate" — morty\n')
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{"requested_by": the_list.RequestedBy.NATE}, {}])
+
     def test_commands_preserve_fields_text_and_history(self) -> None:
         content = "Use the result.\r\n\n\n## Latest status\n\nThis heading stays in the text.\n"
-        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
         result = self.command("add", "--title", 'The page: "List"', "--owner", RUNNER.id,
             "--number", "106", "--source", "nate", "--state", "Working", "--unit", "unit-board",
             "--next-check", "2026-11-16T19:00:00+00:00", "--eta", "Nov 16 15:00 EST",
@@ -352,6 +429,18 @@ class TheListTests(unittest.TestCase):
                          [["--to", OTHER.id, "--recipient-kind", "producer", "--from", "morty"],
                           ["--to", RUNNER.id, "--recipient-kind", "showrunner", "--from", "morty"]])
 
+    def test_assignment_accepts_a_showrunner_notice_held_for_review(self) -> None:
+        item = self.add()
+        self.send_patch.stop()
+        with patch.object(subprocess, "run", side_effect=(
+            subprocess.CompletedProcess([], 0, "SENT: delivered\n", ""),
+            subprocess.CompletedProcess([], 0, "KEPT: showrunner is in a review; delivered at its end\n", ""),
+        )) as send:
+            result = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual(result, (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+        self.assertEqual([call.args[0][3] for call in send.call_args_list], [OTHER.id, RUNNER.id])
+
     def test_assignment_notifies_showrunner_if_the_producer_retires_after_save(self) -> None:
         item = self.add()
         members = staff.snapshot()
@@ -417,7 +506,10 @@ class TheListTests(unittest.TestCase):
         foreign = self.add("Bob's item", changes={"producer": BOB.id})
         path = the_list.folder(MORTY.id) / f"{foreign.id}.md"
         _ = path.write_text(path.read_text().replace("## Next step", "## Invalid heading"))
-        _ = the_list.add(OTHER.id, "Wrong store", owner=RUNNER.id, source="dwight", changes={})
+        legacy = the_list.folder(OTHER.id)
+        legacy.mkdir(parents=True)
+        words = (the_list.folder(MORTY.id) / f"{own.id}.md").read_text()
+        _ = (legacy / f"{own.id}.md").write_text(words.replace("Dwight's item", "Wrong store"))
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
             result, output, error = self.command("list", "--all")
         self.assertEqual((result, error), (0, ""))
@@ -604,7 +696,6 @@ class TheListTests(unittest.TestCase):
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         commands = (
-            ("add", "--title", "New item", "--owner", RUNNER.id),
             ("park", "--id", item.id, "--until", START.isoformat()),
             ("close", "--id", item.id, "--words", "Done"),
             ("reopen", "--id", item.id),
@@ -618,10 +709,53 @@ class TheListTests(unittest.TestCase):
                 with self.subTest(command=name):
                     self.assertEqual(self.command(name, *args, "--source", "dwight"),
                                      (1, "", f"the_list: only morty can run {name}\n"))
-            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer"),
-                             (1, "", "the_list: only morty can run answer\n"))
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
+                                          "--keeper", MORTY.id),
+                             (1, "", "the_list: only the record keeper or morty can answer\n"))
         self.assertEqual(the_list.records(MORTY.id), [item])
         self.assertEqual(self.notices, [])
+
+    def test_two_producers_add_to_mortys_sequence(self) -> None:
+        first = self.add()
+        for number, producer in enumerate((OTHER, BOB), start=2):
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": producer.current_session}):
+                result = self.command("add", "--title", "Check the deployment", "--owner", RUNNER.id,
+                                      "--source", "another name")
+                self.assertEqual(result, (0, f"L{number}\n", ""))
+                item = the_list.load(MORTY.id, f"L{number}")
+                self.assertEqual((item.producer, item.log[0].source), (producer.id, producer.name))
+                self.assertFalse(the_list.folder(producer.id).exists())
+                for option, value in (("--producer", MORTY.id), ("--number", "100")):
+                    result, output, _ = self.command("add", "--title", "Check the deployment",
+                                                      "--owner", RUNNER.id, "--source", producer.name, option, value)
+                    self.assertEqual((result, output), (1, ""))
+        self.assertEqual([item.number for item in the_list.records(MORTY.id)], [first.number, 2, 3])
+
+    def test_unpublished_reservation_does_not_reuse_its_number(self) -> None:
+        first = self.add()
+        with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("Cannot publish the item")):
+            with self.assertRaisesRegex(OSError, "Cannot publish the item"):
+                _ = self.add()
+        self.assertEqual(the_list.records(MORTY.id), [first])
+        with self.assertRaisesRegex(the_list.ListError, "the next available number is L3"):
+            _ = self.add(number=2)
+        self.assertEqual(self.add().number, 3)
+
+    def test_producer_add_only_resolves_its_own_references(self) -> None:
+        foreign = self.add("Private prerequisite", changes={"producer": BOB.id})
+        own = self.add("Visible prerequisite", changes={"producer": OTHER.id})
+        command = ("add", "--title", "Track the result", "--owner", RUNNER.id, "--source", OTHER.name)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for option, suffix in (("--related-to", ""), ("--blocked-by", ":Complete")):
+                with self.subTest(option=option):
+                    missing = self.command(*command, option, "L99" + suffix)
+                    self.assertEqual(missing, (1, "", "the_list: the referenced List item does not exist\n"))
+                    self.assertEqual(self.command(*command, option, foreign.id + suffix), missing)
+            self.assertEqual(self.command(*command, "--related-to", own.id, "--blocked-by", own.id + ":Complete"),
+                             (0, "L3\n", ""))
+        saved = the_list.load(MORTY.id, "L3")
+        self.assertEqual(saved.related_to, (own.number,))
+        self.assertEqual(saved.blocked_by, (the_list.ItemDependency(own.number, "Complete"),))
 
     def test_close_reopen_and_repeats_keep_the_record_and_number(self) -> None:
         item = self.add(number=70)
@@ -999,6 +1133,28 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(answer.text, text)
         self.assertEqual(saved.unread_since, START)
 
+    def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
+        first = self.add(number=1)
+        # Only morty's folder allocates numbers, so a legacy keeper's L1 is a copy of morty's record.
+        legacy = the_list.folder(OTHER.id)
+        legacy.mkdir(parents=True)
+        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{first.id}.md", legacy / f"{first.id}.md")
+        second = the_list.load(OTHER.id, first.id)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
+            _ = the_list.ask_question(keeper, item.id,
+                                      the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        first_open = the_list.load(MORTY.id, first.id)
+        self.assertEqual(self.command("answer", second.id, "--question", "Q1", "--text", "The second check.",
+                                      "--keeper", OTHER.id),
+                         (0, f"answered {second.id} Q1\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, first.id), first_open)
+        saved = the_list.load(OTHER.id, second.id)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, "The second check.")
+        self.assertEqual(saved.log[-1].source, MORTY.name)
+
     def test_close_clears_unread_and_reopen_marks_a_new_update(self) -> None:
         item = self.add()
         self.assertIsInstance(the_list.unread_update(item), the_list.UnreadUpdate)
@@ -1040,8 +1196,6 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.close(MORTY.id, item.id, closed.closing_words, source="nate"), closed)
         self.assertEqual(self.command("answer", item.id, "--question", "Q2", "--text", "The report."),
                          (1, "", "the_list: Unknown question id.\n"))
-        self.assertIsInstance(the_list.resend_question(MORTY.id, item.id, "Q2", "retry", status),
-                              change_page.NoMessageDelivery)
         self.assertIsInstance(the_list.ask_question(MORTY.id, item.id, pending, status),
                               change_page.NoMessageDelivery)
         with self.assertRaisesRegex(question_record.AnswerRefused, "This item is Closed"):
@@ -1051,23 +1205,30 @@ class TheListTests(unittest.TestCase):
             list_page.deliver(list_page.ListQuestionDelivery(sent, status))
             change_page.deliver(claimed, status)
             path = status.path(claimed.page, claimed.row)
-            change_page.recover_page_question(status, path, change_page.read_question_attempt(path))
+            closed_attempt = change_page.read_question_attempt(path)
+            self.assertIs(closed_attempt.state, delivery_state.QuestionSendState.UNKNOWN)
+            self.assertIsInstance(closed_attempt.owner, delivery_state.NoQuestionSendOwner)
+            self.assertEqual(closed_attempt.error, "")
+            change_page.recover_page_question(status, path, closed_attempt)
             send.assert_not_called()
         _ = the_list.reopen(MORTY.id, item.id, source="nate")
         _ = the_list.ask_question(MORTY.id, item.id, replace(pending, request="new"), status)
         self.assertEqual([question.question_id for question in the_list.load(MORTY.id, item.id).questions],
                          ["Q1", "Q3"])
 
-    def test_close_stops_question_retries_and_retains_the_transport_result(self) -> None:
+    def test_close_stops_question_retries_and_keeps_confirmed_acceptance(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
-        for expected in (delivery_state.QuestionSendState.SENT, delivery_state.QuestionSendState.FAILED):
-            with self.subTest(outcome=expected):
+        state = delivery_state.QuestionSendState
+        cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
+            ("sent", state.SENT), ("failed", state.UNKNOWN), ("pending", state.UNKNOWN),
+        )
+        for outcome, expected in cases:
+            with self.subTest(outcome=outcome):
                 item = self.add()
                 delivery = the_list.ask_question(MORTY.id, item.id,
                     the_list.PageRequest("ask", "question", "Which check passed?"), status)
                 assert isinstance(delivery, change_page.PageQuestionSend)
-                header = send_result.OutcomeHeader(
-                    "sent" if expected is delivery_state.QuestionSendState.SENT else "failed", "Test result", "")
+                header = send_result.OutcomeHeader(outcome, "Test result", "")
 
                 def close_during_send(*_args: object) -> tuple[send_result.ConfirmedSendOutcome, str]:
                     _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
@@ -1081,7 +1242,12 @@ class TheListTests(unittest.TestCase):
                 send.assert_called_once()
                 alert.assert_not_called()
                 path = status.path(delivery.page, delivery.row)
-                self.assertEqual(change_page.read_question_attempt(path).state, expected)
+                saved = change_page.read_question_attempt(path)
+                self.assertEqual(saved.state, expected)
+                self.assertIsInstance(saved.owner, delivery_state.NoQuestionSendOwner)
+                self.assertFalse(saved.earlier_unconfirmed)
+                self.assertEqual(saved.error, "")
+                self.assertFalse(status.has_deferred_questions())
 
     def test_retry_read_error_preserves_the_confirmed_failure(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
@@ -1442,8 +1608,7 @@ class TheListTests(unittest.TestCase):
 
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
-        with patch.object(the_list, "user_zone", return_value=ZoneInfo("America/New_York")):
-            self.assertEqual(self.command("park", "--id", item.id, "--until", "2026-11-17", "--source", "nate"), (0, "", ""))
+        self.assertEqual(self.command("park", "--id", item.id, "--until", "2026-11-17", "--source", "nate"), (0, "", ""))
         item = the_list.load(MORTY.id, item.id)
         self.assertEqual(item.parked_until, datetime(2026, 11, 17, 5, tzinfo=UTC))
         self.assertEqual(item.state, the_list.ItemState.WORKING)
@@ -1468,6 +1633,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
                              (0, "", ""))
             delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
             self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual(delivered.unread_since, START + timedelta(days=30))
             self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
@@ -1644,7 +1810,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(sources, [the_list.folder(MORTY.id)])
         item = self.add()
         path = the_list.folder(MORTY.id) / "L2.md"
-        for data in (b"bad", b"\xff"):
+        for next_number, data in enumerate((b"bad", b"\xff"), start=3):
             with self.subTest(data=data):
                 _ = path.write_bytes(data)
                 sources.clear()
@@ -1656,9 +1822,9 @@ class TheListTests(unittest.TestCase):
                 self.assertIn(str(path), errors.getvalue())
                 with self.assertRaises(the_list.ListError):
                     _ = the_list.load(MORTY.id, "L2")
-                self.assertEqual(self.add().number, 3)
+                self.assertEqual(self.add().number, next_number)
                 self.assertEqual(path.read_bytes(), data)
-                (path.parent / "L3.md").unlink()
+                (path.parent / f"L{next_number}.md").unlink()
 
     def test_invalid_fields_and_inputs_refuse_without_writing(self) -> None:
         item = self.add()
@@ -1715,40 +1881,48 @@ class TheListTests(unittest.TestCase):
             _ = the_list.update(MORTY.id, "L1", {"state": the_list.ItemState.WORKING}, source="morty")
         self.assertEqual({cast(Path, call.args[0]).parent for call in writes.call_args_list},
                          {investigation.folder(MORTY.id), the_list.folder(MORTY.id)})
+
+    def test_create_records_validates_and_reserves_mortys_batch(self) -> None:
+        item = self.add()
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "migration")}))
         typed = replace(item, number=50, owner=the_list.UnassignedOwner.NATE,
                         opened=the_list.NoTimestamp.UNSET, updated=the_list.NoTimestamp.UNSET,
                         eta=the_list.EtaDescription("About November 19; approval required"),
                         next_check=the_list.CheckCondition("After the owner supplies proof"))
         dependent = replace(typed, number=51, owner=the_list.UnassignedOwner.NOT_RECORDED,
                             related_to=(50,), blocked_by=(the_list.ItemDependency(50, "Proof is available"),))
-        the_list.create_records(OTHER.id, [dependent, typed])
-        self.assertEqual(the_list.load(OTHER.id, "L50"), typed)
-        self.assertEqual(the_list.load(OTHER.id, "L51"), dependent)
-        text = the_list.table(OTHER.id)
+        with self.assertRaisesRegex(the_list.ListError, "only morty's List folder"):
+            the_list.create_records(OTHER.id, [dependent, typed])
+        self.assertFalse(the_list.folder(OTHER.id).exists())
+        with self.assertRaisesRegex(the_list.ListError, "only morty's List folder"):
+            _ = the_list.add(OTHER.id, "Wrong keeper", owner=RUNNER.id, source="fixture", changes={})
+        self.assertFalse(the_list.folder(OTHER.id).exists())
+        with self.assertRaises(the_list.ListError):
+            the_list.create_records(MORTY.id, [typed, replace(dependent, related_to=(999,))])
+        self.assertEqual(the_list.records(MORTY.id), [])
+        with self.assertRaisesRegex(the_list.ListError, "item numbers must be unique"):
+            the_list.create_records(MORTY.id, [typed, typed])
+        self.assertEqual(the_list.records(MORTY.id), [])
+        _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+        with self.assertRaisesRegex(the_list.ListError, f"{OTHER.name}: retired producer"):
+            the_list.create_records(MORTY.id, [typed, replace(dependent, producer=OTHER.id)])
+        self.assertEqual(the_list.records(MORTY.id), [])
+        the_list.create_records(MORTY.id, [dependent, typed])
+        self.assertEqual(the_list.records(MORTY.id), [typed, dependent])
+        self.assertEqual(self.add().number, 52)
+        with self.assertRaisesRegex(the_list.ListError, "the next available number is L53"):
+            the_list.create_records(MORTY.id, [replace(typed, number=49)])
+        self.assertFalse((the_list.folder(MORTY.id) / "L49.md").exists())
+        text = the_list.table(MORTY.id)
         self.assertIn("| nate |", text)
         self.assertIn("| Not recorded |", text)
         self.assertIn("About November 19; approval required", text)
         self.assertIn("check: After the owner supplies proof", text)
-        with self.assertRaises(the_list.ListError):
-            the_list.create_records(OTHER.id, [replace(typed, number=52)])
-        self.assertFalse((the_list.folder(OTHER.id) / "L52.md").exists())
-        with self.assertRaises(the_list.ListError):
-            the_list.create_records(OWNER.id, [typed, replace(dependent, related_to=(999,))])
-        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
-        with self.assertRaises(the_list.ListError):
-            the_list.create_records(OWNER.id, [typed, typed])
-        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
-        _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
-        with self.assertRaisesRegex(the_list.ListError, f"{OTHER.name}: retired producer"):
-            the_list.create_records(OWNER.id, [typed, replace(dependent, producer=OTHER.id)])
-        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
-        the_list.create_records(OWNER.id, [typed, dependent])
-        self.assertEqual(the_list.records(OWNER.id), [typed, dependent])
         for text_eta in ("2026-11-20/2026-11-19", "2026-11-99/2026-11-19", "Paused"):
             with self.subTest(text_eta=text_eta):
-                changed = the_list.update(OTHER.id, "L50", {"eta": the_list.EtaDescription(text_eta)}, source="morty")
-                self.assertEqual(the_list.load(OTHER.id, "L50"), changed)
-                self.assertIn('eta_kind: "text"', (the_list.folder(OTHER.id) / "L50.md").read_text())
+                changed = the_list.update(MORTY.id, "L50", {"eta": the_list.EtaDescription(text_eta)}, source="morty")
+                self.assertEqual(the_list.load(MORTY.id, "L50"), changed)
+                self.assertIn('eta_kind: "text"', (the_list.folder(MORTY.id) / "L50.md").read_text())
         for eta in ("2026-11-19 (planned)", "Pending (check 18:00 EST)", "Paused"):
             with self.subTest(eta=eta):
                 self.assertEqual(the_list.eta_text(the_list.eta_value(eta)), eta)

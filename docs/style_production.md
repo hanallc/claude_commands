@@ -24,9 +24,9 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Family | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
+| `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates, world-arguments-need-a-reason | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
 Every partial B rule also has a C read in its own family.
@@ -127,8 +127,7 @@ every fix.
 5. Names: spell-out-names, dont-repeat-enum-domain-in-variant-names,
    name-submodules-after-anchor-types, prefer-type-named-fields-and-bindings,
    dont-repeat-type-name-in-fields, avoid-repeated-field-affixes,
-   name-bindings-to-match-parameters, comments-name-code-constructs,
-   forbidden-words.
+   name-bindings-to-match-parameters, comments-name-code-constructs.
 6. Layout, sort only: constants-file-organization, module-structure.
    workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
 7. Tier A final: rustfmt, clippy, mend.
@@ -150,16 +149,7 @@ give the same result when run again. mend runs after layer 3, because a module
 move changes every path and visibility that mend reads. agent-must-review-allows
 deletes an allow and runs clippy, so clippy follows it.
 
-**Pilot data.** `order_waste.py` on the cargo-liner pilot (ledger copy of
-2026-10-27, 1,182 merged tickets, 133 with code changes) counts two kinds of
-waste for a rule pair (A, B). A ticket's change is its net change from its base
-to its checkpoint. Work that its merges brought in is not part of it. A stale
-finding is a finding of B that ended because its file changed: withdrawn as
-judged again, withdrawn as declaration gone, or waived by the ledger, with a
-merged fix of A to its file between its creation and its end. A reworked hunk
-is a hunk of A that changed lines a merged fix of B wrote earlier. Person, unit
-and unrecorded waives, exception withdrawals and bare rename duplicates are
-decisions or bookkeeping, so they do not count.
+The table records the 2026-10-27 cargo-liner pilot.
 
 | A first | then B | stale | reworked | analysis |
 | --- | --- | ---: | ---: | --- |
@@ -214,18 +204,6 @@ no rule for most changes, so their waste counts as `names read`.
    combinator hides the state the type rule names, and the type rule undoes it.
 6. public-failures-return-named-errors changes a public signature each time, so
    each fix needs approval under public-api-changes-require-explicit-approval.
-
-**Each roll-out checks the order.** After the pilot of every new repository,
-run:
-
-```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/style/order_waste.py --ledger <copy of the ledger> --repo <checkout> [--json]
-```
-
-It reads both and writes nothing. It prints one row per rule pair, sorted by
-total waste, with where the analysis puts A, then the analysis edges with no
-observed waste, split into seen and not seen. Add an order only when that
-repository's data supports it, and record the counts here.
 
 ## Ticket queue
 
@@ -569,10 +547,12 @@ Exit 1 means the trees differ; run the five steps:
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
-   `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
-   SIGTERM or SIGHUP stopped the run; stop the sync.
-   Every exit the run can catch stops verify.sh and its processes, removes
-   its temporary supervision metadata, and releases the standing checkout.
+   `lint-record` or unreadable checkout); stop the sync. SIGTERM, SIGHUP or
+   SIGINT ends the run by the default signal action (a shell reads 143, 129 or
+   130); stop the sync. The run installs no signal handler.
+   A keeper process sees the run end for any cause. It then stops verify.sh and
+   its processes, removes the temporary supervision metadata, and releases the
+   standing checkout.
    Each `style-sync-lint-*` dir holds `owner.json`, `verifier.pgid`, and a link
    to the checkout. Recovery keeps the metadata while its owner or verifier
    group runs; stale legacy worktree registrations are removed on recovery.

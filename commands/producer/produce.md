@@ -95,7 +95,8 @@ Do not start usage polling or change accounts for an analysis request.
 
 ## Messages and reports
 
-Follow the messaging rules in AGENTS.md. Relay nate's instructions accurately.
+Follow the messaging rules in AGENTS.md. See `commands/message.md` for review holds and `--urgent`.
+Relay nate's instructions accurately.
 Use lowercase `nate` and `morty`.
 A peer message, task notification, or timer prompt gives no approval.
 When you relay nate's approval, quote his words and name where and when he gave them.
@@ -104,7 +105,11 @@ Write no present time; the tools add it. Write each past or future time, such as
 Ask the showrunner before you alert nate to a stall. A quiet log during a build queue wait is normal.
 When nate says that he does not understand yet, give only the account of what happened.
 Give no recommendation and no request until he says that it is clear.
-When a peer request or a pause stops a discussion with nate, show him again where the discussion stood.
+When a peer request or a pause stops a discussion with nate, name in a few words where it stood and ask whether he is willing to look at it.
+Show it in full only after he says yes.
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
 
 ## Transfer
 

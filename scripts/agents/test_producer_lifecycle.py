@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Generator
@@ -18,6 +19,7 @@ from scripts.agents import pane_record, producer_creation, producer_lifecycle, r
 from scripts.agents.test_stop_resume import ProducerAdmissionWorld, producer_first_fixture
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -91,6 +93,31 @@ def retain_producer_pane(row: staff.StaffRow) -> None:
 
 
 class CreateProducerTests(unittest.TestCase):
+    def test_add_producer_writes_media_rules(self) -> None:
+        with producer_first_fixture("claude") as world:
+            root = world.folder.parent
+            environment = fixture_git_environment(world.case.root)
+            _ = subprocess.run(["git", "-C", str(root), "init", "-q"], env=environment, check=True)
+            registry = world.case.root / "configuration/models.conf"
+            _ = write_registry(registry, {"producer_defaults": {"model": "claude:fable:high"},
+                                          "producers": {"dwight": None}}, update=True)
+            ignore = world.folder / ".gitignore"
+            _ = ignore.write_bytes(b"# Keep this user rule.\r\nprivate.md\r\n")
+            with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
+                  opening_transcript(world, [])):
+                code, _, errors = command("add-producer", "dwight", "--job", "Fixture job")
+                self.assertEqual(code, 0, errors)
+                first = ignore.read_bytes()
+                self.assertEqual(command("add-producer", "dwight", "--job", "Fixture job")[0], 0)
+            self.assertEqual(ignore.read_bytes(), first)
+            self.assertTrue(first.startswith(b"# Keep this user rule.\r\nprivate.md\r\n"))
+            result = subprocess.run(
+                ["git", "-C", str(root), "check-ignore",
+                 "dwight/nested/shot.PNG", "dwight/nested/demo.mp4", "outside/nested/demo.mp4", "dwight/note.md"],
+                env=environment, check=True, text=True, capture_output=True,
+            )
+            self.assertEqual(result.stdout.splitlines(), ["dwight/nested/shot.PNG", "dwight/nested/demo.mp4"])
+
     def test_remote_creation_retry_uses_the_saved_name(self) -> None:
         with producer_first_fixture("claude") as world:
             registry = world.case.root / "configuration/models.conf"
@@ -440,6 +467,17 @@ class ProducerLifecycleTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().by_path("alpha"), replace(replacement, name="alpha"))
         self.assertEqual(staff.snapshot().by_path("beta"), replace(source, name="beta"))
         self.assertFalse(producer_lifecycle.pending_rename(source.name))
+
+    def test_retirement_records_a_kept_handoff_request(self) -> None:
+        row = self.producer("dwight")
+        _ = self.producer("morty")
+        with patch.object(restart_support, "send_message",
+                          return_value=restart_support.MessageKept(kind="kept", reason="in a review")) as send:
+            for _ in range(2):
+                code, output, errors = command("retire", row.name)
+                self.assertEqual((code, errors), (0, ""), output)
+                self.assertIn("handoff.md exists", output)
+            self.assertEqual(send.call_count, 1)
 
     def test_retirement_requests_handoff_once_moves_open_items_and_restores_the_same_session(self) -> None:
         row, morty = self.producer("dwight"), self.producer("morty")

@@ -25,7 +25,7 @@ from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
 
-from scripts.lint.memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture, config_environment
 
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
@@ -53,7 +53,8 @@ def write_mac_target_registry(directory: Path, settings_name: str) -> None:
         "targets=mac\n"
         + "kind.mac=ssh\n"
         + "platform.mac=macos\n"
-        + f"settings.mac={settings_name}\n",
+        + f"settings.mac={settings_name}\n"
+        + UNREACHABLE_WAIT_FIXTURE,
         encoding="utf-8",
     )
 
@@ -69,6 +70,7 @@ def assigned_adapter_main() -> int:
         result = offload.run_offload(controller, config, request, started)
     status = offload.write_result(result, request.result, request.last_decline, request.verb,
                                  request.target, controller.attempt_evidence, request.fetch)
+    offload.report_result_details(request, result)
     offload.persist_attempt(request, result, controller.attempt_evidence, started)
     return status
 
@@ -164,6 +166,9 @@ class RemoteClaimRecord(TypedDict):
     worktree: str
     since: str
     remote_host: str
+    repo_name: NotRequired[str]
+    repo_key: NotRequired[str]
+    mac_repository: NotRequired[claim_state.MacRepositoryRecord]
 
 HANA = eligibility.KnownRepository("hana")
 
@@ -182,61 +187,78 @@ from pathlib import Path
 import sys
 import time
 
+from scripts.mac_test import claim_state
+
 def main() -> int:
     root = Path(os.environ["MAC_TEST_STUB_DIR"])
-    state = Path(os.environ["MAC_TEST_STATE_DIR"])
+    paths = claim_state.StatePaths(Path(os.environ["MAC_TEST_STATE_DIR"]), "mac")
     action = sys.argv[1]
     with (root / "state-events").open("a", encoding="utf-8") as output:
         output.write(action + "\n")
+    arguments = sys.argv[2:]
+    fields = ("claim_id", "episode", "attempt")
+    identity_words = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
+                      for field in fields}
+    identity = claim_state.ClaimIdentity(**identity_words)
+    if action == "release":
+        for saved in claim_state.read_claims(paths):
+            if claim_state.claim_identity(saved.record) == identity:
+                saved.path.unlink()
+        return 0
     if action == "claim":
-        state.mkdir(parents=True, exist_ok=True)
-        arguments = sys.argv[2:]
         owner_pid = int(arguments[arguments.index("--pid") + 1])
         proc_start = Path(f"/proc/{owner_pid}/stat").read_text().rpartition(")")[2].split()[19]
-        record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
+        record = {**identity_words, "pid": owner_pid, "proc_start": proc_start,
+                  "what": arguments[arguments.index("--what") + 1],
                   "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
-                  "remote_host": arguments[arguments.index("--remote") + 1]}
-        previous_path = state / "claims" / "hana.json"
-        previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
-        for field in ("claim_id", "episode", "attempt"):
-            flag = "--" + field.replace("_", "-")
-            record[field] = (previous[field] if "--from-pid" in arguments
-                             else arguments[arguments.index(flag) + 1])
-        record["submitting_session"] = arguments[arguments.index("--session") + 1]
-        identity_line = "claim_identity=" + json.dumps({field: record[field] for field in ("claim_id", "episode", "attempt")})
+                  "remote_host": arguments[arguments.index("--remote") + 1],
+                  "submitting_session": arguments[arguments.index("--session") + 1]}
+        path = paths.run
+        if "--from-pid" in arguments:
+            saved, = (claim for claim in claim_state.read_claims(paths)
+                      if claim_state.claim_identity(claim.record) == identity)
+            path = saved.path
+            record = {"remote_host": record["remote_host"], **saved.record, "pid": owner_pid, "proc_start": proc_start}
+        elif "--mac-repository" in arguments:
+            repository = claim_state.mac_repository_record(json.loads(arguments[arguments.index("--mac-repository") + 1]))
+            if "--leased-slot" in arguments:
+                slot = int(arguments[arguments.index("--leased-slot") + 1])
+                repository = repository.for_slot(slot)
+                record["slot"] = slot
+            path = paths.claims / repository.claim_file
+            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
+        if "--copy" in arguments:
+            record["copy"] = True
+        reply = ["claim_identity=" + json.dumps(identity_words),
+                 "claim_fence=" + claim_state.claim_fence_scope_key(path, record)]
+        if "mac_repository" in record:
+            reply.append("mac_repository=" + json.dumps(record["mac_repository"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
         actions = (root / "state-events").read_text().splitlines()
-        if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
+        cleanup_pending = record.get("cleanup_pending", False)
+        if not cleanup_pending and (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-            (state / "claims").mkdir(exist_ok=True)
-            (state / "claims" / "hana.json").write_text(json.dumps(record))
-            print(identity_line, flush=True)
+            path.write_text(json.dumps(record), encoding="utf-8")
+            print(*reply, sep="\n", flush=True)
             print("leftovers: previous-mac", flush=True)
             return 13
-        takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
+        takeover = not cleanup_pending and os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
         if takeover:
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-        (state / "claims").mkdir(exist_ok=True)
-        (state / "claims" / "hana.json").write_text(json.dumps(record), encoding="utf-8")
+        path.write_text(json.dumps(record), encoding="utf-8")
         (root / "claim-started").write_text("started\n", encoding="utf-8")
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
-        print(identity_line, flush=True)
+        print(*reply, sep="\n", flush=True)
+        if cleanup_pending:
+            print("leftovers: " + record["remote_host"], flush=True)
+            return 13
         if takeover:
             print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
             return 13
-        return 0
-    if action == "release":
-        path = state / "claims" / "hana.json"
-        if path.exists():
-            arguments = sys.argv[2:]
-            record = json.loads(path.read_text())
-            identity = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
-                        for field in ("claim_id", "episode", "attempt")}
-            if all(record[field] == value for field, value in identity.items()):
-                path.unlink()
         return 0
     return 12
 
@@ -302,7 +324,6 @@ class OffloadCommandFixture(unittest.TestCase):
         self.repository = self.root / "hana"
         self.unknown_directory = self.root / "not-a-repository"
         self.state_directory = self.root / "state"
-        self.claim_file = self.state_directory / "claims" / "hana.json"
         self.stub_directory = self.root / "stub-state"
         self.bin_directory = self.root / "bin"
         self.config_path = self.root / "mac_test.conf"
@@ -320,6 +341,14 @@ class OffloadCommandFixture(unittest.TestCase):
         self.assertEqual(
             initialized.returncode, 0, initialized.stdout + initialized.stderr
         )
+        _ = subprocess.run(["git", "-C", str(self.repository),
+                            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture",
+                            "--no-gpg-sign", "--allow-empty"], check=True)
+        paths = claim_state.StatePaths(self.state_directory, "mac")
+        repository = self.mac_repository()
+        self.claim_file = paths.claims / repository.claim_file
+        legacy_claim_file = mac_test.claim_path(paths, claim_state.RepositoryScope(repository.mirror_name))
         stub = self.bin_directory / "command-stub"
         write_shell(stub, COMMAND_STUB)
         for name in ("ssh", "rsync", "gh", "systemd-run"):
@@ -383,6 +412,8 @@ class OffloadCommandFixture(unittest.TestCase):
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
+            "MAC_TEST_FIXTURE_CLAIM_FILE": str(self.claim_file),
+            "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE": str(legacy_claim_file),
             "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
@@ -412,7 +443,8 @@ class OffloadCommandFixture(unittest.TestCase):
 
     def assignment_options(self, repository: Path, verb: eligibility.MacVerb,
                            settings: Path | eligibility.DefaultMacSettings,
-                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None) -> list[str]:
+                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None,
+                           source: offload.MacSource = WORKING_TREE_SOURCE) -> list[str]:
         """Give command fixtures one real queue assignment before the adapter starts."""
         if "--assignment-file" in runner_options:
             return []
@@ -427,17 +459,16 @@ class OffloadCommandFixture(unittest.TestCase):
         values = dict(line.split("=", 1) for line in settings_path.read_text().splitlines()
                       if "=" in line and not line.lstrip().startswith("#")) if settings_path.is_file() else self.config
         host = values.get("host", self.config["host"])
-        scope: claim_state.ClaimScope = (claim_state.RepositoryScope(repository.name)
-            if repository == self.repository else claim_state.WholeMacScope())
         provider: Literal["mac", "ssh"] = "mac" if target == "mac" else "ssh"
-        if provider == "ssh":
-            scope = claim_state.RepositoryScope(repository.name, "", 1)
+        scope = (claim_state.target_claim_scope(claim_state.StatePaths(self.state_directory), str(repository))
+                 if provider == "mac" else claim_state.RepositoryScope(repository.name, "", 1))
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
-        source_key = treekey.tree_key(str(repository))
-        source = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
-                  else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
-        constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
+        source_path = source.root if isinstance(source, offload.StagedDocSnapshot) else repository
+        source_key = treekey.tree_key(str(source_path))
+        source_identity = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                           else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
+        constraints = placement.PlacementConstraints(source_identity, ("cargo", verb), str(repository), "hana",
             session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
         request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
@@ -524,7 +555,7 @@ class OffloadCommandFixture(unittest.TestCase):
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
         assignment_options = (() if direct_placement or assigned_adapter else self.assignment_options(
-            self.repository if repository is None else repository, verb, settings, runner_options))
+            self.repository if repository is None else repository, verb, settings, runner_options, source=source))
         arguments.extend(["--result", str(self.result_path), *runner_options, *assignment_options, "--"])
         arguments.extend(nextest_arguments)
         if assigned_adapter:
@@ -576,8 +607,8 @@ def capture(self, arguments, *args, **kwargs):
         clock[0] = 102.0
     return answer
 
-def stream(self, arguments):
-    answer = real_stream(self, arguments)
+def stream(self, arguments, *args, **kwargs):
+    answer = real_stream(self, arguments, *args, **kwargs)
     clock[0] = 103.0
     return answer
 
@@ -744,13 +775,28 @@ raise SystemExit(offload.main())
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
 
-    def write_kept_claim(self, host: str = "previous-mac") -> RemoteClaimRecord:
+    def mac_repository(self) -> claim_state.MacRepositoryIdentity:
+        repository = claim_state.mac_repository_identity(str(self.repository))
+        if isinstance(repository, claim_state.WholeMacScope):
+            self.fail(f"The fixture repository has no Mac identity: {self.repository}")
+        saved = repository.claim_repository()
+        if not isinstance(saved, claim_state.MacRepositoryIdentity):
+            self.fail(f"The fixture repository has no history key: {self.repository}")
+        return saved
+
+    def write_kept_claim(self, host: str = "previous-mac", *, legacy: bool = False) -> RemoteClaimRecord:
+        self.claim_file = Path(self.environment[
+            "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE" if legacy else "MAC_TEST_FIXTURE_CLAIM_FILE"
+        ])
         self.claim_file.parent.mkdir(parents=True, exist_ok=True)
         record: RemoteClaimRecord = {"claim_id": "kept-claim", "episode": "kept-episode", "attempt": "kept-attempt",
                                      "submitting_session": "fixture-session",
                                      "pid": 1073741824, "proc_start": "gone", "what": "older tests",
                                      "worktree": str(self.repository), "since": datetime.now(timezone.utc).isoformat(),
                                      "remote_host": host}
+        if not legacy:
+            repository = self.mac_repository()
+            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
         _ = self.claim_file.write_text(json.dumps(record))
         return record
 
@@ -768,6 +814,7 @@ raise SystemExit(offload.main())
     def reset_leftover_case(self) -> None:
         self.clear_events()
         self.claim_file.unlink(missing_ok=True)
+        self.claim_file = Path(self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"])
         (self.state_directory / "unreachable_until").unlink(missing_ok=True)
         for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
             (self.stub_directory / name).unlink(missing_ok=True)
@@ -837,7 +884,7 @@ raise SystemExit(offload.main())
     def interrupt_held_claim(
         self, *, takeover: bool = False, after_takeover: bool = False,
         signal_group: bool = False, signal_number: int = signal.SIGTERM,
-        reply_host: str = "reply-mac",
+        reply_host: str = "reply-mac", runner_options: tuple[str, ...] = (),
     ) -> str:
         runner = self.claim_stub_runner()
         if after_takeover:
@@ -853,7 +900,7 @@ raise SystemExit(offload.main())
             extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
                    "MAC_TEST_TAKEOVER_FIRST": "0",
                    "MAC_TEST_TAKEOVER_REPLY": reply_host},
-            start_new_session=signal_group,
+            start_new_session=signal_group, runner_options=runner_options,
         )
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
@@ -901,22 +948,75 @@ raise SystemExit(offload.main())
         self.assertEqual(self.events_for("ssh"), [])
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
-    def assert_takeover_signal_checks_reply_host(self, outcome: str) -> None:
+    def assert_takeover_signal_keeps_claim_for_leased_cleanup(self, reply_host: str) -> None:
+        # The run holds mirror leases here. A later run checks leftovers under the cleanup lease.
+        self.set_leftover_answer("clean")
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host)
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        self.assertEqual(self.events_for("ssh"), [], output)
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+        self.assertEqual(output, "", output)
+
+    def use_linux_target(self) -> tuple[str, ...]:
+        """Register the trusted Linux target box and return its runner options."""
+        settings = self.root / "box.conf"
+        _ = write_config_fixture(settings, "".join(f"{name}={value}\n" for name, value in {
+            **self.config, "slots": "1", "slots.hana": "1", "kinds": "test,check,lint,doc,build",
+            "parity.rustc": "fixture", "parity.nextest": "fixture", "parity.mend": "fixture",
+            "parity.scripts_commit": "fixture"}.items()), template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac\n", "targets=mac,box\n")
+                                + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+        # The Linux runner refuses an untrusted source before it claims.
+        _ = write_config_fixture(self.root / "nix_env.conf", f"trusted_home_folders={self.repository.name}\n")
+        self.environment["HOME"] = str(self.root)
+        # The Linux leftover selector has no lsof; answer it like the Mac selector.
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace(
+            "[[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]", "[[ $remote == *'select_leftovers()'* ]]"))
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").run
+        return ("--target", "box", "--settings", str(settings))
+
+    def assert_linux_takeover_signal_checks_reply_host(self, outcome: str, reply_host: str = "reply-box") -> None:
+        options = self.use_linux_target()
         self.set_leftover_answer(outcome)
-        output = self.interrupt_held_claim(takeover=True)
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host, runner_options=options)
+        state_events = (self.stub_directory / "state-events").read_text().splitlines()
+        if not reply_host:
+            self.assertEqual(state_events, ["claim"], output)
+            self.assert_claim_is_kept("previous-mac")
+            self.assertEqual(output, "mac_test: could not confirm that a lost run's leftovers ended: "
+                             + "the kept claim's host could not be read; the box stays busy\n")
+            self.assertEqual(self.events_for("ssh"), [], output)
+            self.assertFalse((self.stub_directory / "cleanup-called").exists())
+            return
         ssh = self.events_for("ssh")
         self.assertEqual(len(ssh), 1, output)
-        self.assertEqual(ssh[0]["args"][-2], "reply-mac", output)
+        self.assertEqual(ssh[0]["args"][-2], reply_host, output)
+        self.assertIn("select_leftovers()", ssh[0]["args"][-1])
         self.assertTrue((self.stub_directory / "cleanup-called").exists())
-        state_events = (self.stub_directory / "state-events").read_text().splitlines()
         if outcome == "clean":
-            self.assertEqual(state_events, ["claim", "release"])
-            self.assertFalse(self.claim_file.exists())
-            self.assertEqual(output, "")
+            self.assertEqual(state_events, ["claim", "release"], output)
+            self.assertFalse(self.claim_file.exists(), output)
+            self.assertEqual(output, "", output)
+            return
+        self.assertEqual(state_events, ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        if outcome == "remaining":
+            self.assertEqual(output, "mac_test: 3 leftover processes of a lost run are still on the box; "
+                             + "it stays busy until they end\n")
         else:
-            self.assertEqual(state_events, ["claim"])
-            self.assert_claim_is_kept("previous-mac")
-            self.assert_leftover_diagnostic(output, outcome)
+            self.assertRegex(output, r"^mac_test: could not confirm that a lost run's leftovers ended: "
+                             + r"[^\n]*connection refused by host[^\n]*; the box stays busy\n$")
+
+    def remove_tree_key(self) -> None:
+        # The origin keeps the history key that a Mac claim needs; no HEAD means no tree key.
+        git = ["git", "-C", str(self.repository)]
+        _ = subprocess.run([*git, "remote", "add", "origin", "https://example.invalid/fixture/hana.git"], check=True)
+        _ = subprocess.run([*git, "update-ref", "-d", "HEAD"], check=True)
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").claims / self.mac_repository().claim_file
+        self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"] = str(self.claim_file)
 
     def commit_sent_tree(self) -> str:
         environment = {

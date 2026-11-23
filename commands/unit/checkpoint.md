@@ -185,6 +185,8 @@ Loop/verbose only:
    The command requires both arguments and releases only the named step.
 
    After every successful checkpoint commit, enrolled or not, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
+   It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
+   To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id <event id> --reason "<reason>"`.
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
@@ -333,7 +335,9 @@ successful release in <CheckpointCommit/>, and after <ShrinkCommit/>,
    `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
    note is `push skipped: origin/<branch> has commits this branch lacks`.
 3. **Push.** `git push -u origin <branch>`; on the default branch,
-   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force. Run
+   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force any push.
+   After a hash goes to the showrunner, never amend, rebase or force-push that
+   branch; put a later change in a new commit on top. Run
    each step as its own command, never joined to another with `;` or `&&`:
    the allow list covers `git push` alone, and a joined line goes to the
    auto-mode classifier as a whole.

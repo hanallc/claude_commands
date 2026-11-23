@@ -1,8 +1,8 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
+from dataclasses import dataclass
 import shlex
 from pathlib import Path
-from typing import Literal
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
 
@@ -44,11 +44,67 @@ def write_shell(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def configure_nextest_trim(shim: Path, trim: int | Literal["run"]) -> None:
-    """Keep the log writer active for each trim outcome."""
+WORKSPACE_SWEEP_SETTINGS = """\
+# range: 0..
+recent_minutes=60
+# range: 0..
+sweep_budget_gib=24
+sweep_budget_gib.hana=96
+# range: 0..
+sweep_doc_index_mib=250
+# whole: 1..
+sweep_max_tree_depth=3
+# whole: 1..
+sweep_floor_search_depth=8
+sweep_floor_skip=.git node_modules
+# whole: 1..
+sweep_discovery_workers=4
+# whole: 1..
+sweep_dep_info_head_bytes=4096
+# whole: 1..
+sweep_proc_locks_reads=3
+# range: 0..
+sweep_holder_lookback_seconds=180
+# range: 0..
+sweep_delete_stamp_grace_seconds=2
+# range: 0..
+sweep_phone_floor_gib=0
+# range: 0..
+sweep_phone_rearm_gib=5
+# range: 0..
+sweep_phone_rearm_minutes=60
+# range: 0..
+sweep_alert_interval_seconds=3600
+# whole: 1..
+sweep_message_limit=1024
+# range: 3..5
+sweep_alert_folder_count=3
+# range: 0..
+sweep_crossing_repeat_minutes=525600
+# whole: 1..
+sweep_push_text_limit=500
+# range: 0..
+sweep_sender_timeout_seconds=30
+"""
+
+
+@dataclass(frozen=True)
+class WorkspaceSweepFixture:
+    proc: Path
+
+    def python_prefix(self) -> str:
+        """Use the fixture process table in the child sweep."""
+        return ('from functools import partial; from scripts.lint import sweep; '
+                + f'sweep.sweep_workspace = partial(sweep.sweep_workspace, proc={str(self.proc)!r}); ')
+
+
+def configure_nextest_trim(shim: Path, trim: int | WorkspaceSweepFixture) -> None:
+    """Keep the log writer active while the fixture controls the trim."""
     original = Path(__file__).resolve().with_name("nextest_log.py")
     interpreter, _, body = fixture_shim_source().partition("\n")
-    trim_command = f"exit {trim}" if isinstance(trim, int) else ":"
+    trim_command = (f"exit {trim}" if isinstance(trim, int) else
+                    '[ "$#" -eq 4 ] && [ "$1" = -B ] && [ "$2" = -c ] || exit 99\n'
+                    + f'set -- "$1" "$2" {shlex.quote(trim.python_prefix())}"$3" "$4"')
     source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
               + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
               + f'else\n    {trim_command}\nfi\n' + body)
@@ -76,10 +132,18 @@ if [[ $command == systemd-run ]]; then
     printf '\n' >> "$root/systemd-run.jsonl"
     exit 0
 fi
+claim_file=
+for saved in "$MAC_TEST_STATE_DIR/run.json" "$MAC_TEST_STATE_DIR"/claims/*.json; do
+    [[ -f $saved ]] || continue
+    if [[ -n $claim_file ]]; then
+        printf 'The command fixture has more than one saved claim.\n' >&2
+        exit 1
+    fi
+    claim_file=$saved
+done
 {
     record_command "$@"
-    claim_file=$MAC_TEST_STATE_DIR/claims/hana.json
-    if [[ -f $claim_file ]]; then
+    if [[ -n $claim_file ]]; then
         IFS= read -r -d '' claim < "$claim_file" || :
         printf ',"claimed":true,"claim":%s' "${claim//$'\n'/}"
     else
@@ -155,10 +219,8 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
         await_release continue-cleanup
     fi
     if [[ -n $selector_shell ]]; then
-        export PATH="$root/selectors:$PATH"
-        checks=''
+        printf -v checks 'export PATH=%q:"$PATH"\n' "$root/selectors"
         for name in pgrep lsof sleep; do
-            [[ $(command -v "$name") == "$root/selectors/$name" ]] || exit 99
             printf -v check '[ "$(command -v %s)" = %q ] || exit 99\n' "$name" "$root/selectors/$name"
             checks+=$check
         done
@@ -197,15 +259,18 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
         python3 - "$claim_file" <<'SETTLE_FENCE'
 ''' + python_tool_source(r'''
-import json
 from pathlib import Path
 import subprocess
 import sys
 from scripts.mac_test import claim_state, offload
 path = Path(sys.argv[1])
-claim = json.loads(path.read_text())
-identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-command = offload.start_fence_command(identity, "mac", settle=True, scope_key=path.stem)
+claim = claim_state.read_run(path)
+if isinstance(claim, claim_state.NoRun):
+    raise AssertionError(f"Cannot settle a missing claim: {path}")
+command = offload.start_fence_command(
+    claim_state.claim_identity(claim), "mac", settle=True,
+    scope_key=claim_state.claim_fence_scope_key(path, claim),
+)
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''
 SETTLE_FENCE
