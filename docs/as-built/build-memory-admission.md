@@ -362,7 +362,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
-| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. Direct cargo calls take the hold check and enter a new scope in `builds.slice`. Reserved cargo and lint steps still ask the queue. Their memory counts once as build memory through their reservations. |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step starts at once. Its memory counts once as build memory through the step's reservation. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -1246,7 +1246,9 @@ Non-building commands such as `metadata`, `fmt` and `tree` run immediately in Ba
 `test_cargo_wrapper.test_non_building_commands_start_with_no_python_and_no_queue_request` proves this.
 A call already in `builds.slice` runs at once, unless it runs under `builds-detached.slice`.
 Such a call comes from a queued step or an editor scope, so it has no second queue place.
-A call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
+A queued step of a detached run also runs its calls at once.
+The wrapper finds such a step when its cgroup folder equals `BUILDLOG_STEP_SCOPE`, which the step scope exports.
+Any other call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
 These building calls check `hold_applies.py` when the hold directory has an entry.
 An applicable hold refuses the command.
 Unreadable state prints a note and allows the command.
@@ -1790,7 +1792,7 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 
 ### Scratch folders (`scripts/lib/scratch.py`, `scripts/hooks/pre-tool-use-scratch-guard.py`)
 
-`scratch.conf` holds the default lifetime, visible root, hold file, repository depth, excluded folders, and random suffix length.
+`scratch.conf` holds the default lifetime, hold file, repository depth, excluded folders, and random suffix length.
 The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
 `CONF_DIR` selects the configuration folder.
 
@@ -1798,13 +1800,12 @@ The folder audit reads clone age from `hana_instances.conf` and the Mac disk flo
 It reads its other limits and default state folder from `lint.conf` through the same reader.
 The audit and temporary sweep share `folder_remove_after_seconds`.
 The audit and repository scan share `scratch.conf` `repo_skip`.
-The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
-`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new [--task <task> | --until <when>] [--name <word>]` makes a folder and prints its path.
 `scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
 The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
@@ -1845,7 +1846,6 @@ The folder stays with its hold marked ended.
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
-`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
@@ -1858,7 +1858,7 @@ Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/ses
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.
 It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
-In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+In ~/rust, `config/rust_roots.txt` and `scratch` name kept folders.
 Every folder in ~/rust/scratch is loose.
 In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
 The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
