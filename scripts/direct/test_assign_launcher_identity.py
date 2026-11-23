@@ -1,7 +1,10 @@
 """Check fixed staff identity and native review permissions across assignments."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from scripts.agents import codex_test_support as codex_fixture
+from scripts.direct.assign import object_map
 from scripts.direct import assign_launcher_test_support as launcher_fixture
 from scripts.direct.assign_launcher_test_support import read_object
 from scripts.herdr import worker_panes
@@ -13,10 +16,11 @@ setUpModule = codex_fixture.setUpModule
 class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
     def test_review_assignments_resume_the_same_read_only_reviewer_across_phases(self) -> None:
         self.first_assignment("review", "--lens", "contract", "--pass", "1")
-        review_prompt = (self.session_dir / "phases/7/review_prompt_contract_1.txt").read_text()
+        name, first = next(iter(self.assignment_records().items()))
+        passed = object_map(object_map(read_object(self.session_dir / "progress_history_state.json")["pass"])[name])
+        review_prompt = Path(str(passed["prompt_file"])).read_text()
         self.assertIn("Return the complete review result in your final reply", review_prompt)
         self.assertNotIn("write your summary to", review_prompt)
-        name, first = next(iter(self.assignment_records().items()))
         self.record("finish-phase", "--phase-id", "7", "--status", "completed")
         self.record("start-phase", "--phase-id", "8", "--phase-title", "Next phase")
         self.write_phase_prompt("8", "Next phase", "Review the next change.")
