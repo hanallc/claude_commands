@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Generator
+from contextlib import contextmanager
+from threading import local
 
 _open = os.open
 _write = os.write
@@ -11,8 +14,27 @@ CONF_READ_LOG = "CONF_READ_LOG"
 _read_log = os.environ.get(CONF_READ_LOG, "")
 
 
+class _ThreadReadRecording(local):
+    def __init__(self) -> None:
+        self.excluded: bool = False
+
+
+_thread_recording = _ThreadReadRecording()
+
+
+@contextmanager
+def without_recording() -> Generator[None]:
+    """Exclude config reads in the current thread for this call."""
+    previous = _thread_recording.excluded
+    _thread_recording.excluded = True
+    try:
+        yield
+    finally:
+        _thread_recording.excluded = previous
+
+
 def record(stem: str) -> None:
-    if not _read_log:
+    if not _read_log or _thread_recording.excluded:
         return
     descriptor = _open(_read_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
