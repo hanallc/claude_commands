@@ -86,6 +86,8 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertFalse((board / "locks/cargo.d").exists(), "a connection wait holds no cargo token")
             _ = hidden.rename(admission.socket_path)
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
+            lines = errors.read_text().splitlines()
+            self.assertEqual(sum(line.startswith("queue reached again") for line in lines), 1, lines)
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
             self.assertFalse((board / "locks/cargo.d").exists())
         finally:

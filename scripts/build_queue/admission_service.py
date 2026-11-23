@@ -964,6 +964,21 @@ class SystemEvidence:
         return self.activity.run(pid)
 
 
+def local_reservation_row(record: ReservationRecord, evidence: SystemEvidence) -> records.Reservation:
+    row = reservation_row(record)
+    if "build_run" not in row:
+        row["build_run"] = evidence.build_run(record.owner.pid)
+        row["run_origin"] = records.FoundRun(row["build_run"])
+    return row
+
+
+def resolve_reservation_repository(row: records.Reservation, record: ReservationRecord) -> None:
+    repository_name = record.queue_waiter.get("repository_name", record.repo)
+    resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
+    if resolved_name != repository_name:
+        row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
+
+
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
                 reservation_reader: Callable[[ReservationRecord, records.Reservation, gate.StepLifetime,
                     dict[int, gate.ProcessIdentity], Path], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
@@ -1001,7 +1016,10 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
     def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
-        return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
+        # A scope with no recorded caller gets its owner from the family of its oldest process.
+        name = evidence.session_name or ("" if evidence.session_id or not evidence.members
+                                         else records.family_owner_name(evidence.members[0].pid, proc.path))
+        return records.queue_caller(evidence.session_id, "", name, "", evidence.folder,
                                     members=staff_members, unit=unit)
 
     unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))
@@ -2502,11 +2520,8 @@ class AdmissionServer:
                     self._end(episode, record.ending)
                 if episode not in self.reservations:
                     continue
-            row = reservation_row(record)
-            if "build_run" not in row:
-                row["build_run"] = evidence.build_run(record.owner.pid)
-                row["run_origin"] = records.FoundRun(row["build_run"])
-            elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
+            row = local_reservation_row(record, evidence)
+            if isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = records.CallerRun(NoLiveBuildRun())
             captured = evidence.reservations.get(episode)
             memory = (reservation_charge(captured, row, now, config.policy) if captured is not None
@@ -2515,10 +2530,7 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
-            repository_name = record.queue_waiter.get("repository_name", record.repo)
-            resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
-            if resolved_name != repository_name:
-                row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
+            resolve_reservation_repository(row, record)
             lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
             unscoped_direct = (not record.sidecar and episode not in self.placement_requests
                                and episode in evidence.lifetimes)
@@ -3218,6 +3230,23 @@ class AdmissionServer:
         return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote)),
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
+    def _local_occupancy(self, inputs: records.QueueInputs) -> records.LocalAdmissionOccupancy:
+        captured = {row.get("reservation_id"): row for row in inputs.reservations}
+        reservations: list[records.Reservation] = []
+        for record in self.reservations.values():
+            if isinstance(record.place, wire.CloudPlace):
+                continue
+            row = captured.get(record.reservation_id)
+            if row is None:
+                row = reservation_row(record)
+                # Admission used the waiter owner when it granted this reservation.
+                build_run = record.queue_waiter.get("build_run")
+                if build_run is not None:
+                    row["build_run"] = build_run
+                resolve_reservation_repository(row, record)
+            reservations.append(row)
+        return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_owners())
+
     def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]], *,
                          ci_holds: Mapping[str, records.WaitReason] | None = None) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
@@ -3262,8 +3291,9 @@ class AdmissionServer:
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
-        view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
+        occupancy = self._local_occupancy(self.last_inputs)
+        view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         self.published = PublishedReplies(view, explain, positions)
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
@@ -4020,7 +4050,8 @@ done
 
         The Mac can keep the claim after its holder ends. The next claim for the scope takes it
         over and checks for leftovers, so the old assignment holds nothing. A live owner can still
-        send a terminal report, and a pending start can still launch, so both keep it current.
+        send a terminal report, and a pending start can still launch, so both keep it current until
+        the owner asks again (`_close_abandoned_attempt`).
         """
         return (self._ended_claim_holder(saved)
             and not self._placement_owner_live(saved.assignment.owner)
@@ -4045,6 +4076,55 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
 
+    def _close_abandoned_attempt(self, episode: str) -> None:
+        """Close the current attempt as lost when its owner asks again after the claim holder ended.
+
+        The owner asks for a placement again only after its attempt ends, so no report comes for that
+        attempt. The episode goes back to its lines. Only a mac_test claim closes this way: the provider
+        keeps the claim and any pending start, and the next claim for the scope takes it over and settles
+        the start before it runs.
+        """
+        saved = self.assignments.get(self.current_assignments.get(episode, ""))
+        if (saved is None or not isinstance(saved.state, placement.CurrentAssignment)
+                or not isinstance(saved.terminal_report, placement.NoTerminalReport)
+                or not self._ended_claim_holder(saved) or not self._next_claim_takes_over(saved)):
+            return
+        report = self._lost_report()
+        self._close_for_report(replace(saved, terminal_report=report), report)
+
+    def _next_claim_takes_over(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A mac_test claim gives its kept claim and pending start to the next claim for its scope.
+
+        A Hana claim does not: only recovery of the current attempt settles its started command.
+        An unreadable target counts as no takeover, so the attempt stays current.
+        """
+        from scripts.aws_target import hana_placement
+
+        destination = saved.assignment.destination
+        if destination.provider != "ssh":
+            return destination.provider != "local"
+        transport = self._ssh_transport(saved)
+        return transport is not None and not isinstance(
+            transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
+
+    def _ssh_transport(self, saved: records.SavedPlacementAssignment) -> ExecutionTransport | None:
+        """The transport of an ssh assignment's target; None when the target is not ssh or cannot be read."""
+        destination = saved.assignment.destination
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        settings = (placement.ConfiguredProviderSettings() if submitted is None
+                    else self._placement_settings(submitted, destination))
+        try:
+            with conf.report_key_changes():
+                configuration = _provider_configuration()
+                target = configuration.target(destination.target, settings)
+                return configuration.transport(target) if isinstance(target, target_config.SshTarget) else None
+        except (OSError, ValueError):
+            return None
+
+    def _lost_report(self) -> placement.TerminalAttemptReport:
+        return placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
+                                               self.clock.now())
+
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state
 
@@ -4054,14 +4134,9 @@ done
             try:
                 destination = saved.assignment.destination
                 submitted = self.placement_requests.get(saved.assignment.episode)
-                settings = (placement.ConfiguredProviderSettings() if submitted is None
-                            else self._placement_settings(submitted, destination))
-                with conf.report_key_changes():
-                    configuration = _provider_configuration()
-                    target = configuration.target(destination.target, settings)
-                    if not isinstance(target, target_config.SshTarget):
-                        return True
-                    transport = configuration.transport(target)
+                transport = self._ssh_transport(saved)
+                if transport is None:
+                    return True
                 if isinstance(transport, HanaGpuNextestTransport):
                     from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
 
@@ -4907,8 +4982,7 @@ done
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
                     continue
             if isinstance(report, placement.NoTerminalReport):
-                report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
-                    placement.DispatchPathSettled(), self.clock.now())
+                report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
 
@@ -4998,6 +5072,7 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                self._close_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:

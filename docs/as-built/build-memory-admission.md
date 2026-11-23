@@ -444,8 +444,20 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
 The Builds page shows the saved Mac idle alert first, in red.
-The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
+The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
+The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
+`limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
+Examples: natedev `load 52.7/32 · battery 100% charged · not in use`, Mac `link 3 ms · load 19.6/12 · battery 85% · in use`, AWS `no box running`.
+natedev has no link part. A machine without a battery has no battery part.
+On mains a battery is `not in use`, and a full one shows `battery 100% charged · not in use`. Without mains it shows `battery 54% · in use`.
+A failed TCP connect shows `link unreachable`. A failed SSH command after a good connect shows `link 3 ms · load unreadable`.
+A UPS that `upsc` cannot read shows `battery unreadable`. A Mac without an `InternalBattery` line in `pmset`, or a machine with no UPS tool, shows no battery part.
+A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.
+A probe that cannot start shows `facts unreadable`.
+A missing or invalid file reads as `machine_facts.FactsUnread.VALUE` and shows `facts not sampled`.
+Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
 `can run on` is one line that names the targets that can take the step now.
@@ -972,7 +984,30 @@ BRP launches use `launch`; launch permission creates no reservation.
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
 The client checks the staff name, the exported name, and the session folder name in that order.
-It uses `terminal · <folder>` for a direct command with a known folder.
+A caller with no session and no staff reference gets its exported name from `family_owner_name(pid, proc_root)`.
+That function reads the process and its parents in `/proc` once.
+The read stops at the first `claude` or `codex` process, so a session launcher never names the work.
+A read error stops the read, and the next rule applies.
+The script of a process is its first argument that is not an option and ends in `.py`, `.sh`, `.zsh` or `.bash`.
+The read skips the value of `-X`, `-W`, `-o`, `+o`, `-O` and `+O`.
+A relative script path starts at the `/proc/<pid>/cwd` folder of that process.
+The function uses the first rule that matches:
+1. No process can be read, for example on macOS, which has no `/proc`. The name stays `terminal · <folder>`.
+2. A family process runs a script under the showrunner state root, in `<root>/<id>/...`.
+   The name is `<staff name> · <script file>`, for example `cargo-liner · install_rest.sh`.
+   When no staff member has that id, the name uses the first 8 characters of the id.
+   `scripts/lib/showrunner_state.py` `state_root()` gives the root for this rule, `record_store` and `showrunners`.
+3. A family process has a tty, and the read did not stop at an agent: the user's terminal.
+   The client then uses `terminal · <folder>` for a direct command with a known folder.
+4. The process runs in a unit that `systemd-run` made (`run-*.service`).
+   The name is `systemd · <outermost script file>`, else `systemd · <folder of the process cwd>`.
+5. The process runs in another systemd `.service` unit: `systemd · <unit>`.
+6. Other callers: `script · <outermost script file>`, else `script · <command of the process>`.
+The service uses the same function for a scope with no recorded caller.
+It reads the family of the oldest scope process.
+The Builds page and the queue evidence lines never make a `terminal ·` name from a folder alone.
+When the stored name is empty, they show the staff name or `unregistered session`.
+On Linux, a caller with no tty gets a `terminal ·` name only when its family cannot be read, for example when its process ended during the read.
 The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
 The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
 It returns `unregistered session` when no candidate is usable.
@@ -1302,13 +1337,25 @@ It captures outermost gates that work, CI `Runner.Worker` processes, and builds 
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
 `remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
-A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+A drain does not keep a routed gate. A later natedev step of that call waits for the release, unless its run took natedev.
 An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
-A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
+The drain also keeps each run that natedev took, also between its steps (`hold_enforcer.taken_runs`).
+A kept run is its run controller process. A later step under that process is kept.
+A taken run is one of these:
+- the owner of a verify run slot, which holds natedev from the first local grant to the end of the outer verify call;
+- the run of a live local reservation;
+- the owner of a live local reservation with no run.
+The drain keeps the run and the outermost working process of its step, so a step stays kept when its run controller exits.
+A run that only waits has no slot and no reservation, so the drain does not keep it.
+A gate that only waits, under no taken run, is not kept. It waits for the release like new work, and the drain does not wait for it.
+Work under no taken run is kept by its own identity.
 Unreadable claims or admission state keep every outermost gate.
+With unreadable admission state, the drain reads each run from `BUILDLOG_RUN` (`pid:start`) of the working process or an ancestor, and keeps it when that run is a live ancestor.
+The unit in `max_runs.exempt_unit` gets no verify run slot, so the drain keeps its run only while a step has a local reservation.
+Between its steps the drain does not keep it. A slot for exempt runs is a queue change.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
-A second scan adds only identities whose start ticks do not exceed that bound.
+A second scan adds only identities that started before that bound.
 The command merges those identities under the release lock before starting the enforcer.
 If release removes the holder file during discovery, the command ends without restoring the file.
 Each keep entry has a PID and a start time.

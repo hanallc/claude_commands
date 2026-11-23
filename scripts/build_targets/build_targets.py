@@ -305,7 +305,7 @@ def probe_target(target: SshTarget) -> TargetState:
 def command_status(probe: bool = False) -> int:
 
 
-    from scripts.buildlog import mac_idle_alert
+    from scripts.buildlog import mac_idle
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
     from scripts.build_targets.targets import Held, HolderSession, Running
@@ -333,7 +333,7 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
-    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    alert = mac_idle.view_alert_line(time.time(), user_zone())
     if alert is not None:
         print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:

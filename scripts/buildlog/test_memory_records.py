@@ -86,7 +86,9 @@ class MemoryRecordTests(unittest.TestCase):
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
             "sample.CPU_PRESSURE = proc / 'cpu_pressure'; sample.IO_PRESSURE = proc / 'io_pressure'; "
             "sample.STAT = proc / 'stat'; "
-            "sample.BOOT_ID = proc / 'boot_id'; sys.exit(cli.main(['sample']))"
+            "sample.BOOT_ID = proc / 'boot_id'; "
+            "from unittest.mock import patch; from scripts.buildlog import machine_facts; "
+            "patch.object(machine_facts, 'sample_once').start(); sys.exit(cli.main(['sample']))"
         )
         env = self.env(BUILDLOG_BUILDS_CGROUP=str(builds), BUILDLOG_CI_CGROUP=str(self.base / "absent-ci"),
                        BUILDLOG_ZRAM=str(self.base / "absent-zram"))
