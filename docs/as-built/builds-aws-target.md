@@ -207,6 +207,8 @@ It applies each rendered file's mode.
 The image keeps `safety.py`, `receiver.py`, `safety.json`, `receiver.json`, and their units.
 It installs the Python closure in `scripts/aws_target/hana_image.files` under `/var/lib/hana-runtime`.
 That closure supplies the root receiver, the safety code, and the unprivileged bootstrap.
+`scripts/aws_target/hana_image.sha256` holds the source hash of that closure.
+[Hana image freshness](#hana-image-freshness) gives the rule for the hash and the runtime ABI.
 NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved slot settings.
 
 The NixOS build runs the renderer from its pinned `claude-commands` input.
@@ -564,8 +566,13 @@ The launch template sets `DeleteOnTermination` on the root disk. AWS deletes eac
 
 ### Hana image freshness
 
-`hana_render` hashes the paths, modes, and bytes of the rendered image files.
-It adds the digest to the rendered `safety.json`.
+The image digest tells whether the box is compatible with main.
+`hana_render` hashes the paths, modes, and bytes of the rendered control files.
+These are the units, the `safety.py` and `receiver.py` entry shims, `safety.json`, `receiver.json`, and `runtime/config/build_folders.conf`.
+The digest also covers `hana_protocol.RUNTIME_ABI`.
+The image receiver refuses a manifest with another runtime ABI.
+The digest does not cover the Python source under `runtime/`. The image still installs that source.
+`hana_render` adds the digest to the rendered `safety.json`.
 Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
 The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
 The renderer rejects invalid slot probe settings before it computes the digest.
@@ -575,8 +582,22 @@ NixOS supplies the compiler version and runner environment.
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
+An edit to a file in `scripts/aws_target/hana_image.files` also leaves the image digest unchanged.
 The receiver still uses `enabled` as an independent image admission switch.
 This split requires one image replacement before the box accepts a combined payload.
+
+`scripts/aws_target/hana_image.sha256` holds the sha256 of the image file list and each listed path and its bytes.
+`test_hana_render` fails when the checked-in hash differs from the computed hash.
+After an edit to an image file, apply this rule.
+
+1. If the edit changes what the receiver accepts or does, bump `hana_protocol.RUNTIME_ABI`.
+2. Write the new hash to `scripts/aws_target/hana_image.sha256`.
+
+No check makes a writer bump the runtime ABI. The test only makes the writer decide.
+A new runtime ABI makes the deployed image stale.
+Known cost: the box can run an older receiver with the same runtime ABI until the next image.
+A receiver fix that the host does not need reaches the box only with the next image.
+An image recorded with the earlier digest formula reads as stale. It needs one replacement.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
 Registration requires the build derivation and the renderer output to be present in the local store.
