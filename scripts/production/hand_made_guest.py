@@ -6,7 +6,7 @@ holds the guest run lock, and the place ends only after the guest proves that th
 from __future__ import annotations
 
 from collections.abc import Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
@@ -60,6 +60,19 @@ def run_owner(repo: Path) -> str:
 
 
 @contextmanager
+def mac_claim(repo: Path) -> Generator[None]:
+    """Hold the Mac repository claim of the guest for the run; a refused claim takes no run."""
+    from scripts.build_queue.mac_run import MacRunRefused
+
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE))
+        except MacRunRefused as error:
+            raise QueuePlaceRefused(f"{MACHINE}: not started: {error}") from error
+        yield
+
+
+@contextmanager
 def guest_place(repo: Path, checked: Mapping[Path, bytes]) -> Generator[GuestPlace]:
     """Hold the guest for one run. A guest that is off or in retry backoff takes no run.
 
@@ -69,11 +82,12 @@ def guest_place(repo: Path, checked: Mapping[Path, bytes]) -> Generator[GuestPla
         settings = mac_linux.new_run_settings()
     except mac_linux.route_errors() as error:
         raise QueuePlaceRefused(f"{MACHINE}: {error}") from error
+    if isinstance(settings, mac_linux.GuestNotStarted):
+        raise QueuePlaceRefused(settings.reason)
     if isinstance(settings, str):
         raise QueuePlaceRefused(settings)
     unit = run_owner(repo)
-    with (mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE),
-          build_folders.tool_folder(HAND_MADE.step) as folder):
+    with (mac_claim(repo), build_folders.tool_folder(HAND_MADE.step) as folder):
         command = mac_linux.GuestCommand(settings)
         failure: BaseException | None = None
         try:

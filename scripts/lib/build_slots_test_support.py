@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -89,6 +90,9 @@ slots.wait_seconds=30"""
     fixed_lines = fixed.splitlines()
     if machine != "natedev":
         fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
+    mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
+    if mac_hosts and mac_hosts[0] != machine:
+        fixed_lines.extend(("# whole: 1..", f"slots.{mac_hosts[0]}.default_max=1"))
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
     lines = [line for line in settings.read_text().splitlines()

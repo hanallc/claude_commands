@@ -15,8 +15,10 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.build_queue import mac_run
 from scripts.build_targets import mac_linux, target_config
 from scripts.lib import models_registry, nix_env
+from scripts.mac_test import eligibility
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.production import hand_made, hand_made_guest
@@ -79,7 +81,7 @@ class InjectedGuest:
         if self.arm_error:
             raise mac_linux.GuestUnavailable(self.arm_error)
         self.events.append("arm")
-        return mac_linux.ArmedGuestAttempt(attempt, "boot", 1)
+        return mac_linux.ArmedGuestAttempt(attempt, "0" * 32, "boot", 1, "fixture", "/fixture/checkout")
 
     def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
                _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
@@ -241,6 +243,25 @@ class GuestRouteTests(unittest.TestCase):
         row = self.only_row()
         self.assertEqual((row["refusal"], row["status"], row["machine"]),
                          ("queue place: mac-linux is off (build_targets.conf enabled.mac-linux=off)", None, None))
+
+    def test_a_guest_in_retry_backoff_takes_no_run(self) -> None:
+        with mock.patch.object(eligibility, "read_backoff", return_value=eligibility.ACTIVE_BACKOFF):
+            status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        cause = "queue place: mac-linux: guest unreachable during retry backoff"
+        self.assertIn(cause, errors)
+        self.assertEqual(self.guest.events, [])
+        self.assertEqual(self.only_row()["refusal"], cause)
+
+    def test_a_refused_mac_claim_takes_no_run(self) -> None:
+        with mock.patch.object(mac_run, "held", side_effect=mac_run.MacRunRefused("mac is busy with fixture")):
+            status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        cause = "queue place: mac-linux: not started: mac is busy with fixture"
+        self.assertIn(cause, errors)
+        self.assertEqual(self.guest.events, [])
+        row = self.only_row()
+        self.assertEqual((row["refusal"], row["status"], row["machine"]), (cause, None, None))
 
     def test_a_failed_guest_start_is_a_refusal_with_the_cause(self) -> None:
         self.guest.arm_error = "guest arm exited 255: fixture SSH refused the connection"

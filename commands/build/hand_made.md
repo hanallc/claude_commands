@@ -16,6 +16,7 @@ The command does four steps:
    - `python -m` and `uv run -m`: run the module file by its path. Put `--` before a `uv run` command that follows a uv option.
    - `env -C`, `env --chdir`, `env -S`, `uv --directory` and `uv --project`: give the checkout with `--repo`, and give the command words one by one.
    - `env NAME=VALUE`: set the variable outside the hand made command.
+   - A later word that names a folder with a `__main__` entry, such as `__main__.py` or `__main__.pyc`, or a folder that cannot be listed: python runs that file, and the check cannot read it. Run the program file by its path.
    - An empty entry, a relative entry or an entry in the checkout in `PATH`, `LD_LIBRARY_PATH`, `PKG_CONFIG_PATH`, `LIBCLANG_PATH` or `SCCACHE_DIR`: tools then load files from the checkout that the check does not read. Remove the entry.
 2. A yes waits for a place on the machine. On natedev, the run waits in the natedev queue, and the Builds page shows it as `hand made`. The guest has no queue line until item 191 B3; see the guest section below.
 3. At run start, the command reads each checked file again and finds the program files again. A changed, removed or new program file ends the attempt with no run.
@@ -36,6 +37,7 @@ After a no, change the command or the script, then start a new attempt. A check 
 With `--machine mac-linux`, natedev checks the files, then sends the run to the guest:
 
 - The guest takes no run when `enabled.mac-linux=off` in `build_targets.conf`, or while it is in retry backoff. The attempt is refused with the cause.
+- The run holds the Mac repository claim, as a gate run on the guest does. A refused claim, for example while another run holds it, refuses the attempt with the cause.
 - These forms are refused before the model call, because the guest runs its own copy of the checkout:
   - a checkout of a repository other than claude, or a run with no owner unit;
   - an absolute path in the command: on the guest, it names a guest file. Give a path in the checkout or a program name;

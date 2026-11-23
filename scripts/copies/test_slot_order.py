@@ -160,6 +160,8 @@ class SlotOrderTests(unittest.TestCase):
             self.replies.append(reply)
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
+                # Wake a file waiter that also ends when its process exits.
+                (self.root / "queue-wait").touch()
             return reply
 
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
@@ -1543,7 +1545,10 @@ placement_once
                                    timeout=45, processes=(process,))
                         self.assertTrue(observed.exists(), process.communicate(timeout=5) if process.poll() is not None else "")
                     else:
-                        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+                        wait_until(lambda: self.waiting.is_set() or process.poll() is not None, self.root,
+                                   processes=(process,))
+                        self.assertTrue(self.waiting.is_set(),
+                                        process.communicate(timeout=5) if process.poll() is not None else "")
                     request = next(request for request in self.requests[first_request:]
                                    if isinstance(request, wire.PlacementRequest))
                     snapshot = Path(request.constraints.repository)
