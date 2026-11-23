@@ -562,6 +562,16 @@ def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
     if owner is None:
         owner = StandaloneModuleRun()
     try:
+        from scripts.lib import live_config_guard
+    except ImportError:
+        from importlib.util import find_spec
+
+        # A gate fixture checkout can hold the runner without the guard.
+        if find_spec("scripts.lib.live_config_guard") is not None:
+            raise
+    else:
+        live_config_guard.install(live_config_guard.live_folder())
+    try:
         from scripts.lib import conf_reads
     except ImportError:
         from importlib.util import find_spec

@@ -1006,6 +1006,11 @@ It patches loaded modules and passes the same paths to fixture children.
 Checkpoint tests use this shared helper instead of live registries.
 `fixture_unit_location` publishes the staff location required by a test.
 Configuration fixtures supply `CONF_DIR` and the real key limit comments.
+`write_config_fixture` refuses a path in the live configuration folder, also through a link.
+`module_run.py` installs `live_config_guard` before it loads a test module.
+For the rest of that test process, a write, rename, truncation or removal in the live folder raises `LiveConfigWrite`; reads stay allowed.
+The live folder is `~/.claude/config` under the real user's home, so a test that sets `HOME` does not move it.
+The guard covers the test process only, not the processes that a test starts.
 Git-recovery tests use their own committed repositories.
 `test_end_session` removes inherited `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` value before it supplies its test identity.
 The shared hang guard protects expected events without shortening production waits.

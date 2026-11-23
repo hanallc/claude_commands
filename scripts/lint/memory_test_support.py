@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lib import live_config_guard
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -43,6 +44,7 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
 
     Keep each setting's explicit limit.
     """
+    live_config_guard.refuse(path, folder=live_config_guard.live_folder())
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
