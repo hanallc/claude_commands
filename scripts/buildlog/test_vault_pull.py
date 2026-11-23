@@ -123,10 +123,14 @@ class VaultPullTests(unittest.TestCase):
         self.local = self.folder / "natedev"
         self.mac = self.folder / "mac-host/rust/hanadocs"
         self.mac.parent.mkdir(parents=True)
+        git_config = write_fixture_git_config(self.folder)
+        # Both live machines set merge.ff=only; the fixture keeps the same rule.
+        with git_config.open("a", encoding="utf-8") as config:
+            _ = config.write("[merge]\n\tff = only\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.folder), "BUILDLOG_PEER": "fixture-mac",
             **GIT_IDENTITY,
-            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.folder)),
+            "GIT_CONFIG_GLOBAL": str(git_config),
         }))
         for name, destination in (("github.git", self.github), ("natedev", self.local), ("mac", self.mac)):
             _ = shutil.copytree(self.template / name, destination)
@@ -288,6 +292,13 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.git(self.github, "show", "main:from-mac.md"), "Mac")
         self.assertEqual(self.git(self.github, "show", "main:from-natedev.md"), "natedev")
 
+    def test_a_mac_with_no_edits_fast_forwards_without_a_merge_commit(self) -> None:
+        local = self.commit(self.local, {"from-natedev.md": "natedev\n"})
+        _ = self.git(self.local, "push", "origin", "main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.git(self.mac, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.git(self.github, "rev-parse", "main"), local)
+
     def test_concurrent_github_edits_merge_in_the_natedev_object_store(self) -> None:
         _ = (self.mac / "mac.md").write_text("Mac\n")
         self.github_update = {"github.md": "GitHub\n"}
@@ -325,7 +336,7 @@ class VaultPullTests(unittest.TestCase):
     def test_open_mac_merge_files_a_conflict_question_without_changing_the_commit_or_file(self) -> None:
         local, mac = self.conflict()
         _ = self.git(self.mac, "fetch", "origin", "main")
-        merged = subprocess.run(["git", "-C", str(self.mac), "merge", "--no-edit", "origin/main"],
+        merged = subprocess.run(["git", "-C", str(self.mac), "merge", "--ff", "--no-edit", "origin/main"],
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(merged.returncode, 1)
         text = (self.mac / "shared.md").read_text()
@@ -583,7 +594,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
         self.assertIn("conflict", option(args, "--context"))
-        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.")
+        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, run `git -C ~/rust/hanadocs merge --ff origin/main`, then resolve the conflicting edits.")
         self.assertEqual([args[index + 1] for index, value in enumerate(args) if value == "--choice"], [
             "Combine the edits and commit the result. This keeps the wanted content from both copies.",
             "Choose one copy for each file and commit the result. This replaces the other copy's content."])
