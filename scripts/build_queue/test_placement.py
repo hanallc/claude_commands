@@ -29,15 +29,16 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.build_queue import admission_client as client, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
+from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
-from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
@@ -1874,7 +1875,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 repository = fixture.root / "hana"
                 (repository / ".git").mkdir(parents=True)
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+                    "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf",
                     "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
                 request = placement_request(fixture)
@@ -1907,7 +1908,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                                 ) -> tuple[Path, wire.PlacementRequest, placement.PlacementDestination]:
         _ = (fixture.root / "build_targets.conf").write_text(
             f"targets=fixture,healthy\nkind.fixture=ssh\nplatform.fixture={platform}\nsettings.fixture=target.conf\n"
-            + "kind.healthy=ssh\nplatform.healthy=linux\nsettings.healthy=mac_test.conf\n")
+            + "kind.healthy=ssh\nplatform.healthy=linux\nsettings.healthy=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         settings = fixture.root / "target.conf"
         _ = write_config_fixture(settings, "host=fixture\nexecution_transport=ssh\n"
                                  + "probe_timeout_s=10\nslots=1\nkinds=check\n", template="mac_test")
@@ -2118,8 +2119,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
+            window = conf.read(settings).whole("permit_max_seconds")
             self.commit_settings(settings)
-            _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+            _ = settings.write_text(good.replace(f"permit_max_seconds={window}", "permit_max_seconds=broken"))
             warnings = io.StringIO()
 
             def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
@@ -2136,8 +2138,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
                 self.assertEqual(evidence.eligibility, ALLOWED_HOST)
                 start.assert_called_once()
-                self.assertEqual(warnings.getvalue().count("enabled='broken'"), 1)
-                self.assertTrue(hana_spend.read_settings(conf.read(settings)).enabled)
+                self.assertEqual(warnings.getvalue().count("permit_max_seconds='broken'"), 1)
+                self.assertEqual(hana_spend.read_settings(conf.read(settings)).permit_max_seconds, window)
 
                 _ = settings.write_text(good.replace("mount_timeout_seconds=15", "mount_timeout_seconds=broken"))
                 with mock.patch.object(conf, "_committed_files", return_value=()):
@@ -2147,6 +2149,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     self.assertEqual(start.call_count, 2)
                     with self.assertRaisesRegex(conf.Unusable, "mount_timeout_seconds"):
                         _ = hana_spend.read_settings(conf.read(settings))
+
+                # An unattended reader counts an invalid switch as off; it does not recover the committed value.
+                _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, placement.FixedExclusion("off"))
+                self.assertEqual(start.call_count, 2)
 
     def test_linux_kinds_recovers_the_committed_command(self) -> None:
         with PlacementFixture() as fixture:
@@ -2510,7 +2519,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 repository = fixture.root / "hana"
                 (repository / ".git").mkdir(parents=True)
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
+                    f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf",
                     "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
                 request = placement_request(fixture)
@@ -3012,6 +3021,92 @@ class MacOrderTests(unittest.TestCase):
                     _ = worker.probe_next()
                     _ = fixture.run_pass()
                 self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])
+
+
+NatedevCause = records.HeadCause | records.WaitReason | wire.CloudSlotWait | wire.PlacementEvidenceWait | wire.PlacementResourceWait
+
+
+class NatedevOnlyHoldTests(unittest.TestCase):
+    """Rule 9: a natedev guard holds natedev only. A free Mac takes a waiting run that allows the Mac."""
+
+    def mac_takes_the_run_after_a_natedev_wait(
+            self, fixture: PlacementFixture,
+            hold_natedev: Callable[[wire.PlacementRequest], wire.PlacementRequest] = lambda request: request,
+    ) -> NatedevCause:
+        """Make the run wait on natedev while the Mac is busy, then free the Mac. Return the natedev cause."""
+        mac_only = placement_request(fixture)
+        request = hold_natedev(replace(mac_only, constraints=replace(mac_only.constraints,
+            candidates=(local_candidate(fixture), *mac_only.constraints.candidates))))
+        _ = publish_candidate(fixture, mac_only, placement.TemporaryExclusion("busy"))
+        waiting = fixture.connect(request).replies()[-1]
+        assert isinstance(waiting, wire.PlacementWait), waiting
+        _ = publish_candidate(fixture, mac_only)
+        _ = fixture.run_pass()
+        mac = mac_only.constraints.candidates[0].destination
+        self.assertIn(request.episode, fixture.server.current_assignments, "the free Mac did not take the run")
+        self.assertEqual(fixture.server.assignments[fixture.server.current_assignments[request.episode]]
+                         .assignment.destination, mac)
+        # The next request of the run gets the Mac assignment, not the natedev wait.
+        reply, = fixture.server.handle_request(request)
+        assert isinstance(reply, wire.Assignment), reply
+        self.assertEqual(reply.assignment.destination, mac)
+        self.assertNotIn(request.episode, fixture.server.reservations)
+        wait = waiting.wait
+        if isinstance(wait, wire.Wait):
+            return wait.reason.cause if isinstance(wait.reason, records.HeadAdmissionStatus) else wait.reason
+        return wait
+
+    def test_a_natedev_build_space_hold_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), PlacementFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", free_floor_gib="150")
+            _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",
+                                                        return_value=records.BuildSpaceLow(125, 150)))
+            self.assertEqual(self.mac_takes_the_run_after_a_natedev_wait(fixture), records.BuildSpaceLow(125, 150))
+
+    def test_full_or_pressured_natedev_memory_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure), PlacementFixture() as fixture:
+                _ = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+                fixture.allow_next_start()
+                if pressure:
+                    fixture.hold_starts()
+                else:
+                    fixture.free(2 * GIB)
+                self.assertIsInstance(self.mac_takes_the_run_after_a_natedev_wait(fixture),
+                                      records.MemoryPressure if pressure else records.NeedsMemory)
+
+    def test_a_full_natedev_gpu_slot_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf",
+                                gpu_test_slots="1", gpu_test_repositories="fixture")
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+            fixture.allow_next_start()
+            self.assertEqual(self.mac_takes_the_run_after_a_natedev_wait(fixture), records.GpuSlotWait(1, 1))
+
+    def test_a_natedev_build_hold_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            def hold_natedev(request: wire.PlacementRequest) -> wire.PlacementRequest:
+                # The local candidate is first, so this is the natedev build hold reading.
+                _ = publish_candidate(fixture, request, placement.TemporaryExclusion("blocked"))
+                return request
+
+            cause = self.mac_takes_the_run_after_a_natedev_wait(fixture, hold_natedev)
+            assert isinstance(cause, wire.PlacementResourceWait), cause
+            self.assertEqual((cause.resource, cause.reason), ("natedev", "blocked"))
+
+    def test_an_occupied_natedev_cargo_folder_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            folder = fixture.root / "target"
+            granted, = fixture.connect(with_cargo_folder(local_cargo_request(fixture), str(folder))).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            fixture.allow_next_start()
+
+            def same_folder(request: wire.PlacementRequest) -> wire.PlacementRequest:
+                return replace(request, constraints=replace(request.constraints,
+                                                            cargo_folder=placement.CargoFolder(folder)))
+
+            self.assertIsInstance(self.mac_takes_the_run_after_a_natedev_wait(fixture, same_folder),
+                                  placement.CargoFolderWait)
 
 
 class PassGapTests(unittest.TestCase):

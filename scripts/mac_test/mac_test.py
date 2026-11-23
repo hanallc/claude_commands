@@ -100,7 +100,7 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
-    from scripts.mac_test import eligibility
+    from scripts.mac_test import eligibility, offload
 
 MESSAGE_TIMEOUT_S = 30.0
 MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
@@ -359,6 +359,7 @@ class CliArguments(argparse.Namespace):
         self.hours: str = ""
         self.showrunner: str = ""
         self.settings: str = ""
+        self.deadline_monotonic: float | None = None
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
@@ -375,6 +376,7 @@ class CliArguments(argparse.Namespace):
         self.attempt: str = ""
         self.identity: bool = False
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
+        self.asking: AskingSession | NoAskingSession = NO_ASKING_SESSION
 
 
 def state_paths(target: str = "") -> StatePaths:
@@ -575,6 +577,68 @@ def read_block(path: Path) -> MacBlockState:
 def read_claim_block(paths: StatePaths) -> MacBlockState:
     """Read the block that refuses new claims until its record is removed."""
     return read_block(paths.block)
+
+
+@dataclass(frozen=True)
+class OffOnPurpose:
+    """The user turned the machine off. No watcher sends an outage push for it."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class MachineInUse:
+    """No block or setting turns the machine off, so an outage push goes to the user."""
+
+
+MACHINE_IN_USE = MachineInUse()
+
+
+@dataclass(frozen=True)
+class AskingSession:
+    """The session that asks. A Mac block that it holds does not turn the Mac off for it."""
+
+    name: str
+
+
+class NoAskingSession:
+    """No session asks, so every Mac block counts."""
+
+
+NO_ASKING_SESSION = NoAskingSession()
+
+
+def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAskingSession = NO_ASKING_SESSION
+                           ) -> OffOnPurpose | MachineInUse:
+    """The one rule for every outage push: the user turned the named target off.
+
+    Each target reads enabled.<target>=off. The Mac also reads its block and offload=off. A block is a lease that
+    a showrunner gives to one session, so it does not count when its holder asks. An unreadable record or setting
+    proves nothing, so the target counts as in use and a real outage still pushes.
+    """
+    enabled = f"enabled.{target}"
+    try:
+        # The gate refuses an unknown guest, but a missing key here counts as in use: an alert must not hide an outage.
+        if not conf.read("build_targets").value(enabled, conf.on_off, default=True, recover_invalid=False):
+            return OffOnPurpose(f"{enabled}=off")
+    except ConfigError:
+        pass
+    if target != "mac":
+        return MACHINE_IN_USE
+    try:
+        block = read_block(state_paths().block)
+        if not isinstance(block, NoMacBlock) and asking_session != AskingSession(block.holder):
+            return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
+    except StateReadError:
+        pass
+    try:
+        settings = conf.read("mac_test")
+        # A missing key reads the committed file, as the router does. A bad value counts as in use.
+        if not settings.value("offload", conf.on_off, recover_invalid=False):
+            return OffOnPurpose("offload=off")
+    except ConfigError:
+        pass
+    return MACHINE_IN_USE
 
 
 def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBlockState:
@@ -2389,7 +2453,7 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
     """Reserve a slot for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
     settings = Path(args.settings) if args.settings else config_path(args.target)
-    config = eligibility.read_config(settings)
+    config = eligibility.read_target_settings(settings)
     worktree = claim_worktree_path(args.repo_root)
     mac_repository = (claim_state.mac_repository_identity(str(worktree))
                       if paths.platform == "macos" else WHOLE_MAC)
@@ -2549,6 +2613,7 @@ def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
     finish_wait: bool = False,
+    release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2609,13 +2674,16 @@ def release_exact_claims(
                         scope_key=claim_state.claim_fence_scope_key(path, record)) + "\n"
                 if isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
-                observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+                observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
+                                                  release_deadline=release_deadline)
                 if not isinstance(observed.result, offload.LeftoversEnded):
                     return ClaimReleaseRefused("the remote work of the claim has not ended")
                 if fence_pending and ("dispatch_start_settled=" + offload.pending_start_key(identity)
                                       not in observed.output.splitlines()):
                     return ClaimReleaseRefused("the remote start fence remains unconfirmed")
             with nullcontext() if provider_lock_held else locked(paths.lock):
+                if isinstance(release_deadline, offload.ClaimReleaseDeadline) and release_deadline.remaining() <= 0:
+                    return ClaimReleaseRefused("the claim release deadline expired")
                 # The watcher can update its fields during cleanup.
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
@@ -2639,8 +2707,16 @@ def release_exact_claims(
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False,
                     finish_wait: bool = False) -> int:
+    from scripts.mac_test import offload
+
+    deadline = args.deadline_monotonic
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("the claim release deadline must be finite")
+    release_deadline = (offload.ClaimReleaseDeadline(deadline) if deadline is not None
+                        else conf.UseConfiguredValue.CURRENT)
     released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
-                                    args.settings, provider_lock_held=provider_lock_held, finish_wait=finish_wait)
+                                    args.settings, provider_lock_held=provider_lock_held, finish_wait=finish_wait,
+                                    release_deadline=release_deadline)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12
@@ -2657,6 +2733,7 @@ def free_now(
     mac_repository: claim_state.MacMirrorIdentity | WholeMacScope | claim_state.ResolveMacRepository
     = claim_state.RESOLVE_MAC_REPOSITORY,
     mac_scope: ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+    recover_mac_backoff: bool = False,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2672,7 +2749,8 @@ def free_now(
     if paths.target == eligibility.MAC_LINUX_TARGET:
         if not eligibility.mac_linux_enabled(conf.read("build_targets")):
             return "off"
-        if isinstance(eligibility.read_backoff(time.time(), paths.target), eligibility.ActiveBackoff):
+        if not recover_mac_backoff and isinstance(eligibility.read_backoff(time.time(), paths.target),
+                                                   eligibility.ActiveBackoff):
             return "backoff"
     elif not guest:
         if isinstance(capacity_settings, conf.UseConfiguredValue):
@@ -2680,9 +2758,8 @@ def free_now(
             capacity_settings = conf.read(path)
         if not capacity_settings.value("offload", conf.on_off):
             return "off"
-        backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
-                   else eligibility.read_backoff(time.time(), paths.target))
-        if isinstance(backoff, eligibility.ActiveBackoff):
+        if not recover_mac_backoff and isinstance(eligibility.read_backoff(time.time(), paths.target),
+                                                   eligibility.ActiveBackoff):
             return "backoff"
     session = claim_state.submitting_session(session)
     if paths.platform == "linux":
@@ -3060,6 +3137,11 @@ def command_target_status(paths: StatePaths) -> int:
     return 0
 
 
+def command_off_on_purpose(asking: AskingSession | NoAskingSession) -> int:
+    """Exit 0 when the user turned the Mac off for the asking session, 1 when it is in use."""
+    return 0 if isinstance(machine_off_on_purpose("mac", asking), OffOnPurpose) else 1
+
+
 def watch_interval() -> float:
     try:
         interval = float(os.environ.get("MAC_TEST_WATCH_INTERVAL_S", "60"))
@@ -3119,6 +3201,7 @@ def parser() -> argparse.ArgumentParser:
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
     _ = release.add_argument("--settings", default="")
+    _ = release.add_argument("--deadline-monotonic", type=float, help=argparse.SUPPRESS)
     for command in (claim, wait_claim, release):
         for field in ("claim-id", "episode", "attempt"):
             _ = command.add_argument("--" + field, required=command is release, default="")
@@ -3148,10 +3231,16 @@ def parser() -> argparse.ArgumentParser:
     def parsed_session(value: str) -> SubmittingSession:
         return OwningSession(value) if value else NoOwningSession()
 
+    def parsed_asking(value: str) -> AskingSession | NoAskingSession:
+        return AskingSession(value) if value else NO_ASKING_SESSION
+
     for command in (claim, wait_claim, free):
         _ = command.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
     for command in commands.choices.values():
         _ = command.add_argument("--target", default=argparse.SUPPRESS)
+    # This subcommand checks only the Mac, so it takes no --target.
+    off = commands.add_parser("off-on-purpose", help="exit 0 when the user turned the Mac off, 1 when it is in use")
+    _ = off.add_argument("--asking", type=parsed_asking, default=NO_ASKING_SESSION, metavar="SESSION")
     return root
 
 
@@ -3178,6 +3267,8 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
         return command_release(args, paths)
     if args.command == "free-now":
         return command_free_now(args, paths)
+    if args.command == "off-on-purpose":
+        return command_off_on_purpose(args.asking)
     if args.command == "status" and args.target:
         return command_target_status(paths)
     try:

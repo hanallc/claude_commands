@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
 import os
 from pathlib import Path
 import subprocess
 import time
-from typing import Protocol, cast
+from typing import cast
 from uuid import uuid4
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
@@ -82,12 +82,9 @@ class FirstStepAdmission:
         self.grant = HandedOff()
 
     def _hand_gate(self, grant: GatePlacement) -> None:
-        if isinstance(grant.grant, wire.LocalPlacementGranted):
-            # The gate takes its own memory reservation when it starts.
-            local = grant.grant.grant
-            answer = queue_place.release_place(local.reservation, 0, local.cleanup_timing, 'handed_off')
-            if isinstance(answer, wire.Refused):
-                raise FirstStepRefused(answer.reason)
+        # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
+        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
+        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
 
@@ -146,57 +143,13 @@ def _verify_request(command: VerifyCommand, source: Path, folder: Path, owner: w
     return request
 
 
-class AdmissionEvents(Protocol):
-    """Wait for changes to the local admission files."""
-
-    def arm(self) -> None: ...
-    def wait(self, seconds: float) -> None: ...
-
-
 def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted | wire.Assignment:
-    output = client.WaitOutput()
-    directory = store.root() / 'admission'
-    waiter = cast(Callable[..., AbstractContextManager[AdmissionEvents]],
-        getattr(import_module('scripts.direct.local_release_wait'), 'local_release_waiter'))
-    try:
-        with client.placement_acquisition(), waiter(directory, directory,
-                wake_files=(directory / 'state.json', directory / 'queue.json')) as events:
-            while True:
-                events.arm()
-                answer = client.acquire_placement(request)
-                if isinstance(answer, client.LeftQueue):
-                    raise FirstStepRefused('the caller left before first-step admission', 75)
-                output.placement_notices(answer, placement_events=False)
-                if isinstance(answer, (wire.Assignment, wire.LocalPlacementGranted)):
-                    output.finished(left=isinstance(answer, wire.Assignment))
-                    return answer
-                if isinstance(answer, wire.DispatchStatus):
-                    raise FirstStepRefused(answer.reason or 'the first placement ended before admission')
-                if isinstance(answer.wait, wire.Wait):
-                    output(answer.wait)
-                    local = request.local
-                    cause = answer.wait.reason
-                    if isinstance(cause, records.HeadAdmissionStatus):
-                        cause = cause.cause
-                    if isinstance(local, wire.LocalAdmissionContext) and isinstance(cause, records.EstimateExpired):
-                        profile = (request.profile if isinstance(request.profile, records.ProgramProfile)
-                                   else records.INFER_FROM_ARGV)
-                        refreshed = client.step_request(list(local.argv), local.cwd,
-                            wire.Owner(request.owner.pid, request.owner.start_time), request.since,
-                            local.sidecar, request.episode, profile, run=request.run)
-                        request = replace(request, profile=refreshed.profile,
-                            local=wire.LocalAdmissionContext(refreshed.argv, refreshed.cwd, refreshed.sidecar,
-                                refreshed.call, refreshed.test_width, refreshed.fresh_test, refreshed.token_back_at))
-                elif isinstance(answer.wait, wire.PlacementResourceWait):
-                    output.resource_wait(answer.wait)
-                events.wait(records.read_memory_config().waiting_pass_seconds)
-    except client.RunReplaced:
-        # The newer run holds this place now, so this run has no placement left to cancel.
-        raise
-    except BaseException:
-        _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, request.episode, request.owner,
-            'the caller left before first-step admission'))
-        raise
+    answer = queue_place.wait_for_placement(request, 'the caller left before first-step admission')
+    if isinstance(answer, client.LeftQueue):
+        raise FirstStepRefused('the caller left before first-step admission', 75)
+    if isinstance(answer, wire.DispatchStatus):
+        raise FirstStepRefused(answer.reason or 'the first placement ended before admission')
+    return answer
 
 
 def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
@@ -342,8 +295,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     route = target_config.PinnedTarget(targets[0]) if len(targets) == 1 else target_config.ANY_ELIGIBLE_TARGET
     return wire.PlacementRequest(position.episode, placement.SubmittingOwner(store.host_name(), owner.pid, owner.start_time),
         position.since, local.profile, constraints, identity=local.identity, run=local.run, route=route,
-        local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call, local.test_width,
-            local.fresh_test, local.token_back_at))
+        local=queue_place.local_context(local))
 
 
 @contextmanager

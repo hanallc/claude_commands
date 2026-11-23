@@ -8,7 +8,6 @@ import inspect
 import json
 import os
 import re
-import secrets
 import shlex
 import subprocess
 import tempfile
@@ -33,7 +32,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
-from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, review_actions, review_events, review_items, review_page, review_submissions as submissions
+from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
 PRODUCER = staff.StaffId("producer-staff")
@@ -106,11 +105,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
         _ = self.enterContext(patch.object(change_review, "lists_directory", side_effect=AssertionError("Use fixture change lists.")))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.root / "config"),
             "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "key-state"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
         conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +157,12 @@ class ReviewSubmissionTests(unittest.TestCase):
                 self.assertEqual(submitted.key, f"submission/{kind}/{OWNER}/{identity}/{payload.request_id}")
                 self.assertEqual(submitted.kind, kind)
                 self.assertEqual(submissions.submit(payload), submitted)
+                token = submitted.reply_token
+                self.assertTrue(token)
+                note = submitted.path.read_text(encoding="utf-8")
+                self.assertIn(reply_tokens.digest(token), note)
+                self.assertIn(submitted.details.reply_token_nonce, note)
+                self.assertNotIn(token, note)
         question, = self.questions()
         self.assertEqual((question.item.get("review_id"), question.owner, question.item.get("question")),
                          ("Q1", OWNER, request().words))
@@ -204,7 +211,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         directory = self.root / "brain"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
-        self.assertEqual(submissions.proposal_folder(producer),
+        self.assertEqual(submissions.proposal_folder(producer, self.members),
                          submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
 
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
@@ -421,17 +428,98 @@ class ReviewSubmissionTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root / "review")
         second = submissions.submit(request(seed="second"))
         untouched = investigation.load(OWNER, second.id)
+        key = reply_tokens.path()
+        original_key = key.read_bytes()
+        original_token = second.reply_token
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        home = self.root / "fixture-home"
+        inside = self.root / "review" / "state"
+        alias = self.root / "state-alias"
+        alias.symlink_to(inside, target_is_directory=True)
+        for environment, overlapping_key in (
+            ({"XDG_STATE_HOME": str(alias), "REVIEW_LINKS_ROOT": str(inside.parent)},
+             inside / "review-links" / key.name),
+            ({"REVIEW_LINKS_ROOT": str(home / ".local")}, home / ".local/state/review-links" / key.name),
+        ):
+            with (self.subTest(environment=environment),
+                  patch.dict(os.environ, environment, clear=True),
+                  patch.object(Path, "home", return_value=home),
+                  patch.object(reply_tokens, "platform", "darwin"),
+                  patch.object(subprocess, "run", side_effect=AssertionError("The server called SSH."))):
+                with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                    _ = reply_tokens.mint()
+                self.assertFalse(overlapping_key.parent.exists())
+                overlapping_key.parent.mkdir(parents=True)
+                _ = overlapping_key.write_bytes(original_key)
+                overlapping_key.chmod(0o600)
+                with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                    _ = reply_tokens.derive(second.details.reply_proof)
+        served = self.root / "review"
+        spelling = self.root / "review-alias"
+        spelling.symlink_to(served, target_is_directory=True)
+        state = spelling / "alias-state"
+        spelling_key = state / "review-links" / key.name
+        resolve = Path.resolve
+
+        def preserve_spelling(path: Path, strict: bool = False) -> Path:
+            # Simulate a file system that preserves the supplied case.
+            return path if path == spelling_key else resolve(path, strict=strict)
+
+        with (patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}), reply_tokens.serving(served),
+              patch.object(Path, "resolve", autospec=True, side_effect=preserve_spelling)):
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
+                _ = reply_tokens.mint()
+            self.assertFalse(state.exists())
+        mac_key = key.parent / "mac" / key.name
+        with (patch.object(reply_tokens, "platform", "darwin"),
+              patch.object(reply_tokens, "path", return_value=mac_key),
+              patch.object(subprocess, "run", autospec=True) as ssh):
+            ssh.return_value = subprocess.CompletedProcess([], 0, b"short", b"")
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "must contain 32 bytes"):
+                _ = reply_tokens.mint()
+            self.assertFalse(mac_key.exists())
+            ssh.side_effect = subprocess.CalledProcessError(1, "ssh")
+            with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "Cannot copy the reply key from natedev"):
+                _ = reply_tokens.derive(second.details.reply_proof)
+            self.assertFalse(mac_key.exists())
+            ssh.side_effect = None
+            ssh.reset_mock()
+            ssh.return_value = subprocess.CompletedProcess([], 0, original_key, b"")
+            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            proof = reply_tokens.mint()
+            token = reply_tokens.derive(proof)
+            ssh.assert_called_once()
+            self.assertEqual(ssh.call_args.args[0][:4], ["ssh", "-o", "BatchMode=yes", "natedev"])
+            self.assertEqual(ssh.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(mac_key.read_bytes(), original_key)
+            self.assertEqual(mac_key.stat().st_mode & 0o777, 0o600)
+
+            def copy_with_race(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                _ = mac_key.write_bytes(original_key)
+                mac_key.chmod(0o600)
+                return subprocess.CompletedProcess([], 0, b"x" * len(original_key), b"")
+
+            mac_key.unlink()
+            ssh.side_effect = copy_with_race
+            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            self.assertEqual(mac_key.read_bytes(), original_key)
+        self.assertEqual(reply_tokens.derive(proof), token)
         for kind in submissions.SubmissionKind:
             with self.subTest(kind=kind):
                 first = submissions.submit(request(kind, kind))
-                for token in ("", second.reply_token, "✓"):
-                    with self.subTest(token=token):
+                proof = first.details.reply_proof
+                token = reply_tokens.derive(proof)
+                self.assertEqual(token, first.reply_token)
+                self.assertEqual(key.read_bytes(), original_key)
+                for invalid in ("", second.reply_token, "✓"):
+                    with self.subTest(token=invalid):
                         with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
-                            _ = change_page.answer_item(first.key, "An answer", token, status)
-                self.assertTrue(change_page.answer_item(first.key, "An answer", first.reply_token, status))
-                self.assertFalse(change_page.answer_item(first.key, "An answer", first.reply_token, status))
-                with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
-                    _ = change_page.answer_item(first.key, "New answer", first.reply_token, status)
+                            _ = change_page.answer_item(first.key, "An answer", invalid, status)
+                with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
+                    self.assertTrue(change_page.answer_item(first.key, "An answer", token, status))
+                    self.assertFalse(change_page.answer_item(first.key, "An answer", token, status))
+                    with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
+                        _ = change_page.answer_item(first.key, "New answer", token, status)
                 match kind:
                     case submissions.SubmissionKind.QUESTION:
                         answered, = self.questions()
@@ -453,12 +541,77 @@ class ReviewSubmissionTests(unittest.TestCase):
                             _ = change_page.answer_item(first.key, "An answer", first.reply_token, status)
         self.assertEqual(investigation.load(OWNER, second.id), untouched)
 
-    def test_f001_generated_reply_command_accepts_a_dash_from_the_token_generator(self) -> None:
-        def dash_token(size: int) -> str:
-            return "-" + "a" * ((4 * size + 2) // 3 - 1)
+    def test_scrub_preserves_notes_and_legacy_replies_without_a_key(self) -> None:
+        opened = [submissions.submit(request(kind, "open")) for kind in submissions.SubmissionKind]
+        archived = opened[-1]
+        archive = archived.path.parent / "archive"
+        archive.mkdir(exist_ok=True)
+        opened[-1] = replace(archived, path=archived.path.rename(archive / archived.path.name))
+        closed = submissions.submit(request(submissions.SubmissionKind.QUESTION, "closed"))
+        self.assertTrue(submissions.answer(closed.key, "The owner replied.", closed.reply_token))
+        record = update_registration.read_review_question(closed.path)
+        update_registration.review_sent_question(record, read_production(OWNER, self.members), "read", "")
+        notes = [*opened, closed]
+        tokens = {item.key: item.reply_token for item in notes}
+        originals: dict[Path, bytes] = {}
+        for item in notes:
+            blob = item.path.read_bytes()
+            for quote in ('"', r'\"'):
+                blob = blob.replace(
+                    f', {quote}reply_token_nonce{quote}: {quote}{item.details.reply_token_nonce}{quote}'.encode(), b"")
+            self.assertNotIn(b"reply_token_nonce", blob)
+            originals[item.path] = blob
+            legacy = blob.replace(b"reply_token_sha256", b"reply_token", 1)
+            _ = item.path.write_bytes(legacy.replace(item.details.reply_token_sha256.encode(),
+                                                      tokens[item.key].encode(), 1))
 
-        with patch.object(secrets, "token_urlsafe", side_effect=dash_token):
-            saved = submissions.submit(request())
+        key = reply_tokens.path()
+        previous_key = key.with_suffix(".previous")
+        _ = key.rename(previous_key)
+        note = update_registration.read_review_question(opened[0].path)
+        legacy_details = new_item_dialog.read_submission(note.item.get("review_submission"))
+        new_item_dialog.require_reply_token(legacy_details, tokens[opened[0].key])
+        with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
+            new_item_dialog.require_reply_token(legacy_details, tokens[closed.key])
+
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
+        self.assertCountEqual(output.getvalue().splitlines(), [f"Rewrote {item.path}" for item in notes])
+        for item in notes:
+            self.assertEqual(item.path.read_bytes(), originals[item.path])
+        before = {item.path: item.path.stat().st_mtime_ns for item in notes}
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual({item.path: item.path.stat().st_mtime_ns for item in notes}, before)
+        self.assertFalse(key.exists())
+
+        archived = opened[-1]
+        self.assertTrue(submissions.answer(archived.key, "Reply while archived.", tokens[archived.key]))
+        status = change_page.DeliveryStatus(key.parent)
+        for item in opened[:-1]:
+            with self.subTest(kind=item.kind):
+                saved = submissions.submit(request(item.kind, "open"))
+                self.assertEqual(saved.details.reply_token_nonce, "")
+                delivery = review_actions.prepare_submission_delivery(saved, saved.words, status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                current = submissions.submit(request(item.kind, "open"))
+                self.assertTrue(reply_tokens.valid_nonce(current.details.reply_token_nonce))
+                token = current.reply_token
+                self.assertIn(change_page.reply_command(current.key, token), change_page.outbound_review_message(delivery).text)
+                self.assertNotIn(token.encode(), current.path.read_bytes())
+                with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
+                    _ = submissions.answer(current.key, "The old token fails.", tokens[item.key])
+                self.assertTrue(submissions.answer(current.key, "The new token works.", token))
+                with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
+                    answered = submissions.submit(request(item.kind, "open"))
+                    self.assertIsInstance(review_actions.prepare_submission_delivery(answered, answered.words, status),
+                                          change_page.NoMessageDelivery)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+
+    def test_f001_generated_reply_command_uses_the_derived_token(self) -> None:
+        saved = submissions.submit(request())
+        self.assertRegex(saved.reply_token, r"^r[A-Za-z0-9_-]{42}$")
         command = shlex.split(change_page.reply_command(saved.key, saved.reply_token))
         command[-1] = "The command works."
         self.assertEqual(change_page.main(command[2:]), 0)
@@ -702,7 +855,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                   patch.object(review_items, "read", return_value=[item])):
                 delivery, _ = review_page.submit(status.root, body, status)
         assert isinstance(delivery, change_page.MessageDelivery)
-        return shlex.split(delivery.message.splitlines()[-1])[2:]
+        return shlex.split(change_page.outbound_review_message(delivery).text.splitlines()[-1])[2:]
 
     def test_f013_replacement_voids_the_first_token(self) -> None:
         status = change_page.DeliveryStatus(self.root / "review")
@@ -711,7 +864,11 @@ class ReviewSubmissionTests(unittest.TestCase):
                 saved = submissions.submit(request(kind))
                 original = saved.reply_token
                 command = self.replace_review_wait(saved, "Check again", status)
-                self.assertNotEqual(command[command.index("--question") + 1], original)
+                token = command[command.index("--question") + 1]
+                current = submissions.submit(request(kind))
+                self.assertEqual(current.reply_token, token)
+                self.assertNotEqual(token, original)
+                self.assertNotEqual(current.details.reply_token_nonce, saved.details.reply_token_nonce)
                 before = saved.path.read_bytes()
                 with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
                     _ = change_page.answer_item(saved.key, "Stale reply", original, status)
@@ -1068,6 +1225,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                     with patch.object(investigation, "recipient_locks", side_effect=lock_after_lookup):
                         retry = submissions.submit(payload, members=members)
                 self.assertTrue(checked_lookup)
+                self.assertEqual(retry.reply_token, saved.reply_token)
                 if transfer:
                     self.assertFalse(archived.exists())
                 else:
@@ -1684,7 +1842,8 @@ class ReviewSubmissionTests(unittest.TestCase):
                     saved = submissions.submit(payload)
                 collision, = delivered
                 self.assertEqual((saved.id, saved.path), (peer.id, collision))
-                self.assertEqual(saved.reply_token, peer.reply_token)
+                self.assertEqual(saved.reply_token, "")
+                self.assertTrue(new_item_dialog.matches_reply_token(saved.details, peer.reply_token))
                 self.assertEqual(collision.read_bytes(), original)
                 self.assertEqual(submissions.submit(payload), saved)
                 self.assertEqual(set(collision.parent.glob("*.md")) - before, {collision})
@@ -1889,10 +2048,12 @@ class ReviewSubmissionTests(unittest.TestCase):
 
         with patch.object(staff, "snapshot", return_value=members):
             self.doc.unlink()
-            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" is missing\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(standard)
             _ = self.doc.write_bytes(b"\xff")
-            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" cannot be read\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(draft)
             for name in ("pending.json", "receipt.json", ".indexed", "investigation.water"):
                 self.assertEqual(list(self.root.rglob(name)), [])
@@ -1925,8 +2086,10 @@ class ReviewSubmissionTests(unittest.TestCase):
                     _ = producer_doc.write_bytes(content)
                 for payload in (standard, list_page, review):
                     with self.subTest(page=payload.page, content=content):
+                        state = "cannot be read" if content else "is missing"
                         with self.assertRaisesRegex(submissions.SubmissionError,
-                                                    r"^Cannot read the production document for producer\.$"):
+                                                    rf"^The producer production document {re.escape(str(producer_doc))}"
+                                                    + rf" {state}\. builds must fix the producer staff row\.$"):
                             _ = submissions.submit(payload)
                 self.assertEqual({path: path.read_bytes() for path in self.root.rglob("receipt.json")}, before)
                 self.assertEqual(list(self.root.rglob("pending.json")), [])
@@ -2089,7 +2252,8 @@ class ReviewSubmissionTests(unittest.TestCase):
             retry = submissions.submit(payload, members=wrapped)
         self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
         self.assertEqual((retry.id, retry.owner, retry.path), (saved.id, PRODUCER, archived))
-        self.assertEqual((retry.key, retry.reply_token), (saved.key, token))
+        self.assertEqual((retry.key, retry.reply_token), (saved.key, ""))
+        self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))
         self.assertTrue(archived.exists())
         self.assertEqual(investigation.read_review_record(archived).answer, 'Answer in the archive')
 
@@ -2156,7 +2320,8 @@ class ReviewSubmissionTests(unittest.TestCase):
         receipt.unlink()
         self.assertTrue(submissions.answer(saved.key, 'Reply without a receipt', token, members=wrapped))
         retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual((retry.id, retry.key, retry.reply_token), (saved.id, saved.key, token))
+        self.assertEqual((retry.id, retry.key, retry.reply_token), (saved.id, saved.key, ""))
+        self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))
         self.assertEqual((retry.owner, retry.path), (PRODUCER, investigation.folder(PRODUCER) / saved.path.name))
         self.assertEqual(investigation.load(PRODUCER, saved.id).answer, 'Reply without a receipt')
         self.assertEqual(investigation.records(OWNER, include_read=True), [])
@@ -2312,3 +2477,107 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(investigation.records(OWNER), [])
         self.assertEqual(self.questions(), [])
         self.assertEqual(self.proposals(), [])
+
+
+_NATEDEV = staff.StaffRow(staff.StaffId("natedev-staff"), "showrunner", "natedev", staff.StaffRoot(),
+                         current_session=staff.StaffId("natedev-session"),
+                         doc=staff.LiveDoc(local_machine(), Path("/natedev-production.md")))
+_SDLC = replace(_NATEDEV, id=staff.StaffId("sdlc-staff"), name="sdlc", parent=staff.ReportsTo(_NATEDEV.id))
+_BUILDS = replace(_NATEDEV, id=staff.StaffId("builds-staff"), name="builds", parent=staff.ReportsTo(_NATEDEV.id))
+_AWS = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(_BUILDS.id),
+                      current_session=staff.StaffId("aws-session"), unit_type=staff.UnitDetails("direct"))
+_MORTY = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.StaffRoot(),
+                        current_session=staff.StaffId("morty-session"))
+
+
+@final
+class PageOwnerReasonTests(unittest.TestCase):
+    """Each route to a page owner returns the sentence that says why."""
+
+    root: Path = Path()
+    natedev: staff.StaffRow = _NATEDEV
+    sdlc: staff.StaffRow = _SDLC
+    builds: staff.StaffRow = _BUILDS
+    aws: staff.StaffRow = _AWS
+    morty: staff.StaffRow = _MORTY
+    members: staff.StaffSnapshot = staff.StaffSnapshot((_NATEDEV, _SDLC, _BUILDS, _AWS, _MORTY))
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def route(self, page: str, owner: str, members: staff.StaffSnapshot) -> submissions.PageOwnerRoute:
+        config = self.root / "console.conf"
+        owner_line = f"page.{page}.owner={owner}\n" if owner else ""
+        _ = config.write_text(f"page.{page}.label={page.replace('_', ' ').title()}\n{owner_line}"
+                              + f"owner.default={self.sdlc.id}\n", encoding="utf-8")
+        route = submissions.page_owners(page, conf.read(config), members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        return route
+
+    def test_reason_names_the_owner_that_takes_the_item(self) -> None:
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+                                      ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, self.members)
+                self.assertEqual((route.row, route.reason), (owner, expected))
+        config = self.root / "console.conf"
+        _ = config.write_text(f"page.rebuilds.owner={self.natedev.id}\n", encoding="utf-8")
+        route = submissions.page_owners("rebuilds", conf.read(config), self.members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        self.assertEqual(route.reason, "(why natedev? because natedev owns the Rebuilds page!)")
+
+    def test_reason_names_the_showrunner_of_a_unit_owner(self) -> None:
+        route = self.route("aws_machines", self.aws.id, self.members)
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because aws owns the Aws Machines page"
+                                                     + " and builds is its showrunner!)"))
+        worker = staff.StaffRow(staff.StaffId("worker-staff"), "worker", "fixer", staff.ReportsTo(self.aws.id),
+                                current_session=staff.StaffId("worker-session"))
+        route = self.route("aws_machines", worker.id, replace(self.members, rows=(*self.members.rows, worker)))
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because fixer owns the Aws Machines page"
+                                                     + " and builds is the nearest showrunner above it!)"))
+
+    def test_reason_names_the_owner_that_is_not_available_and_the_parent_that_takes_the_item(self) -> None:
+        retired = replace(self.members, pending_retire=(self.builds.id,))
+        expected = "(why natedev? because builds is not available and natedev is the nearest available showrunner above it!)"
+        for page, owner in (("builds", self.builds), ("aws_machines", self.aws)):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, retired)
+                self.assertEqual((route.row, route.reason), (self.natedev, expected))
+
+    def test_reason_names_the_default_owner_when_no_owner_in_the_chain_is_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.morty.id,))
+        route = self.route("list", self.morty.id, retired)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because morty is not available and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_page_has_no_owner(self) -> None:
+        route = self.route("disks", "", self.members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because the Disks page has no owner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_owner_is_not_on_the_staff_list(self) -> None:
+        route = self.route("disks", "missing-staff", self.members)
+        self.assertEqual((route.row, route.reason), (
+            self.sdlc, "(why sdlc? because the Disks page owner is not on the staff list and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_a_unit_owner_has_no_showrunner(self) -> None:
+        orphan = replace(self.aws, parent=staff.StaffRoot())
+        members = staff.StaffSnapshot((self.natedev, self.sdlc, self.builds, orphan, self.morty))
+        route = self.route("aws_machines", orphan.id, members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because aws has no showrunner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_parent_of_a_default_owner_that_is_not_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.sdlc.id,))
+        route = self.route("disks", "", retired)
+        self.assertEqual((route.row, route.reason), (self.natedev, "(why natedev? because the Disks page has no owner,"
+                                                     + " the default owner sdlc is not available, and natedev"
+                                                     + " is the nearest available showrunner above it!)"))
+
+    def test_no_available_owner_has_no_route_and_no_reason(self) -> None:
+        config = self.root / "console.conf"
+        _ = config.write_text("page.disks.label=Disks\nowner.default=missing-staff\n", encoding="utf-8")
+        owners = submissions.page_owners("disks", conf.read(config), self.members)
+        self.assertEqual(owners, submissions.PageOwners(submissions.PageOwnerUnavailable(),
+                                                        submissions.PageOwnerUnavailable()))

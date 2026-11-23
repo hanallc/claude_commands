@@ -7,8 +7,8 @@ from scripts.lib import cancellation, test_phase
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
-from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
 import errno
@@ -358,6 +358,32 @@ class SocketPeer:
         self.socket.close()
 
 
+class RefillMark(threading.local):
+    clear_pending: bool = False
+
+
+class GaplessRefill:
+    """A patch.dict exit calls clear() and then update(); the clear waits for that update, so no reader sees an empty environment."""
+    def __init__(self, environ: MutableMapping[str, str]) -> None:
+        self.environ: MutableMapping[str, str] = environ
+        self.mark: RefillMark = RefillMark()
+
+    def clear(self) -> None:
+        """The clear waits for the next update() from this thread, so a direct os.environ.clear() keeps the environment while a fixture is open."""
+        self.mark.clear_pending = True
+
+    def update(self, values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+        cleared, self.mark.clear_pending = self.mark.clear_pending, False
+        target = dict(values, **keywords)
+        for key, value in target.items():
+            self.environ[key] = value
+        if cleared:
+            for key in [key for key in self.environ if key not in target]:
+                # Another thread can remove the same key first.
+                with suppress(KeyError):
+                    del self.environ[key]
+
+
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
@@ -368,48 +394,51 @@ class AdmissionFixture(ExitStack):
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
-        self.temporary: Path = self.root / "tmp"
-        self.temporary.mkdir(parents=True, exist_ok=True)
-        # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
-        self.socket_dir: Path = Path(self.enter_context(
-            short_socket_directory()))
-        logs = log_dir if log_dir is not None else self.root / "log"
-        self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.socket_path: Path = self.socket_dir / "admission.sock"
-        self.scenery_reservations: set[str] = set()
-        self.skip_idle_spacing: bool = skip_idle_spacing
-        self.clock: FakeClock = FakeClock()
-        self.fault: Faults = Faults()
-        self.proc: TestProcesses = TestProcesses(self.root / "proc")
-        _ = self.callback(self.proc.close)
-        pressure = self.root / "pressure"
-        if not pressure.exists():
-            write_pressure_reading(pressure)
-        memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
-                   "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
-                  if (self.root / "meminfo").exists() else fake_memory_readings(
-                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-        environment = {**gate_isolation_environment(self.root), **memory,
-            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
-            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
-            "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
-            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
-            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
-            "BUILDLOG_RUN": "",
-            "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root), "TMPDIR": str(self.temporary),
-            **interpreter_cache_environment(self.root / "cache")}
-        self.enter_context(mock.patch.dict(os.environ, environment))
-        if not (self.root / "build_admission.conf").exists():
-            write_memory_config(self.root / "build_admission.conf")
-        self.readings: PrivateReadings = PrivateReadings(self.root)
-        self.turn_gate: threading.Lock = threading.Lock()
-        self.loop_access: threading.RLock = threading.RLock()
-        self.serving_active: threading.Event = threading.Event()
-        self.loop_permission: threading.local = threading.local()
         try:
+            self.temporary: Path = self.root / "tmp"
+            self.temporary.mkdir(parents=True, exist_ok=True)
+            # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
+            self.socket_dir: Path = Path(self.enter_context(
+                short_socket_directory()))
+            logs = log_dir if log_dir is not None else self.root / "log"
+            self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self.socket_path: Path = self.socket_dir / "admission.sock"
+            self.scenery_reservations: set[str] = set()
+            self.skip_idle_spacing: bool = skip_idle_spacing
+            self.clock: FakeClock = FakeClock()
+            self.fault: Faults = Faults()
+            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            _ = self.callback(self.proc.close)
+            pressure = self.root / "pressure"
+            if not pressure.exists():
+                write_pressure_reading(pressure)
+            memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+                       "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
+                      if (self.root / "meminfo").exists() else fake_memory_readings(
+                          self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
+            environment = {**gate_isolation_environment(self.root), **memory,
+                "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
+                "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
+                "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
+                "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
+                "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+                "BUILDLOG_RUN": "",
+                "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
+                "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
+                "HOME": str(self.root), "TMPDIR": str(self.temporary),
+                **interpreter_cache_environment(self.root / "cache")}
+            refill = GaplessRefill(os.environ)
+            _ = self.enter_context(mock.patch.object(os.environ, "clear", refill.clear))
+            _ = self.enter_context(mock.patch.object(os.environ, "update", refill.update))
+            self.enter_context(mock.patch.dict(os.environ, environment))
+            if not (self.root / "build_admission.conf").exists():
+                write_memory_config(self.root / "build_admission.conf")
+            self.readings: PrivateReadings = PrivateReadings(self.root)
+            self.turn_gate: threading.Lock = threading.Lock()
+            self.loop_access: threading.RLock = threading.RLock()
+            self.serving_active: threading.Event = threading.Event()
+            self.loop_permission: threading.local = threading.local()
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
             self.close()

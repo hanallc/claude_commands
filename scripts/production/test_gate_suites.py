@@ -14,19 +14,22 @@ import time
 import subprocess
 import select
 from types import SimpleNamespace
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
-from scripts.build_queue import admission_client as client
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records
+from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib import process_group
+from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
-from scripts.production.gate_modules import discover_test_modules, test_module_name
+from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 
@@ -261,6 +264,480 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     self.assertFalse(any(record["tree"] == tree and record["kind"] == "full"
                                          and record["suites"] == list(self.suites) for record in self.pass_records()))
 
+    @gate_suites("hooks")
+    def test_cloud_gate_checks_the_checkout_after_each_return_path(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        local_result = gate.GateRun((), 1, 0, selection_certified=True)
+        subject = self.checkout / "subject.txt"
+
+        def run_changed_checkout(*_args: object, **_kwargs: object) -> gate.GateRun:
+            self.write(subject, "changed during the local run\n")
+            return local_result
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(gate, "run_suites", return_value=local_result) as run_local,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertIs(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT), local_result)
+            run_local.side_effect = run_changed_checkout
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+        _ = self.git(self.checkout, "restore", "subject.txt")
+        remote = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value=remote),
+              mock.patch.object(gate, "run_suites", side_effect=run_changed_checkout) as run_types):
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, ("scripts",), target=gate.NO_GATE_ASSIGNMENT)
+            run_types.assert_called_once_with(
+                self.checkout, ("scripts",), gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                source="tests-only", full=False, mode=gate.SuiteMode.GATE, selected=gate.SelectedModules(()))
+
+        _ = self.git(self.checkout, "restore", "subject.txt")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value=remote) as route):
+            self.assertIs(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT), remote)
+            route.side_effect = run_changed_checkout
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+        _ = self.git(self.checkout, "restore", "subject.txt")
+        working_tree = cloud_gate.working_tree(self.checkout)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value=remote),
+              mock.patch.object(cloud_gate, "working_tree", side_effect=[
+                  working_tree, affected_modules.GraphError("fixture final tree error")])):
+            with self.assertRaisesRegex(GateRefused, "^fixture final tree error$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+    @gate_suites("hooks")
+    def test_targeted_returns_refuse_a_changed_checkout(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        subject = self.checkout / "subject.txt"
+        selection = affected_modules.AffectedSelection(
+            affected_modules.CertifiedBase(self.git(self.checkout, "rev-parse", "HEAD"), "2026-01-15T00:00:00+00:00"),
+            (), ())
+        for reuse, types in ((True, ()), (False, ()), (False, ("scripts",))):
+            for changed in (False, True):
+                with (self.subTest(reuse=reuse, types=types, changed=changed),
+                      mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(cloud_gate, "route") as route,
+                      mock.patch.object(gate.PassedTreeLedger, "reuse", return_value=reuse),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    _ = self.git(self.checkout, "restore", "subject.txt")
+
+                    def select(*_args: object, **_kwargs: object) -> affected_modules.AffectedSelection:
+                        if changed and not (reuse or types):
+                            self.write(subject, "changed during empty selection\n")
+                        return selection
+
+                    def local(*_args: object, **_kwargs: object) -> gate.GateRun:
+                        if changed:
+                            self.write(subject, "changed during local checks\n")
+                        jobs = (gate.GateJobResult("types", "basedpyright", 0, 1, "",
+                                                   kind=gate.GateJobKind.TYPE_CHECK),) if types else ()
+                        return gate.GateRun(jobs, 1, 0, tests_reused=reuse)
+
+                    before = self.pass_records()
+                    with (mock.patch.object(gate, "select_affected", side_effect=select),
+                          mock.patch.object(gate, "run_suites", side_effect=local) as run_local):
+                        if changed:
+                            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                                _ = gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
+                                                         target=gate.NO_GATE_ASSIGNMENT)
+                            self.assertEqual(self.pass_records(), before)
+                        else:
+                            self.assertTrue(gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
+                                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
+                    route.assert_not_called()
+                    self.assertEqual(run_local.call_count, int(reuse or bool(types)))
+
+    @gate_suites("hooks")
+    def test_refused_empty_selection_does_not_record_a_pass(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        selection = affected_modules.AffectedSelection(
+            affected_modules.CertifiedBase(head, "2026-01-15T00:00:00+00:00"), (), ())
+
+        def change_during_selection(*_args: object, **_kwargs: object) -> affected_modules.AffectedSelection:
+            self.write(self.checkout / "subject.txt", "changed during empty selection\n")
+            return selection
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route") as route,
+              mock.patch.object(gate, "select_affected", return_value=selection) as select,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED,
+                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
+            accepted, = self.gate_run_records()
+            self.assertEqual((accepted["selection"], accepted["status"]), ("affected", 0))
+            before = self.pass_records()
+
+            select.side_effect = change_during_selection
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+            route.assert_not_called()
+
+        self.assertEqual(self.gate_run_records(), [accepted])
+        self.assertEqual(self.pass_records(), before)
+
+    @gate_suites("hooks")
+    def test_empty_selection_history_keeps_the_validated_commit_and_branch(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+        branch = self.git(self.checkout, "branch", "--show-current")
+        self.write(self.checkout / "subject.txt", "contents of the second commit\n")
+        second = self.commit(self.checkout, "Change the subject")
+        _ = self.git(self.checkout, "reset", "--hard", head)
+        _ = self.git(self.checkout, "branch", "after-validation", second)
+        selection = affected_modules.AffectedSelection(
+            affected_modules.CertifiedBase(head, "2026-01-15T00:00:00+00:00"), (), ())
+        append_pass = gate.PassedTreeLedger.append_pass
+
+        def move_head_after_validation(ledger: gate.PassedTreeLedger, passed: gate.ValidatedTestPass) -> None:
+            append_pass(ledger, passed)
+            _ = self.git(self.checkout, "checkout", "after-validation")
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route") as route,
+              mock.patch.object(gate, "select_affected", return_value=selection),
+              mock.patch.object(gate.PassedTreeLedger, "append_pass", autospec=True,
+                                side_effect=move_head_after_validation),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED,
+                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
+            route.assert_not_called()
+
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), second)
+        self.assertEqual(self.git(self.checkout, "branch", "--show-current"), "after-validation")
+        record, = self.gate_run_records()
+        self.assertEqual((record["sha"], record["tree"], record["branch"], record["status"]), (head, tree, branch, 0))
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_records_no_pass_when_the_checkout_changes_during_the_hold(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        added = self.checkout / "scripts/hooks/test_added.py"
+
+        def change_tree_during_hold() -> None:
+            if not added.exists():
+                self.write(added, SUITE_MODULE)
+                _ = self.commit(self.checkout, "Add a module during the build hold")
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=change_tree_during_hold),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+        self.assertEqual(self.pass_records(), [])
+        starts = [row["module"] for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, ["test_first.py", "test_added.py"])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_records_no_pass_when_the_module_list_changes(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        added = self.checkout / "scripts/hooks/test_ignored.py"
+        with (self.checkout / ".git/info/exclude").open("a") as excludes:
+            _ = excludes.write(f"\n/{added.relative_to(self.checkout)}\n")
+        finish = gate.finish_gate_job
+
+        def add_module_after_job(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            result = finish(job, status)
+            self.write(added, SUITE_MODULE)
+            return result
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(gate, "finish_gate_job", side_effect=add_module_after_job),
+              contextlib.redirect_stdout(io.StringIO())):
+            original_tree = cloud_gate.working_tree(self.checkout)
+            run = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+            self.assertEqual(cloud_gate.working_tree(self.checkout), original_tree)
+
+        self.assertTrue(added.is_file())
+        self.assertTrue(run.passed)
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_publishes_the_pass_only_after_final_validation(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        subject = self.checkout / "subject.txt"
+        working_tree = cloud_gate.working_tree
+        calls = 0
+
+        def change_before_final_check(repo: Path) -> tuple[str, set[str]]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.write(subject, "changed before the final tree check\n")
+            return working_tree(repo)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              contextlib.redirect_stdout(io.StringIO())):
+            with (mock.patch.object(cloud_gate, "working_tree", side_effect=change_before_final_check),
+                  self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$")):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+            self.assertEqual(self.pass_records(), [])
+            self.assertEqual(marker.read_text(), notice)
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+            unavailable = self.state / "unavailable-pass-ledger"
+            self.write(unavailable, "The ledger directory is a file.\n")
+            with mock.patch.dict(os.environ, {"GATE_PASSED_DIR": str(unavailable)}):
+                self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertEqual(self.pass_records(), [])
+            self.assertEqual(marker.read_text(), notice)
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
+        record, = self.pass_records()
+        self.assertEqual(record["tree"], working_tree(self.checkout)[0])
+        self.assertFalse(marker.exists())
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_checks_the_tree_after_coverage_validation(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        modules = discover_test_modules(self.checkout)
+
+        def change_during_coverage() -> list[tuple[str, Path]]:
+            self.write(self.checkout / "subject.txt", "changed during coverage validation\n")
+            _ = self.commit(self.checkout, "Change the tree during coverage validation")
+            return modules
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(gate, "discover_test_modules") as discover,
+              mock.patch.object(cloud_gate, "working_tree", wraps=cloud_gate.working_tree) as read_tree,
+              contextlib.redirect_stdout(io.StringIO())):
+            def discover_then_change(_repo: Path) -> list[tuple[str, Path]]:
+                if discover.call_count == 1:
+                    return modules
+                self.assertEqual(read_tree.call_count, 1)
+                return change_during_coverage()
+
+            discover.side_effect = discover_then_change
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+            self.assertEqual(read_tree.call_count, 2)
+            self.assertEqual(discover.call_count, 2)
+
+        self.assertEqual(self.pass_records(), [])
+        self.assertEqual(marker.read_text(), notice)
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_refuses_a_mixed_reset_after_clean_status(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.checkout / "subject.txt", "contents of the second commit\n")
+        second = self.commit(self.checkout, "Change the subject")
+        _ = self.git(self.checkout, "checkout", "--detach", head)
+        working_tree = cloud_gate.working_tree
+        checked_git = gate.checked_git
+        final_read = False
+
+        def checkout_second_before_final_read(repo: Path) -> tuple[str, set[str]]:
+            nonlocal final_read
+            if read_tree.call_count == 2:
+                _ = self.git(repo, "checkout", "--detach", second)
+                final_read = True
+            return working_tree(repo)
+
+        def reset_before_head_tree(repo: Path, *args: str) -> str:
+            nonlocal final_read
+            if final_read and args[0] == "rev-parse" and "HEAD^{tree}" in args:
+                self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+                _ = self.git(repo, "reset", "--mixed", head)
+                final_read = False
+            return checked_git(repo, *args)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(cloud_gate, "working_tree", side_effect=checkout_second_before_final_read) as read_tree,
+              mock.patch.object(gate, "checked_git", side_effect=reset_before_head_tree),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "M subject.txt")
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_publishes_no_pass_when_the_index_changes_during_the_final_read(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        added = "ignored.txt"
+        self.write(self.checkout / ".git/info/exclude", f"/{added}\n")
+        self.write(self.checkout / added, "ignored until staged\n")
+        private_copy = git_index.private_copy
+
+        def stage_and_restore_after_copy(source: Path, destination: Path) -> None:
+            if copy.call_count != 2:
+                private_copy(source, destination)
+                return
+            self.write(self.checkout / "subject.txt", "edited before the index copy\n")
+            private_copy(source, destination)
+            _ = self.git(self.checkout, "add", "-f", added)
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(git_index, "private_copy", side_effect=stage_and_restore_after_copy) as copy,
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(GateRefused, "^The Git index changed during the checkout read$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+            self.assertEqual(copy.call_count, 2)
+
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), f"A  {added}")
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_refuses_an_unreadable_tree_at_pass_publication(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        modules = discover_test_modules(self.checkout)
+        working_tree = cloud_gate.working_tree
+        for ledger_unavailable in (False, True):
+            with (self.subTest(ledger_unavailable=ledger_unavailable),
+                  mock.patch.dict(os.environ, self.environment),
+                  mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+                  mock.patch.object(gate, "discover_test_modules", return_value=modules) as discover,
+                  mock.patch.object(cloud_gate, "working_tree") as read_tree,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                def read_after_coverage(repo: Path) -> tuple[str, set[str]]:
+                    if discover.call_count == 2:
+                        raise affected_modules.GraphError("fixture publication tree read failed")
+                    return working_tree(repo)
+
+                read_tree.side_effect = read_after_coverage
+                if ledger_unavailable:
+                    unavailable = self.state / "unreadable-pass-ledger"
+                    self.write(unavailable, "The ledger directory is a file.\n")
+                    os.environ["GATE_PASSED_DIR"] = str(unavailable)
+                with self.assertRaisesRegex(GateRefused, "^fixture publication tree read failed$"):
+                    _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+                self.assertEqual(read_tree.call_count, 2)
+                self.assertEqual("Test pass ledger unavailable" in output.getvalue(), ledger_unavailable)
+        self.assertEqual(self.pass_records(), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_keeps_the_marker_when_the_pass_append_fails(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        path = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        path.mkdir(parents=True)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(gate, "discover_test_modules", wraps=discover_test_modules) as discover,
+              mock.patch.object(cloud_gate, "working_tree", wraps=cloud_gate.working_tree) as read_tree,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            events = mock.Mock()
+            events.attach_mock(discover, "discover")
+            events.attach_mock(read_tree, "read_tree")
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertIn(f"Is a directory: '{path}'", output.getvalue())
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(list(path.iterdir()), [])
+            self.assertEqual([call[0] for call in events.mock_calls],
+                             ["read_tree", "discover", "discover", "read_tree"])
+
+            modules = discover_test_modules(self.checkout)
+            with (mock.patch.object(gate, "discover_test_modules", side_effect=[
+                      modules, OSError("fixture coverage read failed")]),
+                  self.assertRaisesRegex(GateRefused, "^fixture coverage read failed$")):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(list(path.iterdir()), [])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_accepts_matching_clean_dirty_and_index_only_sources(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        subject = self.checkout / "subject.txt"
+        finish = gate.finish_gate_job
+
+        def stage_other_contents(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            completed = finish(job, status)
+            blob = self.git(self.checkout, "rev-parse", "HEAD:scripts/hooks/test_first.py")
+            _ = self.git(self.checkout, "update-index", "--cacheinfo", f"100644,{blob},subject.txt")
+            return completed
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              contextlib.redirect_stdout(io.StringIO())):
+            clean_tree, dirty = cloud_gate.working_tree(self.checkout)
+            self.assertEqual(dirty, set())
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
+            original, = self.pass_records()
+            self.assertEqual(original["tree"], clean_tree)
+
+            self.write(subject, "working contents stay dirty throughout the gate\n")
+            dirty_tree, dirty = cloud_gate.working_tree(self.checkout)
+            self.assertNotEqual(dirty_tree, clean_tree)
+            self.assertEqual(dirty, {"subject.txt"})
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertEqual(self.pass_records(), [original])
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+            marker, notice = self.write_nightly_red_marker()
+            with mock.patch.object(gate, "finish_gate_job", side_effect=stage_other_contents):
+                self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertEqual(cloud_gate.working_tree(self.checkout), (clean_tree, {"subject.txt"}))
+            self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-only"), "subject.txt")
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertEqual(marker.read_text(), notice)
+            self.assertEqual(self.pass_records(), [original])
+
+    @gate_suites("hooks")
+    def test_cloud_fallback_accepts_a_staged_deletion_of_an_ignored_tracked_file(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        subject = self.checkout / "subject.txt"
+        added = self.checkout / "ignored.txt"
+        with (self.checkout / ".git/info/exclude").open("a") as excludes:
+            _ = excludes.write("\n/subject.txt\n/ignored.txt\n")
+        expected = subject.read_bytes()
+        marker, notice = self.write_nightly_red_marker()
+
+        def fallback(*_args: object, **_kwargs: object) -> str:
+            _ = self.git(self.checkout, "rm", "--cached", "subject.txt")
+            return "fixture cloud unavailable"
+
+        def commit_ignored_file(*_args: object, **_kwargs: object) -> str:
+            self.write(added, "new tracked file\n")
+            _ = self.git(self.checkout, "add", "-f", "ignored.txt")
+            _ = self.git(self.checkout, "commit", "-qm", "Track the ignored file", "--only", "--", "ignored.txt")
+            return "fixture cloud unavailable"
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", side_effect=fallback) as route,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertEqual(cloud_gate.working_tree(self.checkout),
+                             (self.git(self.checkout, "rev-parse", "HEAD^{tree}"), {"subject.txt"}))
+            route.side_effect = commit_ignored_file
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+        self.assertEqual(subject.read_bytes(), expected)
+        self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-status"), "D\tsubject.txt")
+        self.assertEqual(marker.read_text(), notice)
+        self.assertEqual(self.pass_records(), [])
+
     @gate_suites("hooks", "direct")
     def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
         path = self.state / "module_seconds.json"
@@ -332,6 +809,90 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(len([event for event in self.module_events() if event["event"] == "start"]), 1)
         self.assertIn("hooks/test_first.py exit=1 seconds=", output.getvalue())
         self.assertNotIn("Rerun alone", output.getvalue())
+
+    @gate_suites("lib", "hooks")
+    def test_named_modules_use_the_build_hold_and_repository_run_limit(self) -> None:
+        checkout = self.root / "named-modules"
+        _ = self.git(self.checkout, "worktree", "add", "--detach", str(checkout))
+        self.write(checkout / "scripts/hooks/test_first.py", SUITE_MODULE
+                   + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        repository = "claude_commands"
+        machine = "nixos"
+        _ = self.git(checkout, "remote", "set-url", "origin", str(self.root / f"{repository}.git"))
+        self.configure_gate(f"# whole: 1..\nmax_runs.{machine}.{repository}=2\nmax_runs.exempt_unit=natemerge\n")
+        holder = Path(self.environment["BUILD_HOLD_DIR"]) / "fixture-holder"
+        self.write(holder, "Fixture build hold\n")
+
+        occupied: list[wire.Admitted] = []
+        events: list[str | admission_records.RunLimitWait] = []
+        grants: list[tuple[str, str, int]] = []
+        previous = self.admission.server.reply_filter
+
+        def observe(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Admitted):
+                reservations = self.admission.server.reservations.values()
+                record = next(row for row in reservations if row.reservation_id == reply.reservation)
+                grants.append((record.step, record.queue_waiter.get("repository_name", ""), len(reservations)))
+                events.append("admitted")
+            elif isinstance(reply, wire.Wait):
+                limit = reply.snapshot.decision.run_limit
+                if isinstance(limit, admission_records.RunLimitWait) and limit not in events:
+                    events.append(limit)
+                    self.admission.release(occupied.pop(0))
+            return previous(reply)
+
+        def release_fixture_hold(holders: Path, release: Path) -> LocalReleaseEvents:
+            self.assertEqual(os.environ["BUILDLOG_UNIT"], "fixture-unit")
+            self.assertEqual(self.module_events(), [])
+            self.assertEqual(len(self.admission.caller_reservations()), 2)
+            events.append("hold")
+            holder.unlink()
+            return LocalReleaseEvents(holders, release)
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(self.admission.server, "host", machine),
+              mock.patch.object(self.admission.server, "reply_filter", observe),
+              mock.patch.object(gate, "local_release_waiter", side_effect=release_fixture_hold),
+              mock.patch.object(gate, "run_gate_suites", side_effect=AssertionError("run_gate_suites")),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+            try:
+                for _slot in range(2):
+                    self.admission.allow_next_start()
+                    request = self.admission.request(need=admission_records.GIB, step="gate")
+                    assert isinstance(request.profile, admission_records.StepProfile)
+                    request = replace(request, profile=replace(request.profile, repo=repository))
+                    with self.admission.loop_turn():
+                        occupied.append(only_admitted(self.admission.server.handle_request(request)))
+                self.admission.allow_next_start()
+                os.environ["BUILDLOG_UNIT"] = "natemerge"
+                code = gate.main(["--affected", "--repo", str(checkout),
+                                  "--module", "lib/test_second.py"])
+                self.assertEqual(code, 0, output.getvalue())
+                self.assertTrue(holder.exists())
+                self.assertEqual(events, ["admitted"])
+                self.assertEqual(grants, [("test-affected", repository, 3)])
+                self.clear_gate_events()
+
+                self.admission.allow_next_start()
+                os.environ["BUILDLOG_UNIT"] = "fixture-unit"
+                code = gate.main(["--tests-only", "--repo", str(checkout),
+                                  "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+            finally:
+                for grant in occupied:
+                    self.admission.release(grant)
+        self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual(events, ["admitted", "hold", admission_records.RunLimitWait(2, 2, repository, machine),
+                                  "admitted"])
+        self.assertEqual(grants, [("test-affected", repository, 3), ("gate", repository, 2)])
+        self.assert_gate_released()
+        # A named run writes no gate record.
+        self.assertEqual(self.gate_run_records(), [])
+        self.assertFalse(Path(self.environment["GATE_PASSED_DIR"], "passed-trees.jsonl").exists())
+        starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
+        # A red module runs once more alone, as in the gate, so a flake is not a red name.
+        self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
+        self.assertEqual(checkpoint_gate.red_names(["gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
 
     @gate_suites("lib", "hooks")
     def test_named_modules_report_red_without_a_ledger_or_gate_record(self) -> None:

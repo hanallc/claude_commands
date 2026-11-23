@@ -199,12 +199,10 @@ class HandoffClientTests(unittest.TestCase):
             closed = mock.Mock(assignment=assignment, state=placement.ClosedAssignment("completed"))
             position = SlotQueuePosition(request.episode, request.since)
             local = wire.LocalPlacementGranted(assignment, granted)
-            grants: tuple[tuple[wire.Admitted | wire.LocalPlacementGranted | first_step.GatePlacement, bool,
+            grants: tuple[tuple[wire.Admitted | wire.LocalPlacementGranted, bool,
                                 tuple[int, wire.ReleaseEnding]], ...] = (
                 (granted, True, (0, "handed_off")),
                 (local, True, (0, "handed_off")),
-                # The gate takes its own memory reservation when it starts.
-                (first_step.GatePlacement(local, request), True, (0, "handed_off")),
                 (granted, False, (1, "result")))
             for grant, handoff, expected in grants:
                 with (self.subTest(grant=type(grant).__name__, expected=expected),
@@ -219,6 +217,11 @@ class HandoffClientTests(unittest.TestCase):
                         admitted.close()
                     status, ending = expected
                     released.assert_called_once_with(granted.reservation, status, granted.cleanup_timing, ending)
+            with (mock.patch.dict(os.environ),
+                  mock.patch.object(client, "release", return_value=wire.Ok()) as released):
+                # A gate keeps the grant through the handoff; gate.py ends it after its assignment check.
+                first_step.FirstStepAdmission(position, first_step.GatePlacement(local, request), path).handoff(fixture.root)
+                released.assert_not_called()
 
     def test_a_release_carries_its_ending_and_an_older_release_reads_as_a_result(self) -> None:
         handed_off = wire.ReleaseRequest("handoff", "stem", 0, "handed_off")

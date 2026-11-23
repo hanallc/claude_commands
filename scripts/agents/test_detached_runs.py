@@ -40,12 +40,14 @@ from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import roster, send, send_later, sessions
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
@@ -186,8 +188,8 @@ class DetachedRunsTests(unittest.TestCase):
         evidence = detached_runs.live_run_evidence_for_staff(path.parent, frozenset({self.worker_id}))
         self.assertEqual(evidence.runs, (record,))
         self.assertEqual(len(evidence.read_errors), 1)
+        start_new_command(self)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            unit_runs.report_anomaly.cache_clear()
             evidence.report_errors()
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(damaged), errors.getvalue())
@@ -2485,7 +2487,8 @@ sys.exit(status)
             record = self.supervise(path)
         self.assertEqual(record.get("exit_code"), 0, Path(record["log"]).read_text())
         self.assertEqual(json.loads(Path(record["log"]).read_text()),
-                         [str(selected / "scripts/value.py"), str(startup), "loaded"])
+                         [str(selected / "scripts/value.py"),
+                          startup_pythonpath(str(startup)), "loaded"])
 
     def test_repeat_budget_hook_selects_the_test_copy_without_exporting_it(self) -> None:
         result = subprocess.run(

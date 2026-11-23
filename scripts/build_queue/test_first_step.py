@@ -20,6 +20,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 GATE_COMMAND = ("python3", "scripts/production/gate.py", "--tests-only", "--type-dirs", "scripts")
@@ -36,7 +37,7 @@ def forbid_admission_calls() -> AbstractContextManager[object]:
 
 
 class FirstStepTests(unittest.TestCase):
-    def test_local_gate_releases_preparation_and_keeps_its_assignment(self) -> None:
+    def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
         position = SlotQueuePosition("episode", 3)
         assignment = placement.PlacementAssignment(position.episode, "attempt",
             placement.PlacementDestination("local", "natedev", "fixture-host", claim_state.WHOLE_MAC),
@@ -54,7 +55,8 @@ class FirstStepTests(unittest.TestCase):
               mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
               mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
             admitted.handoff(Path("/fixture"))
-            release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing, "handed_off")
+            # The gate ends the reservation after it confirms the assignment.
+            release.assert_not_called()
             cancel.assert_not_called()
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], assignment.episode)
@@ -70,7 +72,7 @@ class FirstStepTests(unittest.TestCase):
                 "kind.mac-linux=ssh", "platform.mac-linux=linux", "settings.mac-linux=guest.conf",
                 "kind.natedev=local", "platform.natedev=linux",
                 "kind.mac=ssh", "platform.mac=macos", "settings.mac=mac.conf", "",
-            )))
+            )) + UNREACHABLE_WAIT_FIXTURE)
             remote = placement.PlacementCandidate(
                 placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", claim_state.WHOLE_MAC, 1))
             local = local_candidate(fixture)

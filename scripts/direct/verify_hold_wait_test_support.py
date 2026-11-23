@@ -6,7 +6,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.lib.checkout_test_support import fixture_shim_source
 
-from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
@@ -37,9 +37,10 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.local_release_wait import episode_is_assigned
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
+from scripts.lib.release_waiter import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.fixture_test_support import clean_up_fixture, register_fixture_class_cleanup, set_up_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -464,7 +465,7 @@ exit "$status"
         settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
         _ = (self.fixture.root / "build_targets.conf").write_text(
             f"targets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
-            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n")
+            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n" + UNREACHABLE_WAIT_FIXTURE)
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:

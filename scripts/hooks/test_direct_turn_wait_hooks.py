@@ -26,6 +26,7 @@ from scripts.hooks.conversation_pause_test_support import ConversationPauseFixtu
 from scripts.message import send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file, recorded_unit
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 HOOKS = Path(__file__).resolve().parent
@@ -162,7 +163,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
             "CONVERSATION_PAUSE_NOTIFIER": false_command, "AUTO_SILENCE_COMMAND": true_command,
             "CONVERSATION_PAUSE_HOOK_BUDGET": "25",
             "SHOWRUNNERS_SESSIONS": str(session_lookup), "NOTIFIER_SESSIONS_DIR": str(sessions),
-            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": "/nonexistent/herdr",
+            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": MISSING_HERDR_BIN,
         }
         yield DirectorWaitFixture(root, run, history, environment, execution)
 

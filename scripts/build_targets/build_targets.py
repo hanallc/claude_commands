@@ -11,7 +11,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import importlib
 import io
 import json
 import os
@@ -393,6 +392,10 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
     return AnyTarget()
 
 
+# The command kind of a hand made run. The Mac takes it as a Mac run, and the guest line takes it as a gate step.
+HAND_MADE_KIND: CommandKind = "run"
+
+
 def mac_run_bypasses_repository_policy(target: LocalTarget | SshTarget, kind: str) -> bool:
     """A Mac run has no repository step policy."""
     return isinstance(target, SshTarget) and target.platform == "macos" and kind in MAC_RUN_KINDS
@@ -445,7 +448,7 @@ def fixed_remote_candidates(
     from scripts.mac_test import eligibility
 
     if target.name == eligibility.MAC_LINUX_TARGET:
-        return (fixed_mac_linux_candidate(target, settings, repo_root, command, rule),)
+        return (fixed_mac_linux_candidate(target, settings, repo_root, kind, command, rule),)
 
     provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
     policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
@@ -491,7 +494,7 @@ def fixed_remote_candidates(
                 repository = eligibility.UNKNOWN_REPOSITORY
         else:
             scope = claim_state.target_claim_scope(paths, str(repo_root))
-        host = eligibility.SshProbeSettings(configuration).host
+        host = configuration.text("host")
         if isinstance(rule, NatedevOnly):
             policy = placement.FixedExclusion(rule.reason)
         elif (selection == ROUTED and target_config.uses_legacy_mac_layout(target.platform)
@@ -516,10 +519,10 @@ def fixed_remote_candidates(
         slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
 
 
-def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path,
+def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path, kind: CommandKind,
                                command: tuple[str, ...], rule: AnyTarget | NatedevOnly
                                ) -> placement.PlacementCandidate:
-    """Name the single guest slot for a supported gate."""
+    """Name the single guest slot for a supported gate or a hand made run (kind HAND_MADE_KIND)."""
     from scripts.build_queue import placement
     from scripts.build_queue.admission_jobs import StepJob
     from scripts.build_targets import mac_linux
@@ -531,7 +534,8 @@ def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, rep
     job = gate_job_for_command(command)
     if isinstance(rule, NatedevOnly):
         policy = placement.FixedExclusion(rule.reason)
-    elif not isinstance(job, StepJob) or job.step not in ("test-affected", "test-all", "test-modules", "test-nightly", "integrate"):
+    elif kind != HAND_MADE_KIND and (not isinstance(job, StepJob) or job.step not in (
+            "test-affected", "test-all", "test-modules", "test-nightly", "integrate")):
         policy = placement.FixedExclusion("command")
     else:
         try:
@@ -626,7 +630,7 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     from scripts.mac_test import eligibility
 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
-              else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
+              else eligibility.read_target_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_target_settings())
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
@@ -757,10 +761,11 @@ def command_probe_backoff(name: str, *, probe: bool) -> int:
     # A target without an offload probe keeps its backoff until its own route clears it.
     if isinstance(config, ExcludedTarget):
         return 1
+    probe_started_ns = time.time_ns()
     if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
         return 1
-    offload.record_reachable(name)
-    return 0
+    offload.record_reachable(name, probe_started_ns=probe_started_ns)
+    return int(isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff))
 
 
 @dataclass(frozen=True)
@@ -777,6 +782,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+                           recover_mac_backoff: bool = False,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -785,24 +791,26 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = (eligibility.SshProbeSettings(configuration) if isinstance(configuration, conf.ConfigRead)
-                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
-        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF,
-                                 configuration=configuration)
+        backoff = eligibility.NO_BACKOFF if recover_mac_backoff else eligibility.READ_BACKOFF
+        repository = step_policy(target, repo_root, package, kind, backoff=backoff, configuration=configuration)
         if isinstance(repository, ExcludedTarget):
             return repository
+        # An excluded step reads no probe settings.
+        config = (eligibility.probe_settings(configuration) if isinstance(configuration, conf.ConfigRead)
+                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         if isinstance(answer, CapacityNotRead):
             settings = config.source if isinstance(config, eligibility.OffloadConfig) else config.configuration.source
             answer = mac_test.free_now(mac_test.state_paths(name), settings, repo_root, session=session,
-                                      configuration=configuration, mac_scope=mac_scope)
+                                      configuration=configuration, mac_scope=mac_scope,
+                                      recover_mac_backoff=recover_mac_backoff)
     except (OSError, UnicodeError, ValueError) as error:
         if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
             raise
         return ExcludedTarget(target, f"state unreadable: {error}")
     if answer in ("blocked", "backoff"):
         return ExcludedTarget(target, answer)
-    if answer == "bad":
+    if answer == "bad" and not recover_mac_backoff:
         return EligibleTarget(target)
     # Only an eligible step pays for the offload runner's import.
     from scripts.mac_test import offload
@@ -812,11 +820,12 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         probe = offload.probe_mac(controller, config, repository, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
             return ExcludedTarget(target, "busy")
+        if isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+            return ExcludedTarget(target, "backoff")
         if isinstance(probe, offload.UnavailableProbe):
-            with claim_state.locked(eligibility.state_directory(name) / "probe-result.lock"):
-                delay = (config.unreachable_backoff_s if isinstance(config, eligibility.OffloadConfig)
-                         else config.configuration.number("unreachable_backoff_s"))
-                offload.write_backoff(time.time() + delay, name)
+            delay = (config.unreachable_backoff_s if isinstance(config, eligibility.OffloadConfig)
+                     else config.configuration.number("unreachable_backoff_s"))
+            offload.write_backoff(time.time() + delay, name, wait=not recover_mac_backoff)
             return ExcludedTarget(target, "unreachable")
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
@@ -840,8 +849,9 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+                           recover_mac_backoff: bool = False,
                            ) -> EligibleTarget | ExcludedTarget:
-    """Read Linux policy and capacity without evaluating a development shell."""
+    """Read SSH target policy and capacity without evaluating a Linux development shell."""
 
     from scripts.mac_test import eligibility, mac_test
 
@@ -887,12 +897,14 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
         answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
-                                 configuration=configuration, mac_scope=mac_scope)
-        if new_step and not isinstance(selection, Pinned) and answer == "bad":
+                                 configuration=configuration, mac_scope=mac_scope,
+                                 recover_mac_backoff=recover_mac_backoff)
+        if new_step and not recover_mac_backoff and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
             return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
-                                          configuration=configuration, session=session, mac_scope=mac_scope)
+                                          configuration=configuration, session=session, mac_scope=mac_scope,
+                                          recover_mac_backoff=recover_mac_backoff)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
     config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
@@ -913,7 +925,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     from scripts.mac_test import offload
 
-    probe_settings = eligibility.SshProbeSettings(config) if isinstance(config, conf.ConfigRead) else config
+    probe_settings = eligibility.probe_settings(config) if isinstance(config, conf.ConfigRead) else config
     if isinstance(offload.probe_reachability(offload.ProcessController(), probe_settings), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)
@@ -1587,11 +1599,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
 
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
+    from scripts.lib.release_waiter import local_release_waiter
 
-    # This CLI's import root excludes the worker module.
-    # Use importlib at the typed provider boundary.
-    release_waiter = cast(Callable[[Path, Path], LocalHoldWait], getattr(
-        importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
     _ = pid
     if not leave_hook and not caller:
         leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
@@ -1619,7 +1628,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
-        release_events = notifications.enter_context(release_waiter(
+        release_events = notifications.enter_context(local_release_waiter(
             build_hold.holder_directory(), build_hold.release_directory()))
         context = LOCAL_HOLD_WAIT.set(release_events)
         _ = notifications.callback(LOCAL_HOLD_WAIT.reset, context)

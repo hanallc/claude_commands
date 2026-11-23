@@ -13,9 +13,13 @@ from typing import Literal, TypedDict, cast
 from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.production import staff
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.review_links import (
+    accounts_page, change_page, console_theme, for_you, new_item_dialog, page_frame, review_link, review_legacy,
+    review_submissions,
+)
 from scripts.for_you.action import review_place
 
 PHONE_QUERY = "(max-width:680px)"
@@ -32,7 +36,7 @@ REVIEW_PLACE_SCRIPT = review_legacy.SCRIPT + r"""function legacyReviewPlace(para
 }
 """
 ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "server", "hard-drive", "image", "message-circle-question", "panel-left-close",
-                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
+                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search", "torus"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.
 SEEN_NAME = ".review-link-seen.json"
@@ -256,6 +260,39 @@ def for_you_payload() -> ForYouPayload:
     return {**count, "entries": entries}
 
 
+def _unavailable_owner_controls(pages: tuple[str, ...]) -> str:
+    """Use the configured owners in the console's unavailable view."""
+    if not pages:
+        return ""
+    try:
+        members = staff.local_snapshot()
+        settings = conf.read_or_repository("console")
+    except (OSError, ValueError):
+        return ""
+    controls: list[str] = []
+    show_dialog = False
+    for page in pages:
+        if page not in page_frame.OWNER_PAGES:
+            continue
+        owners = review_submissions.page_owners(page, settings, members)
+        if isinstance(owners.route, review_submissions.PageOwnerRoute):
+            recipient = owners.route.row.name
+        elif review_submissions.has_recipient_choice(members):
+            recipient = page_frame.OwnerNewItem.CHOOSE_RECIPIENT
+        elif isinstance(owners.shown, staff.StaffRow):
+            recipient = page_frame.OwnerNewItem.UNAVAILABLE
+        else:
+            continue
+        shown = owners.shown if isinstance(owners.shown, staff.StaffRow) else page_frame.NoShownOwner()
+        control = page_frame.owner_control(page, shown, members, recipient=recipient)
+        controls.append(f'<div data-unavailable-owner="{page}" hidden>{control}</div>')
+        show_dialog |= recipient is not page_frame.OwnerNewItem.UNAVAILABLE
+    if not controls:
+        return ""
+    dialog = new_item_dialog.render() if show_dialog else ""
+    return '<div class="unavailable-owners">' + "".join(controls) + "</div>" + dialog
+
+
 def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | UnavailablePage) -> bytes:
     """Render navigation, the action notifier, and the page frames."""
     entries: list[str] = []
@@ -304,6 +341,13 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
     content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
+    unavailable = tuple(page.identity for page in pages if isinstance(page.destination, UnavailablePage))
+    if isinstance(rebuilds, UnavailablePage):
+        unavailable += ("rebuilds",)
+    controls = _unavailable_owner_controls(unavailable)
+    content = content.replace("<!-- UNAVAILABLE OWNERS -->", controls)
+    if controls:
+        content = content.replace("</head>", page_frame.OWNER_STYLE + page_frame.PAGE_SCRIPT_ERRORS + "</head>", 1)
     return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
@@ -482,7 +526,8 @@ DOCUMENT = """<!doctype html>
 /* Quota tokens. */
 :root{color-scheme:light dark;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 --nav:#f8f9fc;--page:#fff;--text:#192339;--muted:#525c6e;--border:#e1e5ed;--active:#e8edfd;--accent:#2849a3;--hover:#edf0f6;
---notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3}
+--notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3;
+--bg:var(--page);--card:var(--nav);--line:var(--border);--ink:var(--text);--ink-2:var(--muted);--ink-3:var(--muted)}
 @media(prefers-color-scheme:dark){:root{--nav:#141b28;--page:#10151e;--text:#e4eaf4;--muted:#a4afc2;
 --border:#2d3748;--active:#253758;--accent:#c2d4ff;--hover:#202b3c;--notice:#3a2b12;--notice-text:#ffd28f;--notice-hover:#4a3718}}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--text);overflow:hidden}
@@ -521,6 +566,10 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .frame-area{flex:1;min-height:0;position:relative}
 .frame-area iframe{position:absolute;inset:0;display:block;border:0;width:100%;height:100%;background:var(--page)}
 .frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}
+#page-unavailable{height:100%}
+#page-unavailable #review-new-item .new-item-page-capture{display:none}
+.unavailable-owners{position:absolute;inset:16px 24px auto;display:flex;justify-content:flex-end}
+.unavailable-owners>[data-unavailable-owner]{min-width:0}
 .empty{height:100%;display:grid;place-content:center;text-align:center;padding:24px;color:var(--muted)}
 .empty h3{font-size:20px;color:var(--text);margin:0 0 8px}.empty p{max-width:30ch;margin:0}
 .rebuild-slot{position:fixed;left:0;bottom:0;width:244px;padding:12px;z-index:4}.collapsed .rebuild-slot{width:72px}
@@ -561,7 +610,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <button class="dismiss" id="nav-dismiss" type="button" aria-label="Collapse navigation" tabindex="-1"></button>
 <main class="workspace">
 <div class="frame-area">
-<section class="empty" id="page-unavailable" hidden><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></section></div></main>
+<section id="page-unavailable" hidden>
+<div class="empty"><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></div>
+<!-- UNAVAILABLE OWNERS --></section></div></main>
 </div>
 <section id="action-popover" aria-label="For you actions" hidden>
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
@@ -585,6 +636,10 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   // The rebuild link opens its page as a navigation entry does, so it is one of the pages.
   const pages = [...entries, rebuildLink];
   const frameArea = document.querySelector('.frame-area');
+  const unavailable = document.getElementById('page-unavailable');
+  const unavailableOwners = unavailable.querySelectorAll('[data-unavailable-owner]');
+  const unavailableScreenshot = unavailable.querySelector('input[name="include_page"]');
+  if (unavailableScreenshot) unavailableScreenshot.defaultChecked = false;
   // Each opened page keeps a live frame, so a page keeps its filter, card, scroll and typed text.
   const frames = new Map();
   const frameNavigation = new WeakMap();
@@ -766,7 +821,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     actions.syncLinks();
     const path = selected.dataset.url;
     frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });
-    document.getElementById('page-unavailable').hidden = Boolean(path);
+    unavailable.hidden = Boolean(path);
+    unavailableOwners.forEach(owner => { owner.hidden = owner.dataset.unavailableOwner !== selected.dataset.page; });
     if (path) {
       const opened = frames.has(selected.dataset.page);
       const frame = frameFor(selected);

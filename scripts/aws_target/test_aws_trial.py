@@ -35,12 +35,13 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import config_environment
 from scripts.production import gate
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
@@ -331,7 +332,7 @@ class GuestTests(unittest.TestCase):
                 call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
                 self.assertEqual(call['args'], [str(suite), path.name])
                 environment = ledger.mapping(call['env'])
-                self.assertEqual(environment['HERDR_BIN'], '/nonexistent/herdr')
+                self.assertEqual(environment['HERDR_BIN'], MISSING_HERDR_BIN)
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)
@@ -375,10 +376,8 @@ class PairedTrialTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
-        for name in tuple(os.environ):
-            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
-                del os.environ[name]
-        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
+        # clear=True drops the caller's GIT_* variables, such as GIT_DIR or GIT_INDEX_FILE.
+        self.enterContext(mock.patch.dict(os.environ, fixture_git_environment(self.root), clear=True))
         shipped = Path(__file__).resolve().parents[2]
         self.repo = self.root / 'repo'
         self.repo.mkdir()
@@ -422,6 +421,20 @@ class Sample(unittest.TestCase):
         text_setting(gate_settings, 'credential_file', str(self.root / 'credentials'))
         text_setting(gate_settings, 'regions', 'us-east-2 us-west-2')
         text_setting(gate_settings, 'trial_branch_prefix', 'gate-trial')
+
+    def test_a_caller_git_variable_does_not_reach_the_fixture_commands(self) -> None:
+        folder = self.root / 'caller'
+        folder.mkdir()
+        caller = {'GIT_INDEX_FILE': str(folder / 'index'), 'GIT_DIR': str(folder / 'repository.git')}
+        probe = PairedTrialTests('test_expired_sweep_preserves_a_racing_coordinator_termination')
+        with mock.patch.dict(os.environ, caller):
+            try:
+                probe.setUp()
+                self.assertFalse(set(caller) & set(os.environ))
+                _ = trial.checked_git(probe.repo, 'add', 'change')
+            finally:
+                probe.doCleanups()
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000
