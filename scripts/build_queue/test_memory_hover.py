@@ -98,14 +98,14 @@ class MemoryHoverTests(unittest.TestCase):
         fixture.setUp()
         page = fixture.caller_selection_page()
         expected = (
-            (700001, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (50, "hana CI: nextest", "hana CI", "hana CI"),
-            (301, "held caller", "held caller", "held caller"),
-            (302, "unregistered session", "unregistered session", "unregistered session"),
+            (700001, "recorded cloud", "", "recorded cloud"),
+            (50, "hana CI: nextest", "", "hana CI"),
+            (301, "held caller", "", "held caller"),
+            (302, "unregistered session", "", "unregistered session"),
             (304, "hana: nextest", "unregistered session", "hana: nextest"),
-            (200, "recorded local", "recorded local", "recorded local"),
-            (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (303, "recorded slot", "recorded slot", "recorded slot"),
+            (200, "recorded local", "", "recorded local"),
+            (700002, "recorded cloud", "", "recorded cloud"),
+            (303, "recorded slot", "", "recorded slot"),
         )
         self.assertEqual(page["reserved"], 11.0)
         self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
@@ -128,6 +128,18 @@ class MemoryHoverTests(unittest.TestCase):
                 assert owner is not None
                 self.assertEqual("".join(owner.itertext()), caller)
                 self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+
+    def test_the_second_line_shows_no_owner_that_the_row_name_shows(self) -> None:
+        walk = [{"name": "aws-unit: test affected", "caller": "aws-unit", "queued": True},
+                {"name": "hana CI: nextest", "ci_label": "hana CI · hana-mac-1"},
+                {"kind": "mac-build", "name": "hana: nextest", "showrunner": "hana"},
+                {"kind": "cloud", "name": "held caller", "caller": "held caller"},
+                {"kind": "cloud", "name": "research: nextest", "showrunner": "hana"}]
+        waiters = [{"name": "devtools: cargo check", "caller": "fixture"}]
+        lines = self.page_expression(
+            "[...data.walk.map(row => rowOwner(row)), ...data.waiters.map(row => rowOwner(row, true))]",
+            {"walk": walk, "waiters": waiters})
+        self.assertEqual(lines, ["", "", "", "", "hana", "fixture"])
 
     def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))

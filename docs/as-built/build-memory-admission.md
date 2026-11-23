@@ -394,6 +394,7 @@ After a restart, the service restores live run places and removes ended run plac
 Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `nateroids: nextest`.
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
+On the Builds page, `rowOwner` in `memory_live.html` makes the small line under each row name. The line is empty when the row name is the owner or starts with `<owner>: `. It shows only a different fact, such as another session.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
 1. The recorded unit, then the staff unit.
