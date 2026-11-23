@@ -214,7 +214,7 @@ Group A (branch `style-s3`, checkpoints done 2026-11-20; on main 2026-11-22, mer
 4. `s3-relocation`: `same_declaration`, the declaration in place, a gained same-name destination, or the exact blocker.
 5. `s3-outside`: `outside_rename`, the source-based outside rename proof or its candidates and reasons.
 
-Group B (branches `style-s3-rename`, `style-s3-applied` and `style-s3-footprint`, checkpoints done 2026-11-20; the group merge renumbers the reply schema steps):
+Group B (branches `style-s3-rename`, `style-s3-applied` and `style-s3-footprint`, checkpoints done 2026-11-20; group merge checkpoint 8637efe on `style-s3-group-b`, 2026-11-23, waits for the merge line):
 
 6. `s3-rename`: `rename_admission`, the anchored rename permission or its refusal.
 7. `s3-rename-applied`: `rename_applied`, the ticket-aware applied check. It builds on `s3-rename`.
