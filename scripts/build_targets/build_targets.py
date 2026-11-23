@@ -626,7 +626,7 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     from scripts.mac_test import eligibility
 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
-              else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
+              else eligibility.read_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_settings())
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,

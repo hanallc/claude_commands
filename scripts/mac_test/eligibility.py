@@ -254,9 +254,13 @@ def state_directory(target: str = "mac") -> Path:
     return ssh_target_state_directory(target)
 
 
+def read_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> conf.ConfigRead:
+    """Read only the target settings file. A policy check uses this read; it needs no registry and no wait."""
+    return conf.read(config_path() if isinstance(path, DefaultMacSettings) else path.expanduser())
+
+
 def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    return connection_settings(conf.read(settings))
+    return connection_settings(read_settings(path))
 
 
 def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
