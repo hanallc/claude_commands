@@ -25,11 +25,12 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
                                  placement, queue_lines, queue_place, step_estimator)
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
+from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
-from scripts.production import hand_made, hand_made_limit
+from scripts.production import hand_made
 from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -432,7 +433,7 @@ class HandMadeTests(AttemptCase):
             status, errors = self.attempt(("helper",))
         # bwrap starts the program by its path, so the failed start ends the attempt with no run.
         self.assertEqual(status, hand_made.REFUSED_EXIT)
-        self.assertIn(hand_made_limit.BWRAP_FAILED.format(status=1), errors)
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
         self.assertEqual(self.line.place.programs(), [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 

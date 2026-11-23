@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import timedelta
 import errno
 import fcntl
+import io
 import os
 from pathlib import Path
 import pwd
@@ -14,6 +15,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,6 +43,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 
@@ -130,8 +133,17 @@ sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment,
 
 BWRAP_FIXTURE = '''import os
 from pathlib import Path
+import subprocess
 import sys
 
+if sys.argv[1] == '--json-status-fd':
+    # The read limit of a hand made run: run the argv after the limit words, and write its exit status.
+    words = sys.argv[1:]
+    end = words.index('--')
+    assert {'--unshare-net', '--remount-ro', '--chdir'} <= set(words[:end]), words
+    status = subprocess.call(words[end + 1:])
+    os.write(int(words[1]), f'{{"exit-code": {status}}}\\n'.encode())
+    sys.exit(status)
 flags = ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
          '--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '/dev/shm', '--']
 assert sys.argv[1:1 + len(flags)] == flags, sys.argv[1:]
@@ -146,6 +158,7 @@ SANDBOX_SUITE = '''import fcntl
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 
 tmp_device, tmp_inode, shm_device, pid_namespace, lock = map(int, sys.argv[1:])
@@ -171,6 +184,7 @@ GATE_FIXTURE = '''import fcntl
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 from time import sleep
 
@@ -272,6 +286,7 @@ from pathlib import Path
 import runpy
 import signal
 import socket
+import socket
 import sys
 
 from scripts.aws_target import gate_box, ledger
@@ -337,6 +352,122 @@ class MacLinuxSandboxTests(unittest.TestCase):
         unlocked = subprocess.run(['flock', '--exclusive', '--timeout', '1', str(run_lock), 'true'],
                                   timeout=2, check=False)
         self.assertEqual(unlocked.returncode, 0, 'The guest run lock is still held after the deadline.')
+
+
+# A hand made program under the guest read limit: it prints the source text of its copy, then yes or no for each
+# try. It also tries to write each outside path; the fixture is under /tmp, so such a write can land in the private
+# /tmp of the limit, and the test reads the real paths.
+LIMIT_PROGRAM = '''from pathlib import Path
+import socket
+import sys
+
+copy, sibling, key, port, *outside = sys.argv[1:]
+
+
+def connect():
+    with socket.create_connection(('127.0.0.1', int(port)), timeout=2):
+        pass
+
+
+tries = (lambda: Path(sibling, 'source.txt').read_text(), lambda: Path(key).read_text(),
+         lambda: Path(copy, 'written').write_text('copy'), lambda: Path(copy, 'target/built').write_text('output'),
+         lambda: Path('/tmp/written').write_text('tmp'), lambda: Path('/hand-made-written').write_text('root'),
+         connect)
+results = []
+for attempt in tries:
+    try:
+        attempt()
+    except OSError:
+        results.append('no')
+    else:
+        results.append('yes')
+for path in outside:
+    try:
+        Path(path).write_text('outside')
+    except OSError:
+        pass
+print(Path(copy, 'source.txt').read_text().strip(), *results, flush=True)
+'''
+
+
+@contextmanager
+def standard_output(path: Path) -> Generator[None]:
+    """Send file descriptor 1, which the guest run writes, to the file while the block runs."""
+    _ = sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        with path.open('wb') as output:
+            _ = os.dup2(output.fileno(), 1)
+        yield
+    finally:
+        _ = sys.stdout.flush()
+        _ = os.dup2(saved, 1)
+        os.close(saved)
+
+
+class GuestLimitTests(unittest.TestCase):
+    """A hand made argv runs under the read limit with the real bwrap, in a fixture home with two numbered copies."""
+    root: Path = Path()
+    home: Path = Path()
+    copy: Path = Path()
+    sibling: Path = Path()
+    tmp: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        if shutil.which('bwrap') is None:
+            self.fail('This Mac Linux sandbox test requires Bubblewrap (bwrap) on PATH.')
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.home = self.root / 'home'
+        self.copy, self.sibling = self.home / 'build/claude/unit/1', self.home / 'build/claude/unit/2'
+        # The runner makes the run tool folder in the copy target folder.
+        self.tmp = self.copy / 'target/runtime/tmp'
+        for folder in (self.home / '.ssh', self.sibling, self.tmp):
+            folder.mkdir(parents=True)
+        _ = (self.home / '.ssh/id_fixture').write_text('key\n')
+        for folder in (self.copy, self.sibling):
+            _ = (folder / 'source.txt').write_text(f'copy {folder.name}\n')
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {'HOME': str(self.home)})))
+
+    def run_limited(self, argv: list[str], tmp: Path | None = None) -> tuple[int, str, str]:
+        """Run the argv as the runner does: the status, the stream standard output and the runner stderr."""
+        runtime = self.copy / 'target/runtime'
+        environment = {**os.environ, 'HOME': str(runtime / 'home'), 'TMPDIR': str(self.tmp),
+                       'CARGO_HOME': str(runtime / 'home/.cargo'), 'RUSTUP_HOME': str(runtime / 'home/.rustup'),
+                       'CARGO_TARGET_DIR': str(self.copy / 'target')}
+        output, errors = self.root / 'output', io.StringIO()
+        with standard_output(output), redirect_stderr(errors):
+            status = mac_linux.run_limited(tmp or self.tmp, argv, self.copy, environment, 'fixture')
+        return status, output.read_text(), errors.getvalue()
+
+    def test_a_hand_made_argv_reads_and_writes_only_its_copy_and_has_no_network(self) -> None:
+        outside = (self.root / 'outside', self.home / '.ssh/written', self.sibling / 'written')
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen()
+            port = cast(tuple[str, int], server.getsockname())[1]
+            status, output, errors = self.run_limited([
+                os.path.realpath(sys.executable), '-I', '-c', LIMIT_PROGRAM, str(self.copy), str(self.sibling),
+                str(self.home / '.ssh/id_fixture'), str(port), *map(str, outside)])
+        self.assertEqual(status, 0, output + errors)
+        # The sibling copy and the key do not exist for the program. It writes its copy, its output folder and its
+        # own /tmp, and not the root of the limit; and it reaches no port outside.
+        self.assertEqual(output, f'{mac_linux.run_start_line("fixture")}\ncopy 1 no no yes yes yes no no\n')
+        self.assertEqual([(self.copy / 'written').exists(), (self.copy / 'target/built').exists(),
+                          (self.tmp / 'written').exists()], [True, True, True])
+        self.assertEqual([path for path in outside if path.exists()], [])
+
+    def test_a_limit_that_bwrap_cannot_set_up_starts_nothing_and_refuses_the_run(self) -> None:
+        mark = self.copy / 'ran'
+        status, output, errors = self.run_limited(['touch', str(mark)], tmp=self.root / 'missing-tmp')
+        self.assertEqual((status, output), (1, f'{mac_linux.run_refused_line("fixture")}\n'))
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
+        self.assertFalse(mark.exists())
+        with patch.dict(os.environ, {'PATH': str(self.root)}):
+            status, output, errors = self.run_limited(['touch', str(mark)])
+        self.assertEqual((status, output, errors),
+                         (1, f'{mac_linux.run_refused_line("fixture")}\n', mac_linux.BWRAP_MISSING + '\n'))
+        self.assertFalse(mark.exists())
 
 
 class GuestCommandParityTests(unittest.TestCase):

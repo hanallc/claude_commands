@@ -40,8 +40,8 @@ On each machine:
 On natedev (Read limit):
 
 - `bwrap` starts the program with a read limit. A path that the limit does not bind does not exist for the program, so no command word can make a tool read it. The root of the limit is read only, so a write to a path that is not bound fails.
-- The program reads: `/nix/store`, `/run/current-system`, `/etc`, `/bin`, `/usr`, the rustup folder (`RUSTUP_HOME`, else `~/.rustup`), `CARGO_HOME/bin` and `CARGO_HOME/config.toml` (`CARGO_HOME` is else `~/.cargo`), and each `PATH` folder that is not in a system folder and holds no home folder, temp folder or checkout. When the first `cargo` on `PATH` is the build-hold cargo wrapper, the program also reads the wrapper folder and its `lib` folder. Each file that the check read, and the file that the run starts, stays readable at its real path; its folder stays hidden.
-- Each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden: an empty folder replaces a folder, and `/dev/null` replaces a file.
+- The program reads: `/nix/store`, `/run/current-system`, `/etc`, `/bin`, `/usr` and `/sbin` (each one that exists), the rustup folder (`RUSTUP_HOME`, else `~/.rustup`), `CARGO_HOME/bin` and `CARGO_HOME/config.toml` (`CARGO_HOME` is else `~/.cargo`), and each `PATH` folder that is not in a system folder and holds no home folder, temp folder or checkout. When the first `cargo` on `PATH` is the build-hold cargo wrapper, the program also reads the wrapper folder and its `lib` folder. Each file that the check read, and the file that the run starts, stays readable at its real path; its folder stays hidden.
+- Each entry under `/etc`, `/bin`, `/usr` and `/sbin` that root does not own is hidden: an empty folder replaces a folder, and `/dev/null` replaces a file.
 - The limit does not bind a path that holds the home folder, and it does not bind a path that has a symbolic link in it. The one exception is a read only path whose link goes into `/nix/store`, such as `~/.cargo/config.toml`.
 - The program reads and writes: the checkout, `CARGO_HOME/registry`, `CARGO_HOME/git`, the cargo lock files `.package-cache`, `.package-cache-mutate` and `.global-cache` in `CARGO_HOME`, `SCCACHE_DIR` (else `~/.cache/sccache`), and the cargo build output folder.
 - The run has one cargo build output folder: `CARGO_TARGET_DIR` when it is set, else the checkout `target`. natedev cannot take a cargo word that names another output folder, such as `--target-dir x` or a `build.target-dir` value in a `--config` word. Only the words of a `cargo` command before its first `--` are checked, so `rg target-dir src` passes. The refusal says: "the run builds in <place>; leave out --target-dir, or give that folder".
@@ -99,14 +99,20 @@ On the Mac Linux guest:
   - a checked file has a symbolic link or `..` in its path in the checkout. Give the real path.
 - The run holds the Mac repository claim, as a gate run on the guest does.
 - natedev makes one commit of the checkout, with the dirty files. Each checked program file must be in that commit with the checked text.
-- The guest runs the command words as given, in its numbered copy of that commit, in its sandbox. It finds the first word in the copy or on its own PATH.
+- The guest runs the command words as given, in its numbered copy of that commit, under its read limit (below). It finds the first word in the copy or on its own PATH.
 - Before it starts the program, the guest checks each command word, so that it runs only a file that natedev read or a tool. A word that fails stops the run before the start, and the cause names the word and the reason:
   - a later word must name no folder with a `__main__` file, such as `__main__.py` or `__main__.pyc`, because python runs that file. An example is `python3 target`;
   - a word with a file that natedev read runs that checked file;
   - another word with a slash must have no `..` and no symbolic link in its path, and must name no guest file. A relative path starts at the copy. An example is a file that an earlier run left in `target/`;
   - another later word with no slash must name no guest file in the copy. A plain folder passes, so `cargo test` runs with a `test` folder;
   - for a word with no slash, each match on the guest PATH must be in a system folder, or be a compiled file outside the copy. For a later word, a readable match with no execute bit counts too, because bash finds a script name on PATH by read access.
-- The guest gives the program its own variables. The natedev variable list below does not apply.
+- The guest starts the program with `bwrap` under the read limit of natedev. The rules are in one place, `scripts/build_targets/mac_linux.py`, and natedev adds its own paths (`scripts/production/hand_made_limit.py`). A path that the limit does not bind does not exist for the program, and the root of the limit is read only.
+- The program reads the system folders, as on natedev, and each guest `PATH` folder that is not in a system folder and holds no temp folder or numbered copy. Each entry of a system folder that root does not own is hidden, as on natedev.
+- The program reads and writes: its numbered copy, the guest `SCCACHE_DIR` when it is set, and the run temp folder, which it sees as `/tmp`. The copy holds the run home that the guest gives the program, with `CARGO_HOME`, `RUSTUP_HOME` and the cache folder, and the cargo build output folder `target`.
+- The rest of the guest home is hidden: the other numbered copies, `~/.ssh` and the guest main checkout `~/.claude`. `/run/user` and the `/tmp` of other processes are hidden too.
+- The program has no network and no display, and `CARGO_NET_OFFLINE` is `true`. A cargo failure from offline mode ends the attempt with the natedev refusal: "a hand made run has no network, so cargo cannot fetch a dependency; a normal run of this line must fetch the dependency first".
+- `/bin/sh` in the limit prints the start line, then runs the command words. So when `bwrap` is not on the guest PATH, or it cannot set up the limit, the program does not start: the guest prints the cause and the refused line, and the attempt ends with a refusal that names `bwrap`. A first word that the shell cannot start after the start line gives the shell status, 126 or 127.
+- The guest gives the program its own variables. The natedev variable list below does not apply. The read limit sets `TMPDIR` to `/tmp` and adds `SCCACHE_SERVER_UDS` and `CARGO_NET_OFFLINE`, as on natedev.
 - The guest fails before the start, and the run goes back, after a retry backoff that starts after the placement, a refused Mac repository claim, an SSH failure before natedev sends the command, a checked file that is not in the commit with the checked text (a file that changed after the check, or a file that git ignores), or a busy guest run lock.
 - A word that the guest refuses ends the attempt with no run, as on the Mac. The refusal names `mac-linux refused the run` and the word.
 - After natedev sends the command, only a busy guest run lock or a refused word proves that the guest started nothing. Each other stop before the start line, such as a lost SSH link or a bundle that the guest cannot use, makes the start unknown. Then the attempt ends with no run, and the run does not go to another machine, because the program can run there too. The refusal names `mac-linux start unknown`.
@@ -124,7 +130,7 @@ The exit status is the status of the command, or 2 for an attempt that ended wit
 
 After a no, change the command or the script, then start a new attempt. A check with no answer (timeout, model exit, bad JSON, schema failure, a program file that cannot be read, or program files over the size limit together) also ends the attempt with no run.
 
-Known gap: the check reads command words, not the value rules of each tool, so it cannot close these forms. On natedev, the read limit closes them: the program cannot read a path outside the limit. The Mac and the guest keep these forms until each has its own read limit.
+Known gap: the check reads command words, not the value rules of each tool, so it cannot close these forms. On natedev and on the guest, the read limit closes them: the program cannot read a path outside the limit. The Mac keeps these forms until it has its own read limit.
 
 1. A prefix option to an existing file in an outside folder, such as `cc -B/home/u/out/p-`: the tool runs other entries of that folder.
 2. A value that the tool resolves against an earlier value, such as `make -C src -C build`.

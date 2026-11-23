@@ -43,7 +43,8 @@ from scripts.build_hold.owning_session import owning_session
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
 from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
 from scripts.build_targets import build_targets
-from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, entry_kind, main_folder
+from scripts.build_targets.mac_linux import (BWRAP_FAILED, BWRAP_MISSING, COMPILED_START, TOOL_FOLDERS, entry_kind,
+                                             main_folder, setup_failed)
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
@@ -632,7 +633,7 @@ class NatedevRun:
         """
         bwrap = shutil.which("bwrap")
         if bwrap is None:
-            raise Refused(hand_made_limit.BWRAP_MISSING)
+            raise Refused(BWRAP_MISSING)
         environment = program_environment()
         refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
         if refusal:
@@ -650,9 +651,9 @@ class NatedevRun:
             tail = hand_made_limit.OutputTail(output)
             with process:
                 status = stream(process, tail)
-            if hand_made_limit.setup_failed(status, status_read):
+            if setup_failed(status, status_read):
                 self.started_at = None
-                raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
+                raise Refused(BWRAP_FAILED.format(status=status))
             if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
                 raise Refused(hand_made_limit.NO_NETWORK)
             return status
