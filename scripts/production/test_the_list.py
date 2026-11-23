@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -18,9 +19,10 @@ from typing import Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
-from scripts.lib import atomic_file, conf
+from scripts.lib import atomic_file, conf, main_publish
 from scripts.message import send_result, session_send
 from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
@@ -274,6 +276,7 @@ class TheListTests(unittest.TestCase):
         _ = sender.write_text(r"""from pathlib import Path
 import json
 import sys
+import time
 
 args = sys.argv[1:]
 log = Path(__file__).with_name("sent.jsonl")
@@ -282,6 +285,8 @@ key = args[args.index("--key") + 1]
 to = args[args.index("--to") + 1]
 with attempted.open("a") as stream:
     stream.write(json.dumps(args) + "\n")
+if "Slow notice" in args[-1] and key.endswith(":owner_start"):
+    time.sleep(30)
 rows = log.read_text().splitlines() if log.exists() else []
 if any(key in json.loads(row) for row in rows):
     print("SKIPPED: key already accepted")
@@ -306,9 +311,12 @@ else:
             ("cap", "FREQ=DAILY", 2, 0, RUNNER),
             ("missed", "FREQ=DAILY;COUNT=4", 730, 2, RUNNER),
             ("Lose receipt", "", 730, 0, RUNNER),
+            ("owner changed", "", 730, 0, RUNNER),
         )
         config = self.list_config.read_text().replace("confirm_wait_minutes=15", "confirm_wait_minutes=2")
-        with patch.object(session_send, "SEND_SCRIPT", sender):
+        with (patch.object(session_send, "SEND_SCRIPT", sender),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(sys, "platform", "linux")):
             for case, rule, limit, missed_days, caller in cases:
                 with self.subTest(case=case):
                     _ = self.list_config.write_text(config.replace("series_run_limit=730", f"series_run_limit={limit}"))
@@ -320,15 +328,25 @@ else:
                                                    "schedule": schedule, "producer": BOB.id})
                     due = START + timedelta(days=missed_days)
                     tick = due + timedelta(minutes=1) if missed_days else due
-                    with patch.object(the_list, "now", return_value=START - timedelta(seconds=1)):
+                    if case == "confirmed":
+                        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+                        _ = path.write_text("".join(line for line in path.read_text().splitlines(keepends=True)
+                                                    if not line.startswith("scheduled_check:")))
+                    with (patch.object(the_list, "now", return_value=START - timedelta(seconds=1)),
+                          patch.object(the_list, "load", side_effect=AssertionError("the future record was loaded"))):
                         the_list.fire_scheduled()
                     self.assertEqual(sent.read_text(), "")
+                    extra_logs = missed_days + int(case == "Lose receipt")
                     with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
                         the_list.fire_scheduled()
                         working = the_list.load(MORTY.id, item.id)
                         self.assertIs(working.state, the_list.ItemState.WORKING)
-                        self.assertEqual(len(working.log), len(item.log) + 1)
-                        self.assertIn("Instruction sent", str(working.log[-1].what))
+                        self.assertEqual(len(working.log), len(item.log) + 1 + extra_logs)
+                        self.assertIn("Instruction sent", str(working.log[len(item.log) + missed_days].what))
+                        if missed_days:
+                            expected = [f"Scheduled run due {(START + timedelta(days=day)).isoformat()}. Missed."
+                                        for day in range(missed_days)]
+                            self.assertEqual([entry.what for entry in working.log[len(item.log):-1]], expected)
                         starts = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
                         self.assertEqual([args[args.index("--to") + 1] for args in starts],
                                          [f"staff:{RUNNER.id}", f"staff:{BOB.id}"])
@@ -337,13 +355,21 @@ else:
                             self.assertIn(f"Scheduled List item {item.number} starts now: {case}", message)
                             self.assertIn(scheduled.words, message)
                             self.assertIn(due.isoformat(), message)
-                        self.assertIsInstance(working.run_delivery, the_list.RunDelivery)
-                        assert isinstance(working.run_delivery, the_list.RunDelivery)
-                        run_key = working.run_delivery.key
+                        self.assertEqual(len(working.run_deliveries), 1)
+                        run_key = working.run_deliveries[0].key
                         if case == "Lose receipt":
                             the_list.fire_scheduled()
                             sends = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
-                            self.assertEqual(sends, [*starts, starts[1]])
+                            self.assertEqual(sends, starts)
+                            self.assertIn("Delivery uncertain for producer start", str(working.log[-1].what))
+                            self.assertEqual(the_list.load(MORTY.id, item.id).log, working.log)
+                        if case == "owner changed":
+                            _ = the_list.update(MORTY.id, item.id, {"owner": OTHER.id}, source="nate")
+                            extra_logs += 1
+                            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER.current_session}):
+                                code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(code, 1)
+                            self.assertIn("only the owner or morty", error)
                         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
                             code, _, error = self.command("confirm", "--id", item.id)
                         self.assertEqual(code, 1)
@@ -363,16 +389,17 @@ else:
                         the_list.fire_scheduled()
                         the_list.fire_scheduled()
                     changed = the_list.load(MORTY.id, item.id)
-                    self.assertEqual(len(changed.log), len(item.log) + 1)
+                    self.assertEqual(len(changed.log), len(item.log) + 1 + extra_logs)
+                    result_entry = changed.log[len(item.log) + missed_days]
                     rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
                     if case == "timeout":
-                        self.assertIn("No confirmation", str(changed.log[-1].what))
+                        self.assertIn("No confirmation", str(result_entry.what))
                         self.assertEqual([args[args.index("--to") + 1] for args in rows],
                                          [f"staff:{RUNNER.id}", f"staff:{BOB.id}", "user", f"staff:{BOB.id}"])
                         self.assertEqual(rows[2][rows[2].index("--text-id") + 1], "nate.adhoc")
                         self.assertIn("has no confirmation", rows[3][-1])
                     else:
-                        self.assertIn("Confirmed", str(changed.log[-1].what))
+                        self.assertIn("Confirmed", str(result_entry.what))
                         self.assertEqual(rows, starts)
                     if rule:
                         self.assertIs(changed.state, the_list.ItemState.SCHEDULED)
@@ -386,7 +413,7 @@ else:
                             self.assertEqual(self.command("confirm", "--id", item.id),
                                              (0, f"confirmed {item.id}\n", ""))
                         changed = the_list.load(MORTY.id, item.id)
-                        self.assertEqual(len(changed.log), len(item.log) + 2)
+                        self.assertEqual(len(changed.log), len(item.log) + 2 + extra_logs)
                         self.assertIn(next_time.isoformat(), str(changed.log[-1].what))
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
                         with patch.object(the_list, "now", return_value=next_time + timedelta(days=1)):
@@ -394,6 +421,127 @@ else:
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
                     self.assertIs(changed.state, the_list.ItemState.WORKING)
                     self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
+
+            for case in ("interrupted owner", "slow notice", "overlapping runs", "Mac"):
+                with self.subTest(case=case):
+                    for path in (sent, attempted):
+                        _ = path.write_text("")
+                    _ = self.list_config.write_text(config)
+                    match case:
+                        case "interrupted owner":
+                            self.check_scheduled_instruction_interrupt(attempted)
+                        case "slow notice":
+                            self.check_slow_scheduled_notice(sent, attempted)
+                        case "overlapping runs":
+                            self.check_overlapping_scheduled_runs(sent)
+                        case "Mac":
+                            self.check_mac_scheduled_run(attempted)
+
+    def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Interrupted", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (patch.object(the_list, "_send_scheduled_notice", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            the_list.fire_scheduled()
+        interrupted = the_list.load(MORTY.id, item.id)
+        active = interrupted.run_deliveries[0]
+        self.assertEqual(active.notices[0], the_list.ScheduledNotice(the_list.RunNotice.OWNER_START,
+                                                                    the_list.NoticeState.SENDING))
+        code, _, error = self.command("confirm", "--id", item.id, "--run", active.key)
+        self.assertEqual(code, 1)
+        self.assertIn("waiting for its owner instruction", error)
+        recovered_at = START + timedelta(minutes=3)
+        with patch.object(the_list, "now", return_value=recovered_at):
+            the_list.fire_scheduled()
+            the_list.fire_scheduled()
+        recovered = the_list.load(MORTY.id, item.id)
+        self.assertEqual(recovered.run_deliveries[0].confirmation,
+                         the_list.AwaitingConfirmation(recovered_at + timedelta(minutes=2)))
+        self.assertEqual([entry.what for entry in recovered.log[len(item.log):]],
+                         [f"Scheduled run due {START.isoformat()}. Instruction uncertain. Waiting for confirmation.",
+                          f"Scheduled run due {START.isoformat()}. Delivery uncertain for owner start."])
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows], ["producer_start"])
+        with patch.object(the_list, "now", return_value=recovered_at + timedelta(minutes=2)):
+            the_list.fire_scheduled()
+            the_list.fire_scheduled()
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows],
+                         ["producer_start", "user_timeout", "producer_timeout"])
+
+    def check_slow_scheduled_notice(self, sent: Path, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
+        slow = self.add("Slow notice", changes=changes)
+        later = self.add("Later item", changes=changes)
+        with redirect_stderr(io.StringIO()) as errors:
+            the_list.fire_scheduled()
+        self.assertIn("timed out", errors.getvalue())
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
+        done = the_list.load(MORTY.id, slow.id)
+        self.assertIn("Delivery uncertain for owner start", str(done.log[-1].what))
+        for item in (slow, later):
+            self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
+        the_list.fire_scheduled()
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual(sum(slow.title in args[-1] and args[args.index("--key") + 1].endswith(":owner_start")
+                             for args in rows), 1)
+
+    def check_overlapping_scheduled_runs(self, sent: Path) -> None:
+        first = the_list.ScheduledRun(START, "First words.")
+        schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"))
+        item = self.add("Lose receipt in moved run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        second = START + timedelta(days=1)
+        moved = second + timedelta(minutes=1)
+        self.assertEqual(self.command("update", "--id", item.id, "--scope", "this", "--start", moved.isoformat(),
+                                      "--source", "nate"), (0, "Repeats: Daily for 2 runs\n", ""))
+        with patch.object(the_list, "now", return_value=second), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled()
+            after_second = the_list.load(MORTY.id, item.id)
+            active = after_second.run_deliveries[0]
+            self.assertEqual(active.run.start, second)
+            self.assertIn("Delivery uncertain for producer start", str(after_second.log[-1].what))
+            remaining = after_second.schedule
+            assert isinstance(remaining, the_list.ScheduledSeries)
+            self.assertEqual([(run.number, run.run.start) for run in remaining.runs(730)], [(1, moved)])
+        with patch.object(the_list, "now", return_value=moved), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled()
+            the_list.fire_scheduled()
+            started = the_list.load(MORTY.id, item.id)
+            self.assertEqual([run.run.start for run in started.run_deliveries], [second, moved])
+            for run in started.run_deliveries:
+                self.assertEqual(self.command("confirm", "--id", item.id, "--run", run.key),
+                                 (0, f"confirmed {item.id}\n", ""))
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(len(rows), 4)
+        for args, due in zip(rows, (second, second, moved, moved), strict=True):
+            self.assertIn(due.isoformat(), args[-1])
+        self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
+
+    def check_mac_scheduled_run(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Mac check", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        settings = self.list_config.with_name("live_settings.conf")
+        _ = settings.write_text("# whole: 1..\nnatedev_forward_seconds=45\n")
+        run_key = "fixture run"
+        receipt = subprocess.CompletedProcess(["ssh"], 0, f"confirmed {item.id}\n", "")
+        with (patch.object(remote, "local_machine", return_value="mac"),
+              patch.object(sys, "platform", "darwin"),
+              patch.object(main_publish, "ssh", return_value=receipt) as ssh):
+            the_list.fire_scheduled()
+            self.assertEqual(attempted.read_text(), "")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(self.command("confirm", "--id", item.id, "--run", run_key),
+                             (0, f"confirmed {item.id}\n", ""))
+            args = cast(tuple[str, ...], ssh.call_args.args)
+            self.assertEqual(shlex.split(args[0]), ["CODEX_THREAD_ID=", f"CLAUDE_CODE_SESSION_ID={MORTY.current_session}",
+                             "$HOME/.claude/scripts/lib/py", "$HOME/.claude/scripts/production/the_list.py",
+                             "confirm", "--id", item.id, "--run", run_key])
+            ssh.assert_called_once_with(args[0], ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev",
+                                        time_limit=main_publish.CommandTimeLimit(45))
 
     def test_repeat_series_limit_uses_the_live_setting(self) -> None:
         start = "2026-11-30T17:00:00Z"

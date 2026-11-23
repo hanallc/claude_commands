@@ -621,18 +621,28 @@ The record keeps its earlier log entries when the schedule changes or ends.
 A producer can change its own schedules. Morty can change all schedules.
 Herdr upkeep checks the List on natedev after it restores the shared server.
 The job uses its existing lock and interval.
+It reads the next check time from each item header.
+It loads the item when a run, notice, or confirmation deadline is due.
+Delivery has separate time limits for a notice, an item, and the whole check.
+
 On the first check at or after the start, the List saves the run and sets the item to Working.
 The owner receives the instruction. The producer receives a copy.
-Each notice uses a saved key so a retry can recover a delivery that `send.py` accepted.
-If several runs became due while upkeep was off, the List sends the latest one and keeps the next start.
+The List saves each notice as sending before it calls the sender.
+If the List cannot confirm acceptance, it records one uncertainty entry.
+Each notice has at most one send attempt.
+If several runs are overdue, the List sends the latest one with its due time.
+The same save records each earlier run as missed.
+If an edit moves a run after a later run, the List starts both at their saved times.
 
-Use `the_list.py confirm --id L<n>` to confirm the current run.
+Use `the_list.py confirm --id L<n>` to confirm the latest active run.
 The start message includes `--run` to select that exact run.
-The owner or morty can confirm. On the Mac, the command forwards the confirmation to natedev.
+The owner saved for that run or morty can confirm.
+On the Mac, the command forwards the confirmation to natedev.
+The confirmation time starts when the sender accepts the owner's instruction or the List marks its delivery uncertain.
 If the confirmation time passes, the List sends one phone text to nate and a second message to the producer.
-The List starts this time limit when it saves the run as Working.
-It stores the result on the same log line as the start.
-After confirmation or timeout, a repeat returns to Scheduled if runs remain.
+The List stores the result on the run's start line.
+Each future run can start while an earlier run awaits confirmation.
+After the active runs finish, the item returns to Scheduled if runs remain.
 The item stays open when the series ends.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.

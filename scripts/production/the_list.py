@@ -23,11 +23,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from scripts.agents import remote
 from scripts.lib import conf, operation_deadline
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, repeat_rule, session_pane, staff
@@ -284,6 +287,13 @@ class ScheduledSeries:
             if not self.is_used(number) and isinstance(run, ScheduledRun):
                 yield SeriesRun(number, original, run)
 
+    def first_pending(self, limit: int) -> SeriesRun | repeat_rule.NoNextRun:
+        runs = self.runs(limit)
+        if not self.exceptions:
+            return next(runs, repeat_rule.NoNextRun.REMAINING)
+        return min(runs, key=lambda run: run.run.start.astimezone(UTC),
+                   default=repeat_rule.NoNextRun.REMAINING)
+
     def next_run(self, moment: datetime, limit: int) -> SeriesRun | repeat_rule.NoNextRun:
         """Find the next pending run at or after a time."""
         instant = moment.astimezone(UTC)
@@ -314,10 +324,21 @@ class SeriesRun:
 Schedule = NoSchedule | ScheduledRun | ScheduledSeries
 
 
+class AwaitingInstruction(StrEnum):
+    OWNER = "waiting for instruction"
+
+
+@dataclass(frozen=True)
+class AwaitingConfirmation:
+    deadline: datetime
+
+
 class RunResult(StrEnum):
-    WAITING = "waiting"
     CONFIRMED = "confirmed"
     NOT_CONFIRMED = "not confirmed"
+
+
+RunConfirmation = AwaitingInstruction | AwaitingConfirmation | RunResult
 
 
 class RunNotice(StrEnum):
@@ -331,8 +352,20 @@ _START_NOTICES = (RunNotice.OWNER_START, RunNotice.PRODUCER_START)
 _TIMEOUT_NOTICES = (RunNotice.USER_TIMEOUT, RunNotice.PRODUCER_TIMEOUT)
 
 
-class NoRunDelivery(StrEnum):
-    IDLE = ""
+class NoticeState(StrEnum):
+    READY = "ready"
+    SENDING = "sending"
+    ACCEPTED = "accepted"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass(frozen=True)
+class ScheduledNotice:
+    kind: RunNotice
+    state: NoticeState = NoticeState.READY
+
+    def needs_check(self) -> bool:
+        return self.state in (NoticeState.READY, NoticeState.SENDING)
 
 
 @dataclass(frozen=True)
@@ -342,22 +375,35 @@ class RunDelivery:
     title: str
     owner: staff.StaffId
     producer: staff.StaffId
-    confirm_by: datetime
     log_index: int
-    result: RunResult
-    pending: tuple[RunNotice, ...]
+    confirmation: RunConfirmation
+    notices: tuple[ScheduledNotice, ...]
 
     def log_text(self) -> str:
         due = _schedule_time_text(self.run.start)
-        if self.result is RunResult.CONFIRMED:
-            status = "Confirmed."
-        elif self.result is RunResult.NOT_CONFIRMED:
-            status = "No confirmation."
-        elif RunNotice.OWNER_START in self.pending:
-            status = "Sending the instruction."
-        else:
-            status = "Instruction sent. Waiting for confirmation."
+        match self.confirmation:
+            case RunResult.CONFIRMED:
+                status = "Confirmed."
+            case RunResult.NOT_CONFIRMED:
+                status = "No confirmation."
+            case AwaitingInstruction.OWNER:
+                status = "Sending the instruction."
+            case AwaitingConfirmation():
+                owner = next(notice for notice in self.notices if notice.kind is RunNotice.OWNER_START)
+                status = ("Instruction sent. Waiting for confirmation." if owner.state is NoticeState.ACCEPTED
+                          else "Instruction uncertain. Waiting for confirmation.")
         return f"Scheduled run due {due}. {status}"
+
+
+class NoDueRun(StrEnum):
+    YET = "no run due"
+
+
+@dataclass(frozen=True)
+class DueRun:
+    run: ScheduledRun
+    remaining: Schedule
+    missed: tuple[ScheduledRun, ...] = ()
 
 
 class ScheduleScope(StrEnum):
@@ -404,7 +450,7 @@ class ListItem:
     reviews: tuple[str, ...] = ()
     questions: tuple[question_record.Question, ...] = ()
     schedule: Schedule = NoSchedule.UNSET
-    run_delivery: RunDelivery | NoRunDelivery = NoRunDelivery.IDLE
+    run_deliveries: tuple[RunDelivery, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
@@ -705,25 +751,71 @@ def _read_schedule(raw: object) -> Schedule:
 
 
 def _run_delivery_fields(delivery: RunDelivery) -> dict[str, object]:
+    confirmation = delivery.confirmation
     return {"key": delivery.key, "start": _schedule_time_text(delivery.run.start), "do": delivery.run.words,
             "title": delivery.title, "owner": delivery.owner, "producer": delivery.producer,
-            "confirm_by": _time_text(delivery.confirm_by), "log_index": delivery.log_index,
-            "result": delivery.result, "pending": delivery.pending}
+            "log_index": delivery.log_index,
+            "confirmation": "waiting for confirmation" if isinstance(confirmation, AwaitingConfirmation) else confirmation,
+            "confirm_by": _time_text(confirmation.deadline) if isinstance(confirmation, AwaitingConfirmation) else "",
+            "notices": [[notice.kind, notice.state] for notice in delivery.notices]}
 
 
-def _read_run_delivery(raw: object) -> RunDelivery | NoRunDelivery:
-    if raw is None:
-        return NoRunDelivery.IDLE
-    match _json_fields(raw):
-        case {"key": str(key), "start": str(start), "do": str(words), "title": str(title),
-              "owner": str(owner), "producer": str(producer), "confirm_by": str(confirm_by),
-              "log_index": int(index), "result": str(result), "pending": pending} if type(index) is int and isinstance(pending, list):
-            notices = tuple(RunNotice(_field_text(value, "pending notice")) for value in cast(list[object], pending))
-            return RunDelivery(key, ScheduledRun(_scheduled_time(start), words), title, staff_id(owner, "run owner"),
-                               staff_id(producer, "run producer"), _required_time(confirm_by), index,
-                               RunResult(result), notices)
-        case _:
-            raise ListError("invalid scheduled run delivery")
+def _read_run_delivery(raw: object) -> RunDelivery:
+    fields = _json_fields(raw)
+    index = fields.get("log_index")
+    if type(index) is not int:
+        raise ListError("invalid scheduled run log reference")
+    confirm_by = _field_text(fields.get("confirm_by"), "confirm_by")
+    if "confirmation" in fields:
+        rows = fields.get("notices")
+        if not isinstance(rows, list):
+            raise ListError("invalid scheduled run notices")
+        notices: list[ScheduledNotice] = []
+        for row in cast(list[object], rows):
+            match row:
+                case [str(kind), str(state)]:
+                    notices.append(ScheduledNotice(RunNotice(kind), NoticeState(state)))
+                case _:
+                    raise ListError("invalid scheduled run notice")
+        name = _field_text(fields["confirmation"], "confirmation")
+        if name == "waiting for confirmation":
+            confirmation: RunConfirmation = AwaitingConfirmation(_required_time(confirm_by))
+        else:
+            if confirm_by:
+                raise ListError("unexpected scheduled run confirmation deadline")
+            confirmation = AwaitingInstruction.OWNER if name == AwaitingInstruction.OWNER else RunResult(name)
+    else:
+        # An earlier delivery can have attempted a send without saving acceptance.
+        pending = fields.get("pending")
+        if not isinstance(pending, list):
+            raise ListError("invalid pending scheduled run notices")
+        outstanding = tuple(RunNotice(_field_text(kind, "pending notice")) for kind in cast(list[object], pending))
+        result = _field_text(fields.get("result"), "result")
+        if result == "waiting":
+            confirmation = (AwaitingInstruction.OWNER if RunNotice.OWNER_START in outstanding
+                            else AwaitingConfirmation(_required_time(confirm_by)))
+        else:
+            confirmation = RunResult(result)
+        kinds = (*_START_NOTICES, *_TIMEOUT_NOTICES) if confirmation is RunResult.NOT_CONFIRMED else _START_NOTICES
+        notices = [ScheduledNotice(kind, NoticeState.SENDING if kind in outstanding else NoticeState.ACCEPTED)
+                   for kind in kinds]
+    return RunDelivery(_field_text(fields.get("key"), "key"),
+                       ScheduledRun(_scheduled_time(_field_text(fields.get("start"), "start")),
+                                    _field_text(fields.get("do"), "do")),
+                       _field_text(fields.get("title"), "title"),
+                       staff_id(_field_text(fields.get("owner"), "owner"), "run owner"),
+                       staff_id(_field_text(fields.get("producer"), "producer"), "run producer"),
+                       index, confirmation, tuple(notices))
+
+
+def _read_run_deliveries(fields: dict[str, str]) -> tuple[RunDelivery, ...]:
+    if "run_deliveries" not in fields:
+        legacy = cast(object, json.loads(fields.get("run_delivery", "null")))
+        return (_read_run_delivery(legacy),) if legacy is not None else ()
+    rows = cast(object, json.loads(fields["run_deliveries"]))
+    if not isinstance(rows, list):
+        raise ListError("invalid scheduled run deliveries")
+    return tuple(_read_run_delivery(row) for row in cast(list[object], rows))
 
 
 def _validate_scheduled_run(run: ScheduledRun) -> None:
@@ -1008,7 +1100,7 @@ def _validate(item: ListItem) -> None:
         raise ListError("a schedule requires the Scheduled state and a start and words")
     if (item.state is not ItemState.SCHEDULED and item.schedule is not NoSchedule.UNSET
             and not (item.state is not ItemState.CLOSED and isinstance(item.schedule, ScheduledSeries)
-                     and isinstance(item.run_delivery, RunDelivery))):
+                     and bool(item.run_deliveries))):
         raise ListError("a schedule requires the Scheduled state and a start and words")
     if item.schedule is not NoSchedule.UNSET and item.parked_until is not NoTimestamp.UNSET:
         raise ListError("a Scheduled item cannot be parked")
@@ -1022,17 +1114,27 @@ def _validate(item: ListItem) -> None:
     for name, value in (("next_step", item.next_step), ("latest_status", item.latest_status),
                         ("evidence", item.evidence), ("done_when", item.done_when)):
         _ = _field_text(value, name)
-    delivery = item.run_delivery
-    if isinstance(delivery, RunDelivery):
+    seen_runs: set[str] = set()
+    seen_logs: set[int] = set()
+    for delivery in item.run_deliveries:
         _validate_scheduled_run(delivery.run)
         _line(delivery.title, "scheduled run title")
-        _validate_time(delivery.confirm_by)
-        allowed_notices = (*_START_NOTICES, *_TIMEOUT_NOTICES) if delivery.result is RunResult.NOT_CONFIRMED else _START_NOTICES
-        if (len(set(delivery.pending)) != len(delivery.pending) or not set(delivery.pending).issubset(allowed_notices)
+        confirmation = delivery.confirmation
+        if isinstance(confirmation, AwaitingConfirmation):
+            _validate_time(confirmation.deadline)
+        kinds = (*_START_NOTICES, *_TIMEOUT_NOTICES) if confirmation is RunResult.NOT_CONFIRMED else _START_NOTICES
+        if (len(delivery.notices) != len(kinds) or {notice.kind for notice in delivery.notices} != set(kinds)
                 or not re.fullmatch("[a-f0-9]{32}", delivery.key)
+                or delivery.key in seen_runs or delivery.log_index in seen_logs
                 or not 0 <= delivery.log_index < len(item.log)
                 or item.log[delivery.log_index].what != delivery.log_text()):
             raise ListError("invalid scheduled run delivery or log reference")
+        owner = next(notice for notice in delivery.notices if notice.kind is RunNotice.OWNER_START)
+        if (confirmation is AwaitingInstruction.OWNER and not owner.needs_check()
+                or isinstance(confirmation, AwaitingConfirmation) and owner.needs_check()):
+            raise ListError("invalid owner instruction state for confirmation")
+        seen_runs.add(delivery.key)
+        seen_logs.add(delivery.log_index)
     for change in item.log:
         if isinstance(change.what, str):
             _log_line(change.what, "log text")
@@ -1411,7 +1513,7 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
                         delivery_state.read_list_questions(fields.get("questions", "[]")),
                         _read_schedule(cast(object, json.loads(fields.get("schedule", "null")))),
-                        _read_run_delivery(cast(object, json.loads(fields.get("run_delivery", "null")))))
+                        _read_run_deliveries(fields))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -1448,8 +1550,12 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     if item.schedule is not NoSchedule.UNSET:
         fields["schedule"] = json.dumps(_schedule_fields(item.schedule), ensure_ascii=False)
-    if isinstance(item.run_delivery, RunDelivery):
-        fields["run_delivery"] = json.dumps(_run_delivery_fields(item.run_delivery), ensure_ascii=False)
+    check = _scheduled_check(item)
+    if check:
+        fields["scheduled_check"] = check
+    if item.run_deliveries:
+        fields["run_deliveries"] = json.dumps([_run_delivery_fields(delivery) for delivery in item.run_deliveries],
+                                             ensure_ascii=False)
     if item.questions:
         fields["questions"] = json.dumps([question_record.stored(question) for question in item.questions], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
@@ -1901,84 +2007,96 @@ def _confirmation_wait() -> timedelta:
 
 
 def _save_run_delivery(store: record_store.NumberedRecords, item: ListItem, delivery: RunDelivery,
-                       moment: datetime) -> None:
+                       moment: datetime, *, uncertain: RunNotice | None = None) -> ListItem:
     log = list(item.log)
     if delivery.log_index == len(log):
         log.append(ItemChange(moment, delivery.log_text(), "the List"))
     else:
         log[delivery.log_index] = replace(log[delivery.log_index], what=delivery.log_text())
-    changed = replace(item, log=tuple(log), run_delivery=delivery)
-    if delivery.result is not RunResult.WAITING and not delivery.pending:
-        state = ItemState.SCHEDULED if item.schedule is not NoSchedule.UNSET else item.state
-        changed = replace(changed, state=state, run_delivery=NoRunDelivery.IDLE)
-    if changed.log != item.log or changed.state != item.state:
+    if uncertain is not None:
+        due = _schedule_time_text(delivery.run.start)
+        log.append(ItemChange(moment, f"Scheduled run due {due}. Delivery uncertain for {uncertain}.", "the List"))
+    if delivery.log_index == len(item.log):
+        deliveries = (*item.run_deliveries, delivery)
+    else:
+        deliveries = tuple(delivery if other.key == delivery.key else other for other in item.run_deliveries)
+    active = tuple(run for run in deliveries
+                   if not isinstance(run.confirmation, RunResult) or any(notice.needs_check() for notice in run.notices))
+    state = item.state
+    if not active and item.schedule is not NoSchedule.UNSET:
+        state = ItemState.SCHEDULED
+    changed = replace(item, log=tuple(log), run_deliveries=active, state=state)
+    if changed.log != item.log or state != item.state:
         changed = replace(changed, updated=moment, unread_since=moment)
     _save(store, changed)
+    return changed
 
 
-def _due_schedule(item: ListItem, moment: datetime) -> tuple[ScheduledRun, Schedule] | NoRunDelivery:
-    if item.state is not ItemState.SCHEDULED:
-        return NoRunDelivery.IDLE
+def _due_schedule(item: ListItem, moment: datetime) -> DueRun | NoDueRun:
+    if item.state not in (ItemState.SCHEDULED, ItemState.WORKING):
+        return NoDueRun.YET
     instant = moment.astimezone(UTC)
     schedule = item.schedule
     if isinstance(schedule, ScheduledRun) and schedule.start.astimezone(UTC) <= instant:
-        return schedule, NoSchedule.UNSET
+        return DueRun(schedule, NoSchedule.UNSET)
     if not isinstance(schedule, ScheduledSeries):
-        return NoRunDelivery.IDLE
+        return NoDueRun.YET
     limit = series_run_limit()
-    due: SeriesRun | repeat_rule.NoNextRun = repeat_rule.NoNextRun.REMAINING
-    used: list[int] = []
+    due: list[SeriesRun] = []
     for run in schedule.runs(limit):
-        start = run.run.start.astimezone(UTC)
-        if start <= instant:
-            used.append(run.number)
-            if isinstance(due, repeat_rule.NoNextRun) or start >= due.run.start.astimezone(UTC):
-                due = run
+        if run.run.start.astimezone(UTC) <= instant:
+            due.append(run)
         elif not schedule.exceptions:
             break
-    if not isinstance(due, SeriesRun):
-        return NoRunDelivery.IDLE
-    remaining = schedule.use_runs(used)
-    following = remaining.next_run(instant, limit)
-    return due.run, remaining if isinstance(following, SeriesRun) else NoSchedule.UNSET
+    if not due:
+        return NoDueRun.YET
+    due.sort(key=lambda run: run.run.start.astimezone(UTC))
+    remaining = schedule.use_runs(run.number for run in due)
+    following = remaining.first_pending(limit)
+    return DueRun(due[-1].run, remaining if isinstance(following, SeriesRun) else NoSchedule.UNSET,
+                  tuple(run.run for run in due[:-1]))
 
 
-def _prepare_scheduled_run(store: record_store.NumberedRecords, item: ListItem,
-                           moment: datetime) -> RunDelivery | NoRunDelivery:
-    delivery = item.run_delivery
-    if isinstance(delivery, RunDelivery):
-        if delivery.result is RunResult.WAITING and moment >= delivery.confirm_by:
-            pending = (RunNotice.USER_TIMEOUT, *delivery.pending, RunNotice.PRODUCER_TIMEOUT)
-            delivery = replace(delivery, result=RunResult.NOT_CONFIRMED, pending=pending)
-            _save_run_delivery(store, item, delivery, moment)
-        return delivery
+def _prepare_scheduled_runs(store: record_store.NumberedRecords, item: ListItem, moment: datetime) -> ListItem:
+    for delivery in item.run_deliveries:
+        confirmation = delivery.confirmation
+        if isinstance(confirmation, AwaitingConfirmation) and moment >= confirmation.deadline:
+            notices = (*delivery.notices, *(ScheduledNotice(kind) for kind in _TIMEOUT_NOTICES))
+            expired = replace(delivery, confirmation=RunResult.NOT_CONFIRMED, notices=notices)
+            item = _save_run_delivery(store, item, expired, moment)
     due = _due_schedule(item, moment)
-    if due is NoRunDelivery.IDLE:
-        return due
-    if isinstance(item.owner, UnassignedOwner):
-        raise ListError("assign a showrunner owner before this scheduled run starts")
-    start, remaining = due
-    delivery = RunDelivery(secrets.token_hex(16), start, item.title, item.owner, item.producer,
-                           moment + _confirmation_wait(), len(item.log), RunResult.WAITING, _START_NOTICES)
-    _save_run_delivery(store, replace(item, state=ItemState.WORKING, schedule=remaining), delivery, moment)
-    return delivery
+    if isinstance(due, NoDueRun):
+        return item
+    owner = item.owner
+    if isinstance(owner, UnassignedOwner):
+        print(f"the_list: {item.id}: assign a showrunner owner before this scheduled run starts", file=sys.stderr)
+        return item
+    missed = tuple(ItemChange(moment, f"Scheduled run due {_schedule_time_text(run.start)}. Missed.", "the List")
+                   for run in due.missed)
+    item = replace(item, state=ItemState.WORKING, schedule=due.remaining, log=(*item.log, *missed))
+    delivery = RunDelivery(secrets.token_hex(16), due.run, item.title, owner, item.producer, len(item.log),
+                           AwaitingInstruction.OWNER, tuple(ScheduledNotice(kind) for kind in _START_NOTICES))
+    return _save_run_delivery(store, item, delivery, moment)
 
 
 def confirm_scheduled(keeper: staff.StaffId, identity: str, caller: staff.StaffRow, *, run_key: str = "") -> None:
     store = _store(keeper)
     with store.locked():
         item = load(keeper, identity)
-        if caller.id not in (item.owner, keeper):
-            raise ListError("only the owner or morty can confirm a scheduled run")
-        delivery = item.run_delivery
-        if not isinstance(delivery, RunDelivery) or (run_key and run_key != delivery.key):
+        delivery = next((run for run in reversed(item.run_deliveries) if not run_key or run_key == run.key), None)
+        if delivery is None:
             raise ListError("there is no matching scheduled run to confirm")
+        if caller.id not in (delivery.owner, keeper):
+            raise ListError("only the owner or morty can confirm a scheduled run")
+        confirmation = delivery.confirmation
         moment = now()
-        if delivery.result is RunResult.CONFIRMED:
+        if confirmation is RunResult.CONFIRMED:
             return
-        if delivery.result is not RunResult.WAITING or moment >= delivery.confirm_by:
+        if confirmation is AwaitingInstruction.OWNER:
+            raise ListError("the scheduled run is waiting for its owner instruction")
+        if not isinstance(confirmation, AwaitingConfirmation) or moment >= confirmation.deadline:
             raise ListError("the confirmation time has passed")
-        _save_run_delivery(store, item, replace(delivery, result=RunResult.CONFIRMED), moment)
+        _ = _save_run_delivery(store, item, replace(delivery, confirmation=RunResult.CONFIRMED), moment)
 
 
 def _confirm_on_natedev(identity: str, run_key: str) -> int:
@@ -2019,7 +2137,7 @@ def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNoti
 def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice) -> None:
     command = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
     result = subprocess.run(command, capture_output=True, text=True, check=False,
-                            timeout=operation_deadline.remaining(55))
+                            timeout=operation_deadline.remaining(_SCHEDULED_SEND_SECONDS))
     attempt = send_result.send_outcome(result.returncode, result.stdout)
     if (isinstance(attempt, send_result.ConfirmedSendOutcome)
             and attempt.header.outcome in {"sent", "queued", "kept", "skipped", "replaced"}):
@@ -2028,39 +2146,149 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
     raise ListError(detail)
 
 
-def _fire_scheduled_item(store: record_store.NumberedRecords, identity: str) -> None:
-    with store.locked():
+_SCHEDULED_SEND_SECONDS = 2.0
+_SCHEDULED_ITEM_SECONDS = 3.0
+_SCHEDULED_CHECK_SECONDS = 8.0
+_SCHEDULED_CHECK_READY = "ready"
+_SCHEDULED_CHECK_IDLE = "idle"
+_SCHEDULED_CHECK_FIELDS = frozenset({"scheduled_check", "state", "run_delivery"})
+
+
+def _next_scheduled_run(schedule: Schedule) -> ScheduledRun | repeat_rule.NoNextRun:
+    if isinstance(schedule, ScheduledSeries):
+        pending = schedule.first_pending(series_run_limit())
+        return pending.run if isinstance(pending, SeriesRun) else pending
+    return schedule if isinstance(schedule, ScheduledRun) else repeat_rule.NoNextRun.REMAINING
+
+
+def _legacy_schedule_due(store: record_store.NumberedRecords, path: Path,
+                         fields: dict[str, list[str]], moment: datetime) -> bool:
+    legacy = fields.get("run_delivery")
+    if legacy:
+        stored = cast(object, json.loads(store.field(path.stem, "run_delivery")))
+        if stored is not None:
+            delivery = _read_run_delivery(stored)
+            if any(notice.needs_check() for notice in delivery.notices):
+                return True
+            confirmation = delivery.confirmation
+            if isinstance(confirmation, AwaitingConfirmation) and confirmation.deadline <= moment:
+                return True
+    state = fields.get("state")
+    if state != [ItemState.SCHEDULED] and (state != [ItemState.WORKING] or not legacy):
+        return False
+    if state == [ItemState.WORKING] and not record_store.read_header(path, keys=frozenset({"schedule"})):
+        return False
+    stored_schedule = cast(object, json.loads(store.field(path.stem, "schedule")))
+    next_run = _next_scheduled_run(_read_schedule(stored_schedule))
+    return isinstance(next_run, ScheduledRun) and next_run.start.astimezone(UTC) <= moment.astimezone(UTC)
+
+
+def _scheduled_check(item: ListItem) -> str:
+    """Save the first time that the scheduler needs the record."""
+    if any(notice.needs_check() for run in item.run_deliveries for notice in run.notices):
+        return _SCHEDULED_CHECK_READY
+    times = [run.confirmation.deadline for run in item.run_deliveries
+             if isinstance(run.confirmation, AwaitingConfirmation)]
+    if item.state in (ItemState.SCHEDULED, ItemState.WORKING):
+        next_run = _next_scheduled_run(item.schedule)
+        if isinstance(next_run, ScheduledRun):
+            times.append(next_run.start)
+    if times:
+        return min(times, key=lambda instant: instant.astimezone(UTC)).isoformat()
+    return _SCHEDULED_CHECK_IDLE if item.schedule is not NoSchedule.UNSET else ""
+
+
+def _change_notice(delivery: RunDelivery, kind: RunNotice, state: NoticeState) -> RunDelivery:
+    return replace(delivery, notices=tuple(replace(notice, state=state) if notice.kind is kind else notice
+                                          for notice in delivery.notices))
+
+
+def _settle_notice(store: record_store.NumberedRecords, item: ListItem, delivery: RunDelivery, kind: RunNotice,
+                   state: NoticeState, wait: timedelta) -> None:
+    moment = now()
+    delivery = _change_notice(delivery, kind, state)
+    if kind is RunNotice.OWNER_START and delivery.confirmation is AwaitingInstruction.OWNER:
+        delivery = replace(delivery, confirmation=AwaitingConfirmation(moment + wait))
+    _ = _save_run_delivery(store, item, delivery, moment,
+                           uncertain=kind if state is NoticeState.UNCERTAIN else None)
+
+
+def _deliver_scheduled_notice(store: record_store.NumberedRecords, identity: str, run_key: str,
+                              kind: RunNotice, wait: timedelta) -> None:
+    operation_deadline.check()
+    with exclusive(store.lock_path(), wait=False) as lock:
+        if lock is LockResult.BUSY:
+            return
         item = load(store.owner, identity)
-        delivery = _prepare_scheduled_run(store, item, now())
-    if isinstance(delivery, NoRunDelivery):
-        return
-    for notice in delivery.pending:
-        operation_deadline.check()
+        delivery = next((run for run in item.run_deliveries if run.key == run_key), None)
+        if delivery is None:
+            return
+        notice = next(entry for entry in delivery.notices if entry.kind is kind)
+        if notice.state is NoticeState.SENDING:
+            _settle_notice(store, item, delivery, kind, NoticeState.UNCERTAIN, wait)
+            return
+        if notice.state is not NoticeState.READY:
+            return
+        _ = _save_run_delivery(store, item, _change_notice(delivery, kind, NoticeState.SENDING), now())
+    result = NoticeState.ACCEPTED
+    try:
+        _send_scheduled_notice(identity, delivery, kind)
+    except (ListError, OSError, subprocess.SubprocessError) as error:
+        print(f"the_list: {identity}: {kind}: {error}", file=sys.stderr)
+        result = NoticeState.UNCERTAIN
+    with exclusive(store.lock_path(), wait=False) as lock:
+        if lock is LockResult.BUSY:
+            return
+        item = load(store.owner, identity)
+        current = next((run for run in item.run_deliveries if run.key == run_key), None)
+        if current is not None and ScheduledNotice(kind, NoticeState.SENDING) in current.notices:
+            _settle_notice(store, item, current, kind, result, wait)
+
+
+def _fire_scheduled_item(store: record_store.NumberedRecords, identity: str, moment: datetime) -> None:
+    with exclusive(store.lock_path(), wait=False) as lock:
+        if lock is LockResult.BUSY:
+            return
+        item = load(store.owner, identity)
+        prepared = _prepare_scheduled_runs(store, item, moment)
+    if any(notice.needs_check() for run in prepared.run_deliveries for notice in run.notices):
+        wait = _confirmation_wait()
         try:
-            _send_scheduled_notice(identity, delivery, notice)
-        except (ListError, OSError, subprocess.SubprocessError) as error:
-            print(f"the_list: {identity}: {notice}: {error}", file=sys.stderr)
-            continue
-        with store.locked():
-            item = load(store.owner, identity)
-            current = item.run_delivery
-            if isinstance(current, RunDelivery) and current.key == delivery.key and notice in current.pending:
-                pending = tuple(other for other in current.pending if other is not notice)
-                _save_run_delivery(store, item, replace(current, pending=pending), now())
+            with operation_deadline.within(monotonic() + _SCHEDULED_ITEM_SECONDS):
+                for delivery in prepared.run_deliveries:
+                    for notice in delivery.notices:
+                        if notice.needs_check():
+                            _deliver_scheduled_notice(store, identity, delivery.key, notice.kind, wait)
+        except TimeoutError:
+            operation_deadline.check()
 
 
 def fire_scheduled() -> None:
-    """Process due List runs under the existing upkeep job lock."""
-    keeper = producer_id(staff.snapshot(), "morty")
-    store = _store(keeper)
-    for path in sorted(store.folder().glob("L*.md")):
-        operation_deadline.check()
-        try:
-            fields = record_store.read_header(path, keys=frozenset({"state", "run_delivery"}))
-            if fields.get("state") == [ItemState.SCHEDULED] or "run_delivery" in fields:
-                _fire_scheduled_item(store, path.stem)
-        except (ListError, OSError, UnicodeError) as error:
-            print(f"the_list: {path.stem}: {error}", file=sys.stderr)
+    """Process due List runs under the natedev upkeep job lock."""
+    if remote.local_machine() != staff.OWNER_MACHINE:
+        return
+    deadline = monotonic() + operation_deadline.remaining(_SCHEDULED_CHECK_SECONDS)
+    with operation_deadline.within(deadline):
+        keeper = producer_id(staff.snapshot(), "morty")
+        store = _store(keeper)
+        for path in sorted(store.folder().glob("L*.md")):
+            try:
+                operation_deadline.check()
+                fields = record_store.read_header(path, keys=_SCHEDULED_CHECK_FIELDS)
+                check = fields.get("scheduled_check", [])
+                moment = now()
+                if check == [_SCHEDULED_CHECK_IDLE]:
+                    continue
+                if check:
+                    if check != [_SCHEDULED_CHECK_READY] and _required_time(check[0]) > moment:
+                        continue
+                elif not _legacy_schedule_due(store, path, fields, moment):
+                    continue
+                _fire_scheduled_item(store, path.stem, moment)
+            except TimeoutError:
+                break
+            except (ValueError, OSError) as error:
+                print(f"the_list: {path.stem}: {error}", file=sys.stderr)
 
 
 def _say_schedule(schedule: Schedule) -> None:
@@ -2750,7 +2978,7 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
         elif item.state is ItemState.SCHEDULED and isinstance(item.schedule, ScheduledSeries):
             state += " · Starts " + _schedule_time_text(item.schedule.first.start)
             state += " · " + item.schedule.rule.describe(item.schedule.first.start)
-            next_run = next(item.schedule.runs(series_run_limit()), repeat_rule.NoNextRun.REMAINING)
+            next_run = item.schedule.first_pending(series_run_limit())
             state += " · next " + _schedule_time_text(next_run.run.start) if isinstance(next_run, SeriesRun) else " · no runs remain"
         if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()

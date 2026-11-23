@@ -53,7 +53,8 @@ def upkeep() -> None:
         herdr.save_shared_layout(running)
         _ = detection_rules.refresh(running, herdr.reload_agent_rules)
         try:
-            the_list.fire_scheduled()
+            with operation_deadline.within(time.monotonic() + operation_deadline.remaining() / 4):
+                the_list.fire_scheduled()
         except (OSError, ValueError, staff.StaffRefused, subprocess.SubprocessError) as error:
             print(f"herdr-upkeep: scheduled List items: {error}", file=sys.stderr)
         producers = accounts.producer_upkeep_members()
