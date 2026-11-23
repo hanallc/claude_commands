@@ -883,13 +883,22 @@ class ProgramFileTests(unittest.TestCase):
         # A real store folder: its path has /nix/store, which is group-writable with the sticky bit.
         store = Path(sys.executable).resolve().parent
         self.assertTrue(store.is_relative_to("/nix/store"))
-        for argv in (("cc", f"-I{store}"), ("cc", "-I", str(store)), ("cc", "-I/usr/hand-made-missing"),
-                     ("cc", "-I/hand-made-missing")):
-            with self.subTest(argv=argv):
-                self.assertEqual(self.read(*argv), [])
-        self.assertTrue(hand_made.root_only("/"))
-        self.assertFalse(hand_made.root_only("/nix/store"))
-        self.assertFalse(hand_made.root_only(str(self.root)))
+        # In a user namespace, as in the guest gate sandbox, a root owned entry shows the overflow uid, the owner
+        # of /. The fixture owner check reads that uid as root, as the host outside the namespace sees it.
+        root_seen, lstat = os.lstat("/").st_uid, os.lstat
+
+        def host_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+            info = lstat(path)
+            return info if info.st_uid != root_seen else os.stat_result((*info[:4], 0, *info[5:]))
+
+        with mock.patch.object(os, "lstat", host_lstat):
+            for argv in (("cc", f"-I{store}"), ("cc", "-I", str(store)), ("cc", "-I/usr/hand-made-missing"),
+                         ("cc", "-I/hand-made-missing")):
+                with self.subTest(argv=argv):
+                    self.assertEqual(self.read(*argv), [])
+            self.assertTrue(hand_made.root_only("/"))
+            self.assertFalse(hand_made.root_only("/nix/store"))
+            self.assertFalse(hand_made.root_only(str(self.root)))
 
     def test_a_wrapper_word_from_path_with_no_start_line_is_read(self) -> None:
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")

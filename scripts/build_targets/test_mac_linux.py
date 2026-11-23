@@ -1522,6 +1522,18 @@ fi
     def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
         # Without Chromium on the guest PATH, the runner stops before a test starts.
         (self.root / 'bin/chromium').unlink()
+        # A host can have Chromium, as the guest has: a PATH folder that holds it changes to a fixture folder of links
+        # to each of its other entries.
+        folders = os.environ['PATH'].split(os.pathsep)
+        for index, folder in enumerate(folders):
+            if folder and shutil.which('chromium', path=folder):
+                links = self.root / f'path-{index}'
+                links.mkdir()
+                for entry in Path(folder).iterdir():
+                    if entry.name != 'chromium':
+                        (links / entry.name).symlink_to(entry)
+                folders[index] = str(links)
+        os.environ['PATH'] = os.pathsep.join(folders)
         self.assertIsNone(shutil.which('chromium'))
         reason = self.not_started(self.route())
         self.assertRegex(reason, r'^SSH or source stream exited 1: .*Chromium is absent from the guest PATH')
