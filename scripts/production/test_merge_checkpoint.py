@@ -296,6 +296,23 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertIn("ancestry: ok", result.process.stdout)
 
+    def test_shrink_ancestry_accepts_a_duplicate_with_a_production_only_parent(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("reset", "--hard", f"{duplicate}^", cwd=self.unit)
+        parent = self.checkpoint("src/beta.txt", "production work\n", subject="Update production", push=False)
+        _ = self.git("merge", "--ff-only", parent)
+        _ = self.git("push", "origin", "production")
+        _ = self.git("cherry-pick", duplicate, cwd=self.unit)
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-list", "main..production", cwd=self.origin), parent)
+
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
     def test_shrink_ancestry_holds_on_content_after_a_duplicate_shrink(self) -> None:
         _ = self.duplicate_shrink_on_unit_branch()
         subject = "Add pending work"

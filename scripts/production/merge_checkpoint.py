@@ -447,34 +447,45 @@ def merged(request: MergeRequest) -> bool:
                request.production.merge_branch).returncode == 0
 
 
-def ancestry(request: MergeRequest) -> CheckpointOrigin:
+def check_closing_ancestry(request: MergeRequest) -> None:
     checkout = request.production.checkout
+    run_git = partial(git, checkout)
+    _ = good(run_git("fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
+    main_tip = good(run_git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"), "ancestry")
+    closing = good(run_git("rev-list", "--first-parent", "--no-merges", "-n", "1", request.commit), "ancestry")
+    unmerged = good(run_git("rev-list", "--reverse", "--topo-order", "--no-merges",
+                            "--no-commit-header", "--format=%H %P",
+                            f"{request.production.merge_branch}..{request.commit}", f"^{main_tip}"), "ancestry")
+    candidates = [line.split() for line in unmerged.splitlines()]
+    pending = [row for row in candidates if row[0] != closing]
+    if not pending:
+        return
+    commit = pending[0][0]
+    try:
+        target = git_merge_tree.prepare_target(run_git, main_tip)
+        for commit, *parents in pending:
+            if not parents or not git_merge_tree.leaves_target_unchanged(
+                    run_git, commit, target, merge_base=parents[0]):
+                break
+        else:
+            return
+    except OSError as error:
+        raise checkpoint_gate.Stop("ancestry", "failed", f"{commit} against origin/main ({main_tip}): {error}",
+                                   "the showrunner will inspect the failed command") from error
+    subject = good(run_git("show", "-s", "--format=%s", commit), "ancestry")
+    kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
+    raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {commit[:12]}: {subject}",
+                               f"wait for {commit[:12]} to merge, then resend the {kind}")
+
+
+def ancestry(request: MergeRequest) -> CheckpointOrigin:
     origin_branch = on_origin(request)
     if origin_branch is None:
         raise checkpoint_gate.Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = merged(request)
     if not isinstance(request.kind, CodeCheckpoint):
-        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
-        main_tip = good(git(checkout, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"), "ancestry")
-        closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
-                           request.commit), "ancestry")
-        unmerged = good(git(checkout, "rev-list", "--reverse", "--topo-order", "--no-merges",
-                            f"{request.production.merge_branch}..{request.commit}", f"^{main_tip}"), "ancestry").splitlines()
-        run_git = partial(git, checkout)
-        for commit in unmerged:
-            if commit == closing:
-                continue
-            try:
-                if git_merge_tree.leaves_target_unchanged(run_git, commit, main_tip):
-                    continue
-            except OSError as error:
-                raise checkpoint_gate.Stop("ancestry", "failed", str(error),
-                                           "the showrunner will inspect the failed command") from error
-            subject = good(git(checkout, "show", "-s", "--format=%s", commit), "ancestry")
-            kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
-            raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {commit[:12]}: {subject}",
-                                       f"wait for {commit[:12]} to merge, then resend the {kind}")
+        check_closing_ancestry(request)
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return CheckpointOrigin(origin_branch.removeprefix("origin/"), already)
