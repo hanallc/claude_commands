@@ -5512,11 +5512,13 @@ window.fetch=async(url)=>{
   await document.fonts.ready;
   for(const width of [1280,390,320]){
    frameElement.style.width=width+'px';
+   await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
+   const atRight=Math.abs(o.right-r.right)<=1;
    if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
-      n.left<r.left-1 || Math.abs(o.right-r.right)>1 ||
+      n.left<r.left-1 || !atRight ||
       (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
     failures.push('The owner button is the only title action and fits at '+width+' px.');
    }

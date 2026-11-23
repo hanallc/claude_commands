@@ -903,11 +903,13 @@ window.fetch=async (path,options={})=>{
         owner = replace(MORTY, name="cargo-liner")
         markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
                                        "list", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        setup = f"<script>Date.now=()=>{int(NOW.timestamp() * 1000)};</script>"
         probe = """<script>
 (async()=>{
  const failures=[];
  try{
   await document.fonts.ready;
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
   const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-owner-new]');
   const heading=title.parentElement.getBoundingClientRect(), bounds=title.getBoundingClientRect();
   const line=parseFloat(getComputedStyle(title).lineHeight);
@@ -932,7 +934,7 @@ window.fetch=async (path,options={})=>{
 </script>"""
         for in_console in (False, True):
             with self.subTest(in_console=in_console):
-                self.browser_answer_visibility(markup.decode(), "", probe, reload_console=in_console,
+                self.browser_answer_visibility(markup.decode(), setup, probe, reload_console=in_console,
                                                viewport_width=320)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
