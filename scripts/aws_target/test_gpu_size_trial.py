@@ -2428,7 +2428,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': claim})
 
         cancel = shell_functions(trial.ROOT / 'scripts/direct/verify.sh',
-                                 'run_cleanup', 'remove_tree_watch_folder', 'stop_assigned_gpu_unit',
+                                 'remove_tool_folder', 'remove_tree_watch', 'stop_assigned_gpu_unit',
                                  'cancel_tree_run', 'forward_mac_runner_signal')
         cancel += """
 after_tree_change() { return 0; }

@@ -32,7 +32,7 @@ from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 from scripts.build_targets import targets, target_config
-from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert, write_live_mac_state
 from scripts.message import roster
 from scripts.message import session_send
 from scripts.production import staff
@@ -331,6 +331,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
+        _ = write_live_mac_state(self.mac_state, block=True)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         expected = ("MAC BLOCKED by research since 13:50 (P15 F11 L0 run): 7 steps wait for the Mac, "
                     "idle 10 min; /build:mac unblock clears it.")

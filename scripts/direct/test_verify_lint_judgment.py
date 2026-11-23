@@ -125,10 +125,10 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
         functions = shell_functions(
-            VERIFY, "collect_child", "run_cleanup", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
-            "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch",
-            "remove_tree_watch_folder", "cancel_tree_run",
-            "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
+            VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
+            "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
+            "remove_tool_folder", "remove_tree_watch", "start_tree_watch", "finish_tree_watch",
+            "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         functions += shell_functions(SCRIPTS / "lint/invoke.sh", "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend")

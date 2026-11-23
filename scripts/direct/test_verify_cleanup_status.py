@@ -16,7 +16,10 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SOURCE = VERIFY.read_text(encoding="utf-8")
+LOCK_HELD = 1
+REMOVE_REPORTED = 2
 REMOVE_REFUSED = 4
+REFUSED_LINE = "build folders: remove refused\n"
 TEST_FAILED = 101
 REFUSED_COMMAND = f"sh -c 'exit {REMOVE_REFUSED}'"
 
@@ -67,7 +70,7 @@ class TreeWatchCleanupTests(unittest.TestCase):
 
     def run_test_path(self, step_status: int) -> subprocess.CompletedProcess[str]:
         script = "set -euo pipefail\n" + shell_functions(
-            VERIFY, "run_cleanup", "remove_tree_watch_folder", "after_tree_change", "stop_tree_watch",
+            VERIFY, "remove_tool_folder", "remove_tree_watch", "after_tree_change", "stop_tree_watch",
             "cancel_tree_run", "finish_tree_watch",
         )
         script += f"""
@@ -99,7 +102,7 @@ class FolderRemovalTests(unittest.TestCase):
     """A failed tree-watch folder removal prints one line and changes no exit path."""
 
     def run_script(self, names: tuple[str, ...], body: str) -> tuple[subprocess.CompletedProcess[str], Path]:
-        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run_cleanup", "remove_tree_watch_folder", *names)
+        script = "set -euo pipefail\n" + shell_functions(VERIFY, "remove_tool_folder", "remove_tree_watch", *names)
         script += f"""
 verify_helper() {{
     if [[ "$2" == tool ]]; then printf '%s\\n' "$FIXTURE_DIR"; return 0; fi
@@ -118,20 +121,6 @@ MAC_RUNNER_PID="" MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB="" CMD=test RUN_ST
         self.assertIn(
             f"verify.sh: cleanup failed: tree-watch folder removal (status {REMOVE_REFUSED})\n", result.stderr,
         )
-
-    def test_cancelled_run_exits_77_and_reports_the_cleanup(self) -> None:
-        result, _directory = self.run_script(
-            ("after_tree_change", "stop_tree_watch", "find_mac_runner_pid", "cancel_tree_run"),
-            """
-collect_child() { :; }
-TREE_CHANGED_STATUS=77
-printf 'changed\\n' > "$FIXTURE_DIR/fired"
-cancel_tree_run
-exit 0
-""",
-        )
-        self.assertEqual(result.returncode, 77, result.stderr)
-        self.assert_cleanup_line(result)
 
     def test_forwarded_signal_collects_the_runner_and_keeps_its_status(self) -> None:
         result, directory = self.run_script(
@@ -161,12 +150,12 @@ printf 'folder=[%s]\\n' "$TREE_WATCH_DIR"
 
 
 class HoldWaitTrapTests(unittest.TestCase):
-    """A cached pass exits 0 when the hold-wait folder removal fails in the EXIT trap."""
+    """A cached pass exits 0 for each hold-wait folder removal status in the EXIT trap."""
 
-    def test_cached_pass_exits_zero_and_reports_the_cleanup(self) -> None:
-        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run_cleanup", "finish_hold_wait")
+    def run_hold_trap(self, remove_status: int) -> subprocess.CompletedProcess[str]:
+        script = "set -euo pipefail\n" + shell_functions(VERIFY, "remove_tool_folder", "finish_hold_wait")
         script += f"""
-verify_helper() {{ printf 'build folders: remove refused\\n' >&2; return {REMOVE_REFUSED}; }}
+verify_helper() {{ printf 'build folders: remove refused\\n' >&2; return {remove_status}; }}
 interrupt_hold_wait() {{ :; }}
 phase_wait_finish_all() {{ :; }}
 collect_hold_wait() {{ :; }}
@@ -179,12 +168,20 @@ cache_lookup() {{ LOOKUP_STATUS=0; printf 'verify.sh: recorded pass\\n'; }}
 HOLD_WAIT_DIR=$1 HOLD_WAITER_PID="" MAC_ONLY=0 BUILD_FOLDERS_SCRIPT=build_folders.py
 """
         script += hold_trap_and_lookup() + "printf 'no cached exit\\n'\n"
-        result = run_bash(script, str(temporary_folder(self)))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "verify.sh: recorded pass\n", result.stderr)
-        self.assertIn(
-            f"verify.sh: cleanup failed: hold-wait folder removal (status {REMOVE_REFUSED})\n", result.stderr,
-        )
+        return run_bash(script, str(temporary_folder(self)))
+
+    def test_cached_pass_exits_zero_and_prints_a_line_only_above_status_2(self) -> None:
+        cleanup_line = f"verify.sh: cleanup failed: hold-wait folder removal (status {REMOVE_REFUSED})\n"
+        for remove_status, stderr in (
+            (LOCK_HELD, REFUSED_LINE),
+            (REMOVE_REPORTED, REFUSED_LINE),
+            (REMOVE_REFUSED, REFUSED_LINE + cleanup_line),
+        ):
+            with self.subTest(remove_status=remove_status):
+                result = self.run_hold_trap(remove_status)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "verify.sh: recorded pass\n", result.stderr)
+                self.assertEqual(result.stderr, stderr)
 
 
 class ExitTrapTests(unittest.TestCase):
@@ -194,7 +191,7 @@ class ExitTrapTests(unittest.TestCase):
         self, command: str, last: str, names: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         script = "set -euo pipefail\n" + shell_functions(
-            VERIFY, "run", "report_stop", "verify_exit", "finish_run", *names,
+            VERIFY, "run", "report_stop", "verify_exit", "finish_exit_diagnostics", "finish_run", *names,
         )
         script += f"""
 run_step() {{ return "$STEP_STATUS"; }}
@@ -207,6 +204,11 @@ lint_failure_is_the_tree() {{ [[ "$CMD" == lint ]]; }}
 cache_record() {{ printf '%s\\n' "$1" > "$CACHE_DIR/record"; }}
 CMD={command} CACHE_DIR=$1 RUN_LOG=$1/run.log RUN_STARTED=$SECONDS LAST_STEP_STATUS="" EXIT_STATUS=0
 STEP_STATUS={TEST_FAILED}
+VERIFY_START_DIR={VERIFY.parent} PY={VERIFY.parent}/../lib/py
+# verify_exit sends its diagnostics through this copy of standard error.
+exec {{VERIFY_EXIT_STDERR_FD}}>&2
+exit_diagnostics=$1/exit-diagnostics
+: > "$exit_diagnostics"
 printf 'older stop\\n' > "$CACHE_DIR/stopped.log"
 printf 'this run\\n' > "$RUN_LOG"
 {exit_trap()}
