@@ -50,6 +50,7 @@ from scripts.review_links import image_store, review_events
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
+from scripts.worktree import worktrees
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import invoke_cli
@@ -106,7 +107,7 @@ def setUpModule() -> None:
         "SHOWRUNNER_STATE_DIR": str(folder / "showrunner-state"),
         "UNIT_HISTORY_DIR": str(folder / "history"), copy_record.ROOT_ENV: str(folder / "scratch"),
         copy_record.COPIES_ENV: str(folder / "copies"),
-        scratch.VISIBLE_ROOT_ENV: str(folder / "repro"), scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
+        scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
     _ = unittest.enterModuleContext(mock.patch.object(sys.modules[__name__], "PRODUCTION", home / DEMO_DOC))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
@@ -2632,7 +2633,7 @@ class ChangeIdentityTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
             "NEXT_STATE_DIR": str(self.root / "next"), copy_record.ROOT_ENV: str(self.root / "scratch"),
-            scratch.VISIBLE_ROOT_ENV: str(self.root / "repro"), scratch.HOLDS_ENV: str(self.root / "holds.json")})))
+            scratch.HOLDS_ENV: str(self.root / "holds.json")})))
         self.path = self.root / "change-review - natedev.md"
         top_doc = self.root / "top.md"
         self.doc = self.root / "child.md"
@@ -2768,7 +2769,7 @@ class ActionTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            copy_record.ROOT_ENV: str(root / "scratch"), scratch.VISIBLE_ROOT_ENV: str(root / "repro"),
+            copy_record.ROOT_ENV: str(root / "scratch"),
             scratch.HOLDS_ENV: str(root / "holds.json"),
         })))
         self.path = root / "change-review.md"
@@ -3234,7 +3235,7 @@ class ActionTest(unittest.TestCase):
                               + "| 2026-10-14 |\n| C70 |", text)
 
     def test_a_verdict_keeps_the_rows_scratch_folders_either_way(self) -> None:
-        demo = scratch.new("row:natedev-C1", "demo", visible=True)
+        demo = scratch.new("row:natedev-C1", "demo")
         copy = scratch.new("row:natedev-C2", "copy")
         kept = scratch.new("row:natedev-C3")
         _ = change_review.append_rows(self.fresh, pictured_changes([Visible(name, "B", "C") for name in "XYZ"]), date(2026, 10, 15), "",
@@ -3247,6 +3248,56 @@ class ActionTest(unittest.TestCase):
                           f"kept for a manual removal list: {copy} (scratch, task row:natedev-C2 ended)\n"))
         self.assertTrue(demo.is_dir() and copy.is_dir())
         self.assertTrue(kept.is_dir())
+
+    def try_folder(self) -> tuple[Path, Path]:
+        """Give row C76 a producer unit and that unit's recorded try folder; return the folder and its repository."""
+        unit = fixture_member("unit", name="tryunit", parent=fixture_member("showrunner", name="fixture").id)
+        _ = self.path.write_text(LIST.replace("| How to check |\n| --- | --- | --- | --- | --- |",
+                                              "| How to check | Producer |\n| --- | --- | --- | --- | --- | --- |")
+                                 .replace("| Launch Hana |", f"| Launch Hana | {unit.id} |")
+                                 .replace("| Change a font |", "| Change a font | |"), encoding="utf-8")
+        root = self.path.parent
+        origin, repo, tree = root / "origin.git", root / "repo", root / "worktrees/repo/tryunit/try-C76"
+        for arguments in (("init", "--bare", str(origin)), ("init", "-b", "main", str(repo)),
+                          ("-C", str(repo), "commit", "--allow-empty", "-m", "base"),
+                          ("-C", str(repo), "remote", "add", "origin", str(origin)),
+                          ("-C", str(repo), "push", "-q", "origin", "main"),
+                          ("-C", str(repo), "worktree", "add", "-q", "-b", "tryunit-try-C76", str(tree))):
+            _ = subprocess.run(["git", *arguments], check=True, capture_output=True)
+        base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        worktrees.write_record(worktrees.WorktreeRecord(
+            1, str(tree), "tryunit-try-C76", str(repo), base, "main", "tryunit", "2026-11-23T00:00:00+00:00",
+            worktrees.RecordedWorktreeOutput("tryunit", "try-C76", root / "build/repo/tryunit/try-C76")))
+        self.addCleanup(worktrees.record_file(tree).unlink, missing_ok=True)
+        return tree, repo
+
+    def test_a_verdict_removes_the_producers_clean_try_folder(self) -> None:
+        tree, repo = self.try_folder()
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                 "--verdict", "works"), (0, "fixture/C76 landed\n", ""))
+        remove.assert_called_once_with(tree, repo)
+
+    def test_a_verdict_keeps_a_dirty_try_folder_and_names_the_command(self) -> None:
+        tree, repo = self.try_folder()
+        _ = (tree / "notes.txt").write_text("work")
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            code, output, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                  "--verdict", "no")
+        remove.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertIn(f"{tree} kept: it has uncommitted changes. Save the work, then run: env --chdir={repo} ", output)
+        self.assertIn(f"worktrees.py remove {tree}\n", output)
+        self.assertTrue((tree / "notes.txt").is_file())
+
+    def test_withdraw_removes_the_rows_try_folder(self) -> None:
+        tree, repo = self.try_folder()
+        with mock.patch.object(worktrees, "remove_git_checkout") as remove:
+            code, output, _ = run("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                  "--reason", "reverted")
+        self.assertEqual((code, output), (0, "fixture/C76 withdrawn\n"))
+        remove.assert_called_once_with(tree, repo)
 
     def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
         for row in ("C99", "76"):

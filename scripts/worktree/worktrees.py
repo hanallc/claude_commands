@@ -927,6 +927,43 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         record_file(path).unlink(missing_ok=True)
 
 
+def unsaved_work(path: Path) -> str | None:
+    """Give the reason to keep a checkout, or None when Git holds all its work on a remote."""
+    if git(path, "status", "--porcelain").stdout:
+        return "it has uncommitted changes"
+    if git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes").stdout.strip():
+        return "it has commits that are on no remote"
+    return None
+
+
+def remove_named(unit: str, short_name: str) -> list[str]:
+    """Remove each recorded worktree of `unit` called `short_name`, and keep its branch.
+
+    A worktree with unsaved work stays. Return one line for each kept worktree.
+    """
+    lines: list[str] = []
+    for record_path in sorted(state_folder().glob("*.json")):
+        try:
+            record = read_record(record_path)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record.layout, RecordedWorktreeOutput) or (
+                record.layout.unit, record.layout.short_name) != (unit, short_name):
+            continue
+        path, repo = Path(record.path), Path(record.repo)
+        try:
+            reason = unsaved_work(path) if path.exists() else None
+            if reason is None:
+                remove_git_checkout(path, repo)
+                continue
+        except (Refused, OSError, ValueError) as error:
+            reason = str(error)
+        command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
+        lines.append(f"{path} kept: {reason}. Save the work, then run: {command}")
+    return lines
+
+
 @dataclass(frozen=True)
 class UnitFolderRename:
     repo: str

@@ -369,16 +369,21 @@ such as `sdlc/C434` or `sdlc/C9`.
 ## A folder for the user to try
 
 When the user needs a folder to try a change in (a repro, a demo crate, a
-copy), make it after `add` prints the row's number, never by hand:
+copy), make a worktree after `add` prints the row's number. Never make the folder by hand.
+The team that made the row runs this from its own worktree:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/scratch.py" new --task row:<showrunner>-C<n> --name <word> --visible
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/worktree/worktrees.py" make <repo> <team> try-C<n>
 ```
 
-It prints `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
-Name that path in the row's How to check cell (`edit`). `adopt <path>` with the
-same options moves a folder that already exists there. Without `--visible`
-the folder uses the configured scratch root. The row's verdict removes the folder and its owned Cargo outputs.
+`<team>` is the row's Producer (the unit, or the showrunner for its own change), and `<n>` is the row's local number.
+It prints `~/worktrees/<repo>/<team>/try-C<n>`. Its `target` link points to the build output `/build/<repo>/<team>/try-C<n>`.
+Name that path in the row's How to check cell (`edit`).
+
+The row's verdict or withdraw sends the try folder to `worktrees.py remove` and keeps its branch.
+That removal lists the checkout and its build output for manual removal.
+A try folder with uncommitted changes, or with commits that are on no remote, stays.
+The verdict or withdraw then prints one line with the path, the reason and the command the team runs after it saves the work.
 Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
 Check both output filesystems with `df -h` before a large build.
 
@@ -401,7 +406,8 @@ Pass the displayed ID, such as `sdlc/C9`, or its existing list-based ID.
 For a showrunner check, include `--validation <id>` from the validation message.
 An ordinary verdict moves the row to `## Reviewed` with the verdict, today's date and its Merged cell.
 It prints `<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`.
-It removes the row's scratch folders and prints `removed <path>` for each.
+It ends the row's scratch task: each scratch folder of the row stays for a manual removal list.
+It sends the row's try folder to removal (see "A folder for the user to try").
 The Producer cell stays with the row in Reviewed.
 Send a returning row and the user's words to its Producer staff id.
 Read its current session from the staff record at send time.
@@ -409,7 +415,7 @@ An empty Producer cell belongs to the list's showrunner.
 The fix returns as a new row.
 
 Rerunning the same verdict prints `already has this verdict`, the first run's
-line and the scratch removal lines. A different verdict for a Reviewed row is
+line and the scratch and try folder lines. A different verdict for a Reviewed row is
 refused; it still ends the row's scratch folders.
 
 ## withdraw
@@ -424,6 +430,7 @@ Pass the displayed ID, such as `hana/C386`.
 The row moves to Reviewed with the verdict `withdrawn`.
 The Review log keeps the user's words, the withdrawal time and any previous verdict.
 A repeat with the same words leaves the history unchanged.
+Like a verdict, it ends the row's scratch task and sends the row's try folder to removal.
 Wait for any pending verdict message before you withdraw the row.
 
 ## Validate

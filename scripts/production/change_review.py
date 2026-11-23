@@ -53,6 +53,7 @@ from scripts.production import change_routing, delivery_state, session_staff, sh
 from scripts.production.production_doc import ProductionDocument, Refusal, production_field
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
+from scripts.worktree import worktrees
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -2001,15 +2002,27 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """End the scratch task of `row` and return any error.
+    """End the scratch task and the try folder of `row`, and return any error.
 
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
         _ = scratch.end(f"row:{_owner(path)}-{row}")
-        return []
+        lines: list[str] = []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
-        return [f"scratch not removed: {error}"]
+        lines = [f"scratch not removed: {error}"]
+    return lines + end_try_folder(path, row)
+
+
+def end_try_folder(path: Path, row: str) -> list[str]:
+    """Remove the try folder `try-<row>` of the row's producer; return one line for a kept folder."""
+    local = row.rpartition("/")[2]
+    try:
+        found = next((item for item in review_rows(path) if item["#"] == local), None)
+        producer = staff.snapshot().by_id(staff.StaffId(found.get(PRODUCER, ""))) if found is not None else None
+        return worktrees.remove_named(producer.name if producer is not None else _owner(path), f"try-{local}")
+    except (ChangeReviewError, staff.StaffRefused, OSError, ValueError) as error:
+        return [f"try folder not checked: {error}"]
 
 
 class VerdictDurabilityUnconfirmed(RuntimeError):

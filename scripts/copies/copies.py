@@ -735,7 +735,7 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         scratch_settings = conf.read("scratch")
     moment = time.time() if now is None else now
     task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
-    destination = scratch.target(task, word, False, scratch_settings=scratch_settings)
+    destination = scratch.target(task, word, scratch_settings=scratch_settings)
     if owner:
         destination = scratch.free_name(destination.parent, clone_owner_prefix(checked_owner(owner)) + destination.name)
     spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=destination.parent,
