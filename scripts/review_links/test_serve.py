@@ -5995,7 +5995,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         configuration.mkdir()
         _ = write_config_fixture(configuration / "build_queue.conf",
             "move_timeout_seconds=3\nmove_request_bytes=512\nmove_highlight_seconds=2\n")
-        _ = write_config_fixture(configuration / "review_links.conf", "kill_operator_login=local-node-owner\n")
+        _ = write_config_fixture(configuration / "review_links.conf")
         origin = f"http://127.0.0.1:{self.port}"
         request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"))
         line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id),))
@@ -7407,6 +7407,32 @@ class ReviewLinksConfigTests(unittest.TestCase):
                     "tailscale_check_seconds"):
             with self.subTest(key=key):
                 self.assertEqual(settings.number(key), float(values[key]))
+
+    def builds_operator_with(self, overrides: str, login_name: str) -> tuple[bool, list[list[str]]]:
+        """Run builds_operator against a fake Tailscale peer with one review_links.conf override."""
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(folder / "review_links.conf", overrides)
+        commands: list[list[str]] = []
+
+        def tailscale(args: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            self.assertEqual(args[:-1], ["tailscale", "whois", "--json", "--proto=tcp"])
+            output = {"Node": {}, "UserProfile": {"ID": 8, "LoginName": login_name}}
+            return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+
+        with (patch.dict(os.environ, {"CONF_DIR": str(folder)}),
+              patch.object(serve, "subprocess", Mock(wraps=subprocess, run=tailscale))):
+            return serve.builds_operator(("127.0.0.1", 4242)), commands
+
+    def test_builds_operator_refuses_each_peer_when_the_login_is_empty(self) -> None:
+        self.assertEqual(self.builds_operator_with("operator_login=\n", "nate@example.com"), (False, []))
+
+    def test_builds_operator_accepts_only_the_named_login(self) -> None:
+        allowed, commands = self.builds_operator_with("operator_login=nate@example.com\n", "nate@example.com")
+        self.assertTrue(allowed)
+        self.assertEqual(len(commands), 1)
+        refused, _ = self.builds_operator_with("operator_login=nate@example.com\n", "other@example.com")
+        self.assertFalse(refused)
 
 if __name__ == "__main__":
     _ = unittest.main()

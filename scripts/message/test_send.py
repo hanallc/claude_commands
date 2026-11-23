@@ -161,15 +161,39 @@ def run_bound_fixture(message: send.Message, timeout: float, command: list[str],
                                        target.to, send.RelayRequestForwarded("t1", send.agent_text(target, via_relay=True)))
 
 
-def approve_relay_call(command: list[str], target: str, text: str, summary: str, tool_id: str = "t1") -> int:
+STAND_IN = send.RELAY_MESSAGE_STAND_IN
+
+
+def relay_guard_command(command: list[str]) -> list[str]:
+    """The guard command that send.py put in the relay's --settings."""
     settings = send.as_dict(send.loads(command[command.index("--settings") + 1]))
-    hooks = send.as_dict(settings.get("hooks"))
-    group = send.as_dict(send.as_list(hooks["PreToolUse"])[0])
-    hook = send.as_dict(send.as_list(group["hooks"])[0])
-    result = subprocess.run(shlex.split(send.as_str(hook["command"])), text=True, capture_output=True, check=False,
+    group = send.as_dict(send.as_list(send.as_dict(settings.get("hooks"))["PreToolUse"])[0])
+    return shlex.split(send.as_str(send.as_dict(send.as_list(group["hooks"])[0])["command"]))
+
+
+def run_relay_guard(command: list[str], target: str, text: str, summary: str,
+                    tool_id: str = "t1") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(relay_guard_command(command), text=True, capture_output=True, check=False,
         input=json.dumps({"tool_name": "SendMessage", "tool_use_id": tool_id,
                           "tool_input": {"to": target, "message": text, "summary": summary}}))
-    return result.returncode
+
+
+def approve_relay_call(command: list[str], target: str, text: str, summary: str, tool_id: str = "t1") -> int:
+    return run_relay_guard(command, target, text, summary, tool_id).returncode
+
+
+def expected_relay_text(command: list[str]) -> str:
+    """Read the approved message that send.py gave the relay guard."""
+    expected = Path(relay_guard_command(command)[-2])
+    return send.as_str(send.as_dict(send.loads(expected.read_text()))["message"])
+
+
+def guarded_payload(command: list[str], target: str, summary: str) -> str:
+    """Run the guard on a stand-in call, as Claude does, and return the message that Claude then sends."""
+    result = run_relay_guard(command, target, STAND_IN, summary)
+    assert result.returncode == 0, result.stderr
+    output = send.as_dict(send.loads(result.stdout))
+    return send.as_str(send.as_dict(send.as_dict(output["hookSpecificOutput"])["updatedInput"])["message"])
 
 
 RELAY_FIXTURE_TARGET = "uds:/fixture/private/delivery.sock"
@@ -320,8 +344,8 @@ send._bound_relay(message, 2, [], {}, attempt)
                                                        if line.startswith("- to: "))))
                 self.assertNotEqual(destination, message.to)
                 text = send.agent_text(message, via_relay=True)
-                self.assertEqual(approve_relay_call(command, message.to, text + " changed", message.summary), 0)
-                self.assertEqual(approve_relay_call(command, destination, text, message.summary, "t2"), 2)
+                self.assertEqual(approve_relay_call(command, message.to, STAND_IN + " changed", message.summary), 0)
+                self.assertEqual(approve_relay_call(command, destination, STAND_IN, message.summary, "t2"), 2)
                 with socket.socket(socket.AF_UNIX) as client:
                     client.settimeout(2)
                     client.connect(destination.removeprefix("uds:"))
@@ -332,14 +356,14 @@ send._bound_relay(message, 2, [], {}, attempt)
                     client.shutdown(socket.SHUT_WR)
                     if expect_no_write:
                         self.assertEqual(client.recv(1), b"")
-                        return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
+                        return 0, stream(INIT, call(STAND_IN + " changed", target=message.to), answer(OK)), ""
                     with listener.accept()[0] as checked:
                         checked.settimeout(2)
                         with checked.makefile("rb") as request:
                             self.assertEqual(request.read(), wire)
                         checked.sendall(b"fixture reply")
                     self.assertEqual(client.recv(40), b"fixture reply")
-                return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
+                return 0, stream(INIT, call(STAND_IN + " changed", target=message.to), answer(OK)), ""
 
             pid = os.getpid()
             registered = record(pid)
@@ -482,7 +506,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                   if line.startswith("- to: "))))
                 text = send.agent_text(message, via_relay=True)
-                self.assertEqual(approve_relay_call(command, target, text, message.summary), 0)
+                self.assertEqual(approve_relay_call(command, target, STAND_IN, message.summary), 0)
                 partial = stream({"type": "auth", "token": "fixture"}).encode() + relay_wire(text)[:-3]
                 client.settimeout(2)
                 client.connect(target[4:])
@@ -493,7 +517,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                     peer.setblocking(False)
                     with self.assertRaises(BlockingIOError):
                         _ = peer.recv(1)
-                    return 0, stream(INIT, call(text, target=target), answer(OK)), ""
+                    return 0, stream(INIT, call(STAND_IN, target=target), answer(OK)), ""
 
             with mock.patch.object(send, "run", side_effect=launch):
                 result = send.relay(message, 2)
@@ -558,7 +582,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                                _environment: dict[str, str], _cwd: Path) -> tuple[int, str, str]:
                         target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                           if line.startswith("- to: "))))
-                        self.assertEqual(approve_relay_call(command, target, text, message.summary), 0)
+                        self.assertEqual(approve_relay_call(command, target, STAND_IN, message.summary), 0)
                         with socket.socket(socket.AF_UNIX) as client:
                             client.settimeout(2)
                             client.connect(target[4:])
@@ -570,7 +594,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                                     with peer.makefile("rb") as reader:
                                         self.assertEqual(reader.read(), wire)
                             self.assertEqual(client.recv(1), b"")
-                        return 0, stream(INIT, call(text, target=target), answer(OK)), ""
+                        return 0, stream(INIT, call(STAND_IN, target=target), answer(OK)), ""
 
                     with mock.patch.object(send, "run", side_effect=launch):
                         result = send.relay(message, 2)
@@ -600,8 +624,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             publish_relay_identity(os.getpid(), "fixture", send.STATE / "relay_senders")
             attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), os.getpid(), started), os.getpid(), started, path)
             message = send.Message(f"uds:{path}", "fixture", "Preview", "body", None, claude_attempt=attempt)
-            text = send.agent_text(message, via_relay=True)
-            with mock.patch.object(send, "run", return_value=(0, stream(INIT, call(text), answer(OK)), "")):
+            with mock.patch.object(send, "run", return_value=(0, stream(INIT, call(STAND_IN), answer(OK)), "")):
                 result = send.relay(message, 2)
         self.assertNotIsInstance(result, send.UncertainRelayDelivery)
         self.assertEqual(result, send.Result("failed", "cannot forward through the checked socket: fixture broken pipe"))
@@ -738,8 +761,7 @@ send._bound_relay(message, 2, [], {}, attempt)
         at = datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)
         changed_message = {
             "time": at.isoformat(), "to": RELAY_FIXTURE_TARGET, "to_truncated": False,
-            "text_difference": {"first_difference": 37, "approved_window": displayed[5:69],
-                                "sent_window": original[5:]},
+            "text_difference": {"first_difference": 0, "approved_window": STAND_IN, "sent_window": original[:32]},
         }
         other_target = "session:other"
         with tempfile.TemporaryDirectory() as directory:
@@ -749,20 +771,20 @@ send._bound_relay(message, 2, [], {}, attempt)
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
             for label, code, events, outcome, detail, mismatches in (
-                ("approved", 0, stream(INIT, call(displayed), answer(OK)), "sent", "; verbatim;", []),
+                ("approved", 0, stream(INIT, call(STAND_IN), answer(OK)), "sent", "; verbatim;", []),
                 ("changed message", 0, stream(INIT, call(original), answer(OK)), "sent",
                  "guard set the approved input", [changed_message]),
-                ("changed target", 0, stream(INIT, call(displayed, target=other_target), answer(OK)), "sent",
+                ("changed target", 0, stream(INIT, call(STAND_IN, target=other_target), answer(OK)), "sent",
                  "guard set the approved input", [{"time": at.isoformat(), "to": other_target, "to_truncated": False}]),
-                ("changed summary", 0, stream(INIT, call(displayed, summary="Different"), answer(OK)), "sent",
+                ("changed summary", 0, stream(INIT, call(STAND_IN, summary="Different"), answer(OK)), "sent",
                  "guard set the approved input", [{"time": at.isoformat(), "to": RELAY_FIXTURE_TARGET,
                                                    "to_truncated": False, "summary_changed": True}]),
-                ("timeout", None, stream(INIT, call(displayed)), "failed",
+                ("timeout", None, stream(INIT, call(STAND_IN)), "failed",
                  "relay timed out after 10 s; delivery unconfirmed", []),
                 ("timeout with changed message", None, stream(INIT, call(original)), "failed",
                  "relay timed out after 10 s; delivery unconfirmed", [changed_message]),
                 ("second call refused", 0,
-                 stream(INIT, call(original), answer(OK), call(displayed, "refused"),
+                 stream(INIT, call(original), answer(OK), call(STAND_IN, "refused"),
                         answer("already approved", "refused", error=True)),
                  "sent", "guard set the approved input; forwarded 1 of 2 SendMessage calls", [changed_message]),
             ):
@@ -778,8 +800,10 @@ send._bound_relay(message, 2, [], {}, attempt)
                     mock.patch.object(send, "run", return_value=(code, events, "")) as launch,
                 ):
                     _ = write_send_config(config / "send.conf", "")
-                    result = send.relay(fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
-                                                             "sdlc · roles · worker test"), 10)
+                    message = fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
+                                                    "sdlc · roles · worker test")
+                    self.assertEqual(send.agent_text(message, via_relay=True), displayed)
+                    result = send.relay(message, 10)
                     self.assertEqual(result.outcome, outcome, result.detail)
                     self.assertIn(detail, result.detail)
                     self.assertEqual(relay_mismatches(state), mismatches)
@@ -788,12 +812,23 @@ send._bound_relay(message, 2, [], {}, attempt)
                     command = cast(list[str], launch.call_args.args[0])
                     self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
                     self.assertEqual(command[4], "sender-address")
-                    self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+                    prompt = cast(str, launch.call_args.args[1])
+                    self.assertNotIn("body", prompt)
+                    self.assertIn(f"- message: {json.dumps(STAND_IN)}", prompt)
+
+    def test_relay_prompt_carries_the_stand_in_and_no_message_text(self) -> None:
+        body = "line of a long report\n" * 1000
+        message = send.Message("uds:/recipient", "shutdown", "Stop", body, None)
+        prompt = send.relay_prompt(message)
+        self.assertNotIn("line of a long report", prompt)
+        self.assertIn(f"- message: {json.dumps(STAND_IN)}", prompt)
+        self.assertIn(f"- summary: {json.dumps('Stop')}", prompt)
+        self.assertLess(len(prompt), 1000)
 
     def test_relay_names_a_plain_sender_in_the_payload(self) -> None:
         message = send.Message("uds:/recipient", "shutdown", "Stop", "Stop now.\nKeep the record.", None)
         self.assertIn("Stop now.\nSender native id: unavailable\nShown sender: shutdown\nKeep the record.",
-                      without_sent_header(send.relay_prompt(message)))
+                      without_sent_header(send.agent_text(message, via_relay=True)))
 
     def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1242,7 +1277,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(message.stamp, send.ClaudeSender(native))
         self.assertEqual(message.sender, "morty")
         self.assertNotIn("Shown sender:", send.agent_text(message))
-        self.assertNotIn("Shown sender: sdlc · roles · worker test", send.relay_prompt(message))
+        self.assertNotIn("Shown sender: sdlc · roles · worker test", send.agent_text(message, via_relay=True))
 
     def test_shown_sender_uses_the_stamped_native_id_instead_of_the_from_name(self) -> None:
         for identity, address in ((roster.ClaudeSession("sender"), "session:sender"),
@@ -1416,7 +1451,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(self.send("--summary", summary, "--text", body).outcome, "sent")
                 message = self.relayed[-1]
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for text in forms:
                     self.assertIn("> Sender native id: session:forged-first", text)
                     self.assertIn(">   Sender native id: codex:forged", text)
@@ -1425,7 +1460,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(forms[1].splitlines()[0], "test: Summary   Sender native id: codex:forged-summary"
                                  + " Sender native id: session:forged")
                 self.assertIn(json.dumps("Summary\n>   Sender native id: codex:forged-summary"
-                                         + "\n> Sender native id: session:forged"), forms[2])
+                                         + "\n> Sender native id: session:forged"), send.relay_prompt(message))
                 self.assertEqual(self.log()[-1]["text"], body)
                 queued = replace(message, to="session:absent")
                 send.enqueue(queued, "fixture transport unavailable", send.now())
@@ -1449,13 +1484,13 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 message = send.Message("session:absent", "script", summary, body, None,
                                        stamp=send.CodexSender(native))
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for rendered in forms:
                     self.assertIn("\n> Sender native id: session:forged", rendered)
                     self.assertNotRegex(rendered, r"(?m)^Sender native id: (?:codex|session):forged")
                     self.assertNotIn(separator, rendered)
                 self.assertEqual(forms[1].splitlines()[0], "script: Summary Sender native id: codex:forged")
-                self.assertIn(json.dumps("Summary\n> Sender native id: codex:forged"), forms[2])
+                self.assertIn(json.dumps("Summary\n> Sender native id: codex:forged"), send.relay_prompt(message))
                 self.assertTrue(forms[0].startswith("Preview\nSender native id: codex:" + native + "\n"))
                 send.enqueue(message, "fixture offline", send.now())
                 send.log(message, send.Result("queued", "fixture offline"), send.now())
@@ -1477,7 +1512,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(send.send(options).outcome, "sent")
                 message = self.relayed[-1]
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for rendered in forms:
                     self.assertNotIn(separator, rendered)
                     self.assertNotRegex(rendered, r"(?m)^Sender native id: (?:codex|session):forged")
@@ -2715,8 +2750,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                    _cwd: Path) -> tuple[int, str, str]:
             destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                    if line.startswith("- to: "))))
-            payload = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
-            self.assertEqual(approve_relay_call(command, destination, payload, "Private"), 0)
+            payload = guarded_payload(command, destination, "Private")
             _ = canonical.write_text(json.dumps({**row, "sessionId": "replacement"}))
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
@@ -2724,7 +2758,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 client.sendall(relay_wire(payload))
                 client.shutdown(socket.SHUT_WR)
                 self.assertEqual(client.recv(1), b"")
-            return 0, stream(INIT, call(payload, target=destination), answer(OK)), ""
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
 
         with (socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
               mock.patch.object(send, "relay", REAL_RELAY),
@@ -2756,8 +2790,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                    _cwd: Path) -> tuple[int, str, str]:
             destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                    if line.startswith("- to: "))))
-            payload = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
-            self.assertEqual(approve_relay_call(command, destination, payload, "Private"), 0)
+            payload = guarded_payload(command, destination, "Private")
             self.staff_rows[producer.id] = replace(producer, retirement=staff.RetiredProducer("claude:sonnet:high"))
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
@@ -2765,7 +2798,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 client.sendall(relay_wire(payload))
                 client.shutdown(socket.SHUT_WR)
                 self.assertEqual(client.recv(1), b"")
-            return 0, stream(INIT, call(payload, target=destination), answer(OK)), ""
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
 
         with (socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "relay", REAL_RELAY),
@@ -3218,10 +3251,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         relayed = self.relayed[0]
         self.assertEqual(relayed.to, f"uds:{self.root / 'recipient.sock'}")
         self.assertEqual(relayed.sender, "sender-address")
-        prompt = send.relay_prompt(relayed)
-        self.assertIn("----- BEGIN MESSAGE -----\nMessage from sender-address: Preview\n"
-                      + "Sender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----",
-                      without_sent_header(prompt))
+        self.assertEqual("Message from sender-address: Preview\n"
+                         + "Sender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody",
+                         without_sent_header(send.agent_text(relayed, via_relay=True)))
         self.assertEqual(self.log()[0]["from"], "sender-address")
 
     def test_remote_forwarding_keeps_sending_machine_display_despite_receiver_name_collision(self) -> None:
@@ -3910,14 +3942,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         def launch(command: list[str], prompt: str, _timeout: float, _env: dict[str, str] | None,
                    _cwd: Path | None, *, fault: str = "") -> tuple[int | None, str, str]:
             target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith("- to: "))))
-            text = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
+            text = expected_relay_text(command)
             wire = relay_wire(text)
             with socket.socket(socket.AF_UNIX) as client, listener.accept()[0] as peer:
                 if fault != "empty-timeout":
                     client.settimeout(3)
                     client.connect(target[4:])
                 if fault not in ("empty-timeout", "accept"):
-                    self.assertEqual(approve_relay_call(command, target, text, "Notice"), 0)
+                    self.assertEqual(approve_relay_call(command, target, STAND_IN, "Notice"), 0)
                     client.sendall(wire[:-3] if fault in ("buffered-timeout", "exit", "command") else wire)
                     client.shutdown(socket.SHUT_WR)
                 if fault in ("", "confirmed-timeout", "forwarded-timeout", "review-rejection-timeout"):
@@ -3927,7 +3959,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(accepted[-1], wire)
                     peer.sendall(b"k")
                     self.assertEqual(client.recv(1), b"k")
-                    request_call = call(text, target=target)
+                    request_call = call(STAND_IN, target=target)
                     if fault == "forwarded-timeout":
                         return None, stream(INIT, request_call), ""
                     if fault == "review-rejection-timeout":
@@ -6765,6 +6797,127 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertFalse((self.root / "log.jsonl").exists())
         self.assertEqual(self.relayed, [])
 
+    def mac_locked_main(self, sender: str = "hana", *extra: str) -> tuple[int, str, mock.MagicMock]:
+        arguments = ["--to", "user", "--text-id", "mac.locked", "--value", f"sender={sender}",
+                     "--value", "waiting=One unit's phase waits for 2 shots", "--clears-when", "true", *extra]
+        with (mock.patch.object(send, "send", return_value=send.Result("sent", "to the user")) as sent,
+              redirect_stdout(output := io.StringIO()), redirect_stderr(io.StringIO())):
+            code = send.main(arguments)
+        return code, output.getvalue(), sent
+
+    def mac_in_use(self) -> tuple[Path, Path, Path]:
+        """Give the Mac state folder, mac_test.conf and build_targets.conf of a Mac in use."""
+        state = self.root / "mac-state"
+        state.mkdir(exist_ok=True)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(state)})))
+        mac_test_conf, build_targets_conf = self.root / "config/mac_test.conf", self.root / "config/build_targets.conf"
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
+        _ = write_config_fixture(build_targets_conf, "enabled.mac=on\n")
+        (state / "block.json").unlink(missing_ok=True)
+        return state, mac_test_conf, build_targets_conf
+
+    def write_mac_block(self, state: Path, holder: str) -> None:
+        from scripts.mac_test import mac_test
+
+        since = datetime.fromtimestamp(1000, timezone.utc)
+        block = mac_test.block_record(mac_test.ActiveMacBlock(
+            holder, "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue(holder),
+            mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+        _ = (state / "block.json").write_text(json.dumps(block))
+
+    def assert_mac_locked_sent(self, sender: str = "hana", *extra: str) -> None:
+        code, output, sent = self.mac_locked_main(sender, *extra)
+        self.assertEqual(code, 0)
+        self.assertIn("SENT: to the user", output)
+        sent.assert_called_once()
+
+    def assert_mac_locked_not_sent(self, sender: str = "hana") -> None:
+        code, output, sent = self.mac_locked_main(sender)
+        self.assertEqual(code, 0)
+        self.assertIn("SKIPPED: the Mac is off on purpose", output)
+        sent.assert_not_called()
+
+    def test_mac_locked_push_waits_for_a_mac_in_use(self) -> None:
+        for name, offload, enabled, blocked in (("block", "on", "on", True), ("offload", "off", "on", False),
+                                                ("enabled", "on", "off", False)):
+            state, mac_test_conf, build_targets_conf = self.mac_in_use()
+            _ = write_config_fixture(mac_test_conf, f"offload={offload}\n")
+            _ = write_config_fixture(build_targets_conf, f"enabled.mac={enabled}\n")
+            if blocked:
+                self.write_mac_block(state, "nate")
+            with self.subTest(signal=name):
+                self.assert_mac_locked_not_sent()
+        _ = self.mac_in_use()
+        self.assert_mac_locked_sent()
+
+    def test_mac_locked_push_goes_when_a_record_or_setting_is_unusable(self) -> None:
+        def corrupt_block(state: Path, _mac_test_conf: Path, _build_targets_conf: Path) -> None:
+            _ = (state / "block.json").write_text("{not json")
+
+        def unusable_offload(_state: Path, mac_test_conf: Path, _build_targets_conf: Path) -> None:
+            _ = write_config_fixture(mac_test_conf, "offload=maybe\n")
+
+        def unusable_enabled(_state: Path, _mac_test_conf: Path, build_targets_conf: Path) -> None:
+            _ = write_config_fixture(build_targets_conf, "enabled.mac=maybe\n")
+
+        def missing_settings_with_no_committed_copy(_state: Path, mac_test_conf: Path,
+                                                    _build_targets_conf: Path) -> None:
+            # CONF_DIR is not a Git checkout, so conf finds no committed copy.
+            # The offload read fails, so the Mac counts as in use.
+            mac_test_conf.unlink()
+
+        for fault in (corrupt_block, unusable_offload, unusable_enabled, missing_settings_with_no_committed_copy):
+            fault(*self.mac_in_use())
+            with self.subTest(fault=fault.__name__):
+                self.assert_mac_locked_sent()
+
+    def test_mac_locked_push_reads_the_committed_offload_when_the_live_value_is_missing(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        # CONF_DIR is a Git checkout here, so conf reads the committed copy.
+        for arguments in (("init", "-q"), ("add", mac_test_conf.name), ("commit", "-qm", "committed settings")):
+            _ = subprocess.run(["git", "-C", str(mac_test_conf.parent), "-c", "user.name=Send test",
+                                "-c", "user.email=send@example.invalid", "-c", "commit.gpgsign=false", *arguments],
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                               env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def missing_key() -> None:
+            _ = mac_test_conf.write_text("# The live file has no offload key.\n")
+
+        for fault in (missing_key, mac_test_conf.unlink):
+            fault()
+            with self.subTest(fault=fault.__name__):
+                code, output, sent = self.mac_locked_main()
+                self.assertEqual(code, 0)
+                self.assertIn("SKIPPED: the Mac is off on purpose (offload=off)", output)
+                sent.assert_not_called()
+
+    def test_mac_locked_block_holder_still_pushes_and_another_sender_does_not(self) -> None:
+        state, _, _ = self.mac_in_use()
+        self.write_mac_block(state, "hana")
+        self.assert_mac_locked_sent("hana")
+        self.assert_mac_locked_not_sent("nate")
+
+    def test_mac_locked_forward_to_natedev_asks_only_on_the_delivering_host(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        self.assert_mac_locked_sent("hana", "--machine", "natedev")
+        self.assert_mac_locked_not_sent()
+
+    def test_mac_locked_skip_on_natedev_is_a_confirmed_skip_on_the_mac(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        code, output, _ = self.mac_locked_main()
+        options = send.parse(["--machine", "natedev", "--to", "user", "--text-id", "mac.locked",
+                              "--value", "sender=hana", "--value", "waiting=One unit's phase waits for 2 shots",
+                              "--clears-when", "true"])
+        message = send.Message("user", "hana", "Mac locked", "Details", options.key)
+        with mock.patch.object(send, "run", return_value=(code, output, "")):
+            result = send.remote(message, "natedev", options)
+        self.assertEqual(result.outcome, "skipped")
+        self.assertIsInstance(result.failure, send.NoFailedPush)
+        self.assertIn("the Mac is off on purpose (offload=off)", result.detail)
+
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
                      "--action", "Choose retry.", "--text", "The build stopped."]
@@ -8111,18 +8264,18 @@ class ReadRelayTests(ShutdownTestCase):
         return send.read_relay(send.RelayTransportResponse(0, stdout, "", RELAY_FIXTURE_TARGET, forward), "hello")
 
     def test_delivered_verbatim(self) -> None:
-        result = self.read_relay(stream(INIT, call("hello"), answer(OK)))
+        result = self.read_relay(stream(INIT, call(STAND_IN), answer(OK)))
         self.assertEqual(result, send.CheckedRelayAcceptance("t1", "mode auto; verbatim; queued there (msg_id m1)"))
         self.assertEqual(relay_mismatches(self.state), [])
 
     def test_forwarded_changed_call_is_accepted_and_records_the_difference(self) -> None:
         for text, target, logged_target, truncated, difference in (
-            ("hi", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
-             {"first_difference": 1, "approved_window": "hello", "sent_window": "hi"}),
-            ("hell", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
-             {"first_difference": 4, "approved_window": "hello", "sent_window": "hell"}),
-            ("hello", "session:other", "session:other", False, None),
-            ("hello", "a" * 257, "a" * 256, True, None),
+            ("hello", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 0, "approved_window": STAND_IN, "sent_window": "hello"}),
+            ("approved", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 8, "approved_window": STAND_IN, "sent_window": "approved"}),
+            (STAND_IN, "session:other", "session:other", False, None),
+            (STAND_IN, "a" * 257, "a" * 256, True, None),
         ):
             with self.subTest(text=text, target=target):
                 result = self.read_relay(stream(INIT, call(text, target=target), answer(OK)))
@@ -8140,7 +8293,7 @@ class ReadRelayTests(ShutdownTestCase):
         self.assertEqual(len(relay_mismatches(self.state)), 1)
 
     def test_multiple_changed_calls_are_logged_before_the_forward_result(self) -> None:
-        events = stream(INIT, call("changed", target="session:first"), call("hello", "t2", target="session:second"))
+        events = stream(INIT, call("changed", target="session:first"), call(STAND_IN, "t2", target="session:second"))
         refused = send.RefusedRelayRequest("failed", "the relay tool call has no approval")
         for forward, expected in (
             (send.RelayRequestNotForwarded(), send.Result("failed", "2 SendMessage calls")),
@@ -8158,23 +8311,23 @@ class ReadRelayTests(ShutdownTestCase):
 
     def test_error_result_is_not_delivered(self) -> None:
         no_write = send.RelayRequestNotForwarded()
-        result = self.read_relay(stream(INIT, call("hello"), answer("No agent named bogus", error=True)), no_write)
+        result = self.read_relay(stream(INIT, call(STAND_IN), answer("No agent named bogus", error=True)), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus"))
         refused = answer('{"success":false,"message":"No agent named bogus is reachable. Use ListAgents."}')
-        result = self.read_relay(stream(INIT, call("hello"), refused), no_write)
+        result = self.read_relay(stream(INIT, call(STAND_IN), refused), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus is reachable. Use ListAgents."))
 
     def test_recipient_refusal_after_the_write_is_unconfirmed(self) -> None:
         for refused in (answer("recipient refused", error=True),
                         answer('{"success":false,"message":"recipient refused"}')):
             with self.subTest(result=refused):
-                result = self.read_relay(stream(INIT, call("hello"), refused))
+                result = self.read_relay(stream(INIT, call(STAND_IN), refused))
                 self.assertIsInstance(result, send.UncertainRelayDelivery)
                 self.assertEqual(result, send.Result("failed", "recipient refused; delivery unconfirmed"))
 
     def test_review_relay_preserves_an_explicit_rejection_after_forwarding(self) -> None:
         refusal = answer('{"success":false,"message":"No agent named bogus is reachable."}')
-        events = stream(INIT, call("hello"), refusal)
+        events = stream(INIT, call(STAND_IN), refusal)
         observed = send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, self.FORWARDED)
         ordinary = send.read_relay(observed, "hello")
         self.assertIsInstance(ordinary, send.UncertainRelayDelivery)
@@ -8182,8 +8335,8 @@ class ReadRelayTests(ShutdownTestCase):
         self.assertEqual(result, send.Result("failed", "No agent named bogus is reachable."))
 
     def test_multiple_calls_with_missing_or_failed_forward_evidence_cannot_confirm_delivery(self) -> None:
-        events = stream(INIT, call("hello"), answer("matched two sessions", error=True),
-                        call("hello", "t2"), answer(OK, "t2"))
+        events = stream(INIT, call(STAND_IN), answer("matched two sessions", error=True),
+                        call(STAND_IN, "t2"), answer(OK, "t2"))
         for forward, expected in (
             (send.RelayRequestForwarded("t3", "hello"),
              send.UncertainRelayDelivery("failed", "2 SendMessage calls; delivery unconfirmed")),
@@ -8205,13 +8358,13 @@ class ReadRelayTests(ShutdownTestCase):
         for label, events, forward in (
             ("wrong forward for changed call", stream(INIT, call("hi"), answer(OK)),
              send.RelayRequestForwarded("t2", "hello")),
-            ("missing result", stream(INIT, call("hello")), self.FORWARDED),
-            ("wrong result", stream(INIT, call("hello"), answer(OK, "t2")), self.FORWARDED),
-            ("implicit result", stream(INIT, call("hello"), answer("queued there")), self.FORWARDED),
-            ("missing forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestNotForwarded()),
-            ("wrong forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t2", "hello")),
-            ("wrong forwarded payload", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t1", "hi")),
-            ("interrupted forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestInterrupted("write interrupted")),
+            ("missing result", stream(INIT, call(STAND_IN)), self.FORWARDED),
+            ("wrong result", stream(INIT, call(STAND_IN), answer(OK, "t2")), self.FORWARDED),
+            ("implicit result", stream(INIT, call(STAND_IN), answer("queued there")), self.FORWARDED),
+            ("missing forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestNotForwarded()),
+            ("wrong forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestForwarded("t2", "hello")),
+            ("wrong forwarded payload", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestForwarded("t1", "hi")),
+            ("interrupted forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestInterrupted("write interrupted")),
         ):
             with self.subTest(label=label):
                 result = self.read_relay(events, forward)
@@ -8394,17 +8547,16 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         executable.parent.mkdir(parents=True)
         _ = executable.write_text(python_tool_source(
             "import json, socket, sys\n"
-            + "from scripts.message.test_send import INIT, OK, answer, approve_relay_call, call, relay_wire, stream\n"
+            + "from scripts.message.test_send import INIT, OK, STAND_IN, answer, call, guarded_payload, relay_wire, stream\n"
             + "prompt = sys.stdin.read()\n"
             + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
-            + "text = prompt.split('----- BEGIN MESSAGE -----\\n', 1)[1].rsplit('\\n----- END MESSAGE -----', 1)[0]\n"
             + "summary = json.loads(next(line[11:] for line in prompt.splitlines() if line.startswith('- summary: ')))\n"
-            + "assert approve_relay_call(sys.argv, target, text, summary) == 0\n"
+            + "text = guarded_payload(sys.argv, target, summary)\n"
             + "with socket.socket(socket.AF_UNIX) as connection:\n"
             + "    connection.connect(target.removeprefix('uds:'))\n"
             + "    connection.sendall(relay_wire(text))\n"
             + "    connection.shutdown(socket.SHUT_WR)\n"
-            + "print(stream(INIT, call(text, target=target), answer(OK)), end='')\n"))
+            + "print(stream(INIT, call(STAND_IN, target=target), answer(OK)), end='')\n"))
         executable.chmod(0o755)
         question, response = "Can you confirm the survey?", "The survey is confirmed."
         sender_id = fixture_runtime_id("account-daemon-reply-sender")
