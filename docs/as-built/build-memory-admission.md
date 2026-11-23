@@ -367,7 +367,7 @@ An explicit private sweep root selects its own `copies` folder instead of the li
 Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
-The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
+The service keeps `state.json`, `queue.json`, and `view.json` in the admission folder outside temporary build folders.
 `step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
@@ -636,6 +636,13 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
+Each publication of the view also replaces `admission/view.json` atomically.
+The file holds the publication time and the encoded socket reply.
+A socket `ViewRequest` returns the last published view without starting a pass.
+
+The Builds feed reads `view.json` and uses its publication time as the data time.
+The page shows `Late` when the data age exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
+A missing or unreadable view file gives the queue read error.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.

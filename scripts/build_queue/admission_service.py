@@ -1394,7 +1394,7 @@ class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
     wait_positions: dict[str, int]
-    view_bytes: bytes = b""
+    view_bytes: bytes
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
 
@@ -2909,6 +2909,7 @@ class AdmissionServer:
                     self._prune_places()
             self.persist()
             (self.state_dir / "queue.json").unlink(missing_ok=True)
+            (self.state_dir / queue_snapshot.VIEW_NAME).unlink(missing_ok=True)
             for episode, waiting in tuple(self.waiters.items()):
                 if self.waiters.get(episode) is not waiting:
                     continue
@@ -3352,7 +3353,13 @@ class AdmissionServer:
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
-        self.published = PublishedReplies(view, explain, positions)
+        view_bytes = wire.encode_reply(view).encode()
+        self.published = PublishedReplies(view, explain, positions, view_bytes)
+        try:
+            queue_snapshot.write_view_snapshot(self.state_dir, self.clock.now(), view_bytes)
+        except OSError:
+            # Keep the last complete file when publication fails.
+            pass
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3360,8 +3367,6 @@ class AdmissionServer:
         published = self.published
         if isinstance(published, PublishedReplies):
             if reply is published.view:
-                if not published.view_bytes:
-                    published.view_bytes = wire.encode_reply(reply).encode()
                 return published.view_bytes
             if reply is published.explain:
                 if not published.explain_bytes:
@@ -5454,16 +5459,17 @@ done
         if isinstance(request, wire.BuildHistoryRequest):
             return [wire.BuildHistoryReply(self.build_history_generation)]
         if isinstance(request, (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
-            if not isinstance(self.pending_configuration, NoPass):
-                _ = self.run_pass()
-            elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
-                self._prune_runs()
-                ordered = self._queue_order()
-                if isinstance(self.last_policy, records.AdmissionPolicy):
-                    self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
-                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
-                self.pass_stale = False
-                self._publish_replies(ordered)
+            if not isinstance(request, wire.ViewRequest):
+                if not isinstance(self.pending_configuration, NoPass):
+                    _ = self.run_pass()
+                elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
+                    self._prune_runs()
+                    ordered = self._queue_order()
+                    if isinstance(self.last_policy, records.AdmissionPolicy):
+                        self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
+                        self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
+                    self.pass_stale = False
+                    self._publish_replies(ordered)
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, records.QueueInputs)
@@ -5472,10 +5478,10 @@ done
             published = self.published
             if not isinstance(published, PublishedReplies):
                 raise RuntimeError("service has no published pass")
-            if isinstance(request, wire.ExplainRequest):
-                return [published.explain]
             if isinstance(request, wire.ViewRequest):
                 return [published.view]
+            if isinstance(request, wire.ExplainRequest):
+                return [published.explain]
             return [wire.MineReply(published.view.reading)]
         if isinstance(request, (wire.QueueMoveRequest, wire.QueueUndoRequest)):
             return self._move_queue(request)

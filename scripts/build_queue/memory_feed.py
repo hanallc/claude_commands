@@ -45,10 +45,10 @@ from scripts.build_queue import admission_code
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
 from scripts.buildlog import charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
-from scripts.buildlog.store import host_name
+from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, limits_view, placement
+from scripts.build_queue import cloud_progress, limits_view, placement, queue_snapshot
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
@@ -2789,7 +2789,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     names = read_step_names()
     staff_display = staff_names.read()
     with codec.snapshot_staff(staff_display.members):
-        parsed = admission_client.view()
+        published = queue_snapshot.read_view_snapshot(root() / "admission")
+    parsed = published.reading
+    admission_records.warn_configuration_diagnostics(parsed.diagnostics)
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
@@ -3291,7 +3293,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(),
-        "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": published.written_at, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",

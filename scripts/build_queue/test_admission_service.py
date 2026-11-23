@@ -65,7 +65,8 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import (AdmissionFixture, FixedSystemReader, GIB, InjectedCrash,
+                                                       SocketPeer, caller_admission, only_admitted)
 
 
 def setUpModule() -> None:
@@ -1934,26 +1935,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         self.assertIn(str(path), reading.reason)
 
 
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
 class ReferenceActivityReader(ScopeActivityReader):
     """Keep the original ancestry traversal as an independent test reference."""
 
@@ -2012,6 +1993,39 @@ class ReplyPublicationTests(unittest.TestCase):
             owner = records.run_owner(request.owner.pid, request.owner.start_time)
             self.assertEqual(occupancy.verify_run_owners, {"fixture": frozenset({owner})})
 
+    def test_publish_writes_the_view_reply_and_publication_time(self) -> None:
+        with AdmissionFixture() as fixture:
+            server = fixture.server
+            path = fixture.state_dir / "view.json"
+            for _ in range(2):
+                fixture.clock.advance(1)
+                _ = server.run_pass()
+                reply, = server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                saved = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(saved["written_at"], fixture.clock.now())
+                self.assertEqual(saved["reply"], wire.encode_reply(reply))
+                self.assertEqual(queue_snapshot.read_view_snapshot(fixture.state_dir),
+                                 queue_snapshot.PublishedView(fixture.clock.now(), reply.reading))
+
+    def test_view_request_does_not_run_a_pending_or_stale_pass(self) -> None:
+        for reason in ("pending configuration", "stale pass"):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                server = fixture.server
+                previous, = server.handle_request(wire.ViewRequest())
+                configuration = server.configuration
+                assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+                if reason == "pending configuration":
+                    server.pending_configuration = configuration
+                else:
+                    server.pass_stale = True
+                with (mock.patch.object(server, "run_pass", wraps=server.run_pass) as passed,
+                      mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as refreshed):
+                    current, = server.handle_request(wire.ViewRequest())
+                passed.assert_not_called()
+                refreshed.assert_not_called()
+                self.assertIs(current, previous)
+
     def test_view_and_explain_reuse_the_bytes_of_the_completed_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.hold_starts()
@@ -2029,7 +2043,7 @@ class ReplyPublicationTests(unittest.TestCase):
             expected_explain = wire.encode_reply(wire.ExplainReply(reading.explanation, reading.diagnostics)).encode()
             with mock.patch.object(wire, "encode_reply", wraps=wire.encode_reply) as encode:
                 _ = server.run_pass()
-                encode.assert_not_called()
+                self.assertEqual(encode.call_count, 1)
                 view, = server.handle_request(wire.ViewRequest())
                 explain, = server.handle_request(wire.ExplainRequest())
                 self.assertEqual(server.reply_bytes(view), expected_view)
@@ -2051,6 +2065,7 @@ class ReplyPublicationTests(unittest.TestCase):
             assert isinstance(configuration, gate.UsableAdmissionConfiguration)
             policy = replace(configuration.config.policy, safety_bytes=9 * GIB)
             server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
+            _ = server.run_pass()
             reply, = server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             self.assertEqual(reply.reading.explanation.policy.safety_bytes, 9 * GIB)
@@ -2343,6 +2358,7 @@ class ReplyPublicationTests(unittest.TestCase):
             assert isinstance(configuration, gate.UsableAdmissionConfiguration)
             policy = replace(configuration.config.policy, peak_hold=records.PeakHold(1000))
             server.pending_configuration = replace(configuration, config=replace(configuration.config, policy=policy))
+            _ = server.run_pass()
             reply, = server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             inputs = server.last_inputs
@@ -4687,6 +4703,7 @@ class RoomAndSlotTests(unittest.TestCase):
             successor = fixture.request(run=run, need=8 * GIB)
             _ = fixture.server.handle_request(successor)
             fixture.release(grant)
+            _ = fixture.run_pass()
             reply, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             viewed, = reply.reading.explanation.decided_from.slots
@@ -9132,7 +9149,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             self.assertEqual(service.read_state(fixture.state_dir).caller_versions,
                              {f"{live.owner.pid}-{live.owner.start_time}": live.code_version})
 
-    def test_release_keeps_unrelated_running_evidence_and_defers_admission_until_query(self) -> None:
+    def test_release_keeps_unrelated_running_evidence_and_defers_admission_until_the_pass(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.compiler(GIB)
             scope = fixture.root / "builds.slice/cache.scope"
@@ -9161,7 +9178,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             fixture.allow_next_start()
             with mock.patch.object(gate, "admission_pass", wraps=gate.admission_pass) as passed:
                 self.assertIsInstance(fixture.server.handle_request(wire.ViewRequest())[0], wire.ViewReply)
-            self.assertEqual(passed.call_count, 1)
+            passed.assert_not_called()
             self.assertNotIn(waiting.episode, fixture.server.reservations)
             fixture.server.run_once(0)
             self.assertIn(waiting.episode, fixture.server.reservations)

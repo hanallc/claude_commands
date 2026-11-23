@@ -625,8 +625,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
 
     def test_head_drop_goes_ahead_of_a_leading_unnamed_wait(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -650,7 +650,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -658,8 +658,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(page.get("move_revision"), moved.line.revision)
 
     def test_undo_restores_the_head_ahead_of_an_unnamed_wait_after_restart(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -693,7 +693,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -734,8 +734,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undone.line), [first, second, third])
 
     def test_unstarted_scoped_grant_shows_once_and_keeps_its_memory_charge(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             request = fixture.request()
@@ -753,7 +753,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -1297,8 +1297,8 @@ class QueueMoveTests(unittest.TestCase):
 
     def check_builds_table(self, fixture: PlacementFixture, requests: tuple[wire.PlacementRequest, ...],
                           mac: wire.PlacementRequest) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         _ = fixture.run_pass()
         reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -1306,7 +1306,7 @@ class QueueMoveTests(unittest.TestCase):
         feed = MemoryFeedTests()
         feed.setUp()
         try:
-            with patch.object(admission_client, "view", return_value=reply.reading):
+            with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                 table = memory_feed.reading()["waiters"]
         finally:
             _ = feed.doCleanups()
@@ -1519,8 +1519,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual([member.row_id for member in move_line(fixture).members], [after, before])
 
     def test_builds_table_reports_a_hold_and_the_speculative_copy_rule(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with PlacementFixture() as fixture:
             fixture.free(0)
@@ -1543,7 +1543,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     table = {row["pid"]: row for row in memory_feed.reading()["waiters"]}
             finally:
                 _ = feed.doCleanups()
