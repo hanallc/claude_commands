@@ -1254,6 +1254,11 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         except ValueError:
             detail = f"(unreadable record): {line}"
         captured += f"\n{job.module}: a test read live memory {detail}\n"
+    config_marker = job.log.parent / "live-config-writes"
+    config_violation = config_marker.is_file()
+    if config_violation:
+        path = config_marker.read_text(encoding="utf-8", errors="replace").partition("\n")[0]
+        captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     try:
@@ -1269,7 +1274,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     if (job.memory_stopped or job.killed_for.startswith("time limit")) and status == 0:
         status = 1
-    tripwire_tripped = bool(calls or readings)
+    tripwire_tripped = bool(calls or readings or config_violation)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
