@@ -1680,7 +1680,7 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The Images page shows every waiting image, oldest first, with no age filter.
 A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
-On a page 1108px or wider, a single card is 680px wide and a pair card is up to 1376px wide; both are centered in the images pane.
+On a page 1108px or wider, a single card is 680px wide while the group panel is 300px or narrower, and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card.
 
@@ -1688,6 +1688,7 @@ A group is a run of shown cards in a row with the same owner.
 A panel at the top left of the images pane lists one row per group, in three columns: owner name, count and the time of its first image.
 The owner name has no kind, such as `(unit)`.
 The panel has a rounded outline and thin lines between its rows and columns.
+Above 900px each panel column is as wide as its widest cell, so no name or time wraps; a wide panel can stack a pair below 1108px.
 The panel stays in place while the cards scroll.
 Each row shows a hover color, and a click on a row goes to the first image of its group.
 On a narrow screen the panel goes above the cards and scrolls with them, and its owner column takes the spare width.
