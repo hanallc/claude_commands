@@ -10,6 +10,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1172,9 +1173,15 @@ def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChan
 def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
     """Create complete typed records after checking the whole batch under one lock."""
     store = _store(keeper)
-    with store.locked():
+    with store.list_allocation():
+        next_number = store.next_number()
+        for item in items:
+            if item.number < next_number:
+                raise ListError(f"{item.id}: the next available number is L{next_number}")
         if any(store.folder().glob("*.md")):
             raise ListError("the list folder already holds a record")
+        if os.path.lexists(store.counter_path()):
+            raise ListError("the list folder already has a number sequence")
         pending = {item.number: item for item in items}
         if len(pending) != len(items):
             raise ListError("item numbers must be unique")
@@ -1189,6 +1196,8 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
                 raise ListError(f"{item.id}: the item already exists")
             _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
         _require_active_open_producers(items)
+        if pending:
+            store.reserve_number(max(pending))
         for item in items:
             _save(store, item)
 
@@ -1219,14 +1228,30 @@ _CREATION_DEFAULTS: _CreationDefaults = {
 def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
         number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
+        assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
         ) -> ListItem:
     """Create an item without reusing an existing record number."""
     store = _store(keeper)
-    with store.locked():
-        chosen = store.next_number() if isinstance(number, NextNumber) else number
+    def read_reference(number: int) -> ListItem:
+        identity = f"L{number}"
+        if assigned_to is AllItems.INCLUDED:
+            return load(keeper, identity)
+        try:
+            fields, body = store.read(identity)
+            if fields.get("producer", keeper) == assigned_to:
+                return _read_item(store, identity, fields, body)
+        except (ListError, OSError):
+            pass
+        raise ListError("the referenced List item does not exist")
+
+    with store.list_allocation():
+        next_number = store.next_number()
+        chosen = next_number if isinstance(number, NextNumber) else number
         identity = f"L{chosen}"
-        if store.path(identity).exists():
+        if os.path.lexists(store.path(identity)):
             raise ListError(f"{identity}: the item already exists")
+        if chosen < next_number:
+            raise ListError(f"{identity}: the next available number is L{next_number}")
         moment = now()
         defaults = _CREATION_DEFAULTS.copy()
         defaults["requested_by"] = requested_by
@@ -1240,8 +1265,9 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
                                 "requested_by": item.requested_by, **changes}
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
-        _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
+        _check_links(read_reference, item.number, changes)
         _require_active_open_producers((item,))
+        store.reserve_number(chosen)
         _save(store, item)
         return item
 
@@ -1782,6 +1808,7 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 @dataclass(frozen=True)
 class _ListQuestionStore:
     keeper: staff.StaffId
+    source: str
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
@@ -1801,7 +1828,7 @@ class _ListQuestionStore:
         self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
 
     def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
-        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), PAGE_SOURCE)
+        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), self.source)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
     def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
@@ -1814,7 +1841,7 @@ class _ListQuestionStore:
             questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
                               for question in current.questions)
             moment = now()
-            entry = ItemChange(moment, QuestionAnswered(question_id), "morty")
+            entry = ItemChange(moment, QuestionAnswered(question_id), self.source)
             changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
             try:
                 _save(store, changed)
@@ -1830,7 +1857,7 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    questions = _ListQuestionStore(keeper, request)
+    questions = _ListQuestionStore(keeper, PAGE_SOURCE, request)
     with store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
@@ -2068,6 +2095,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
+    _ = answer.add_argument("--keeper", type=staff.StaffId,
+                            help="the staff ID of the record keeper (defaults to your staff ID)")
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2115,6 +2144,18 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session has no staff row")
         if caller.kind != "producer":
             raise ListError("the current session must be a producer")
+        if name == "answer":
+            identity, question = cast(str, args.id), cast(str, args.question)
+            target = cast(staff.StaffId | None, args.keeper)
+            keeper = caller.id if target is None else target
+            if keeper != caller.id and caller.id != producer_id(record, "morty"):
+                raise ListError("only the record keeper or morty can answer")
+            result = page_question.answer(_ListQuestionStore(keeper, caller.name), identity, question,
+                                          cast(str, args.text))
+            if isinstance(result, page_question.AnswerRefused):
+                raise ListError(result.reason)
+            print(f"answered {identity} {question}")
+            return 0
         keeper = producer_id(record, "morty")
         assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
         if name == "list":
@@ -2148,15 +2189,8 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
-        if assigned_to is not AllItems.INCLUDED:
+        if assigned_to is not AllItems.INCLUDED and name != "add":
             raise ListError(f"only morty can run {name}")
-        if name == "answer":
-            identity, question = cast(str, args.id), cast(str, args.question)
-            result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
-            if isinstance(result, page_question.AnswerRefused):
-                raise ListError(result.reason)
-            print(f"answered {identity} {question}")
-            return 0
         assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
@@ -2190,16 +2224,24 @@ def main(argv: list[str] | None = None) -> int:
             _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
             changes = _cli_changes(args, record)
+            number = cast(dict[str, object], vars(args)).get("number")
+            if assigned_to is not AllItems.INCLUDED:
+                if changes.get("producer", caller.id) != caller.id:
+                    raise ListError("a producer can add only its own items")
+                if number is not None:
+                    raise ListError("only morty can choose an item number")
+                changes["producer"] = caller.id
+                source = caller.name
             if add_evidence is not None:
                 changes["evidence"] = _append_evidence(changes.get("evidence", ""), add_evidence)
-            number = cast(dict[str, object], vars(args)).get("number")
             owner = changes.get("owner")
             if owner is None:
                 raise ListError("owner must name a showrunner staff id")
             item = add(keeper, cast(str, args.title), owner=owner, source=source,
-                       number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes)
+                       number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes,
+                       assigned_to=assigned_to)
             print(item.id)
-            return _notify_producer_assignment(item, keeper, keeper)
+            return _notify_producer_assignment(item, caller.id, keeper)
         elif name == "park":
             _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source)
         elif name == "close":
