@@ -899,7 +899,7 @@ def builds_operator(peer: tuple[str, int]) -> bool:
     try:
         settings = conf.read_or_repository("review_links")
         timeout = settings.number("tailscale_timeout_seconds")
-        login = settings.text("kill_operator_login")
+        login = settings.value("operator_login", str, allow_blank=True)
         if not login:
             return False
         address, port = peer
