@@ -34,7 +34,7 @@ from scripts.lib.slot_root import slot_root as slot_root
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
 LEASE_SUFFIX = ".lease.json"
 # Python writes these folders beside each imported module; they hold no work.
-TOOL_OUTPUT_FOLDERS = ("__pycache__",)
+_TOOL_OUTPUT_FOLDERS = ("__pycache__",)
 
 
 @dataclass(frozen=True)
@@ -419,7 +419,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 if not os.path.lexists(index):
                     _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
                 scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
-                        *(f"--exclude={folder}/" for folder in TOOL_OUTPUT_FOLDERS))
+                        *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
                 rescued = False
                 try:
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
