@@ -2675,6 +2675,17 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(self.agent.submitted, [])
 
+        with self.subTest(cause="an exact-path retry has no saved delivery"):
+            _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                worker_name=opened.row.name, worker_id=opened.row.id,
+                launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)],
+                prompt=self.prompt, kind="impl", lens="")
+            state = self.run_dir / unit_runs.STATE_FILE
+            recorded = state.read_bytes()
+            self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
+            self.assertEqual(state.read_bytes(), recorded)
+            self.assertEqual(self.agent.submitted, [])
+
         with self.subTest(cause="busy assignment preserves the submitted pass"):
             self.fixture.world.first_turn_timeout = False
             self.agent.finish_after = 100

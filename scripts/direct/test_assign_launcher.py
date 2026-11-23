@@ -1103,14 +1103,21 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertEqual(self.native.agent.submitted, submitted)
                 self.assertEqual(self.native.fixture.world.launches, launched)
                 self.assertEqual({path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}, files)
+        manifest = self.session_dir / "phases/7/dispatch_1_paths.json"
+        def assert_files_published_before_prompt() -> None:
+            self.assertEqual(read_object(manifest)["paths"], ["src/worker.py", "tests/test_worker.py"])
+            self.assertIn("[impl] register:", (self.session_dir / "board.log").read_text())
+
+        self.native.agent.during_prompt = assert_files_published_before_prompt
         _ = self.successful("implement", "--reply-file", str(reply_file))
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(self.turn_starts, 1)
-        prompt = (self.session_dir / f"phases/7/{name}_prompt.txt").read_text()
+        state = read_object(self.session_dir / unit_runs.STATE_FILE)
+        passed = assign.object_map(assign.object_map(state["pass"])[name])
+        prompt = Path(str(passed["prompt_file"])).read_text()
         self.assertIn(self.prompt.read_text().strip(), prompt)
         for text in ("detached_runs.py start", "--kind python-tests before --", "Simple, Fast and Beautiful", "poll"):
             self.assertIn(text, prompt)
-        manifest = self.session_dir / "phases/7/dispatch_1_paths.json"
         self.assertEqual(read_object(manifest), {"worker": name, "round": 1,
                                                "paths": ["src/worker.py", "tests/test_worker.py"]})
         self.assertEqual((manifest.parent / f"{name}_status").read_text().strip(), "done")
@@ -1174,6 +1181,12 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.assignment_records()[name]["thread_id"], record["thread_id"])
         command = self.native.fixture.world.requests[-1][1]
         self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+
+        _ = (self.project / "new.rs").write_text("fn third() {}\n")
+        outcomes.append("Findings")
+        _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
+        self.assertEqual(len(prepared), 3)
+        self.assertIn("+fn third", prepared[2].read_text())
 
     def test_style_preparation_failure_through_assign_keeps_code_review_running(self) -> None:
         self.prepare_style_project()
@@ -1293,6 +1306,21 @@ class AssignLauncherTests(HookAssignmentFixture):
                     self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, saved_files)
                     self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run_files)
                     self.assertEqual(self.turn_starts, 2)
+            with self.subTest(target="named worker with a status file to move"):
+                source = phase / "requested_status"
+                write_text_atomic(source, "requested worker status\n")
+                arguments = ["assign", "impl", str(self.prompt), "--session-dir", str(self.session_dir),
+                             "--phase", "7", "--slot", "requested", "--kind", "assign", "--name", "impl",
+                             "--launcher-command", json.dumps(["assign.sh", "requested"]),
+                             "--completion-actions", json.dumps({"status_file": str(source)})]
+                with worker_panes.worker_lock(self.native.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
+                    self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                    refused = invoke_cli(worker, lambda: worker.main(arguments), arguments, os.environ.copy(), self.project)
+                self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+                self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()},
+                                 {**saved_files, source: b"requested worker status\n"})
+                self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run_files)
+                self.assertEqual(self.turn_starts, 2)
             self.native.agent.complete(pane)
             self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
 

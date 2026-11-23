@@ -98,12 +98,13 @@ The recorder gives the replacement a new pass id even when the assignment inputs
 
 A standard `assign.sh` launch prepares a prompt with a unique file name.
 The pass records the prompt path and content digest before submission.
-A retry with the same prompt content uses the saved path and checks the transcript receipt.
-Changed content for the same slot prompt returns busy while the pass stays active.
-This refusal applies when the launcher arguments change.
+A retry with the same launcher arguments and prompt content uses the saved path and checks the transcript receipt.
+Changed content for the same assignment returns busy while the pass stays active.
+The check treats equivalent worker target arguments as the same assignment.
 The recorder repeats the digest check under its lock before it changes the pass.
-On exit 6, the launcher leaves the slot prompt, numbered paths record, slot log, status and summary untouched.
+On exit 6, the launcher leaves the open pass files untouched.
 The launcher records the refusal on the shared board.
+Before prompt delivery, the worker publishes the numbered paths record, posts board registration, and writes the heartbeat header.
 The worker prepares style review files after it checks readiness under the worker lock.
 The intentional second review stage keeps its existing pass across its separate prompt path.
 An identical rerun of a completed dispatch uses the saved pass notice.

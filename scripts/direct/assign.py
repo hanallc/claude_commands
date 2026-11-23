@@ -38,7 +38,7 @@ from scripts.production import staff, worker_admission
 from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
 from scripts.production import worker as staff_worker
-from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 from scripts.whoami import quota_state
@@ -263,6 +263,24 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
 
 
 @dataclass
+class NoStyleAssignment:
+    """This dispatch has no phase style result to capture."""
+
+
+@dataclass
+class StyleAssignment:
+    directory: Path
+    summary: Path
+    captured: bool = False
+
+
+
+
+
+
+
+
+@dataclass
 class AssignmentResult:
     args: Arguments
     run: Path
@@ -272,9 +290,17 @@ class AssignmentResult:
     env: dict[str, str]
     pass_open: bool = False
     started_at: float = field(default_factory=time.time)
+    style_assignment: NoStyleAssignment | StyleAssignment = field(default_factory=NoStyleAssignment)
 
     def failed_pass_command(self) -> list[str]:
         return [PYTHON, PASS_RECORD, "finish-pass", "--session-dir", str(self.run), "--status", "error"]
+
+    def capture_style(self, code: int) -> None:
+        assignment = self.style_assignment
+        if isinstance(assignment, StyleAssignment) and not assignment.captured:
+            style_review.finish(assignment.directory, assignment.summary, code)
+            assignment.captured = True
+
 
 def recorded_phase(run: Path, phase_id: str) -> tuple[dict[str, object], dict[str, object]]:
     state = read_object(run / "progress_history_state.json")
@@ -401,6 +427,7 @@ def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, show
         _ = (status.parent / f"{dispatch.worker}_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
     if completed and reply.exists():
         _ = summary.write_text(reply.read_text())
+    dispatch.capture_style(0 if completed else code or 1)
     record_review(dispatch, completed, summary)
     if shown not in summary.read_text():
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
@@ -478,8 +505,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     summary = directory / f"{slot}_summary{suffix}.txt"
     status = directory / f"{slot}_status{suffix}"
-    slot_prompt = directory / f"{slot}_prompt{suffix}.txt"
-    prepared_prompt = slot_prompt.with_suffix(f".{instance}.txt")
+    prepared_prompt = directory / f"{slot}_prompt{suffix}.{instance}.txt"
     reply = directory / f"{slot}_reply{suffix}.txt"
     log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
@@ -491,7 +517,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(prepared_prompt),
                "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
                "--lens", args.lens, "--fix-cause", args.fix_cause,
-               "--fix-pass", str(args.pass_number if role == "fix" else 0), "--assignment-attempt-prompt"]
+               "--fix-pass", str(args.pass_number if role == "fix" else 0), "--assignment-paths", json.dumps(paths)]
     if args.style_since:
         command += ["--style-since", args.style_since, "--style-until", args.style_until,
                     "--style-checkout", str(Path(args.cwd).expanduser().resolve())]
@@ -503,15 +529,14 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
                 "--new-pass-instance-id", str(instance)]
-    worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
     with tempfile.TemporaryDirectory() as attempt:
         attempt_log = Path(attempt) / log.name
         if role != "review" and not claim_herdr_phase(run, phase, args.cwd, log, attempt_log, slot, env):
-            publish_slot_prompt(run, slot_prompt, content)
             return 1
         if args.model or args.effort:
             selection = resolve_model(args, role, env)
             command += ["--model", selection[1], "--effort", selection[2]]
+        worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
         write_text_atomic(prepared_prompt, content)
         with attempt_log.open("a+") as output:
             offset = output.tell()
@@ -525,21 +550,11 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                 elif (line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT)
                       or args.style_since and line.startswith(("Rust change ", "Diff: ", "Additions: ", "Style report: "))):
                     print(line, end="")
-    records = recorded_passes(run)
-    launches = [entry for entry in records if entry.get("event_type") == "pass_started"]
-    number = launch_number(launches, str(instance))
-    if args.style_since or (not number and not any(entry.get("prompt_file") == str(prepared_prompt)
-                                                  for entry in records)):
-        prepared_prompt.unlink()
     if result.returncode == staff_worker.ExitCode.BUSY:
+        prepared_prompt.unlink(missing_ok=True)
         _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
                   f"role={role}; exit {result.returncode}"], env)
         return result.returncode
-    publish_slot_prompt(run, slot_prompt, content)
-    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
-              f"role={role}; status in {status}"], env)
-    _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
-              "header", slot, role], env, check=False)
     outcome = progress_history.AssignmentLaunchExit.SUBMITTED
     if result.returncode:
         outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)
@@ -553,15 +568,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     log = progress_history.worker_artifact(log, slot, selected)
     with log.open("a") as output:
         _ = output.write(attempt_output)
-    if number:
-        publish_paths_manifest(directory, number, selected, paths, replace_existing=True)
-    elif result.returncode:
-        publish_paths_manifest(directory, len(launches) + 1, selected, paths, replace_existing=False)
-    else:
-        previous = next((text(entry.get("instance_id")) for entry in records if
-                         "event_type" not in entry and entry.get("team_slot") == selected), "")
-        if retry_number := launch_number(launches, previous):
-            publish_paths_manifest(directory, retry_number, selected, paths, replace_existing=False)
     if isinstance(recorded, progress_history.RecordedAssignmentLaunch) and result.returncode and not failure_recorded:
         return result.returncode
     if result.returncode:
@@ -586,36 +592,6 @@ def claim_herdr_phase(run: Path, phase: str, cwd: str, log: Path, attempt_log: P
             _ = output.write(attempt_log.read_text())
         print(diagnostics.getvalue().replace(str(attempt_log), str(log)), end="", file=sys.stderr)
     return claimed
-
-
-def publish_slot_prompt(run: Path, path: Path, content: str) -> None:
-    """Keep the slot copy available and protect open passes from older launchers."""
-    if path.is_file() and path.read_text() == content:
-        return
-    state = read_object(run / unit_runs.STATE_FILE)
-    if all(passed.get("prompt_file") != str(path) for passed in pass_recorder.open_passes(state).values()):
-        write_text_atomic(path, content)
-
-
-def launch_number(launches: list[dict[str, object]], instance: str) -> int:
-    return next((index for index, entry in enumerate(launches, 1)
-                 if instance and entry.get("pass_instance_id") == instance), 0)
-
-
-def publish_paths_manifest(directory: Path, number: int, slot: str, paths: list[str], *,
-                           replace_existing: bool) -> None:
-    manifest = directory / f"dispatch_{number}_paths.json"
-    content = json.dumps({"worker": slot, "round": number, "paths": paths})
-    if replace_existing:
-        write_text_atomic(manifest, content)
-    elif not manifest.is_file():
-        with prepared_replacement(manifest, content, mode=0o600) as candidate:
-            try:
-                os.link(candidate, manifest)
-            except FileExistsError:
-                return
-            sync_folder(directory)
-
 
 
 def require_live_director() -> None:
@@ -829,19 +805,6 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
     """Publish, hold, review, and close one managed Astra worker."""
     run = Path(args.session_dir).expanduser().resolve()
     return execute_astra_review_herdr(args, run, cwd, prompt, env)
-
-
-def recorded_passes(run: Path) -> list[dict[str, object]]:
-    state = read_object(run / unit_runs.STATE_FILE)
-    passes = [{**object_map(value), "team_slot": slot}
-              for slot, value in object_map(state.get("pass")).items()]
-    history = text(state.get("history_file"))
-    if history:
-        for line in Path(history).read_text().splitlines():
-            entry = object_map(cast(object, json.loads(line)))
-            if entry.get("event_type") in ("pass_started", "pass_finished"):
-                passes.append(entry)
-    return passes
 
 
 def submission_result(result: int) -> int:
