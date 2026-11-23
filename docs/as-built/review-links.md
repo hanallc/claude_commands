@@ -1663,9 +1663,27 @@ The request gets the Tailscale, host and origin checks of a Review attachment re
 Any other name, a link below the root, a missing file, or a file over 64 KB gets 404.
 A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
 
-`data-list-path` on `[data-list]` names `/console/list.html`.
-Row actions post to that path, and item-state reads use it, so the server needs no Studio POST route.
+`data-list-path` on `[data-list]` names the path of the view: `/console/list.html` or `/console/studio.html`.
+Row actions post to that path, and item-state reads use it.
+`serve.LIST_VIEWS` maps each path to its view, so both paths use one POST handler with the same Tailscale, origin and form-token checks.
+The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
 A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
+
+Each producer has one top priority item: the `top_item` List number in its staff row.
+`ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
+`list_page.top_priority_mark` reads the mark at render time.
+An item is the top item when it is open, its producer is an active producer row, and that row names its number.
+A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
+A flag before the title marks the top item in its row, also on the All tab.
+Each other open item has the button **Make top priority** beside Remove in its panel.
+The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
+The List path refuses `top`. The refresh after the save moves the flag and the band.
+
+The band is above the filters on a producer tab and hidden on All.
+It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
+The page renders one band for each top item and one band for no top item.
+A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
 `CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
 `page.studio.owner` sets the owner when the console shows the Studio as unavailable.
 The Studio uses the List status age limit and has no `status.studio` key.

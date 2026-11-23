@@ -92,9 +92,21 @@ font-size:20px;font-weight:600}
 .studio-tabs :is(.studio-name,b){position:absolute;bottom:4px;z-index:1;color:#fff;font-size:12px;line-height:16px}
 .studio-name{left:6px;right:24px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;text-align:left}
 .studio-tabs b{right:6px}
+.list-top-band{gap:16px;align-items:center;flex-wrap:wrap;margin:0 0 12px;padding:10px 14px;border-radius:10px;
+border:1px solid color-mix(in srgb,var(--warning) 45%,var(--line));background:color-mix(in srgb,var(--warning) 8%,var(--card))}
+.list-top-label{display:flex;align-items:center;gap:6px;color:var(--warning);font-size:12px;font-weight:700;
+letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
+.list-top-what{flex:1 1 240px;min-width:0}
+.list-top-what b{display:block;font-size:16px}
+.list-top-next{color:var(--ink-2);font-size:13.5px}.list-top-next p{margin:0}
+.list-top-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;white-space:nowrap}
+.list-top-meta small{color:var(--ink-3);font-size:12px}
+.list-top-flag{width:14px;height:14px;fill:currentColor;flex:none}
+.list-top-mark{display:inline-flex;vertical-align:-2px;margin-right:4px;color:var(--warning)}
 </style>'''
 
-STUDIO_VIEW = list_page.ListView("The Studio", "studio", STYLE, tabs, list_page.ProducerPlacement.ABOVE_FILTERS)
+STUDIO_VIEW = list_page.ListView("The Studio", "studio", PAGE_PATH, STYLE, tabs, list_page.ProducerPlacement.ABOVE_FILTERS,
+                                 list_page.TopPriority.SHOWN)
 
 
 def avatar(relative: str) -> bytes:

@@ -1083,7 +1083,7 @@ if(example.filterOn){
         self.assertIn('<h1 class="page-title">The List</h1>', listing)
         self.assertIn('<title>The List</title>', listing)
         self.assertNotIn('studio-tabs', listing)
-        self.assertEqual(studio.count('data-filter-row="producer"'), 1)
+        self.assertEqual(studio.count(row), 1)
         self.assertIn('<div class="studio-tabs">' + row, studio)
         self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
@@ -1153,6 +1153,82 @@ if(example.filterOn){
   && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
 '''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, add_item=False, markup=initial)
+
+    def test_studio_marks_the_open_top_item_of_each_producer_and_the_list_shows_no_marks(self) -> None:
+        items = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        status, latest, removed = items[1], items[2], items[5]
+        _ = staff.set_producer_top_item(DWIGHT.id, staff.TopItem(status.number))
+        # A Closed item reads as no top item.
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(removed.number))
+        listing = list_page.render(self.root / "reviews").decode()
+        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        for mark in ("list-top", 'value="top"', "Make top priority"):
+            self.assertNotIn(mark, listing)
+        rows: dict[int, str] = {}
+        for part in studio.split('<tbody data-list-item')[1:]:
+            row = part.split('</tbody>', 1)[0]
+            number = re.search(r'data-number="(\d+)"', row)
+            assert number is not None
+            rows[int(number[1])] = row
+        self.assertEqual([number for number, row in rows.items() if 'class="list-top-mark"' in row], [status.number])
+        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority" title="Top priority"><svg',
+                      rows[status.number])
+        self.assertNotIn('value="top"', rows[status.number])
+        self.assertIn('<button name="action" value="top">Make top priority</button><div class="list-parking-actions">',
+                      rows[latest.number])
+        self.assertLess(studio.index('<div class="studio-tabs">'), studio.index('<div class="list-top-bands">'))
+        bands = studio.split('<div class="list-top-bands">', 1)[1].split('<div data-record-filters>', 1)[0]
+        dwight = bands.split(f'<section class="list-top-band" data-top-band="staff:{DWIGHT.id}" aria-label="Top priority">',
+                             1)[1].split('</section>', 1)[0]
+        self.assertIn(f'<b>#{status.number} {status.title}</b>', dwight)
+        self.assertIn("Read the result and check the page.", dwight)
+        self.assertIn('<span class="list-state accent">Working</span><small>ETA ', dwight)
+        self.assertNotIn(MORTY.id, bands)
+        self.assertIn('<section class="list-top-band" data-top-band="none" aria-label="Top priority">', bands)
+        self.assertIn('<b>No top priority item</b><div class="list-top-next">Open an item and click "Make top priority".',
+                      bands)
+        self.assertIn(f':not([data-filter-value="all"],[data-filter-value="staff:{DWIGHT.id}"])) '
+                      + '[data-top-band="none"]{display:flex}', bands)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_band_follows_the_tab_and_make_top_priority_moves_the_flag(self) -> None:
+        _ = self.studio_avatars(MORTY.id, DWIGHT.id)
+        first = self.add("First item", number=1)
+        second = self.add("Second item", number=2)
+
+        def page() -> str:
+            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(second.number))
+        initial = page()
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(first.number))
+        fresh = page()
+        steps = r'''
+ const flagged=()=>JSON.stringify([...document.querySelectorAll('[data-list-item]')]
+  .filter(item=>item.querySelector('.list-top-mark')).map(item=>item.dataset.number));
+ const shown=()=>[...document.querySelectorAll('[data-top-band]')].filter(band=>getComputedStyle(band).display!=='none');
+ const bands=()=>JSON.stringify(shown().map(band=>band.dataset.topBand));
+ const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
+ check(flagged()==='["2"]' && bands()==='[]','The flag marks item 2 on the All tab, and All shows no band.');
+ check(form.querySelector('[value="top"]')?.textContent==='Make top priority','Item 1 has the Make top priority button.');
+ refreshMarkup=FRESH_PAGE;
+ submit('top');
+ check(requests.at(-1).get('action')==='top','The button posts the top action.');
+ finishPost({state:'saved',unread:'false'});
+ for(let tries=0;tries<200 && flagged()!=='["1"]';tries++) await new Promise(resolve=>setTimeout(resolve,10));
+ check(flagged()==='["1"]','The refresh moves the flag to item 1.');
+ tab('staff:'+MORTY).click();
+ check(bands()===JSON.stringify(['staff:'+MORTY]) && shown()[0].textContent.includes('#1 First item'),
+  'The producer tab shows its top item band.');
+ tab('staff:'+DWIGHT).click();
+ check(bands()==='["none"]' && shown()[0].textContent.includes('No top priority item'),
+  'A producer without a top item shows the empty band.');
+ tab('all').click();
+ check(bands()==='[]','The All tab hides the band.');
+'''.replace('MORTY', json.dumps(MORTY.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
+        steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
 
     def browser_row_expansion(self, steps: str, view: list_page.ListView = list_page.LIST_VIEW) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False, view=view).decode()

@@ -4985,14 +4985,58 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(b"<title>The Studio</title>", response.body)
         self.assertIn(b'<div class="studio-tabs">', response.body)
         self.assertIn(item.title.encode(), response.body)
-        self.assertEqual(response.body.count(b'data-filter-row="producer"'), 1)
-        self.assertIn(f'data-list-path="{list_page.PAGE_PATH}"'.encode(), response.body)
+        self.assertEqual(response.body.count(b'aria-label="Producer" data-filter-row="producer">'), 1)
+        self.assertIn(f'data-list-path="{studio_page.PAGE_PATH}"'.encode(), response.body)
         with (patch.object(list_page, "render", side_effect=OSError("fixture read failed")),
               redirect_stderr(StringIO()) as log):
             failed = self.request(studio_page.PAGE_PATH)
         self.assertEqual(failed.status, 503)
         self.assertIn(b"The Studio page is not available.", failed.body)
         self.assertIn("review-links studio: fixture read failed", log.getvalue())
+
+    def test_studio_top_priority_post_names_the_item_and_refuses_other_requests(self) -> None:
+        morty, item = self.list_keeper_item("Make this the top item")
+        _, closed = self.list_keeper_item("A closed item")
+        record = [staff.StaffSnapshot((morty,))]
+
+        def name_top_item(identity: staff.StaffId, top_item: staff.TopItem | staff.NoTopItem) -> staff.StaffRow:
+            named = replace(morty, top_item=top_item)
+            self.assertEqual(identity, morty.id)
+            record[0] = staff.StaffSnapshot((named,))
+            return named
+
+        def current_record(*_arguments: object, **_options: object) -> staff.StaffSnapshot:
+            return record[0]
+
+        def fields(entry: the_list.ListItem) -> dict[str, str]:
+            request = uuid4().hex
+            return {"keeper": morty.id, "id": entry.id, "request": request,
+                    "token": list_page.request_token(self.root, morty.id, entry.id, request),
+                    "action": "top", "words": "", "until": ""}
+
+        with (patch.object(staff, "snapshot", side_effect=current_record),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(staff, "set_producer_top_item", side_effect=name_top_item) as write):
+            _ = the_list.close(morty.id, closed.id, "Done", source="nate")
+            refusals = ((list_page.PAGE_PATH, fields(item), "", 400), (studio_page.PAGE_PATH, fields(closed), "", 400),
+                        (studio_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
+                        (studio_page.PAGE_PATH, fields(item), "https://elsewhere.invalid", 403))
+            for path, body, origin, status in refusals:
+                with self.subTest(path=path, id=body["id"], origin=origin):
+                    self.assertEqual(self.post(path, urlencode(body), origin=origin)[0], status)
+            with (patch.object(self.server, "verified_tailscale_address", ""),
+                  patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
+                self.assertEqual(self.post(studio_page.PAGE_PATH, urlencode(fields(item)))[0], 403)
+            write.assert_not_called()
+            code, body = self.post(studio_page.PAGE_PATH, urlencode(fields(item)))
+            self.assertEqual(code, 200, body)
+            page = self.request(studio_page.PAGE_PATH).body.decode()
+        write.assert_called_once_with(morty.id, staff.TopItem(item.number))
+        response = cast(dict[str, str], json.loads(body))
+        self.assertEqual(response["state"], "saved")
+        self.assertNotIn("Make top priority", response["detail_html"])
+        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
+        self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"

@@ -645,6 +645,43 @@ class TheListTests(unittest.TestCase):
                               source=retired.name, assigned_to=retired)
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
+    def top_items(self) -> tuple[staff.TopItem | staff.NoTopItem, ...]:
+        record = staff.snapshot()
+        return tuple(row.top_item for row in (record.by_id(OTHER.id), record.by_id(BOB.id)) if row is not None)
+
+    def test_make_top_priority_replaces_the_producers_top_item(self) -> None:
+        first = self.add(changes={"producer": OTHER.id})
+        second = self.add("Second item", changes={"producer": OTHER.id})
+        self.assertEqual(the_list.make_top_priority(MORTY.id, first.id, assigned_to=OTHER.id), first)
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        self.assertEqual(self.top_items(), (staff.TopItem(second.number), staff.NoTopItem()))
+        self.assertEqual(the_list.load(MORTY.id, second.id), second)
+
+    def test_make_top_priority_refuses_a_closed_unknown_or_other_producer_item(self) -> None:
+        closed = self.add(changes={"producer": OTHER.id})
+        _ = the_list.close(MORTY.id, closed.id, "Done", source="fixture")
+        other = self.add("Bob item", changes={"producer": BOB.id})
+        cases: tuple[tuple[str, staff.StaffId | the_list.AllItems, str], ...] = (
+            (closed.id, the_list.AllItems.INCLUDED, "is Closed"),
+            (other.id, OTHER.id, "assigned to another producer"),
+            ("L999", the_list.AllItems.INCLUDED, "L999: no list item"))
+        for identity, assigned_to, message in cases:
+            with self.subTest(identity=identity), self.assertRaisesRegex(the_list.ListError, message):
+                _ = the_list.make_top_priority(MORTY.id, identity, assigned_to=assigned_to)
+        self.assertEqual(self.top_items(), (staff.NoTopItem(), staff.NoTopItem()))
+
+    def test_top_priority_command_names_a_producers_own_item_and_morty_names_any(self) -> None:
+        own = self.add(changes={"producer": OTHER.id})
+        other = self.add("Bob item", changes={"producer": BOB.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("top-priority", "--id", str(own.number)),
+                             (0, f"{own.id} is the top priority item of dwight\n", ""))
+            refused, _, errors = self.command("top-priority", "--id", other.id)
+        self.assertEqual((refused, errors), (1, f"the_list: {other.id} is assigned to another producer\n"))
+        self.assertEqual(self.command("top-priority", "--id", other.id),
+                         (0, f"{other.id} is the top priority item of bob\n", ""))
+        self.assertEqual(self.top_items(), (staff.TopItem(own.number), staff.TopItem(other.number)))
+
     def test_producer_cli_update_reads_staff_once(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         record = staff.snapshot()

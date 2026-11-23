@@ -593,6 +593,8 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Make an open item the top priority item of its producer with `top-priority --id L<n>`.
+   A producer can name only its own item. Morty can name the item of any producer.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.

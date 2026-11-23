@@ -810,6 +810,35 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(restored, producer)
         self.assertEqual(staff.snapshot().by_path(producer.name), restored)
 
+    def test_producer_top_item_round_trips_and_the_setter_replaces_or_clears_it(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        runner = fixture_member("showrunner", name="another-production")
+        initial = cast(dict[str, object], self.assert_rerun("set-producer-top-item", producer.id, "--number=233"))
+        self.assertEqual(initial["top_item"], 233)
+        named = staff.set_producer_top_item(producer.id, staff.TopItem(240))
+        self.assertEqual(named, replace(producer, top_item=staff.TopItem(240)))
+        self.assertEqual(staff.StaffSnapshot.decode(staff.snapshot().encode()).by_id(producer.id), named)
+        self.assertEqual(staff.StaffRow.from_json(named.to_json()), named)
+        for row, value in ((producer, 0), (producer, -1), (producer, True), (producer, "233"), (runner, 1)):
+            with self.subTest(kind=row.kind, value=value), self.assertRaises(staff.StaffUnreadable):
+                _ = staff.StaffRow.from_json({**row.to_json(), "top_item": value})
+        self.assert_refused(lambda: staff.set_producer_top_item(runner.id, staff.TopItem(1)))
+        self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(0)))
+        _ = self.cli("set-producer-top-item", producer.id, "--number=L1", code=2)
+        cleared = staff.set_producer_top_item(producer.id, staff.NoTopItem())
+        self.assertEqual(cleared, producer)
+        self.assertNotIn("top_item", cleared.to_json())
+        _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
+        self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(1)))
+
+    def test_remote_top_item_setter_uses_one_owner_write(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        with self.machine("mac"):
+            changed = staff.set_producer_top_item(producer.id, staff.TopItem(7))
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["set-producer-top-item"])
+        self.assertEqual(changed.top_item, staff.TopItem(7))
+        self.assertEqual(staff.by_id(producer.id), changed)
+
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()

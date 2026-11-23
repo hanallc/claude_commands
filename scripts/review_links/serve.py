@@ -89,6 +89,9 @@ CONSOLE_DOCUMENTS = {
     placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
 }
 
+# Each List view answers its page, its item-state reads and its item actions at its own path.
+LIST_VIEWS = {view.path: view for view in (list_page.LIST_VIEW, studio_page.STUDIO_VIEW)}
+
 
 def capture_page_key(root: Path, place: str) -> str:
     """Identify a console document that Firefox can open."""
@@ -1041,11 +1044,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 prepared = _compressed_review_shell(owned) if accepts_gzip(self.headers.get("Accept-Encoding", "")) else b""
             self.review_response(owned, 'text/html; charset=utf-8', prepared)
             return None
-        if route.path == list_page.PAGE_PATH:
-            self.list_document(route.query, list_page.LIST_VIEW)
-            return None
-        if route.path == studio_page.PAGE_PATH:
-            self.list_document(route.query, studio_page.STUDIO_VIEW)
+        if route.path in LIST_VIEWS:
+            self.list_document(route.query, LIST_VIEWS[route.path])
             return None
         if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
             return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
@@ -1308,8 +1308,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == investigations_page.PAGE_PATH:
             self._write_post(self.investigation_post)
             return
-        if route.path == list_page.PAGE_PATH:
-            self._write_post(self.list_post)
+        if route.path in LIST_VIEWS:
+            view = LIST_VIEWS[route.path]
+            self._write_post(lambda: self.list_post(view))
             return
         if route.path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
@@ -1882,7 +1883,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         fields = parse_qs(query)
         if "item-state" in fields:
-            self.list_action_state(fields)
+            self.list_action_state(fields, view)
             return
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
@@ -2175,7 +2176,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     content += '<template data-list-review-read-error></template>'
             self.html_response(200, content.encode())
 
-    def list_action_state(self, fields: dict[str, list[str]]) -> None:
+    def list_action_state(self, fields: dict[str, list[str]], view: list_page.ListView) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
         try:
@@ -2185,7 +2186,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
-                                                       review_records=server.list_review_records())
+                                                       review_records=server.list_review_records(),
+                                                       top_priority=view.top_priority)
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -2193,8 +2195,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, current)
 
-    def list_post(self) -> None:
-        """Save List feedback before the shared sender starts."""
+    def list_post(self, view: list_page.ListView) -> None:
+        """Save a List view's item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
         try:
@@ -2208,7 +2210,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access():
                 submission, current = list_page.save_action(
                     server.root, body, server.delivery_status,
-                    review_records=server.list_review_records(), include_detail=True)
+                    review_records=server.list_review_records(), include_detail=True,
+                    top_priority=view.top_priority)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -2224,7 +2227,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
         with server.item_delivery(pending) as check:
             try:
-                state = {"read": "read", "question": "saved"}.get(action, "sent")
+                state = {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
                 reply = {"state": state, "delivery_pending": pending, **saved_fields}
                 if check:
                     reply["delivery"] = check
