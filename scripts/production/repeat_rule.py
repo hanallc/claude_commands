@@ -183,7 +183,19 @@ class RepeatRule:
                 if local.replace(tzinfo=None) == run.replace(tzinfo=None):
                     yield run
 
-        return islice(valid_runs(), max(0, count))
+        runs = islice(valid_runs(), max(0, count))
+        if not isinstance(self.end, RunCount):
+            return runs
+
+        def counted_runs() -> Iterator[datetime]:
+            seen = 0
+            for run in runs:
+                seen += 1
+                yield run
+            if seen < count:
+                raise ValueError("COUNT crosses the supported date limit")
+
+        return counted_runs()
 
     def next_after(self, start: datetime, after: datetime, limit: int) -> datetime | NoNextRun:
         """Find the first run strictly after a time."""

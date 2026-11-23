@@ -218,11 +218,12 @@ class TheListTests(unittest.TestCase):
                             "--state", "scheduled", "--start", start, "--do", "Read the figures.\nSend the total.",
                             "--source", "nate", *options)
 
-    def save_series_progress(self, identity: str, runs_used: int) -> None:
+    def save_series_progress(self, identity: str, *, finished: range | frozenset[int]) -> None:
         store = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", the_list.ListError)
         fields, body = store.read(identity)
         schedule = cast(dict[str, object], json.loads(fields["schedule"]))
-        schedule["runs_used"] = runs_used
+        schedule["runs_used"] = len(finished)
+        schedule["finished_runs"] = sorted(finished)
         fields["schedule"] = json.dumps(schedule)
         store.write(identity, fields, body)
 
@@ -259,6 +260,60 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(event.fields.get("schedule"), schedule)
                 page = list_page.render(self.root, include_counts=False).decode()
                 self.assertIn("Check the predictions", page)
+
+        second = datetime(2026, 11, 30, 17, tzinfo=UTC) + timedelta(days=1)
+        moved = second + timedelta(hours=1)
+        third = second + timedelta(days=1)
+        for label, finished, expected in (
+            ("run 2 comes before a delayed run 1", frozenset[int](), ((2, second), (1, moved), (3, third))),
+            ("finished run 2 leaves run 1 pending", frozenset({2}), ((1, moved), (3, third))),
+            ("finishing both runs leaves run 3 pending", frozenset({1, 2}), ((3, third),)),
+        ):
+            with self.subTest(label=label):
+                code, output, errors = self.add_scheduled((second - timedelta(days=1)).isoformat(), "--repeat", "FREQ=DAILY;COUNT=3")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                              "--start", moved.isoformat()), (0, "Repeats: Daily for 3 runs\n", ""))
+                series = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                progress = series.finish_runs(finished)
+                self.assertEqual(progress.runs_used, len(finished))
+                self.assertEqual(progress.finished_runs, finished)
+                self.save_series_progress(identity, finished=progress.finished_runs)
+                saved = the_list.load(MORTY.id, identity).schedule
+                self.assertEqual(saved, progress)
+                assert isinstance(saved, the_list.ScheduledSeries)
+                self.assertEqual(tuple((run.number, run.run.start) for run in saved.runs(the_list.series_run_limit())),
+                                 expected)
+                rows = self.command("list")[1].splitlines()
+                row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
+                self.assertIn(f"· next {expected[0][1].isoformat()}", row)
+
+        for label, offset, old_cursor, expected_finished in (
+            ("6de0503120 split", 1, {}, frozenset({1})),
+            ("9eb8ed1201 cursor", 0, {"runs_used": 2}, frozenset({1})),
+        ):
+            with self.subTest(label=label):
+                code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY;COUNT=4")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                store = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", the_list.ListError)
+                fields, body = store.read(identity)
+                legacy = {"start": stamp, "do": "Check the figures.", "repeat": "FREQ=DAILY;COUNT=4",
+                          "runs_before": offset, "exceptions": [{"number": 2, "removed": True}], **old_cursor}
+                current = fields["schedule"]
+                fields["schedule"] = json.dumps(legacy)
+                body = body.replace('"schedule": ' + current, '"schedule": ' + fields["schedule"])
+                store.write(identity, fields, body)
+                saved = the_list.load(MORTY.id, identity)
+                series = saved.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                self.assertEqual((series.finished_runs, series.skipped_runs, series.runs_used),
+                                 (expected_finished, frozenset({2}), 2))
+                event = saved.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), series)
 
         parked = self.add("A parked item")
         _ = the_list.park(MORTY.id, parked.id, START + timedelta(days=1), source="nate")
@@ -504,6 +559,8 @@ else:
             self.assertIn("Delivery uncertain for producer start", str(after_second.log[-1].what))
             remaining = after_second.schedule
             assert isinstance(remaining, the_list.ScheduledSeries)
+            self.assertEqual(remaining.finished_runs, frozenset({2}))
+            self.assertEqual(remaining.runs_used, 1)
             self.assertEqual([(run.number, run.run.start) for run in remaining.runs(730)], [(1, moved)])
         with patch.object(the_list, "now", return_value=moved), redirect_stderr(io.StringIO()):
             the_list.fire_scheduled()
@@ -566,13 +623,13 @@ else:
                 for progress in ("exhausted", "skipped"):
                     with self.subTest(progress=progress):
                         if progress == "skipped":
-                            self.save_series_progress(saved.id, limit - 2)
+                            self.save_series_progress(saved.id, finished=range(1, limit - 1))
                             moment = last - timedelta(days=1)
                             with patch.object(the_list, "now", return_value=moment):
                                 self.assertEqual(self.command("close", "--id", saved.id, "--scope", "this",
                                                               "--source", "nate", "--words", "Skip once."), (0, "", ""))
                         else:
-                            self.save_series_progress(saved.id, limit)
+                            self.save_series_progress(saved.id, finished=range(1, limit + 1))
                             moment = last + timedelta(microseconds=1)
                         path = the_list.folder(MORTY.id) / f"{saved.id}.md"
                         before = path.read_bytes()
@@ -605,7 +662,7 @@ else:
                 self.assertEqual((code, errors), (0, ""))
                 identity = output.splitlines()[-1]
                 if now_at == second:
-                    self.save_series_progress(identity, 1)
+                    self.save_series_progress(identity, finished=frozenset({1}))
                 before = the_list.load(MORTY.id, identity)
                 with patch.object(the_list, "now", return_value=now_at):
                     code, output, errors = self.command("update", "--id", identity, "--source", "nate",
@@ -616,10 +673,10 @@ else:
                 series = item.schedule
                 assert isinstance(series, the_list.ScheduledSeries)
                 self.assertEqual((series.first.start, series.runs_before), (first, runs_before))
-                next_run = series.next_run(now_at, the_list.series_run_limit())
+                next_run = series.next_run(the_list.series_run_limit())
                 assert isinstance(next_run, the_list.SeriesRun)
                 self.assertEqual(next_run.run, the_list.ScheduledRun(moved, "Read new figures."))
-                after = series.next_run(moved + timedelta(microseconds=1), the_list.series_run_limit())
+                after = series.finish_runs((next_run.number,)).next_run(the_list.series_run_limit())
                 assert isinstance(after, the_list.SeriesRun)
                 self.assertEqual(after.run.words, next_words)
                 self.assertEqual(len(tuple(series.rule.runs(series.first.start, the_list.series_run_limit()))),
@@ -629,20 +686,31 @@ else:
 
         original_words = "Read the figures.\nSend the total."
         moved_first = start + timedelta(hours=1)
-        for label, prepare, scope, change, expected in (
-            ("following keeps the pending move", ("update", "--start", moved.isoformat()), "following",
-             ("--repeat", "FREQ=DAILY;INTERVAL=2"), the_list.ScheduledRun(moved, original_words)),
-            ("all keeps a skip after a time edit", ("close", "--words", "Skip this check."), "all",
-             ("--start", moved_first.isoformat()), the_list.ScheduledRun(moved + timedelta(days=1), original_words)),
-            ("all keeps the pending run when repeat ends", (), "all",
-             ("--repeat", ""), the_list.ScheduledRun(second, original_words)),
+        for label, now_at, finished, prepare, scope, change, number, expected in (
+            ("following keeps the pending move", second, frozenset({1}), ("update", "--start", moved.isoformat()),
+             "following", ("--repeat", "FREQ=DAILY;INTERVAL=2"), 2, the_list.ScheduledRun(moved, original_words)),
+            ("all keeps a skip after a time edit", second, frozenset({1}), ("close", "--words", "Skip this check."),
+             "all", ("--start", moved_first.isoformat()), 3, the_list.ScheduledRun(moved + timedelta(days=1), original_words)),
+            ("all keeps the pending run when repeat ends", second, frozenset({1}), (), "all",
+             ("--repeat", ""), 2, the_list.ScheduledRun(second, original_words)),
+            ("this edits run 2 before a delayed run 1", second, frozenset[int](), ("update", "--start", moved.isoformat()),
+             "this", ("--do", "Read new figures."), 2, the_list.ScheduledRun(second, "Read new figures.")),
+            ("repeat removal keeps run 2 before a delayed run 1", second, frozenset[int](),
+             ("update", "--start", moved.isoformat()), "all", ("--repeat", ""), 2,
+             the_list.ScheduledRun(second, original_words)),
+            ("following uses the moved Monday for a new weekday rule", start, frozenset({1}),
+             ("update", "--start", moved_first.isoformat()), "following", ("--repeat", "FREQ=WEEKLY;BYDAY=MO"), 2,
+             the_list.ScheduledRun(moved_first, original_words)),
+            ("following after run 2 finishes keeps a delayed run 1", second, frozenset({2}),
+             ("update", "--start", moved.isoformat()), "following", ("--start", moved.isoformat()), 3,
+             the_list.ScheduledRun(moved, original_words)),
         ):
             with self.subTest(label=label):
                 code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=4")
                 self.assertEqual((code, errors), (0, ""))
                 identity = output.splitlines()[-1]
-                self.save_series_progress(identity, 1)
-                with patch.object(the_list, "now", return_value=second):
+                self.save_series_progress(identity, finished=finished)
+                with patch.object(the_list, "now", return_value=now_at):
                     if prepare:
                         verb, *flags = prepare
                         code, _, errors = self.command(verb, "--id", identity, "--source", "nate",
@@ -658,25 +726,31 @@ else:
                     self.assertEqual(item.schedule, expected)
                 else:
                     assert isinstance(item.schedule, the_list.ScheduledSeries)
-                    pending = next(item.schedule.runs(the_list.series_run_limit()))
-                    self.assertEqual((pending.number, pending.run), (3 if scope == "all" else 2, expected))
+                    pending = item.schedule.next_run(the_list.series_run_limit())
+                    assert isinstance(pending, the_list.SeriesRun)
+                    self.assertEqual((pending.number, pending.run), (number, expected))
 
     def test_repeated_item_removals_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
         second = start + timedelta(days=1)
         third = start + timedelta(days=2)
-        for scope, now_at, operation, options, state in (
-            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED),
-            ("following", second, "park", ("--until", third.isoformat()), the_list.ItemState.WORKING),
-            ("all", START, "close", ("--words", "Stop these checks"), the_list.ItemState.CLOSED),
-            ("all", START, "update", ("--state", "Working"), the_list.ItemState.WORKING),
+        delayed = second + timedelta(hours=1)
+        for scope, now_at, operation, options, state, reorder in (
+            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED, False),
+            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED, True),
+            ("following", second, "park", ("--until", third.isoformat()), the_list.ItemState.WORKING, False),
+            ("all", START, "close", ("--words", "Stop these checks"), the_list.ItemState.CLOSED, False),
+            ("all", START, "update", ("--state", "Working"), the_list.ItemState.WORKING, False),
         ):
-            with self.subTest(scope=scope, operation=operation):
+            with self.subTest(scope=scope, operation=operation, reorder=reorder):
                 code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY")
                 self.assertEqual((code, errors), (0, ""))
                 identity = output.splitlines()[-1]
-                if now_at == second:
-                    self.save_series_progress(identity, 1)
+                if reorder:
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                  "--start", delayed.isoformat()), (0, "Repeats: Daily\n", ""))
+                elif now_at == second:
+                    self.save_series_progress(identity, finished=frozenset({1}))
                 before = the_list.load(MORTY.id, identity)
                 with patch.object(the_list, "now", return_value=now_at):
                     self.assertEqual(self.command(operation, "--id", identity, "--source", "nate",
@@ -686,10 +760,15 @@ else:
                 if scope == "this":
                     series = item.schedule
                     assert isinstance(series, the_list.ScheduledSeries)
-                    next_run = series.next_run(second, the_list.series_run_limit())
+                    next_run = series.next_run(the_list.series_run_limit())
                     assert isinstance(next_run, the_list.SeriesRun)
-                    self.assertEqual((next_run.number, next_run.run.start), (3, third))
-                    self.assertEqual(series.exceptions, (the_list.RunException(2, the_list.SkippedRun("Skip this check")),))
+                    self.assertEqual((next_run.number, next_run.run.start), (1, delayed) if reorder else (3, third))
+                    skip = the_list.RunException(2, the_list.SkippedRun("Skip this check"))
+                    if reorder:
+                        self.assertEqual(series.skipped_runs, frozenset({2}))
+                        self.assertIn(skip, series.exceptions)
+                    else:
+                        self.assertEqual(series.exceptions, (skip,))
                 else:
                     self.assertIs(item.schedule, the_list.NoSchedule.UNSET)
                 if operation == "park":
@@ -703,29 +782,34 @@ else:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
         second = start + timedelta(days=1)
         moved = second + timedelta(hours=1)
-        for options, moment, runs_used, prepare, reason in (
-            (("update", "--do", "Read new figures."), START, 0, (), "use --scope"),
-            (("update", "--do", "Read new figures.", "--scope", "following"), START, 0, (), "from the second run"),
-            (("update", "--repeat", "FREQ=WEEKLY", "--scope", "this"), START, 0, (), "change a repeat rule"),
-            (("close", "--words", "Stop"), START, 0, (), "use --scope"),
-            (("close", "--words", "Stop", "--scope", "following"), START, 0, (), "from the second run"),
+        for options, moment, runs_used, prepare, reason, rule in (
+            (("update", "--do", "Read new figures."), START, 0, (), "use --scope", "FREQ=DAILY"),
+            (("update", "--do", "Read new figures.", "--scope", "following"), START, 0, (), "from the second run", "FREQ=DAILY"),
+            (("update", "--repeat", "FREQ=WEEKLY", "--scope", "this"), START, 0, (), "change a repeat rule", "FREQ=DAILY"),
+            (("close", "--words", "Stop"), START, 0, (), "use --scope", "FREQ=DAILY"),
+            (("close", "--words", "Stop", "--scope", "following"), START, 0, (), "from the second run", "FREQ=DAILY"),
             (("update", "--scope", "this", "--start", "2026-12-01T09:00-08:00"),
-             START, 0, (), "another run already uses this time"),
+             START, 0, (), "another run already uses this time", "FREQ=DAILY"),
             (("update", "--scope", "following", "--do", "Read new figures."),
-             START, 0, ("update", "--start", moved.isoformat()), "from the second run"),
+             START, 0, ("update", "--start", moved.isoformat()), "from the second run", "FREQ=DAILY"),
             (("update", "--scope", "following", "--do", "Read new figures."),
-             second, 0, ("close", "--words", "Skip the first run."), "from the second run"),
+             second, 0, ("close", "--words", "Skip the first run."), "from the second run", "FREQ=DAILY"),
             (("update", "--scope", "following", "--start", start.isoformat()),
-             second, 1, (), "choose a time on or after now"),
+             second, 1, (), "choose a time on or after now", "FREQ=DAILY"),
             (("update", "--scope", "all", "--repeat", ""),
-             second, 0, (), "choose a time on or after now"),
+             second, 0, (), "choose a time on or after now", "FREQ=DAILY"),
+            (("update", "--scope", "all", "--repeat", "FREQ=DAILY;COUNT=3"),
+             START, 0, ("update", "--start", (second + timedelta(days=1)).isoformat()),
+             "another run already uses this time", "FREQ=DAILY;COUNT=2"),
+            (("update", "--scope", "all", "--start", "9999-12-30T23:00-05:00"),
+             START, 0, (), "COUNT crosses the supported date limit", "FREQ=DAILY;COUNT=2"),
         ):
             with self.subTest(options=options, moment=moment, prepare=prepare):
-                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY")
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", rule)
                 self.assertEqual((code, errors), (0, ""))
                 identity = output.splitlines()[-1]
                 if runs_used:
-                    self.save_series_progress(identity, runs_used)
+                    self.save_series_progress(identity, finished=range(1, runs_used + 1))
                 if prepare:
                     verb, *flags = prepare
                     code, _, errors = self.command(verb, "--id", identity, "--source", "nate", "--scope", "this", *flags)
