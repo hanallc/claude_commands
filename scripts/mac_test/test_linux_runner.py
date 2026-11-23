@@ -20,6 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lib import process_stat, removal_guard
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
@@ -896,9 +897,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("mac_exit=", wire.stdout)
         self.assertFalse(self.events("lint"))
 
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
 
         class CompletedRemoteStep:
             stdout: io.StringIO = io.StringIO(wire.stdout + wire.stderr)
@@ -1409,9 +1408,7 @@ class LinuxProcessTests(unittest.TestCase):
     def test_unattributed_unreadable_process_retains_claim_through_completion_and_takeover(self) -> None:
         run_command = subprocess.run
         open_process = subprocess.Popen
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
         _ = dispatch.settings.write_text(dispatch.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         identity = eligibility.repository_identity(dispatch.source)
         if not isinstance(identity, eligibility.KnownRepository):
@@ -1535,9 +1532,7 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertTrue(marker.exists())
 
     def assert_unresolved_startup_stays_busy(self, stage: Literal["run", "probe", "after-probe"]) -> None:
-        dispatch = LinuxDispatchTests()
-        self.addCleanup(dispatch.doCleanups)
-        dispatch.setUp()
+        dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
         identity = eligibility.repository_identity(dispatch.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -1945,8 +1940,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.source = self.fixture.repository("rust/phase-copy", "https://example.com/team/hana.git")
         for name in ("flake.nix", "flake.lock", "nix/shell.nix", "src/main.rs"):
             path = self.source / name

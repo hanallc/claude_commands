@@ -50,6 +50,7 @@ from scripts.lib.shell_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
+
 _REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
 
 
