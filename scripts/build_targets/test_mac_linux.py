@@ -1356,6 +1356,17 @@ fi
         with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
 
+    def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
+        # A busy Mac can be silent for more than 30 s, so each hop waits the unreachable wait of 600 s.
+        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600)
+        command = settings.command('true')
+        alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
+        mac_hop = list(command[:-2])
+        self.assertEqual(mac_hop[-4:], alive)
+        self.assertEqual(command[-2], 'fixture-mac')
+        guest_hop = shlex.split(command[-1])
+        self.assertEqual(guest_hop[guest_hop.index('-l') - 4:guest_hop.index('-l')], alive)
+
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user
         settings = self.registry.with_name('mac_linux.conf')
