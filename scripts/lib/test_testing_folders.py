@@ -1,6 +1,8 @@
 """Test folder cleanup at normal exit and after a stopped test run."""
 from __future__ import annotations
 
+import atexit
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
@@ -150,13 +152,22 @@ class Child(unittest.TestCase):
 
     def test_a_run_without_a_build_log_keeps_its_log_in_the_run_folder(self) -> None:
         for caller in ("", str(self.root / "caller-buildlog")):
-            with self.subTest(caller=caller), mock.patch.dict(os.environ, self.environment()):
+            finishes: list[Callable[[], None]] = []
+            with (self.subTest(caller=caller), mock.patch.dict(os.environ, self.environment()),
+                  mock.patch.object(atexit, "register", finishes.append)):
                 _ = os.environ.pop("BUILDLOG_DIR", None)
                 if caller:
                     os.environ["BUILDLOG_DIR"] = caller
-                with testing_folders.test_run_folder() as path:
-                    self.assertEqual(os.environ["BUILDLOG_DIR"], caller or str(path / "buildlog"))
+                # The targeted gate holds a run folder and keeps the caller's build log.
+                with testing_folders.test_run_folder():
+                    self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
+                testing_folders.start_test_run()
+                path = Path(os.environ[testing_folders.RUN_FOLDER_ENV])
+                self.assertEqual(os.environ["BUILDLOG_DIR"], caller or str(path / "buildlog"))
+                finish, = finishes
+                finish()
                 self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
+                self.assertFalse(path.exists())
 
     def test_a_run_has_an_absent_session_root_and_restores_the_callers(self) -> None:
         for caller in ("", str(self.root / "caller-session")):

@@ -31,10 +31,14 @@ Standalone fixed local callers retain their existing local admission path.
 A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
 The guest puts the type-check environment in the copy's gate tool folder.
 For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
-If a tool is missing, the guest refuses the route.
+If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
-If the assigned Mac Linux guest refuses the route, the gate fails and reports the guest and the reason.
-The caller must submit a new run to retry.
+The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
+If the guest run fails before that line, the route returns `GuestNotStarted` with the cause, and the queue gives the gate to the next named target, for example natedev.
+If the guest run fails after that line, the gate fails and reports the guest and the reason.
+Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
+A reply that the route cannot read also names its first 200 characters.
+The caller must submit a new run to retry a gate that failed after a test started.
 
 ## Mac queue runs
 
@@ -73,15 +77,24 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
 A Mac block or a busy repository slot can refuse the claim.
-The route reports `not started` with the refusal reason before any upload or retry backoff.
+The route returns `GuestNotStarted` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
+natedev holds the SSH input open for the whole run.
+When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 
 The Mac Linux route runs the suite in a numbered copy.
+The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
+Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
+The reply descriptor is a copy of the stream standard output.
+The runner starts the sandbox, and `dbus-run-session` if the guest has it, for the gate run with standard output on standard error.
+Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
+The gate in the guest uses the configured gate root (`roots.gate`, `/dev/shm`), as natedev does.
+So test folders are outside the copy and outside the guest user's home.
 The guest removes the tool folder when the suite returns.
 A forced stop can leave the tool folder in the numbered copy.
 On a later allocation, the shared build folder allocator removes the folder if its lease owner has ended and the locks permit removal.

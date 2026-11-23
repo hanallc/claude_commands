@@ -30,7 +30,8 @@ from uuid import uuid4
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
-from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
+from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
+    gate_regions, money, read_settings)
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
@@ -100,28 +101,19 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
-class CloudGateSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
-
-
-@dataclass(frozen=True)
-class InvalidCloudGateSwitch:
-    reason: str
-
-
-type CloudGateSetting = CloudGateSwitch | InvalidCloudGateSwitch
-
-
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
 
-def launch_switch(configuration: conf.ConfigRead) -> CloudGateSetting:
-    try:
-        return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
-    except conf.Unusable as error:
-        return InvalidCloudGateSwitch(str(error))
+def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
+    """Name an open reservation that reconcile ends: a dead worker's, or an expired one with no known worker."""
+    if not ledger.gate_is_open(reservation):
+        return False
+    if isinstance(reservation.owner, ledger.GateWorkerOwner):
+        current = process_start(reservation.owner.pid)
+        return not (isinstance(current, Unreadable)
+            or isinstance(current, Started) and current.start == reservation.owner.start)
+    return reservation.expires <= now
 
 
 def read(path: Path) -> dict[str, object]:
@@ -542,18 +534,13 @@ class GateWorker:
         return not pending
 
     def cleanup_due(self, reservation: ledger.GateReservation) -> bool:
-        """Preserve live or unreadable workers before checking expiry."""
-        if isinstance(reservation.owner, ledger.GateWorkerOwner):
-            current = process_start(reservation.owner.pid)
-            return not (isinstance(current, Unreadable)
-                or isinstance(current, Started) and current.start == reservation.owner.start)
-        return reservation.expires <= int(self.clock())
+        return cleanup_due(reservation, int(self.clock()))
 
     def reconcile(self) -> None:
         """Clean expired or dead attempts while preserving live workers."""
         attempts: list[GateCleanupAttempt] = []
         for reservation in self.book.read_snapshot().gate_reservations:
-            if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)) or not self.cleanup_due(reservation):
+            if not self.cleanup_due(reservation):
                 continue
             launch: dict[str, object] = {}
             checked = False
@@ -1339,6 +1326,25 @@ def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Pa
          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
 
 
+def reconcile_command(directory: Path) -> list[str]:
+    """Run only the reconcile step; one unit name lets one reconcile run at a time."""
+    return service_command('scripts.aws_target.cloud_gate',
+        ['--reconcile', '--directory', str(directory), '--settings', str(account_settings_path())], 'cloud-gate-reconcile')
+
+
+def end_open_gates(directory: Path, service: Callable[[Sequence[str]], int]) -> None:
+    """Start the reconcile step while the switch is off when a gate is due for cleanup; the step launches no box.
+
+    An error here prints its own line and never changes the off reason of the caller."""
+    try:
+        book = ledger.CostLedger(directory)
+        now = int(time.time())
+        if book.path.exists() and any(cleanup_due(row, now) for row in book.read_snapshot().gate_reservations):
+            _ = service(reconcile_command(directory))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f'The cloud gate reconcile did not start: {error}', file=sys.stderr, flush=True)
+
+
 def settle_incompatible_attempt(folder: Path, book: ledger.CostLedger,
                                 service: Callable[[Sequence[str]], int]) -> bool:
     def settled(*, cleanup_finished: bool) -> bool:
@@ -1424,11 +1430,11 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    switch = launch_switch(settings())
-    if isinstance(switch, InvalidCloudGateSwitch):
-        return LocalFallback(switch.reason)
-    if switch is CloudGateSwitch.OFF:
-        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
+    switch = aws_switch(settings())
+    if not isinstance(switch, AwsOn):
+        reason = cloud_gate_off_reason(switch)
+        end_open_gates(attempt.directory, service)
+        return LocalFallback(reason)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
@@ -1540,6 +1546,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         if box_failures > box_retry_limit:
                             reservation.status = 0
                             return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
+                        # A retry launches a new box, so it reads the switch again.
+                        switch = aws_switch(settings())
+                        if not isinstance(switch, AwsOn):
+                            reservation.status = 0
+                            return LocalFallback(cloud_gate_off_reason(switch))
                     command = gate_attempt_command('--worker', folder, directory, sidecar)
                     request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
                                                        selected=selected, gate_job=attempt.gate_job)
@@ -1601,12 +1612,10 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
     """Use the installed scaler environment for each gate controller."""
     credential = str(admin_secrets.credentials_file())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
-    owner = ['--setenv=' + name + '=' + os.environ[name] for name in
-             ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_NAME', admission_records.BUILDLOG_UNIT)
-             if name in os.environ]
+    owner = ['--setenv=' + name + '=' + value for name, value in admission_records.owner_environment().items()]
     cleanup: list[str] = []
     stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
-    if '--cleanup' not in arguments:
+    if '--cleanup' not in arguments and '--reconcile' not in arguments:
         if paired:
             folder = arguments[arguments.index('--paired-worker') + 1]
             cleanup_arguments = ['--paired-cleanup', folder]
@@ -1660,18 +1669,31 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     _ = group.add_argument('--worker', type=Path)
     _ = group.add_argument('--cleanup', type=Path)
+    _ = group.add_argument('--reconcile', action='store_true')
     _ = parser.add_argument('--directory', required=True, type=Path)
-    _ = parser.add_argument('--sidecar', required=True, type=Path)
+    _ = parser.add_argument('--sidecar', type=Path, help='required with --worker and --cleanup')
     _ = parser.add_argument('--settings', type=Path, default=account_settings_path())
     args = parser.parse_args()
-    cleanup = cast(Path | None, args.cleanup)
-    folder = cleanup if cleanup is not None else cast(Path, args.worker)
     directory = cast(Path, args.directory)
-    with control_lock(folder):
-        settings_path = cast(Path, args.settings)
+    settings_path = cast(Path, args.settings)
+    sidecar = cast(Path | None, args.sidecar)
+    reconcile = cast(bool, args.reconcile)
+    if sidecar is None and not reconcile:
+        parser.error('--worker and --cleanup require --sidecar')
+
+    def gate_worker() -> GateWorker:
         configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
-        worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
+        # The reconcile step publishes no progress, so it has no sidecar.
+        return GateWorker(api, ledger.CostLedger(directory), settings_path, sidecar or Path(os.devnull))
+
+    if reconcile:
+        gate_worker().reconcile()
+        return 0
+    cleanup = cast(Path | None, args.cleanup)
+    folder = cleanup if cleanup is not None else cast(Path, args.worker)
+    with control_lock(folder):
+        worker = gate_worker()
         if cleanup is not None:
             with cancellation.defer_cleanup_signals():
                 return int(not cleanup_folder(folder, worker))
