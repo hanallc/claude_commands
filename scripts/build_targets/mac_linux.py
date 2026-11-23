@@ -1252,16 +1252,40 @@ def guest_tool(real: Path, copy: Path) -> bool:
         return False
 
 
+EntryKind = Literal['folder', 'file', 'link', 'other', 'missing']
+
+
+def entry_kind(path: str, *, follow: bool = True) -> EntryKind:
+    """The kind of the entry at the path: os.stat follows a link, and os.lstat does not. A file is a regular
+    file; other is a FIFO, a socket or a device.
+
+    ENOENT and ENOTDIR mean missing. Each other OSError, such as ENAMETOOLONG or ELOOP, is raised, so that
+    the caller refuses the word and does not take the entry as missing.
+    """
+    try:
+        mode = (os.stat if follow else os.lstat)(path).st_mode
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return 'missing'
+        raise
+    if stat.S_ISDIR(mode):
+        return 'folder'
+    if stat.S_ISREG(mode):
+        return 'file'
+    return 'link' if stat.S_ISLNK(mode) else 'other'
+
+
 def main_folder(path: str) -> bool:
     """Tell if python runs a file of the folder when it gets the folder as its script.
 
     Python imports __main__ from the folder, so each entry with that name and any suffix counts, for example
     __main__.py or __main__.pyc. A folder that cannot be listed counts too, because python can still open a
-    file in it by its name.
+    file in it by its name. A stat error other than a missing entry, such as ELOOP or ENAMETOOLONG, counts
+    too, because the check cannot tell what the path names.
     """
-    if not os.path.isdir(path):
-        return False
     try:
+        if entry_kind(path) != 'folder':
+            return False
         return any(name.startswith('__main__') for name in os.listdir(path))
     except OSError:
         return True

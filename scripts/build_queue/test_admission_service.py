@@ -1024,6 +1024,11 @@ class MacBackoffTestFixture:
 
 
 class LocalHoldPlacementTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The service applies natedev holds only on natedev; the guest has another host name.
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
+
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
         from scripts.build_queue import placement

@@ -441,6 +441,13 @@ class GuestCommandParityTests(unittest.TestCase):
         (self.copy / 'test').mkdir()
         self.assertEqual(self.refusal('cargo', 'test'), '')
 
+    def test_main_folder_counts_a_stat_error_and_passes_a_missing_entry(self) -> None:
+        # A link to itself makes os.stat fail with ELOOP: the check cannot tell what the word names.
+        (self.copy / 'loop').symlink_to('loop')
+        self.assertTrue(mac_linux.main_folder(str(self.copy / 'loop')))
+        self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing')))
+        self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing' / 'below')))
+
     def test_a_bare_word_found_in_the_copy_is_refused(self) -> None:
         _ = self.program(self.copy / 'target/built', b'\x7fELF\x02\x01\x01')
         refusal = self.refusal('built', search_path=f'target{os.pathsep}{self.tools}')
