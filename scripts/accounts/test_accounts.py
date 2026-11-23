@@ -8902,11 +8902,19 @@ class PaneWorkerMoveTests(unittest.TestCase):
                       patch.object(detached_runs, "result_text", return_value="The detached check passed.")):
                     result = detached_runs.CompletedCommand(0)
                     if name == "parked":
+                        # The supervisor parks the result; the turn-end replay resumes the worker under its lock.
+                        record.update(status="finished")
+                        atomic_file.write_text_atomic(run_record, json.dumps(record))
+                        self.assertEqual(detached_runs.deliver(record, result), detached_runs.PARKED_WORKER_RESULT)
                         with worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(name)) as hold:
                             assert isinstance(hold, worker_panes.WorkerLockHold)
                             held = hold
-                            self.assertIn("sent", detached_runs.deliver(record, result,
-                                resume_parked=lambda: worker.restore_parked_worker(row, self.owner.id, held)))
+                            _ = detached_runs.submit_finished_worker_result(
+                                self.run_dir, row, worker_input=detached_runs.WorkerResultInput.TYPE,
+                                resume_parked=lambda: worker.restore_parked_worker(row, self.owner.id, held),
+                                input_lock=held)
+                        parked_record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        self.assertIn("sent", parked_record.get("delivery", ""))
                     else:
                         self.assertIn("sent", detached_runs.deliver(record, result))
                 delivery.assert_called_once()

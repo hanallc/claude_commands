@@ -2321,13 +2321,7 @@ def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatc
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    try:
-        source = worker_admission.transcript_source(row, backend)
-    except (OSError, ValueError) as error:
-        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
-            return DispatchNotSubmitted()
-        return DispatchEvidenceUnknown(str(error))
-    return transcript_receipt(worker_admission.transcript_records(source),
+    return transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
         DispatchPrompt(dispatch.instance_id, include_stage_two=True), DoneReply(dispatch.instance_id)).receipt
 
 
@@ -2917,16 +2911,14 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     resume_sent = True
                     _ = cleanup.pop_all()
-                    if isinstance(plan.step, UnsubmittedAssignment):
+                    # Only the report counts restored workers; it counts one after the worker accepts the assignment.
+                    if isinstance(plan.step, UnsubmittedAssignment) and isinstance(report, RestoreReport):
                         dispatch_id = plan.step.dispatch_id
                         assignments = (worker_panes.worker_pass(row, directory, record=resumed_record)
                                        for directory in dict.fromkeys((run, *held_runs)))
                         if not any(item.get("instance_id") == dispatch_id and _accepted_assignment(row, item)
                                    for item in assignments):
-                            if isinstance(report, RestoreReport):
-                                report.skipped[row.id] = "The director received the launcher instruction"
-                            else:
-                                print(f"{row.name}: the director received the launcher instruction")
+                            report.skipped[row.id] = "The director received the launcher instruction"
                             continue
                     if isinstance(report, RestoreReport):
                         report.restored.add(row.id)

@@ -2524,6 +2524,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return ["user:\nOne moment."]
 
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
               patch.object(worker_panes, "worker_run", return_value=run),

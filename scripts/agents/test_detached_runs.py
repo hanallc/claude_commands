@@ -62,6 +62,7 @@ LASTING_THREAD = fixture_runtime_id("detached-run-lasting-thread")
 ADOPTED_THREAD = fixture_runtime_id("detached-run-adopted-thread")
 SHARED_THREAD = fixture_runtime_id("detached-run-shared-thread")
 DEAD_PID = 2 ** 22 + 12345
+PASS_COMPLETION_ID = "pass-1-2"
 
 
 def setUpModule() -> None:
@@ -593,7 +594,8 @@ class DetachedRunsTests(unittest.TestCase):
             "owner_staff_id": self.unit.id, "pass": {WORKER: {
                 "instance_id": "pass-1", "worker_id": self.worker_id, "status": status, "started_at": started_at}}}))
 
-    def save_pass_receipt(self, *run_ids: str) -> None:
+    def save_pass_stage(self, *run_ids: str) -> Path:
+        """Save the pass stage and its assignment transcript, as the launcher does before input."""
         row = staff.local_snapshot().by_id(self.worker_id)
         assert row is not None
         backend = staff.CodexBackend(self.root / "codex-home")
@@ -603,17 +605,20 @@ class DetachedRunsTests(unittest.TestCase):
         observed = staff.backend(row)
         assert isinstance(observed, staff.CodexBackend)
         path = worker_admission.transcript_source(row, observed)
-        completion_id = "pass-1-2"
-        line = f"End your final reply with DONE {completion_id}."
-        reply = f"All checks are complete.\nDONE {completion_id}"
-        reply_file = self.session / "reply.md"
+        line = f"End your final reply with DONE {PASS_COMPLETION_ID}."
         entries = [{"type": "user", "message": {"role": "user", "content": text}}
                  for text in (line, *(f"Detached run: {run_id}" for run_id in run_ids))]
-        entries.append({"type": "assistant", "message": {"role": "assistant", "content": reply}})
         write_text_atomic(path, "".join(json.dumps(entry) + "\n" for entry in entries))
-        write_text_atomic(reply_file, reply + "\n")
         progress_history.save_dispatch_delivery(self.session, "pass-1",
-            pass_recorder.DispatchDelivery(line, completion_id, str(reply_file)))
+            pass_recorder.DispatchDelivery(line, PASS_COMPLETION_ID, str(self.session / "reply.md")))
+        return path
+
+    def save_pass_receipt(self, *run_ids: str) -> None:
+        path = self.save_pass_stage(*run_ids)
+        reply = f"All checks are complete.\nDONE {PASS_COMPLETION_ID}"
+        entry = {"type": "assistant", "message": {"role": "assistant", "content": reply}}
+        write_text_atomic(path, path.read_text() + json.dumps(entry) + "\n")
+        write_text_atomic(self.session / "reply.md", reply + "\n")
 
     def run_files(self, run_id: str) -> list[str]:
         folder = self.session / detached_runs.DETACHED_RUNS_DIR
@@ -636,6 +641,7 @@ class DetachedRunsTests(unittest.TestCase):
 
     def test_reap_completes_cancelled_run_after_releasing_start_lock(self) -> None:
         self.set_pass("active", 0)
+        _ = self.save_pass_stage()
         for status in ("finished", "running"):
             with self.subTest(status=status):
                 path = self.finished_run(f"cancelled-{status}", pid=DEAD_PID, exit_code=143,
@@ -1157,6 +1163,7 @@ sys.exit(1)
     # delivers nothing, and its worker waits for a result that never comes.
     def test_a_start_ends_a_run_whose_supervisor_is_gone_with_a_failure_result(self) -> None:
         self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
+        _ = self.save_pass_stage()
         path = self.record(["bash", "verify.sh", "test", "hana"])
         self.update_record(path, pid=DEAD_PID)
         legacy = path.with_name("legacy.json")
@@ -2587,6 +2594,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="test", phase="40", role="test",
                     worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
                     kind="test", lens="")
+                # The launcher saves the stage before input, so a result has a known stage.
+                line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
+                reply = self.fixture.root / "finished-reply.txt"
+                progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+                    pass_recorder.DispatchDelivery(line, dispatch_id, str(reply)))
                 runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
                 before = set(runs.glob("*.json"))
                 input_count = len(self.inputs)
@@ -2620,10 +2632,6 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 if completed:
                     agent = test_worker.DispatchAgent(self.fixture)
                     agent.pane_commands(self)
-                    line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
-                    reply = self.fixture.root / "finished-reply.txt"
-                    progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        pass_recorder.DispatchDelivery(line, dispatch_id, str(reply)))
                     agent.append(pane, "user", line)
                     agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
                     self.fixture.world.locations[pane]["agent_status"] = "done"
@@ -4666,8 +4674,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(record.get("pane_dispatch_id"), {"unavailable": reason})
         record.update(stop_pass_requested=True, stop_reason="Private stop.", exit_code=143, command_group=DEAD_PID)
         write_text_atomic(path, json.dumps(record))
+        # Round 18 rule: unknown ownership stays pending until restore or the director acts.
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
+        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual(saved.get("delivery"), "deferred: the result's pass ownership is unknown")
         self.assertIn(reason, errors.getvalue())
         active = progress_history.active_dispatch(row.id, self.run_dir)
         assert isinstance(active, progress_history.ActiveDispatch)
@@ -5504,16 +5515,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture.world.add(row, "w1:p1", family="codex")
         record = self.record(row)
         self.defer_transcript = True
-        read_entries = worker_admission.transcript_entries
+        read_records = worker_admission.transcript_records
 
-        def delayed_entries(source: Path, changed: set[str]) -> Iterator[str | worker_admission.TornTranscriptRecord]:
-            entries = list(read_entries(source, changed))
+        # Publish pending input only after a reader has listed the transcript.
+        # The receipt and the submission confirmation both read records through this function.
+        def delayed_records(source: Path, *, offset: int = 0,
+                            boundary: worker_admission.TranscriptRecordBoundary = worker_admission.TranscriptRecordBoundary.ALL_RECORDS,
+                            ) -> Iterator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+            records = list(read_records(source, offset=offset, boundary=boundary))
             for pending_source, entry in self.pending_transcripts:
                 write_text_atomic(pending_source, pending_source.read_text() + entry)
             self.pending_transcripts.clear()
-            yield from entries
+            yield from records
 
-        with patch.object(worker_admission, "transcript_entries", delayed_entries), ThreadPoolExecutor(max_workers=2) as pool:
+        with patch.object(worker_admission, "transcript_records", delayed_records), ThreadPoolExecutor(max_workers=2) as pool:
             futures = (pool.submit(detached_runs.deliver, record, detached_runs.CompletedCommand(0)), pool.submit(detached_runs.deliver, record, detached_runs.CompletedCommand(0)))
             results = [future.result() for future in futures]
         self.assertEqual(len(self.inputs), 1)

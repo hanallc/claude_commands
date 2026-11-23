@@ -2051,24 +2051,29 @@ class WorkerCommandTests(unittest.TestCase):
             return sorted(observe(parent, record), key=lambda state: (state.row.name != "impl", state.row.name))
 
         _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
+        # Round 18: a "sent" delivery without a saved receipt is uncertain, and its DONE is no proof.
+        # Round 21: restore never continues a pass from a result receipt; the director inspects the worker.
+        uncertain = "cm: Detached run private-check: the result delivery is uncertain. The director must inspect the worker."
         with patch.object(self.fixture.world, "prompt") as send_resume:
             code, _, errors = self.command("restore")
-        send_resume.assert_called_once()
-        self.assertEqual(send_resume.call_args.args[0], cm.pane)
+        send_resume.assert_not_called()
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
         self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
-                                               "cm: a detached run result awaits a matching DONE",
+                                               uncertain,
                                                "reap: reap must record the run result"])
         self.assertIn(impl.pane, self.fixture.world.locations)
         self.assertIn(cm.pane, self.fixture.world.locations)
 
         self.agent.append(cm.pane, "assistant", f"The check is complete.\nDONE {dispatches['cm']}")
-        code, _, errors = self.command("restore")
+        with patch.object(self.fixture.world, "prompt") as send_resume:
+            code, _, errors = self.command("restore")
+        send_resume.assert_not_called()
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
         self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
+                                               uncertain,
                                                "reap: reap must record the run result"])
         self.assertIn(impl.pane, self.fixture.world.locations)
-        self.assertNotIn(cm.pane, self.fixture.world.locations)
+        self.assertIn(cm.pane, self.fixture.world.locations)
 
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
         for foreign_tab in (False, True):
