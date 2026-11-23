@@ -362,7 +362,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
-| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step starts at once. Its memory counts once as build memory through the step's reservation. |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step or a queued program starts at once. Its memory counts once as build memory through the step's reservation. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -1142,6 +1142,14 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+A place that holds a reservation gives `--scope-start` the word `--reserved` (`program_start.ScopeReservation.HELD`).
+For such a place, the scoped wrapper exports `BUILDLOG_STEP_SCOPE`, the published scope folder, before program execution.
+A cargo call of the program then starts at once in that scope, also under `builds-detached.slice`.
+`memory_admit` charges the compilers that sccache runs for the program to the program's reservation.
+An `UnreservedProgram` place, such as the rust-analyzer editor server, exports no value.
+No reservation pays for its scope, so its flycheck compilers stay in the global sccache figure.
+`test_queue_place.test_transient_scope_sidecar_and_sampler_use_the_program_scope` proves the exported value.
+`test_queue_place.test_editor_server_starts_while_builds_wait` proves that the editor server gets no value.
 `QueuePlace.popen` installs no signal handler.
 It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
 It then restores the caller's previous signal mask.
@@ -1246,8 +1254,11 @@ Non-building commands such as `metadata`, `fmt` and `tree` run immediately in Ba
 `test_cargo_wrapper.test_non_building_commands_start_with_no_python_and_no_queue_request` proves this.
 A call already in `builds.slice` runs at once, unless it runs under `builds-detached.slice`.
 Such a call comes from a queued step or an editor scope, so it has no second queue place.
-A queued step of a detached run also runs its calls at once.
-The wrapper finds such a step when its cgroup folder equals `BUILDLOG_STEP_SCOPE`, which the step scope exports.
+A queued step or a reserved `queue_place` program of a detached run also runs its calls at once.
+The wrapper finds such a scope when its cgroup folder equals `BUILDLOG_STEP_SCOPE`.
+Each step scope of `invoke.sh` and each reserved program scope of `queue_place` exports this variable.
+A stale value from another scope does not start cargo at once and does not skip the folder step.
+`cargo_folder.folder_step_due` uses the same rule.
 Any other call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
 These building calls check `hold_applies.py` when the hold directory has an entry.
 An applicable hold refuses the command.

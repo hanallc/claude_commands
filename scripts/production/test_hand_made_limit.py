@@ -539,6 +539,11 @@ class NatedevRunTests(unittest.TestCase):
 
     def test_a_cargo_run_does_the_folder_steps_only_when_the_wrapper_does(self) -> None:
         clear = {"CARGO_FOLDER_CHECKED": "", "BUILDLOG_STEP_SCOPE": ""}
+        # The value of the own scope skips the steps; a value from another scope is stale.
+        cgroup = self.root / "cgroup"
+        _ = cgroup.write_text("0::/user.slice/builds.slice/builds-detached.slice/run-42.scope\n")
+        own_scope = {**clear, "CARGO_WRAPPER_CGROUP_FILE": str(cgroup),
+                     "BUILDLOG_STEP_SCOPE": "/sys/fs/cgroup/user.slice/builds.slice/builds-detached.slice/run-42.scope"}
         for argv, variables, due in (
                 (("cargo", "build"), clear, True), (("cargo", "+nightly", "--config", "x", "test"), clear, True),
                 (("cargo", "clippy", "--build-info"), clear, True), (("cargo", "test", "--", "--help"), clear, True),
@@ -547,7 +552,8 @@ class NatedevRunTests(unittest.TestCase):
                 (("cargo", "nextest", "--version"), clear, False), (("cargo", "mend", "--build-info"), clear, False),
                 (("cargo", "metadata"), clear, False), (("cargo", "--color", "build", "tree"), clear, False),
                 (("cargo", "build"), {**clear, "CARGO_FOLDER_CHECKED": "1"}, False),
-                (("cargo", "build"), {**clear, "BUILDLOG_STEP_SCOPE": "/step.scope"}, False)):
+                (("cargo", "build"), {**clear, "BUILDLOG_STEP_SCOPE": "/step.scope"}, True),
+                (("cargo", "build"), own_scope, False)):
             with (self.subTest(argv=argv, variables=variables), mock.patch.dict(os.environ, variables),
                   mock.patch.object(cargo_folder, "checked_step", return_value=cargo_folder.NoOutputLock()) as step,
                   ExitStack() as held):
