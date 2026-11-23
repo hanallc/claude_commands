@@ -34,6 +34,7 @@ interval_seconds = 120
 timeout_seconds = 30
 [parts.refusals]
 # Sets the minimum time after a successful quota refusal check before the next scheduled check.
+# interval_seconds also sets how often the Mac completes its off-target group members.
 # Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60

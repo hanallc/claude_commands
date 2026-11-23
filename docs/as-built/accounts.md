@@ -368,6 +368,26 @@ A group request keeps the member eligible for completion.
 A selection without a time is older than any individual move by hand.
 A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
+Each machine completes only the group members in its own session registry.
+On natedev, the refusal pass of the notes timer completes them.
+On the Mac, the `usage-only` job runs `refusal_watch.complete_local_groups` after its usage read.
+The Mac pass runs at most once in each `parts.refusals.interval_seconds`, less half a poll, also after a failed move.
+Its schedule history is `~/.local/state/agent-notes/group-completion/completed.json`.
+Natedev is the only authority on which groups a machine may complete.
+Each natedev refusal pass that is not a dry run or a proof writes `~/.local/state/accounts/completion_plan.json`.
+The plan holds the pass time `at` and, for each permitted group, `target`, `cause`, `why` and `selected_at`.
+The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal.
+Legacy selections stay natedev's job, because natedev upgrades them in the role map.
+`accounts completion-plan-read` prints the plan on natedev, and the Mac reads it through the role map ssh transport.
+The Mac pass first reads its local group members and stops before ssh when no member is live.
+It then reads the plan fresh and does nothing when the plan is unreadable.
+It also does nothing when the plan is older than three `parts.refusals` intervals.
+Natedev runs its refusal part one interval after the last run ends, so two plans can be almost two intervals apart.
+The Mac completes only the planned groups, with the plan's target, cause and why.
+It applies the Mac journal check for moves by hand made after `selected_at`.
+It never writes the role map and never calls `set_group_account`.
+The move batch reads the group's current target again under the session row lock, so a later selection wins.
+The Mac pass uses the watch lock, the journal checks and detached moves, but no refusal placement or quota alerts.
 An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
 A retry uses that decision ID when only some members still need to move.

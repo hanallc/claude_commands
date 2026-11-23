@@ -7353,6 +7353,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="action")
     _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
     _ = commands.add_parser("role-map-read")
+    _ = commands.add_parser("completion-plan-read")
     _ = commands.add_parser("session-counts-read")
     counts_fetch = commands.add_parser("session-counts-fetch")
     _ = counts_fetch.add_argument("--counts-lock", type=int, required=True)
@@ -7527,6 +7528,14 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 print(next_moves.update_next_move_hold(options.group, options.next_position, options.hold_mode, expected))
             else:
                 print(next_moves.list_next_moves())
+            return 0
+        if options.action == "completion-plan-read":
+            if not role_map.is_role_map_host():
+                raise AccountsError(f"accounts: the completion plan belongs on {role_map.ROLE_MAP_HOST}")
+            try:
+                print(role_map.completion_plan_file().read_text(encoding="utf-8"), end="")
+            except OSError as error:
+                raise AccountsError(f"accounts: no completion plan: {error.strerror or error}") from error
             return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():
