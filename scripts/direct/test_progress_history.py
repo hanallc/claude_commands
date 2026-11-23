@@ -131,6 +131,13 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         self.models_config_file = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(self.models_config_file)
+        accounts = self.models_config_file.with_name("accounts.json")
+        _ = accounts.write_text('{"workers": ""}\n', encoding="utf-8")
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root),
+            "CONF_DIR": str(self.config_file.parent),
+            "MODELS_CONFIG_FILE": str(self.models_config_file),
+        }))
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:

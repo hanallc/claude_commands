@@ -16,6 +16,7 @@ from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_function
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -68,8 +69,12 @@ class VerifyStepOwnerTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="verify-owner-test-")))
         for name in ("home", "tmp", "runtime", "state", "buildlog", "stubs"):
             (self.root / name).mkdir()
+        config = self.root / "home/.claude/config"
+        _ = write_config_fixture(config / "build_folders.conf")
+        _ = write_config_fixture(config / "direct.conf")
         self.environment = {
             "PATH": stub_build_tool_path(self.root / "stubs"),
+            "CONF_DIR": str(config),
             "HOME": str(self.root / "home"),
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),

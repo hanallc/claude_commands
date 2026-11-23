@@ -9,7 +9,6 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
-from scripts.lib import conf
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -1187,8 +1186,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         claude = self.home / ".claude"
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
-        _ = copy_helpers(self.home, *VERIFY_HELPERS)
-        _ = conf.copy_for_test(VERIFY.parent.parent.parent / "config", claude / "config")
+        _ = copy_helpers(self.home, *VERIFY_HELPERS, "config")
         log = scripts / "buildlog"
         # Keep the recorder's import interface while the command records fixture observations.
         record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()
