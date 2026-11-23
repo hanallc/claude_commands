@@ -23,7 +23,7 @@ from scripts.build_queue import placement, admission_protocol as wire
 from scripts.build_queue.test_placement import (
     PlacementFixture, placement_request, publish_candidate, assignment_for, coordinator_holder,
 )
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class ClaimProcessStartTests(unittest.TestCase):
@@ -268,7 +268,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 target = "mac" if provider == "mac" else "box"
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                    + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+                    + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", template="mac_test")
                 _ = write_config_fixture(fixture.root / "machines.conf", "mac.hosts=fixture-mac\n")
                 _ = write_config_fixture(fixture.root / "build_folders.conf",
