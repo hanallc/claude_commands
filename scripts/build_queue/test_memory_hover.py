@@ -1737,6 +1737,29 @@ process.stdout.write(JSON.stringify(steps));
         for detail in (estimate, billed, older):
             self.assertNotRegex(detail, r"(?i)\bgate\b|targeted test")
 
+    def test_aws_cost_day_with_no_unit_leaves_out_the_unit_column_and_names_the_first_unit_day(self) -> None:
+        first, no_first, no_unit, no_unit_job, unit_day, no_record = cast(list[str], self.page_expression(
+            "[awsFirstUnitDay(data.days), awsFirstUnitDay(data.days.slice(1)),"
+            + " awsDayDetail(data.days[2], data.price_day, {groupBy:'none', openGroups:new Set()}, '2026-11-19'),"
+            + """ awsDayRuns(data.days[2], {groupBy:'job', openGroups:new Set(['["job",null]'])}),"""
+            + " awsDayDetail(data.days[0], data.price_day, {groupBy:'none', openGroups:new Set()}, '2026-11-19'),"
+            + " awsDayDetail(data.days[2], data.price_day, undefined, null)]",
+            aws_cost_fixture(), walk=True))
+        self.assertEqual((first, no_first), ("2026-11-19", None))
+        for detail in (no_unit, no_unit_job):
+            self.assertNotIn(">Unit</th>", detail)
+            self.assertNotIn("Unit not recorded", detail)
+            # Each run row has one cell for each header.
+            table = detail[detail.index('<table class="aws-table"><thead>', detail.index("aws-run-scroll")):]
+            row = table[table.index("<tbody>"):table.index("</tr>", table.index("<tbody>"))]
+            self.assertEqual(row.count("<td"), table[:table.index("</thead>")].count("<th "))
+        self.assertNotIn('data-aws-group-by="unit"', no_unit)
+        self.assertIn('<p class="aws-note aws-unit-note">Runs before Thu Nov 19 have no unit record.</p>', no_unit)
+        self.assertIn(">Unit</th>", unit_day)
+        self.assertIn('data-aws-group-by="unit"', unit_day)
+        self.assertNotIn("no unit record", unit_day)
+        self.assertIn('<p class="aws-note aws-unit-note">Runs have no unit record.</p>', no_record)
+
     def test_aws_cost_times_use_the_user_zone(self) -> None:
         for zone, rule, start, header in (
             ("America/Los_Angeles", "In Pacific time, a day starts at <b>4:00 PM on the day before</b> and ends at 4:00 PM.",

@@ -442,6 +442,7 @@ small .aws-point { cursor: help; }
 .aws-history-table .aws-detail-cell { padding-top: 2px; padding-bottom: 14px; }
 .aws-day-detail { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 10px 16px 12px; }
 .aws-day-detail > .aws-note { margin: 0 0 2px; }
+.aws-day-detail > .aws-unit-note { margin: 8px 0 0; }
 .aws-run-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 2px; }
 .aws-run-controls .aws-more { margin: 0 0 0 auto; }
 .aws-run-scroll { overflow: auto; contain: inline-size; }
@@ -845,7 +846,7 @@ const awsAmount = total => awsMoney(total.cents, awsEstimated(total));
 const awsDateRange = (label, start, end) => [field(label + " (UTC)", "", "title"),
   field("Starts", awsDateTime(start)), field("Ends", awsDateTime(end))];
 
-let awsCostView = "day", awsShowAll = false, awsCostReport, awsCostGroups;
+let awsCostView = "day", awsShowAll = false, awsCostReport, awsCostGroups, awsUnitStart = null;
 const awsCostOpen = new Map(Object.keys(AWS_PERIODS).map(period => [period, new Map()]));
 const awsRunViews = new Map();
 const awsLimitTips = new Map(), awsPeriodTips = new Map();
@@ -920,6 +921,15 @@ const AWS_NO_RUN_COSTS = 'Costs with no run<span class="aws-dim aws-hint">Storag
 const awsNewRunView = () => ({groupBy:"job", openGroups:new Set()});
 const awsRunJob = run => run.kind === "hana" ? AWS_HANA_LABEL : run.job;
 const awsRunFields = run => [awsRunJob(run), run.unit, run.region, run.zone, run.machine, run.mode];
+// The Unit column and the Unit group show only on a day where a run has a unit.
+const AWS_UNIT_COLUMN = 2;
+const awsDayHasUnits = day => day.runs_list.some(run => run.unit);
+// The first UTC bill day where a run has a unit, or null when no run has a unit.
+const awsFirstUnitDay = days => days.filter(awsDayHasUnits).map(day => day.day).sort()[0] ?? null;
+function awsUnitNote(unitStart) {
+  const before = unitStart == null ? "" : ` before ${awsDayName(awsDate(unitStart))}`;
+  return `<p class="aws-note aws-unit-note">Runs${before} have no unit record.</p>`;
+}
 
 function awsRunTime(seconds) {
   const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
@@ -937,15 +947,17 @@ function awsTable(headers, rows, numeric) {
     <tbody>${body}</tbody></table>`;
 }
 
-function awsRunTable(runs, estimated, extraRows = []) {
+function awsRunTable(runs, estimated, extraRows, units) {
+  const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
   const rows = runs.map(run => {
     const [job, unit, region, zone, machine, mode] = awsRunFields(run);
     return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), esc(awsUnit(unit)),
       ...[region, zone, machine, mode].map(value => value ? esc(value) : "—"),
       awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
   });
+  const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
   return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
-    ${awsTable(awsRunHeaders(), [...rows, ...extraRows], [7,8])}</div>`;
+    ${awsTable(columns(awsRunHeaders()), tableRows, units ? [7,8] : [6,7])}</div>`;
 }
 
 function awsRunGroups(runs, groupBy, hanaIdle) {
@@ -975,6 +987,7 @@ function awsDayRuns(day, view) {
   const amount = usd => awsMoney(usd == null ? null : awsCents(usd), estimated);
   const hanaIdle = awsCents(day.hana?.idle_usd ?? (day.hana?.runs === 0 ? day.hana.cost_usd : "0.00"));
   const {groupBy, openGroups} = view;
+  const units = awsDayHasUnits(day);
   const idleCharge = {name:AWS_HANA_IDLE, cents:hanaIdle, time:"no record"};
   const charges = [
     ...(groupBy === "job" ? [] : [idleCharge]),
@@ -987,7 +1000,7 @@ function awsDayRuns(day, view) {
   if (groupBy === "none") {
     const extraRows = [...charges.map(runCharge),
       charge(`Total · ${awsCount(day.runs)} runs`, amount(day.amount_usd), {total:true})];
-    return awsRunTable(day.runs_list, estimated, extraRows);
+    return awsRunTable(day.runs_list, estimated, extraRows, units);
   }
 
   const rows = awsRunGroups(day.runs_list, groupBy, hanaIdle).map(group => {
@@ -998,7 +1011,7 @@ function awsDayRuns(day, view) {
       '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
     const time = count ? awsRunTime(group.seconds) : group.key === AWS_HANA_GROUP ? "no record" : "—";
     const idleRows = group.idle ? [runCharge(idleCharge)] : [];
-    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows) : "",
+    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
       values:[name + note, count ? awsCount(count) : "—", time,
         awsMoney(group.cents + group.idle, estimated),
         count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
@@ -1011,18 +1024,19 @@ function awsDayRuns(day, view) {
     ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
 }
 
-function awsDayDetail(day, priceDay, view = awsNewRunView()) {
+function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
   if (day.state === "none") return '<div class="aws-day-detail"><p class="aws-note">no record</p></div>';
   const price = priceDay ? ` and the prices from the newest AWS amount (${AWS_SHORT_DAY.format(awsDate(priceDay))})` : "";
   const estimate = day.state === "estimate" ? `<p class="aws-note">This amount is our estimate. It uses our run records${price}.
     AWS has no amount for this day yet.</p>` : "";
-  const controls = Object.entries(AWS_RUN_GROUPS).map(([group, label]) =>
+  const units = awsDayHasUnits(day);
+  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) =>
     `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}">${label}</button>`).join("");
   return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
     <div class="aws-run-controls"><span class="aws-dim">Group by</span>
       <div class="filter" role="group" aria-label="Group by">${controls}</div>
       <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
-    <div class="aws-run-content">${awsDayRuns(day, view)}</div></div>`;
+    <div class="aws-run-content">${awsDayRuns(day, view)}</div>${units ? "" : awsUnitNote(unitStart)}</div>`;
 }
 
 function awsRunsCsv(days) {
@@ -1896,7 +1910,7 @@ function awsHistoryRow(row, depth, costs, largest, openPeriods, tips) {
     if (row.period === "day") {
       const day = row.days[0];
       children = `<tr><td class="aws-detail-cell" colspan="5" style="padding-left:${indent + 30}px">
-        ${awsDayDetail(day, costs.price_day, awsRunViews.get(day.day))}</td></tr>`;
+        ${awsDayDetail(day, costs.price_day, awsRunViews.get(day.day), awsUnitStart)}</td></tr>`;
     } else {
       const lower = AWS_PERIODS[row.period][2];
       children = awsPeriods(lower, row.days, row).map(child =>
@@ -1937,6 +1951,7 @@ function renderAwsCosts(costs) {
     return;
   }
   awsZone = costs.zone;
+  awsUnitStart = awsFirstUnitDay(costs.days);
   read.textContent = costs.read_at == null ? "AWS amounts not read yet" :
     `AWS amounts read ${awsDateTime(new Date(costs.read_at * 1000))}`;
   const groups = Object.fromEntries(Object.keys(AWS_PERIODS).map(period => [period, awsPeriods(period, costs.days)]));

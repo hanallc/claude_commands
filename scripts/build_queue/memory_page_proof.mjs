@@ -516,7 +516,7 @@ try {
             const ids = awsCostReport.days.flatMap(day => day.runs_list.map(run => run.id));
             pane.scrollIntoView({block:'start'});
             return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
-              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[7].textContent),
+              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[row.cells.length - 2].textContent),
               idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
               csvHeader:csv[0], csvRows:csv.length - 2,
               recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
@@ -681,6 +681,7 @@ try {
         assert.deepEqual(result.month,['2,986','~$104.47']);
         assert.deepEqual(result.year,result.month);
         assert.match(result.billed,/Job not recorded/);
+        assert.match(result.billed,/Runs before Thu Nov 19 have no unit record\./);
         assert.doesNotMatch(result.billed,/Our estimate before the AWS amount/);
         assert.deepEqual([result.savedDay,result.savedMonthDay],['false','true']);
       }
