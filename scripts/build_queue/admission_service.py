@@ -3812,7 +3812,8 @@ done
 
         The Mac can keep the claim after its holder ends. The next claim for the scope takes it
         over and checks for leftovers, so the old assignment holds nothing. A live owner can still
-        send a terminal report, and a pending start can still launch, so both keep it current.
+        send a terminal report, and a pending start can still launch, so both keep it current until
+        the owner asks again (`_close_abandoned_attempt`).
         """
         return (self._ended_claim_holder(saved)
             and not self._placement_owner_live(saved.assignment.owner)
@@ -3836,6 +3837,22 @@ done
                 and isinstance(saved.provider, placement.ProviderClaimReference)
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
+
+    def _close_abandoned_attempt(self, episode: str) -> None:
+        """Close the current attempt as lost when its owner asks again after the claim holder ended.
+
+        The owner asks for a placement again only after its attempt ends, so no report comes for that
+        attempt. The episode goes back to its lines. The provider keeps the claim and any pending start
+        for cleanup: the next claim for the scope takes it over and settles the start before it runs.
+        """
+        saved = self.assignments.get(self.current_assignments.get(episode, ""))
+        if (saved is None or not isinstance(saved.state, placement.CurrentAssignment)
+                or not isinstance(saved.terminal_report, placement.NoTerminalReport)
+                or not self._ended_claim_holder(saved)):
+            return
+        report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
+                                                 self.clock.now())
+        self._close_for_report(replace(saved, terminal_report=report), report)
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
@@ -4771,6 +4788,7 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                self._close_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:
