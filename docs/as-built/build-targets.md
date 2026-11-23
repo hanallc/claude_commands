@@ -310,10 +310,11 @@ A shortfall selects logical units by their bytes on that filesystem, in target l
 Each selected unit includes its intermediate files and copied artifacts on both filesystems.
 Only bytes freed on the selected filesystem reduce its shortfall.
 A held checkout protects both output roots.
-A process use or build hold on one output root also holds the other roots of that root's own saved mappings (`pair_roots_for`).
-A target is held when one root of its own mappings is in use. A held target does not hold other roots.
-A longer chain of mappings does not spread the hold.
-The scan still groups every root that a chain of mappings connects (`connected_roots_for`).
+A process use or build hold on one output root counts as a use of the other roots of that root's own saved mappings (`pair_roots_for`).
+A target is held (`PairHeld`) when a root of its own mappings is in use. A held target makes no other root held.
+A lock or a live use that the take finds on a held target replaces the hold, and the target is then in use.
+Example: the mappings are (one, shared), (two, shared) and (two, three), and a process uses one. One and shared are in use, two is held, and three is free.
+The closure of the mappings (`connected_roots_for`) has five uses: scan clusters, batch order, group last use, the CI exclusion and the filesystem floor's target list.
 The take checks both roots' processes, Cargo locks, use stamps, and observed output before deletion.
 The take records both roots in `target-deletes.json` before it removes any output.
 A saved trim intent retains the paired paths after an interruption.

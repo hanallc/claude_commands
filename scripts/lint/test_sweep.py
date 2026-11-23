@@ -2181,7 +2181,7 @@ class FloorTests(SweepCase):
         self.root_row(base / "ws-three", two, three)
         return one, shared, two, three
 
-    def test_one_process_holds_its_own_mapping_pairs_and_not_the_whole_chain(self) -> None:
+    def test_one_process_holds_its_pairs_and_their_targets_but_not_the_whole_chain(self) -> None:
         base = self.base()
         one, shared, two, three = self.chained_targets(base)
         use = sweep.TargetUse(62002, "maps build output")
@@ -2190,10 +2190,38 @@ class FloorTests(SweepCase):
             status, printed = self.hold(base, 10 * GIB, [0], dry_run=True, recorded=False)
         self.assertEqual(status, 0)
         busy = cast(dict[str, sweep.FloorProtection], shrink.call_args.args[6])
-        self.assertEqual(busy, {one: use, shared: use, two: use})
-        self.assertEqual(set(cast(Collection[str], shrink.call_args.kwargs["pair_held"])), {two})
+        self.assertEqual(busy, {one: use, shared: use, two: sweep.PairHeld(use)})
         self.assertIn(f"lint sweep: pid {use.pid} {use.how}; {shared} left alone", printed)
         self.assertIn(f"the floor lists {three}", printed)
+
+    def test_held_paths_spread_from_uses_and_from_a_lock_found_on_a_pair_held_target(self) -> None:
+        for late_lock in (False, True):
+            with self.subTest(late_lock=late_lock):
+                base = self.base()
+                one, shared, two, three = self.chained_targets(base)
+                use = sweep.TargetUse(62003, "maps build output")
+                judgment_lock = scratch.judgment_lock
+                checked: list[str] = []
+
+                @contextmanager
+                def lock_two_after_the_first_check(path: Path) -> Generator[bool]:
+                    if late_lock and str(path) == two and two in checked:
+                        yield False
+                        return
+                    checked.append(str(path))
+                    with judgment_lock(path) as idle:
+                        yield idle
+
+                with (mock.patch.object(sweep, "process_uses", return_value={one: use}),
+                      mock.patch.object(scratch, "judgment_lock", side_effect=lock_two_after_the_first_check),
+                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
+                    status, _ = self.hold(base, 10 * GIB, [0], dry_run=False, recorded=False)
+                self.assertEqual(status, 0)
+                outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+                self.assertEqual(set(outcome.held_targets),
+                                 {one, shared, two, three} if late_lock else {one, shared, two})
 
     def test_scan_clusters_keep_the_whole_mapping_chain(self) -> None:
         base = self.base()
