@@ -283,6 +283,11 @@ def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = Tr
 
 
 _EARLIER_CARGO_TARGET = "the checkout's earlier Cargo target"
+_MAIN_STAYS = "main checkout stays in place"
+_ALREADY_MOVED = "already moved"
+_AT_DESTINATION = "already at the destination"
+# Keeps that need no further work.
+_SETTLED_KEEPS = frozenset((_MAIN_STAYS, _ALREADY_MOVED, _AT_DESTINATION))
 
 
 class TargetReappeared(FileExistsError):
@@ -295,6 +300,11 @@ class TargetReappeared(FileExistsError):
 
 def _saved_target_prefix(checkout: Path) -> str:
     return f".saved-target-{checkout.name}-"
+
+
+def _report_saved_targets(checkout: Path) -> None:
+    for saved in _saved_targets(checkout):
+        report_retained_folder(saved, _EARLIER_CARGO_TARGET)
 
 
 def _saved_targets(checkout: Path) -> tuple[Path, ...]:
@@ -333,8 +343,11 @@ def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> 
                 else:
                     try:
                         target.symlink_to(output, target_is_directory=True)
-                    except FileExistsError as error:
-                        raise TargetReappeared(error, output) from error
+                    except OSError as error:
+                        if os.path.lexists(target):
+                            raise TargetReappeared(error, output) from error
+                        os.rename(output.name, target, src_dir_fd=parent)
+                        raise
                     return
         if previous == target:
             _save_target_and_link(target, output)
@@ -2023,7 +2036,8 @@ class MigrationSelection:
         return any(self.includes(path) for path in (journal.move.old, journal.move.new, journal.source_key))
 
 
-def repository_selection(repo: str, listed: dict[Path, ListedWorktree], folders: MigrationFolders) -> MigrationSelection:
+def repository_selection(repo: str, listed: dict[Path, ListedWorktree],
+                         folders: MigrationFolders) -> MigrationSelection:
     """Select the main checkout of one repository, its worktrees, its scratch clones, and its saved moves."""
     main = main_checkout_for_word(repo)
     members = {main, *(tree.path for tree in linked_trees(main))}
@@ -2331,6 +2345,8 @@ class WorktreeMigration:
     skipped: dict[Path, str]
     # Moved checkouts whose target is a real folder or missing, so it still needs the link to the recorded output.
     moved: tuple[Path, ...] = ()
+    # Other moved checkouts that have a folder with an earlier target.
+    saved: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2460,7 +2476,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
                if journal.stage is MoveStage.PLANNED and journal.git_entry != Path(".git")}
     repaired_entries = {journal.move.new: journal for journal in repairs.values()}
     clones: dict[Path, tuple[RegisteredTree, ...]] = {}
-    skipped = {path: "main checkout stays in place" for path in mains} | journals.kept
+    skipped = {path: _MAIN_STAYS for path in mains} | journals.kept
     trees: list[RegisteredTree] = []
     for path in _scratch_checkouts(scratch_root):
         reason = _migration_path_keep(path, folders)
@@ -2592,7 +2608,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             continue
         if path in placed_destinations:
             already_placed.add(path)
-            skipped[path] = "already moved"
+            skipped[path] = _ALREADY_MOVED
         elif selection.includes(path):
             candidates.append(tree)
 
@@ -2669,7 +2685,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             skipped[path] = str(error)
             continue
         if new == path:
-            skipped[path] = "already at the destination"
+            skipped[path] = _AT_DESTINATION
             continue
         if os.path.lexists(new):
             skipped[path] = f"short name occupied at {new}"
@@ -2707,12 +2723,13 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
     for path in listed.keys() - registered_paths - skipped.keys() - former:
         skipped[path] = "no registered worktree at this path"
     ordered = tuple(sorted(selected.values(), key=lambda plan: (plan.tree.path in clones, plan.tree.path)))
+    placed = sorted(path for path in already_placed if selection.includes(path))
+    moved = tuple(path for path in placed
+                  if _is_real_target(path / "target") or not os.path.lexists(path / "target"))
     return WorktreeMigration(ordered, tuple(tree for tree in stale if selection.includes(tree.path)),
                              tuple(main_plans), clone_members,
                              {path: reason for path, reason in skipped.items() if selection.includes(path)},
-                             tuple(sorted(path for path in already_placed if selection.includes(path)
-                                          and (_is_real_target(path / "target")
-                                               or not os.path.lexists(path / "target")))))
+                             moved, tuple(path for path in placed if path not in moved and _saved_targets(path)))
 
 
 _NO_PROBE_FDS: frozenset[int] = frozenset()
@@ -3185,7 +3202,10 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
             snapshot = staff_record()
             listed = listed_worktrees(list_file, folders, snapshot) if list_file is not None else {}
             if scope is MigrationScope.REPOSITORY:
-                selection = repository_selection(repo, listed, folders)
+                try:
+                    selection = repository_selection(repo, listed, folders)
+                except ValueError as error:
+                    return _unknown_repo(repo, error)
             else:
                 selection = MigrationSelection(scope, listed)
             _ = locks.enter_context(move_lock(create=not dry_run))
@@ -3200,6 +3220,11 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
     except WorktreeMoveLockHeld as error:
         print(f"kept: {error.lock} held")
         return error.code
+
+
+def _unknown_repo(repo: str, error: ValueError) -> int:
+    print(f"migrate --repo {repo}: {error}", file=sys.stderr)
+    return 2
 
 
 # The Mac copy of this script runs the guarded switch for one repository.
@@ -3217,8 +3242,7 @@ def migrate_on_mac(repo: str, *, dry_run: bool) -> int:
     try:
         checkout = main_checkout_for_word(repo)
     except ValueError as error:
-        print(f"kept: {repo}: natedev has no main checkout for the Mac claim ({error})")
-        return 1
+        return _unknown_repo(repo, error)
     try:
         with mac_run.repository_claim(checkout, "mac", f"migrate --repo {repo}", mac_test.MacClaimKind.MIRROR):
             return _run_on_mac(command)
@@ -3237,20 +3261,10 @@ def _run_on_mac(command: str) -> int:
 
 
 def _run_ssh(command: tuple[str, ...]) -> int:
-    """Run ssh, and on a stop close its input and wait for it, so the claim lasts while the Mac command runs."""
-    with subprocess.Popen(command, stdin=subprocess.PIPE, start_new_session=True) as process:
-        try:
-            return process.wait()
-        except BaseException:
-            if process.stdin is not None:
-                process.stdin.close()
-            while True:
-                try:
-                    _ = process.wait()
-                    break
-                except KeyboardInterrupt:
-                    continue
-            raise
+    """Run ssh with stops deferred until it ends, so the claim lasts while the Mac command runs."""
+    # ssh inherits the deferred signals, so a stop at the terminal also waits for the Mac command.
+    with cancellation.defer_cleanup_signals():
+        return subprocess.run(command, stdin=subprocess.DEVNULL, check=False).returncode
 
 
 def _hold_idle_target(target: Path, held: ExitStack) -> str:
@@ -3279,20 +3293,22 @@ def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *,
     if reason := _migration_target_lock(checkout, common, output):
         progress.kept[checkout] = reason
         return False
-    for saved in _saved_targets(checkout):
-        report_retained_folder(saved, _EARLIER_CARGO_TARGET)
+    _report_saved_targets(checkout)
     target = checkout / "target"
+    real = _is_real_target(target)
     with ExitStack() as held:
-        if _is_real_target(target):
+        if real:
+            # The flocks come first: a cargo that waits on one keeps the lock file open, so the scan finds it.
+            if reason := _hold_idle_target(target, held):
+                progress.kept[checkout] = reason
+                return False
             uses = _migration_processes((target,))
             progress.record_process_scan(uses)
             if reason := _migration_process_use(target, uses, ignore_stopped_pane_shells=False):
                 progress.kept[checkout] = f"target in use ({reason})"
                 return False
-            if reason := _hold_idle_target(target, held):
-                progress.kept[checkout] = reason
-                return False
-        if not dry_run and (reason := _link_output(checkout, output)):
+        # A target that appears after this check is not moved; the link refuses it and keeps the checkout.
+        if not dry_run and (reason := _link_output(checkout, output, save_existing=real)):
             progress.kept[checkout] = reason
             return False
     return True
@@ -3317,14 +3333,15 @@ def _moved_output(checkout: Path, publication: MigrationPublication) -> Path | s
     return output
 
 
-def _link_output(checkout: Path, output: Path) -> str:
+def _link_output(checkout: Path, output: Path, *, save_existing: bool) -> str:
     """Move the target to the output and link it, or give the reason to keep the checkout."""
     try:
-        ensure_target_link(checkout, output)
+        ensure_target_link(checkout, output, save_existing=save_existing)
     except TargetReappeared as error:
         return f"rerun: a new {checkout / 'target'} appeared after the move; the earlier target is in {error.kept}"
-    except ValueError as error:
-        # Each ValueError comes before the target moves, so the checkout is unchanged.
+    except (OSError, ValueError) as error:
+        # The target is unchanged or back in place.
+        # If the move back failed, the target is in the output, and a rerun links it.
         return f"kept: {error}"
     return ""
 
@@ -3453,13 +3470,17 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
         elif _switch_output(checkout, recorded, progress, dry_run=dry_run):
             _ = progress.kept.pop(checkout, None)
             print(f"output {checkout} -> {recorded}")
+    for checkout in plan.saved:
+        _report_saved_targets(checkout)
     progress.print_keeps(dry_run=dry_run)
     if not dry_run and any(selection.includes(path)
                            and progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
                            for path in _scratch_checkouts(folders.scratch)):
         print("keep the old build root until all remaining scratch checkouts have a confirmed location", file=sys.stderr)
         return 1
-    return 0
+    # A loop over repositories sees a kept checkout in the exit status.
+    kept = progress.in_use.keys() | {path for path, reason in progress.kept.items() if reason not in _SETTLED_KEEPS}
+    return 1 if selection.scope is MigrationScope.REPOSITORY and kept else 0
 
 
 def main() -> int:
@@ -3485,7 +3506,7 @@ def main() -> int:
     selection = migration.add_mutually_exclusive_group()
     _ = selection.add_argument("--all", dest="scope", action="store_const", const=MigrationScope.ALL,
                                default=MigrationScope.LISTED, help="select all worktrees")
-    _ = selection.add_argument("--repo", help="select one repository by its repo word: its main checkout and worktrees")
+    _ = selection.add_argument("--repo", help="select one repository by its repo word: its main checkout, worktrees, scratch clones and saved moves")
     _ = migration.add_argument("--host", choices=("mac",),
                                help="hold the Mac claim on natedev and run migrate --repo on the Mac")
     _ = migration.add_argument("--list", type=Path, help="select worktrees or supply names for --all or --repo")
