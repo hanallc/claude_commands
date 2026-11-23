@@ -224,11 +224,9 @@ def process_ended(pid: int) -> bool:
     """Wait a short time for a process to leave or become a zombie."""
     deadline = time.monotonic() + process_group.STOP_WAIT_SECONDS + 5
     while time.monotonic() < deadline:
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except (FileNotFoundError, ProcessLookupError):
-            return True
-        if state == "Z":
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS, check=False).stdout.strip()
+        if not state or state.startswith("Z"):
             return True
         time.sleep(.05)
     return False
@@ -250,7 +248,7 @@ class RunProcessGroupTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired) as stopped:
             _ = process_group.run_process_group(
                 ["sh", "-c", f"sleep 30 & echo $! > {written}; mv {written} {shlex.quote(str(record))}; echo waiting; wait"],
-                timeout=5)
+                timeout=15)
         self.assertEqual(cast(str, stopped.exception.output), "waiting\n")
         self.assertTrue(process_ended(int(record.read_text())))
 

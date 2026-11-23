@@ -46,14 +46,15 @@ def run_process_group(command: Sequence[str], *, timeout: float,
     Output goes to files, so a helper that keeps a pipe open cannot delay the result.
     """
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        with subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, start_new_session=True) as process:
-            try:
-                _ = process.wait(timeout=timeout)
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                timed_out = True
-            finally:
-                stop_process_group(process)
+        # No context manager: its exit waits for the leader with no time limit.
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        try:
+            _ = process.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            stop_process_group(process)
         result = subprocess.CompletedProcess(list(command), process.returncode, _text(stdout), _text(stderr))
     if timed_out:
         raise subprocess.TimeoutExpired(list(command), timeout, result.stdout, result.stderr)
