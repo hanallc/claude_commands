@@ -3199,7 +3199,7 @@ def report_mac_linux_no_answer(reason: str) -> MacLinuxNoAnswer:
     assignment = admission_wire.read_assignment(path).assignment
     failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
     write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
-    return MacLinuxNoAnswer(f"Mac Linux guest took no run: {reason}")
+    return MacLinuxNoAnswer(f"Mac Linux guest took no run ({reason})")
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -3460,7 +3460,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
     except MacLinuxNoAnswer as error:
-        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        print(error, file=sys.stderr, flush=True)
         return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
@@ -3578,7 +3578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             with gate_recovery(checkout):
                 return merge_checkpoint(args)
     except MacLinuxNoAnswer as error:
-        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        print(error, file=sys.stderr, flush=True)
         return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

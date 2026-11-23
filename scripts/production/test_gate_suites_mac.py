@@ -489,7 +489,7 @@ class MacGateSuitesTests(GateSuitesFixture):
               mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(reason)) as guest,
               mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
-        self.assertIn(reason, errors.getvalue())
+        self.assertEqual(errors.getvalue(), f"Mac Linux guest took no run ({reason})\n")
         guest.assert_called_once()
         local.assert_not_called()
         self.cloud_route.assert_not_called()

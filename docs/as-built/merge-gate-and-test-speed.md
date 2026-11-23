@@ -83,8 +83,8 @@ The queue currently releases the Mac claim at this deadline. The guest run keeps
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
-It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes just before the first test.
-The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
+The gate then prints `Mac Linux guest took no run (<reason>)`, writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
@@ -95,7 +95,7 @@ A refused placement during the retry stops the gate step with "Gate placement bl
 A failure after the first test started is not placed again: the gate fails.
 `copies.py run` with named gate targets does not place the gate again yet.
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
-Each reason names the exit status of the SSH stream and the last 1200 characters of its standard error (`stream_report`).
+Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
 When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.

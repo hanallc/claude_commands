@@ -223,6 +223,8 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert full == (mode is SuiteMode.GATE)
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
+    if scenario == 'child-stdout':
+        subprocess.run(['echo', 'A child log line must stay outside the JSON result.'], check=True)
     if scenario == 'hang':
         Path(os.environ['FIXTURE_RUN_GROUP']).write_text(str(os.getpgrp()))
         signal.pause()
@@ -885,9 +887,9 @@ fi
         self.assertFalse(self.run_lock().exists())
 
     def test_disconnect_before_take_copy_kills_the_run_and_proves_end(self) -> None:
-        result = self.route('disconnect-before-copy')
-        self.assertIn('SSH or source stream exited 255', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        reason = self.not_started(self.route('disconnect-before-copy'))
+        self.assertIn('SSH or source stream exited 255', reason)
+        self.assertIn('Guest cleanup: ended', reason)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -1120,7 +1122,7 @@ fi
                   patch.object(mac_linux, 'sleep'),
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0)):
                 result = self.route()
-        self.assertIn('Guest cleanup: ended', str(result))
+        self.assertIn('Guest cleanup: ended', self.not_started(result))
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
 
     def test_full_stderr_pipe_does_not_extend_the_proof_wait(self) -> None:
@@ -1416,6 +1418,12 @@ fi
         self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def test_child_text_on_standard_output_leaves_the_reply_clean(self) -> None:
+        result = self.route('child-stdout')
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
+        self.assertTrue(result.passed)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
     def test_red_module_returns_a_failed_gate(self) -> None:
         result = self.route('red')
         assert isinstance(result, GateRun), result
@@ -1444,15 +1452,16 @@ fi
                                      'SSH or source stream exited 0: fixture stderr tail', False)
         source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', frozenset(), ModuleCoverage.COMPLETE)
         request = cast(mac_linux.GuestRequest, cast(object, {}))
-        with self.assertRaises(mac_linux.GuestNoAnswer) as before:
+        with self.assertRaises(mac_linux.GuestTookNoRun) as before:
             _ = mac_linux.completed_run(reply, request, source)
         self.assertEqual(str(before.exception), 'the guest stopped before a test started: the guest reply is unusable '
-                         + '(Expecting value: line 1 column 1 (char 0)); SSH or source stream exited 0: fixture stderr tail')
+                         + "(Expecting value: line 1 column 1 (char 0)); reply start ''; "
+                         + 'SSH or source stream exited 0: fixture stderr tail')
         with self.assertRaises(mac_linux.GuestUnavailable) as after:
             _ = mac_linux.completed_run(replace(reply, tests_started=True), request, source)
-        self.assertNotIsInstance(after.exception, mac_linux.GuestNoAnswer)
+        self.assertNotIsInstance(after.exception, mac_linux.GuestTookNoRun)
         self.assertEqual(str(after.exception), 'the guest reply is unusable (Expecting value: line 1 column 1 '
-                         + '(char 0)); SSH or source stream exited 0: fixture stderr tail')
+                         + "(char 0)); reply start ''; SSH or source stream exited 0: fixture stderr tail")
 
     def test_copy_can_retry_after_a_partial_upload(self) -> None:
         main = self.guest_home / '.claude'
@@ -1584,10 +1593,10 @@ fi
     def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:
         missing = self.root / 'missing-basedpyright'
         with patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(missing)}):
-            result = self.route(type_dirs=('scripts',))
-        assert isinstance(result, str), result
-        self.assertIn(f'The guest cannot find the type-check tool {missing}', result)
-        self.assertIn('Guest cleanup: ended', result)
+            reason = self.not_started(self.route(type_dirs=('scripts',)))
+        self.assertIn('the guest stopped before a test started', reason)
+        self.assertIn(f'The guest cannot find the type-check tool {missing}', reason)
+        self.assertIn('Guest cleanup: ended', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:

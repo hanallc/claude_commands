@@ -8,7 +8,7 @@ Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An
 from __future__ import annotations
 
 from collections.abc import Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 import errno
@@ -381,7 +381,7 @@ class ArmedGuestAttempt:
         return cls(**record)
 
 
-class GuestNoAnswer(GuestUnavailable):
+class GuestTookNoRun(GuestUnavailable):
     """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
 
 
@@ -932,7 +932,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                         try:
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
-                            raise GuestNoAnswer(f'the guest did not arm the run: {error}') from error
+                            raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
                         arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send, count=True)
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
                     if end is None:
@@ -970,7 +970,12 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             raise GuestMissingPrerequisite(diagnostics.strip())
         raise guest_failure(tests_started, f'{stream_report(stream)}. {cleanup_detail}')
     result, _, count = stream.stdout.rstrip().rpartition(b'\n')
-    return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), send.form, send.reason,
+    try:
+        bundle_bytes = int(count) - len(bootstrap)
+    except ValueError:
+        raise guest_failure(tests_started, f'the guest stream gave no byte count ({count[-200:]!r}); '
+                            + f'{stream_report(stream)}. {cleanup_detail}') from None
+    return GuestReply(result.decode('utf-8', errors='replace'), bundle_bytes, send.form, send.reason,
                       stream_report(stream), tests_started)
 
 
@@ -984,7 +989,7 @@ def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
     if tests_started:
         return GuestUnavailable(reason)
-    return GuestNoAnswer(f'the guest stopped before a test started: {reason}')
+    return GuestTookNoRun(f'the guest stopped before a test started: {reason}')
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -997,13 +1002,13 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
     except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
         from scripts.mac_test import offload
 
-        no_answer = GuestNoAnswer(f'the guest main probe failed: {error}')
+        took_no_run = GuestTookNoRun(f'the guest main probe failed: {error}')
         try:
             delay = conf.read('mac_test').number('unreachable_backoff_s')
             offload.write_backoff(time() + delay, TARGET, strict=True)
         except (conf.Unusable, OSError) as backoff_error:
-            no_answer.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
-        raise no_answer from error
+            took_no_run.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
+        raise took_no_run from error
     if isinstance(guest, EmptyGuestMain):
         return FullBundle(BundleReason.FIRST_RUN)
     if subprocess.run(['git', 'cat-file', '-e', f'{guest.commit}^{{commit}}'], cwd=repo,
@@ -1174,7 +1179,8 @@ def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSou
     try:
         return reply_run(reply, request, source)
     except route_errors() as error:
-        raise guest_failure(reply.tests_started, f'the guest reply is unusable ({error}); {reply.stream_report}') from error
+        raise guest_failure(reply.tests_started, f'the guest reply is unusable ({error}); '
+                            + f'reply start {reply.result[:200]!r}; {reply.stream_report}') from error
 
 
 def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource) -> MacLinuxGateRun:
@@ -1247,7 +1253,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return run
     except mac_run.MacRunRefused as error:
         return GuestNotStarted(f'{TARGET}: not started: {error}')
-    except GuestNoAnswer as error:
+    except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(f'{TARGET}: not started: ' + ' '.join((str(error), *notes)))
     except route_errors() as error:
@@ -1452,7 +1458,13 @@ def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
 
 
 def run_copy(request_path: Path) -> None:
-    """Run the candidate's gate and write one JSON result to standard output."""
+    """Run the candidate's gate and write one JSON result to standard output.
+
+    Descriptor 1 points at standard error during the run, so text from this process or a child cannot
+    come before the JSON line.
+    """
+    reply = os.fdopen(os.dup(1), 'w', encoding='utf-8')
+    _ = os.dup2(2, 1)
     from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.production import gate
@@ -1487,7 +1499,7 @@ def run_copy(request_path: Path) -> None:
     # natedev reads this line: a failure before it lets natedev take the gate.
     print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
     try:
-        with build_folders.inherit_build_lock(RUN_LOCK_FD), redirect_stdout(sys.stderr):
+        with build_folders.inherit_build_lock(RUN_LOCK_FD):
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
@@ -1496,7 +1508,8 @@ def run_copy(request_path: Path) -> None:
     finally:
         copies.COMMAND_LOCKS.reset(token)
     print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
-                      'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}), flush=True)
+                      'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
+          file=reply, flush=True)
 
 
 if __name__ == '__main__':

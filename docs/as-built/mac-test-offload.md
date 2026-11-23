@@ -33,10 +33,11 @@ The guest puts the type-check environment in the copy's gate tool folder.
 For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
 If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
-The guest runner writes the `mac-linux run start` line to standard error just before the first test.
+The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
 If the guest run fails before that line, the route reports `not started` and the queue gives the gate to the next named target, for example natedev.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
-Each failure reason names the exit status of the SSH stream and the last 1200 characters of its standard error.
+Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
+A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 
 ## Mac queue runs
@@ -85,6 +86,7 @@ Item 191 B3 will keep the Mac claim until proof and bind the claim identity to t
 The Mac Linux route runs the suite in a numbered copy.
 The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
 Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy`.
+During the run, the runner points descriptor 1 at standard error. Only the JSON reply line goes to the stream standard output.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
 The guest removes the tool folder when the suite returns.
