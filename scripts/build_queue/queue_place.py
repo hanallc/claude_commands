@@ -32,6 +32,9 @@ from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
 
 
+DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
+
+
 @dataclass(frozen=True)
 class ConfiguredFirstPeak:
     pass
@@ -80,6 +83,8 @@ def no_hold_wait() -> None:
 
 
 def in_builds_slice() -> bool:
+    if sys.platform != "linux":
+        return False
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
     except OSError:
@@ -90,7 +95,7 @@ def suite_scope_prefix() -> list[str]:
     if os.environ.get("BUILDLOG_SCOPE") == "0":
         print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
         return []
-    if in_builds_slice():
+    if not os.environ.get(DETACHED_SLICE_ENV) and in_builds_slice():
         print("Module scope skipped: gate already runs in builds.slice", flush=True)
         return []
     return probe_scope_prefix()
@@ -98,8 +103,11 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
+    if sys.platform != "linux":
+        return []
+    slice_name = os.environ.get(DETACHED_SLICE_ENV) or "builds.slice"
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
+              "--expand-environment=no", f"--slice={slice_name}", "--"]
     try:
         probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=10, check=False)
@@ -109,7 +117,7 @@ def probe_scope_prefix() -> list[str]:
     if probe.returncode:
         print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
         return []
-    print("Module scope: builds.slice", flush=True)
+    print(f"Module scope: {slice_name}", flush=True)
     return prefix
 
 
@@ -328,6 +336,8 @@ class QueuePlace:
         return child
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
+        if sys.platform != "linux":
+            raise QueuePlaceRefused("a queued program requires Linux")
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
         if self.arguments and tuple(argv) != self.arguments:

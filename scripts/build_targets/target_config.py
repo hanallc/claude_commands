@@ -197,7 +197,7 @@ def ssh_target_state_directory(target: str) -> Path:
 
 
 def uses_legacy_mac_layout(platform: Platform) -> bool:
-    """Mac targets retain one mirror and claim per source repository name."""
+    """Mac targets retain one mirror per source repository name."""
     return platform == "macos"
 
 
