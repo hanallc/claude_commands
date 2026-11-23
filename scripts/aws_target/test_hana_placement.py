@@ -495,7 +495,8 @@ with hana_command_lock(directory) as access:
 
     def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
         lines = self.workload.read_text().splitlines(keepends=True)
-        _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
+        _ = self.workload.write_text(''.join('daily_budget_usd=unset\n' if line.startswith('daily_budget_usd=') else line
+                                             for line in lines))
         recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
         with self.preview_calls() as calls, conf.report_key_changes(), redirect_stderr(StringIO()) as warnings:
             with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:
@@ -503,7 +504,7 @@ with hana_command_lock(directory) as access:
                 self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertEqual(history.call_args_list, [mock.call(self.workload)] * 2)
         self.assertEqual(calls, [self.clock.now] * 2)
-        self.assertEqual(warnings.getvalue().count("daily_budget_usd='<missing>'"), 1)
+        self.assertEqual(warnings.getvalue().count("daily_budget_usd='unset'"), 1)
 
     def test_history_lifecycle_and_setup_writes_refresh_the_preview(self) -> None:
         history = ledger.CostLedger(self.state).launch_history_path

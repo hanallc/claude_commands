@@ -1031,12 +1031,16 @@ Production readers follow `CONF_DIR`:
 - `user_zone.settings_path()` reads `USER_ZONE_CONF`, else `conf.path("user_zone")`, at each call.
 - `statusline.sh` reads `statusline.conf` and `user_zone.conf` from `${CONF_DIR:-$HOME/.claude/config}`, the `conf.sh` rule. `USER_ZONE_CONF` still comes first.
 - `copies.config_settings()` and `record.sync_config()` read `COPIES_CONFIG` or `BUILD_TARGETS_CONFIG`, else `conf.read_or_repository` under `CONF_DIR`.
-- Under `CONF_DIR`, each repository fallback reads the twin: `conf._repository_path`, `shutdown_record.record_lock_seconds`, `copies.guard_choice_limit`, `waiting_rows.model_color_key` and the `models.conf` fallback of `accounts.SessionModelReader.registry`.
+- No reader falls back to the repository `config/` for a missing live key or file.
+  `conf.read`, `shutdown_record.record_lock_seconds` and `copies.guard_choice_limit` fail and name the key and the path.
+  `conf.known_host_names` fails and names the path.
+  `waiting_rows.model_color_key` refuses the color, and `accounts.SessionModelReader.registry` gives no rows.
+  A fixture that lacks a key gets it from the twin through `write_config_fixture` or `copy_for_test`.
 - Under `CONF_DIR` at import, the default paths `stall_watch.WATCH_DEFAULTS`, `nextest_log.DEFAULT_SETTINGS`, `review.NOTIFY_CONFIG`, `rust_release.LINT_CONFIG`, `rebuild_row.DEFAULT_CONFIG` and `design_roles.DEFAULT_CONFIG` are the twins.
 
 `conf.test_config_path(stem)` is the one path to a test-owned file.
 `memory_test_support` templates use it.
-Under `CONF_DIR`, the `conf.read_or_repository` fallback and the `conf._repository_path` recovery also use it.
+Under `CONF_DIR`, the `conf.read_or_repository` fallback for a fixture without the file also uses it.
 `conf.copy_for_test(source, destination)` is the one copy of a config folder for a test.
 It keeps links and gives each top-level `.conf` file its `test_config/` values.
 It keeps a file that the destination already holds.

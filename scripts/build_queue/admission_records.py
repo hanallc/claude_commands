@@ -1576,7 +1576,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
         def value[Value](key: str, convert: Callable[[str], Value], *, use_file_limits: bool = True) -> Value:
             result = settings_read.origin(key, convert, use_file_limits=use_file_limits)
             if isinstance(result, conf.UnavailableValue):
-                raise conf.Unusable(f"{result.reason}; no usable committed value")
+                raise conf.Unusable(result.unrecovered())
             if isinstance(result, conf.RecoveredValue):
                 messages.append(f"warning: {result.reason}")
             return result.value

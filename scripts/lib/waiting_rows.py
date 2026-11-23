@@ -47,9 +47,6 @@ def model_color_key(stem: str, key: str) -> bool:
         override = os.environ.get("MODELS_CONFIG_FILE")
         source = Path(override) if override else conf.path("models")
         try:
-            if not override and not source.exists():
-                source = (conf.test_config_path("models") if "CONF_DIR" in os.environ
-                          else Path(__file__).resolve().parents[2] / REGISTRY_PATH)
             registry = registry_rows.parse_registry(conf_reads.read_text(source))
         except (OSError, UnicodeError):
             return False

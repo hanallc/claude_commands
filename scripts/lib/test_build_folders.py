@@ -2288,19 +2288,11 @@ assert not loaded, loaded
         self.assertNotEqual(folders.repository_key(first), folders.repository_key(second))
         self.assertEqual(folders.repository_key(first), folders.repository_key(alias))
 
-    def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
+    def test_private_config_without_folder_rules_uses_the_test_owned_file_without_git(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         original = config.read_text()
-        fallback = self.root / "fallback/build_folders.conf"
-        _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
         config.unlink()
-        original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
-
-        def repository_path(stem: str) -> Path:
-            return fallback if stem == "build_folders" else original_path(stem)
-
-        with (mock.patch.object(conf, "_repository_path", side_effect=repository_path),
-              mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run"))):
+        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
             self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
             path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
         self.assertTrue(path.is_dir())

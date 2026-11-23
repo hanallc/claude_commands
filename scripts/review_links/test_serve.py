@@ -99,6 +99,7 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
+    _ = write_config_fixture(configuration / "machines.conf")
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
         "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))

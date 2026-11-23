@@ -288,7 +288,7 @@ Above that limit, `UnresolvedChoices.choice_texts` retains dropped text through 
 A program with no tree-making word passes.
 Known or retained tree-making text refuses with `cannot resolve interpreter program choices`.
 An unknown executable in a tree-making position keeps its unresolved-executable refusal.
-The required-key reader uses the repository configuration when an override omits `guard_choice_limit`.
+A copies configuration without `guard_choice_limit` refuses and names the key and the path.
 
 Expanded Python that does not parse passes unless its known text contains a tree-making word.
 That case refuses with `cannot parse Python program`.

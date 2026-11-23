@@ -10179,15 +10179,11 @@ class SessionModelReaderTests(unittest.TestCase):
         self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
                          accounts.ObservedSessionModel("claude-opus-5-5", "high"))
 
-    def test_registry_fallback_reads_the_test_owned_models_file_under_conf_dir(self) -> None:
-        twin = self.home / "test_config/models.conf"
-        twin.parent.mkdir()
-        _ = twin.write_text("[fixture]\nrow=value\n", encoding="utf-8")
+    def test_unreadable_live_registry_gives_no_rows_and_reads_no_other_file(self) -> None:
         with (patch.object(models_registry, "registry_text", side_effect=OSError("unreadable")),
-              patch.object(conf, "test_config_path", return_value=twin) as twin_path):
-            registry = accounts.SessionModelReader().registry
-        twin_path.assert_called_once_with("models")
-        self.assertEqual(registry, {"fixture": {"row": "value"}})
+              patch.object(conf, "test_config_path", side_effect=AssertionError("no fallback file")),
+              patch.object(Path, "read_text", side_effect=AssertionError("no fallback file"))):
+            self.assertEqual(accounts.SessionModelReader().registry, {})
 
     def test_model_reader_stops_at_the_configured_scan_limit(self) -> None:
         _ = write_config_fixture(self.settings, "session_model_scan_kib=256\n")

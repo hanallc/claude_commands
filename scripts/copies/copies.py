@@ -435,12 +435,10 @@ def load_config() -> CopiesConfiguration:
 
 
 def guard_choice_limit() -> int:
-    """Read the branch limit, using the repository setting for older configuration files."""
+    """Read the branch limit."""
     path, values = config_settings()
     if "guard_choice_limit" not in values:
-        path = (conf.test_config_path("copies") if "CONF_DIR" in os.environ
-                else Path(__file__).resolve().parents[2] / "config/copies.conf")
-        values = conf.read(path).values()
+        raise CopyError(f"{path}: guard_choice_limit is missing; add it to {path}")
     try:
         limit = int(values["guard_choice_limit"])
         if limit <= 0:

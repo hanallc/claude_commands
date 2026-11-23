@@ -72,6 +72,7 @@ class StatusBoardTests(unittest.TestCase):
         _ = write_config_fixture(configuration / "accounts.conf",
                                  "next_move_percent=1\nusage_stale_minutes=10\nsession_model_cache_entries=2\n")
         _ = write_config_fixture(configuration / "statusline.conf")
+        _ = write_config_fixture(configuration / "machines.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_the_table_matches_the_plugin_columns_lines_and_totals(self) -> None:

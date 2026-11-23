@@ -14,12 +14,25 @@ The first key wins. A `key.<short-host>` value takes precedence over `key`.
 A comment directly above a key sets its limits: `# whole: A..B`,
 `# range: A..B` or `# one of: a, b, c`.
 
-The reader resolves a missing or invalid key when the caller uses it.
-An absent default file or key can use the repository value when `CONF_DIR` is unset.
-Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
+The reader checks a key when the caller uses it.
+A missing live file, or a missing key without a code default, raises `conf.Unusable`.
+The message names the key and the live path: `<path>: <key> is missing; add it to <path>`.
+A missing file adds `; the file does not exist` to that message.
+A read of the whole missing file says `<path>: the file does not exist; add it with its keys`.
+The reader does not read the repository `config/` or Git history for a missing key.
+For an invalid value, the reader warns and uses the newest valid committed value under that revision's limits.
 Recovery prefers a value that also passes the current setting's limit.
 With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
+
+A production `conf.read(stem)` or `conf.sh` read uses `~/.claude/config`, also from a unit worktree.
+Some readers use the `config/` folder of their own checkout instead:
+`copies.config_settings()`, `record.sync_config()`, and the default files of `stall_watch`, `nextest_log`,
+`rust_release`, `rebuild_row`, `design_roles` and `review`.
+So a key that a unit branch adds to a `conf.read` file is not live until the merge and the live config change.
+Before then, a production run from that worktree fails and names the key.
+To point one hand run at another folder, set `CONF_DIR=<folder>`.
+`conf.py`, `conf.sh`, `user_zone` and `statusline.sh` follow it.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
 on approval, with the user's words. `/tune` makes the value live on both

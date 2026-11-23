@@ -47,6 +47,15 @@ SSH_SOURCE_TRUST = copies.SshSourceTrust(trusted_caller=offload.trusted_linux_so
 
 
 
+class GuardChoiceLimitTests(unittest.TestCase):
+    def test_a_missing_guard_choice_limit_fails_and_names_the_key_and_path(self) -> None:
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "copies.conf"
+        _ = path.write_text("guard_timeout_seconds=10\n")
+        with mock.patch.dict(os.environ, {"COPIES_CONFIG": str(path)}), self.assertRaises(copies.CopyError) as caught:
+            _ = copies.guard_choice_limit()
+        self.assertEqual(str(caught.exception), f"{path}: guard_choice_limit is missing; add it to {path}")
+
+
 class ImportTests(unittest.TestCase):
     def test_import_loads_no_modules_from_unit_labels(self) -> None:
         program = dedent("""
