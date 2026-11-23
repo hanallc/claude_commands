@@ -1294,6 +1294,52 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertFalse(target.is_symlink())
         self.assertEqual((other / "target").readlink(), self.root / "build/other/main")
 
+    def test_failed_link_moves_the_output_back_to_the_previous_target(self) -> None:
+        self.layout_fixture()
+        checkout = self.migration_main()
+        previous = self.root / "backup/target"
+        (previous / "debug").mkdir(parents=True)
+        _ = (previous / "debug/artifact").write_text("warm")
+        output = self.root / "build/origin/main"
+        refusal = PermissionError(errno.EACCES, "fixture refusal")
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(Path, "symlink_to", side_effect=refusal), self.assertRaises(PermissionError)):
+            worktrees._link_with_previous_target(checkout, output, previous)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((previous / "debug/artifact").read_text(), "warm")
+        self.assertFalse(output.exists())
+        self.assertFalse(os.path.lexists(checkout / "target"))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_scan_skips_its_own_cargo_lock_descriptors(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        self.register_process(os.getpid())
+        with patch.dict(os.environ, self.environment, clear=True), redirect_stdout(text := StringIO()):
+            status = worktrees.migrate_worktrees(None, scope=worktrees.MigrationScope.REPOSITORY,
+                                                 repo="origin", dry_run=False)
+        self.assertEqual(status, 0, text.getvalue())
+        self.assertIn(f"main output {main} -> {self.root}/build/origin/main", text.getvalue())
+        self.assertEqual((main / "target").readlink(), self.root / "build/origin/main")
+
+    def test_migration_repo_keeps_the_text_of_an_error_that_is_not_an_unknown_word(self) -> None:
+        self.layout_fixture()
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees, "repository_selection", side_effect=ValueError("fixture journal")),
+              self.assertRaisesRegex(ValueError, "fixture journal")):
+            _ = worktrees.migrate_worktrees(None, scope=worktrees.MigrationScope.REPOSITORY,
+                                            repo="origin", dry_run=False)
+
+    def test_migration_repo_counts_a_deferred_output_as_no_work(self) -> None:
+        self.layout_fixture()
+        new, _output, _lock = self.moved_worktree_with_real_target()
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees.MigrationPublication, "places_output", return_value=False),
+              redirect_stdout(text := StringIO())):
+            status = worktrees.migrate_worktrees(None, scope=worktrees.MigrationScope.REPOSITORY,
+                                                 repo="origin", dry_run=False)
+        self.assertEqual(status, 0, text.getvalue())
+        self.assertIn(f"keep {new}: already moved; defer output: archive the old build root first", text.getvalue())
+
     def test_migration_reports_the_saved_target_of_a_linked_moved_worktree(self) -> None:
         self.layout_fixture()
         new, output, _lock = self.moved_worktree_with_real_target()
@@ -1337,15 +1383,15 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def test_run_ssh_waits_for_ssh_to_end_on_sigterm(self) -> None:
         marker = self.root / "ended"
-        # The fake ssh sends SIGTERM to the caller, sleeps briefly, and then writes the marker.
+        # The fake ssh sends SIGTERM to the caller, sleeps briefly, and then records whether it leads its own session.
         child = ("import os, pathlib, signal, sys, time; os.kill(os.getppid(), signal.SIGTERM); time.sleep(0.2); "
-                 + "pathlib.Path(sys.argv[1]).write_text('ended')")
+                 + "pathlib.Path(sys.argv[1]).write_text(str(os.getsid(0) == os.getpid()))")
         runner = ("import sys\nfrom scripts.worktree import worktrees\n"
                   + "worktrees._run_ssh((sys.executable, '-c', sys.argv[1], sys.argv[2]))\nprint('after ssh')\n")
         result = subprocess.run([sys.executable, "-c", runner, child, str(marker)], cwd=CHECKOUT,
                                 capture_output=True, text=True, check=False, timeout=60)
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
-        self.assertEqual(marker.read_text(), "ended")
+        self.assertEqual(marker.read_text(), "True")
         self.assertNotIn("after ssh", result.stdout)
 
     def test_migration_refuses_rows_for_numbered_hana_copies(self) -> None:

@@ -287,7 +287,8 @@ _MAIN_STAYS = "main checkout stays in place"
 _ALREADY_MOVED = "already moved"
 _AT_DESTINATION = "already at the destination"
 # Keeps that need no further work.
-_SETTLED_KEEPS = frozenset((_MAIN_STAYS, _ALREADY_MOVED, _AT_DESTINATION))
+_DEFERRED_OUTPUT = "already moved; defer output: archive the old build root first"
+_SETTLED_KEEPS = frozenset((_MAIN_STAYS, _ALREADY_MOVED, _AT_DESTINATION, _DEFERRED_OUTPUT))
 
 
 class TargetReappeared(FileExistsError):
@@ -346,7 +347,7 @@ def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> 
                     except OSError as error:
                         if os.path.lexists(target):
                             raise TargetReappeared(error, output) from error
-                        os.rename(output.name, target, src_dir_fd=parent)
+                        os.rename(output.name, previous, src_dir_fd=parent)
                         raise
                     return
         if previous == target:
@@ -883,13 +884,17 @@ def _main_checkout_path(repo: str) -> Path:
     return Path.home() / (".claude" if repo == alias else f"rust/{repo}")
 
 
+class UnknownRepoWord(ValueError):
+    """No main checkout matches the repo word."""
+
+
 def main_checkout_for_word(repo: str) -> Path:
     """Verify the main checkout selected by the repo word."""
     source = _main_checkout_path(repo)
     if not (source / ".git").is_dir() or source.is_symlink() or main_checkout(source) != source.resolve():
-        raise ValueError(f"{source}: no main checkout for {repo!r}")
+        raise UnknownRepoWord(f"{source}: no main checkout for {repo!r}")
     if build_folders.repo_word(source) != repo:
-        raise ValueError(f"{source}: the repo word {repo!r} differs from origin")
+        raise UnknownRepoWord(f"{source}: the repo word {repo!r} differs from origin")
     return source.resolve()
 
 
@@ -3204,7 +3209,7 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
             if scope is MigrationScope.REPOSITORY:
                 try:
                     selection = repository_selection(repo, listed, folders)
-                except ValueError as error:
+                except UnknownRepoWord as error:
                     return _unknown_repo(repo, error)
             else:
                 selection = MigrationSelection(scope, listed)
@@ -3222,7 +3227,7 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
         return error.code
 
 
-def _unknown_repo(repo: str, error: ValueError) -> int:
+def _unknown_repo(repo: str, error: UnknownRepoWord) -> int:
     print(f"migrate --repo {repo}: {error}", file=sys.stderr)
     return 2
 
@@ -3241,7 +3246,7 @@ def migrate_on_mac(repo: str, *, dry_run: bool) -> int:
         return _run_on_mac(command)
     try:
         checkout = main_checkout_for_word(repo)
-    except ValueError as error:
+    except UnknownRepoWord as error:
         return _unknown_repo(repo, error)
     try:
         with mac_run.repository_claim(checkout, "mac", f"migrate --repo {repo}", mac_test.MacClaimKind.MIRROR):
@@ -3262,13 +3267,13 @@ def _run_on_mac(command: str) -> int:
 
 def _run_ssh(command: tuple[str, ...]) -> int:
     """Run ssh with stops deferred until it ends, so the claim lasts while the Mac command runs."""
-    # ssh inherits the deferred signals, so a stop at the terminal also waits for the Mac command.
+    # ssh runs in its own session, so a terminal or pane signal reaches only this process, which waits.
     with cancellation.defer_cleanup_signals():
-        return subprocess.run(command, stdin=subprocess.DEVNULL, check=False).returncode
+        return subprocess.run(command, stdin=subprocess.DEVNULL, start_new_session=True, check=False).returncode
 
 
-def _hold_idle_target(target: Path, held: ExitStack) -> str:
-    """Hold every Cargo lock in the target folder, or give the lock that is held."""
+def _hold_idle_target(target: Path, held: ExitStack) -> frozenset[int] | str:
+    """Hold every Cargo lock in the target folder and give their descriptors, or give the lock that is held."""
     from scripts.lint import sweep
 
     # A Cargo build folder holds no nested build folder, so the walk stops at one; its output folders are skipped.
@@ -3284,7 +3289,7 @@ def _hold_idle_target(target: Path, held: ExitStack) -> str:
     if isinstance(locks, sweep.TargetLockBusy):
         return f"kept: {locks.path} held"
     _ = held.callback(sweep.release, locks.held)
-    return ""
+    return frozenset(locks.held)
 
 
 def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *, dry_run: bool) -> bool:
@@ -3299,10 +3304,12 @@ def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *,
     with ExitStack() as held:
         if real:
             # The flocks come first: a cargo that waits on one keeps the lock file open, so the scan finds it.
-            if reason := _hold_idle_target(target, held):
-                progress.kept[checkout] = reason
+            locks = _hold_idle_target(target, held)
+            if isinstance(locks, str):
+                progress.kept[checkout] = locks
                 return False
-            uses = _migration_processes((target,))
+            # The scan skips this process's own lock descriptors.
+            uses = _migration_processes((target,), ignored_fds=locks)
             progress.record_process_scan(uses)
             if reason := _migration_process_use(target, uses, ignore_stopped_pane_shells=False):
                 progress.kept[checkout] = f"target in use ({reason})"
@@ -3329,7 +3336,7 @@ def _moved_output(checkout: Path, publication: MigrationPublication) -> Path | s
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return f"already moved; cannot read the recorded output ({error})"
     if not publication.places_output(form.repo):
-        return "already moved; defer output: archive the old build root first"
+        return _DEFERRED_OUTPUT
     return output
 
 
