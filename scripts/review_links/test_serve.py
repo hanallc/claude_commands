@@ -117,6 +117,30 @@ def capture_sender(name: str) -> Generator[Mock]:
         yield send
 
 
+class HandlerCalls:
+    """Count the handler calls in progress, so a test can wait until each one ends."""
+
+    def __init__(self) -> None:
+        self._running: int = 0
+        self._changed: threading.Condition = threading.Condition()
+
+    @contextmanager
+    def running(self) -> Generator[None]:
+        with self._changed:
+            self._running += 1
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._running -= 1
+                self._changed.notify_all()
+
+    def wait_until_none_run(self) -> bool:
+        """A late end of an earlier call cannot release this wait, as an Event set could."""
+        with self._changed:
+            return self._changed.wait_for(lambda: self._running == 0, TEST_HANG_GUARD_SECS)
+
+
 class ReviewLinksServerTests(unittest.TestCase):
     root: Path = Path()
     outside: Path = Path()
@@ -125,8 +149,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.review_post_done: threading.Event = threading.Event()
-        self.new_item_post_done: threading.Event = threading.Event()
+        self.review_posts: HandlerCalls = HandlerCalls()
+        self.new_item_posts: HandlerCalls = HandlerCalls()
 
     @property
     def server(self) -> serve.ReviewLinksServer:
@@ -159,23 +183,19 @@ class ReviewLinksServerTests(unittest.TestCase):
             server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
         server.review_cache.synchronize()
         self._server = server
-        complete = self.review_post_done
-        new_item_complete = self.new_item_post_done
+        review_posts = self.review_posts
+        new_item_posts = self.new_item_posts
 
         class ReviewFixtureHandler(serve.ReviewLinksHandler):
             @override
             def review_post(self) -> None:
-                try:
+                with review_posts.running():
                     super().review_post()
-                finally:
-                    complete.set()
 
             @override
             def new_item_post(self) -> None:
-                try:
+                with new_item_posts.running():
                     super().new_item_post()
-                finally:
-                    new_item_complete.set()
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
@@ -216,8 +236,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def new_item_http(self, body: bytes | None = None, *, query: str = '',
                       headers: dict[str, str] | None = None, finished: bool = False) -> HttpReply:
-        if finished:
-            self.new_item_post_done.clear()
         connection = HTTPConnection('127.0.0.1', self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             connection.request('GET' if body is None else 'POST', review_page.NEW_ITEM_PATH + query,
@@ -228,7 +246,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
             if finished:
-                self.assertTrue(self.new_item_post_done.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(self.new_item_posts.wait_until_none_run())
 
     def new_item_body(self, request: new_item_dialog.NewItemRequest) -> bytes:
         return json.dumps({**asdict(request), "token": self.server.new_item_token},
@@ -4138,7 +4156,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIs(pending['delivery_pending'], True)
             finally:
                 release.set()
-                self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(self.review_posts.wait_until_none_run())
             settled = cast(dict[str, object], json.loads(self.request(version_path).body))
             self.assertIs(settled['delivery_pending'], False)
 
@@ -4833,8 +4851,6 @@ class ReviewLinksServerTests(unittest.TestCase):
     def post(self, path: str, body: str, *, origin: str = "", headers: Mapping[str, str] | None = None,
              wait_for_delivery: bool = True) -> tuple[int, bytes]:
         review_post = path == review_page.PAGE_PATH
-        if review_post:
-            self.review_post_done.clear()
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             sent = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -4844,7 +4860,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             response = connection.getresponse()
             content = response.read()
             if review_post and wait_for_delivery:
-                self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(self.review_posts.wait_until_none_run())
             return response.status, content
         finally:
             connection.close()

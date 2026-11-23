@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+import io
 import json
 import subprocess
 from typing import cast, override
@@ -61,6 +63,15 @@ class HanaSpendTests(CostFixture):
                 text_setting(configuration, 'fallback_instance_types', value)
                 with self.assertRaisesRegex(ValueError, 'distinct types and no empty items'):
                     _ = hana_spend.read_settings(conf.read(configuration))
+
+    def test_an_invalid_switch_counts_as_off(self) -> None:
+        configuration = self.root / 'hana_aws.conf'
+        committed = configuration.read_text()
+        self.assertEqual(committed.count('enabled=on'), 1)
+        _ = configuration.write_text(committed.replace('enabled=on', 'enabled=of'))
+        with (mock.patch.object(conf, '_committed_files', return_value=iter((committed,))),
+              redirect_stderr(io.StringIO())):
+            self.assertFalse(hana_spend.read_settings(conf.read(configuration)).enabled)
 
     def test_hana_budget_refuses_start_and_saves_no_exposure(self) -> None:
         self.controller.settings = replace(self.workload, daily_budget_usd=self.workload.storage_usd_per_month / 60)

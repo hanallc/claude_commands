@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1084,13 +1085,13 @@ class TheListTests(unittest.TestCase):
         sent = the_list.load(MORTY.id, item.id)
         self.assertEqual(replace(sent, log=read.log), read)
         self.assertEqual(sent.log[-1].what, the_list.PageFeedback("request", words))
-        self.assertEqual(the_list.sent_to_morty(sent), START)
+        self.assertEqual(the_list.sent_notice_time(sent), START)
         self.assertIs(sent.unread_since, the_list.NoTimestamp.UNSET)
         again = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
-        self.assertEqual(the_list.sent_to_morty(again), START)
+        self.assertEqual(the_list.sent_notice_time(again), START)
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
-        self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.sent_notice_time(changed), the_list.NoTimestamp.UNSET)
 
     def test_answer_refusals_leave_the_record_unchanged(self) -> None:
         item = self.add()
@@ -1580,6 +1581,74 @@ class TheListTests(unittest.TestCase):
         read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=current)
         self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
         self.assertEqual(read.log[-1].what, the_list.MarkedRead())
+
+    def page_read(self, item: the_list.ListItem, request: str = "read") -> the_list.ListEdit:
+        return the_list.mark_read_edit(MORTY.id, item.id, source=the_list.PAGE_SOURCE,
+                                       update=the_list.ReadCurrentUpdate.CURRENT,
+                                       page_request=the_list.PageRequest(request, "read", ""))
+
+    def test_page_mark_read_moves_a_waiting_item_to_working_and_asks_its_producer_for_the_next_step(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WAITING_FOR_NATE, "producer": BOB.id})
+        read = self.page_read(item).item
+        self.assertEqual(read.state, the_list.ItemState.WORKING)
+        self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual([entry.what for entry in read.log[len(item.log):-1]],
+                         [the_list.FieldChange("Updated", {"state": the_list.ItemState.WORKING}), the_list.MarkedRead()])
+        notices = the_list.feedback_requests(read)
+        self.assertEqual(list(notices), ["read"])
+        notice = notices["read"]
+        self.assertEqual((notice.action, notice.state), ("read", "pending"))
+        self.assertEqual(notice.words.count("\n"), 0)
+        self.assertIn(f"Write its next step: `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py "
+                      + f"update --id {item.id} --source bob --next-step", notice.words)
+        self.assertEqual((notice.recipient, the_list.notice_recipient(MORTY.id, notice)), (BOB.id, BOB.id))
+        self.assertEqual(the_list.load(MORTY.id, item.id), read)
+        retry = self.page_read(item)
+        self.assertIsInstance(retry, the_list.UnchangedEdit)
+        self.assertEqual(the_list.load(MORTY.id, item.id), read)
+
+    def test_page_mark_read_notice_command_writes_the_next_step_for_each_producer(self) -> None:
+        for producer in (MORTY, BOB):
+            with self.subTest(producer=producer.name):
+                item = self.add(changes={"state": the_list.ItemState.WAITING_FOR_NATE, "producer": producer.id})
+                notice = the_list.feedback_requests(self.page_read(item).item)["read"]
+                launcher, script, *args = shlex.split(notice.words.split("`")[1].replace("<step>", "Check the page."))
+                self.assertEqual((launcher, script), ("~/.claude/scripts/lib/py",
+                                                      "~/.claude/scripts/production/the_list.py"))
+                with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": producer.current_session}):
+                    self.assertEqual(self.command(*args)[0], 0)
+                self.assertEqual(the_list.load(MORTY.id, item.id).next_step, "Check the page.")
+
+    def test_page_mark_read_keeps_a_waiting_item_with_an_open_question(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WAITING_FOR_NATE})
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Ready?"), status)
+        asked = the_list.load(MORTY.id, item.id)
+        self.assertTrue(the_list.has_open_question(asked))
+        read = self.page_read(asked).item
+        self.assertEqual(read.state, the_list.ItemState.WAITING_FOR_NATE)
+        self.assertEqual(read.log[-1].what, the_list.MarkedRead())
+        self.assertEqual(the_list.feedback_requests(read), {})
+
+    def test_mark_read_leaves_the_state_of_other_items_unchanged(self) -> None:
+        cases = (("working page read", the_list.ItemState.WORKING, False, True),
+                 ("delivered page read", the_list.ItemState.DELIVERED, False, True),
+                 ("parked waiting page read", the_list.ItemState.WAITING_FOR_NATE, True, True),
+                 ("waiting read outside the page", the_list.ItemState.WAITING_FOR_NATE, False, False))
+        for name, state, parked, page in cases:
+            with self.subTest(name):
+                item = self.add(changes={"state": state})
+                if parked:
+                    item = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
+                read = (self.page_read(item).item if page
+                        else the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE))
+                self.assertEqual(read.state, state)
+                self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
+                self.assertEqual(read.log[-1].what, the_list.MarkedRead())
+                self.assertEqual(the_list.feedback_requests(read), {})
+                if page:
+                    receipt = the_list.load(MORTY.id, item.id).log[-2].what
+                    self.assertEqual(receipt, the_list.PageRequest("read", "read", ""))
 
     def test_page_item_actions_save_the_notice_in_the_same_write(self) -> None:
         for action in ("remove", "park"):

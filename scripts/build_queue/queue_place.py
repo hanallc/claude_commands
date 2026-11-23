@@ -29,7 +29,7 @@ from scripts.build_queue import program_start as startup
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
-from scripts.direct.local_release_wait import local_release_waiter
+from scripts.lib.release_waiter import local_release_waiter
 import uuid
 
 

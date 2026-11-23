@@ -33,6 +33,11 @@ class GuestFailed(MachineFailed):
         super().__init__(text, MAC_LINUX_NO_ANSWER)
 
 
+def took_no_run(cause: str) -> GuestFailed:
+    """The failure of a guest that took no run, as "mac-linux: <cause>"."""
+    return GuestFailed(f"{MACHINE}: {cause}")
+
+
 def linked_path(path: Path, repo: Path) -> bool:
     """A path in the checkout with .. or a symbolic link in it, from the checkout down."""
     relative = path.relative_to(repo)
@@ -49,9 +54,9 @@ def run_owner(repo: Path) -> str:
         mac_linux.check_repository(repo)
         unit = step_identity(HAND_MADE.step, str(repo)).unit
     except mac_linux.route_errors() as error:
-        raise GuestFailed(f"{MACHINE}: {error}") from error
+        raise took_no_run(str(error)) from error
     if not unit:
-        raise GuestFailed(f"{MACHINE}: the run has no owner unit for a numbered copy")
+        raise took_no_run("the run has no owner unit for a numbered copy")
     return unit
 
 
@@ -93,9 +98,9 @@ def run_settings() -> mac_linux.GuestSettings:
     try:
         settings = mac_linux.new_run_settings()
     except mac_linux.route_errors() as error:
-        raise GuestFailed(f"{MACHINE}: {error}") from error
+        raise took_no_run(str(error)) from error
     if isinstance(settings, mac_linux.GuestNotStarted):
-        raise GuestFailed(settings.reason)
+        raise took_no_run(settings.reason)
     if isinstance(settings, str):
         raise GuestFailed(settings)
     return settings
@@ -110,7 +115,7 @@ def mac_claim(repo: Path) -> Generator[None]:
         try:
             stack.enter_context(mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE))
         except MacRunRefused as error:
-            raise GuestFailed(f"not started: {error}") from error
+            raise took_no_run(str(error)) from error
         yield
 
 
@@ -148,15 +153,16 @@ class GuestRun:
         """Send the checkout and run the argv in the guest.
 
         The guest finds the first word in its numbered copy or on its own PATH, and refuses a word that can
-        start a guest file that the check did not read. It gives the program its own variables and no input.
-        The output is one pipe.
+        start a guest file that the check did not read; that refusal ends the attempt, as on the Mac. It gives
+        the program its own variables and no input. The output is one pipe.
         """
         try:
             process = self.command.start(self.program.repo, self.program.argv, work=HAND_MADE.step, unit=self.unit,
                                          bootstrap=self.bootstrap, checked=self.checked_bytes())
+        except mac_linux.GuestRefusedCommand as error:
+            raise Refused(f"{MACHINE} refused the run: {error}") from error
         except mac_linux.route_errors() as error:
-            proven = self.command.process is None or isinstance(
-                error, (mac_linux.GuestNotLocked, mac_linux.GuestRefusedCommand))
+            proven = self.command.process is None or isinstance(error, mac_linux.GuestNotLocked)
             if not proven:
                 raise start_unknown(MACHINE, f"the guest got the command and gave no start line: {error}") from error
             raise GuestFailed(f"guest start: {error}") from error
