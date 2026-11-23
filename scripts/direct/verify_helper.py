@@ -129,6 +129,11 @@ class LoadedSources:
         for name, module in list(sys.modules.items()):
             if name != "__main__" and module_source_path(module) in self.stamps:
                 del sys.modules[name]
+                # A namespace package has no source, so it stays loaded; drop its
+                # binding too, or `from package import name` returns the old module.
+                parent, _, child = name.rpartition(".")
+                if parent in sys.modules and getattr(sys.modules[parent], child, None) is module:
+                    delattr(sys.modules[parent], child)
         programs.clear()
         self.stamps.clear()
         importlib.invalidate_caches()

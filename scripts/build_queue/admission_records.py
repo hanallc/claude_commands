@@ -8,7 +8,7 @@ import math
 import os
 import re
 from types import MappingProxyType
-from typing import Callable, Literal, NotRequired, TypedDict, assert_never, cast
+from typing import Callable, Literal, NamedTuple, NotRequired, TypedDict, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import sys
@@ -30,6 +30,8 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.lib.process_stat import PROC_ROOT, process_fields
+from scripts.lib.showrunner_state import state_root
 from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -103,6 +105,7 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1162,8 +1165,16 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
+
+
+class ConfirmedGuestRun(TypedDict):
+    """Identify a confirmed Mac Linux attempt in a queue reading."""
+
+    target: Literal["mac-linux"]
+    attempt: str
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1193,9 @@ class RunningStep:
     project: str = ""
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    assignment_target: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1346,6 +1360,14 @@ StartSpacing = ReadyToStart | NextStartAt
 
 
 @dataclass(frozen=True)
+class LocalAdmissionOccupancy:
+    """The service captures these reservations and owners after it grants starts."""
+
+    reservations: tuple[Reservation, ...]
+    verify_run_owners: Mapping[str, frozenset[str]]
+
+
+@dataclass(frozen=True)
 class QueueExplanation:
     """The explanation holds queue evidence, policy, decisions, and memory checks."""
     now: float
@@ -1361,6 +1383,8 @@ class QueueExplanation:
     spacing: StartSpacing = ReadyToStart()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     room: MemoryRoom | ReadingUnavailable = ReadingUnavailable()
+    local_occupancy: LocalAdmissionOccupancy | None = field(
+        default=None, kw_only=True, metadata={"acquisition_unused": True})
 
 
 @dataclass(frozen=True)
@@ -1387,6 +1411,8 @@ class QueueInputs:
     run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
     verify_run_owners: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]], kw_only=True)
     verify_slot_requests: Mapping[str, str] = field(default_factory=dict[str, str], kw_only=True)
+    placement_candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = field(
+        default_factory=dict[str, tuple[placement.CandidateEligibility, ...]], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1747,10 +1773,100 @@ def queue_caller(session_id: str, staff_id: str, exported_name: str, session_fol
     return QueueCaller(session_id, name, unit)
 
 
+SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".zsh", ".bash"})
+# Python and shell options whose value is the next argument.
+VALUE_OPTIONS = frozenset({"-X", "-W", "-o", "+o", "-O", "+O"})
+AGENT_COMMANDS = frozenset({"claude", "codex"})
+FAMILY_LIMIT = 64
+
+
+class FamilyProcess(NamedTuple):
+    """One process of a caller family and the script file that it runs."""
+    argv: tuple[str, ...]
+    tty: int
+    script: Path | None
+
+
+def run_script(argv: Sequence[str]) -> Path | None:
+    """Return the script file that a shell or Python command runs: its first argument that is not an option."""
+    arguments = iter(argv[1:])
+    for argument in arguments:
+        if argument in VALUE_OPTIONS:
+            _ = next(arguments, "")
+        elif not argument.startswith(("-", "+")):
+            path = Path(argument)
+            return path if path.suffix in SCRIPT_SUFFIXES and not any(c.isspace() for c in argument) else None
+    return None
+
+
+def family_owner_name(pid: int, proc_root: Path) -> str:
+    """Name the owner of a process that has no session and no staff reference.
+
+    Read the process and its parents once, up to the first claude or codex process.
+    A read error stops the read, and the next rule applies.
+    An empty name keeps the `terminal · <folder>` name that queue_caller gives.
+    """
+    family: list[FamilyProcess] = []
+    under_agent = False
+    current = pid
+    while current > 0 and len(family) < FAMILY_LIMIT:
+        folder = proc_root / str(current)
+        try:
+            fields = process_fields(current, proc_root)
+            tty, parent = int(fields[4]), int(fields[1])
+            argv = tuple(part for part in read_proc_text(folder / "cmdline").split("\0") if part)
+        except (OSError, IndexError, ValueError):
+            break
+        if argv and Path(argv[0]).name in AGENT_COMMANDS:
+            under_agent = True
+            break
+        script = run_script(argv)
+        if script is not None and not script.is_absolute():
+            try:
+                script = Path(os.readlink(folder / "cwd")) / script
+            except OSError:
+                pass
+        family.append(FamilyProcess(argv, tty, script))
+        current = parent
+    if not family:
+        # macOS has no /proc. The caller keeps the terminal name.
+        return ""
+    scripts = [process.script for process in family if process.script is not None]
+    state = state_root()
+    for script in scripts:
+        if script.is_relative_to(state) and len(parts := script.relative_to(state).parts) > 1:
+            members = queue_staff()
+            member = members.by_member_reference(parts[0]) if isinstance(members, staff.StaffSnapshot) else None
+            return f"{member.name if member else parts[0][:8]} · {script.name}"
+    if not under_agent and any(process.tty for process in family):
+        return ""
+    try:
+        cgroup = read_proc_text(proc_root / str(pid) / "cgroup")
+    except OSError:
+        cgroup = ""
+    # Login sessions and terminals run in .scope units, so only a service matches.
+    unit = next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::")), "")
+    if unit.startswith("run-") and unit.endswith(".service"):
+        # systemd-run generates the unit name, so the script or the folder names the work.
+        if scripts:
+            return f"systemd · {scripts[-1].name}"
+        try:
+            return f"systemd · {Path(os.readlink(proc_root / str(pid) / 'cwd')).name or unit}"
+        except OSError:
+            return f"systemd · {unit}"
+    if unit.endswith(".service"):
+        return f"systemd · {unit}"
+    if scripts:
+        return f"script · {scripts[-1].name}"
+    return f"script · {Path(family[0].argv[0]).name if family[0].argv else 'unknown program'}"
+
+
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = staff.caller_identity()
     reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
-    caller = queue_caller(session, reference, os.environ.get("CLAUDE_SESSION_NAME", ""),
+    exported = os.environ.get("CLAUDE_SESSION_NAME", "") or (
+        "" if session or reference else family_owner_name(os.getpid(), PROC_ROOT))
+    caller = queue_caller(session, reference, exported,
         os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
         members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=os.environ.get(BUILDLOG_UNIT, ""))
     identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,

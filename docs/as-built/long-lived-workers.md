@@ -779,6 +779,7 @@ The supervisor records the command exit before it starts delivery.
 After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
 A failed push saves the send error as pending delivery.
 The finished run leaves the live-run limit and keeps its record and log.
+The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
@@ -793,33 +794,82 @@ The next reap can recover an alert if the process exits before the record saves 
 A rare exit or a retirement can repeat the alert once. It never repeats the result.
 The alert for an unconfirmed push says that the result may have arrived.
 If an alert fails, the sender prints one anomaly and keeps the result pending.
-The command runs in its own session, including through a systemd scope prefix.
+The command runs in its own session.
+On natedev, the launcher starts the command scope in `builds-detached-<id>.slice`.
+The slice name uses the run ID without dashes.
+Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
+The limits and anonymous memory totals of `builds.slice` include the nested scopes.
+The queue charges each unowned scope inside a run slice.
+The launcher indexes the run record and saves the slice identity before it starts the command.
+It exports `DETACHED_RUN_SLICE` to the command.
+The index lets the live-run reader find the slice after its supervisor exits.
+The reader also checks records named by live supervisors and legacy stop markers.
+It matches older records without an index to their slice names.
+An index without its record gives a read error.
+The supervisor or reaper removes the slice index after it saves the finished record.
+The scope launchers use the run slice when the variable is set.
+Transient services keep their usual placement.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
 Other `systemd-run` forms return exit 2.
+With a run slice, the launcher uses the user manager and adds `--slice-inherit` to this scope wrapper.
 The guard skips `env` assignments and the two-word `-u` and `--unset` options.
 If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
-The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group.
-Each checks the supervisor and the command leader identity before it signals the group.
-Each stages the stop reason before it sends TERM.
+
+1. Wait for the stop lock.
+2. Read the current run record.
+3. Check whether the slice is populated.
+4. Check that the caller's stop route still applies.
+5. Save the stop reason and pane cancellation if both checks pass.
+6. Send TERM through pidfds to processes that still belong to the run slice.
+7. Give the processes the stop grace to exit.
+8. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+9. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+
+An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
+The record stays running until the supervisor or recovery can confirm that the slice is empty.
+The supervisor saves the exit code and cleanup intent before it releases the watcher.
+The run record saves `finished_at` when it records the confirmed end of the slice.
+The caller saves the stop commit before it sends a signal. The stop commit is final.
+Recovery syncs the record directory before it signals a slice for a saved stop commit.
+A sync error leaves the record available for another attempt.
+A read error before the commit leaves the run record unchanged.
+After supervisor loss, the watcher retries slice reads within the stop grace.
+The hold enforcer checks the active holder set again after it acquires the stop lock.
+If pruning removes the run during the lock wait, the stop returns a refusal.
+Builds Kill recovery uses the same locked route check for a first commit.
+It can finish the commit for its action.
+The stop commit saves the notice ID in the run record.
+Pruning keeps a finished run while its notice ID is present.
+Builds acknowledges the notice ID after it saves `SendingNotice` or confirms that the action was abandoned.
+Builds recovery uses the saved run path to acknowledge notices after either event.
+An acknowledgment confirms the run directory sync even when the notice ID is absent.
+An acknowledgment error does not block notice delivery.
+After acknowledgment, the usual pruning rules apply.
+A run that ends by itself just after the stop commit reports as stopped.
+Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
+On Linux with pidfds, a run without a saved slice can receive TERM and reports an unconfirmed stop.
+On systems without pidfds, the stop checks the saved leader identity and sends TERM to the group.
+The watcher confirms the command group from its own membership before it leaves the group.
+It can send TERM to surviving members after the leader exits.
+The watcher waits for the saved leader and the group to end before it reaps the run.
+The stop grace limits this wait.
+After a normal command exit, the supervisor gives the slice members the stop grace to exit.
+It stops any processes that remain and reports them as a cleanup in the result.
+A build hold records the run as stopped after the same slice stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
-A self-stop requires a native Claude session record or Codex pane report for the caller.
-The caller's worker staff ID must match the run's owner.
-Missing records, unreadable records, and conflicting identities prevent a self-stop.
-The self-stop saves `self_stop: true` with the stop reason.
-The supervisor keeps the pass active and sends the result to the owning worker.
+A committed slice stop cancels the verified owning pass.
+A group stop with `self_stop: true` keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
-A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
 An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-For either stop kind, the supervisor records the leader's exit status.
+The supervisor records the leader's exit status.
 The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
