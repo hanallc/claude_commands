@@ -1156,6 +1156,14 @@ class AssignLauncherTests(HookAssignmentFixture):
         name, record = next(iter(self.assignment_records().items()))
         before = prepared[0].read_bytes()
         _ = (self.project / "new.rs").write_text("fn second() {}\n")
+        state = phase / "style_review_state.json"
+        report = phase / "phase_style_review.md"
+        saved = state.read_bytes(), report.read_bytes()
+        with worker_panes.worker_lock(self.native.fixture.parent.id, staff.WorkerName.parse(name)) as hold:
+            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+            refused = self.launch("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
+        self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+        self.assertEqual((state.read_bytes(), report.read_bytes()), saved)
         _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
         self.assertEqual(read_object(phase / "style_review_state.json")["state"], "complete")
         self.assertIn("Style review: Findings", (phase / "phase_style_review.md").read_text())
@@ -1266,6 +1274,27 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual((status.read_bytes(), status.stat().st_ino), saved)
         self.assertEqual(self.turn_starts, 1)
         self.assertIn("role=impl; exit 6", (self.session_dir / "board.log").read_text())
+
+        with self.subTest(cause="the worker has an open pass"):
+            self.native.agent.finish_after = 100
+            _ = self.successful("implement", "--to", "impl")
+            pane = self.native.agent.submitted[-1][0]
+            phase = status.parent
+            saved_files = {path: path.read_bytes() for path in phase.iterdir() if path.is_file()}
+            run_files = [self.session_dir / name for name in ("heartbeat.log", "progress_history_state.json")]
+            saved_run_files = {path: path.read_bytes() for path in run_files}
+            self.write_phase_prompt("7", "Assignment core", "Test the second change.")
+            _ = self.paths.write_text("tests/test_worker.py\n")
+            for target in ("--to", "--new-worker"):
+                with self.subTest(target=target):
+                    refused = self.launch("implement", target, "impl")
+                    self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+                    self.assertIn("has different prompt content", refused.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, saved_files)
+                    self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run_files)
+                    self.assertEqual(self.turn_starts, 2)
+            self.native.agent.complete(pane)
+            self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
 
     def test_a_failed_worker_records_an_error_pass_and_returns_worker_failure(self) -> None:
         status = self.session_dir / "phases/7/impl_status"
@@ -1385,6 +1414,16 @@ class AssignLauncherTests(HookAssignmentFixture):
         passed["status"] = pass_status
         write_text_atomic(state_path, json.dumps(state))
         write_text_atomic(status, "running\n")
+        location = self.native.fixture.world.locations[opened.pane]
+        location["agent_status"] = "working"
+        self.native.fixture.world.first_turn_timeout = True
+        saved_state = state_path.read_bytes()
+        refused = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+        self.assertEqual(state_path.read_bytes(), saved_state)
+        self.assertEqual(self.turn_starts, 0)
+        location["agent_status"] = "idle"
+        self.native.fixture.world.first_turn_timeout = False
         retried = invoke_assignment(arguments, os.environ.copy())
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         saved = worker_panes.worker_pass(opened.row, self.session_dir)
