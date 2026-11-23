@@ -295,9 +295,11 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         rows = cast(dict[str, dict[str, object]], ledger["findings"])
         self.assertEqual([(row["title"], row["state"]) for row in rows.values()],
                          [("late nit", "open"), ("late fix", "accepted")])
-        event = self.events()[-1]
-        self.assertEqual((event["event_type"], event["phase_instance_id"], event["state"]),
+        opened, verdict = self.events()[-2:]
+        self.assertEqual((opened["event_type"], opened["phase_instance_id"], opened["state"]),
                          ("finding_opened", "phase-sixty-two", "accepted"))
+        self.assertEqual((verdict["event_type"], verdict["finding_id"], verdict["resulting_state"]),
+                         ("finding_verdict", "F002", "accepted"))
 
     def test_accepted_is_refused_outside_a_closed_phase(self) -> None:
         _ = self.closed_phase_beside_an_open_one()

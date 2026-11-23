@@ -208,6 +208,7 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
 
     The newest open phase owns `findings_state.json`, which assign_claude.py checks.
     An older open phase named with `--phase` writes its parked file.
+    A closed phase writes its parked file unless the live file already holds it.
     """
     session_dir.mkdir(parents=True, exist_ok=True)
     live = _state_path(session_dir)
@@ -279,11 +280,12 @@ def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
 
 
 def _phase_identity(
-    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False,
+    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False, late_finding: bool = False,
 ) -> tuple[str, str]:
     """Resolve the phase for this ledger command.
 
     A named phase must be open unless the caller permits a closed phase.
+    A late finding goes to the newest instance the run started, the one review-trial reads.
     An unnamed command selects the only open phase.
     Several open phases require an explicit name.
     """
@@ -295,8 +297,9 @@ def _phase_identity(
         for phase in phases:
             if _string(phase.get("id")) == phase_id:
                 return _string(phase.get("instance_id")), phase_id
-        if closed_phase_ok:
-            instance_id = _newest_ledger_instance(session_dir, phase_id) or _started_instance(session_dir, phase_id)
+        if late_finding or closed_phase_ok:
+            instance_id = (_started_instance(session_dir, phase_id) if late_finding
+                           else _newest_ledger_instance(session_dir, phase_id))
             if instance_id:
                 return instance_id, phase_id
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
@@ -356,12 +359,13 @@ def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, objec
 
 
 def _read_state(
-    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
+    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False, late_finding: bool = False,
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
-    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
+    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok,
+                                            late_finding=late_finding)
     state = read_phase_ledger(session_dir, instance_id, phase_id, now)
-    if not closed_phase_ok and not instance_id and _string(state.get("phase_instance_id")):
+    if not (closed_phase_ok or late_finding) and not instance_id and _string(state.get("phase_instance_id")):
         ledger_phase = _string(state.get("phase_id"))
         raise SystemExit(f"Phase {ledger_phase} is not open (open phases: none)")
     return state
@@ -745,7 +749,7 @@ def _open(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
     phase = _arg_string(args, "phase")
-    state = _read_state(session_dir, now, phase, closed_phase_ok=bool(phase))
+    state = _read_state(session_dir, now, phase, late_finding=bool(phase))
     severity = _arg_string(args, "severity")
     held = bool(getattr(args, "held_for_decision", False))
     accepted = bool(getattr(args, "accepted", False))
@@ -775,6 +779,8 @@ def _open(args: argparse.Namespace) -> None:
         "fix_attempts": 0,
         "reopen_count": 0,
     }
+    if accepted:
+        entry["accepted_at"] = now
     _findings(state)[finding_id] = entry
     state["next_ordinal"] = ordinal + 1
     _write_state(session_dir, state)
@@ -796,6 +802,23 @@ def _open(args: argparse.Namespace) -> None:
             "round": len(_rounds(state)),
         },
     )
+    if accepted:
+        # A late fixed finding counts as accepted in the round tally, as a verdict would make it.
+        _append_event(
+            session_dir,
+            state,
+            {
+                "event_type": "finding_verdict",
+                "timestamp": _iso_time(now),
+                "timestamp_epoch": now,
+                "finding_id": finding_id,
+                "verdict": "accepted",
+                "resulting_state": STATE_ACCEPTED,
+                "fix_attempts": 0,
+                "reopen_count": 0,
+                "round": len(_rounds(state)),
+            },
+        )
     print(finding_id)
 
 

@@ -241,10 +241,12 @@ command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. Three commands also take a closed phase that the run started:
-`decision` and `status`, and `open` for a late finding. A late finding goes into
-the closed phase's parked file, so `review-trial` counts it. `open --accepted`
-records a late finding that is already fixed; it refuses an open phase. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
+--phase`. `decision` and `status` also take a closed phase by its newest ledger.
+`open` takes a late finding for a closed phase: it writes the parked ledger of
+the newest instance that the run started, which `review-trial` reads.
+`open --accepted` records a late finding that is already fixed, with the
+`finding_verdict` event that `verdict` writes. It refuses an open or unnamed
+phase and `--held-for-decision`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
