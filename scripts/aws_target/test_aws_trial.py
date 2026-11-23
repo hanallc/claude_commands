@@ -380,6 +380,7 @@ class PairedTrialTests(CostFixture):
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         record = self.root / 'staff.json'
         _ = record.write_text('{"schema": 2, "rows": []}')
+        # clear=True drops the caller's GIT_* variables, such as GIT_DIR or GIT_INDEX_FILE.
         self.enterContext(mock.patch.dict(os.environ, {
             **fixture_git_environment(self.root), 'STAFF_FILE': str(record), 'GIT_ALLOW_PROTOCOL': 'file',
         }, clear=True))
@@ -426,6 +427,20 @@ class Sample(unittest.TestCase):
         text_setting(gate_settings, 'credential_file', str(self.root / 'credentials'))
         text_setting(gate_settings, 'regions', 'us-east-2 us-west-2')
         text_setting(gate_settings, 'trial_branch_prefix', 'gate-trial')
+
+    def test_a_caller_git_variable_does_not_reach_the_fixture_commands(self) -> None:
+        folder = self.root / 'caller'
+        folder.mkdir()
+        caller = {'GIT_INDEX_FILE': str(folder / 'index'), 'GIT_DIR': str(folder / 'repository.git')}
+        probe = PairedTrialTests('test_expired_sweep_preserves_a_racing_coordinator_termination')
+        with mock.patch.dict(os.environ, caller):
+            try:
+                probe.setUp()
+                self.assertFalse(set(caller) & set(os.environ))
+                _ = trial.checked_git(probe.repo, 'add', 'change')
+            finally:
+                probe.doCleanups()
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000

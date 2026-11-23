@@ -44,7 +44,7 @@ from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.message import send, sessions
 from scripts.usage import agents_log
 
@@ -356,7 +356,8 @@ class WorkerCommandTests(unittest.TestCase):
         _ = write_config_fixture(self.fixture.root / "conf/shutdown.conf")
         _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
         _ = self.enterContext(detached_fixture_processes())
-        _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
+        _ = (self.fixture.root / "conf/build_targets.conf").write_text(
+            "targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n" + UNREACHABLE_WAIT_FIXTURE)
         self.fixture.world.binary = "/nonexistent/herdr"
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()

@@ -42,6 +42,7 @@ scripts/buildlog/treekey.py
 scripts/copies/copies.py
 scripts/direct/local_release_wait.py
 scripts/direct/recorder_state.py
+scripts/direct/runner_result.py
 scripts/direct/step_selection.py
 scripts/lib/atomic_file.py
 scripts/lib/boot_identity.py

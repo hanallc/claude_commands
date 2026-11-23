@@ -9,6 +9,7 @@ try:
 except FileNotFoundError:
     pass
 
+import json
 import os
 import re
 import shutil
@@ -16,10 +17,10 @@ import stat
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from scripts.lib import atomic_file  # noqa: E402
 from scripts.production import investigation, log_backup, record_store, showrunners, staff, unit_lookup  # noqa: E402
@@ -58,6 +59,43 @@ def can_hold_questions(document: Path) -> bool:
     )
 
 
+def hash_move_header(header: bytes, kind: new_item_dialog.SubmissionKind,
+                     submission: new_item_dialog.ReviewSubmission) -> bytes:
+    """Replace the token in the native submission field."""
+    question = kind == new_item_dialog.SubmissionKind.QUESTION
+    field_name = b"registration" if question else b"review_submission"
+    match = re.search(rb"(?m)^" + field_name + rb": ([^\r\n]*)", header)
+    if match is None:
+        raise TidyRefused("The moving record has no submission field.")
+    value = cast(object, json.loads(match[1]))
+    registration: dict[str, object] = {}
+    if question and isinstance(value, dict):
+        registration = cast(dict[str, object], value)
+        value = registration.get("review_submission")
+    elif not question and isinstance(value, str):
+        value = cast(object, json.loads(value))
+    if not isinstance(value, dict):
+        raise TidyRefused("The moving record has invalid submission fields.")
+    fields = cast(dict[str, object], value)
+    hashed = new_item_dialog.hashed_submission_fields(fields, submission)
+    if hashed is fields:
+        return header
+    if question:
+        registration["review_submission"] = hashed
+        encoded = json.dumps(registration, ensure_ascii=False)
+    else:
+        encoded = json.dumps(json.dumps(hashed), ensure_ascii=False)
+    return header[:match.start(1)] + encoded.encode() + header[match.end(1):]
+
+
+def _header_end(content: bytes, path: Path) -> int:
+    start = content.index(b"\n") + 1
+    fence = re.search(rb"(?m)^---\r?$", content[start:])
+    if fence is None:
+        raise TidyRefused(f"{path}: the record has no closing header fence")
+    return start + fence.start()
+
+
 @dataclass(frozen=True)
 class ReviewRecordMove:
     """One user filing and its destination under the parent showrunner."""
@@ -71,6 +109,7 @@ class ReviewRecordMove:
     submission: new_item_dialog.ReviewSubmission
     source_digest: str
     content: bytes
+    legacy_content: bytes = field(repr=False)
 
     @classmethod
     def plan(cls, source: Path, target: Path, source_owner: staff.StaffId, owner: staff.StaffId, identity: str,
@@ -78,27 +117,36 @@ class ReviewRecordMove:
         field = b"production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else b"owner"
         value = owner.encode() if field == b"production_id" else b'"' + owner.encode() + b'"'
         content = source.read_bytes()
-        header_start = content.index(b"\n") + 1
-        fence = re.search(rb"(?m)^---\r?$", content[header_start:])
-        if fence is None:
-            raise TidyRefused(f"{source}: the record has no closing header fence")
-        end = header_start + fence.start()
+        end = _header_end(content, source)
         header, count = re.subn(rb"(?m)^" + field + rb": [^\r\n]*", field + b": " + value, content[:end])
         if count != 1:
             raise TidyRefused(f"{source}: the record has no unique owner field")
-        return cls(source.resolve(), target.parent.resolve() / target.name, source_owner, owner, identity, kind, submission,
-                   sha256(content).hexdigest(), header + content[end:])
+        hashed_header = hash_move_header(header, kind, submission)
+        legacy_content = header + content[end:] if hashed_header != header else b""
+        return cls(source.resolve(), target.parent.resolve() / target.name, source_owner, owner, identity, kind,
+                   submission, sha256(content).hexdigest(), hashed_header + content[end:], legacy_content)
+
+    def keep_target(self, content: bytes, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
+        """Keep changes to the destination and replace any legacy token."""
+        end = _header_end(content, self.target)
+        hashed = hash_move_header(content[:end], self.kind, submission) + content[end:]
+        return replace(self, content=hashed, legacy_content=content if hashed != content else b"")
 
     def check_collision(self, occupied: set[Path]) -> None:
         if self.source == self.target or occupied - {self.target} or (os.path.lexists(self.target) and not (
-                self.target.is_file() and not self.target.is_symlink() and self.target.read_bytes() == self.content)):
+                self.target.is_file() and not self.target.is_symlink()
+                and self.target.read_bytes() in (self.content, self.legacy_content or self.content))):
             raise TidyRefused(f"{self.identity}: ID collision in {self.owner}'s store; kept {self.source}")
 
     @contextmanager
     def publish_record(self, numbers: record_store.LockedRecordNumbers) -> Generator[None]:
-        with numbers.write(self.target, self.identity, self.owner, new_record=True):
-            if os.path.lexists(self.target):
+        exists = os.path.lexists(self.target)
+        with numbers.write(self.target, self.identity, self.owner, new_record=not exists):
+            if exists:
                 self.check_collision(set())
+                if self.legacy_content and self.target.read_bytes() == self.legacy_content:
+                    mode = stat.S_IMODE(self.target.stat().st_mode)
+                    atomic_file.write_bytes_atomic(self.target, self.content, mode=mode)
                 atomic_file.sync_folder(self.target.parent)
                 atomic_file.sync_folder(self.target.parent.parent)
                 yield
@@ -216,7 +264,7 @@ def recover_review_moves(root: Path) -> None:
                     if sha256(target_content).hexdigest() != move.digests.destination:
                         if plan.source_digest != move.digests.source:
                             raise TidyRefused(f"{move.id}: both copies changed; kept both copies")
-                        plan = replace(plan, content=target_content)
+                        plan = plan.keep_target(target_content, target.details)
                     elif plan.content != target_content:
                         atomic_file.write_bytes_atomic(move.path, plan.content)
                 numbers = (questions.question_numbers() if move.kind == new_item_dialog.SubmissionKind.QUESTION

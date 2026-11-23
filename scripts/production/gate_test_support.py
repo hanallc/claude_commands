@@ -479,6 +479,8 @@ class MergeGateFixture(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
+            # A gate that runs as a detached run has its own slice; the fixture gate never has one.
+            "DETACHED_RUN_SLICE": "",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),

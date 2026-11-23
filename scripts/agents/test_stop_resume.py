@@ -4092,7 +4092,7 @@ class StopResumeTests(unittest.TestCase):
                 now = Mock(return_value=initial)
                 seed: moves.RequestedMove = {"kind": "requested", "tool": "claude", "at": initial.isoformat(),
                     "subject": "unrelated", "move_id": "earlier", "why": "earlier", "window": "unknown",
-                    "from": "claude2", "to": "claude3"}
+                    "from": "claude2", "to": "claude3", "scope": "session"}
                 if clock_reversed:
                     moves.append_move(seed)
 
@@ -4384,6 +4384,25 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(shown.getvalue(), advice)
         self.assertEqual(legacy.read_text(), report)
         self.assertEqual(moves.pending_move_requests(), ())
+
+    def test_legacy_group_result_and_retry_preserve_the_group(self) -> None:
+        identity = self.entry["session_id"]
+        batch_id = "a" * 32
+        legacy = moves.store_file().parent / "move-results" / f"{batch_id}.json"
+        legacy.parent.mkdir(parents=True)
+        report = json.dumps({"group": "showrunners", "target": "claude3",
+                             "pending": [{"reference": identity, "name": "alpha"}]})
+        _ = legacy.write_text(report)
+        advice = f"alpha: start a new move with {moves.MOVE_COMMAND} batch --group showrunners -- {identity}\n"
+
+        with (patch.object(accounts, "current_move_account", return_value="claude4"),
+              patch.object(stop_resume, "_stop") as stopped):
+            for command in ("result", "retry"):
+                with self.subTest(command=command), redirect_stdout(io.StringIO()) as shown:
+                    self.assertEqual(stop_resume.main([command, batch_id]), 0)
+                    self.assertEqual(shown.getvalue(), advice)
+        stopped.assert_not_called()
+        self.assertEqual(legacy.read_text(), report)
 
     def test_retry_names_an_invalid_file_and_moves_the_valid_member(self) -> None:
         identity = self.entry["session_id"]
@@ -5848,7 +5867,7 @@ class StopResumeTests(unittest.TestCase):
                         return write(descriptor, data[:-1])
                     return write(descriptor, data)
 
-                def append_request(entry: moves.MoveEntry) -> None:
+                def append_request(entry: moves.MoveWriteEntry) -> None:
                     nonlocal first_id, append_failed
                     append(entry)
                     if fail_read and not append_failed and entry["kind"] == "requested" and entry["subject"] == subject:
@@ -5997,7 +6016,7 @@ class StopResumeTests(unittest.TestCase):
             return results[0] if identity == "bad" else results[1]
 
         append = moves.append_move
-        def fail_one(entry: moves.MoveEntry) -> None:
+        def fail_one(entry: moves.MoveWriteEntry) -> None:
             if entry["kind"] == "confirmed" and entry["subject"] == "bad":
                 raise OSError("TEST receipt write failed")
             append(entry)

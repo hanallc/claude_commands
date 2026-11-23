@@ -28,11 +28,11 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, new_item_dialog, page_frame, review_events, review_link
+from scripts.review_links import image_store, new_item_dialog, page_frame, reply_tokens, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
-    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size, new_reply_token,
+    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size,
     read_kind, read_request_id, read_words, read_submission,
     ByRequestId, BuildCell as BuildCell, BuildStepEvidence as BuildStepEvidence, Evidence as Evidence,
     MemoryReading as MemoryReading,
@@ -206,8 +206,22 @@ class SavedSubmission(NativeSubmissionDestination):
         return details
 
     @property
+    def awaiting_reply(self) -> bool:
+        return _awaiting_reply(self.record)
+
+    @property
     def reply_token(self) -> str:
-        return self.details.reply_token
+        return self.details.reply_token if self.awaiting_reply else ""
+
+
+def _awaiting_reply(record: NativeSubmittedRecord) -> bool:
+    match record:
+        case update_registration.QuestionRecord():
+            return update_registration.pending_review_reply(record)
+        case Issue():
+            return proposal_issue.pending_review_reply(record)
+        case investigation.Investigation():
+            return record.state == investigation.InvestigationState.OPEN
 
 
 @dataclass(frozen=True)
@@ -1015,25 +1029,29 @@ def _recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.S
 class _UnreadableOwnerDocument(OSError):
     """Send could not read a named local owner document."""
 
-    def __init__(self, owner: staff.StaffRow) -> None:
-        super().__init__(f"Cannot read the production document for {owner.name}.")
+    def __init__(self, owner: staff.StaffRow, document: Path, error: OSError | UnicodeError,
+                 members: staff.StaffSnapshot) -> None:
+        state = "is missing" if isinstance(error, FileNotFoundError) else "cannot be read"
+        parent = members.parent_of(owner)
+        fixer = parent.name if parent is not None else "You"
+        super().__init__(f"The {owner.name} production document {document} {state}. {fixer} must fix the {owner.name} staff row.")
 
 
-def owner_is_active(row: staff.StaffRow, *, require_document: bool = False) -> bool:
+def owner_is_active(row: staff.StaffRow) -> bool:
     """Check both the staff row and the production document."""
+    try:
+        return _document_is_active(row)
+    except FileNotFoundError:
+        return False
+
+
+def _document_is_active(row: staff.StaffRow) -> bool:
     if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
         return False
     if isinstance(row.doc, staff.LiveDoc):
-        try:
-            if row.kind == "producer" and row.doc.path.is_dir():
-                return True
-            lines = row.doc.path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as error:
-            if require_document:
-                raise _UnreadableOwnerDocument(row) from error
-            if isinstance(error, FileNotFoundError):
-                return False
-            raise
+        if row.kind == "producer" and row.doc.path.is_dir():
+            return True
+        lines = row.doc.path.read_text(encoding="utf-8").splitlines()
         status = next((line for line in lines if line.startswith("> **Status:")), "")
         if row.kind == "showrunner":
             return status.startswith("> **Status: PRODUCTION — running.**")
@@ -1059,7 +1077,12 @@ def _submission_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapsho
     if _has_remote_document(row):
         return (isinstance(row.doc, staff.LiveDoc) and not isinstance(row.worktree, staff.RemovedWorktree)
                 and not isinstance(row.exited, staff.Exited) and row.id not in members.pending_retire)
-    return owner_is_active(row, require_document=True)
+    try:
+        return _document_is_active(row)
+    except (OSError, UnicodeError) as error:
+        if not isinstance(row.doc, staff.LiveDoc):
+            raise
+        raise _UnreadableOwnerDocument(row, row.doc.path, error, members) from error
 
 
 @dataclass(frozen=True)
@@ -1068,9 +1091,17 @@ class PageOwnerUnavailable:
 
 
 @dataclass(frozen=True)
+class PageOwnerRoute:
+    """The recipient for new items and one sentence that says why the route chose it."""
+
+    row: staff.StaffRow
+    reason: str
+
+
+@dataclass(frozen=True)
 class PageOwners:
     shown: staff.StaffRow | PageOwnerUnavailable
-    route: staff.StaffRow | PageOwnerUnavailable
+    route: PageOwnerRoute | PageOwnerUnavailable
 
 
 def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> bool:
@@ -1082,29 +1113,71 @@ def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> 
 def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
     """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
-    values = settings.values(key, "owner.default")
+    label_key = f"page.{page}.label"
+    values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
-    route = _page_owner_route(designated, default, members)
+    # A page outside the console navigation, such as rebuilds, has no label setting.
+    label = values.get(label_key) or page.replace("_", " ").title()
+    route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
         return PageOwners(shown, route)
-    return PageOwners(route, route)
+    return PageOwners(route.row if isinstance(route, PageOwnerRoute) else route, route)
 
 
 def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Resolve the recipient for new items from a console page."""
-    return page_owners(page, settings, members).route
+    route = page_owners(page, settings, members).route
+    return route.row if isinstance(route, PageOwnerRoute) else route
 
 
-def _page_owner_route(designated: staff.StaffId, default: staff.StaffId,
-                      members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
+def _page_owner_route(label: str, designated: staff.StaffId, default: staff.StaffId,
+                      members: staff.StaffSnapshot) -> PageOwnerRoute | PageOwnerUnavailable:
+    owner = members.by_id(designated)
+    missed: list[staff.StaffRow] = []
     for identity in (designated, default):
         for candidate in investigation.owner_chain(identity, members):
-            row = _available_page_owner(candidate, members, allow_producer=candidate == designated)
+            allow_producer = candidate == designated
+            row = _available_page_owner(candidate, members, allow_producer=allow_producer)
             if isinstance(row, staff.StaffRow):
-                return row
+                if identity == designated:
+                    cause = _owner_chain_cause(label, owner, row, missed, members)
+                else:
+                    cause = _default_owner_cause(label, designated, owner, missed, row, members.by_id(default))
+                return PageOwnerRoute(row, f"(why {row.name}? because {cause}!)")
+            skipped = members.by_id(candidate)
+            if (identity == designated and skipped is not None
+                    and (skipped.kind == "showrunner" or skipped.kind == "producer" and allow_producer)):
+                missed.append(skipped)
     return PageOwnerUnavailable()
+
+
+def _owner_chain_cause(label: str, owner: staff.StaffRow | None, route: staff.StaffRow,
+                       missed: list[staff.StaffRow], members: staff.StaffSnapshot) -> str:
+    if missed:
+        return f"{missed[0].name} is not available and {route.name} is the nearest available showrunner above it"
+    if owner is None or owner == route:
+        return f"{route.name} owns the {label} page"
+    relation = "its showrunner" if members.parent_of(owner) == route else "the nearest showrunner above it"
+    return f"{owner.name} owns the {label} page and {route.name} is {relation}"
+
+
+def _default_owner_cause(label: str, designated: staff.StaffId, owner: staff.StaffRow | None,
+                         missed: list[staff.StaffRow], route: staff.StaffRow,
+                         default: staff.StaffRow | None) -> str:
+    if not designated:
+        cause = f"the {label} page has no owner"
+    elif owner is None:
+        cause = f"the {label} page owner is not on the staff list"
+    elif missed:
+        cause = f"{missed[0].name} is not available"
+    else:
+        cause = f"{owner.name} has no showrunner"
+    if default is None or default == route:
+        return f"{cause} and {route.name} is the default owner"
+    return (f"{cause}, the default owner {default.name} is not available,"
+            + f" and {route.name} is the nearest available showrunner above it")
 
 
 def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot, *,
@@ -1178,14 +1251,14 @@ class RecipientOption(TypedDict):
     proposal: bool
 
 
-def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
+def proposal_folder(recipient: staff.StaffRow, members: staff.StaffSnapshot) -> Path | NoNativeFolder:
     from scripts.production import proposals_folder
 
     if isinstance(recipient.doc, (staff.LiveDoc, staff.WrappedDoc)) and not _has_remote_document(recipient):
         try:
             folder = None if recipient.doc.path.is_dir() else proposals_folder.issues_folder(recipient.doc.path)
         except (OSError, UnicodeError) as error:
-            raise _UnreadableOwnerDocument(recipient) from error
+            raise _UnreadableOwnerDocument(recipient, recipient.doc.path, error, members) from error
         if folder is not None:
             return folder
     return NoNativeFolder(SubmissionKind.PROPOSAL)
@@ -1225,7 +1298,7 @@ def recipient_options(members: staff.StaffSnapshot, *,
     options: list[RecipientOption] = []
     for row in _recipient_choices(members, owner=owner):
         try:
-            can_receive_proposals = isinstance(proposal_folder(row), Path)
+            can_receive_proposals = isinstance(proposal_folder(row, members), Path)
         except OSError:
             can_receive_proposals = False
         options.append(RecipientOption(id=row.id, name=row.name, proposal=can_receive_proposals))
@@ -1652,13 +1725,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             assert current is not None
             recipient = lookup.recipient
             assert recipient is not None
-            destination = proposal_folder(recipient) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
+            destination = proposal_folder(recipient, current) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
-            details = ReviewSubmission(request_id, payload_hash, evidence, images, new_reply_token(),
-                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent)
+            proof = reply_tokens.mint()
+            details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
+                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent,
+                                       reply_token_nonce=proof.nonce)
             title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False
@@ -1780,6 +1855,48 @@ def read_attached_page_screenshot(target: ScopedSubmissionKey, request: new_item
     return new_item_dialog.PageScreenshot(image, new_item_dialog.PageViewport(request.width, request.height, request.dark))
 
 
+def current_reply_proof(key: str) -> reply_tokens.ReplyTokenProof:
+    """Read the proof from the current native note for a saved delivery."""
+    scoped = read_submission_key(key)
+    address = _request_address(scoped.kind, scoped.recipient_id, scoped.request_id)
+    located = locate_native_submission(address, _request_hint(address))
+    if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
+        raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
+    return located.details.reply_proof
+
+
+def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
+    """Give a waiting legacy note a new proof while the caller holds the recipient locks."""
+    saved = located.saved()
+    if not saved.awaiting_reply or saved.details.reply_token_nonce:
+        return saved
+    target = located.destination
+    lock = (update_registration.wrap_question_locks(target.owner) if target.kind == SubmissionKind.QUESTION
+            else proposal_issue.issue_lock(target.path) if target.kind == SubmissionKind.PROPOSAL
+            else nullcontext())
+    with lock:
+        current = _read_native_submission(target.address, target.path, target.owner)
+        if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
+            raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
+        record = current.record
+        if _awaiting_reply(record) and not current.details.reply_token_nonce:
+            proof = reply_tokens.mint()
+            match record:
+                case update_registration.QuestionRecord():
+                    fields = record.item.get("review_submission", {})
+                    _ = update_registration.write_review_submission(
+                        record, new_item_dialog.renewed_submission_fields(fields, proof))
+                case Issue():
+                    proposal_issue.renew_reply_proof(record, proof)
+                case investigation.Investigation():
+                    investigation.renew_reply_proof(target.path, record, proof)
+            updated = _read_native_submission(target.address, target.path, target.owner)
+            if not isinstance(updated, LocatedSubmission) or updated.destination.id != target.id:
+                raise reply_tokens.UnavailableReplyToken("Cannot read the renewed reply proof.")
+            record = updated.record
+        return replace(saved, path=target.path, owner=target.owner, record=record)
+
+
 def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
                      image: bytes | new_item_dialog.PageScreenshot) -> ReviewSubmission:
     """Store the screenshot and keep the page data for a Bug report."""
@@ -1812,13 +1929,9 @@ def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
 
 
 def _write_investigation_submission(located: LocatedSubmission, details: ReviewSubmission) -> None:
-    owner, identity, path = located.destination.owner, located.destination.id, located.destination.path
-    store = investigation.Investigations(owner, "investigations", "I", "investigation",
-                                         investigation.InvestigationError)
-    fields, body = store.read(identity, path=path)
-    fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(details))
-    with investigation.investigation_numbers() as numbers, numbers.write(path, identity, owner, folder=store.folder()):
-        store.write(identity, fields, body, path=path)
+    record = located.record
+    assert isinstance(record, investigation.Investigation)
+    investigation.write_review_submission(located.destination.path, record, details)
 
 
 class ScreenshotAttachment(Enum):
@@ -1958,3 +2071,47 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
                     return investigation.answer_submission(path, scoped, words, reply_token, owner=owner)
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error
+
+
+def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:
+    """Convert legacy reply tokens in the native stores and archives."""
+    kinds = (record_store.RecordKind.QUESTION, record_store.RecordKind.PROPOSAL,
+             record_store.RecordKind.INVESTIGATION)
+    folders = tuple(folder for kind in kinds for folder in record_store.staff_store_folders(kind, members=members))
+    changed = 0
+    keys = frozenset(("record_type", "registration", "review_submission", "id", "owner"))
+    for path in record_store.stored_paths(folders, strict=True):
+        fields = Issue(path, record_store.read_header(path, strict=True, keys=keys))
+        if fields.value("record_type") == "question":
+            if '"reply_token"' not in fields.value("registration"):
+                continue
+            question = update_registration.read_review_question(path)
+            saved = update_registration.scrub_reply_token(path, question.owner)
+        elif not re.search(r'\breply_token\\?"\s*:', fields.value("review_submission")):
+            continue
+        elif fields.value("record_type") == "proposal":
+            saved = proposal_issue.scrub_reply_token(path)
+        elif fields.value("id") and fields.value("owner"):
+            saved = investigation.scrub_reply_token(path, staff.StaffId(fields.value("owner")), fields.value("id"))
+        else:
+            continue
+        if saved:
+            changed += 1
+            print(f"Rewrote {path}")
+    return changed
+
+
+def main(argv: list[str]) -> int:
+    if argv != ["scrub-reply-tokens"]:
+        print("usage: python -m scripts.review_links.review_submissions scrub-reply-tokens", file=sys.stderr)
+        return 2
+    try:
+        _ = scrub_reply_tokens(staff.snapshot())
+    except (OSError, ValueError, update_registration.RegistrationFailure) as error:
+        print(f"Reply token scrub: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

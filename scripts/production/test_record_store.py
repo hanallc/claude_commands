@@ -14,6 +14,51 @@ from scripts.production import record_store, staff
 
 
 class NumberedRecordsTests(unittest.TestCase):
+    def test_list_sequence_starts_from_records_and_the_migration_log(self) -> None:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory)}))
+        store = record_store.NumberedRecords(staff.StaffId("keeper"), "list", "L", "list item", ValueError)
+        morty = staff.StaffRow(store.owner, "producer", "morty", staff.StaffRoot(), current_session=store.owner)
+        self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot((morty,))))
+        former = directory / "former-keeper" / "list"
+        former.mkdir(parents=True)
+        closed = former / "L207.md"
+        _ = closed.write_text('state: "Closed"\n\n## Log\n\nRemoved from the List.\n')
+        history = store.folder() / ".migration-complete.json"
+        with store.locked():
+            self.assertEqual(store.next_number(), 208)
+            _ = history.write_text(json.dumps({"records": {"L208.md": "fixture hash"}}))
+            self.assertEqual(store.next_number(), 209)
+            with self.assertRaisesRegex(ValueError, "below the saved sequence"):
+                store.reserve_number(208)
+            store.reserve_number(209)
+            history.unlink()
+            closed.unlink()
+            self.assertEqual(store.next_number(), 210)
+            with self.assertRaisesRegex(ValueError, "below the saved sequence"):
+                store.reserve_number(208)
+            self.assertEqual(store.next_number(), 210)
+            _ = store.counter_path().write_text("invalid\n")
+            with self.assertRaisesRegex(ValueError, "invalid next number"):
+                _ = store.next_number()
+
+    def test_second_keeper_cannot_allocate_a_list_number(self) -> None:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory)}))
+        keeper = staff.StaffId("keeper")
+        second = staff.StaffId("second")
+        members = staff.StaffSnapshot((
+            staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper),
+            staff.StaffRow(second, "producer", "second", staff.StaffRoot(), current_session=second),
+        ))
+        self.enterContext(staff.supplied_snapshot(members))
+        store = record_store.NumberedRecords(second, "list", "L", "list item", ValueError)
+        with self.assertRaisesRegex(ValueError, "only morty's List folder"):
+            _ = store.next_number()
+        with self.assertRaisesRegex(ValueError, "only morty's List folder"):
+            store.reserve_number(1)
+        self.assertFalse(store.folder().exists())
+
     def git_history_fixture(self) -> Path:
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
