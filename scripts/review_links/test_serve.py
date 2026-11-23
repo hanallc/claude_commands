@@ -5528,7 +5528,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(len(deliveries), 1)
                 self.assertEqual(deliveries[0][0], morty.id)
                 self.assertIn("List item 1: Ask question\nThe question item\n" + words, deliveries[0][1])
-                self.assertIn('the_list.py answer L1 --question Q1 --text "<answer>"', deliveries[0][1])
+                self.assertIn(f'the_list.py answer L1 --keeper {morty.id} --question Q1 --text "<answer>"', deliveries[0][1])
             finally:
                 release.set()
                 if started.is_set():
@@ -5840,7 +5840,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(send.call_count, tries)
             self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
-            self.assertIn("answer L1 --question Q1", messages[0])
+            self.assertIn(f"answer L1 --keeper {morty.id} --question Q1", messages[0])
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
