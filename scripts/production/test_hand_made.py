@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,7 +26,7 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
                                  placement, queue_lines, queue_place, step_estimator)
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
-from scripts.buildlog import record
+from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
@@ -422,8 +423,10 @@ class HandMadeTests(AttemptCase):
                                 str(self.root / value) if value != "true" else value], check=True)
         # A new mtime makes git status compare the file content, which runs a clean filter.
         os.utime(self.repo / "check.py", (1, 1))
+        # A folder word makes the check ask git if it ignores the folder.
+        (self.repo / "sub").mkdir()
         self.reply = self.answer(NO)
-        status, _ = self.attempt(("cargo", "build"))
+        status, _ = self.attempt(("cargo", "build", "--target-dir=sub"))
         _ = self.assert_no_run(status, "the check said no")
         self.assertEqual(sorted(path.name for path in marks.iterdir()), [])
         self.assertIsNotNone(self.only_row()["tree_key"])
@@ -500,6 +503,52 @@ class HandMadeTests(AttemptCase):
         files = cast(list[dict[str, object]], self.only_row()["files"])
         self.assertIsNone(files[0]["sha256_run"])
 
+    def test_a_folder_that_git_ignores_or_a_link_reaches_after_the_check_refuses_the_run(self) -> None:
+        for name in ("out", "data", "real"):
+            (self.repo / name).mkdir()
+
+        def ignore(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            _ = (self.repo / ".gitignore").write_text("/out\n")
+            return self.answer(YES)(argv)
+
+        def link(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            (self.repo / "data").rmdir()
+            (self.repo / "data").symlink_to(self.repo / "real")
+            return self.answer(YES)(argv)
+
+        for reply, word, reason in ((ignore, "out", "git ignores"), (link, "data", "is reached through a link")):
+            with self.subTest(word=word):
+                for path in (self.root / "buildlog").glob("*/*.jsonl"):
+                    path.unlink()
+                self.line = FakeLine(self.root / "place")
+                self.reply = reply
+                status, errors = self.attempt((sys.executable, "check.py", word))
+                self.assertEqual(status, hand_made.REFUSED_EXIT)
+                text = "a folder changed after the check: " + hand_made.FOLDER_REFUSAL.format(
+                    word=word, entry="the folder", folder=self.repo / word, reason=reason)
+                self.assertIn(text, errors)
+                self.assertEqual((self.line.place.started, self.line.closed),
+                                 ([], [("natedev", None, "a checked file changed after the check")]))
+                self.assertIn(text, str(self.only_row()["refusal"]))
+
+    def test_a_folder_that_gets_a_main_file_after_the_check_refuses_the_run(self) -> None:
+        (self.repo / "pkg").mkdir()
+        _ = (self.repo / "pkg" / "data.txt").write_text("data\n")
+        for command in (["add", "pkg"], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                                         "commit", "-q", "-m", "pkg"]):
+            _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+
+        def add_main(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            _ = (self.repo / "pkg" / "__main__.py").write_text(SCRIPT)
+            return self.answer(YES)(argv)
+
+        self.reply = add_main
+        status, errors = self.attempt((sys.executable, "check.py", "pkg"))
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("a folder changed after the check: " + hand_made.MAIN_FOLDER_REFUSAL, errors)
+        self.assertEqual((self.line.place.started, self.line.closed),
+                         ([], [("natedev", None, "a checked file changed after the check")]))
+
     def test_queue_place_refusal_is_recorded_with_no_run(self) -> None:
         self.line.refusal = "admission service unavailable"
         status, _ = self.attempt()
@@ -530,6 +579,9 @@ class ProgramFileTests(unittest.TestCase):
         self.repo, self.bin = self.root / "repo", self.root / "bin"
         for folder in (self.repo / "tools", self.bin):
             folder.mkdir(parents=True)
+        _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
+        # The folder check calls git from PATH.
+        (self.bin / "git").symlink_to(shutil.which("git") or "git")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"PATH": str(self.bin)})))
 
     def write(self, path: Path, text: str) -> Path:
@@ -650,9 +702,161 @@ class ProgramFileTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "a word names a folder with a __main__ file"):
             _ = self.read("python3", "build")
 
-    def test_a_word_that_names_a_plain_folder_is_not_refused(self) -> None:
-        (self.repo / "test").mkdir()
-        self.assertEqual(self.read("cargo", "test"), [])
+    def test_a_folder_word_that_a_tool_can_run_an_unread_file_from_is_refused(self) -> None:
+        (self.repo / "target" / "t").mkdir(parents=True)
+        _ = (self.repo / ".gitignore").write_text("/target\n")
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        (self.repo / "linked").symlink_to(self.repo / "tools")
+        home, new_tmp = Path.home(), Path("/tmp") / f"{self.root.name}-new"
+        prefix = f"-B{home}/hand-made-missing-prefix-"
+        target, ignores, outside_reason = self.repo / "target", "git ignores", "is outside the checkout and not in /nix/store"
+        folder, new = "the folder", "a new entry in the folder"
+        cases = {
+            ("make", "-C", "target"): ("target", folder, target, ignores),
+            ("make", "-Ctarget"): ("-Ctarget", folder, target, ignores),
+            ("node", "target"): ("target", folder, target, ignores),
+            ("pytest", "target/t"): ("target/t", folder, target / "t", ignores),
+            ("cmd", "--dir=target"): ("--dir=target", folder, target, ignores),
+            ("cargo", "build", "--target-dir", "target"): ("target", folder, target, ignores),
+            ("cargo", "build", "--target-dir", "target/new"): ("target/new", new, target, ignores),
+            ("make", "-C", str(outside)): (str(outside), folder, outside, outside_reason),
+            ("cc", f"-I{outside}"): (f"-I{outside}", folder, outside, outside_reason),
+            ("cargo", "build", "--config", f"build.target-dir={outside}"):
+                (f"build.target-dir={outside}", folder, outside, outside_reason),
+            ("cargo", "build", f"--config=build.target-dir={outside}"):
+                (f"--config=build.target-dir={outside}", folder, outside, outside_reason),
+            ("cargo", "build", "--config", f'build.target-dir="{outside}"'):
+                (f'build.target-dir="{outside}"', folder, outside, outside_reason),
+            ("cargo", "build", f"--target-dir={home}"): (f"--target-dir={home}", folder, home, outside_reason),
+            ("pytest", "/home"): ("/home", folder, Path("/home"), outside_reason),
+            ("cc", prefix): (prefix, new, home, outside_reason),
+            ("cargo", "build", "--target-dir", str(new_tmp)): (str(new_tmp), new, Path("/tmp"), outside_reason),
+            ("make", "-C", "../elsewhere"): ("../elsewhere", folder, outside, "is named with a .. part"),
+            ("cc", "-I/etc/../etc"): ("-I/etc/../etc", folder, Path("/etc"), "is named with a .. part"),
+            ("make", "-C", "tools/../tools"): ("tools/../tools", folder, self.repo / "tools", "is named with a .. part"),
+            ("make", "-C", "linked"): ("linked", folder, self.repo / "linked", "is reached through a link"),
+            ("make", "-C", ".git/hooks"): (".git/hooks", folder, self.repo / ".git" / "hooks", "is in .git"),
+        }
+        for argv, (word, entry, place, reason) in cases.items():
+            with self.subTest(argv=argv), self.assertRaises(Refused) as refused:
+                _ = self.read(*argv)
+            self.assertEqual(str(refused.exception),
+                             hand_made.FOLDER_REFUSAL.format(word=word, entry=entry, folder=place, reason=reason))
+        with mock.patch.object(treekey, "ignored_paths", return_value=None), \
+                self.assertRaisesRegex(Refused, "which is in a submodule, or git cannot check it"):
+            _ = self.read("make", "-C", "tools")
+
+    def test_a_value_joined_to_an_option_that_names_a_file_is_read(self) -> None:
+        (self.root / "out").mkdir()
+        evil = self.write(self.root / "out" / "evil.mk", "all:\n\trm -rf ~/work\n")
+        local = self.write(self.repo / "build.mk", "all:\n")
+        cases = {("make", f"-f{evil}"): [evil], ("make", f"--file={evil}"): [evil], ("make", "-fbuild.mk"): [local],
+                 ("make", "--file=build.mk"): [local]}
+        for argv, expected in cases.items():
+            with self.subTest(argv=argv):
+                self.assertEqual(self.read(*argv), expected)
+
+    def test_a_response_file_is_refused(self) -> None:
+        (self.root / "out").mkdir()
+        outside = self.write(self.root / "out" / "rsp", "-B/tmp/x\n")
+        _ = self.write(self.repo / "rsp", "-O2\n")
+        for word, path in ((f"@{outside}", outside), ("@rsp", self.repo / "rsp")):
+            with self.subTest(word=word), self.assertRaises(Refused) as refused:
+                _ = self.read("cc", word, "x.c")
+            self.assertEqual(str(refused.exception), hand_made.RESPONSE_REFUSAL.format(word=word, path=path))
+        self.assertEqual(self.read("cc", "@missing", "x.c"), [])
+        fifo = self.root / "out" / "fifo"
+        os.mkfifo(fifo)
+        with self.assertRaises(Refused) as refused:
+            _ = self.read("cc", f"@{fifo}", "x.c")
+        self.assertEqual(str(refused.exception), hand_made.RESPONSE_REFUSAL.format(word=f"@{fifo}", path=fifo))
+
+    def test_a_value_that_names_a_fifo_is_refused_and_dev_null_passes(self) -> None:
+        (self.root / "out").mkdir()
+        (self.repo / "src").mkdir()
+        outside, inside = self.root / "out" / "fifo", self.repo / "src" / "fifo.py"
+        for fifo in (outside, inside):
+            os.mkfifo(fifo)
+        reason = "is not a regular file or a folder, so the check cannot read it"
+        cases = {("python3", str(outside)): (str(outside), outside), ("python3", "src/fifo.py"): ("src/fifo.py", inside),
+                 ("make", "-f", str(outside)): (str(outside), outside),
+                 ("make", f"-f{outside}"): (f"-f{outside}", outside)}
+        for argv, (word, path) in cases.items():
+            with self.subTest(argv=argv), self.assertRaises(Refused) as refused:
+                _ = self.read(*argv)
+            self.assertEqual(str(refused.exception), hand_made.FOLDER_REFUSAL.format(
+                word=word, entry="the entry", folder=path, reason=reason))
+        self.assertEqual(self.read("cc", "-o", "/dev/null", "x.c"), [])
+
+    def test_git_revision_words_pass_and_a_quoted_toml_value_is_refused(self) -> None:
+        for argv in (("git", "log", "@"), ("git", "log", "@{u}.."), ("git", "log", "main@{upstream}..HEAD"),
+                     ("git", "log", "HEAD@{1}"), ("git", "log", "--format={a}:{b}")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.read(*argv), [])
+        outside = self.root / "x"
+        outside.mkdir()
+        word = f'build={{target-dir="{outside}"}}'
+        with self.assertRaises(Refused) as refused:
+            _ = self.read("cargo", "build", "--config", word)
+        self.assertEqual(str(refused.exception), hand_made.FOLDER_REFUSAL.format(
+            word=word, entry="the folder", folder=outside, reason="is outside the checkout and not in /nix/store"))
+
+    def test_a_long_value_is_normalized_and_an_unchecked_value_is_refused(self) -> None:
+        (self.repo / "target").mkdir()
+        _ = (self.repo / ".gitignore").write_text("/target\n")
+        long_word = "./" * 2030 + "target"
+        self.assertEqual(len(long_word), 4066)
+        with self.assertRaises(Refused) as refused:
+            _ = self.read("make", "-C", long_word)
+        self.assertEqual(str(refused.exception), hand_made.FOLDER_REFUSAL.format(
+            word=long_word, entry="the folder", folder=self.repo / "target", reason="git ignores"))
+        # A link to itself makes os.stat fail with ELOOP, not with ENOENT.
+        (self.repo / "loop").symlink_to("loop")
+        for argv in (("make", "-C", "loop"), (sys.executable, "loop")):
+            with self.subTest(argv=argv), self.assertRaises(Refused) as refused:
+                _ = self.read(*argv)
+            self.assertEqual(str(refused.exception), hand_made.FOLDER_REFUSAL.format(
+                word="loop", entry="the entry", folder=self.repo / "loop", reason="cannot be checked (ELOOP)"))
+
+    def test_a_folder_in_another_git_repository_is_refused(self) -> None:
+        nested = self.repo / "nested"
+        (nested / "sub").mkdir(parents=True)
+        _ = (nested / ".git").write_text("gitdir: /nonexistent/modules/nested\n")
+        reason = "is in another git repository"
+        cases = (("nested", "the folder", nested), ("nested/sub", "the folder", nested / "sub"),
+                 ("nested/new", "a new entry in the folder", nested))
+        for word, entry, folder in cases:
+            with self.subTest(word=word), self.assertRaises(Refused) as refused:
+                _ = self.read("make", "-C", word)
+            self.assertEqual(str(refused.exception),
+                             hand_made.FOLDER_REFUSAL.format(word=word, entry=entry, folder=folder, reason=reason))
+
+    def test_a_folder_word_with_the_trust_of_the_checkout_top_passes(self) -> None:
+        for name in ("tests", "sub", "test"):
+            (self.repo / name).mkdir()
+            _ = self.write(self.repo / name / "Makefile", "all:\n")
+        for command in (["add", "."], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                                       "commit", "-q", "-m", "fixture"]):
+            _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+        for argv in (("pytest", "tests"), ("make", "-C", "sub"), ("make", "-Csub"), ("cargo", "build", "-j4"),
+                     ("cc", "-Wall"), ("cargo", "test"), ("make", "-C", "."), ("mkdir", "newdir"),
+                     ("cargo", "build", "--target-dir", "newdir"), ("git", "log", "HEAD..main"), ("make", "-j8"),
+                     ("make", "-j", "8")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.read(*argv), [])
+
+    def test_a_folder_in_the_store_or_a_new_entry_in_a_root_only_folder_passes(self) -> None:
+        # A real store folder: its path has /nix/store, which is group-writable with the sticky bit.
+        store = Path(sys.executable).resolve().parent
+        self.assertTrue(store.is_relative_to("/nix/store"))
+        for argv in (("cc", f"-I{store}"), ("cc", "-I", str(store)), ("cc", "-I/usr/hand-made-missing"),
+                     ("cc", "-I/hand-made-missing")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.read(*argv), [])
+        self.assertTrue(hand_made.root_only("/"))
+        self.assertFalse(hand_made.root_only("/nix/store"))
+        self.assertFalse(hand_made.root_only(str(self.root)))
 
     def test_a_wrapper_word_from_path_with_no_start_line_is_read(self) -> None:
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")
