@@ -1363,7 +1363,13 @@ Bold delimiters require adjacent text and a valid whitespace or punctuation boun
 Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
-Mark read clears the dot and adds a log entry without sending a message.
+Mark read clears the dot and adds a log entry.
+Mark read on an unparked Waiting for nate item with no open question also sets the state to Working.
+The same write logs the state change and saves a notice for the item's producer.
+The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
+The existing sender delivers it with its retry and alert rules.
+The page applies the Working state from the response, so the row leaves Needs me in place.
+Mark read on any other item sends no message.
 All actions use the record keeper and item ID from the signed form.
 Ask question and feedback can mark the update read after the action saves.
 The form signature includes the identity of the unread update that the row shows.
@@ -1519,7 +1525,9 @@ The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
-The notice tells the record keeper which action Nate completed.
+The notice tells its recipient which action Nate completed.
+The recipient is the item's producer for Mark read and the record keeper for each other action.
+The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Feedback sends the user's words without changing the item state or parking time.
@@ -1574,7 +1582,8 @@ A repeated POST retries a pending request without adding another pending log ent
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows the record keeper and send time until the next log entry from that keeper.
+The Update cell shows “sent to <recipient>” with its time until the next log entry from another writer.
+The recipient is the record keeper, or the item's producer for a Mark read notice.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.

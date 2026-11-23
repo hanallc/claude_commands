@@ -3056,6 +3056,26 @@ raise SystemExit(2)
         self.assertTrue(tree.is_dir())
         self.assertTrue(self.record_path(tree).is_file())
 
+    def test_allow_existing_reuses_unrecorded_checkouts_without_adoption(self) -> None:
+        self.layout_fixture()
+        for owner, tree, merge_branch in (
+            ("style", self.trees / "origin/style/worktree", ""),
+            ("restored", self.root / "legacy-checkout", "integration"),
+        ):
+            with self.subTest(owner=owner):
+                branch = f"{owner}-worktree"
+                _ = self.git(self.repository, "worktree", "add", "-b", branch, str(tree), self.base)
+                head = self.commit(tree, "code.txt", f"{owner} work\n")
+                with patch.dict(os.environ, self.environment, clear=True):
+                    layout = worktrees.unit_checkout_output(tree, "origin", owner)
+                    reused = worktrees.create_checkout(
+                        tree, self.merge_tree, build_folders.ExistingWorktreeBranch(branch), layout,
+                        owner=owner, merge_branch=merge_branch, allow_existing=True)
+                    self.assertIsNone(worktrees.checkout_record(tree))
+                self.assertEqual(reused, tree)
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), head)
+                self.assertFalse((tree / "target").is_symlink())
+
     def test_landed_worktree_lists_its_assigned_output(self) -> None:
         self.layout_fixture()
         tree, branch = self.trees / "origin/demo/probe", "demo-probe"

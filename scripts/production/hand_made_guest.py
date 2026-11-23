@@ -148,15 +148,16 @@ class GuestRun:
         """Send the checkout and run the argv in the guest.
 
         The guest finds the first word in its numbered copy or on its own PATH, and refuses a word that can
-        start a guest file that the check did not read. It gives the program its own variables and no input.
-        The output is one pipe.
+        start a guest file that the check did not read; that refusal ends the attempt, as on the Mac. It gives
+        the program its own variables and no input. The output is one pipe.
         """
         try:
             process = self.command.start(self.program.repo, self.program.argv, work=HAND_MADE.step, unit=self.unit,
                                          bootstrap=self.bootstrap, checked=self.checked_bytes())
+        except mac_linux.GuestRefusedCommand as error:
+            raise Refused(f"{MACHINE} refused the run: {error}") from error
         except mac_linux.route_errors() as error:
-            proven = self.command.process is None or isinstance(
-                error, (mac_linux.GuestNotLocked, mac_linux.GuestRefusedCommand))
+            proven = self.command.process is None or isinstance(error, mac_linux.GuestNotLocked)
             if not proven:
                 raise start_unknown(MACHINE, f"the guest got the command and gave no start line: {error}") from error
             raise GuestFailed(f"guest start: {error}") from error

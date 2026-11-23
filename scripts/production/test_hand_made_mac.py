@@ -12,6 +12,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import cast, final, override
 import unittest
@@ -156,6 +157,21 @@ class MacAttemptTests(AttemptCase):
         self.assertEqual((self.mac.copies, self.mac.commands), ([], []))
         self.assertEqual(self.line.closed, [("mac", None, "a checked file changed after the check")])
 
+    def test_a_folder_word_that_the_check_refuses_at_the_run_start_takes_no_mac_run(self) -> None:
+        (self.repo / "out").mkdir()
+
+        def ignore(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            _ = (self.repo / ".gitignore").write_text("/out\n")
+            return self.answer(YES)(argv)
+
+        self.reply = ignore
+        status, errors = self.mac_attempt(remote(), machines=("mac",), argv=(sys.executable, "check.py", "out"))
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("a folder changed after the check: " + hand_made.FOLDER_REFUSAL.format(
+            word="out", entry="the folder", folder=self.repo / "out", reason="git ignores"), errors)
+        self.assertEqual((self.mac.copies, self.mac.commands), ([], []))
+        self.assertEqual(self.line.closed, [("mac", None, "a checked file changed after the check")])
+
     def test_a_mac_file_that_differs_from_the_checked_file_refuses_the_run(self) -> None:
         self.mac.lines, self.mac.exit = (hand_made_mac.REFUSED + "check.py on the Mac is not the checked file\n",), 1
         status, errors = self.mac_attempt(remote(), local_grant())
@@ -216,7 +232,9 @@ class MacAttemptTests(AttemptCase):
         _ = (self.repo / "x.sh").write_text("echo hand made ran\n")
         (self.repo / "link").symlink_to(outside / "sub")
         status, errors = self.mac_attempt(local_grant(), argv=("bash", "link/../x.sh"))
-        self.assertEqual((status, self.output.getvalue()), (0, NATEDEV_RAN))
+        # The kernel takes .. after the link, so bash opens outside/x.sh. The read limit hides that folder.
+        self.assertEqual((status, self.output.getvalue()),
+                         (127, f"{shutil.which('bash')}: link/../x.sh: No such file or directory\n".encode()))
         self.assertIn("the word link/../x.sh has a .. part", errors)
         self.assertEqual((self.line.requests[-1].machines, self.mac.commands), (("natedev",), []))
 

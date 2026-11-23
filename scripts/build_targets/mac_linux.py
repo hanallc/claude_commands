@@ -1291,6 +1291,11 @@ def main_folder(path: str) -> bool:
         return True
 
 
+def unchecked_entry(path: Path, error: OSError) -> str:
+    """The reason for a path that the guest cannot stat: the check cannot tell what the path names."""
+    return f'{path} cannot be checked ({error.strerror or type(error).__name__})'
+
+
 def unread_entry(copy: Path, word: str) -> str:
     """The reason that the word can name a guest entry that natedev did not read, or empty. The path starts at
     the copy.
@@ -1312,7 +1317,7 @@ def unread_entry(copy: Path, word: str) -> str:
         except OSError as error:
             if error.errno in (errno.ENOENT, errno.ENOTDIR):
                 return ''
-            return f'the guest cannot read {path}: {error.strerror}'
+            return unchecked_entry(path, error)
         if stat.S_ISLNK(mode):
             return f'{path} is a symbolic link'
     if not slash and stat.S_ISDIR(mode):
@@ -1336,9 +1341,16 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
     """
     copy = copy.resolve()
     for index, word in enumerate(argv):
-        if index and main_folder(str(copy / word)):
-            return (f'The guest refuses the command word {word}: python runs a __main__ file of the folder '
-                    + f'{copy / word}, and natedev read no file there.')
+        if index:
+            try:
+                # entry_kind names a stat error first; main_folder alone takes it as a __main__ folder.
+                folder = entry_kind(str(copy / word)) == 'folder'
+            except OSError as error:
+                return (f'The guest refuses the command word {word}: {unchecked_entry(copy / word, error)}, '
+                        + 'and natedev read no file there.')
+            if folder and main_folder(str(copy / word)):
+                return (f'The guest refuses the command word {word}: python runs a __main__ file of the folder '
+                        + f'{copy / word}, and natedev read no file there.')
         if (index or '/' in word) and Path(word).as_posix() not in checked:
             reason = unread_entry(copy, word)
             if reason:

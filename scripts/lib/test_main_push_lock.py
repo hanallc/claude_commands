@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 from scripts.lib import main_push_lock
 
@@ -52,6 +55,21 @@ class MainPushLockRecordTests(unittest.TestCase):
         with main_push_lock.main_push_lock(self.checkout, "now"):
             pass
         self.assertEqual([line["holder"] for line in self.lines()], ["recent", "now"])
+
+    def test_each_hold_reads_the_inherited_hold_from_its_own_environment(self) -> None:
+        # verify_helper.py runs many commands in one process, each with its own environment.
+        with main_push_lock.main_push_lock(self.checkout, "parent"):
+            path = main_push_lock.held_environment(self.checkout)["MAIN_PUSH_LOCK_HELD"]
+        unheld = {key: value for key, value in os.environ.items() if key != "MAIN_PUSH_LOCK_HELD"}
+        with open(path, "a") as parent:
+            fcntl.flock(parent, fcntl.LOCK_EX)
+            with mock.patch.dict(os.environ, unheld, clear=True), self.assertRaises(BlockingIOError):
+                with main_push_lock.main_push_lock(self.checkout, "plain", wait=False):
+                    pass
+            with mock.patch.dict(os.environ, {"MAIN_PUSH_LOCK_HELD": path}):
+                with main_push_lock.main_push_lock(self.checkout, "child", wait=False):
+                    pass
+        self.assertEqual([line["holder"] for line in self.lines()], ["parent"])
 
 
 if __name__ == "__main__":
