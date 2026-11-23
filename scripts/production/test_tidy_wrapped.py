@@ -34,6 +34,7 @@ from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.review_links import change_browser, change_page, new_item_dialog, reply_tokens, review_actions, review_items, review_later, review_submissions
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
@@ -55,7 +56,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            **copies_environment(self.root), "HERDR_BIN": MISSING_HERDR_BIN,
             "XDG_STATE_HOME": str(self.root / "key-state"),
         }))
         _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
@@ -564,7 +565,7 @@ class TidyWrappedTests(unittest.TestCase):
         unrelated_before = unrelated.read_bytes(), unrelated.stat().st_mtime_ns
         reminders = self.write(self.state / "outstanding" / f"{owner.id}.json", "[]\n")
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),
@@ -612,7 +613,7 @@ class TidyWrappedTests(unittest.TestCase):
         paths = [*state, question, document, other / relative, caller / relative, self.root / "staff.json"]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         environment = {**os.environ, **source_environment(self.root / "sources"),
-                       "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(self.state),
+                       "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "SHOWRUNNER_STATE_DIR": str(self.state),
                        "NOTIFIER_STATE_DIR": str(self.notifier)}
         with (mock.patch.dict(os.environ, environment), isolated_source_readers(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state),

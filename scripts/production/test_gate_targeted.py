@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.production import gate
@@ -16,6 +16,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.test_times.gate_record_test_support import gate_run
 
 
 class TargetedTestTests(MergeGateFixture):
@@ -31,8 +32,9 @@ class TargetedTestTests(MergeGateFixture):
     def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
         allocated: list[Path] = []
 
-        def run(args: gate.GateArguments, mode: gate.SuiteMode) -> int:
+        def run(args: gate.GateArguments, mode: gate.SuiteMode, target: str | gate.NoGateAssignment) -> int:
             self.assertIs(mode, gate.SuiteMode.TARGETED)
+            self.assertIsInstance(target, gate.NoGateAssignment)
             self.assertEqual(args.gate_job, StepJob("test-affected"))
             path = Path(os.environ["TMPDIR"])
             allocated.append(path)
@@ -117,6 +119,44 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertNotIn("tests reused from", result.stdout)
         self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
         self.assertEqual(self.gate_run_records()[-1]["step"], "test-affected")
+
+    @gate_suites("lib", "hooks")
+    def test_a_config_change_selects_by_the_full_gate_records_of_the_callers_default_build_log(self) -> None:
+        first = self.run_gate()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        # The caller sets no BUILDLOG_DIR, so its build log is the default one under HOME.
+        caller_log = Path(self.environment.pop("BUILDLOG_DIR"))
+        default_log = Path(self.environment["HOME"]) / ".local/state/buildlog"
+        default_log.parent.mkdir(parents=True, exist_ok=True)
+        default_log.symlink_to(caller_log, target_is_directory=True)
+        # The newest full gate recorded that only lib/test_second.py reads the config file.
+        modules: list[dict[str, object]] = []
+        for path in sorted((self.checkout / "scripts").glob("*/test_*.py")):
+            config_reads: list[str] = ["fixture_settings"] if path.name == "test_second.py" else []
+            modules.append({"suite": path.parent.name, "module": path.name, "attempt": 1, "config_reads": config_reads})
+        reads: dict[str, object] = {
+            **gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-config-reads", "host": "fixture-host",
+            "started_at": "2100-01-01T00:00:00.000Z", "selection": "full", "aborted": False, "modules": modules}
+        self.write(caller_log / "fixture-host/config-reads.jsonl", json.dumps(reads) + "\n")
+        self.write(self.checkout / "config/fixture_settings.conf", "value=changed\n")
+        _ = self.commit(self.checkout, "config changed")
+        self.clear_gate_events()
+        (self.state / "buildlogs.jsonl").unlink()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"affected: 1 of {self.module_count} modules", result.stdout)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(starts, [("lib", "test_second.py")])
+        # The module job writes its own private build log, not the caller's.
+        line, = (self.state / "buildlogs.jsonl").read_text().splitlines()
+        log = cast(dict[str, str], json.loads(line))
+        self.assertTrue(Path(log["buildlog"]).is_relative_to(log["tmpdir"]), log)
+        self.assertFalse(Path(log["buildlog"]).is_relative_to(caller_log), log)
+        self.assertEqual(list(caller_log.rglob("fixture-log")), [])
+        # The gate writes its own record to the caller's build log.
+        rows = [cast(dict[str, object], json.loads(line)) for path in caller_log.glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        self.assertIn(("test-affected", "affected"), [(row.get("step"), row.get("selection")) for row in rows])
 
     @gate_suites("lib", "hooks", "message")
     def test_a_nightly_red_marker_keeps_selection_by_the_four_rules(self) -> None:

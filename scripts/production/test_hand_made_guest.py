@@ -91,7 +91,8 @@ class InjectedGuest:
 
     def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
                _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
-               count: bool) -> list[str]:
+               count: bool, link: int) -> list[str]:
+        del link
         self.events.append(f"run count={count}")
         return [self.stream_program, "-c", GUEST_RUN, str(self.status), mac_linux.RUN_START,
                 mac_linux.RUN_LOCKED if self.locked else "", self.setup_error,
@@ -137,6 +138,7 @@ class GuestRouteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.lift_read_limit_guard()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.config = self.root / "config"
         self.config.mkdir()
@@ -165,6 +167,10 @@ class GuestRouteTests(unittest.TestCase):
         (self.root / "place").mkdir()
         # The queue gives the run to the guest; a later wait gives it to natedev.
         self.line = FakeLine(self.root / "place", answers=[remote(hand_made_guest.MACHINE), local_grant()])
+
+    def lift_read_limit_guard(self) -> None:
+        """Remove the refusal for a guest with no read limit, so that the test reaches the guest route behind it."""
+        _ = self.enterContext(mock.patch.object(hand_made_guest, "NO_READ_LIMIT", ""))
 
     def checkout(self, name: str, origin: str) -> Path:
         """A clean checkout with check.py and an origin/main at its head."""
@@ -288,7 +294,7 @@ class GuestRouteTests(unittest.TestCase):
     def test_a_refused_mac_claim_takes_no_run(self) -> None:
         with mock.patch.object(mac_run, "held", side_effect=mac_run.MacRunRefused("mac is busy with fixture")):
             status, errors = self.attempt()
-        self.assert_failed(status, errors, "not started: mac is busy with fixture")
+        self.assert_failed(status, errors, "mac-linux: mac is busy with fixture")
         self.assertEqual(self.guest.events, [])
 
     def test_a_failed_guest_start_takes_no_run_and_names_the_cause(self) -> None:

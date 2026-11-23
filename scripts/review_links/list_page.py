@@ -78,10 +78,6 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
     return ListChip.MORTY_ANSWERING if open_question else chip
 
 
-def has_open_question(item: the_list.ListItem) -> bool:
-    return any(question.answer is None for question in item.questions)
-
-
 def shown_asks(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[the_list.Ask, ...]:
     """Show an open ask only when its target has a staff row."""
     if item.state == the_list.ItemState.CLOSED:
@@ -237,8 +233,8 @@ def log_field_html(field: str, value: object, today: datetime, names: staff_name
     return field_html(field, value, today, names)
 
 
-def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   fields: Mapping[str, object], evidence_id: str, keeper_label: str) -> str:
+def log_entry_html(record: ListRecord, change: the_list.ItemChange, index: int, today: datetime,
+                   names: staff_names.StaffNames, fields: Mapping[str, object], evidence_id: str) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
     question: Literal["Question", "Answer"] | None = None
@@ -250,9 +246,11 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
+        recipient = the_list.notice_recipient(record.keeper, content)
         label = {"pending": "Feedback for ", "sent": "Feedback sent to ",
-                 "alerted": "Feedback could not reach "}[content.state] + keeper_label
-        body = label + by + change_browser.question_paragraphs(content.words)
+                 "alerted": "Feedback could not reach "}[content.state]
+        body = label + names.html(recipient, owner_name(names.members, recipient)) + by
+        body += change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
@@ -298,8 +296,6 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
                   unread_answers: frozenset[str]) -> str:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
-    keeper = names.members.by_id(record.keeper)
-    keeper_label = html.escape(keeper.name) if keeper is not None else "the record keeper"
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
@@ -308,8 +304,8 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}", keeper_label)))
+            rows.append((change.time, log_entry_html(record, change, index, today, names, fields,
+                                                    f"list-evidence-{row_id}-{index}")))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
@@ -530,9 +526,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
                              ("next_step", item.next_step), ("done_when", item.done_when)))
     return ('<div class="list-panel"><div>' + asks + '<div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
-            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
-            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
-            + '<ol class="list-log">' + log + '</ol></div></section></div>')
+            + '</div>' + record_table.log_panel(log_id, log) + '</div>')
 
 
 class LinkedReviewRead(StrEnum):
@@ -685,11 +679,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
-    sent = the_list.sent_to_morty(item)
+    sent = the_list.sent_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        keeper = names.members.by_id(entry.keeper)
-        notice = "sent to " + (names.html(keeper.id, keeper.name) if keeper is not None else "the record keeper")
+        recipient = the_list.notice_recipient(entry.keeper, feedback)
+        notice = "sent to " + names.html(recipient, owner_name(names.members, recipient))
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
@@ -800,7 +794,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     unread = item.unread_since
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
-    open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
+    open_question = item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
     open_ask = bool(shown_asks(item, staff.snapshot()))
@@ -878,7 +872,7 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
-        delivery = change_page.NoMessageDelivery()
+        delivery = _notice_delivery(keeper, read_edit.item, request)
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status)
     if not include_detail:
@@ -924,14 +918,20 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         return ListFeedbackDelivery(keeper, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
         raise question_record.AnswerRefused("enter words for the record keeper")
-    saved_notice = the_list.feedback_requests(changed).get(request)
-    delivery = (ListFeedbackDelivery(keeper, identity, request)
-                if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
+    delivery = _notice_delivery(keeper, changed, request)
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
-                   if saved_notice is None else UnparkOutcome.CLEARED)
+                   if request not in the_list.feedback_requests(changed) else UnparkOutcome.CLEARED)
         return ListUnparkSubmission(outcome, delivery)
     return delivery
+
+
+def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
+                     request: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+    """Send the notice that an item action saved, if it is still pending."""
+    notice = the_list.feedback_requests(item).get(request)
+    return (ListFeedbackDelivery(keeper, item.id, request)
+            if notice is not None and notice.state == "pending" else change_page.NoMessageDelivery())
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -954,11 +954,12 @@ def deliver(submission: ListActionSubmission) -> None:
                    if feedback.action == "tell" else feedback.words)
         source = the_list.folder(delivery.keeper) / f"{item.id}.md"
         key = change_page.review_delivery_key(source, item.id, feedback.request)
-        failures = change_page.send_with_retries(change_page.SENDER, (delivery.keeper,), message,
+        recipient = the_list.notice_recipient(delivery.keeper, feedback)
+        failures = change_page.send_with_retries(change_page.SENDER, (recipient,), message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key)
         if not failures:
             return replace(feedback, state="sent")
-        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != delivery.keeper)
+        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != recipient)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
@@ -1197,7 +1198,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     for index, (entry, parked) in enumerate(ordered_items):
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
-        open_question = has_open_question(entry.item)
+        open_question = the_list.has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         unread_answers = the_list.unread_answer_ids(entry.item)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
@@ -1230,7 +1231,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
-    log_max_height = settings.whole("list_log_max_height_rem")
+    log_max_height = record_table.log_max_height_rem(settings)
     counts = ''
     if include_counts:
         if defer_counts:
@@ -1360,10 +1361,6 @@ font-weight:600;cursor:pointer}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
 .list-panel [data-waiting-note]{margin-top:16px}
-[data-record-inline-view] .record-dialog-status{border-inline-start:3px solid var(--accent);text-align:left}
-[data-record-inline-view] .record-dialog-status:not(:has(> :not([hidden]))){display:none}
-[data-record-inline-view] [data-record-error]{padding-inline:24px;text-align:left}
-[data-record-inline-view] [data-record-link-notice]{padding:0;border:0}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 .list-eta{display:block;position:relative;min-width:0}
@@ -1427,26 +1424,6 @@ const unparkMessages={
  expired:'Parking time already expired',
  no_active_parking:'No active parking time to clear',
 };
-/** @typedef {{key: string, index: string, offset: number}} LogPosition */
-const openLog=()=>recordDetails(tableView.openItem)?.querySelector('.list-log-scroll');
-/** @type {LogPosition | null} */
-let heldLog=null;
-// Moving or replacing the open row resets its log scroll, so hold the first visible entry for this task.
-function holdLog(){
- const log=openLog();
- if(heldLog || !log?.clientHeight || !log.scrollTop) return;
- const top=log.getBoundingClientRect().top;
- const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
- if(!entry) return;
- heldLog={key:tableView.openItem.dataset.key,index:entry.dataset.logIndex,offset:entry.getBoundingClientRect().top-top};
- queueMicrotask(()=>{heldLog=null;});
-}
-function restoreLog(){
- const log=openLog();
- if(!heldLog || tableView.openItem?.dataset.key!==heldLog.key) return;
- const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
- if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
-}
 function restoreEvidenceDetails(fresh){
  const opened=new Map();
  for(const details of content.querySelectorAll('.log-evidence[open]')){
@@ -1504,12 +1481,10 @@ function installListDetail(item){
 function renderListDetail(revision,text,{retainLinks=false}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
-  if(row===tableView.openItem) holdLog();
   row.dataset.detailRevision=revision;
   detail.innerHTML=text;
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
   installListDetail(row);
-  restoreLog();
  };
 }
 function installSavedListDetail(request,revision,text,options){
@@ -1547,8 +1522,6 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- beforeApply:holdLog,
- applied:restoreLog,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -2113,7 +2086,7 @@ function applyListSnapshot(fresh){
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
- holdLog();
+ tableView.holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter && !nextFooter.childNodes.length)
   nextFooter.replaceChildren(...footer.childNodes);
@@ -2128,7 +2101,7 @@ function applyListSnapshot(fresh){
  bindListControls();tableView.replace();
  const openItem=tableView.openItem;
  if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
- restoreLog();
+ tableView.restoreLog();
  if(field?.isConnected) field.focus({preventScroll:true});
  else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
