@@ -1711,6 +1711,8 @@ class AdmissionServer:
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
+        # The build space hold of the last pass; None until the first natedev reading.
+        self.build_space_held: bool | None = None
         self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
         try:
             self.boot_id: str = boot_identity(proc.path)
@@ -2803,6 +2805,7 @@ class AdmissionServer:
         inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
+            self._record_build_space(inputs.build_space)
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:
@@ -4706,6 +4709,16 @@ done
         state_reason = "cancelled" if isinstance(report.outcome, placement.AttemptCancelled) else reason
         self._close_placement(replace(saved, terminal_report=settled), state_reason, placement.DoNotRetry(reason))
         return True
+
+    def _record_build_space(self, hold: records.BuildSpaceHold | records.NoBuildSpaceHold) -> None:
+        """Write a queue_times.jsonl event, with its time, when a build space hold starts or ends."""
+        held = not isinstance(hold, records.NoBuildSpaceHold)
+        if held == self.build_space_held:
+            return
+        self.build_space_held = held
+        event: dict[str, object] = (
+            {"kind": "build_space_hold", "hold": codec.snapshot_value(hold)} if held else {"kind": "build_space_clear"})
+        gate.append_queue_time(self.state_dir, event, self.clock.now())
 
     def _settle_attempt_reports(self, keys: PlacementEvidenceKeys) -> None:
         for key, saved in tuple(self.assignments.items()):

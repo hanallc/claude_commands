@@ -77,6 +77,38 @@ class BuildSpaceTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIn(head.episode, fixture.server.reservations)
 
+    def test_a_build_space_hold_records_one_timed_event_when_it_starts_and_one_when_it_ends(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            output = self.configure_floor(fixture)
+            free = 125 * GIB
+
+            def read_build_space(path: Path) -> os.statvfs_result:
+                self.assertEqual(path, output)
+                return os.statvfs_result((4096, 4096, 100000000, 90000000, free // 4096, 0, 0, 0, 0, 255))
+
+            def events() -> list[dict[str, object]]:
+                with (fixture.state_dir / "queue_times.jsonl").open("rb") as handle:
+                    return [row for row in store.whole_rows(handle, 0) if row.get("kind") in gate.BUILD_SPACE_EVENTS]
+
+            with mock.patch.object(os, "statvfs", side_effect=read_build_space):
+                started = fixture.clock.now()
+                _ = fixture.run_pass()
+                fixture.clock.advance(60)
+                _ = fixture.run_pass()
+                # A restarted service knows no earlier pass; the log already has the start.
+                fixture.server.build_space_held = None
+                _ = fixture.run_pass()
+                free = 151 * GIB
+                fixture.clock.advance(60)
+                ended = fixture.clock.now()
+                _ = fixture.run_pass()
+                _ = fixture.run_pass()
+            self.assertEqual(events(), [
+                {"kind": "build_space_hold", "hold": {"kind": "BuildSpaceLow", "free_gib": 125, "floor_gib": 150},
+                 "at": started},
+                {"kind": "build_space_clear", "at": ended},
+            ])
+
     def test_failed_space_read_holds_new_steps_and_keeps_running_work(self) -> None:
         with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
             write_memory_config(fixture.root / "build_admission.conf", free_floor_gib=None)
