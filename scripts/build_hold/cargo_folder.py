@@ -226,13 +226,13 @@ STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused)
 
 
 def checked_step(argv: list[str], cwd: Path, locks: ExitStack,
-                 environment: Mapping[str, str]) -> CheckedOutputLock | NoOutputLock:
+                 environment: Mapping[str, str], *, note_outside: bool) -> CheckedOutputLock | NoOutputLock:
     """The folder steps of the build-hold cargo wrapper before Cargo starts with the environment: make or check
     the checkout target link to the assigned build folder, hold the build folder lock in locks, and write the use
     stamp.
 
-    A path outside the build folders is a note when the build folder model only reports; each other error in
-    STEP_ERRORS ends the step.
+    A path outside the build folders is a note when the build folder model only reports; with note_outside
+    False, a later step gives that note. Each other error in STEP_ERRORS ends the step.
     """
     enforce = worktrees.enforce_build_folders()
     try:
@@ -240,7 +240,8 @@ def checked_step(argv: list[str], cwd: Path, locks: ExitStack,
     except OutsideBuildFolders as error:
         if enforce:
             raise
-        print(f"cargo: {error}", file=sys.stderr)
+        if note_outside:
+            print(f"cargo: {error}", file=sys.stderr)
         return NoOutputLock()
 
 
@@ -277,7 +278,7 @@ def main(argv: list[str]) -> int:
         route, executable = "", ""
     with ExitStack() as locks:
         try:
-            output = checked_step(argv, Path.cwd(), locks, os.environ)
+            output = checked_step(argv, Path.cwd(), locks, os.environ, note_outside=True)
         except STEP_ERRORS as error:
             print(f"cargo: {error}", file=sys.stderr)
             return 1

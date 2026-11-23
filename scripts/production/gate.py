@@ -1192,6 +1192,9 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     return job
 
 
+GATE_MODULE_OWNER = "gate module"
+
+
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
     """Give a module a private build log and tripwires for tools and live memory."""
     root = root.absolute()
@@ -1212,7 +1215,9 @@ raise SystemExit(99)
         _ = executable.write_text(script)
         executable.chmod(0o755)
     cargo = str(root / "target")
-    return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+    # A module that a gate box or a timer runs inherits no owner; its queue requests still name one.
+    owner = admission_records.named_owner(environment, GATE_MODULE_OWNER)
+    return {**environment, **owner, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
             "MERGE_GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": MISSING_HERDR_BIN,
@@ -2419,8 +2424,9 @@ def merge_checkpoint(args: GateArguments, target: str | NoGateAssignment) -> int
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_gate_suites(repo, module_time_limit_s=float(args.module_time_limit_s),
-                                     source="checkpoint", full=args.full, gate_job=args.gate_job, target=target)
+            with admission_records.default_owner(args.unit):
+                suites = run_gate_suites(repo, module_time_limit_s=float(args.module_time_limit_s),
+                                         source="checkpoint", full=args.full, gate_job=args.gate_job, target=target)
         finally:
             if previous_unit is None:
                 _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
@@ -3487,7 +3493,11 @@ def run_tests_only(args: GateArguments, mode: SuiteMode, target: str | NoGateAss
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
-            with gate_recovery(repo):
+            # The copy record names the owner only when the caller and its process family name none,
+            # so a bad copy record never refuses a run whose caller gave an owner.
+            unowned = isinstance(admission_records.request_owner(""), admission_records.OwnerNotGiven)
+            owner = copies.source_owner(repo) if unowned else ""
+            with gate_recovery(repo), admission_records.default_owner(owner):
                 run = (run_named_modules(repo, args.modules, mode) if args.modules else
                        run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
                                        mode=mode, gate_job=args.gate_job, target=target))
@@ -3605,10 +3615,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
-                try:
-                    return nightly(args)
-                finally:
-                    _sweep_nightly_build_folders()
+                with admission_records.default_owner(args.unit):
+                    try:
+                        return nightly(args)
+                    finally:
+                        _sweep_nightly_build_folders()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)

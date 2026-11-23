@@ -26,7 +26,7 @@ from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
+from scripts.lib.build_steps import StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
@@ -69,9 +69,6 @@ class MacBuildOrigin(Enum):
     CI = "ci"
     NON_CI = "non-ci"
     UNKNOWN = "unknown"
-
-
-UNRECORDED_OWNER = UnitLabels("")
 
 
 class MacGateLabel(Enum):
@@ -179,15 +176,6 @@ def mac_command_step(build: MacBuild) -> tuple[str, str]:
             package = word[2:]
             break
     return step, package
-
-
-def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
-                  identity: UnitLabels = UNRECORDED_OWNER) -> str:
-    step, package = mac_command_step(build)
-    step = step or "cargo"
-    current_name = " ".join(part for part in (package or build.repository, step) if part)
-    return names.for_owner(step, identity.unit if identity.unit != "—" else "", identity.role,
-                           ci=build.origin is MacBuildOrigin.CI, current_name=current_name)
 
 
 def gate_label_text(build: MacBuild) -> str:
