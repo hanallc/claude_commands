@@ -971,8 +971,9 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                             "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture", "--no-gpg-sign", "--allow-empty"],
                            check=True)
         _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", origin], check=True)
-        for step, folder in (("prepared", "copies-source/source"), ("merged", "copies-merge/merged")):
-            copy = self.root / "tmp" / folder
+        # copies.requested_source puts both kinds at <tool folder>/copies-source/source.
+        for step in ("prepared", "merged"):
+            copy = self.root / f"{step}-tool" / "copies-source" / "source"
             _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(copy)], check=True)
             _ = subprocess.run(["git", "-C", str(copy), "remote", "set-url", "origin", origin], check=True)
             for package, expected in (("portable", placement.AllowedHost()),

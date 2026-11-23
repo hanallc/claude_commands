@@ -971,11 +971,18 @@ def _mac_mirror_name(source: "MacSourceRepository") -> str:
             lent = repository.mac_source_repository(str(Path(lender).parent), lender)
         except (OSError, SubprocessError, ValueError):
             break
-        if not isinstance(lent, repository.MacSourceRepository) or lent.key != source.key:
+        if not isinstance(lent, repository.MacSourceRepository) or not _same_repository(lent.key, source.key):
             break
         named = lent.git_dir
         lender = _lending_git_dir(lender)
     return Path(named).parent.name
+
+
+def _same_repository(lender_key: str, key: str) -> bool:
+    """A lender is the same repository when it has the same origin, or when neither has an origin."""
+    from scripts.buildlog.repository import NO_ORIGIN_KEY_PREFIX
+
+    return lender_key == key or (lender_key.startswith(NO_ORIGIN_KEY_PREFIX) and key.startswith(NO_ORIGIN_KEY_PREFIX))
 
 
 def _lending_git_dir(git_dir: str) -> str | None:

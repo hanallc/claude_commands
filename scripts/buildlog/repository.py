@@ -114,6 +114,10 @@ class UnrecordedSourceCheckout:
     """Git gives the shared metadata path without the main checkout path."""
 
 
+# A source repository with no origin is keyed by its Git folder.
+NO_ORIGIN_KEY_PREFIX = "git-dir:"
+
+
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | UnrecordedSourceCheckout:
     """Follow local clone origins from the checkout to the source repository."""
     origin = _mac_origin(Path(common))
@@ -132,7 +136,7 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | U
         seen.add(common)
         directory = str(source.toplevel)
         origin = _mac_origin(source.common_dir)
-    return MacSourceRepository(common, "git-dir:" + common)
+    return MacSourceRepository(common, NO_ORIGIN_KEY_PREFIX + common)
 
 
 def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:

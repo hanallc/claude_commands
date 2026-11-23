@@ -773,6 +773,15 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                            env=self.environment, check=True)
         expected = claim_state.mac_repository_identity(str(source))
         assert isinstance(expected, claim_state.MacMirrorIdentity)
+        # A source repository with no origin: the copy's origin is removed, so neither has one.
+        plain = self.repository("plain")
+        plain_copy = self.root / "plain-tmp" / "copies-source" / "source"
+        _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(plain), str(plain_copy)],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(plain_copy), "remote", "remove", "origin"], env=self.environment, check=True)
+        plain_mirror = claim_state.mac_repository_identity(str(plain_copy))
+        assert isinstance(plain_mirror, claim_state.MacMirrorIdentity)
+        self.assertEqual(plain_mirror.mirror_name, "plain")
         for checkout in (copy, task, task_copy, unshared, worktree):
             with self.subTest(checkout=checkout.relative_to(self.root)):
                 mirror = claim_state.mac_repository_identity(str(checkout))

@@ -161,7 +161,8 @@ class SlotOrderTests(unittest.TestCase):
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
                 # Wake a file waiter that also ends when its process exits.
-                (self.root / "queue-wait").touch()
+                # A write, not touch: touch on an existing file changes only its times, which wakes no waiter.
+                _ = (self.root / "queue-wait").write_bytes(b"")
             return reply
 
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
