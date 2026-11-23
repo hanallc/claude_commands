@@ -97,9 +97,10 @@ A replacement for a failed pass starts after the hook delivers the pending notic
 The recorder gives the replacement a new pass id even when the assignment inputs match.
 
 A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
-`assign.sh` prepares a separate prompt path for each call and removes it if no pass uses it.
-The worker publishes the paths manifest for the admitted pass before it submits the prompt.
-A matching retry checks the receipt and restores a missing or changed prompt at the recorded path.
+`assign.sh` prepares a separate prompt for each call.
+It removes the prompt when the recorder confirms that no pass uses it.
+The worker writes the numbered paths manifest at admission before it submits the prompt.
+A matching retry checks the receipt before it validates and restores the recorded prompt under the recorder lock.
 The pass records the digest before submission.
 Changed content at the same prompt path starts a new pass after completion.
 With an active pass, changed content returns busy and names that pass without printing `submitted`.

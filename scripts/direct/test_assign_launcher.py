@@ -1,13 +1,15 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+import argparse
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -18,12 +20,12 @@ from uuid import UUID
 
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, progress_history, recorder_state
+from scripts.direct import assign, pass_record, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr, turn_end, worker_panes
-from scripts.lib import unit_runs
+from scripts.lib import atomic_file, unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
@@ -707,6 +709,15 @@ class AssignLauncherTests(HookAssignmentFixture):
         phase = prompt.parent
         manifests = {path: path.read_bytes() for path in phase.glob("dispatch_*_paths.json")}
         prompts = set(phase.glob("*_prompt.*.txt"))
+        write_bytes = atomic_file.write_bytes_atomic
+
+        def restore_under_lock(path: Path, data: bytes, *, mode: int | None = None) -> None:
+            if path == prompt:
+                with pass_record.recorder_lock_path(self.session_dir).open() as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            write_bytes(path, data, mode=mode)
+
         for pass_status in ("active", "completed"):
             if pass_status == "completed":
                 self.native.agent.complete(pane)
@@ -717,7 +728,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                         prompt.unlink()
                     elif damage == "changed":
                         write_text_atomic(prompt, "Changed prompt bytes.\n")
-                    _ = self.successful()
+                    with patch.object(atomic_file, "write_bytes_atomic", side_effect=restore_under_lock):
+                        _ = self.successful()
                     state = read_object(self.session_dir / "progress_history_state.json")
                     saved = assign.object_map(assign.object_map(state["pass"])["impl"])
                     self.assertEqual((saved["instance_id"], saved["status"]), (identity, pass_status))
@@ -727,6 +739,49 @@ class AssignLauncherTests(HookAssignmentFixture):
                     self.assertEqual(sum(event.get("event_type") == "pass_started" for event in self.events()), 1)
                     self.assertEqual(set(phase.glob("*_prompt.*.txt")), prompts)
                     self.assertEqual({path: path.read_bytes() for path in phase.glob("dispatch_*_paths.json")}, manifests)
+
+        with self.subTest(retry="history is unavailable during cleanup"):
+            history = Path(str(state["history_file"]))
+            unavailable = history.with_suffix(".unavailable")
+            record_launch = assign.record_worker_launch_exit
+
+            def remove_history(run: Path, instance: UUID, outcome: progress_history.AssignmentLaunchExit
+                               ) -> progress_history.RecordedAssignmentLaunch | progress_history.AssignmentLaunchNotRecorded:
+                result = record_launch(run, instance, outcome)
+                _ = history.replace(unavailable)
+                return result
+
+            try:
+                with patch.object(assign, "record_worker_launch_exit", side_effect=remove_history):
+                    result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            finally:
+                if unavailable.is_file():
+                    _ = unavailable.replace(history)
+            retained, = set(phase.glob("*_prompt.*.txt")) - prompts
+            self.assertEqual(retained.read_bytes(), content)
+            self.assertEqual(self.native.agent.submitted, submitted)
+
+        with self.subTest(retry="phase closes during the receipt check"):
+            receipt = worker.dispatch_receipt
+            write_text_atomic(prompt, "Changed prompt bytes.\n")
+            changed = prompt.read_bytes()
+
+            def close_phase(row: staff.StaffRow, line: str, dispatch_id: str, *,
+                            run: Path) -> worker.DispatchReceipt:
+                result = receipt(row, line, dispatch_id, run=run)
+                with pass_record.recorder_lock_path(run).open("a") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    closed = pass_record.read_state(run, resolve_staff=False)
+                    closed[recorder_state.OPEN_PHASES_KEY] = []
+                    pass_record.write_state(run, closed)
+                return result
+
+            with patch.object(worker, "dispatch_receipt", side_effect=close_phase):
+                refused = self.launch()
+            self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+            self.assertEqual(prompt.read_bytes(), changed)
+            self.assertEqual(self.native.agent.submitted, submitted)
 
     def test_unnamed_assignment_finishes_the_selected_workers_pass_and_artifacts(self) -> None:
         opened = self.native.opened("impl2")
@@ -1146,6 +1201,51 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(len(finished), 1, self.events())
         started = next(event for event in self.events() if event.get("event_type") == "pass_started")
         self.assertEqual(started["worker_id"], record["staff_id"])
+
+        run_command = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        start_pass = pass_record.start_pass
+        write_manifest = atomic_file.write_text_atomic
+        ticket = "style-ticket-fixture"
+
+        def check_worker_arguments(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 2 and Path(command[1]).name == "worker.py" and command[2] == "assign":
+                _ = run_command([sys.executable, "-c", "pass", *command[2:]], check=True)
+            return run_command(command, **options)
+
+        def check_ticket_lock() -> None:
+            with (manifest.parent / "ticket-paths.lock").open("a") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def start_with_ticket_lock(args: argparse.Namespace,
+                              selection: pass_record.DispatchSelection | pass_record.SelectDispatchAtRecorder
+                              ) -> str:
+            instance = start_pass(args, selection)
+            if pass_record.optional_arg(args, "team_slot") == ticket:
+                check_ticket_lock()
+            return instance
+
+        def write_with_ticket_lock(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path == manifest and assign.object_map(cast(object, json.loads(text))).get("worker") == ticket:
+                check_ticket_lock()
+            write_manifest(path, text, new_file_mode=new_file_mode)
+
+        self.native.agent.during_prompt = lambda: None
+        for round_number, case in enumerate(("stale manifest", "large paths", ticket), start=2):
+            with self.subTest(admission=case):
+                paths = self.paths.read_text().splitlines()
+                manifest = manifest.parent / f"dispatch_{round_number}_paths.json"
+                if case == "stale manifest":
+                    write_text_atomic(manifest, json.dumps({"worker": "refused", "round": round_number, "paths": ["stale"]}))
+                elif case == "large paths":
+                    paths = [f"src/{index:04d}-{'x' * 48}.py" for index in range(3300)]
+                    write_text_atomic(self.paths, "\n".join(paths) + "\n")
+                worker_name = ticket if case == ticket else f"impl{round_number}"
+                with (patch.object(subprocess, "run", side_effect=check_worker_arguments),
+                      patch.object(pass_record, "start_pass", side_effect=start_with_ticket_lock),
+                      patch.object(atomic_file, "write_text_atomic", side_effect=write_with_ticket_lock)):
+                    _ = self.successful("implement", "--to", worker_name)
+                self.assertEqual(read_object(manifest), {"worker": worker_name, "round": round_number, "paths": paths})
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")

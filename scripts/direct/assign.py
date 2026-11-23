@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -509,15 +509,15 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     try:
         return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message)
     finally:
-        if message.is_file() and not _prompt_adopted(run, instance):
-            message.unlink(missing_ok=True)
+        with suppress(OSError, SystemExit, ValueError, recorder_state.OldRecorderState):
+            if message.is_file() and not _prompt_adopted(run, instance):
+                message.unlink(missing_ok=True)
 
 
 def _prompt_adopted(run: Path, instance: uuid.UUID) -> bool:
-    if not pass_recorder.state_path(run).is_file():
-        return False
     state = pass_recorder.read_state(run, resolve_staff=False)
-    return (any(passed.get("instance_id") == str(instance) for passed in pass_recorder.pass_slots(state).values())
+    return (not pass_recorder.string(state.get("history_file"))
+            or any(passed.get("instance_id") == str(instance) for passed in pass_recorder.pass_slots(state).values())
             or isinstance(staff_worker.admitted_pass_number(state, str(instance)), int))
 
 
@@ -533,7 +533,8 @@ def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: li
     style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
     if args.style_since:
         style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
-        message.unlink()
+        with suppress(OSError):
+            message.unlink(missing_ok=True)
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
@@ -554,12 +555,18 @@ def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: li
     actions = pass_recorder.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
         style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
+    path_file = directory / f".assignment-paths.{instance}.json"
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
-                "--new-pass-instance-id", str(instance), "--assignment-paths", json.dumps(paths)]
+                "--new-pass-instance-id", str(instance), "--assignment-paths-file", str(path_file)]
     worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
     with log.open("a") as output:
         offset = output.tell()
-        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
+        try:
+            write_text_atomic(path_file, json.dumps(paths))
+            result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
+        finally:
+            with suppress(OSError):
+                path_file.unlink(missing_ok=True)
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
