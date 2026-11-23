@@ -13,8 +13,6 @@ from uuid import uuid4
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import queue_place
-from scripts.buildlog import store
-from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
@@ -99,42 +97,19 @@ def _verify_request(command: VerifyCommand, source: Path, folder: Path, owner: w
 
 
 def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted | wire.Assignment:
-    output = client.WaitOutput()
-    directory = store.root() / 'admission'
-    try:
-        with client.placement_acquisition(), local_release_waiter(directory, directory,
-                wake_files=(directory / 'state.json', directory / 'queue.json')) as events:
-            while True:
-                events.arm()
-                answer = client.acquire_placement(request)
-                if isinstance(answer, client.LeftQueue):
-                    raise FirstStepRefused('the caller left before first-step admission', 75)
-                output.placement_notices(answer, placement_events=False)
-                if isinstance(answer, (wire.Assignment, wire.LocalPlacementGranted)):
-                    output.finished(left=isinstance(answer, wire.Assignment))
-                    return answer
-                if isinstance(answer, wire.DispatchStatus):
-                    raise FirstStepRefused(answer.reason or 'the first placement ended before admission')
-                if isinstance(answer.wait, wire.Wait):
-                    output(answer.wait)
-                    local = request.local
-                    cause = answer.wait.reason
-                    if isinstance(cause, records.HeadAdmissionStatus):
-                        cause = cause.cause
-                    if isinstance(local, wire.LocalAdmissionContext) and isinstance(cause, records.EstimateExpired):
-                        refreshed = client.step_request(list(local.argv), local.cwd,
-                            wire.Owner(request.owner.pid, request.owner.start_time), request.since,
-                            local.sidecar, request.episode, run=request.run)
-                        request = replace(request, profile=refreshed.profile,
-                            local=wire.LocalAdmissionContext(refreshed.argv, refreshed.cwd, refreshed.sidecar,
-                                refreshed.call, refreshed.test_width, refreshed.fresh_test, refreshed.token_back_at))
-                elif isinstance(answer.wait, wire.PlacementResourceWait):
-                    output.resource_wait(answer.wait)
-                events.wait(records.read_memory_config().waiting_pass_seconds)
-    except BaseException:
-        _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, request.episode, request.owner,
-            'the caller left before first-step admission'))
-        raise
+    local = request.local
+
+    def refresh() -> wire.AdmitRequest:
+        assert isinstance(local, wire.LocalAdmissionContext)
+        return client.step_request(list(local.argv), local.cwd, wire.Owner(request.owner.pid, request.owner.start_time),
+                                   request.since, local.sidecar, request.episode, run=request.run)
+
+    answer = queue_place.wait_for_placement(request, refresh, 'the caller left before first-step admission')
+    if isinstance(answer, client.LeftQueue):
+        raise FirstStepRefused('the caller left before first-step admission', 75)
+    if isinstance(answer, wire.DispatchStatus):
+        raise FirstStepRefused(answer.reason or 'the first placement ended before admission')
+    return answer
 
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
