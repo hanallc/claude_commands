@@ -1790,7 +1790,11 @@ def role_account(role: str) -> AccountSelection:
         home = _workers_home()
         label = agent_accounts.codex_home_role_label(home)
         return CodexWorkersAccount(label, home)
-    group: ClaudeGroup = "units" if role == "unit" else "producers" if role == "producer" else "showrunners"
+    return group_account("units" if role == "unit" else "producers" if role == "producer" else "showrunners")
+
+
+def group_account(group: ClaudeGroup) -> ClaudeLaunchAccount:
+    """Resolve a Claude group to the numbered account selected for it."""
     selected = group_label(group_accounts(), group)
     if isinstance(selected, GroupNotConfigured):
         raise AccountsError("accounts: " + group_configuration_line(group))

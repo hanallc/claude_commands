@@ -17,7 +17,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import mac_test, claim_state
 
 from scripts.lib import process_start as process_identity
@@ -247,7 +247,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
 ''')
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-                              + "kind.natedev=local\nplatform.natedev=linux\n")
+                              + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")

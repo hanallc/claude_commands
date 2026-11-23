@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
 
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -22,6 +22,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -772,9 +773,9 @@ class FixtureCPU(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
-            env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
-                   "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            env["PYTHONPATH"] = str(root)
+            env = direct_test_fixture_environment(root)
+            env.update(TEST_TIMES_OUT=str(output), HOME=str(root / "home"),
+                       BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
             result = subprocess.run(
                 [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -784,6 +785,36 @@ class FixtureCPU(unittest.TestCase):
             self.assertEqual(len(warnings), 1, result.stderr)
             self.assertTrue(output.is_dir())
             self.assertEqual(list(root.glob(".output.*")), [])
+
+
+class MacGateModuleTests(unittest.TestCase):
+    def test_macos_gate_keeps_the_module_temporary_folder(self) -> None:
+        from scripts.lib import build_folders
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        module = self.enterContext(build_folders.tool_folder("test-module", root))
+        case = root / "test_gate_parent.py"
+        _ = case.write_text(f"""import os
+from pathlib import Path
+import unittest
+
+class GateParent(unittest.TestCase):
+    def test_module_folder(self):
+        module = Path({str(module)!r})
+        self.assertEqual(Path(os.environ['TMPDIR']), module)
+        self.assertEqual(Path(os.environ['SCRATCH_ROOT']), module / 'test-run-roots' / 'scratch')
+        self.assertEqual(Path(os.environ['ASTRA_REVIEW_DIR']), module / 'test-run-roots' / 'astra')
+        self.assertEqual(Path(os.environ['CONF_READ_LOG']), module / 'config-reads' / 'reads')
+""", encoding="utf-8")
+        environment = direct_test_fixture_environment(root)
+        environment.update(GATE_PARENT_PID=str(os.getpid()), HOME=str(root / "home"), PYTHONPATH=str(root))
+        entry = "import runpy, sys; sys.platform = 'darwin'; runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        result = subprocess.run(
+            [str(gate.python_shim(RUNNER.parents[2])), "-c", entry, str(RUNNER), str(root), case.name],
+            cwd=RUNNER.parents[2], env=gate.test_module_environment(module, environment),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
@@ -797,14 +828,23 @@ class ModuleProcessCleanupTests(unittest.TestCase):
             with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
                 root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
-                environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-                    "PYTHONPATH": str(root), "TMPDIR": str(root)})
-                _ = environment.pop("TEST_TIMES_OUT", None)
+                environment = processes.environment(direct_test_fixture_environment(root))
+                environment.update({**interpreter_cache_environment(root / "cache"),
+                                    "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+                                    "PYTHONPATH": str(root)})
                 _ = environment.pop("MERGE_GATE_MODULE_DIR", None)
-                _ = (root / "test_parent.py").write_text("""import os, signal, unittest
+                module = root / "module"
+                if runner_case == "gate":
+                    module = cleanup.enter_context(build_folders.tool_folder("module", root))
+                    environment = gate.test_module_environment(module, environment)
+                elif runner_case == "unleased TMPDIR":
+                    module.mkdir()
+                    environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
+                case = root / "test_parent.py"
+                _ = case.write_text("""import os, select, unittest
 from pathlib import Path
 from scripts.lib import conf_reads
+
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
         for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
@@ -813,42 +853,50 @@ class ParentDeath(unittest.TestCase):
             (folder / 'output').write_text(name)
         conf_reads.record('ready')
         print('ready', flush=True)
-        signal.pause()
+        select.select([], [], [])
 """, encoding="utf-8")
-                module = root / "module"
-                if runner_case == "gate":
-                    module = cleanup.enter_context(build_folders.tool_folder("module", root))
-                    environment = gate.test_module_environment(module, environment)
-                elif runner_case == "unleased TMPDIR":
-                    module.mkdir()
-                    environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
+                repository = RUNNER.parents[2]
+                log = root / "runner.log"
+                shim = repository / "scripts/lib/py"
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
+                source = f"""import os, sys
+from pathlib import Path
+from scripts.production import gate
+job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
+                         Path({str(repository)!r}), dict(os.environ), Path({str(log)!r}))
+print(job.process.pid, flush=True)
+sys.exit(job.process.wait())
+"""
                 _ = cleanup.callback(processes.finish)
-                parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
                 processes.track(parent)
-                for name in parent_names:
-                    _ = environment.pop(name, None)
-                environment[parent_name] = str(parent.pid)
-                runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
-                    env=environment, cwd=root, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-                processes.track(runner)
-                output = runner.stdout
+                output = parent.stdout
                 assert output is not None
                 self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-                self.assertEqual(cast(str, output.readline()), "ready\n")
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                _ = cleanup.callback(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
                 if runner_case == "gate":
                     for folder, name in (("scratch", "SCRATCH_ROOT"), ("astra", "ASTRA_REVIEW_DIR")):
                         self.assertEqual((module / "test-run-roots" / folder / "output").read_text(), name)
                     self.assertEqual((module / "config-reads" / "reads").read_text(), "ready\n")
                 elif runner_case == "unleased TMPDIR":
                     lease = cast(dict[str, object], json.loads((module / "test-run-roots.lease.json").read_text()))
-                    self.assertEqual(lease["pid"], runner.pid)
-                parent.send_signal(signal.SIGTERM)
+                    self.assertEqual(lease["pid"], runner_pid)
+                parent.terminate()
                 self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-                stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
-                self.assertNotIn("Traceback", stderr)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
                 if runner_case != "standalone":
                     self.assertEqual(list(module.glob("test-run-roots*")), [])
                 if runner_case == "gate":
@@ -919,12 +967,9 @@ class InheritedSignal(unittest.TestCase):
         source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
                   .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
         _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
-        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-            "PYTHONDONTWRITEBYTECODE": "1"})
-        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
-            _ = environment.pop(name, None)
-        environment["PYTHONPATH"] = str(root)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(root))
         process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)
