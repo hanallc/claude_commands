@@ -394,9 +394,6 @@ names.test-all=test all
 names.test-modules=test named
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 """,
     "showrunners": """\
 # range: 0..100

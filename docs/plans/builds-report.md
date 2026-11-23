@@ -1361,7 +1361,7 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 
 #### As-built
 
-- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name. Later removed: ownersay dropped the template reader, and ownedkeys deleted the `[owned]` keys.
 - Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
 - A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
 - Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.

@@ -34,11 +34,7 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.test-affected=test affected\n"
         + "names.gate=merge gate\n"
-        + "prose.gate=merge gate\n"
-        + "owned.test-affected={unit} targeted\n"
-        + "owned.gate={unit} merge\n"
-        + "owned.showrunner-gate=showrunner merge\n"
-        + "owned.default={unit} {step}\n",
+        + "prose.gate=merge gate\n",
         encoding="utf-8",
     )
     with mock.patch.dict(os.environ, {"CONF_DIR": str(fixture.root)}):
@@ -557,14 +553,6 @@ class CloudQueueViewTests(unittest.TestCase):
                     place=wire.CloudPlace("aws", CloudGroup("older", 2, trial_started, wire.Owner(700004, "400"))))
                 waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
                 self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
-
-    def test_owner_templates_keep_the_step_name_and_prose(self) -> None:
-        model = self.cloud_model()[0]
-        settings = dict(model.names.settings)
-        settings["owned.test-affected"] = "targeted for {unit}"
-        configured = replace(model, names=type(model.names)(settings))
-        self.assertEqual(configured.names.shown("test-affected"), "test affected")
-        self.assertEqual(configured.names.prose("gate"), "merge gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
