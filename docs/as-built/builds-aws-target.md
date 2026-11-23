@@ -980,8 +980,13 @@ An expired permit or reservation still counts until the ledger confirms closure.
 The page, spending guard, and admission use the usual prices and bill carry on run days.
 After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
 It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The bill row for Cost Explorer requests is `USE1-APIRequest`; the scheduled read interval counts these fees once.
+After the builder removal, the idle day also skips every `EBS:Volume` row.
+The ledger prices the Hana disk from its `hana_storage` rate for the whole day instead.
+Before the builder removal, the idle day keeps the volume rows, because the builder disk stays with no run.
 The page, spending guard, and admission use the same idle-day rule.
 The guard keeps any higher established charges.
+On an idle today, the guard cost holds the Hana disk until now, and the Hana reserve adds the rest of the day one time.
 The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
 A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
 Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.

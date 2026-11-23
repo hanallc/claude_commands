@@ -1545,18 +1545,29 @@ def spend_group(usage_type: str) -> str:
     return 'other'
 
 
-def _run_related_usage(usage_type: str) -> bool:
+# The bill groups by usage type only. Cost Explorer bills each request in us-east-1 with this usage type.
+COST_EXPLORER_USAGE = 'USE1-APIRequest'
+
+
+def _run_related_usage(usage_type: str, *, priced_volumes: bool) -> bool:
+    """Name the bill rows that a day with no run does not have."""
     usage = usage_type.lower()
-    return spend_group(usage_type) == 'data transfer' or any(marker in usage for marker in (
-        'spotusage:', 'boxusage:', 'publicipv4:inuseaddress', 'requests-tier', 'costexplorer-apirequest',
-    ))
+    return (spend_group(usage_type) == 'data transfer' or usage_type == COST_EXPLORER_USAGE
+            or (priced_volumes and 'ebs:volume' in usage) or any(marker in usage for marker in (
+                'spotusage:', 'boxusage:', 'publicipv4:inuseaddress', 'requests-tier')))
 
 
-def _carried_bill_groups(bill: ChargeRead, *, idle: bool) -> tuple[SpendGroupCost, ...]:
+def _priced_volumes(state: LedgerEvidence) -> bool:
+    """After builder removal, the ledger prices each volume that stays with no run: the Hana disk."""
+    return bool(state.inventories) and max(state.inventories, key=lambda row: row.at).builder_removed
+
+
+def _carried_bill_groups(bill: ChargeRead, *, idle: bool, priced_volumes: bool) -> tuple[SpendGroupCost, ...]:
     """Carry saved usage amounts and retain unknown usage."""
     groups: dict[str, Decimal] = dict.fromkeys(SPEND_GROUPS, Decimal(0))
     for row in bill.usage_types:
-        if 'SpotUsage:' not in row.usage_type and not (idle and _run_related_usage(row.usage_type)):
+        if 'SpotUsage:' not in row.usage_type and not (
+                idle and _run_related_usage(row.usage_type, priced_volumes=priced_volumes)):
             groups[spend_group(row.usage_type)] += row.usd
     groups['other'] += bill.actual_usd - sum((row.usd for row in bill.usage_types), Decimal(0))
     return tuple(SpendGroupCost(group, usd) for group, usd in groups.items())
@@ -1876,6 +1887,11 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     hana_storage = [r for r in state.hana_storage if latest is None or reserve or r.at >= latest.period_end]
     hana = hana_intervals(replace(state, hana_storage=hana_storage), now,
         settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
+    # An idle day drops the bill's volume rows, so the ledger prices the older Hana disk for the whole day.
+    priced_volumes = _priced_volumes(state)
+    billed_disk = hana_intervals(replace(state, hana_compute=[], hana_storage=[
+        r for r in state.hana_storage if latest is not None and not reserve and r.at < latest.period_end]),
+        now, settings.box_minimum_seconds, reserve=True)
     saved_days = {r.day for r in readings if r.account_bill and r.period_end <= now}
     exposures = tuple(state.run_exposures(settings.observation_max_age_seconds)) if latest is not None else ()
     hana_by_region = {(kind, region): hana_intervals(replace(state, hana_storage=[],
@@ -1926,9 +1942,12 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             source = 'estimated from the newest bill' if latest is not None else 'estimated from configured prices'
             if latest is not None:
                 idle = _uses_idle_bill_carry(key, start, end, latest, saved_days, exposures)
-                for group in _carried_bill_groups(latest, idle=idle):
+                for group in _carried_bill_groups(latest, idle=idle, priced_volumes=priced_volumes):
                     groups[group.group] += group.usd
                 include(ChargedInterval(start, end, sum(groups.values(), Decimal(0)), 'newest bill non-compute', 'fixed'))
+                for charge in billed_disk if idle and priced_volumes else ():
+                    groups['storage'] += _overlap(charge, start, end)
+                    include(charge)
             else:
                 groups['storage'] += period_cost(tuple(row for row in base.intervals if row.kind != 'explorer'
                                                        and row.kind != 'instance'), start, end)
@@ -1966,12 +1985,16 @@ def _add_idle_bill_carry(state: LedgerEvidence, costs: CostEstimate, settings: S
                          readings: Sequence[ChargeRead],
                          latest: ChargeRead) -> CostEstimate:
     """Use the idle day estimate and keep any higher established charges."""
-    carry = sum((row.usd for row in _carried_bill_groups(latest, idle=True)), Decimal(0))
+    priced_volumes = _priced_volumes(state)
+    carry = sum((row.usd for row in _carried_bill_groups(latest, idle=True, priced_volumes=priced_volumes)), Decimal(0))
     if carry <= 0:
         return costs
     saved_days = {row.day for row in readings if row.account_bill and row.period_end <= costs.at}
     exposures = tuple(state.run_exposures(settings.observation_max_age_seconds))
-    known_costs = tuple(row for row in costs.intervals if row.kind != 'explorer')
+    # The carry has no volume rows, so the comparison omits the Hana disk too.
+    # The guard's Hana reserve counts the rest of the day for the disk one time.
+    known_costs = tuple(row for row in costs.intervals if row.kind != 'explorer'
+                        and not (priced_volumes and row.source == 'Hana storage'))
     utc = ZoneInfo('UTC')
     zone = settings.accounting_zone
     month_start, _ = _month_bounds(datetime.fromtimestamp(costs.at, zone).date(), zone)

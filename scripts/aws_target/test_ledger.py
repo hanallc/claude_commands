@@ -56,12 +56,14 @@ class LedgerTests(CostFixture):
                 ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.20')),
                 ledger.UsageTypeCost('USE2-DataTransfer-Out-Bytes', Decimal('.07')),
                 ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal('.26')),
-                ledger.UsageTypeCost('CostExplorer-APIRequest', Decimal('.02')),
+                ledger.UsageTypeCost('USE1-APIRequest', Decimal('.02')),
             )))
         journal = self.state / 'hana' / 'provider'
         journal.mkdir(parents=True)
         starts: list[tuple[Path, dict[str, object]]] = []
         with self.book.transaction() as evidence:
+            # The Hana data disk is the USE2-EBS:VolumeUsage.gp3 row: 1.16 each day.
+            evidence.hana_storage.append(ledger.HanaStorageExposure(bill_start, Decimal('34.80')))
             for generation in range(1, 27):
                 at = today + 142 * generation
                 evidence.hana_compute.append(ledger.HanaComputeExposure(at, at + 600, generation,
@@ -87,7 +89,8 @@ class LedgerTests(CostFixture):
         # Base 740aae528 counts every dispatch without evidence of refusal.
         self.assertEqual(legacy.days[0].usd, Decimal('2.01288'))
         legacy_guard = self.book.accrued_cost(self.settings, now, window='day')
-        self.assertEqual(legacy_guard.cost, Decimal('.28288'))
+        disk_so_far = Decimal('34.80') * 7200 / (30 * 86400)
+        self.assertEqual(legacy_guard.cost, Decimal('.28288') + disk_so_far)
 
         for path, record in starts:
             _ = path.write_text(json.dumps({**record, 'start_refusal_code': 'Blocked'}))
@@ -98,10 +101,13 @@ class LedgerTests(CostFixture):
             ('2026-11-20', Decimal('1.18')), ('2026-11-19', Decimal('1.18')), ('2026-11-18', Decimal('7.73'))])
         self.assertEqual(published.days[0].runs, 0)
         accrued = self.book.accrued_cost(self.settings, now, window='day')
-        self.assertEqual((accrued.cost, accrued.limit_count), (Decimal('1.18'), Decimal('1.18')))
+        # The cost holds the disk so far. The guard reserve adds the rest of the day one time.
+        today_so_far = Decimal('.02') + disk_so_far
+        self.assertEqual((accrued.cost, accrued.limit_count), (today_so_far, Decimal('1.18')))
         costs = self.guard(now).evidence.costs
         assert isinstance(costs, ledger.CostEstimate)
-        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal('1.18'), Decimal('10.09')))
+        self.assertEqual((costs.daily.usd, costs.monthly.usd),
+                         (today_so_far, Decimal('7.73') + Decimal('1.18') + today_so_far))
         scope = run_cost.SpotHoursScope(('m7a.4xlarge',), {'us-east-2': ('m7a.4xlarge',)})
         hours = run_cost.day_hours_checks(self.book, datetime.fromtimestamp(today, UTC),
             datetime.fromtimestamp(today + 86400, UTC), 'us-east-2', 'm7a.8xlarge', scope, Decimal(1))
@@ -130,6 +136,41 @@ class LedgerTests(CostFixture):
         self.assertEqual(days['2026-01-16'].usd, Decimal(69))
         self.assertEqual(days['2026-01-17'].usd, Decimal(21))
         self.assertEqual(days['2026-01-18'].usd, Decimal(13))
+
+    def real_bill_days(self) -> dict[str, ledger.DailySpend]:
+        """Spend days after a bill with the row names of the 2026-11-18 bill, a run on day 2 and none on day 3."""
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        end = self.start + 86400
+        names = ('USE2-SpotUsage:c7a.8xlarge', 'EUS2-SpotUsage:c7a.4xlarge', 'USE2-EBS:VolumeUsage.gp3',
+                 'EUS2-EBS:VolumeUsage.gp3', 'EUN1-EBS:VolumeUsage.gp3', 'USW2-EBS:VolumeUsage.gp3',
+                 'EBS:VolumeUsage.gp3', 'USE2-TimedStorage-ByteHrs', 'USE2-EBS:SnapshotUsage', 'USE1-APIRequest',
+                 'EUS2-PublicIPv4:InUseAddress', 'EUS2-USE2-AWS-Out-Bytes', 'USE2-Requests-Tier1',
+                 'EUS2-DataTransfer-In-Bytes')
+        amounts = ('4', '3', '1', '.2', '.06', '.01', '.01', '.02', '.01', '.02', '.2', '.05', '.15', '0')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', end, self.start, end,
+            Decimal('8.73'), Decimal(0), Decimal(0),
+            tuple(ledger.UsageTypeCost(name, Decimal(usd)) for name, usd in zip(names, amounts, strict=True))))
+        with self.book.transaction() as evidence:
+            # The Hana data disk is in USE2-EBS:VolumeUsage.gp3: .90 each day.
+            evidence.hana_storage.append(ledger.HanaStorageExposure(self.start, Decimal(27)))
+            evidence.gate_reservations.append(ledger.GateReservation(
+                'completed', end, end + 3600, Decimal(2), Decimal(0),
+                state=ledger.GateTerminated(end + 3600, 'fixture'), instance_type='c7a.8xlarge', region='us-east-2'))
+        settings = config.read_settings(self.settings)
+        return {row.day: row for row in self.book.spend_days(settings, end + 2 * 86400 + 7200)}
+
+    def test_idle_day_prices_the_kept_disk_and_drops_run_volumes_and_cost_explorer_requests(self) -> None:
+        idle = self.real_bill_days()['2026-01-17']
+        # S3 .02, snapshots .01 and the Hana disk .90 stay. Run volumes, IPv4, transfer and requests go.
+        self.assertEqual({row.group: row.usd for row in idle.groups if row.usd}, {'storage': Decimal('.93')})
+        self.assertEqual(idle.usd, Decimal('.93'))
+        self.assertIn('Hana storage', {row.source for row in idle.intervals})
+
+    def test_run_day_carries_the_run_rows_of_the_bill(self) -> None:
+        run = {row.group: row.usd for row in self.real_bill_days()['2026-01-16'].groups}
+        self.assertEqual((run['storage'], run['public IPv4'], run['data transfer'], run['other']),
+                         (Decimal('1.31'), Decimal('.2'), Decimal('.05'), Decimal('.17')))
 
     def test_dispatch_and_observed_acceptance_keep_the_original_hana_hours(self) -> None:
         self.inventory(self.start)
