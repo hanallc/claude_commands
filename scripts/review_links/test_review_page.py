@@ -2729,7 +2729,12 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
   const failed=review();
   check(typeof frame.contentWindow.consoleNavigate==='undefined','The error page does not register navigation.');
   nav('list').click();
-  await until(()=>list()?.readyState==='interactive' && aliasLink('questions'),'the interactive List document');
+  // The console handles a link only after the List document is ready; readyState is interactive before that.
+  let listConnected=false;
+  document.querySelector('[data-console-page=list]').addEventListener('console-document-ready',
+   ()=>{listConnected=true;},{once:true});
+  await until(()=>listConnected && list()?.readyState==='interactive' && aliasLink('questions'),
+   'the interactive List document');
   aliasLink('questions').click();
   await until(()=>review()!==failed && review().querySelector('[data-review-loading]'),'the second Review request');
   check(review().readyState==='loading','The second Review document waits for the fixture.');
