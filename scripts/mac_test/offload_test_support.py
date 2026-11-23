@@ -25,7 +25,7 @@ from scripts.lib import process_start as process_identity
 from scripts.copies.copies_test_support import copies_environment
 
 
-from scripts.lint.memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture, config_environment
 
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.buildlog import treekey
@@ -53,7 +53,8 @@ def write_mac_target_registry(directory: Path, settings_name: str) -> None:
         "targets=mac\n"
         + "kind.mac=ssh\n"
         + "platform.mac=macos\n"
-        + f"settings.mac={settings_name}\n",
+        + f"settings.mac={settings_name}\n"
+        + UNREACHABLE_WAIT_FIXTURE,
         encoding="utf-8",
     )
 
@@ -606,8 +607,8 @@ def capture(self, arguments, *args, **kwargs):
         clock[0] = 102.0
     return answer
 
-def stream(self, arguments):
-    answer = real_stream(self, arguments)
+def stream(self, arguments, *args, **kwargs):
+    answer = real_stream(self, arguments, *args, **kwargs)
     clock[0] = 103.0
     return answer
 
