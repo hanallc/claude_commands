@@ -279,10 +279,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
               mock.patch.object(gate, "run_suites", return_value=local_result) as run_local,
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertIs(gate.run_gate_suites(self.checkout), local_result)
+            self.assertIs(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT), local_result)
             run_local.side_effect = run_changed_checkout
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
         _ = self.git(self.checkout, "restore", "subject.txt")
         remote = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0)
@@ -290,7 +290,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(cloud_gate, "route", return_value=remote),
               mock.patch.object(gate, "run_suites", side_effect=run_changed_checkout) as run_types):
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout, ("scripts",))
+                _ = gate.run_gate_suites(self.checkout, ("scripts",), target=gate.NO_GATE_ASSIGNMENT)
             run_types.assert_called_once_with(
                 self.checkout, ("scripts",), gate.DEFAULT_MODULE_TIME_LIMIT_S,
                 source="tests-only", full=False, mode=gate.SuiteMode.GATE, selected=gate.SelectedModules(()))
@@ -298,10 +298,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
         _ = self.git(self.checkout, "restore", "subject.txt")
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(cloud_gate, "route", return_value=remote) as route):
-            self.assertIs(gate.run_gate_suites(self.checkout), remote)
+            self.assertIs(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT), remote)
             route.side_effect = run_changed_checkout
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
         _ = self.git(self.checkout, "restore", "subject.txt")
         working_tree = cloud_gate.working_tree(self.checkout)
@@ -310,7 +310,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(cloud_gate, "working_tree", side_effect=[
                   working_tree, affected_modules.GraphError("fixture final tree error")])):
             with self.assertRaisesRegex(GateRefused, "^fixture final tree error$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
     @gate_suites("hooks")
     def test_targeted_returns_refuse_a_changed_checkout(self) -> None:
@@ -346,10 +346,12 @@ class MergeGateSuitesTests(GateSuitesFixture):
                           mock.patch.object(gate, "run_suites", side_effect=local) as run_local):
                         if changed:
                             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                                _ = gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED)
+                                _ = gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
+                                                         target=gate.NO_GATE_ASSIGNMENT)
                             self.assertEqual(self.pass_records(), before)
                         else:
-                            self.assertTrue(gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED).passed)
+                            self.assertTrue(gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
+                                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
                     route.assert_not_called()
                     self.assertEqual(run_local.call_count, int(reuse or bool(types)))
 
@@ -369,14 +371,15 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(cloud_gate, "route") as route,
               mock.patch.object(gate, "select_affected", return_value=selection) as select,
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED,
+                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
             accepted, = self.gate_run_records()
             self.assertEqual((accepted["selection"], accepted["status"]), ("affected", 0))
             before = self.pass_records()
 
             select.side_effect = change_during_selection
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED)
+                _ = gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
             route.assert_not_called()
 
         self.assertEqual(self.gate_run_records(), [accepted])
@@ -407,7 +410,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate.PassedTreeLedger, "append_pass", autospec=True,
                                 side_effect=move_head_after_validation),
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED,
+                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
             route.assert_not_called()
 
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), second)
@@ -431,7 +435,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=change_tree_during_hold),
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
         self.assertEqual(self.pass_records(), [])
         starts = [row["module"] for row in self.module_events() if row["event"] == "start"]
@@ -456,7 +460,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "finish_gate_job", side_effect=add_module_after_job),
               contextlib.redirect_stdout(io.StringIO())):
             original_tree = cloud_gate.working_tree(self.checkout)
-            run = gate.run_gate_suites(self.checkout)
+            run = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
             self.assertEqual(cloud_gate.working_tree(self.checkout), original_tree)
 
         self.assertTrue(added.is_file())
@@ -484,7 +488,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               contextlib.redirect_stdout(io.StringIO())):
             with (mock.patch.object(cloud_gate, "working_tree", side_effect=change_before_final_check),
                   self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$")):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
             self.assertEqual(self.pass_records(), [])
             self.assertEqual(marker.read_text(), notice)
             _ = self.git(self.checkout, "restore", "subject.txt")
@@ -492,10 +496,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
             unavailable = self.state / "unavailable-pass-ledger"
             self.write(unavailable, "The ledger directory is a file.\n")
             with mock.patch.dict(os.environ, {"GATE_PASSED_DIR": str(unavailable)}):
-                self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+                self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertEqual(self.pass_records(), [])
             self.assertEqual(marker.read_text(), notice)
-            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
         record, = self.pass_records()
         self.assertEqual(record["tree"], working_tree(self.checkout)[0])
         self.assertFalse(marker.exists())
@@ -525,7 +529,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
             discover.side_effect = discover_then_change
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
             self.assertEqual(read_tree.call_count, 2)
             self.assertEqual(discover.call_count, 2)
 
@@ -565,7 +569,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "checked_git", side_effect=reset_before_head_tree),
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "M subject.txt")
@@ -594,7 +598,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(git_index, "private_copy", side_effect=stage_and_restore_after_copy) as copy,
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(GateRefused, "^The Git index changed during the checkout read$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
             self.assertEqual(copy.call_count, 2)
 
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), f"A  {added}")
@@ -624,7 +628,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     self.write(unavailable, "The ledger directory is a file.\n")
                     os.environ["GATE_PASSED_DIR"] = str(unavailable)
                 with self.assertRaisesRegex(GateRefused, "^fixture publication tree read failed$"):
-                    _ = gate.run_gate_suites(self.checkout)
+                    _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
                 self.assertEqual(read_tree.call_count, 2)
                 self.assertEqual("Test pass ledger unavailable" in output.getvalue(), ledger_unavailable)
         self.assertEqual(self.pass_records(), [])
@@ -644,7 +648,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
             events = mock.Mock()
             events.attach_mock(discover, "discover")
             events.attach_mock(read_tree, "read_tree")
-            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertIn(f"Is a directory: '{path}'", output.getvalue())
             self.assertEqual(marker.read_text(), notice)
             self.assertEqual(list(path.iterdir()), [])
@@ -655,7 +659,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
             with (mock.patch.object(gate, "discover_test_modules", side_effect=[
                       modules, OSError("fixture coverage read failed")]),
                   self.assertRaisesRegex(GateRefused, "^fixture coverage read failed$")):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
 
             self.assertEqual(marker.read_text(), notice)
             self.assertEqual(list(path.iterdir()), [])
@@ -678,7 +682,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               contextlib.redirect_stdout(io.StringIO())):
             clean_tree, dirty = cloud_gate.working_tree(self.checkout)
             self.assertEqual(dirty, set())
-            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
             original, = self.pass_records()
             self.assertEqual(original["tree"], clean_tree)
 
@@ -686,16 +690,16 @@ class MergeGateSuitesTests(GateSuitesFixture):
             dirty_tree, dirty = cloud_gate.working_tree(self.checkout)
             self.assertNotEqual(dirty_tree, clean_tree)
             self.assertEqual(dirty, {"subject.txt"})
-            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertEqual(self.pass_records(), [original])
             _ = self.git(self.checkout, "restore", "subject.txt")
 
             marker, notice = self.write_nightly_red_marker()
             with mock.patch.object(gate, "finish_gate_job", side_effect=stage_other_contents):
-                self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+                self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertEqual(cloud_gate.working_tree(self.checkout), (clean_tree, {"subject.txt"}))
             self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-only"), "subject.txt")
-            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertEqual(marker.read_text(), notice)
             self.assertEqual(self.pass_records(), [original])
 
@@ -723,12 +727,12 @@ class MergeGateSuitesTests(GateSuitesFixture):
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(cloud_gate, "route", side_effect=fallback) as route,
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
             self.assertEqual(cloud_gate.working_tree(self.checkout),
                              (self.git(self.checkout, "rev-parse", "HEAD^{tree}"), {"subject.txt"}))
             route.side_effect = commit_ignored_file
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
         self.assertEqual(subject.read_bytes(), expected)
         self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-status"), "D\tsubject.txt")
         self.assertEqual(marker.read_text(), notice)
