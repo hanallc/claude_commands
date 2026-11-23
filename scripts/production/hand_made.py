@@ -198,14 +198,15 @@ def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     each file that is not compiled. The execvp of a wrapper also goes on to a later PATH match when a start
     fails, for example for a #! line with a missing interpreter, so a later word reads each match. The run
     starts the first word by its exec_path, with no PATH search and no /bin/sh, so the first word reads only
-    that file and only a #! script; the model sees a word with a slash in the command.
+    that file and only a #! script. An interpreter reads a later word with a slash as a script, with or
+    without a #! line, so that word reads each file that is not compiled.
     """
     found: list[Path] = []
     for index, word in enumerate(argv):
         programs = [repo / word] if "/" in word else path_programs(word)
         for program in programs if index else programs[:1]:
             if os.path.isfile(program) and (
-                    in_checkout(program, repo) or outside_program(program, any_text=bool(index) and "/" not in word)):
+                    in_checkout(program, repo) or outside_program(program, any_text=bool(index))):
                 found.append(program)
         if index and in_checkout(repo / word, repo) and os.path.isfile(repo / word):
             found.append(repo / word)
@@ -311,6 +312,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
     if sets_variable(argv):
         raise Refused("env NAME=VALUE is refused: a variable can make the program load code that the check does not "
                       + "read; set the variable outside the hand made command")
+    if any(os.path.isfile(os.path.join(repo, word, "__main__.py")) for word in argv[1:]):
+        raise Refused("a word names a folder with a __main__.py: python runs that folder as a package that the check "
+                      + "cannot read; run the program file by its path")
     for name in PATH_LIST_VARIABLES:
         for entry in os.environ[name].split(os.pathsep) if name in os.environ else ():
             if not entry or not os.path.isabs(entry) or in_checkout(Path(entry).resolve(), repo):

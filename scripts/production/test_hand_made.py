@@ -569,6 +569,17 @@ class ProgramFileTests(unittest.TestCase):
         with mock.patch.dict(os.environ, clean | {"PATH": f"{self.bin}:/usr/bin", "LD_LIBRARY_PATH": "/x"}, clear=True):
             self.assertEqual(self.read(sys.executable, "-c", "1"), [])
 
+    def test_a_word_that_names_a_folder_with_a_main_file_is_refused(self) -> None:
+        package = self.repo / "build"
+        package.mkdir()
+        _ = self.write(package / "__main__.py", "import os\n")
+        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__.py"):
+            _ = self.read("python3", "build")
+
+    def test_a_later_path_outside_the_checkout_with_no_start_line_is_read(self) -> None:
+        script = self.write(self.root / "outside.sh", "rm -rf ~/work\n")
+        self.assertEqual(self.read("sh", str(script)), [script])
+
     def test_a_wrapper_word_from_path_with_no_start_line_is_read(self) -> None:
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")
         self.assertEqual(self.read("timeout", "600", "helper"), [helper])
