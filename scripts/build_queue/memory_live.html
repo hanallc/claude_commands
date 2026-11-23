@@ -1013,7 +1013,7 @@ function awsDayRuns(day, view) {
       aria-hidden="true"></span>${esc(group.name)}</button>`;
     const note = group.unitUnknown ?
       '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
-    const time = count ? awsRunTime(group.seconds) : group.key === AWS_HANA_GROUP ? "no record" : "—";
+    const time = count ? awsRunTime(group.seconds) : "—";
     const idleRows = group.idle ? [runCharge(idleCharge)] : [];
     return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
       values:[name + note, count ? awsCount(count) : "—", time,

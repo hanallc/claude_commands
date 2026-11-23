@@ -1727,8 +1727,7 @@ process.stdout.write(JSON.stringify(steps));
         self.assertIn("Job not recorded", billed)
         self.assertNotIn("Our estimate before the AWS amount", billed)
         self.assertNotIn("Start (Eastern)", billed)
-        self.assertIn('Hana check and lint</button></td><td class="num">—</td><td class="num">no record</td>',
-                      no_attempt)
+        self.assertIn('Hana check and lint</button></td><td class="num">—</td><td class="num">—</td>', no_attempt)
         self.assertRegex(no_attempt, r'Hana machine with no run</td>.*<td class="num">—</td>.*\$1\.03</td>')
         self.assertRegex(no_attempt, r'Compute with no run record</td>.*\$4\.24</td>')
         self.assertRegex(no_attempt, r'Costs with no run.*<td class="num">\$1\.60</td>')
@@ -1771,13 +1770,18 @@ process.stdout.write(JSON.stringify(steps));
 
     def test_aws_cost_hana_idle_row_shows_the_machine_time_with_no_run(self) -> None:
         details = cast(list[str], self.page_expression(
-            """[data.days[0], data.days[12]].map(day => awsDayRuns(day, {groupBy:'job', openGroups:new Set(['["hana"]'])}))""",
+            "[data.days[0], data.days[12], {...data.days[12], hana:{...data.days[12].hana, idle_seconds:3521}}]"
+            + """.map(day => awsDayRuns(day, {groupBy:'job', openGroups:new Set(['["hana"]'])}))""",
             aws_cost_fixture(), walk=True))
-        idle_rows = [re.search(r"<td>Hana machine with no run</td>((?:<td[^>]*>[^<]*</td>)+)</tr>", detail)
-                     for detail in details]
-        # The cell before the cost is the Time on AWS cell.
-        times = [re.findall(r"<td[^>]*>([^<]*)</td>", row[1])[-2] if row else None for row in idle_rows]
-        self.assertEqual(times, ["2 h 22 min 55 s", "—"])
+        cells = r"((?:<td[^>]*>[^<]*</td>)+)</tr>"
+        # The cell before the cost is the Time on AWS cell of the idle row, and the Run time cell of the group row.
+        idle = [re.findall(r"<td[^>]*>([^<]*)</td>", match[1])[-2] if (match := re.search(
+            "<td>Hana machine with no run</td>" + cells, detail)) else None for detail in details]
+        group = [re.findall(r"<td[^>]*>([^<]*)</td>", match[1])[1] if (match := re.search(
+            "Hana check and lint</button></td>" + cells, detail)) else None for detail in details]
+        self.assertEqual(idle, ["2 h 22 min 55 s", "—", "58 min 41 s"])
+        # A group with no run has no run time, as other groups with no run.
+        self.assertEqual(group, ["21 s", "—", "—"])
 
     def test_aws_cost_times_use_the_user_zone(self) -> None:
         for zone, rule, start, header in (

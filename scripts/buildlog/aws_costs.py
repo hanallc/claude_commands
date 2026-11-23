@@ -350,6 +350,27 @@ def hana_runs_by_day(state: ledger.LedgerEvidence, instant: int) -> dict[str, li
     return days
 
 
+type RunOverlap = tuple[Decimal, Decimal, str]
+
+
+def interval_overlaps(reference: str, charge: ledger.ChargedInterval,
+                      runs: Sequence[HanaRun]) -> tuple[list[RunOverlap], Decimal]:
+    """Find the run time inside one machine interval, and the union of that time."""
+    overlaps: list[RunOverlap] = []
+    for run in runs:
+        if run.references and reference not in run.references:
+            continue
+        begin, end = max(run.begin, Decimal(charge.start)), min(run.end, Decimal(charge.end))
+        if begin < end:
+            overlaps.append((begin, end, run.attempt))
+    covered = Decimal(0)
+    previous_end = Decimal(charge.start)
+    for begin, end, _ in sorted(overlaps):
+        covered += max(Decimal(0), end - max(begin, previous_end))
+        previous_end = max(previous_end, end)
+    return overlaps, covered
+
+
 def hana_attempt_costs(runs: Sequence[HanaRun], compute: HanaCompute, priced: dict[HanaMachine, Decimal],
                        paid: dict[HanaMachine, Decimal]) -> dict[str, Decimal]:
     """Share the cost of covered time among the attempts that used it."""
@@ -361,21 +382,10 @@ def hana_attempt_costs(runs: Sequence[HanaRun], compute: HanaCompute, priced: di
         for reference, charge in compute[machine]:
             if charge.start == charge.end:
                 continue
-            overlaps: list[tuple[Decimal, Decimal, str]] = []
-            for run in runs:
-                if run.references and reference not in run.references:
-                    continue
-                begin, end = max(run.begin, Decimal(charge.start)), min(run.end, Decimal(charge.end))
-                if begin < end:
-                    overlaps.append((begin, end, run.attempt))
+            overlaps, covered = interval_overlaps(reference, charge, runs)
             if not overlaps:
                 continue
-            covered = used = Decimal(0)
-            previous_end = Decimal(charge.start)
-            for begin, end, _ in sorted(overlaps):
-                covered += max(Decimal(0), end - max(begin, previous_end))
-                used += end - begin
-                previous_end = max(previous_end, end)
+            used = sum((end - begin for begin, end, _ in overlaps), Decimal(0))
             cost = charge.usd * fraction * covered / Decimal(charge.end - charge.start)
             for begin, end, attempt in overlaps:
                 costs[attempt] += cost * (end - begin) / used
@@ -383,11 +393,11 @@ def hana_attempt_costs(runs: Sequence[HanaRun], compute: HanaCompute, priced: di
 
 
 def hana_idle_seconds(compute: HanaCompute, runs: Sequence[HanaRun]) -> int | None:
-    """Count the machine time of the day that the day's runs do not use."""
+    """Count the machine time of the day that no run covers, from the intervals that price it."""
     if not compute:
         return None
-    machine = sum(charge.end - charge.start for intervals in compute.values() for _, charge in intervals)
-    return max(0, machine - sum(run.seconds for run in runs))
+    return round(sum((charge.end - charge.start - interval_overlaps(reference, charge, runs)[1]
+                    for intervals in compute.values() for reference, charge in intervals), Decimal(0)))
 
 
 def per_run(cost: Decimal, count: int) -> AmountPerRun:

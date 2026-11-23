@@ -3671,6 +3671,24 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(today["hana"] and today["hana"]["idle_seconds"], 550)
         self.assertIsNone(aws_costs.hana_idle_seconds({}, []))
 
+    def test_aws_cost_feed_counts_overlapping_hana_attempts_once_in_the_idle_seconds(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        start = bill.period_start + 300
+        with book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(start, start + 3600, 1, Decimal(2),
+                ledger.HanaExposureClosed(start + 3600), "m7a.4xlarge", region="us-east-2"))
+        generation = HanaHostGeneration("fixture", "token", "boot")
+        # Two attempts share 100 s. The third starts after the machine stops.
+        for attempt, begin, end in (("first", 100, 400), ("second", 300, 600), ("late", 4000, 4100)):
+            book.record_hana_attempt(hana_result.HanaAttemptCharge(
+                hana_result.HanaAttemptKey("episode", attempt, "claim", generation),
+                hana_result.LogicalStepLink("call", "episode"), 0, 0, 0,
+                start + begin, start + end, ("hana_compute:1",)))
+
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        self.assertEqual(billed["hana"] and (billed["hana"]["runs"], billed["hana"]["idle_seconds"]), (3, 3100))
+
     def test_aws_cost_feed_does_not_copy_private_fields_or_unit_identifiers(self) -> None:
         joined = "research" + PRIVATE_AWS_FIELDS["instance_id"] + "report"
         book = write_aws_cost_fixture(self.root, unknown_unit=joined)

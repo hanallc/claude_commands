@@ -505,7 +505,7 @@ try {
             const groupTime = hanaCells[2].textContent;
             const hanaRuns = day.runs_list.filter(run => run.kind === 'hana');
             const expectedGroupTime = hanaRuns.length
-              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : 'no record';
+              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : '—';
             const perRun = hanaCells[4].textContent;
             const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
             hana.click();
