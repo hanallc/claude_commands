@@ -278,7 +278,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    1. Run `git fetch origin`, then `git merge --no-ff origin/main` on the tip.
       Push the join commit. Do not fetch again before step 3.
    2. Run the affected tests of the join through the queue, with no `--module`:
-      `python3 ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ~/.claude/scripts/lib/py scripts/production/targeted_test.py --repo .`.
+      `python3 ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ./scripts/lib/py scripts/production/gate.py --affected`.
       The selector finds each module that imports, embeds, copies or reads a
       changed file. Do not choose the modules by hand. Single cases do not
       replace this run.
