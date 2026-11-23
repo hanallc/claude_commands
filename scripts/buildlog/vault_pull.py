@@ -17,7 +17,7 @@ from typing import Literal, cast, get_args
 from scripts.buildlog import ci
 from scripts.buildlog.health import Machine
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import file_lock, land_main
+from scripts.lib import file_lock, land_main, main_push_lock
 from scripts.lib.process_failure import failure_detail
 from scripts.buildlog import store
 from scripts.buildlog import sync
@@ -139,6 +139,7 @@ class VaultState:
 
 
 # Mac login can hide the exit status. The printed marker gives the outcome.
+# Both machines set merge.ff=only; the merge's --ff fast-forwards when it can, else it makes a merge commit.
 REMOTE_PULL = """export LC_ALL=C
 outcome() { printf 'VAULT_OUTCOME=%s\\n' "$1"; exit 0; }
 g() { git -C rust/hanadocs "$@"; }
@@ -186,7 +187,7 @@ case $? in
   *) outcome failed ;;
 esac
 count=$(g rev-list --count HEAD..refs/remotes/origin/main) || outcome failed
-if ! retry_git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main; then
+if ! retry_git merge --ff --no-edit --no-overwrite-ignore refs/remotes/origin/main; then
   files=$(g diff --name-only --diff-filter=U) || outcome failed
   [ -n "$files" ] || outcome failed
   retry_git merge --abort || outcome failed
@@ -275,6 +276,16 @@ def remote_outcome(result: subprocess.CompletedProcess[str]) -> MacMerged | Pull
 
 
 def publish_mac(merged: MacMerged) -> PullOutcome:
+    try:
+        with main_push_lock.main_push_lock(LOCAL_VAULT, "vault-pull", wait=False):
+            return _publish_mac(merged)
+    except BlockingIOError:
+        return DeferredSync("the vault lock is busy; the next hour retries")
+    except OSError as error:
+        return VaultCommandFailed(str(error))
+
+
+def _publish_mac(merged: MacMerged) -> PullOutcome:
     fetched = mac_git("fetch", f"{sync.peer_name()}:rust/hanadocs", f"refs/heads/main:{MAC_MAIN}")
     if isinstance(fetched, (VaultCommandFailed, MacUnreachable)):
         return fetched
@@ -419,7 +430,7 @@ def stop_details(outcome: PullStop) -> tuple[StopCause, str, StopQuestion]:
     match outcome:
         case VaultConflict(files):
             return ("conflict", f"The hanadocs merge has a conflict on Mac. Files: {', '.join(files)}.", StopQuestion(
-                "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.",
+                "In a terminal on the Mac, run `git -C ~/rust/hanadocs merge --ff origin/main`, then resolve the conflicting edits.",
                 "Both copies changed the same content. The commits remain available.",
                 ("Combine the edits and commit the result. This keeps the wanted content from both copies.",
                  "Choose one copy for each file and commit the result. This replaces the other copy's content."),

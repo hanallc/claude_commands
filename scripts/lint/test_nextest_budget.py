@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 require_checkout(Path(__file__))
 
@@ -48,7 +48,7 @@ LINT_TEST_WIDTH={mode}
 run_nextest "$@"
 """
         environment = {
-            **os.environ,
+            **memory_gate_shell_environment(),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             # No jobserver pool: the run takes no tokens.
             "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",

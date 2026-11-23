@@ -31,7 +31,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
 from scripts.direct import step_record
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
+from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings, memory_gate_shell_environment
 from scripts.message import send
 from scripts.buildlog.test_index import use_test_log
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
@@ -1331,7 +1331,7 @@ test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
         with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
             process = subprocess.Popen(["bash", "-c", command, "memory-marker-test",
-                str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ,
+                str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**memory_gate_shell_environment(),
                 "TEST_RETRY_MARKER": str(marker)}, stdout=output, stderr=errors, start_new_session=True)
             expired = False
             try:

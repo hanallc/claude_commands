@@ -374,6 +374,7 @@ The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
 Durable waiter records retain only the step arrival time.
+An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
@@ -405,7 +406,7 @@ The first two minutes use the same calculation. A run never counts its use twice
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
-Waiting runs follow priority, first run arrival, and PID order.
+Waiting steps follow priority, first run arrival, step arrival, and PID order.
 A younger run starts only when its need fits after the first run's need remains protected.
 The first run can start despite insufficient room when no admitted run or held slot remains.
 Readable host memory, clear readable pressure, and a current estimate remain necessary.
@@ -1314,30 +1315,24 @@ An absent key sets no repository run limit.
 A value of zero holds new runs on that machine.
 `max_runs.natedev.hana` permits two concurrent Hana Verify runs on natedev.
 `max_runs.natedev.cargo-liner` permits one cargo-liner Verify run at a time on natedev.
-Verify requests a repository slot for its first compiling Cargo step.
-The request follows detachment, the cache checks, and lint step selection.
-In Mac-only mode Verify checks the cache after it gets an assignment.
-On a cache miss, Verify requests its slot before it claims the Mac.
-The slot belongs to the Verify process and ends when that process exits.
-The service saves grants and restores the owner watches after restart.
+Verify asks for placement first and takes no slot before it.
+A Verify run takes its natedev repository slot with its first local memory grant, in the same admission decision.
+The slot belongs to the outer Verify process.
+If the caller returns all local grants before any step starts, the service releases the slot.
+After a local step starts, the run keeps its natedev slot until the outer Verify process exits.
+The run keeps the slot between steps and during later Mac or AWS steps.
+Later local steps of the run reuse the slot.
 A child Verify uses a live ancestor Verify's slot for the same repository.
 The service verifies each process in that chain by PID, start time, and parent PID.
-Separate Verify calls under the same copy preparation process each request their own slot.
-A run keeps its natedev slot while its steps run on the Mac or AWS.
-The run wait occurs before Cargo memory admission.
-Cargo steps use the existing rules for memory claims and start spacing.
-Copy preparation and commands that only format or read cached results take no run slot.
-Copy preparation can retain its memory during the configured gap before Verify takes a slot.
-The gap is about ten seconds with the current configuration.
+A run that never receives a local grant takes no natedev slot.
+The exempt unit takes no natedev slot.
+A run that waits only for its repository limit holds back no step of another repository.
+The service saves slots with their local grant and restores the owner watches after restart.
 Local `gate` and `test-affected` runs count while they hold a reservation.
 `max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
-The unit in `max_runs.exempt_unit` can start above the limit. Its runs use slots.
-Verify prints the count, limit, repository, and machine while it waits.
-The slot request uses the Verify Python helper, including when detached output goes to a file.
-The slot wait ignores the queue leave hooks.
-Slot request failures do not enter the lint cache.
-The Builds page shows these details for Verify runs and gate reservations.
+The unit in `max_runs.exempt_unit` can start above the limit. Its gate reservations count toward the limit.
+The Builds page shows the count, limit, repository, and machine for a run-limit wait, and each machine the run can use.
 The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
@@ -2079,7 +2074,7 @@ Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
-The first eligible run follows queue priority, first run arrival, and PID.
+The first eligible step follows queue priority, first run arrival, step arrival, and PID.
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
@@ -2112,7 +2107,7 @@ An incomplete CI template uses the generic CI label.
 The feed omits unusable parts from step titles.
 The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
 The Builds page uses the names and hover titles from the feed.
-A continuation within the slot bypasses order, spacing, and pressure.
+A continuation within the slot bypasses spacing and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
 Repeated release cannot recreate a slot. A standalone request has no reusable slot.
@@ -2379,3 +2374,59 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+### Move a waiting step
+
+A drag acts like a bump: main's claim rules run on the shared order.
+
+Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
+To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
+Press Escape to cancel.
+The numbers show queue positions.
+The policy still checks eligibility before each start.
+Cloud waits have their own order.
+
+The admission service gives each wait an ID when it enters the queue.
+The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
+A refresh keeps the ID.
+The service saves pins in `state.json` when a move completes.
+A pin records the wait ID and an anchor.
+The anchor identifies the row directly ahead or the head of the queue.
+The service applies the usual priority and arrival rules to all saved waits.
+It then places each pinned wait directly after its anchor.
+A move gives the moved row a new anchor and keeps its former successor in place.
+Absent and unnamed waits stay in the full order.
+The page omits waits with no name source.
+Placement, memory admission, and continuation claims use the eligible rows in this order.
+The head-stall snapshot uses the order of local waits.
+The grant pass shows a newly granted row in Waiting without a move handle.
+The first pass that counts its reservation shows the row in Running and includes the memory charge.
+When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
+A confirmed move or Undo changes queue order only.
+A drag can return a waiting row's unstarted slot claim, as a bump does.
+A departing row loses its pin.
+A row anchored to the departing row inherits its anchor or its predecessor in the full order.
+A local reservation keeps its saved place until the service sees processes in its scope.
+The first reading clears the saved place for a direct reservation without a scope file.
+A placement retry before launch keeps its place.
+Both hosts use the visible order for normal steps.
+When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
+The table includes remote-only waits in queue order.
+The table identifies waits that a build hold blocks.
+Speculative Mac copy rows show the newest-first rule.
+A speculative Mac copy waits for placement outside the table while its parent holds local memory.
+A refusal before launch keeps the pin. Closing the attempt removes the local waiter and drops its slot claim.
+
+The service checks the order revision for all rows, including rows without handles.
+The replay ledger records the reply and the anchor from before the move.
+Undo restores the step to that anchor in the full order.
+The anchor is the head or the row that directly preceded the step.
+If that row left the full order, the service refuses Undo.
+Undo saves pins as a new move.
+A conflict supplies the current order. If the revision changed, the page waits for a fresh reading.
+A move sends the drop target.
+A drop above the first shown row uses the head anchor, ahead of unnamed and absent waits.
+Other drops use their neighbor in the full order.
+An Undo request identifies the move to restore. The service reads the saved anchor from the replay ledger.
+The page applies the confirmed order to the rows it shows.
+The confirmation uses the table numbers, including the places of waits without handles.

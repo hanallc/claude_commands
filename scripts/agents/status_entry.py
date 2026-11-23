@@ -13,6 +13,7 @@ from typing import Literal, Never, TypedDict, override
 
 from scripts.agents import remote
 from scripts.agents.inventory import CheckoutState, Host, InvalidInventory, Inventory, inventory, parse_inventory
+from scripts.herdr import herdr
 from scripts.herdr.herdr_types import HerdrFailure
 from scripts.production import staff
 from scripts.whoami.account import Account, UnreadableAccount, named_claude_account, own_claude_account
@@ -97,7 +98,7 @@ def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
                 reading = staff.decode_peer_status_authority(stdin.read())
             except (OSError, UnicodeError):
                 pass
-        with staff.status_authority(reading):
+        with staff.status_authority(reading), herdr.observation_snapshot():
             return [inventory(selected.login)]
 
     arguments = ["status", selected.login, "--json", "--here"]
@@ -118,7 +119,8 @@ def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
         # A local failure must let the command exit before the peer replies.
         Thread(target=read_peer, daemon=True).start()
         try:
-            local = inventory(selected.login)
+            with herdr.observation_snapshot():
+                local = inventory(selected.login)
         except BaseException:
             cancellation.cancel()
             raise
