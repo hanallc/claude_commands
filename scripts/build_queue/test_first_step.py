@@ -84,7 +84,8 @@ class FirstStepTests(unittest.TestCase):
                     request.constraints.source_key, request.owner, request.constraints.session, request.since))
 
             with (mock.patch.dict(os.environ,
-                      {"BUILDLOG_PLACEMENT_FILE": "outer-file", "BUILDLOG_PLACEMENT_EPISODE": "outer-episode"}),
+                      {"BUILDLOG_PLACEMENT_FILE": "outer-file", "BUILDLOG_PLACEMENT_EPISODE": "outer-episode",
+                       "BUILDLOG_PLACEMENT_SIDECAR": "outer-sidecar"}),
                   mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
                   mock.patch.object(build_targets, "fixed_remote_candidates", return_value=(remote,)) as candidates,
@@ -103,6 +104,7 @@ class FirstStepTests(unittest.TestCase):
                     self.assertIsInstance(request.profile, records.ProgramProfile)
                     assert isinstance(request.local, wire.LocalAdmissionContext)
                     self.assertEqual(request.local.argv, ("gate", "--type-dirs", "scripts"))
+                    self.assertEqual(request.local.sidecar, str(fixture.root / "placement.cgroup"))
 
                     saved = client.read_assignment(admitted.assignment_file).assignment
                     self.assertEqual(saved.owner, request.owner)
@@ -110,10 +112,12 @@ class FirstStepTests(unittest.TestCase):
                     admitted.handoff(fixture.root)
                     self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
                     self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], saved.episode)
+                    self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], request.local.sidecar)
                     self.assertNotIn("BUILDLOG_FIRST_STEP_ASSIGNMENT", os.environ)
                     cancel.assert_not_called()
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], "outer-file")
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], "outer-episode")
+                self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], "outer-sidecar")
                 candidates.assert_called_once()
                 cancel.assert_called_once()
                 program.assert_not_called()

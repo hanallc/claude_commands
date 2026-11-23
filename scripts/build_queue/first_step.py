@@ -87,6 +87,8 @@ class FirstStepAdmission:
         # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
+        if isinstance(grant.request.local, wire.LocalAdmissionContext):
+            os.environ['BUILDLOG_PLACEMENT_SIDECAR'] = grant.request.local.sidecar
 
     def place_again(self, request: wire.PlacementRequest) -> None:
         """Place the gate again with its original request and pass the new assignment to the next run."""
@@ -265,8 +267,9 @@ def gate_targets(command: Sequence[str], requested: str = "") -> tuple[str, ...]
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
-                  owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity) -> wire.PlacementRequest:
-    local = _program_request(command, source, owner, position, run).refresh()
+                  owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
+                  sidecar: Path) -> wire.PlacementRequest:
+    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
                   else execution_identity.SourceKeyUnavailable('source key is unavailable'))
@@ -308,6 +311,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
     position = SlotQueuePosition(uuid4().hex, time.time())
     keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
             'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE',
+            'BUILDLOG_PLACEMENT_SIDECAR',
             'BUILDLOG_PREPARED_COPY', 'UNIT_DETACHED_RUN')
     previous = {key: os.environ.get(key) for key in keys}
     os.environ['BUILDLOG_RUN'] = f'{owner.pid}:{owner.start_time}'
@@ -318,6 +322,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
     if gate:
         _ = os.environ.pop('BUILDLOG_PLACEMENT_FILE', None)
         _ = os.environ.pop('BUILDLOG_PLACEMENT_EPISODE', None)
+        _ = os.environ.pop('BUILDLOG_PLACEMENT_SIDECAR', None)
     try:
         with build_folders.tool_folder('copies-admission') as folder:
             assignment_file = folder / 'assignment.json'
@@ -327,7 +332,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
             elif targets:
-                gate_request = _gate_request(command, source, targets, owner, position, run)
+                gate_request = _gate_request(command, source, targets, owner, position, run, folder / 'placement.cgroup')
                 grant = GatePlacement(_placement_grant(gate_request), gate_request)
             else:
                 grant = _program_grant(command, source, owner, position, run)
