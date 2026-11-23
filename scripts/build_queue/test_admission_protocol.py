@@ -537,6 +537,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
                 wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
+                wire.PrioritySetRequest("one-run", "queue-unit", "/build:bump --run 2", "actor",
+                                        wire.OneRun(wire.RunIdentity(41, "900"), "nextest")),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
                 for call in (test_phase.CallRecord("a-call"), test_phase.NoCallRecord()):
@@ -548,6 +550,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                     self.assertEqual(len(encoded.splitlines()), 1)
                     self.assertEqual(wire.parse_request(encoded), value)
                     self.assertEqual(wire.parse_record(wire.encode_record(value), type(value)), value)
+            # A one-run bump uses its own envelope name, so an older service refuses it.
+            self.assertEqual([cast(dict[str, object], json.loads(wire.encode_request(value)))["type"]
+                              for value in requests if isinstance(value, wire.PrioritySetRequest)],
+                             ["priority_set", "priority_run_set"])
             build = fixture.request(step="build")
             assert isinstance(build.profile, records.StepProfile)
             self.assertEqual(wire.VERSION, 3)

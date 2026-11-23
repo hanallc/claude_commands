@@ -363,6 +363,26 @@ class RefillMark(threading.local):
     clear_pending: bool = False
 
 
+class FixedSystemReader:
+    """Publish private evidence without an operating-system reader."""
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 class GaplessRefill:
     """A patch.dict exit calls clear() and then update(); the clear waits for that update, so no reader sees an empty environment."""
     def __init__(self, environ: MutableMapping[str, str]) -> None:

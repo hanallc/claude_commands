@@ -534,6 +534,7 @@ The status line under the free amount names one cause, in this order:
 5. One running build that leaves too little free.
 Use `/build:page` for the queue view and admission evidence.
 Use `/build:bump <position|session|folder>` to set a waiting unit's priority.
+Use `/build:bump --run <position|session|folder>` to raise only the run of one waiting step.
 Use `/build:bump clear [unit]` to remove priority.
 `queue_evidence.py` formats the recorded memory amounts for the Builds page and memory reports.
 Admission and release calculations remain in `memory_admit.py`.
@@ -547,7 +548,7 @@ An expired estimate requires a client refresh through the service.
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Add a unit or one-run entry to the priority list, or remove entries |
 | `view`, `explain`, `mine` | Read the stored pass |
 
 `/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
@@ -555,6 +556,43 @@ It sets priority for that step's unit. An unmatched selector exits 3 without a p
 The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
 `/build:bump` works from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
+
+`build_queue.py` passes `--words` verbatim as the entry's `why`; a clear passes them as the history row's `why`.
+`/build:bump` passes `--words "/build:bump $ARGUMENTS"`, so the user types no more.
+The service decides the words in one place, `asked_words`:
+- A request without words from a session is refused: `--words is required: pass the user's words; the queue priority did not change` (exit 3).
+- A request without words from a plain shell (actor `"user"`) stores `typed by nate in a plain shell`.
+
+`_submit_queue_change` calls `asked_words` before the roster read starts.
+The roster read of a set also resolves the actor (`actor_asker`).
+The entry keeps `set_by` (the session id or `"user"`) and stores `asker`:
+- `StaffAsker(name)`: a staff row names the session. The text shows the staff name.
+- `UnstaffedSession(session_id)`: no staff row names the session. The text shows the session id.
+- `PlainShellAsker`: the actor is `"user"`. The text shows `nate (plain shell)`.
+An entry saved before this change reads as `AskerNotRecorded` and shows its `why` alone.
+
+`PriorityEntry` is a tagged union of `UnitPriorityEntry` and `RunPriorityEntry`.
+An untagged saved entry reads as a unit entry; stored files do not change.
+`--run` sends `OneRun(run, step)` under the `priority_run_set` envelope, so an older service refuses it.
+A run entry holds `RunIdentity(pid, start_time)`, keyed like a run place, plus the unit and step for its text.
+The service refuses a run that no waiting or admitted step has.
+A waiter takes the first entry in list order that covers it: a run entry by its run, a unit entry by its unit.
+Other runs of the same unit keep their place unless a unit entry also covers them.
+`clear <unit>` removes the unit entry and the run entries of that unit.
+`_prune_runs` ends each run entry whose run is no longer live, in the pass that sees the run end and in the first pass after a restart.
+It writes a clear transition with why `its run ended` and actor `admission service`.
+A pending transition waits until a pass writes its history row; each pass and each restart retries the write.
+A history write that fails does not stop the service. A new set or clear is refused until the pending row is written.
+The refusal takes no replay entry, so the same request id can try again.
+When the history file is unreadable, the entry stays.
+The service logs each new history error text once in `priority_history`.
+A history write that works forgets the text. A history read that works for an ended run entry also forgets it.
+`_prune_watches` keeps the owner watch of each run entry.
+
+Three limits apply while the deploy is not complete:
+- A rollback to an older service reads a run entry as a unit entry, and that entry stays until a clear.
+- An older client sends "the user's bump" as the words until it updates.
+- An older client cannot clear from a session until it updates.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
@@ -645,9 +683,32 @@ The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, `is_head`, and `passed`.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+`is_head` is true when the step was the first queued row in queue order.
+A token-waiting row is not a queued row.
+A false `is_head` does not show that the step went past a row that waits for memory.
+The first queued row is often a step that waits for its repository run limit.
+
+`passed` is a `PassedRows` object. It counts the earlier rows that the step went past, by cause.
+`passed_rows` reads the walk of the pass that admitted the step.
+The walk records the `run_limit` cause on each row as `HeldByRunLimit`, so `passed_rows` does not repeat rule 8.
+A row that the same pass admits is not a passed row.
+Each passed row has one cause. The first cause in this list that applies is the cause:
+
+1. `run_limit`: the row waits for its repository run limit, or waits behind such a row (rule 8).
+2. `cargo_token`: the row left to wait for the Cargo token.
+3. `other_machine`: the row is not routed to natedev, or a remote start is pending for it.
+4. `gpu`: the row waits for a GPU test slot.
+5. `folder`: the row waits for a busy Cargo folder.
+6. `memory`: any other held local row.
+
+The walk never starts a step past a local row that waits for memory, so `memory` is always 0.
+A nonzero `memory` is a walk fault.
+A cloud admission is not in the local walk and has no `passed`.
+`read_queue_lifetimes` reads a row without `passed` as `PassedNotRecorded`, not as zero counts.
 
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
@@ -1291,6 +1352,11 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 The no-unit display placeholder supplies no unit.
 Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
 The Builds page shows the saved priority order and reasons.
+Each entry reads `<unit> (<name>: "<words>")`, or `<unit> · <step> (one run) (<name>: "<words>")` for a run entry.
+The bump output prints the same `queue priority:` line after the set.
+The page tooltip shows `Priority` with the unit names and one `Bump` line for each entry.
+A page row of a step with a live run carries `build_run` (`RunIdentity`), and a run entry matches only that row.
+A row with only a step pid matches no run entry; the walk head shows that entry.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -2146,6 +2212,7 @@ Direct test instances can supply a fixed reader.
 Persistence reuses each unchanged record's encoding.
 The state bytes, atomic writes, and lifecycle commit order stay the same.
 `query_timeout_seconds` stays 0.5.
+The bump command reads the queue with the live-service wait: it waits up to `silence_seconds` for a slow service and fails at once when the service is down.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
 
@@ -2585,8 +2652,8 @@ So each step of one CI job ranks at the job start, ahead of steps that arrived a
 Queue priority remains the first ordering field.
 A step with `NoJobStart` keeps its arrival place.
 `state.json` saves the job start with the waiter place, so the place survives a service restart.
-The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
-Its hover shows the same time and age under `Job start`.
+The Builds page shows the job start only in the hover of the waiting row, under `Job start`.
+The hover shows the time in the user zone and the age.
 The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.

@@ -65,7 +65,8 @@ from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
 from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
+from scripts.build_queue.scope_activity import (LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunIdentity,
+    RunningServiceJob, ScopeProcesses)
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
@@ -484,6 +485,14 @@ class ConfirmedGuestRun(TypedDict):
     attempt: str
 
 
+class RunNotes(TypedDict, total=False):
+    build_run: RunIdentity
+
+
+def run_notes(run: LiveBuildRun | NoLiveBuildRun) -> RunNotes:
+    return {"build_run": RunIdentity(run.pid, run.start_time)} if isinstance(run, LiveBuildRun) else {}
+
+
 class RowQueueNotes(CallNotes):
     caller: NotRequired[str]
     owner_text: NotRequired[str]
@@ -497,8 +506,11 @@ class RowQueueNotes(CallNotes):
     # True on the step the queue admits next; only that step shows its room.
     first_in_line: NotRequired[bool]
     head_room: NotRequired[HeadRoom]
-    priority_text: NotRequired[str]
+    # The run of the step, when the step has a live run; a run entry marks only the rows of its run.
+    build_run: NotRequired[RunIdentity]
     priority_entries: NotRequired[list[admission_records.PriorityEntry]]
+    # Each line names the unit or the one run, the actor that asked, and the user's words.
+    priority_lines: NotRequired[list[str]]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
     because: NotRequired[str]
@@ -1190,8 +1202,8 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
-    unmatched_priority_text: str
     unmatched_priority_entries: list[admission_records.PriorityEntry]
+    unmatched_priority_lines: list[str]
     mac_idle_alert: str
     targets: list[target_availability.TargetRow]
     cloud_slots_used: int
@@ -2811,6 +2823,13 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
+def priority_covers_row(entry: admission_records.PriorityEntry, unit: str, run: RunNotes) -> bool:
+    """A run entry covers a row that carries its run identity; a unit entry covers the rows of its unit."""
+    if admission_records.is_run_entry(entry):
+        return "build_run" in run and run["build_run"] == entry["run"]
+    return unit == entry["unit"]
+
+
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
@@ -2955,11 +2974,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         run = hold.memory.run
         pid = (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid) if step is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
+        step_run = step.run if step is not None else run
         row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
         walk.append({**row_labels,
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
-                     "state": "", "pid": pid, "detail": detail, "used": use,
+                     "state": "", "pid": pid, **run_notes(step_run), "detail": detail, "used": use,
                      **(build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                         home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))
                         if step is not None else SlotPlace()),
@@ -3158,7 +3178,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
-                        "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
+                        "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid),
+                        **run_notes(waiter.run), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
                         "reason": reason,
                         "fits": not targets and not isinstance(cause, admission_records.NatedevHeld)
@@ -3277,22 +3298,21 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         named_wait for visible in visible_waits
         if (named_wait := (cloud_waiters.get(entry.owner) if isinstance(entry := visible.source, wire.CloudRow) else
                            waiters.get(entry.position) if isinstance(entry, queue_view.WaitingBuild) else None)) is not None]
-    unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
+    unmatched_priority_lines: list[str] = []
     queued_priority_units: list[str] = []
     if isinstance(explanation.priority, admission_records.QueuePriority):
-        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
-                      for entry in explanation.priority.entries}
-        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
-        matched_units: set[str] = set()
+        entries = explanation.priority.entries
+        matched: set[int] = set()
         for work_row in (*work_rows, *waiting_rows):
-            if work_row["unit"] in priorities:
-                work_row["priority_text"] = priorities[work_row["unit"]]
-                work_row["priority_entries"] = [entry for entry in explanation.priority.entries
-                                                if entry["unit"] == work_row["unit"]]
-                matched_units.add(work_row["unit"])
-        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
-        unmatched_priority_entries = [entry for entry in explanation.priority.entries if entry["unit"] not in matched_units]
+            covering = [index for index, entry in enumerate(entries) if priority_covers_row(entry, work_row["unit"], work_row)]
+            if covering:
+                work_row["priority_lines"] = [head_facts.priority_entry_text(entries[index]) for index in covering]
+                work_row["priority_entries"] = [entries[index] for index in covering]
+                matched.update(covering)
+        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if "priority_entries" in row))
+        unmatched_priority_entries = [entry for index, entry in enumerate(entries) if index not in matched]
+        unmatched_priority_lines = [head_facts.priority_entry_text(entry) for entry in unmatched_priority_entries]
     if waiting_rows:
         head_pid = waiting_rows[0]["pid"]
         if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -3341,8 +3361,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
-        "unmatched_priority_text": unmatched_priority_text,
         "unmatched_priority_entries": unmatched_priority_entries,
+        "unmatched_priority_lines": unmatched_priority_lines,
         "mac_idle_alert": "\n".join(text for text in (
             mac_idle.view_alert_line(time.time(), zone,
                 block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",

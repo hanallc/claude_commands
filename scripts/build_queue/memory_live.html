@@ -587,6 +587,10 @@ function field(label, value, kind = 'field', group = false) {
 function staffField(label, names) {
   return {...field(label, names.join(', ')), valueStaffNames: names};
 }
+// Each bump line names the unit or the one run, the actor that asked, and the user's words.
+function priorityFields(entries, lines) {
+  return [staffField('Priority', entries.map(entry => entry.unit)), ...(lines || []).map(line => field('Bump', line))];
+}
 function staffTitle(name, value, suffix = '') {
   return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
 }
@@ -989,7 +993,7 @@ function stepTooltip(key, data) {
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
   rows.push(...ownerFields(row), ...detailFields, ...stepFields);
-  if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
+  if (row.priority_entries?.length) rows.push(...priorityFields(row.priority_entries, row.priority_lines));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
@@ -1066,7 +1070,7 @@ function tooltipRows(key, data) {
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
-    rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
+    rows.push(...priorityFields(data.unmatched_priority_entries, data.unmatched_priority_lines));
   return rows;
 }
 function tooltipHtml(key, data) {
@@ -1959,8 +1963,7 @@ function renderWalk(d) {
     cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass);
     const reason = w.order_note
       || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
-    const note = [reason, w.job_start && `job started ${w.job_start}`].filter(Boolean).join(" · ");
-    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, note)}` +
+    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, reason)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });

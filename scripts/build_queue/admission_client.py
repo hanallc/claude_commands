@@ -25,7 +25,7 @@ import shlex
 import subprocess
 import sys
 from types import TracebackType
-from typing import TYPE_CHECKING, Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
 import uuid
 
 from scripts.build_queue import execution_identity
@@ -50,6 +50,14 @@ from scripts.lib.atomic_file import write_text_atomic
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()
+
+type QueueReadWait = Literal["page read", "command read"]
+"""How long a queue read waits for an answer.
+
+A page read waits `query_timeout_seconds`, so the Builds page does not hang.
+A command read waits `silence_seconds`, so a typed command waits while a live service is slow.
+Both fail at once when the service is down.
+"""
 
 
 class ClientClock(Protocol):
@@ -393,7 +401,9 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest,
+           wait: QueueReadWait = "page read") -> wire.Reply:
+    """Send one query. `wait` sets the read limit; a placement call ignores it and waits while a live service is slow."""
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
@@ -403,7 +413,8 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-    timeout = records.read_memory_config().query_timeout_seconds
+    configuration = records.read_memory_config()
+    timeout = configuration.silence_seconds if wait == "command read" else configuration.query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
     try:
         with _connect(_remaining_seconds(deadline)) as connection:
@@ -639,9 +650,9 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
     return records.BuildHistoryGeneration(reply.generation)
 
 
-def view() -> records.QueueRead | wire.CloudQueueRead:
+def view(wait: QueueReadWait = "page read") -> records.QueueRead | wire.CloudQueueRead:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    reply = _query(wire.ViewRequest())
+    reply = _query(wire.ViewRequest(), wait)
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
     records.warn_configuration_diagnostics(reply.reading.diagnostics)
@@ -1623,12 +1634,14 @@ def move_queue(request: wire.QueueMoveRequest | wire.QueueUndoRequest, timeout: 
     raise CheckerFailure("invalid queue move answer")
 
 
-def priority_set(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
-    return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor))
+def priority_set(unit: str, why: str | wire.WordsNotGiven, actor: str,
+                 target: wire.WholeUnit | wire.OneRun = wire.WHOLE_UNIT) -> wire.Ok | wire.Refused:
+    return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor, target))
 
 
-def priority_clear(actor: str, unit: str = "") -> wire.Ok | wire.Refused:
-    return _mutation(wire.PriorityClearRequest(uuid.uuid4().hex, actor, unit))
+def priority_clear(actor: str, unit: str = "",
+                   why: str | wire.WordsNotGiven = wire.WORDS_NOT_GIVEN) -> wire.Ok | wire.Refused:
+    return _mutation(wire.PriorityClearRequest(uuid.uuid4().hex, actor, unit, why))
 
 
 def token_wait(reservation: str, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
@@ -2055,7 +2068,7 @@ class ClientArguments(argparse.Namespace):
     session_id: str = ""
     reservation: str = ""
     value: int = 0
-    why: str = ""
+    words: str | wire.WordsNotGiven = wire.WORDS_NOT_GIVEN
     unit: str = ""
     pid: int = 0
     since: float = 0.0
@@ -2303,7 +2316,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("view", "explain", "down-alert", "priority-clear", "code-version", "check-nested"):
+    for name in ("view", "explain", "down-alert", "code-version", "check-nested"):
         _ = subcommands.add_parser(name)
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
@@ -2354,7 +2367,9 @@ def main(argv: list[str] | None = None) -> int:
             _ = mutation.add_argument("value", type=int)
     priority_parser = subcommands.add_parser("priority-set")
     _ = priority_parser.add_argument("unit")
-    _ = priority_parser.add_argument("--why", default="the user's bump")
+    clear_parser = subcommands.add_parser("priority-clear")
+    for words_parser in (priority_parser, clear_parser):
+        _ = words_parser.add_argument("--words", default=wire.WORDS_NOT_GIVEN, help="the user's words")
     args = parser.parse_args(argv, namespace=ClientArguments())
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
@@ -2410,8 +2425,8 @@ def main(argv: list[str] | None = None) -> int:
         result = (view() if args.command == "view" else explain() if args.command == "explain" else
                   mine(args.session_id) if args.command == "mine" else width(args.reservation, args.value)
                   if args.command == "width" else token_wait(args.reservation, saved_cleanup_timing()) if args.command == "token-wait" else
-                  priority_set(args.unit, args.why, command_actor()) if args.command == "priority-set" else
-                  priority_clear(command_actor()))
+                  priority_set(args.unit, args.words, command_actor()) if args.command == "priority-set" else
+                  priority_clear(command_actor(), why=args.words))
         if isinstance(result, wire.Refused):
             return 2
         print(wire.encode_record(result))
