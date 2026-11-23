@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, tzinfo
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
@@ -978,6 +979,31 @@ class MemoryWaitRow(WaitRow):
     order_note: NotRequired[str]
 
 
+class HeldPlaceRow(TypedDict):
+    """The place of a run that ended in its first step or while it waited. It waits for the next run of its unit."""
+
+    kind: Literal["held"]
+    key: str
+    unit: UnitCell
+    since: float
+    text: str
+    text_parts: list[staff_names.NamePart]
+    failed_run: str
+
+
+def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlaceRow:
+    """Show a held place with no machine and no memory, in the user zone."""
+    def clock(moment: float) -> str:
+        return datetime.fromtimestamp(moment, zone).strftime("%H:%M")
+
+    unit = public_queue_text(place.unit)
+    ended = "First step failed" if place.ended == "failed" else "First step ended without a result"
+    parts = staff_names.text_parts(f"{ended} at {clock(place.failed_at)}. The place waits for the next run of ",
+                                   staff_names.StaffReference(unit), f" until {clock(place.ends_at)}.")
+    return {"kind": "held", "key": place.failed_run, "unit": StaffUnitName(unit) if unit else "", "since": place.since,
+            "text": staff_names.parts_text(parts), "text_parts": parts, "failed_run": place.failed_run}
+
+
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     kind: Literal["mac-build"]
     repository: str
@@ -1124,6 +1150,8 @@ class MemoryPage(TypedDict):
     swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
+    # Held places show among the waiters in arrival order; the page places them by since.
+    held_places: list[HeldPlaceRow]
     move_revision: NotRequired[str]
     swap_by: list[SwapRow]
     priority_text: str
@@ -3055,6 +3083,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                     ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
+        elif waiter.took_place:
+            waiters[place]["order_note"] = f"Took the place of its {waiter.took_place} run."
         if member is not None:
             waiters[place]["move"] = member
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
@@ -3217,6 +3247,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                  "outside_bytes": swap.used - swap.builds_ci,
                  "reserve_share_percent": explanation.policy.agent_swap_share_percent},
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
+        "held_places": [held_place_row(place, zone) for place in sorted(parsed.held_places, key=lambda place: place.since)],
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,

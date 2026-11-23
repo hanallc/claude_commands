@@ -1166,6 +1166,8 @@ class WaitingStep:
     ci_runner: str = field(default="", kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
+    # "failed" or "waiting": the run took the place of an older run of its unit (rules 13 and 20).
+    took_place: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1408,6 +1410,44 @@ class QueueInputs:
         object.__setattr__(self, "ordered", [(path, stored_waiter(row)) for path, row in self.ordered])
 
 
+# The test jobs take each other's place (rules 13 and 20); every other job matches on its exact name.
+TEST_JOB_FAMILY = frozenset({"test-affected", "test-modules", "test-all", "verify-test"})
+
+
+def run_job_name(job: StepJob | GateJobNotRecorded, verify: VerifyStep) -> str:
+    """Name the job of a run's first request as build_steps.conf does, or give "" for a run with no job."""
+    if isinstance(job, StepJob):
+        return f"verify-{job.step}" if job.step in VERIFY_VERBS else job.step
+    if isinstance(verify, VerifyCall):
+        return f"verify-{verify.verb}"
+    return ""
+
+
+def place_kind(job: str) -> str:
+    """Runs of one unit and repository take each other's place when their jobs have the same kind."""
+    return "test" if job in TEST_JOB_FAMILY else job
+
+
+# "failed": the first step released with a status other than 0. "no_result": its owner ended with no release.
+HeldPlaceEnd = Literal["failed", "no_result"]
+
+
+@dataclass(frozen=True)
+class HeldPlace:
+    """The arrival time of a run that ended in its first step, kept for the next run of its unit and job kind."""
+    unit: str
+    repository: str
+    job: str
+    since: float
+    failed_at: float
+    ends_at: float
+    # The run_owner key of the run that ended.
+    failed_run: str
+    machines: tuple[str, ...]
+    replaces: int
+    ended: HeldPlaceEnd
+
+
 @dataclass(frozen=True)
 class QueueRead:
     """The queue reading holds its view, explanation, ordered waiters, and diagnostics."""
@@ -1415,6 +1455,7 @@ class QueueRead:
     explanation: QueueExplanation
     ordered: list[tuple[Path, RankedWaiter]]
     diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+    held_places: tuple[HeldPlace, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1515,6 +1556,19 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
             print(diagnostic.diagnostic, file=sys.stderr)
 
 TEST_PHASE_MARGIN_FALLBACK = 1.2
+REPLACE_AFTER_FAIL_MAX_KEY = "replace_after_fail.max_times"
+
+
+@dataclass(frozen=True)
+class ReplaceAfterFail:
+    """Rule 20: how many times a failed first step keeps its place, and how long a held place waits."""
+    max_times: int
+    time_limit_seconds: float
+
+
+@dataclass(frozen=True)
+class ReplaceAfterFailNotRead:
+    """The configuration has no replace-after-fail settings, so no ended run keeps its place."""
 
 
 @dataclass(frozen=True)
@@ -1547,6 +1601,8 @@ class MemoryConfig:
     program_stop_seconds: float
     peak_wave_seconds: float
     free_floor_gib: int | None = field(default=None, kw_only=True)
+    replace_after_fail: ReplaceAfterFail | ReplaceAfterFailNotRead = field(
+        default=ReplaceAfterFailNotRead(), kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1661,7 +1717,10 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"),
                 free_floor_gib=whole("free_floor_gib")
-                    if settings_read.effective_key("free_floor_gib") in values else None)
+                    if settings_read.effective_key("free_floor_gib") in values else None,
+                replace_after_fail=ReplaceAfterFail(whole(REPLACE_AFTER_FAIL_MAX_KEY),
+                                                    whole("replace_after_fail.time_limit_minutes") * 60.0)
+                    if settings_read.effective_key(REPLACE_AFTER_FAIL_MAX_KEY) in values else ReplaceAfterFailNotRead())
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)

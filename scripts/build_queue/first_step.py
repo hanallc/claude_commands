@@ -47,11 +47,11 @@ class FirstStepAdmission:
         os.environ['BUILDLOG_PREPARED_COPY'] = str(tree)
         grant = self.grant
         if isinstance(grant, wire.Admitted):
-            answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing)
+            answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing, 'handed_off')
             if isinstance(answer, wire.Refused):
                 raise FirstStepRefused(answer.reason)
         elif isinstance(grant, wire.LocalPlacementGranted):
-            _ = client.finish_step(self.assignment_file, 0)
+            _ = client.finish_step(self.assignment_file, 0, ending='handed_off')
         elif isinstance(grant, wire.Assignment):
             destination = grant.assignment.destination
             os.environ['BUILDLOG_FIRST_STEP_ASSIGNMENT'] = str(self.assignment_file)
@@ -131,6 +131,9 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
                 elif isinstance(answer.wait, wire.PlacementResourceWait):
                     output.resource_wait(answer.wait)
                 events.wait(records.read_memory_config().waiting_pass_seconds)
+    except client.RunReplaced:
+        # The newer run holds this place now, so this run has no placement left to cancel.
+        raise
     except BaseException:
         _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, request.episode, request.owner,
             'the caller left before first-step admission'))
@@ -163,13 +166,16 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
         if word.startswith(('--type-dirs=', '--type-dir=')):
             arguments.extend(('--type-dirs', word.partition('=')[2]))
             break
+    unit = ''
     def refresh() -> wire.AdmitRequest:
+        nonlocal unit
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
+        unit = request.identity.unit
         return replace(request, identity=replace(request.identity, job=job))
     output = client.WaitOutput()
     answer = queue_place.request_place(queue_place.RefreshedRequest(refresh), output)
     if isinstance(answer, wire.Refused):
-        raise FirstStepRefused(answer.reason)
+        raise FirstStepRefused(client.replaced_line(answer.reason, unit) or answer.reason)
     if not isinstance(answer, wire.Admitted):
         raise FirstStepRefused('the caller left before first-step admission', 75)
     output.finished()

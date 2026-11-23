@@ -289,7 +289,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
-.wrow.wait .row-label .name { white-space: normal; }
+.wrow.wait .row-label .name, .wrow.held .row-label .name { white-space: normal; }
 .wrow:has(.queue-grip) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
@@ -321,6 +321,8 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
+/* A held place has no memory, so its text uses the full row. */
+.wrow.held .row-label { grid-column: 1 / -1; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
 .queue-title { display: flex; min-width: 0; white-space: nowrap; }
@@ -993,6 +995,7 @@ function tooltipRows(key, data) {
   data = shownReading(data);
   const [kind, index] = key.split(':');
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'held') return (data.held_places || []).filter(row => row.key === index).map(row => field('Failed run', row.failed_run));
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
@@ -1835,8 +1838,8 @@ function renderWalk(d) {
   const columnClasses = ["place", "done", "step", "duration", "verify", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
-  const waitingCount = d.waiters.length;
-  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const waitingCount = d.waiters.length, heldCount = d.held_places?.length || 0;
+  if (waitingCount || heldCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
   const title = d.move_revision ? "Waiting, in queue order"
     : !units.length ? "Queued, in order of submission"
@@ -1844,9 +1847,17 @@ function renderWalk(d) {
     : `Queued, ${units.join(" followed by ")} and then in submission order`;
   const titleHtml = d.move_revision || !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount + heldCount})</span></span></div>`);
   let localPosition = 0;
-  d.waiters.forEach((w, i) => {
+  queueRows(d.waiters, d.held_places || []).forEach((w, i) => {
+    if (w.kind === "held") {
+      // A held place has no machine and no memory.
+      const tip = `held:${w.key}`, first = i === 0 ? " wait-first" : "";
+      cells("", w.text, "", w.unit, null, "", null, tip, "", `wait held${first}`);
+      rows.push(`<div class="wrow held${first}" data-tip="${tip}"><span class="row-label"><span class="row-heading">` +
+        `<span class="name">${nameParts(w.text_parts)}</span></span></span></div>`);
+      return;
+    }
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
@@ -1878,6 +1889,16 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
+}
+
+// A held place shows among the waiting steps in arrival order.
+function queueRows(waiters, held) {
+  const rows = [], places = [...held];
+  for (const row of waiters) {
+    while (places.length && places[0].since <= row.since) rows.push(places.shift());
+    rows.push(row);
+  }
+  return [...rows, ...places];
 }
 
 function fitAxisLabels() {
@@ -1963,7 +1984,7 @@ function fitWalkDetails() {
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   // Running rows set the label column. A longer queued name wraps at a space, so only its widest word counts.
   const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")].flatMap(label =>
-    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
+    label.closest(".wrow.wait, .wrow.held") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
@@ -2150,7 +2171,9 @@ function placeMemoryBars(d) {
   placeDivider(roomRow, dividerTop);
   const dividerOffset = Math.floor(roomTrack.getBoundingClientRect().top) - dividerTop;
   for (const row of document.querySelectorAll(".wrow.wait-first")) {
-    placeDivider(row, Math.floor(row.querySelector(".track").getBoundingClientRect().top) - dividerOffset);
+    // A held place has no memory track, so its text sets the divider.
+    const anchor = row.querySelector(".track") || row.querySelector(".row-label");
+    placeDivider(row, Math.floor(anchor.getBoundingClientRect().top) - dividerOffset);
   }
 }
 

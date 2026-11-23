@@ -127,12 +127,57 @@ def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]
 
 
 @dataclass(frozen=True)
+class NoFirstStatus:
+    """The first step of the run has sent no release status."""
+
+
+NO_FIRST_STATUS = NoFirstStatus()
+
+
+@dataclass(frozen=True)
+class NotReplaced:
+    """No newer run of the unit took the place of this run."""
+
+
+NOT_REPLACED = NotReplaced()
+
+# The kind of run whose place a new run took: a run that ended in its first step, or a run that waited.
+TookPlace = Literal["", "failed", "waiting"]
+
+
+@dataclass(frozen=True)
+class UnitPlace:
+    """The run's place in the line of its unit and repository, which rules 13 and 20 use."""
+    repository: str
+    # The job of the run's first request; records.place_kind matches it.
+    job: str
+    machines: tuple[str, ...] = ()
+    # Granted reservations; a new grant of the first step, after a token gap, does not count again.
+    reservations: int = 0
+    first_step: str = ""
+    first_status: int | NoFirstStatus = NO_FIRST_STATUS
+    # How many times a place of a failed first step moved to a newer run of the unit.
+    replaces: int = 0
+    replaced_by: RunIdentity | NotReplaced = NOT_REPLACED
+    took_place: TookPlace = ""
+
+
+@dataclass(frozen=True)
+class OutsideUnitRules:
+    """Rules 13 and 20 do not apply: the run has no unit, or its unit is exempt."""
+
+
+OUTSIDE_UNIT_RULES = OutsideUnitRules()
+
+
+@dataclass(frozen=True)
 class RunPlace:
     """The run placement holds its identity, first owner, start time, and unit."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -264,12 +309,17 @@ class LaunchRequest(CallerCode):
     profile: records.StepProfile | records.ProgramProfile
 
 
+ReleaseEnding = Literal["result", "handed_off"]
+
+
 @dataclass(frozen=True)
 class ReleaseRequest(CallerCode):
     """The request releases a reservation with its final status."""
     request_id: str
     reservation: str
     status: int
+    # "handed_off": the grant only held the place until the command sent its own first step.
+    ending: ReleaseEnding = "result"
 
 
 @dataclass(frozen=True)
@@ -466,6 +516,7 @@ class Refused:
 
 
 PLACEMENT_REQUEST_MISSING_REASON = "placement request is missing"
+REPLACED_REASON = "a newer run of this unit took its place"
 
 
 @dataclass(frozen=True)
@@ -921,6 +972,6 @@ def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> N
 
 # JSON escapes one character into at most six ASCII bytes; include the newline.
 CLEANUP_REQUEST_MAX_BYTES = max(len(encode_request(ReleaseRequest(
-    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status,
+    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status, "handed_off",
     code_version="\0" * CLEANUP_STRING_MAX)).encode())
     for status in (CLEANUP_STATUS_MIN, CLEANUP_STATUS_MAX))

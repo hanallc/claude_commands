@@ -15,6 +15,7 @@ from enum import Enum, auto
 import os
 from pathlib import Path
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -471,10 +472,11 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
     return admission_client.service_admit(request, output)
 
 
-def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
+def release_place(reservation: str, status: int, timing: wire.CleanupTiming,
+                  ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
     """End a reservation with its holder's status. This is the one place that releases."""
     with cancellation.defer_cleanup_signals():
-        return admission_client.release(reservation, status, timing)
+        return admission_client.release(reservation, status, timing, ending)
 
 
 @dataclass
@@ -613,6 +615,7 @@ def shell_wait(args: ShellArguments) -> int:
                                          if args.wait_events else lambda _event: None)
     launching = args.command == "launch"
     outcome = "Refused"
+    replaced = ""
     try:
         owner_start = admission_records.process_start_time(args.pid)
         if owner_start is None:
@@ -622,9 +625,13 @@ def shell_wait(args: ShellArguments) -> int:
         since = args.since or admission_client.CLOCK.now()
         run = admission_client.parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
         step_argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        unit = ""
 
         def refresh() -> wire.AdmitRequest:
-            return admission_client.step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode, run=run)
+            nonlocal unit
+            request = admission_client.step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode, run=run)
+            unit = request.identity.unit
+            return request
 
         def refresh_launch() -> wire.LaunchRequest:
             request = refresh()
@@ -640,6 +647,9 @@ def shell_wait(args: ShellArguments) -> int:
             return 75
         if isinstance(grant, wire.Refused):
             output.deadline_reached = launching and grant.reason == admission_client.LAUNCH_WAIT_LIMIT_REASON
+            if (line := admission_client.replaced_line(grant.reason, unit)) is not None:
+                replaced = line
+                print(line, file=sys.stderr)
             return 2
         if args.shell_state is not None:
             try:
@@ -666,7 +676,8 @@ def shell_wait(args: ShellArguments) -> int:
             try:
                 with args.shell_state.open("a") as state:
                     _ = state.write(f"BUILDLOG_MEM_WAIT_S={output.elapsed_seconds()}\n"
-                                    + f"BUILDLOG_MEM_OUTCOME={outcome}\n")
+                                    + f"BUILDLOG_MEM_OUTCOME={outcome}\n"
+                                    + f"BUILDLOG_MEM_REPLACED={shlex.quote(replaced)}\n")
             except OSError:
                 pass
 
