@@ -789,6 +789,12 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
+    def test_a_targeted_run_without_the_natedev_module_list_fails_before_ssh(self) -> None:
+        result = mac_linux.route(self.repo, mode=SuiteMode.TARGETED, full=False, selected=ALL_MODULES,
+                                 module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
+        self.assertEqual(result, 'mac-linux: the targeted run has no module list from the natedev selection')
+        self.assert_guest_clean()
+
     def test_mac_claim_refuses_another_sessions_block(self) -> None:
         paths = claim_state.state_paths('mac')
         paths.directory.mkdir()
@@ -1486,6 +1492,20 @@ fi
 
         with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
+
+    def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
+        # A busy Mac can be silent for more than 30 s, so each hop waits the unreachable wait of 600 s.
+        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600)
+        command = settings.command('true')
+        alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
+        mac_hop = list(command[:-2])
+        guest_hop = shlex.split(command[-1])
+        guest_hop = guest_hop[:guest_hop.index('-l')]
+        self.assertEqual(command[-2], 'fixture-mac')
+        for hop in (mac_hop, guest_hop):
+            # ssh uses the first value of an option, so each hop names each keepalive option once.
+            self.assertEqual(hop[-4:], alive)
+            self.assertEqual([word for word in hop if word.startswith('ServerAlive')], alive[1::2])
 
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user

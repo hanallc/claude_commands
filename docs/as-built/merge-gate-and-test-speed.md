@@ -65,6 +65,10 @@ An assignment to `natedev` runs the gate on natedev.
 An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
 The AWS route refuses assigned gates that request type checks.
 An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
+For a targeted run, natedev selects the affected modules once, prints the `affected:` line, and sends that module list to the guest.
+The guest runs only the listed modules and does no selection. natedev refuses a guest result with a different module list.
+If natedev cannot select the modules (`GraphError`), it refuses the gate and the guest does not start.
+A full selection sends every module name. `--full` asks the guest for all modules.
 The gate reads the guest switch after it confirms the `mac-linux` assignment.
 If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
