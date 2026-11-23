@@ -120,12 +120,14 @@ def tool_folders(environment: Mapping[str, str]) -> list[Path]:
 
 def tools_refusal(checkout: Path, environment: Mapping[str, str]) -> str:
     """The refusal of a write bind that holds, or is in, a tool folder; empty for none. The run can write each
-    write bind, so it could change the check of the next run. The checkout comes first, before the build folder
-    model gives the output folder."""
-    tools = tool_folders(environment)
+    write bind, so it could change the check of the next run. The limit binds no path that is not bindable, so
+    only a bindable path is checked. The checkout comes first, before the build folder model gives the output
+    folder."""
+    tools, home = tool_folders(environment), home_folder(environment)
     for bind in write_binds(checkout, environment):
-        real = Path(os.path.realpath(bind))
-        if any(tool.is_relative_to(real) or real.is_relative_to(tool) for tool in tools):
+        real = Path(os.path.normpath(bind))
+        if bindable(bind, home, read=False) and any(tool.is_relative_to(real) or real.is_relative_to(tool)
+                                                    for tool in tools):
             return TOOLS_REFUSAL.format(bind=bind)
     return ""
 

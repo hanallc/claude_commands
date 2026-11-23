@@ -60,6 +60,17 @@ class FakePlace:
         return [argv[argv.index("--") + 1:] for argv in self.started]
 
 
+# The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
+BUILD_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR")
+
+
+def clear_build_variables(case: unittest.TestCase) -> None:
+    """Remove the build variables of the caller from os.environ until the test ends."""
+    _ = cast(object, case.enterContext(mock.patch.dict(os.environ)))
+    for name in BUILD_VARIABLES:
+        _ = os.environ.pop(name, None)
+
+
 def namespace_members(namespace: str) -> list[str]:
     """The pid of each process of this user in the pid namespace, such as pid:[4026532000]."""
     members: list[str] = []
@@ -170,6 +181,7 @@ class AttemptCase(unittest.TestCase):
                         ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                          "commit", "-q", "-m", "fixture"]):
             _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+        clear_build_variables(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_TARGET": "natedev"})))
         _ = self.enterContext(mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")))
@@ -394,8 +406,9 @@ class HandMadeTests(AttemptCase):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
-        # The read limit adds the socket of the private sccache server, and bwrap sets PWD to the checkout.
-        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES | {"SCCACHE_SERVER_UDS", "PWD"})
+        # The read limit adds the socket of the private sccache server and the cargo offline mode, and bwrap sets
+        # PWD to the checkout.
+        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES | {"SCCACHE_SERVER_UDS", "CARGO_NET_OFFLINE", "PWD"})
         self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"], program["SCCACHE_SERVER_UDS"]),
                          (os.environ["HOME"], os.environ["PATH"], "/tmp", "/tmp/sccache.sock"))
         self.assertLessEqual(shown.items(), program.items())

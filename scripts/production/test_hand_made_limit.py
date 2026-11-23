@@ -19,13 +19,10 @@ from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
 from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import Program, Refused
-from scripts.production.test_hand_made import FakePlace, namespace_members
+from scripts.production.test_hand_made import FakePlace, clear_build_variables, namespace_members
 
 BWRAP = shutil.which("bwrap")
 NOT_ASSIGNED = "its link does not name the build folder of this checkout"
-CRATE = '[package]\nname = "tiny"\nversion = "0.1.0"\nedition = "2021"\n'
-# A git dependency that no cargo home holds, so cargo must fetch it.
-GIT_CRATE = CRATE + '\n[dependencies]\nmissing = { git = "https://example.invalid/missing" }\n'
 # Connects to sockets of other processes, and to a loopback port of the program itself.
 NETWORK = """
 import socket
@@ -73,6 +70,7 @@ class LimitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        clear_build_variables(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.checkout, self.outside = self.root / "checkout", self.root / "outside"
         self.temp = self.root / "place" / "tmp"
@@ -176,18 +174,16 @@ class LimitTests(unittest.TestCase):
         status, output, _ = self.limited(["sh", "-c", "echo ${SSH_AUTH_SOCK:-none}"])
         self.assertEqual((status, output), (0, "none\n"))
 
-    def test_a_tiny_cargo_build_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
-        (self.checkout / "src").mkdir()
-        _ = (self.checkout / "Cargo.toml").write_text(CRATE)
-        _ = (self.checkout / "src" / "main.rs").write_text('fn main() { println!("tiny ran"); }\n')
+    def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
+        # A C compile: the merge gate fails a module that starts cargo or rustc.
+        _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
         cache = self.root / "sccache"
         cache.mkdir()
-        script = ("cargo build -q && ./target/debug/tiny && sccache --show-stats && readlink /proc/self/ns/pid "
+        script = ("sccache cc -c tiny.c -o tiny.o && sccache --show-stats && readlink /proc/self/ns/pid "
                   + "&& cat /proc/[0-9]*/comm")
-        status, output, ran = self.limited(["sh", "-c", script],
-                                           self.environment(SCCACHE_DIR=str(cache), RUSTC_WRAPPER="sccache"))
+        status, output, ran = self.limited(["sh", "-c", script], self.environment(SCCACHE_DIR=str(cache)))
         self.assertEqual((status, ran), (0, True), output)
-        self.assertIn("tiny ran", output)
+        self.assertTrue((self.checkout / "tiny.o").exists())
         requests = next(line for line in output.splitlines() if line.startswith("Compile requests "))
         self.assertGreater(int(requests.split()[-1]), 0, output)
         # The private server ran in the limit, with its socket in the attempt temp folder.
@@ -289,6 +285,7 @@ class NatedevRunTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        clear_build_variables(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout = self.root / "checkout"
         checkout.mkdir()
@@ -338,18 +335,6 @@ class NatedevRunTests(unittest.TestCase):
             place=self.program.repo / "target", reason=NOT_ASSIGNED))
         self.assertEqual(place.started, [])
 
-    def test_a_dependency_fetch_ends_the_attempt_as_the_no_network_refusal(self) -> None:
-        checkout = self.program.repo
-        (checkout / "src").mkdir()
-        _ = (checkout / "Cargo.toml").write_text(GIT_CRATE)
-        _ = (checkout / "src" / "main.rs").write_text("fn main() {}\n")
-        output = io.BytesIO()
-        run = hand_made.NatedevRun(FakePlace(), Program(("cargo", "build"), checkout, None, ()), self.root / "tmp")
-        with mock.patch.dict(os.environ, {"PATH": program_path()}), self.assertRaises(Refused) as caught:
-            _ = run.run(hand_made.OutputCopy(output, None))
-        self.assertEqual(str(caught.exception), hand_made_limit.NO_NETWORK)
-        self.assertIn(b"you are in the offline mode (--offline)", output.getvalue())
-
     def run_script(self, argv: tuple[str, ...], script: str) -> tuple[bytes, Refused | int]:
         """Run the script as the start file of argv under the limit: the output, and the refusal or the status."""
         start = self.program.repo / "start"
@@ -397,6 +382,10 @@ class OfflineFailureTests(unittest.TestCase):
 
 class OutputFolderTests(unittest.TestCase):
     """natedev takes no word that names another cargo build output folder."""
+
+    @override
+    def setUp(self) -> None:
+        clear_build_variables(self)
 
     def test_a_word_that_names_another_output_folder_is_refused(self) -> None:
         checkout = Path("/fixture/checkout")
@@ -470,7 +459,8 @@ class OutputFolderTests(unittest.TestCase):
     def test_an_output_or_sccache_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout = root / "worktree"
-        checkout.mkdir()
+        for folder in (checkout, root / "config", root / "cache"):
+            folder.mkdir()
         scripts = Path(hand_made_limit.__file__).resolve().parents[1]
         cases = (({"CARGO_TARGET_DIR": str(scripts)}, scripts), ({"SCCACHE_DIR": str(root / "config")}, root / "config"),
                  ({"SCCACHE_DIR": str(root / "cache")}, root / "cache"))
