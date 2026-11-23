@@ -49,7 +49,8 @@ On the Mac:
 - The program gets the Mac values of the natedev variable list below, the program `PATH`, and `MAC_PLACEMENT`. It gets no other variable.
 - The log and you get the Mac stderr with the stdout.
 - A Mac block of another session stops the Mac run before it starts, as for each other Mac kind.
-- The Mac fails before the start, and the run goes back, after a block, a failed copy, or an end with no start line, for example from a missing mirror folder.
+- The Mac fails before the start, and the run goes back, after a block, a failed copy, or a wrapper exit status with no start line, for example from a missing mirror folder.
+- When the connection ends before a start line or the wrapper exit status comes, the start is unknown. The attempt ends with an error, and the run does not go to another machine.
 - When the program started and the Mac gave no exit status, the attempt ends; the run does not go to another machine.
 - When the Mac work cannot be proved stopped, the attempt ends, and the queue keeps the Mac place until the attempt process ends.
 

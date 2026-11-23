@@ -324,6 +324,11 @@ class MacRun:
         lines.end(exited)
         if lines.refusal:
             raise Refused(f"the Mac refused the run: {lines.refusal}")
+        if not lines.started and not exited:
+            # The start line can be lost with the connection, so the program may have started, and the run does
+            # not go to another machine.
+            raise Refused(f"the Mac connection ended before a start line or an exit status came, so the start is "
+                          + f"unknown (ssh status {status})")
         if not lines.started:
             raise MachineFailed(f"the Mac did not start the program (status {status})")
         if not exited:

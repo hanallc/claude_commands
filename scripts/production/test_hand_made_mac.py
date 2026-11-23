@@ -271,11 +271,11 @@ class MacAttemptTests(AttemptCase):
         self.assertEqual((status, self.output.getvalue()), (0, b"mac ran\n"))
 
     def test_a_failed_mac_gives_the_run_back_to_natedev_and_the_row_names_it(self) -> None:
-        self.mac.lines, self.mac.exit = (), None
+        self.mac.lines, self.mac.exit = (), 1
         status, errors = self.mac_attempt(remote(), local_grant())
         self.assertEqual(status, 0)
-        self.assertEqual(self.mac.stops, [42])
-        self.assertEqual(self.line.given_back, [("mac", "the Mac did not start the program (status 255)")])
+        self.assertEqual(self.mac.stops, [])
+        self.assertEqual(self.line.given_back, [("mac", "the Mac did not start the program (status 1)")])
         self.assertEqual(self.line.closed, [("natedev", 0, "")])
         self.assertIn("the run goes back to the lines of the other machines", errors)
         row = self.only_row()
@@ -289,7 +289,7 @@ class MacAttemptTests(AttemptCase):
             _ = (self.repo / "check.py").write_text('print("changed")\n')
             return FakeMac.stream(self.mac, command, remote, ssh, write)
 
-        self.mac.lines, self.mac.exit = (), None
+        self.mac.lines, self.mac.exit = (), 1
         with mock.patch.object(self.mac, "stream", side_effect=change_then_fail):
             status, errors = self.mac_attempt(remote(), local_grant())
         self.assertEqual(status, hand_made.REFUSED_EXIT)
@@ -305,6 +305,16 @@ class MacAttemptTests(AttemptCase):
         self.assertEqual(self.mac.stops, [0])
         self.assertIn(hand_made_mac.STILL_LIVE, errors)
         self.assertEqual((self.line.given_back, self.line.closed, self.line.place.started), ([], [], []))
+
+    def test_a_lost_connection_before_the_start_line_gives_no_run_back(self) -> None:
+        self.mac.lines, self.mac.exit = (), None
+        status, errors = self.mac_attempt(remote(), local_grant())
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("so the start is unknown (ssh status 255)", errors)
+        self.assertEqual(self.mac.stops, [42])
+        self.assertEqual((self.line.given_back, self.line.place.started), ([], []))
+        self.assertEqual([machine for machine, _, _ in self.line.closed], ["mac"])
+        self.assertEqual(self.output.getvalue(), b"")
 
     def test_a_mac_that_started_the_program_and_lost_ssh_gives_no_run_back(self) -> None:
         self.mac.exit = None
