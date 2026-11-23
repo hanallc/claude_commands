@@ -375,6 +375,15 @@ def completion_close_evidence(row: staff.StaffRow, delivery: pass_recorder.Dispa
     return _saved_reply_evidence(receipt, reply_file)
 
 
+def stopped_pass_close_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
+                                run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    """Release an ended pass with no DONE; a DONE still needs its saved reply."""
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
+    if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted)):
+        return worker_panes.CloseAllowed()
+    return _saved_reply_evidence(receipt, reply_file)
+
+
 def _saved_reply_evidence(receipt: DispatchReceipt, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
     if isinstance(receipt, DispatchComplete):
         if not reply_file:
@@ -402,7 +411,10 @@ def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDel
     if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
         return worker_panes.Kept("a detached run result awaits a matching DONE")
     if require_completion and not isinstance(_saved_reply_evidence(receipt, reply_file), worker_panes.CloseAllowed):
-        return worker_panes.Kept("submitted pass awaits completion")
+        # A DONE with an unsaved reply is not a DONE wait: recovery must save that reply.
+        cause = (worker_panes.HoldCause.AWAITS_DONE if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted))
+                 else worker_panes.HoldCause.OTHER_CHECK)
+        return worker_panes.Kept("submitted pass awaits completion", cause)
     return worker_panes.CloseAllowed()
 
 
@@ -1330,6 +1342,7 @@ def answer(parent: StaffId, name: WorkerName, text: str, *, question: bool = Fal
         return ExitCode.OK
 
 
+@herdr.pane_evidence_run()
 def end(parent: StaffId, name: WorkerName, *,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
         retire: bool = True) -> ExitCode:
@@ -1338,9 +1351,11 @@ def end(parent: StaffId, name: WorkerName, *,
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.KEPT
-        row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        record = staff.snapshot()
+        row = worker_admission.find_worker(record, parent, name.value)
         if row is None:
             return ExitCode.OK
+        _cancel_passes_without_done(parent, row, record, hold)
         result = worker_panes.close(parent, name, lock=hold)
         if isinstance(result, worker_panes.Kept):
             print(result.blocker, file=sys.stderr)
@@ -1350,6 +1365,21 @@ def end(parent: StaffId, name: WorkerName, *,
         if retire:
             _ = staff.retire(row.id)
         return ExitCode.OK
+
+
+def _cancel_passes_without_done(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot,
+                                lock: worker_panes.WorkerLockHold) -> None:
+    """Cancel the passes of a stopped or closed worker that wait on a DONE no process can send."""
+    observed = worker_panes.observe_worker(parent, row, record)
+    if not isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+        return
+    rows = tuple(item for item in record.rows if item.kind != "worker" or item.reports_to(parent))
+    directories = worker_panes.worker_run_directories(replace(record, rows=rows))
+    detached = _worker_detached_work(record, directories, (row.id,))
+    state = _worker_dispatch_state(row, record, detached, lock)
+    if isinstance(state, worker_panes.DispatchHoldsWorker) and state.cause is worker_panes.HoldCause.AWAITS_DONE:
+        for run in detached.launcher_runs.by_worker[row.id]:
+            _ = progress_history.cancel_worker_passes(run, row.id)
 
 
 def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
@@ -2064,7 +2094,11 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
                 pane, displayed = _worker_pane_state(observed, dispatch)
                 status = work = displayed
             elif status not in ("paused", "exited"):
-                if isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                if (isinstance(dispatch, worker_panes.DispatchHoldsWorker)
+                        and dispatch.cause is worker_panes.HoldCause.AWAITS_DONE
+                        and isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))):
+                    status, work = "stopped", "idle"
+                elif isinstance(dispatch, worker_panes.DispatchHoldsWorker):
                     status, work = "active", "busy"
                 elif status == "active":
                     status = dispatch.value if isinstance(dispatch, worker_panes.ReleasedWorkerPass) else "completed"
@@ -2098,13 +2132,14 @@ def _worker_pane_state(state: worker_panes.WorkerPane,
             return "open", "busy"
         return "open", activity
     if isinstance(state, worker_panes.StoppedWorker):
-        pane, displayed = "open", "exited"
+        pane, displayed = "open", "stopped"
     elif isinstance(state, worker_panes.ClosedWorker):
         pane, displayed = "closed", "-"
     else:
         pane, displayed = "unknown", "-"
     if isinstance(dispatch, worker_panes.DispatchHoldsWorker) and session_state.staff_state(row) == "active":
-        return pane, "busy"
+        no_process = isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))
+        return pane, "stopped" if no_process and dispatch.cause is worker_panes.HoldCause.AWAITS_DONE else "busy"
     return pane, displayed
 
 
@@ -2167,7 +2202,7 @@ def _print_workers(listing: list[dict[str, object]], as_json: bool, record: staf
             pane = fields.get("pane", "-")
             state = fields["state"]
             if pane == "-":
-                state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
+                state = state if state in ("paused", "exited", "stopped") else "busy" if state == "active" else "idle"
             elif pane != "open":
                 account = "-"
             machine = f" ({machines[number - 1]})" if machines else ""

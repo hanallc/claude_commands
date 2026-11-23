@@ -209,9 +209,17 @@ class CloseAllowed:
     """The close checks permit closure; the pane remains open."""
 
 
+class HoldCause(Enum):
+    """Tell a DONE wait apart from every other hold."""
+
+    AWAITS_DONE = "the delivered pass has no DONE reply"
+    OTHER_CHECK = "another close check holds the worker"
+
+
 @dataclass(frozen=True)
 class Kept:
     blocker: str
+    cause: HoldCause = field(default=HoldCause.OTHER_CHECK, compare=False)
 
 
 @dataclass(frozen=True)
@@ -876,13 +884,25 @@ class RecordedCompletionEvidence(Protocol):
     def completion_close_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                                   run: Path, reply_file: str) -> CloseAllowed | Kept: ...
 
+    def stopped_pass_close_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
+                                    run: Path, reply_file: str) -> CloseAllowed | Kept: ...
+
     def pass_reply_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                             run: Path, reply_file: str, require_completion: bool,
                             detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
 
-def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
-    """Require the saved stage and its reply before a pass can release its evidence."""
+class RecordedPassClose(Enum):
+    SAVED_DONE = "require the DONE and its saved reply"
+    STOPPED_PANE = "release an ended pass with no DONE on a stopped pane"
+
+
+def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object],
+                              rule: RecordedPassClose = RecordedPassClose.SAVED_DONE) -> CloseAllowed | Kept:
+    """Require the saved stage and its reply before a pass can release its evidence.
+
+    On a stopped pane, an ended pass with no DONE releases: no process can send the DONE.
+    """
 
     delivery = pass_recorder.dispatch_delivery(passed)
     if not delivery.line or not delivery.completion_id:
@@ -890,7 +910,9 @@ def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, 
     completion = progress_history.hook_completion(passed)
     reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
     receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
-    return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
+    evidence = (receipts.stopped_pass_close_evidence if rule is RecordedPassClose.STOPPED_PANE
+                else receipts.completion_close_evidence)
+    return evidence(row, delivery, run=run, reply_file=reply_file)
 
 
 NO_FINAL_REPLY = "last turn does not end with an assistant reply"
@@ -908,6 +930,7 @@ def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
 @dataclass(frozen=True)
 class DispatchHoldsWorker:
     blocker: str
+    cause: HoldCause = field(default=HoldCause.OTHER_CHECK, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1029,7 +1052,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, Kept):
-            return DispatchHoldsWorker(hold.blocker)
+            return DispatchHoldsWorker(hold.blocker, hold.cause)
         if active:
             return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
@@ -1094,7 +1117,9 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
             return Kept(f"agent state is {worker.status.value}")
         delivery = pass_recorder.dispatch_delivery(passed)
         if delivery.line:
-            completion = recorded_completion_close(worker.row, directory, passed)
+            rule = (RecordedPassClose.STOPPED_PANE if isinstance(worker, StoppedWorker)
+                    and passed.get("status") in ("canceled", "interrupted") else RecordedPassClose.SAVED_DONE)
+            completion = recorded_completion_close(worker.row, directory, passed, rule)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
         elif isinstance(hook, progress_history.HookCompletion) and hook.outcome in ("done", "late DONE"):

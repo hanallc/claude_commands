@@ -4723,7 +4723,7 @@ class WorkerCommandTests(unittest.TestCase):
         numbers = [str(number) for number in range(1, 11)]
         self.assertEqual(output, [[number, row.name, "-", "impl", "closed", "-", "-"]
                                  for number, row in zip(numbers, members, strict=True)])
-        cases = (("idle", "idle"), ("working", "busy"), ("stopped", "exited"),
+        cases = (("idle", "idle"), ("working", "busy"), ("stopped", "stopped"),
                  ("paused", "paused"), ("exited", "exited"), ("unknown", "unknown"))
         columns = [["-", "impl", "closed", "-", "-"] for _ in members]
         _ = staff.set_home(members[6].id, staff.SessionHome(self.fixture.root / ".codex2"))
@@ -4774,7 +4774,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(code, 0, errors)
                 account = "codex (mac)" if machine == "mac" else "codex"
                 rows = {cells[1]: cells[2:] for cells in output}
-                self.assertEqual(rows[members[2].name], [account, "impl", "open", "exited", "-"])
+                self.assertEqual(rows[members[2].name], [account, "impl", "open", "stopped", "-"])
                 code, output_json, errors = self.command("list", "all", "--json")
                 self.assertEqual(code, 0, errors)
                 self.assertEqual(json.loads(output_json), json.loads(json_before))
@@ -4939,6 +4939,74 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.fixture.world.locations)
         self.assertIn("w1:p0", self.fixture.world.locations)
         self.assertEqual(worker.end(self.fixture.parent.id, staff.WorkerName.parse("impl")), worker.ExitCode.OK)
+
+    def submitted_without_done(self, name: str, pane_state: Literal["working", "stopped", "closed"]) -> staff.StaffRow:
+        """Leave a delivered pass with no DONE on a working, stopped or closed pane."""
+        self.agent.without_done = True
+        self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "impl", self.prompt,
+            session_dir=self.run_dir, slot=name, phase="8", kind="impl", launcher_command=["assign.sh"],
+            reply=self.run_dir / f"{name}.md"), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        if pane_state == "working":
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+        else:
+            self.assertTrue(self.fixture.world.stop(row, self.fixture.world))
+        if pane_state == "closed":
+            self.fixture.world.remove_pane(pane)
+        return row
+
+    def pass_status(self, name: str) -> object:
+        fields = cast(dict[str, dict[str, dict[str, object]]],
+                      json.loads((self.run_dir / "progress_history_state.json").read_text()))
+        return fields["pass"][name]["status"]
+
+    def test_end_cancels_and_retires_a_stopped_or_closed_worker_that_waits_on_done(self) -> None:
+        pane_states: tuple[Literal["stopped", "closed"], ...] = ("stopped", "closed")
+        for pane_state in pane_states:
+            with self.subTest(pane_state=pane_state):
+                name = f"impl-{pane_state}"
+                row = self.submitted_without_done(name, pane_state)
+                self.assertEqual(self.pass_status(name), "active")
+                with redirect_stderr(io.StringIO()) as errors:
+                    code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+                self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
+                self.assertIsNone(staff.by_id(row.id))
+                self.assertEqual(self.pass_status(name), "canceled")
+
+    def test_end_keeps_an_open_working_worker_and_a_live_detached_run(self) -> None:
+        for case in ("working", "detached"):
+            with self.subTest(case=case), ExitStack() as context:
+                name = f"impl-{case}"
+                row = self.submitted_without_done(name, "working" if case == "working" else "stopped")
+                if case == "detached":
+                    path, record = self.detached_record(row, name, run=worker_panes.worker_run(row, record=staff.snapshot()))
+                    record.update(status="running", pid=101)
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+
+                    def supervises(pid: int, _path: Path) -> bool:
+                        return pid == 101
+
+                    _ = context.enter_context(patch.object(detached_run_process, "supervises", side_effect=supervises))
+                    _ = context.enter_context(patch.object(detached_run_process, "supervisor_records",
+                                                           return_value={path.resolve(): frozenset({101})}))
+                with redirect_stderr(io.StringIO()) as errors:
+                    code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+                self.assertIs(code, worker.ExitCode.KEPT)
+                self.assertIn("detached run is live" if case == "detached" else "submitted pass awaits completion",
+                              errors.getvalue())
+                self.assertEqual(staff.by_id(row.id), row)
+                self.assertEqual(self.pass_status(name), "active")
+
+    def test_list_all_shows_a_worker_that_waits_on_done_without_a_process_as_stopped(self) -> None:
+        pane_states: tuple[Literal["stopped", "closed"], ...] = ("stopped", "closed")
+        rows = {pane_state: self.submitted_without_done(f"impl-{pane_state}", pane_state) for pane_state in pane_states}
+        for scope in ((), ("--all-parents",)):
+            with self.subTest(scope=scope):
+                code, output, errors = self.text_command("list", "all", *scope)
+                self.assertEqual(code, 0, errors)
+                states = {cells[1]: cells[5] for cells in output}
+                self.assertEqual(states, {row.name: "stopped" for row in rows.values()})
 
     def test_check_distinguishes_resumable_workers_from_unknown_evidence(self) -> None:
         opened = self.opened()

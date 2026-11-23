@@ -2288,6 +2288,30 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
         self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Closed)
 
+    def test_ended_delivered_pass_without_done_allows_a_stopped_pane_to_close(self) -> None:
+        for index, status in enumerate(("canceled", "interrupted"), start=1):
+            with self.subTest(status=status):
+                row = self.worker(f"impl-{status}")
+                self.world.add(row, f"w1:p{index}", live=False)
+                self.dispatch(row, "impl")
+                dispatch = "dispatch-" + row.name
+                prompt = f"End your final reply with DONE {dispatch}."
+                run = self.root / "run"
+                progress_history.save_dispatch_delivery(run, dispatch, pass_recorder.DispatchDelivery(
+                    prompt, dispatch, str(self.root / "reply"), "", progress_history.NO_COMPLETION_ACTIONS))
+                path = run / "progress_history_state.json"
+                fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+                fields["pass"][row.name]["status"] = status
+                write_text_atomic(path, json.dumps(fields))
+                source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                with source.open("a") as stream:
+                    _ = stream.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
+                observed = self.observation(row)
+                assert isinstance(observed, worker_panes.StoppedWorker)
+                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+                self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)),
+                                      worker_panes.Closed)
+
     def test_launcher_can_close_its_own_completed_turn_while_it_holds_the_lock(self) -> None:
         opened = self.start()
         assert isinstance(opened, worker_panes.OpenWorker)
