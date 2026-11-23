@@ -34,6 +34,7 @@ from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store
 from scripts.lib import conf, process_group, process_start
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -922,7 +923,7 @@ fi
             f'# range: 0.01..\nquery_timeout_seconds={timeout}\n', encoding='utf-8')
         start = mac_linux.run_start_line('stream-attempt')
         program = f'import sys; print({start!r}, file=sys.stderr); print("reply")'
-        address = str(self.root / 'report.sock')
+        address = str(Path(self.enterContext(short_socket_directory())) / 'report.sock')
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as queue:
             queue.bind(address)
             queue.listen()
