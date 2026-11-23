@@ -382,12 +382,12 @@ class ArmedGuestAttempt:
 
 
 class GuestNoAnswer(GuestUnavailable):
-    """The guest did not answer before it armed a run, so nothing ran there."""
+    """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
 
 
 @dataclass(frozen=True)
 class GuestNotStarted:
-    """The guest took no run: the Mac refused the claim, or the guest gave no answer before the arm."""
+    """The guest took no run: the Mac refused the claim, the guest did not arm, or no test started."""
 
     reason: str
 
@@ -802,6 +802,8 @@ class GuestReply:
     bundle_bytes: int
     bundle_form: BundleForm
     bundle_reason: BundleReason
+    stream_report: str
+    tests_started: bool
 
 
 @contextmanager
@@ -950,12 +952,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             first_error = first_raised(first_error, error)
 
     assert end is not None
-    diagnostics = stream.stderr.decode(errors='replace') if stream is not None and stream.returncode else ''
-    detail = ' '.join(diagnostics.split())[-1200:]
     if not end.proven:
         error = end.unreachable()
-        if detail:
-            error.add_note(detail)
+        if stream is not None and stream.returncode:
+            error.add_note(stream_report(stream))
         raise error
 
     cleanup_detail = end.cleanup_detail()
@@ -963,13 +963,28 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
+    diagnostics = stream.stderr.decode(errors='replace')
+    tests_started = run_start_line(request['attempt']) in diagnostics
     if stream.returncode:
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
-        raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}. '
-                               + cleanup_detail)
+        raise guest_failure(tests_started, f'{stream_report(stream)}. {cleanup_detail}')
     result, _, count = stream.stdout.rstrip().rpartition(b'\n')
-    return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), send.form, send.reason)
+    return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), send.form, send.reason,
+                      stream_report(stream), tests_started)
+
+
+def stream_report(stream: subprocess.CompletedProcess[bytes]) -> str:
+    """The exit status and the last 1200 characters of the standard error of the guest stream."""
+    detail = ' '.join(stream.stderr.decode(errors='replace').split())[-1200:]
+    return f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}'
+
+
+def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
+    """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
+    if tests_started:
+        return GuestUnavailable(reason)
+    return GuestNoAnswer(f'the guest stopped before a test started: {reason}')
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1156,6 +1171,13 @@ class MacLinuxGateRun(GateRun):
 
 
 def completed_run(reply: GuestReply, request: GuestRequest, source: CandidateSource) -> MacLinuxGateRun:
+    try:
+        return reply_run(reply, request, source)
+    except route_errors() as error:
+        raise guest_failure(reply.tests_started, f'the guest reply is unusable ({error}); {reply.stream_report}') from error
+
+
+def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource) -> MacLinuxGateRun:
     row = ledger.mapping(cast(object, json.loads(reply.result)))
     for key in ('attempt', 'commit', 'tree', 'origin_main'):
         if row.get(key) != request[key]:
@@ -1405,9 +1427,7 @@ def run_guest(request_path: Path) -> int:
                 if request['type_dirs']:
                     environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
                 # The -c entry selects the numbered copy as the Python checkout.
-                command = ['./scripts/lib/py', '-X', f'cpu_count={request["jobs"]}',
-                           '-c', 'import runpy, sys; runpy.run_path(sys.argv[1], run_name="__main__")',
-                           str(Path(__file__).resolve()), str(request_path), '--run-copy']
+                command = gate_entry_command(request['jobs'], Path(__file__).resolve(), request_path)
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
             if 'argv' in request:
@@ -1415,6 +1435,16 @@ def run_guest(request_path: Path) -> int:
             return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy.path, env=environment,
                                   stdin=subprocess.DEVNULL, check=False,
                                   pass_fds=build_folders.held_build_folder_descriptors()).returncode
+
+
+def gate_entry_command(jobs: int, runner: Path, request_path: Path) -> list[str]:
+    """Run the runner in the numbered copy with the argv [runner, request, --run-copy].
+
+    Python gives a -c entry the argv ['-c', *arguments], so the entry removes '-c' before it runs the runner.
+    """
+    return ['./scripts/lib/py', '-X', f'cpu_count={jobs}',
+            '-c', 'import runpy, sys; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")',
+            str(runner), str(request_path), '--run-copy']
 
 
 def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
@@ -1454,6 +1484,8 @@ def run_copy(request_path: Path) -> None:
     selection = request['selection']
     machine = gate.WholeMachine(gate_parent=build_folders.ExplicitBuildParent(Path(os.environ['TMPDIR'])))
     token = copies.COMMAND_LOCKS.set(descriptors)
+    # natedev reads this line: a failure before it lets natedev take the gate.
+    print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
     try:
         with build_folders.inherit_build_lock(RUN_LOCK_FD), redirect_stdout(sys.stderr):
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],

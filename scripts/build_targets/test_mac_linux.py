@@ -285,10 +285,28 @@ if sys.argv[-1] == '--run-copy':
     gate = module_from_spec(spec)
     sys.modules[spec.name] = gate
     spec.loader.exec_module(gate)
-path = sys.argv[2]
-sys.argv = sys.argv[2:]
-runpy.run_path(path, run_name='__main__')
+entry = sys.argv[2:]
+if entry[0] == '-c':
+    # Python sets sys.argv to ['-c', *arguments] for a -c entry.
+    sys.argv = ['-c', *entry[2:]]
+    exec(entry[1], {'__name__': '__main__'})
+else:
+    sys.argv = entry
+    runpy.run_path(entry[0], run_name='__main__')
 '''
+
+
+class GuestEntryTests(unittest.TestCase):
+    def test_gate_entry_gives_the_runner_the_request_and_the_run_copy_word(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        runner = root / 'runner.py'
+        _ = runner.write_text("import json, sys\nprint(json.dumps(sys.argv))\n"
+                              + "print(sys.argv[2:] == ['--run-copy'])\n", encoding='utf-8')
+        request = root / 'request.json'
+        command = mac_linux.gate_entry_command(1, runner, request)
+        output = subprocess.run(command, cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+                                check=True, timeout=30).stdout.splitlines()
+        self.assertEqual(output, [f'["{runner}", "{request}", "--run-copy"]', 'True'])
 
 
 class MacLinuxSandboxTests(unittest.TestCase):
@@ -530,7 +548,7 @@ candidate="$PWD"
 options=()
 if [[ "$1" == "-X" ]]; then
     options=("$1" "$2")
-    shift 4
+    shift 2
 fi
 """
         self.executable(self.repo / 'scripts/lib/py', shim
@@ -1412,13 +1430,36 @@ fi
         self.assertIn('Guest cleanup: ended', str(result))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
+        # Without Chromium on the guest PATH, the runner stops before a test starts.
+        (self.root / 'bin/chromium').unlink()
+        self.assertIsNone(shutil.which('chromium'))
+        reason = self.not_started(self.route())
+        self.assertRegex(reason, r'^mac-linux: not started: the guest stopped before a test started: '
+                         + r'SSH or source stream exited 1: .*Chromium is absent from the guest PATH')
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_unusable_reply_names_the_exit_status_and_the_stderr_tail(self) -> None:
+        reply = mac_linux.GuestReply('', 1, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN,
+                                     'SSH or source stream exited 0: fixture stderr tail', False)
+        source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', frozenset(), ModuleCoverage.COMPLETE)
+        request = cast(mac_linux.GuestRequest, cast(object, {}))
+        with self.assertRaises(mac_linux.GuestNoAnswer) as before:
+            _ = mac_linux.completed_run(reply, request, source)
+        self.assertEqual(str(before.exception), 'the guest stopped before a test started: the guest reply is unusable '
+                         + '(Expecting value: line 1 column 1 (char 0)); SSH or source stream exited 0: fixture stderr tail')
+        with self.assertRaises(mac_linux.GuestUnavailable) as after:
+            _ = mac_linux.completed_run(replace(reply, tests_started=True), request, source)
+        self.assertNotIsInstance(after.exception, mac_linux.GuestNoAnswer)
+        self.assertEqual(str(after.exception), 'the guest reply is unusable (Expecting value: line 1 column 1 '
+                         + '(char 0)); SSH or source stream exited 0: fixture stderr tail')
+
     def test_copy_can_retry_after_a_partial_upload(self) -> None:
         main = self.guest_home / '.claude'
         self.assertIsInstance(self.route(), GateRun)
         _ = (self.repo / 'scripts/fixture/test_added.py').touch()
-        result = self.route('disconnect')
-        self.assertIsInstance(result, str)
-        self.assertIn('SSH or source stream exited', str(result))
+        reason = self.not_started(self.route('disconnect'))
+        self.assertIn('the guest stopped before a test started: SSH or source stream exited 1:', reason)
         self.assertEqual((main / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
         self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
