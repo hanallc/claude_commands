@@ -61,23 +61,25 @@ with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
     finally:
         audit()
 '''
-COPY_DETACHED_RUN = '''import argparse, os, sys
+COPY_DETACHED_RUN = '''import json, os, sys, time
 from pathlib import Path
 from unittest import mock
 from scripts.agents import detached_runs
 
 root = Path(os.environ['EXPECTED_CHECKOUT'])
 record_path = root / 'detached.json'
-record = dict(status='running', pid=os.getpid(), session_dir=str(root), worker='fixture-test',
-              staff_id='fixture-staff', log=str(root / 'detached.log'),
-              command=[sys.executable, *sys.argv[1:]])
+# The supervisor saves the record itself, so the probe keeps a real record file.
+_ = record_path.write_text(json.dumps(dict(
+    run_id='detached', status='running', session_dir=str(root), worker='fixture-test',
+    staff_id='fixture-staff', label='copy imports', command=[sys.executable, *sys.argv[1:]],
+    log=str(root / 'detached.log'), started_at=time.time(), pid=os.getpid(),
+    director_dir=str(root), done_message_file=str(root / 'done.md'))))
 # Simulate a supervisor that inherited the root from an older launcher.
 os.environ['PYTHONPATH'] = str(Path(__file__).parent)
-with (mock.patch.object(detached_runs, '_read_record', side_effect=lambda path: record.copy()),
-      mock.patch.object(detached_runs, '_write_record', side_effect=lambda path, value: record.update(value) or value),
-      mock.patch.object(detached_runs, '_finish_record'),
+with (mock.patch.object(detached_runs, '_finish_record'),
       mock.patch.object(detached_runs, 'deliver_in_fresh_process', return_value=0)):
     status = detached_runs.main(['supervise', str(record_path)])
+record = json.loads(record_path.read_text())
 print(Path(record['log']).read_text())
 assert status == 0 and record['exit_code'] == 0, record
 '''

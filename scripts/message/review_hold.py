@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Generator
@@ -50,11 +51,37 @@ class UnconfirmedRelease(Enum):
     NO_RECEIPT = "no delivery receipt"
 
 
+class NoNewMessage(Enum):
+    OUTSIDE_THE_BATCH = "the new message is not in this batch"
+
+
+@dataclass(frozen=True)
+class HeldFileAppend:
+    """The held messages file and its sizes before and after this release appended to it."""
+
+    path: Path
+    size_before: int
+    size_after: int
+
+
+class NothingFiled(Enum):
+    NOT_FILED = "nothing written to the held messages file"
+
+
 @dataclass
 class ReleasedMessages:
-    messages: tuple[ReviewMessage, ...]
+    to_file: tuple[ReviewMessage, ...]
     held: tuple[ReviewMessage, ...] = ()
+    new_message: ReviewMessage | NoNewMessage = NoNewMessage.OUTSIDE_THE_BATCH
     accepted_at: float | UnconfirmedRelease = UnconfirmedRelease.NO_RECEIPT
+    filed: HeldFileAppend | NothingFiled = NothingFiled.NOT_FILED
+
+    @property
+    def messages(self) -> tuple[ReviewMessage, ...]:
+        """Every message this batch delivers."""
+        if isinstance(self.new_message, NoNewMessage):
+            return self.to_file
+        return (*self.to_file, self.new_message)
 
 
 @dataclass(frozen=True)
@@ -95,6 +122,15 @@ def _read_count(count: Path) -> int:
 
 def _state_file(count: Path) -> Path:
     return count.parent / ".holds" / (count.name + ".json")
+
+
+def _held_file(count: Path) -> Path:
+    return count.parent / ".holds" / (count.name + ".held.md")
+
+
+def held_file(session: str) -> Path:
+    """The file that receives this session's released review messages."""
+    return _held_file(_count_file(session))
 
 
 @contextmanager
@@ -185,14 +221,20 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
         return True
 
 
-def sent_line(at: datetime) -> str:
+def _zone_time(at: datetime, form: str, *, unreadable: str) -> str:
+    """Give the time in the user zone; on an unreadable zone, print `unreadable` and the error."""
     try:
         zone = user_zone()
     except (OSError, ValueError) as error:
-        print("send.py: Sent line omitted: " + " ".join(str(error).split())[:300], file=sys.stderr)
+        print(f"{unreadable}: " + " ".join(str(error).split())[:300], file=sys.stderr)
         return ""
     local = at.astimezone(zone)
-    return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
+    return f"{local:{form}} {local.tzname() or zone.key}"
+
+
+def sent_line(at: datetime) -> str:
+    time = _zone_time(at, "%H:%M", unreadable="send.py: Sent line omitted")
+    return f"\nSent: {time}" if time else ""
 
 
 MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
@@ -204,7 +246,8 @@ def quote_sender_lines(text: str) -> str:
     return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
 
 
-def render(messages: tuple[ReviewMessage, ...]) -> str:
+def numbered_entries(messages: tuple[ReviewMessage, ...]) -> str:
+    """Number the messages in sent order with sender, Sent line, reply address and text."""
     entries: list[str] = []
     for item in sorted(messages, key=lambda item: item.sent):
         stamp = sent_line(datetime.fromtimestamp(item.sent, timezone.utc)).replace("\n", "\n   ")
@@ -212,7 +255,49 @@ def render(messages: tuple[ReviewMessage, ...]) -> str:
         body = "\n".join("   " + line for line in quote_sender_lines(item.text).splitlines())
         native_id = " ".join(item.native_id.splitlines())
         entries.append(f"{len(entries) + 1}. {sender}{stamp}\n   Sender native id: {native_id}\n{body}")
-    return "Messages from the review\n\n" + "\n\n".join(entries)
+    return "\n\n".join(entries)
+
+
+def held_notice(count: int, path: Path, header: str) -> str:
+    if count == 1:
+        return f'1 held message from the review in {path}, under "{header}". Read it at your own pace.'
+    return f'{count} held messages from the review in {path}, under "{header}". Read them at your own pace.'
+
+
+def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
+    """Append the batch's held part to the held messages file and give the notice that names it."""
+    if not isinstance(batch.filed, NothingFiled):
+        raise RuntimeError(f"review hold: this batch is already in {batch.filed.path}")
+    messages = batch.held if batch_only else batch.to_file
+    if not messages:
+        return ""
+    target = _held_file(count)
+    released = datetime.fromtimestamp(at, timezone.utc)
+    header = "Released at " + (_zone_time(released, "%H:%M:%S", unreadable="review hold: release time in UTC")
+                               or f"{released:%H:%M:%S} UTC")
+    with _locked(_state_file(count)):
+        descriptor = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            size_before = os.fstat(descriptor).st_size
+            text = ("\n" if size_before else "") + f"{header}\n\n{numbered_entries(messages)}\n"
+            remaining = memoryview(text.encode("utf-8", errors="replace"))
+            try:
+                while remaining:
+                    remaining = remaining[os.write(descriptor, remaining):]
+            except BaseException:
+                # A partial write leaves no part of this release in the file.
+                os.ftruncate(descriptor, size_before)
+                raise
+            size_after = os.fstat(descriptor).st_size
+        finally:
+            os.close(descriptor)
+    batch.filed = HeldFileAppend(target, size_before, size_after)
+    return held_notice(len(messages), target, header)
+
+
+def file_release(session: str, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
+    """Append the batch's held part to the session's held messages file before its notice goes out."""
+    return _file_release(_count_file(session), batch, at, batch_only=batch_only)
 
 
 def _end_review(path: Path, state: ReviewState) -> ReviewState:
@@ -253,6 +338,9 @@ def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                     print(f"review hold: cannot record the delivered keys: {error}", file=sys.stderr)
             try:
                 with _locked(path):
+                    filed = batch.filed
+                    if isinstance(accepted_at, UnconfirmedRelease) and isinstance(filed, HeldFileAppend):
+                        _remove_undelivered(filed)
                     state = _read_state(count, path)
                     messages = state.messages
                     if isinstance(accepted_at, UnconfirmedRelease):
@@ -266,11 +354,24 @@ def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                 print(f"review hold: cannot settle the delivery: {error}", file=sys.stderr)
 
 
+def _remove_undelivered(filed: HeldFileAppend) -> None:
+    """Cut an undelivered release from the file, unless the file changed after the append."""
+    try:
+        size = filed.path.stat().st_size
+        if size != filed.size_after:
+            print(f"review hold: {filed.path} changed after the append ({size} bytes, not {filed.size_after});"
+                  + " the undelivered messages stay in it", file=sys.stderr)
+            return
+        os.truncate(filed.path, filed.size_before)
+    except OSError as error:
+        print(f"review hold: cannot remove the undelivered messages from {filed.path}: {error}", file=sys.stderr)
+
+
 def _emit_saved(count: Path, path: Path, held: tuple[ReviewMessage, ...], at: float,
                 emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
     if held:
         with _settle_release(count, path, ReleasedMessages(held, held), record_keys) as batch:
-            emit(render(held))
+            emit(_file_release(count, batch, at, batch_only=True))
             batch.accepted_at = at
 
 
@@ -337,6 +438,8 @@ def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_
             state = _read_state(count, path)
             if not (state.messages or state.reserved):
                 return
+            if _hold_open(count, state, at, conf.read("send")):
+                return
             held = _reserve(path, _end_review(path, state), delivery)
         _emit_saved(count, path, held, at, emit, record_keys)
 
@@ -365,7 +468,8 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
     if count.exists() or path.exists():
         with ExitStack() as delivery:
             held: tuple[ReviewMessage, ...] = ()
-            messages: tuple[ReviewMessage, ...] = ()
+            to_file: tuple[ReviewMessage, ...] = ()
+            new_message: ReviewMessage | NoNewMessage = NoNewMessage.OUTSIDE_THE_BATCH
             with _locked(path):
                 settings = conf.read("send")
                 if _enabled(settings):
@@ -382,14 +486,16 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
                         held = _reserve(path, _end_review(path, state), delivery)
                         if held:
                             if not include_new:
-                                messages = held
+                                to_file = held
                             elif urgent:
-                                messages = (*[item for item in held if not message.key or item.key != message.key], message)
+                                to_file = tuple(item for item in held if not message.key or item.key != message.key)
+                                new_message = message
                             else:
-                                repeated = message.key and any(item.key == message.key for item in held)
-                                messages = held if repeated else (*held, message)
+                                to_file = held
+                                if not (message.key and any(item.key == message.key for item in held)):
+                                    new_message = message
             if held:
-                with _settle_release(count, path, ReleasedMessages(messages, held), record_keys) as batch:
+                with _settle_release(count, path, ReleasedMessages(to_file, held, new_message), record_keys) as batch:
                     yield batch
                     return
     yield ReleasedMessages(())

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -75,17 +75,15 @@ class BrpLaunchGateTests(unittest.TestCase):
             **os.environ,
             "HOME": str(self.root),
             "XDG_CACHE_HOME": str(self.root / "cache"),
-            "BUILD_HOLD_DIR": str(holders),
-            "BUILD_HOLD_RELEASE_DIR": str(release),
-            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(HOOK.parent.parent / "build_targets" / "build_targets.py"),
             **fake_memory_readings(self.root),
+            # The fixture drops the owner around the test and names its own owner.
+            # A real hook call always has an owner, because Claude Code sends the session_id.
+            **gate_isolation_environment(self.root),
             "BUILDLOG_MEM_POLL_S": "0.01",
-            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
-            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILDLOG_DIR": str(self.root / "buildlog"),
         }
         _ = self.environment.pop("CLAUDE_PYTHON", None)

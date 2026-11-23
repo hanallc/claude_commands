@@ -18,8 +18,10 @@ from unittest import mock
 
 
 from scripts.style import style_plan
+from scripts.agents import detached_runs
 from scripts.direct import progress_history
 from scripts.direct.assign_launcher_test_support import AssignLauncherFixture, invoke_assignment
+from scripts.herdr import pass_notices
 from scripts.style import style_ledger
 from scripts.whoami import quota_state
 
@@ -362,23 +364,22 @@ class TicketWorkerTests(AssignLauncherFixture):
             instance = str(ticket_pass()["instance_id"])
             progress_history.complete_dispatch(self.session_dir, slot, instance, status="error")
             self.native.agent.notice_failures = 1
-            with self.assertRaises(style_ledger.LedgerError):
-                restore("7")
-            self.assertEqual(self.native.agent.notice_failures, 0)
-            self.assertEqual(self.turn_starts, 2)
-            self.assertEqual(self.native.agent.notices, [])
-            failed = ticket_pass()
-            self.assertEqual((failed["instance_id"], failed["status"]), (instance, "error"))
-            self.assertNotIn("hook_notice", failed)
-
             restore("7")
+            self.assertEqual(self.native.agent.notice_failures, 1)
             self.assertEqual(self.turn_starts, 3)
-            notice, = self.native.agent.notices
-            self.assertIn(f"; pass {instance}", notice)
+            self.assertEqual(self.native.agent.notices, [])
             successor = ticket_pass()
             self.assertNotEqual(successor["instance_id"], instance)
             self.assertEqual(successor["status"], "active")
             self.assertIn(f"DONE {successor['instance_id']}", self.turn_inputs[-1])
+
+            _ = detached_runs.reap_orphans(str(self.session_dir))
+            self.assertEqual(self.native.agent.notice_failures, 0)
+            self.assertFalse(pass_notices.is_settled(self.session_dir, instance, "done"))
+            _ = detached_runs.reap_orphans(str(self.session_dir))
+            notice, = self.native.agent.notices
+            self.assertIn(f"; pass {instance}", notice)
+            self.assertTrue(pass_notices.is_settled(self.session_dir, instance, "done"))
 
             restore("7")
             self.assertEqual(self.turn_starts, 3)

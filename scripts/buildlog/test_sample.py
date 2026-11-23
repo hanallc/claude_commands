@@ -620,6 +620,8 @@ class SampleTests(unittest.TestCase):
             "stack.enter_context(patch.object(sample, 'IO_PRESSURE', proc / 'io_pressure')); "
             "stack.enter_context(patch.object(sample, 'STAT', proc / 'stat')); "
             "stack.enter_context(patch.object(sample, 'POWER_PROFILE_STATE', proc / 'absent-profile')); "
+            "from scripts.buildlog import machine_facts; "
+            "stack.enter_context(patch.object(machine_facts, 'sample_once')); "
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(

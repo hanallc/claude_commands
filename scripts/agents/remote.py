@@ -12,7 +12,8 @@ import socket
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from threading import Lock
+from typing import Literal, TypedDict, final
 
 from scripts.lib import conf
 
@@ -62,6 +63,7 @@ class WhileLinkAlive(TypedDict):
 
 RemoteCallLimit = TimeLimit | WhileLinkAlive
 STANDARD_TIME_LIMIT: TimeLimit = {"kind": "time limit", "seconds": 120.0}
+STATUS_STAFF_STDIN = "AGENTS_STATUS_STAFF_STDIN"
 
 
 def local_machine() -> str:
@@ -82,36 +84,69 @@ def other_machine() -> str:
     return next(workstation.alias for workstation in _workstations() if workstation.platform != platform)
 
 
+@final
+class RemoteCallCancellation:
+    """Stop and reap one SSH child if its caller fails."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._cancelled = False
+        self._child: subprocess.Popen[str] | None = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            child = self._child
+            if child is None or child.poll() is not None:
+                return
+            child.terminate()
+            try:
+                _ = child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                _ = child.wait()
+
+    def run(
+        self, command: list[str], stdin: str, timeout: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        with self._lock:
+            if self._cancelled:
+                return subprocess.CompletedProcess(command, 255, "")
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True)
+            self._child = child
+        with child:
+            try:
+                output, errors = child.communicate(stdin, timeout=timeout)
+            except BaseException:
+                child.kill()
+                raise
+            return subprocess.CompletedProcess(command, child.returncode, output, errors)
+
+
 def run_remote(
     args: list[str],
     stdin: str = "",
     limit: RemoteCallLimit = STANDARD_TIME_LIMIT,
+    *,
+    cancellation: RemoteCallCancellation | None = None,
 ) -> tuple[int, str]:
     """Run shutdown.py remotely, trusting its explicit trailer rather than ssh's status."""
     arguments = " ".join(shlex.quote(argument) for argument in args)
     remote_command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/agents/shutdown.py"'
+    if args[:1] == ["status"] and "--here" in args and stdin:
+        remote_command = f"{STATUS_STAFF_STDIN}=1 {remote_command}"
     if arguments:
         remote_command += f" {arguments}"
     remote_command += '; printf "rc=%s\\n" $?'
     try:
         command = ["ssh", "-o", "BatchMode=yes", other_machine(), remote_command]
-        if limit["kind"] == "time limit":
-            completed = subprocess.run(
-                command,
-                input=stdin,
-                capture_output=True,
-                text=True,
-                timeout=limit["seconds"],
-                check=False,
-            )
+        timeout = limit["seconds"] if limit["kind"] == "time limit" else None
+        if cancellation is None:
+            completed = subprocess.run(command, input=stdin, capture_output=True,
+                                       text=True, timeout=timeout, check=False)
         else:
-            completed = subprocess.run(
-                command,
-                input=stdin,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            completed = cancellation.run(command, stdin, timeout)
     except subprocess.TimeoutExpired:
         return 255, ""
     except OSError:

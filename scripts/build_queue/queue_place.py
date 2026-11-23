@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
 import os
@@ -29,7 +29,11 @@ from scripts.build_queue import program_start as startup
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
+from scripts.lib.release_waiter import local_release_waiter
 import uuid
+
+
+DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,8 @@ def no_hold_wait() -> None:
 
 
 def in_builds_slice() -> bool:
+    if sys.platform != "linux":
+        return False
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
     except OSError:
@@ -90,7 +96,7 @@ def suite_scope_prefix() -> list[str]:
     if os.environ.get("BUILDLOG_SCOPE") == "0":
         print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
         return []
-    if in_builds_slice():
+    if not os.environ.get(DETACHED_SLICE_ENV) and in_builds_slice():
         print("Module scope skipped: gate already runs in builds.slice", flush=True)
         return []
     return probe_scope_prefix()
@@ -98,8 +104,11 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
+    if sys.platform != "linux":
+        return []
+    slice_name = os.environ.get(DETACHED_SLICE_ENV) or "builds.slice"
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
+              "--expand-environment=no", f"--slice={slice_name}", "--"]
     try:
         probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=10, check=False)
@@ -109,7 +118,7 @@ def probe_scope_prefix() -> list[str]:
     if probe.returncode:
         print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
         return []
-    print("Module scope: builds.slice", flush=True)
+    print(f"Module scope: {slice_name}", flush=True)
     return prefix
 
 
@@ -293,6 +302,7 @@ class QueuePlace:
     configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
+    reservation: HeldReservation | UnreservedProgram = field(default_factory=UnreservedProgram, kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def publish_sample(self, suffix: str, value: str) -> None:
@@ -314,7 +324,21 @@ class QueuePlace:
                 self.publish_sample(".wave", f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
+    def child_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Mark children that run under this reservation."""
+        child = dict(environment)
+        if isinstance(self.reservation, HeldReservation):
+            grant = self.reservation.grant
+            directory = Path(grant.max_path).parent.resolve()
+            socket_path = wire.admission_socket_path().resolve()
+            cpu_pool = admission_client.cpu_pool_path().resolve()
+            child[admission_client.RESERVED_STEP_ENV] = (
+                f"{grant.reservation}\t{os.getpid()}\t{directory}\t{socket_path}\t{cpu_pool}")
+        return child
+
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
+        if sys.platform != "linux":
+            raise QueuePlaceRefused("a queued program requires Linux")
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
         if self.arguments and tuple(argv) != self.arguments:
@@ -322,6 +346,9 @@ class QueuePlace:
         if not popen_arguments.get("start_new_session", True):
             raise QueuePlaceRefused("a queued program must start in its own process group")
         popen_arguments["start_new_session"] = True
+        if isinstance(self.reservation, HeldReservation):
+            environment = popen_arguments.get("env")
+            popen_arguments["env"] = self.child_environment(os.environ if environment is None else environment)
         prefix: list[str] = []
         if self.purpose not in (ProgramPurpose.PROBE, ProgramPurpose.RUNNER) and os.environ.get("BUILDLOG_SCOPE") != "0":
             with redirect_stdout(sys.stderr):
@@ -455,6 +482,65 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
     return admission_client.service_admit(request, output)
 
 
+def local_context(local: wire.AdmitRequest) -> wire.LocalAdmissionContext:
+    """The local part of a placement request: what a local grant admits."""
+    return wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call, local.test_width,
+                                      local.fresh_test, local.token_back_at)
+
+
+PlacementEnd = wire.LocalPlacementGranted | wire.Assignment | wire.DispatchStatus | admission_client.LeftQueue
+
+
+def refreshed_placement(request: wire.PlacementRequest, local: wire.LocalAdmissionContext) -> wire.PlacementRequest:
+    """The request with a new estimate for its local part. A program profile stays; a step profile comes from argv."""
+    profile = (request.profile if isinstance(request.profile, admission_records.ProgramProfile)
+               else admission_records.INFER_FROM_ARGV)
+    refreshed = admission_client.step_request(list(local.argv), local.cwd, wire.Owner(request.owner.pid, request.owner.start_time),
+                                              request.since, local.sidecar, request.episode, profile, run=request.run)
+    return replace(request, profile=refreshed.profile, local=local_context(refreshed))
+
+
+def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> PlacementEnd:
+    """Send the placement request until the queue gives it a machine or ends its episode.
+
+    An expired estimate rebuilds the local part of the request with refreshed_placement. An answer that
+    gives no machine, and an error, cancel the episode with cancel_reason.
+    """
+    output = admission_client.WaitOutput()
+    directory = store.root() / "admission"
+    try:
+        with admission_client.placement_acquisition(), local_release_waiter(directory, directory,
+                wake_files=(directory / "state.json", directory / "queue.json")) as events:
+            while True:
+                events.arm()
+                answer = admission_client.acquire_placement(request)
+                if isinstance(answer, admission_client.LeftQueue):
+                    break
+                output.placement_notices(answer, placement_events=False)
+                if isinstance(answer, (wire.Assignment, wire.LocalPlacementGranted)):
+                    output.finished(left=isinstance(answer, wire.Assignment))
+                    return answer
+                if isinstance(answer, wire.DispatchStatus):
+                    break
+                if isinstance(answer.wait, wire.Wait):
+                    output(answer.wait)
+                    cause = answer.wait.reason
+                    if isinstance(cause, admission_records.HeadAdmissionStatus):
+                        cause = cause.cause
+                    if isinstance(request.local, wire.LocalAdmissionContext) and isinstance(cause, admission_records.EstimateExpired):
+                        request = refreshed_placement(request, request.local)
+                elif isinstance(answer.wait, wire.PlacementResourceWait):
+                    output.resource_wait(answer.wait)
+                events.wait(admission_records.read_memory_config().waiting_pass_seconds)
+    except BaseException:
+        _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, request.episode, request.owner,
+                                                                   cancel_reason))
+        raise
+    _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, request.episode, request.owner,
+                                                               cancel_reason))
+    return answer
+
+
 def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
     """End a reservation with its holder's status. This is the one place that releases."""
     with cancellation.defer_cleanup_signals():
@@ -478,18 +564,53 @@ def held_reservation(request: QueueRequest, *,
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):
         raise QueuePlaceRefused("left the admission queue")
-    output.finished()
     held = HeldReservation(reply)
     try:
+        output.finished()
         yield held
     finally:
         _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
 
 
+@dataclass(frozen=True)
+class PlaceSetup:
+    """A queue place before its grant: its folder, its sidecar and the request for its reservation.
+
+    request is None for a program that takes no reservation.
+    """
+    folder: Path
+    sidecar: Path
+    configuration: admission_records.MemoryConfig
+    purpose: ProgramPurpose
+    arguments: tuple[str, ...]
+    request: Callable[[], wire.AdmitRequest] | None
+
+    @contextmanager
+    def place(self, grant: HeldReservation | UnreservedProgram) -> Generator[QueuePlace]:
+        """Start the program in the place of the grant, and stop what is left of it at the end."""
+        sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
+                       else self.folder / "program")
+        place = QueuePlace(sample_path, self.sidecar, configuration=self.configuration, purpose=self.purpose,
+                           arguments=self.arguments, reservation=grant)
+        failed = False
+        try:
+            yield place
+        except BaseException as error:
+            failed = True
+            place.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
+                            error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
+            raise
+        finally:
+            with cancellation.defer_cleanup_signals():
+                place.finish(failed=failed)
+                if isinstance(grant, HeldReservation):
+                    grant.status = place.status
+
+
 @contextmanager
-def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False,
+                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK
+                ) -> Generator[PlaceSetup]:
     """Use full commands for purpose selection; retain named batch reservations.
 
     A complete Cargo command sizes from its step history, as each Cargo step does.
@@ -517,14 +638,12 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     cleanup_program_starts(config)
     cleanup_queue_place_folders()
     pid = os.getpid()
-    start = admission_records.process_start_time(pid)
-    if start is None:
+    if admission_records.process_start_time(pid) is None:
         raise QueuePlaceRefused("owner no longer exists")
-    # The reservation ends before its folder: the service can read the sidecar until release.
-    with queue_place_folder() as temporary, ExitStack() as reservation:
+    with queue_place_folder() as temporary:
         sidecar = temporary / "program.cgroup"
         atomic_file.atomic_sample(sidecar, "")
-        grant: HeldReservation | UnreservedProgram = UnreservedProgram()
+        request: Callable[[], wire.AdmitRequest] | None = None
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
             profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
@@ -533,25 +652,25 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             if start is None:
                 raise QueuePlaceRefused("owner no longer exists")
             owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+
             def refresh() -> wire.AdmitRequest:
                 return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
-            grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))
-        sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
-                       else temporary / "program")
-        place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
-        failed = False
-        try:
+            request = refresh
+        yield PlaceSetup(temporary, sidecar, config, purpose, arguments, request)
+
+
+@contextmanager
+def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
+                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+    """Wait for the reservation of the program in the queue, and hold it while the program runs."""
+    # The reservation ends before its folder: the service can read the sidecar until release.
+    with place_setup(program, repo, batch=batch, sizing=sizing) as setup, ExitStack() as reservation:
+        grant: HeldReservation | UnreservedProgram = UnreservedProgram()
+        if setup.request is not None:
+            grant = reservation.enter_context(held_reservation(RefreshedRequest(setup.request), before_check=before_check))
+        with setup.place(grant) as place:
             yield place
-        except BaseException as error:
-            failed = True
-            place.status = (128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else
-                            error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
-            raise
-        finally:
-            with cancellation.defer_cleanup_signals():
-                place.finish(failed=failed)
-                if isinstance(grant, HeldReservation):
-                    grant.status = place.status
 
 
 class ShellArguments(argparse.Namespace):

@@ -242,6 +242,7 @@ Unknown liveness keeps the request and reports the cause.
 Both commands name each file with a decode error and continue with valid files.
 Legacy reports supply display data only.
 Both commands show a fresh batch command for an off-target legacy member.
+The command uses `--group` when the legacy report names a group.
 `retry` starts a new move for each saved request that still needs a move.
 The journal writer rolls back an incomplete append before it releases the journal lock.
 The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
@@ -510,6 +511,16 @@ A shell with another session's retained launch stays unchanged; recovery opens a
 A registry error during pending admission returns `ResumeFailed` and preserves the record.
 Without pending admission, a registry error permits the generic resume lookup.
 The [upkeep service](herdr-restore.md#restore-services) recovers admitted producers after server loss or reboot.
+`agents stop NAME`, `agents stop --all`, and local producer exit save an exit hold before the stop.
+If the stop fails, the command restores the previous hold.
+A remote producer exit saves a pause before the stop and changes it to an exit hold after confirmation.
+If the exit hold write fails, the pause keeps the producer stopped.
+The staff row stores the hold. The restart record keeps the producer's fixed ID for `agents restart`.
+Upkeep checks the hold under the producer's row lock. It reports the skipped producer once per run.
+`agents resume` and `agents restart` clear the hold after the producer starts or a live process confirms it already runs.
+Resume in the producer's own pane clears the hold before `execvpe`, so upkeep can retry if the new agent exits.
+A saved restart ID alone does not block upkeep. A crash without an exit hold remains eligible for recovery.
+Accepted limit: a storage fault after the hold write (a failed directory sync, or an unreadable staff record during rollback) can leave a running producer with a hold. Upkeep then does not recover it after a crash; `agents resume NAME` clears the hold.
 
 ## Worker resume results
 
@@ -935,3 +946,57 @@ A surviving run keeps its memory queue place and its age.
 A new process does not take over the place of a dead waiter.
 
 A session restart is not a machine restart. A reboot or power-off can end local supervisors and waiting processes.
+
+## Reboot
+
+Run `agents reboot` from a terminal outside Herdr. The command refuses inside a Herdr pane.
+The shared Herdr session must have the name `agents`.
+
+1. Save and stop the local sessions through `agents stop --all`.
+2. Stop Herdr only when a fresh read finds no live or unidentified agent.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/session_move.py`.
+4. Restore the server and the saved sessions through `agents restart`.
+
+The server stop uses `herdr --session agents server stop`.
+
+Before the first step, the command runs `session_move.py --dry-run` through the same Python shim.
+The plan gives the size of idle folders and counts live folders to size after the stop.
+Use `agents reboot --dry-run` to see the plan without running the four steps.
+If session move returns an error, the plan reports that it is incomplete and omits the totals. The dry run returns status 1.
+
+The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
+The reboot also holds `reboot.lock` exclusively beside the shared Herdr server socket across the four steps.
+The common Herdr launcher takes a shared lock before it creates a pane.
+The direct Herdr start for a producer reservation takes the same lock.
+A lock refusal reports that a reboot is running.
+Nested starts in one process use the same open lock file, including starts in the reboot's restart step.
+The Herdr server start functions take the same shared lock before they can start a server.
+Manual starts through a pane command, `accounts.py exec`, `cli_agent.sh`, or native Herdr can bypass the lock.
+A shell wrapper can start an agent after a resume times out, and a fork without exec can retain the lock.
+All staff tooling shares one `XDG_CONFIG_HOME`, because a process with a different config home locks a different file.
+A slow Ghostty window or pending Linux service can start the server after its shared lock closes and reboot takes the exclusive lock.
+A remote attach started during a reboot can start the server through the Herdr SSH bridge without the lock. Attach after the reboot prints its Attach line.
+The `agents resume` command holds the lock while it changes staff or recovery records.
+The direct resume API also holds the lock for starts in an existing pane.
+The `agents restart` and `agents move` commands hold the lock while they save restart or move records.
+The `agents add-producer` and `agents transfer` commands hold the lock while they change producer state.
+Dry runs can read state during a reboot.
+The Nix healer takes the shared lock before it saves a launch reservation.
+If reboot holds the lock, the healer keeps the stop record and resumes the session on its next available sweep.
+A failed stop, server stop, or restart leaves the next step in `agents/reboot/reboot.json` under the user state folder.
+Run `agents reboot` again to continue at that step.
+A retry at the server stop checks for resumed sessions. Step 1 saves and stops those sessions and keeps the earlier restart entries.
+If an interrupt ends the reboot, the report lists the saved sessions that still need a restart.
+A folder move failure permits restart to proceed.
+The final report names the failed copy folder if available and assigns the move failure to the verify owner.
+
+The first output line gives the log path in the folder set by `REBOOT_LOG_FOLDER`.
+The default log folder is `~/.local/state/agents/reboot/`.
+The command adds the time to each log line. It keeps older logs and sets `latest.log` to the most recent run.
+A terminal shows each step on one line with an elapsed time and a spinner.
+Stop and restart progress includes the current session name.
+The report counts completed sessions and reads the current total under one lock.
+Output to a pipe uses one line for each name and omits the spinner.
+The move step shows the `session_move` summary. The per-folder refusal details go to the log.
+The report names sessions or workers that need a step and says whether Nate must act.
+The last line gives the command `herdr session attach agents`.

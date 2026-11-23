@@ -26,6 +26,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, worker
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 
@@ -346,7 +347,7 @@ class RelaunchTests(ShutdownTestCase):
             + "{k:v for k,v in os.environ.items() if k.startswith('SHOWRUNNER_') or k in ('STAFF_ID','CLAUDE_CODE_SESSION_ID')}}))\n")
         program.chmod(0o700)
         environment = {"HOME": str(self.root), "PATH": os.defpath, "HERDR_ENV": "1",
-            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2", "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2", "HERDR_BIN": MISSING_HERDR_BIN,
             "HERDR_PANE_RECORD_DIR": str(self.root / "panes"), "SHUTDOWN_STATE_DIR": str(self.state)}
         native = {"CLAUDE_CODE_SESSION_ID": "2d058b83-b9da-46fd-9e87-877cd3f50a52"}
         marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha", **native}

@@ -19,6 +19,7 @@ from scripts.agents import remote
 from scripts.production import log_backup, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("log_backup.py")
@@ -52,7 +53,7 @@ class LogBackupTests(unittest.TestCase):
         self.write_doc("running")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN,
             "SHOWRUNNER_STATE_DIR": str(self.state),
         })))
         owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
