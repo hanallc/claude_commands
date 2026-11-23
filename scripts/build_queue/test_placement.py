@@ -48,6 +48,7 @@ SUBMITTING_SESSION = OwningSession("submitting-session")
 ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
 FIXTURE_MAC_SCOPE = RepositoryScope("hana")
+SCALER_TARGET_NAME = "claude-aws"
 
 
 # The mac_test settings these tests depend on. A tune of the repository settings must not change a test.
@@ -172,6 +173,36 @@ def mac_linux_and_natedev_request(fixture: PlacementFixture, *, natedev: bool = 
     request = placement_request(fixture)
     candidates = (guest, local_candidate(fixture)) if natedev else (guest,)
     return replace(request, constraints=replace(request.constraints, candidates=candidates))
+
+
+def register_scaler(fixture: PlacementFixture) -> placement.PlacementCandidate:
+    """Add the proposed AWS scaler target to the private registry."""
+    registry = fixture.root / "build_targets.conf"
+    names = conf.read(registry).text("targets")
+    _ = write_config_fixture(
+        registry,
+        f"targets={SCALER_TARGET_NAME},{names}\n"
+        + f"kind.{SCALER_TARGET_NAME}=scaler\n"
+        + f"enabled.{SCALER_TARGET_NAME}=on\n"
+        + f"settings.{SCALER_TARGET_NAME}=cloud_gate.conf\n",
+    )
+    settings = fixture.root / "cloud_gate.conf"
+    _ = write_config_fixture(settings, "enabled=on\n")
+    return placement.PlacementCandidate(
+        placement.PlacementDestination("scaler", SCALER_TARGET_NAME, SCALER_TARGET_NAME, WholeMacScope()),
+        settings=placement.ExplicitProviderSettings(settings))
+
+
+def scaler_gate_request(fixture: PlacementFixture) -> wire.PlacementRequest:
+    request = mac_linux_and_natedev_request(fixture)
+    cloud = register_scaler(fixture)
+    return replace(request, constraints=replace(request.constraints,
+        command=("gate.py", "--tests-only"), command_kind="final",
+        candidates=(cloud, *request.constraints.candidates)))
+
+
+def dispatch_probe_pending(_worker: service.HostEvidenceWorker, probe: service.DispatchEvidenceProbe) -> bool:
+    return isinstance(probe.read(), placement.DispatchPathPending)
 
 
 def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) -> placement.PlacementAssignment:
@@ -619,6 +650,137 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_gate_uses_guest_when_local_waits_and_aws_has_no_quota(self) -> None:
+        for mode in ("allowed", "fixed exclusion", "Mac block"):
+            with self.subTest(mode=mode), PlacementFixture() as fixture:
+                request = scaler_gate_request(fixture)
+                cloud, guest, local = request.constraints.candidates
+                if mode == "fixed exclusion":
+                    guest = replace(guest, eligibility=placement.FixedExclusion("repo"))
+                request = replace(request, constraints=replace(request.constraints, candidates=(cloud, guest, local)))
+                no_quota = placement.TemporaryExclusion("no quota")
+                provider = mock.Mock(spec=placement.CloudGateProvider,
+                    availability=mock.Mock(return_value=placement.Unavailable(no_quota.reason)))
+                with mock.patch.object(service, "scaler_provider", return_value=provider):
+                    key = fixture.server.host_evidence_key(request, cloud.destination)
+                    fixture.server.host_requests[key] = request
+                    evidence = fixture.server.read_provider_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, no_quota)
+                fixture.server.publish_host_evidence(evidence)
+                guest_request = replace(request, constraints=replace(request.constraints, candidates=(guest,)))
+                guest_state = placement.TemporaryExclusion("blocked") if mode == "Mac block" else placement.AllowedHost()
+                if mode == "Mac block":
+                    guest_key = fixture.server.host_evidence_key(request, guest.destination)
+                    fixture.server.host_requests[guest_key] = request
+                    block = mock.Mock(spec=mac_test.ActiveMacBlock)
+                    with mock.patch.object(mac_test, "blocking_claim_block", return_value=block):
+                        observed = fixture.server.read_provider_evidence(guest_key)
+                    assert isinstance(observed, placement.FreshHostEvidence), observed
+                    self.assertEqual(observed.eligibility, guest_state)
+                _ = publish_candidate(fixture, guest_request, guest_state)
+                local_key = fixture.server.host_evidence_key(request, local.destination)
+                fixture.provider_evidence[local_key] = placement.FreshHostEvidence(local_key,
+                    fixture.clock.now(), "", placement.TemporaryExclusion("blocked"))
+                other_caller = replace(request, owner=placement_request(fixture).owner)
+                other_key = fixture.server.host_evidence_key(other_caller, local.destination)
+                self.assertNotEqual(other_key, local_key)
+                other_host = fixture.read_provider(other_key)
+                assert isinstance(other_host, placement.FreshHostEvidence)
+                self.assertEqual(other_host.eligibility, placement.AllowedHost())
+                reply, = fixture.server.handle_request(request)
+                if mode == "allowed":
+                    assert isinstance(reply, wire.Assignment), reply
+                    self.assertEqual(reply.assignment.destination, guest.destination)
+                else:
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(tuple(item.eligibility for item in reply.eligibility),
+                        (no_quota, guest.eligibility if mode == "fixed exclusion" else guest_state,
+                         placement.TemporaryExclusion("blocked")))
+
+    def test_scaler_assignment_consumes_once_and_retains_pending_launch(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            self.assertEqual(assignment.destination.provider, "scaler")
+            claim = placement.assigned_claim_reference(assignment)
+            saved = fixture.server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
+            self.assertEqual(saved.provider, claim)
+            consume = consume_permission("launch", assignment, claim)
+            self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.FirstAuthorization)
+            self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.DispatchStatus)
+            pending = placement.DispatchPathPending("launch unknown")
+            report = wire.ExecutionReport("launch-unknown", assignment, claim, execution_identity.ExecutionNotStarted(),
+                placement.AttemptDeclined("launch unknown"), pending)
+            settle = mock.Mock(return_value=placement.Pending(pending.reason))
+            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle)
+            with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                  mock.patch.object(service.HostEvidenceWorker, "dispatch_pending",
+                      autospec=True, side_effect=dispatch_probe_pending)):
+                _ = fixture.server.handle_request(report)
+                reply, = fixture.server.handle_request(request)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                self.assertIn(request.episode, fixture.server.current_assignments)
+                other = placement_request(fixture)
+                other = replace(other, constraints=replace(request.constraints,
+                    candidates=request.constraints.candidates[:1]))
+                _ = publish_candidate(fixture, other)
+                waiting, = fixture.server.handle_request(other)
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertEqual(waiting.eligibility[0].eligibility, placement.TemporaryExclusion("cloud slots full"))
+                legacy = replace(fixture.request(), place=wire.CloudPlace(assignment.destination.target))
+                legacy_wait, = fixture.server.handle_request(legacy)
+                assert isinstance(legacy_wait, wire.Wait), legacy_wait
+                self.assertIsInstance(legacy_wait.reason, wire.CloudSlotWait)
+                self.assertNotIn(legacy.episode, fixture.server.reservations)
+                settle.assert_called_with(assignment.episode, int(assignment.attempt, 16))
+                settle.return_value = placement.Settled()
+                _ = fixture.run_pass()
+                self.assertNotEqual(fixture.server.current_assignments.get(request.episode),
+                    execution_identity.attempt_key(assignment.episode, assignment.attempt))
+
+    def test_gate_restart_preserves_episode_and_queue_place(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            original = assignment_for(fixture, request)
+            self.assertEqual(original.destination.provider, "scaler")
+            claim = placement.assigned_claim_reference(original)
+            _ = fixture.server.handle_request(wire.ExecutionReport("settled-refusal", original, claim,
+                execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("no capacity"),
+                placement.DispatchPathSettled()))
+            self.assertNotIn(request.episode, fixture.server.current_assignments)
+            original_place = next(place for place in fixture.server.places.values() if place.episode == request.episode)
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion("no quota"))
+            guest_only = replace(request, constraints=replace(request.constraints, candidates=request.constraints.candidates[1:2]))
+            _ = publish_candidate(fixture, guest_only)
+            local_only = replace(request, constraints=replace(request.constraints, candidates=request.constraints.candidates[2:]))
+            _ = publish_candidate(fixture, local_only, placement.TemporaryExclusion("blocked"))
+            fixture.restart()
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion("no quota"))
+            _ = publish_candidate(fixture, guest_only)
+            replacement = assignment_for(fixture, request)
+            self.assertEqual(replacement.destination.target, "mac-linux")
+            self.assertEqual((replacement.episode, replacement.since), (original.episode, original.since))
+            self.assertNotEqual(replacement.attempt, original.attempt)
+            resumed_place = next(place for place in fixture.server.places.values() if place.episode == request.episode)
+            self.assertEqual(resumed_place.queue_identity, original_place.queue_identity)
+
+    def test_local_gate_decline_returns_its_reservation_for_a_retry(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            local = request.constraints.candidates[-1]
+            request = replace(request, constraints=replace(request.constraints, candidates=(local,)))
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.LocalPlacementGranted), reply
+            status, = fixture.server.handle_request(wire.ClaimFailure("no-launch", reply.assignment, "busy"))
+            assert isinstance(status, wire.DispatchStatus), status
+            self.assertEqual(status.state, placement.ClosedAssignment("busy"))
+            self.assertIsInstance(status.retry, placement.RetryAt)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
     def test_a_tune_of_the_repository_settings_reaches_no_placement_fixture(self) -> None:
         original = cast(Callable[[str], Path], getattr(memory_test_support, "_template"))
         repository = original("mac_test.conf").read_text().splitlines()

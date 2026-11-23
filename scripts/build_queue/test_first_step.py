@@ -10,15 +10,16 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
-from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_wire, first_step, placement
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.test_placement import (
-    PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, mac_linux_candidate,
-    placement_request, publish_candidate,
+    SCALER_TARGET_NAME, PlacementFixture, adopt_assignment, assignment_for, consume_permission,
+    local_candidate, mac_linux_candidate, placement_request, publish_candidate, register_scaler,
 )
+from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import command_job
+from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -55,6 +56,140 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
 
 
 class FirstStepTests(unittest.TestCase):
+    def test_gate_modes_submit_one_default_request(self) -> None:
+        self.check_gate_mode_candidates(register_aws=True)
+
+    def test_gate_without_scaler_registration_requests_slice_one_targets(self) -> None:
+        self.check_gate_mode_candidates(register_aws=False)
+
+    def test_standalone_module_and_nightly_gates_only_place_on_natedev(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            cloud = register_scaler(fixture)
+            local = local_candidate(fixture)
+
+            def grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted:
+                assignment = placement.PlacementAssignment(request.episode, "attempt", local.destination,
+                    request.constraints.source_key, request.owner, request.constraints.session, request.since)
+                return wire.LocalPlacementGranted(assignment, PROGRAM_GRANT)
+
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(first_step, "_placement_grant", side_effect=grant) as submit,
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
+                  forbid_admission_calls()):
+                for arguments in (("--tests-only", "--module=lib/test_gate.py"),
+                                  ("--nightly", "--merge-branch", "main", "--unit", "fixture")):
+                    with self.subTest(arguments=arguments):
+                        command = (*GATE_COMMAND[:2], *arguments)
+                        submit.reset_mock()
+                        with first_step.admitted_run(command, source) as admitted:
+                            grant_for_gate = admitted.grant
+                            assert isinstance(grant_for_gate, first_step.GatePlacement)
+                            self.assertEqual(grant_for_gate.grant.assignment.destination, local.destination)
+                            assert grant_for_gate.request is not None
+                            self.assertEqual(grant_for_gate.request.constraints.candidates, (local,))
+                        submit.assert_called_once()
+                        names = (cloud.destination.target, "mac-linux", "natedev")
+                        with first_step.admitted_run(command, source, targets=names) as admitted:
+                            mixed_grant = admitted.grant
+                            assert isinstance(mixed_grant, first_step.GatePlacement)
+                            assert mixed_grant.request is not None
+                            candidates = mixed_grant.request.constraints.candidates
+                            self.assertEqual(tuple(c.destination.target for c in candidates), names)
+                            self.assertEqual(tuple(c for c in candidates
+                                if isinstance(c.eligibility, placement.AllowedHost)), (local,))
+                        with self.assertRaisesRegex(first_step.FirstStepRefused, "runs only on natedev"):
+                            with first_step.admitted_run(command, source, targets=names[:-1]):
+                                self.fail("a remote-only gate request was accepted")
+                        self.assertEqual(submit.call_count, 2)
+
+    def check_gate_mode_candidates(self, *, register_aws: bool) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            cloud = (register_scaler(fixture),) if register_aws else ()
+            expected = (*cloud, mac_linux_candidate(), local_candidate(fixture))
+            requests: list[wire.PlacementRequest] = []
+
+            def grant(request: wire.PlacementRequest) -> wire.Assignment:
+                requests.append(request)
+                return wire.Assignment(placement.PlacementAssignment(request.episode, str(len(requests)),
+                    request.constraints.candidates[0].destination, request.constraints.source_key, request.owner,
+                    request.constraints.session, request.since))
+
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(first_step, "_placement_grant", side_effect=grant),
+                  mock.patch.object(queue_place, "request_place", side_effect=AssertionError("plain memory admission")),
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
+                  forbid_admission_calls()):
+                for options in ((), ("--affected",), ("--tests-only",)):
+                    command = (*GATE_COMMAND[:2], *options)
+                    with first_step.admitted_run(command, source) as admitted:
+                        self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+                    self.assertEqual(requests[-1].constraints.candidates, expected)
+                self.assertEqual(len(requests), 3)
+                script = source / "gate.py"
+                _ = script.write_text("raise SystemExit(0)\n")
+                self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--",
+                                             "python3", str(script), "--tests-only"]), 0)
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(requests[-1].constraints.candidates, expected)
+                with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "natedev"}):
+                    with first_step.admitted_run(GATE_COMMAND, source) as admitted:
+                        self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+                self.assertEqual(len(requests), 5)
+                self.assertEqual(requests[-1].constraints.candidates, (local_candidate(fixture),))
+                with first_step.admitted_run(GATE_COMMAND, source) as outer:
+                    outer.handoff(source)
+                    saved = outer.grant
+                    assert isinstance(saved, first_step.GatePlacement)
+                    sidecar = str(fixture.root / "placement.cgroup")
+                    self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], sidecar)
+                    assigned = saved.grant.assignment
+                    status = admission_wire.KnownPlacementStatus(assigned, placement.CurrentAssignment(),
+                        placement.NoProviderClaim())
+                    with mock.patch.object(client, "placement_status",
+                            return_value=admission_wire.PlacementStatusReply(status)):
+                        with first_step.admitted_run(GATE_COMMAND, source) as attached:
+                            self.assertEqual(attached.grant, first_step.GatePlacement(saved.grant, None))
+                            self.assertEqual(attached.assignment_file, outer.assignment_file)
+                            attached.handoff(source)
+                            self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], sidecar)
+                self.assertEqual(len(requests), 6)
+                if register_aws:
+                    registry = fixture.root / "build_targets.conf"
+                    cloud_settings = fixture.root / "cloud_gate.conf"
+                    for switch_file, key in ((registry, f"enabled.{SCALER_TARGET_NAME}"), (cloud_settings, "enabled")):
+                        _ = write_config_fixture(switch_file, f"{key}=off\n")
+                        self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev"))
+                        _ = write_config_fixture(switch_file, f"{key}=on\n")
+                    for exit_code in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+                        with self.subTest(exit_code=exit_code), first_step.admitted_run(GATE_COMMAND, source) as admitted:
+                            admitted.handoff(source)
+                            original = client.read_assignment(admitted.assignment_file).assignment
+                            self.assertEqual(original.destination.provider, "scaler")
+                            refusal = wire.ClaimFailure("decline", original, "no capacity")
+                            report = admitted.assignment_file.with_name(admitted.assignment_file.name + CLAIM_FAILURE_SUFFIX)
+                            _ = report.write_text(admission_wire.encode_request(refusal))
+                            settled = wire.DispatchStatus(original, placement.ClosedAssignment(refusal.reason),
+                                placement.PermissionAvailable(), retry=placement.RetryAt(0))
+                            return_codes = iter((exit_code, 0))
+
+                            def run_attempt() -> subprocess.CompletedProcess[str]:
+                                self.assertEqual(os.environ.pop("BUILDLOG_PLACEMENT_SIDECAR"), sidecar)
+                                return subprocess.CompletedProcess(GATE_COMMAND, next(return_codes))
+
+                            run = mock.Mock(side_effect=run_attempt)
+                            with mock.patch.object(client, "claim_failure", return_value=settled) as decline:
+                                self.assertEqual(admitted.run_gate(run).returncode, 0)
+                            self.assertEqual(requests[-2], requests[-1])
+                            local = requests[-1].local
+                            assert isinstance(local, wire.LocalAdmissionContext)
+                            self.assertEqual(local.sidecar, sidecar)
+                            self.assertEqual(run.call_count, 2)
+                            self.assertEqual(decline.call_count, int(exit_code == GATE_PRELAUNCH_REFUSED_STATUS))
+
     def test_explicit_gate_targets_override_the_claude_default(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
@@ -165,7 +300,7 @@ class FirstStepTests(unittest.TestCase):
                     request.constraints.source_key, request.owner, request.constraints.session, request.since))
 
             with (mock.patch.dict(os.environ,
-                      {"BUILDLOG_PLACEMENT_FILE": "outer-file", "BUILDLOG_PLACEMENT_EPISODE": "outer-episode",
+                      {"BUILDLOG_FIRST_STEP_ASSIGNMENT": "outer-file", "BUILDLOG_PLACEMENT_EPISODE": "outer-episode",
                        "BUILDLOG_PLACEMENT_SIDECAR": "outer-sidecar"}),
                   mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
@@ -174,6 +309,7 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel,
                   forbid_admission_calls()):
+                _ = os.environ.pop("BUILDLOG_PLACEMENT_FILE", None)
                 with first_step.admitted_run(command, source, targets=targets) as admitted:
                     self.assertEqual(len(requests), 1)
                     request = requests[0]
@@ -188,6 +324,7 @@ class FirstStepTests(unittest.TestCase):
                     assert isinstance(request.local, wire.LocalAdmissionContext)
                     self.assertEqual(request.local.argv, (expected_identity[0],))
                     self.assertEqual(request.local.sidecar, str(fixture.root / "placement.cgroup"))
+                    self.assertNotIn("BUILDLOG_PLACEMENT_SIDECAR", os.environ)
 
                     saved = client.read_assignment(admitted.assignment_file).assignment
                     self.assertEqual(saved.owner, request.owner)
@@ -198,39 +335,47 @@ class FirstStepTests(unittest.TestCase):
                     self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], request.local.sidecar)
                     self.assertNotIn("BUILDLOG_FIRST_STEP_ASSIGNMENT", os.environ)
                     cancel.assert_not_called()
-                self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], "outer-file")
+                self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], "outer-episode")
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], "outer-sidecar")
+                self.assertEqual(os.environ["BUILDLOG_FIRST_STEP_ASSIGNMENT"], "outer-file")
                 cancel.assert_called_once()
                 program.assert_not_called()
 
     def test_unnamed_gate_uses_program_memory_admission(self) -> None:
         with PlacementFixture() as fixture:
-            program_requests: list[wire.AdmitRequest] = []
+            source = gate_source(fixture, "hana")
+            requests: list[wire.PlacementRequest] = []
 
-            def grant(request: queue_place.RefreshedRequest, _output: client.WaitOutput) -> wire.Admitted:
-                program_requests.append(request.refresh())
-                return PROGRAM_GRANT
+            def grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted:
+                requests.append(request)
+                assignment = placement.PlacementAssignment(request.episode, "attempt",
+                    local_candidate(fixture).destination, request.constraints.source_key, request.owner,
+                    request.constraints.session, request.since)
+                return wire.LocalPlacementGranted(assignment, PROGRAM_GRANT)
 
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
                   mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
-                  mock.patch.object(first_step, "_placement_grant") as placement_grant,
-                  mock.patch.object(queue_place, "request_place", side_effect=grant),
-                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
+                  mock.patch.object(first_step, "_placement_grant", side_effect=grant),
+                  mock.patch.object(queue_place, "request_place") as program,
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
                   forbid_admission_calls()):
-                with first_step.admitted_run(GATE_COMMAND, fixture.root) as admitted:
-                    self.assertEqual(len(program_requests), 1)
-                    profile = program_requests[0].profile
+                with first_step.admitted_run(GATE_COMMAND, source) as admitted:
+                    request, = requests
+                    profile = request.profile
                     assert isinstance(profile, records.ProgramProfile)
                     self.assertEqual(profile.program, "gate")
                     self.assertGreater(profile.sizing.first_peak_bytes, 0)
-                    self.assertEqual(program_requests[0].argv, ("gate",))
-                    self.assertFalse(admitted.assignment_file.exists())
-                    admitted.handoff(fixture.root)
-                    self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
-                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
-                placement_grant.assert_not_called()
+                    assert isinstance(request.local, wire.LocalAdmissionContext)
+                    self.assertEqual(request.local.argv, ("gate",))
+                    self.assertEqual(request.local.sidecar, str(fixture.root / "placement.cgroup"))
+                    self.assertEqual(request.constraints.candidates, (local_candidate(fixture),))
+                    admitted.handoff(source)
+                    self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
+                    self.assertEqual(os.environ["BUILDLOG_PLACEMENT_SIDECAR"], request.local.sidecar)
+                    self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+                program.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:
         with PlacementFixture() as fixture:
