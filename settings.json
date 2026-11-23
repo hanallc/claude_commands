@@ -365,6 +365,16 @@
             "timeout": 120
           }
         ]
+      },
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-review-hold-send.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [
