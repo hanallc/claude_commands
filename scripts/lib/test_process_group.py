@@ -221,8 +221,8 @@ class ProcessGroupTests(PrivateGroupFixture):
 
 
 def process_ended(pid: int) -> bool:
-    """Wait for a process to leave or become a zombie."""
-    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+    """Wait a short time for a process to leave or become a zombie."""
+    deadline = time.monotonic() + process_group.STOP_WAIT_SECONDS + 5
     while time.monotonic() < deadline:
         try:
             state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
@@ -235,18 +235,23 @@ def process_ended(pid: int) -> bool:
 
 
 class RunProcessGroupTests(unittest.TestCase):
-    def test_a_finished_command_leaves_no_child(self) -> None:
+    def test_a_finished_command_returns_at_once_and_leaves_no_child(self) -> None:
+        started = time.monotonic()
         done = process_group.run_process_group(
-            ["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!; echo said >&2"], timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual((done.returncode, done.stderr), (0, "said\n"))
+            ["sh", "-c", r"sleep 30 & echo $!; printf 'said \377' >&2"], timeout=TEST_HANG_GUARD_SECS)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual((done.returncode, done.stderr), (0, "said \ufffd"))
         self.assertTrue(process_ended(int(done.stdout)))
 
     def test_a_timeout_stops_the_command_and_its_child(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         record = folder / "child"
-        with self.assertRaises(subprocess.TimeoutExpired):
+        written = shlex.quote(str(folder / "child.new"))
+        with self.assertRaises(subprocess.TimeoutExpired) as stopped:
             _ = process_group.run_process_group(
-                ["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(record))}; wait"], timeout=1)
+                ["sh", "-c", f"sleep 30 & echo $! > {written}; mv {written} {shlex.quote(str(record))}; echo waiting; wait"],
+                timeout=5)
+        self.assertEqual(cast(str, stopped.exception.output), "waiting\n")
         self.assertTrue(process_ended(int(record.read_text())))
 
 

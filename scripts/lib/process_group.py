@@ -6,8 +6,10 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from typing import IO
 
 STOP_WAIT_SECONDS = 10
 
@@ -38,17 +40,24 @@ def terminate_owned_process_group() -> None:
 
 def run_process_group(command: Sequence[str], *, timeout: float,
                       env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Run a command in its own group and stop the whole group when it returns or fails.
+    """Run a command in its own group and stop the whole group when it exits, fails or times out.
 
     A browser leaves helper processes after its own exit or a timeout.
+    Output goes to files, so a helper that keeps a pipe open cannot delay the result.
     """
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                          env=env, start_new_session=True) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        finally:
-            stop_process_group(process)
-    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        with subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, start_new_session=True) as process:
+            try:
+                _ = process.wait(timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                stop_process_group(process)
+        result = subprocess.CompletedProcess(list(command), process.returncode, _text(stdout), _text(stderr))
+    if timed_out:
+        raise subprocess.TimeoutExpired(list(command), timeout, result.stdout, result.stderr)
+    return result
 
 
 def stop_process_group(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
@@ -61,11 +70,17 @@ def stop_process_group(process: subprocess.Popen[str] | subprocess.Popen[bytes])
         # The leader can exit before its child processes.
         with suppress(ProcessLookupError):
             send_process_group(process.pid, signal.SIGKILL)
-        _ = process.wait(timeout=STOP_WAIT_SECONDS)
+        with suppress(subprocess.TimeoutExpired):
+            _ = process.wait(timeout=STOP_WAIT_SECONDS)
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+
+
+def _text(stream: IO[bytes]) -> str:
+    _ = stream.seek(0)
+    return stream.read().decode(errors="replace")
 
 
 def _send_checked_group(group: int, signum: int) -> None:

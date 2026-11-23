@@ -11,9 +11,12 @@ Shell callers use their checkout's helper through `scripts/lib/py`.
 The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
 `test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
 `run_process_group(command, timeout=..., env=...)` runs a command in its own group and returns its text output.
-It stops the whole group when the command returns, fails, or reaches its timeout.
+It waits for the command to exit, then stops the whole group, also after a failure or a timeout.
+Output goes to temporary files, so a helper process that keeps the output open cannot delay the result.
+Bytes that are not UTF-8 decode as replacement characters.
 `stop_process_group(process)` sends TERM, then KILL, to the group of a `start_new_session` child and closes its pipes.
-Every headless Firefox and Chrome run uses one of these two helpers.
+Every headless Firefox and Chrome run starts under one of these two helpers.
+The Node proof `memory_page_proof.mjs` starts Chrome, so its tests start Node with `run_process_group`.
 A browser leaves helper processes after its own exit or a timeout, and a plain `subprocess.run` stops only the leader.
 
 ## Session commands
