@@ -73,12 +73,31 @@ class NoNextRun(StrEnum):
     REMAINING = "no run remains"
 
 
+def start_instant(start: datetime) -> datetime:
+    if start.utcoffset() is None:
+        raise ValueError("a schedule start must have a time zone")
+    try:
+        instant = start.astimezone(UTC)
+        local = instant.astimezone(start.tzinfo)
+    except OverflowError:
+        raise ValueError("the start is outside the supported date range in UTC") from None
+    if local.replace(tzinfo=None) != start.replace(tzinfo=None):
+        raise ValueError("the start does not exist in its time zone")
+    return instant
+
+
 @dataclass(frozen=True)
 class RepeatRule:
     frequency: Frequency
     interval: int
     days: StartDay | WeeklyDays | MonthDay | MonthWeekday
     end: RepeatUntilLimit | RunCount | RunUntil
+
+    def __post_init__(self) -> None:
+        if isinstance(self.days, WeeklyDays) and self.frequency is not Frequency.WEEKLY:
+            raise ValueError("weekday lists require a weekly repeat")
+        if isinstance(self.days, (MonthDay, MonthWeekday)) and self.frequency is not Frequency.MONTHLY:
+            raise ValueError("monthly days require a monthly repeat")
 
     @property
     def rrule(self) -> str:
@@ -112,14 +131,13 @@ class RepeatRule:
 
     def validate_start(self, start: datetime) -> None:
         """Refuse a start that cannot be the first occurrence."""
-        if start.utcoffset() is None:
-            raise ValueError("the repeat start must have a time zone")
+        instant = start_instant(start)
         day = start.date()
         if self.frequency is Frequency.WEEKLY and _WEEKDAYS[day.weekday()] not in self._weekly_days(day):
             raise ValueError("the start must fall on one of the BYDAY weekdays")
         if self.frequency is Frequency.MONTHLY and day.day != self._month_day(day, day.year, day.month):
             raise ValueError("the start must match the monthly repeat day")
-        if isinstance(self.end, RunUntil) and start.astimezone(UTC) > self.end.utc:
+        if isinstance(self.end, RunUntil) and instant > self.end.utc:
             raise ValueError("UNTIL must be on or after the start")
 
     def _dates(self, start: date) -> Iterator[date]:
@@ -155,10 +173,14 @@ class RepeatRule:
         def valid_runs() -> Iterator[datetime]:
             for day in self._dates(start.date()):
                 run = start if day == start.date() else datetime.combine(day, start.timetz().replace(fold=0))
-                instant = run.astimezone(UTC)
+                try:
+                    instant = run.astimezone(UTC)
+                    local = instant.astimezone(start.tzinfo)
+                except OverflowError:
+                    break
                 if isinstance(self.end, RunUntil) and instant > self.end.utc:
                     break
-                if instant.astimezone(start.tzinfo).replace(tzinfo=None) == run.replace(tzinfo=None):
+                if local.replace(tzinfo=None) == run.replace(tzinfo=None):
                     yield run
 
         return islice(valid_runs(), max(0, count))
@@ -167,7 +189,10 @@ class RepeatRule:
         """Find the first run strictly after a time."""
         if after.utcoffset() is None:
             raise ValueError("the comparison time must have a time zone")
-        instant = after.astimezone(UTC)
+        try:
+            instant = after.astimezone(UTC)
+        except OverflowError:
+            raise ValueError("the comparison time is outside the supported date range in UTC") from None
         return next((run for run in self.runs(start, limit) if run.astimezone(UTC) > instant), NoNextRun.REMAINING)
 
     def describe(self, start: datetime) -> str:
