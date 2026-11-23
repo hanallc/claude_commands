@@ -161,8 +161,11 @@ def buildlog_rows(root: Path) -> list[dict[str, object]]:
 
 
 def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
-                       indexed: bool = False, crates: int | None = 1) -> None:
-    """Write anonymous samples and optional matching Cargo step evidence."""
+                       indexed: bool = False, crates: int | None = 1, arguments: tuple[str, ...] = ()) -> None:
+    """Write anonymous samples and optional matching Cargo step evidence.
+
+    The evidence argv is `arguments`, or `cargo <step>` when none is given.
+    """
     path = gate.admission_dir(root) / "anon_peaks.jsonl"
     with path.open("a") as output:
         for original in rows:
@@ -186,7 +189,7 @@ def write_history_rows(root: Path, rows: Iterable[dict[str, object]], *,
                                    + "call_id,crates_compiled) VALUES (?,?,?,?,?,?,?,?)",
                                    (row.get("host"), row.get("repo"), row.get("step"),
                                     store.utc_iso((datetime.fromisoformat(str(row["ended_at"])) - timedelta(seconds=1)).timestamp()),
-                                    0, json.dumps(["cargo", row.get("step")]), call_id, crates))
+                                    0, json.dumps(list(arguments) or ["cargo", row.get("step")]), call_id, crates))
             _ = output.write(json.dumps(row) + "\n")
 
 
@@ -829,6 +832,45 @@ class HistoryTests(unittest.TestCase):
         peak = step_estimator.expected_peak(HANA, "clippy", self.host, NOW, self.root,
                                   first_peak_bytes=config.program_first_peaks["cargo"])
         self.assertEqual(peak, admission_records.ExpectedPeak(int(4 * GIB * step_estimator.ANON_SHARE), "buildlog", 5))
+
+    def test_a_check_takes_its_need_only_from_checks_with_the_same_targets(self) -> None:
+        # verify.sh check moved to --all-targets (2026-11-23); test code raises the hana check peak.
+        for targets, start_gib in ((("--lib", "--bins"), 1), (("--all-targets",), 10)):
+            write_history_rows(self.root, [{
+                "host": self.host, "repo": "hana", "step": "check",
+                "ended_at": store.utc_iso(HISTORY_AT.timestamp()), "anon_peak_bytes": (start_gib + index) * GIB,
+            } for index in range(5)], indexed=True, arguments=("cargo", "check", "--workspace", *targets))
+        # A peak that the index has not joined yet has unknown targets; neither estimate uses it.
+        unjoined: dict[str, object] = {
+            "host": self.host, "repo": "hana", "step": "check",
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()), "anon_peak_bytes": 30 * GIB,
+        }
+        write_history_rows(self.root, [unjoined] * 5)
+        first_peak = admission_configuration_fixture().program_first_peaks["cargo"]
+        for argv, expected in ((["cargo", "check", "--workspace", "--lib", "--bins"], 5 * GIB),
+                               (["cargo", "check", "--workspace", "--all-targets"], 14 * GIB)):
+            with self.subTest(argv=argv):
+                peak = step_estimator.expected_peak(HANA, "check", self.host, NOW, self.root,
+                                                    targets=step_estimator.check_targets(argv),
+                                                    first_peak_bytes=first_peak)
+                self.assertEqual(peak, admission_records.ExpectedPeak(expected, "measured", 5))
+
+    def test_indexed_check_peaks_keep_the_same_targets(self) -> None:
+        with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
+            _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
+                           + "peak_mem_bytes INTEGER, argv TEXT)")
+            _ = db.executemany("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?)", [
+                (self.host, "hana", "check", HISTORY_AT.isoformat(), gib * GIB,
+                 json.dumps(["cargo", "check", "--workspace", *targets]))
+                for targets, gib in ((("--lib", "--bins"), 2), (("--all-targets",), 8)) for _ in range(5)])
+        first_peak = admission_configuration_fixture().program_first_peaks["cargo"]
+        cases: tuple[tuple[step_estimator.CheckTargets, int], ...] = (("named", 2), ("all-targets", 8))
+        for targets, gib in cases:
+            with self.subTest(targets=targets):
+                peak = step_estimator.expected_peak(HANA, "check", self.host, NOW, self.root, targets=targets,
+                                                    first_peak_bytes=first_peak)
+                self.assertEqual(peak, admission_records.ExpectedPeak(int(gib * GIB * step_estimator.ANON_SHARE),
+                                                                      "buildlog", 5))
 
     def test_measured_history_pools_every_width_unless_one_is_named(self) -> None:
         self.add_measured(5, test_threads=16)
@@ -4369,7 +4411,7 @@ class QueueApiTests(MemoryQueueFixture):
 
     def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
         with patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
-            identity = admission_records.waiter_identity("gate", "tree")
+            identity = admission_records.waiter_identity("gate", "tree", admission_records.request_owner("tree"))
             self.assertEqual(identity.get("unit"), "queue-unit")
             self.assertEqual(identity["session_id"], "showrunner")
             self.assertEqual(gate.waiter_unit_name(identity), "queue-unit")
@@ -4380,7 +4422,7 @@ class QueueApiTests(MemoryQueueFixture):
              patch("os.getcwd", return_value="/tmp/hana-tree"):
             for step in ("nextest", "clippy", "mend", "doc"):
                 with self.subTest(step=step):
-                    self.assertEqual(admission_records.waiter_identity(step, "hana-tree"), {
+                    self.assertEqual(admission_records.waiter_identity(step, "hana-tree", admission_records.request_owner("hana-tree")), {
                         "session_id": "worker-id", "session_name": "recorded-name",
                         "step": step, "folder": "/tmp/hana-tree",
                     })

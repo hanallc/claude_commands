@@ -2987,7 +2987,8 @@ def claimed_run(
                 try:
                     permission = admission_client.consume_permission(wire.ConsumePermission(
                         uuid.uuid4().hex, assignment, reference, holder))
-                except wire.AdmissionUnavailable:
+                except wire.AdmissionUnavailable as error:
+                    print(f"mac_test: no launch permission from the queue: {error.reason}", file=sys.stderr, flush=True)
                     if routed_mac_command:
                         break
                     evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
