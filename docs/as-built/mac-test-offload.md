@@ -38,14 +38,15 @@ The caller must submit a new run to retry.
 
 ## Mac queue runs
 
-`mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
-The run uses the holding unit's session for the block check and the placement request.
-Workers of that unit can start a run during its block.
+`mac_queue_run.py` checks the Mac block for each kind (`shot`, `install`, `probe` and `run`) before placement, before remote preparation, and before the remote command.
+Each kind uses the holding unit's session for the block check, so workers of that unit can start a run during its block.
+A `run` also uses that session for the placement request; a `shot`, `install` or `probe` uses its own session (`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`).
 A run that waits for another session's block prints one line with the holder and reason.
+A run whose block record cannot be read waits, and prints one line with the record path.
 The run returns any placement before it waits for the block to clear.
 The wait can lift an expired block through the Mac block expiry procedure.
 A failed CI restore keeps the block in place.
-`--no-wait` reports the block and exits with status 78.
+`--no-wait` reports the block or the unreadable record and exits with status 78.
 `mac_run.sh` exits with status 9 for a foreign block or unreadable coordination state.
 It also exits with status 9 when the queue reports that the Mac is busy or blocked.
 It retries other placement waits, including waits for host evidence, queue position, or memory.
