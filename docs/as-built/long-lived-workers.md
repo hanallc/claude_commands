@@ -216,6 +216,8 @@ The delivery command defers the result when transcript evidence is uncertain.
 If the run has no usable finish time, the receipt can use a recorded delivery before DONE.
 The receipt reports an anomaly if that delivery is absent from the transcript.
 A result without proof of coverage requires another matching DONE.
+If an open pass has a DONE that does not cover the result, the worker's result message ends with this line.
+`End your final reply with this line alone: DONE <dispatch id>`
 The hook, restore, assign, and close keep the pane while that requirement remains on an active pass.
 A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.

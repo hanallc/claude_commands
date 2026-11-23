@@ -669,6 +669,8 @@ def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record:
     verified = read_result_done_evidence(Path(record["session_dir"]), row, passed)
     if isinstance(verified, VerifiedPassDone):
         return verified.covers_run(record, detached_runs.run_finish_time(record))
+    if verified is detached_runs.ResultDoneCoverage.NEEDS_DELIVERY:
+        return detached_runs.ResultDoneCoverage.NO_MATCHING_DONE
     return verified
 
 
