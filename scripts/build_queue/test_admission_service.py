@@ -9,7 +9,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
-from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
@@ -1202,7 +1202,8 @@ class LocalHoldPlacementTests(unittest.TestCase):
             settings = fixture.root / "linux.conf"
             _ = write_config_fixture(settings, "probe_timeout_s=1\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
-                "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+                "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+                + UNREACHABLE_WAIT_FIXTURE)
             request = placement_request(fixture)
             candidate, = request.constraints.candidates
             destination = replace(candidate.destination, provider="ssh", target="linux")

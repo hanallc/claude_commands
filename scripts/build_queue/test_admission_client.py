@@ -50,7 +50,7 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
-from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, commit_config_fixture, config_environment, write_config_fixture, write_pressure_reading
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(records.EstimateExpired(1), 1, "head", "estimate expired")
@@ -724,7 +724,7 @@ class ClientTests(unittest.TestCase):
                         f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                     _ = (fixture.root / "build_targets.conf").write_text(
                         "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.natedev=local\nplatform.natedev=linux\n")
+                        + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
                 occupied = fixture.occupy_host()
                 fixture.free(0)
                 request = fixture.request()
@@ -936,7 +936,7 @@ class ClientTests(unittest.TestCase):
                     f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                    + "kind.natedev=local\nplatform.natedev=linux\n")
+                    + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
                 request = fixture.request(step="check")
                 finish_probe = threading.Event()
                 _ = fixture.callback(finish_probe.set)
@@ -1009,7 +1009,7 @@ class ClientTests(unittest.TestCase):
                 f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                + "kind.natedev=local\nplatform.natedev=linux\n")
+                + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                 key, fixture.clock.now(), "provider evidence is not ready")
@@ -1047,7 +1047,7 @@ class ClientTests(unittest.TestCase):
                 f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                + "kind.natedev=local\nplatform.natedev=linux\n")
+                + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                 key, fixture.clock.now(), "the test has not published provider evidence")
@@ -1078,7 +1078,7 @@ class ClientTests(unittest.TestCase):
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
                     f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 request = fixture.request(step="check")
                 fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                     key, fixture.clock.now(), "the test has not published provider evidence")

@@ -34,6 +34,7 @@ from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state, mac_test
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[str]]:
@@ -519,7 +520,8 @@ class BuildLimitsTests(unittest.TestCase):
             settings = root / "mac.conf"
             _ = settings.write_text("linux_only.project=linux_package\nlinux_only.quiet=\n", encoding="utf-8")
             _ = (root / "build_targets.conf").write_text(
-                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n", encoding="utf-8")
+                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE,
+                encoding="utf-8")
             claims = root / "claims"
             claims.mkdir()
             since = datetime(2026, 11, 22, 12, tzinfo=UTC)
