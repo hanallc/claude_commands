@@ -3971,15 +3971,16 @@ window.fetch=async(_path,options={})=>{
     def test_browser_list_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
         root = self.root / 'reviews'
         for number in range(7, 28):
-            if number != 13:
-                _ = self.add(f'List item {number}', number=number)
+            title = 'A row that returns above the open item' if number == 13 else f'List item {number}'
+            _ = self.add(title, number=number)
+        _ = the_list.close(MORTY.id, 'L13', 'The row returns later.', source='nate')
 
         def page() -> str:
             return list_page.render(root, include_counts=False).decode().replace(
                 '</head>', '<style>.list-row td { line-height: 22px; }</style></head>')
 
         initial = page()
-        _ = self.add('An added row above the open item', number=13)
+        _ = the_list.reopen(MORTY.id, 'L13', source='nate')
         added = page()
         _ = the_list.close(MORTY.id, 'L12', 'The work has finished.', source='nate')
         removed_above = page()
