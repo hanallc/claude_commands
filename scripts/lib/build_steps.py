@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE as HAND_MADE, GateJobNotRecorded, StepJob as StepJob
 from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
@@ -115,8 +115,8 @@ SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".
 VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
     "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
-    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}
-QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named"}
+    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named", HAND_MADE.step: "hand made"}
 SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
                      "merge-gate": "merge", "targeted-test": "targeted"}
 MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
