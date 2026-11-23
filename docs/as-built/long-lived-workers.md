@@ -980,10 +980,17 @@ DONE closure preserves worker rows and conversations.
 Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
 `worker.py end` first observes the worker pane.
 For a stopped or closed worker, it reads the worker lock, the live detached runs, the newest pass and every older open pass in the worker's launcher runs.
-A pass waits on DONE when its prompt is delivered, its transcript has no DONE and no detached result is pending.
-When every hold is such a DONE wait, `end` cancels exactly those passes with `progress_history.cancel_worker_passes`.
+A pass waits on DONE when the current transcript shows its delivered prompt with no DONE, the pass has an instance id and no detached result is pending.
+When every hold is such a DONE wait, `end` cancels exactly those passes with `progress_history.cancel_worker_pass_instances`.
 When any other check holds the worker, `end` cancels no pass.
-Other holds are the worker lock, a live or unreadable detached run, a pending detached result and a DONE with an unsaved reply.
+Any other hold keeps the pass, for example:
+- the worker lock;
+- a live launcher, or a launcher with no completed pass;
+- a live or unreadable detached run, or a pending detached result;
+- unavailable completion evidence, or a dispatch-state read anomaly;
+- a prompt that is not in the current transcript, because an older transcript can hold an unsaved DONE;
+- a pass with no instance id, with the blocker "the pass has no instance id";
+- a DONE with an unsaved reply.
 `end` cancels no pass of an open worker.
 `end` then closes the pane and retires the row, as for any other worker.
 For a stopped worker, the close check refuses each remaining hold: `end` prints the blocker, exits 7 and leaves the pass active.
@@ -1012,7 +1019,8 @@ Detached command records retain their own process and working directory checks.
 The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
 A canceled or interrupted submission keeps its open pane until the saved stage receipt and reply match.
-On a stopped pane, a canceled or interrupted submission with no DONE in the transcript lets the pane close, because no process can send the DONE.
+On a stopped pane, a canceled or interrupted submission whose prompt is in the current transcript with no DONE lets the pane close, because no process can send the DONE.
+A prompt that is not in the current transcript keeps the stopped pane, because an older transcript can hold an unsaved DONE.
 A stopped pane with a DONE stays open until the saved reply matches it.
 Pruning requires a saved worker or director receipt.
 A director-owned result requires a result receipt before pruning.
@@ -1064,6 +1072,8 @@ Activity uses the active dispatch kind, then the worker's role when no dispatch 
 Waiting on uses existing live detached run labels and shows `-` without a specific run.
 Text rows place open panes first and retain the current order inside each group.
 `_worker_pane_state` maps each observed worker to its pane and state words.
+The table gives the Pane and State columns of `worker.py list` for one parent, with or without `all`.
+`list all --all-parents` uses the table only for an `OpenWorker`.
 
 | Observed worker | Pane | State |
 | --- | --- | --- |
@@ -1072,10 +1082,19 @@ Text rows place open panes first and retain the current order inside each group.
 | `ClosedWorker` | `closed` | `-` |
 | Any other class | `unknown` | `-`, with its reason |
 
-A pass hold makes the state `busy`.
+A pass hold on an active staff row makes the state `busy`.
 On a stopped or closed worker, a hold that waits on a DONE shows `stopped` instead, because no process can send that DONE.
 The JSON `work` field stays `busy` for that worker, because dispatch still refuses it.
-`list all --all-parents` applies the same rule when it reads the panes; with `--json` and no pane read, the hold stays `busy`.
+
+`list all --all-parents` prints `-` for Pane for each worker that is not an `OpenWorker`.
+It gives the State of such a worker in this order:
+1. `exited` or `paused` from staff.
+2. `stopped` when a DONE wait holds a stopped or closed worker.
+3. `busy` for any other hold.
+4. `idle` for any other worker.
+
+Text output always reads the panes.
+With `--json` and no open or closed filter, the command reads no pane, so a DONE wait gives state `active` and work `busy`.
 A row whose pane is not open prints `-` for the account.
 Saved dispatch rows print `-` for Pane and use their recorded dispatch state.
 `display_cells.machine_column` adds a foreign machine inside the account cell, in parentheses.

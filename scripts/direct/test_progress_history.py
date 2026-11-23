@@ -4269,7 +4269,7 @@ with patch.object(fcntl, "flock", admission):
         finished = self.pass_events("canceled-pass", "pass_finished")
         self.assertEqual([event["status"] for event in finished], ["canceled"])
 
-    def test_cancel_worker_passes_ends_only_the_named_instances(self) -> None:
+    def test_cancel_worker_pass_instances_ends_only_the_named_instances(self) -> None:
         session = self.start_run("canceled-instance", 41_000, staff_owned=True)
         owner = unit_runs.run_owner(self.read_state(session), staff.local_snapshot())
         assert isinstance(owner, staff.StaffRow)
@@ -4280,8 +4280,8 @@ with patch.object(fcntl, "flock", admission):
         identity = self.pass_slots(session)["review"]["instance_id"]
         assert isinstance(identity, str)
         with patch.dict(os.environ, {"HOME": str(self.root)}):
-            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id, frozenset({"other"})), 0)
-            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id, frozenset({identity})), 1)
+            self.assertEqual(progress_history.cancel_worker_pass_instances(session, stopped.id, frozenset({"other"})), 0)
+            self.assertEqual(progress_history.cancel_worker_pass_instances(session, stopped.id, frozenset({identity})), 1)
         self.assertEqual((self.pass_slots(session)["impl"]["status"], self.pass_slots(session)["review"]["status"]),
                          ("active", "canceled"))
 

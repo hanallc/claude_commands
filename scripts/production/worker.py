@@ -377,9 +377,12 @@ def completion_close_evidence(row: staff.StaffRow, delivery: pass_recorder.Dispa
 
 def stopped_pass_close_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                                 run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
-    """Release an ended pass with no DONE; a DONE still needs its saved reply."""
+    """Release an ended pass whose delivered prompt has no DONE; a DONE still needs its saved reply.
+
+    A prompt that is not in the current transcript keeps the pane: an older transcript can hold an unsaved DONE.
+    """
     receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
-    if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted)):
+    if isinstance(receipt, DispatchSubmitted):
         return worker_panes.CloseAllowed()
     return _saved_reply_evidence(receipt, reply_file)
 
@@ -419,8 +422,9 @@ def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDel
         return worker_panes.Kept("a detached run result awaits a matching DONE")
     if not require_completion:
         return worker_panes.CloseAllowed()
-    if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted)):
+    if isinstance(receipt, DispatchSubmitted):
         return worker_panes.AwaitsDone(SUBMITTED_PASS_AWAITS_COMPLETION)
+    # A prompt that is not in the current transcript is not a DONE wait: an older transcript can hold an unsaved DONE.
     # A DONE with an unsaved reply is not a DONE wait: recovery must save that reply.
     if not isinstance(_saved_reply_evidence(receipt, reply_file), worker_panes.CloseAllowed):
         return worker_panes.Kept(SUBMITTED_PASS_AWAITS_COMPLETION)
@@ -1399,10 +1403,10 @@ def _cancel_passes_without_done(parent: StaffId, row: staff.StaffRow, record: st
     except (OSError, ValueError) as error:
         _ = _dispatch_anomaly(row, error)
         return
-    instances = frozenset(wait.instance_id for wait in waits if wait.instance_id)
+    instances = frozenset(wait.instance_id for wait in waits)
     if instances:
         for run in runs:
-            _ = progress_history.cancel_worker_passes(run, row.id, instances)
+            _ = progress_history.cancel_worker_pass_instances(run, row.id, instances)
 
 
 def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch

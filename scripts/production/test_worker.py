@@ -5021,6 +5021,26 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(reply.read_text(), "The previous report.\n")
 
+    def test_end_keeps_a_stopped_worker_whose_prompt_is_not_in_the_current_transcript(self) -> None:
+        name = "impl-not-submitted"
+        row = self.submitted_without_done(name, "stopped")
+        # After a session change, an older transcript can hold the prompt and an unsaved DONE.
+        with patch.object(worker, "dispatch_receipt", return_value=worker.DispatchNotSubmitted()):
+            self.assertIn("submitted pass awaits completion", self.end_kept(name))
+        self.assertEqual(self.pass_status(name), "active")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_keeps_a_stopped_worker_whose_pass_has_no_instance_id(self) -> None:
+        name = "impl-no-instance"
+        row = self.submitted_without_done(name, "stopped")
+        path = self.run_dir / "progress_history_state.json"
+        fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+        fields["pass"][name]["instance_id"] = ""
+        atomic_file.write_text_atomic(path, json.dumps(fields))
+        self.assertIn(worker_panes.NO_INSTANCE_ID, self.end_kept(name))
+        self.assertEqual(self.pass_status(name), "active")
+        self.assertEqual(staff.by_id(row.id), row)
+
     def test_end_keeps_a_stopped_worker_with_a_finished_result_not_in_the_transcript(self) -> None:
         name = "impl-unseen-result"
         row = self.submitted_without_done(name, "stopped")

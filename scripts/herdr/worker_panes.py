@@ -933,10 +933,16 @@ class DispatchHoldsWorker:
 
 @dataclass(frozen=True)
 class DispatchAwaitsDone:
-    """A delivered pass waits on its DONE reply; dispatch still refuses the worker."""
+    """A delivered pass waits on its DONE reply; dispatch still refuses the worker.
+
+    `instance_id` is always set: a pass with no instance id is a `DispatchHoldsWorker`.
+    """
 
     blocker: str
     instance_id: str
+
+
+NO_INSTANCE_ID = "the pass has no instance id"
 
 
 @dataclass(frozen=True)
@@ -1096,7 +1102,9 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, AwaitsDone):
-            return DispatchAwaitsDone(hold.blocker, dispatch if isinstance(dispatch, str) else "")
+            if isinstance(dispatch, str) and dispatch:
+                return DispatchAwaitsDone(hold.blocker, dispatch)
+            return DispatchHoldsWorker(NO_INSTANCE_ID)
         if isinstance(hold, Kept):
             return DispatchHoldsWorker(hold.blocker)
         if active:
