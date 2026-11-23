@@ -46,7 +46,7 @@ from scripts.lib import process_start as process_identity
 from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, Exchange, GIB, ScriptedSelector, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
+    AdmissionFixture, Exchange, GIB, InjectedCrash, ScriptedSelector, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
@@ -94,10 +94,13 @@ class ClientTests(unittest.TestCase):
     def test_stale_outer_markers_do_not_refuse_admission(self) -> None:
         for case in ("other-queue", "dead-holder", "released", "reused-pid"):
             with self.subTest(case=case), AdmissionFixture() as fixture:
-                outer = fixture.request()
+                pid = os.getppid()
+                start = records.process_start_time(pid)
+                assert start is not None
+                owner = fixture.proc.spawn() if case == "dead-holder" else wire.Owner(pid, start)
+                outer = fixture.request(owner=owner)
                 with fixture.loop_turn():
-                    grant, = fixture.server.handle_request(outer)
-                assert isinstance(grant, wire.Admitted)
+                    grant = only_admitted(fixture.server.handle_request(outer))
                 directory = fixture.state_dir
                 if case == "other-queue":
                     directory = fixture.root / "other-admission"
@@ -119,11 +122,12 @@ class ClientTests(unittest.TestCase):
 
     def test_nested_reserved_step_refuses_before_it_can_wait(self) -> None:
         with AdmissionFixture() as fixture:
-            outer = fixture.request()
+            pid = os.getppid()
+            start = records.process_start_time(pid)
+            assert start is not None
+            outer = fixture.request(owner=wire.Owner(pid, start))
             with fixture.loop_turn():
-                replies = fixture.server.handle_request(outer)
-            grant, = replies
-            assert isinstance(grant, wire.Admitted)
+                grant = only_admitted(fixture.server.handle_request(outer))
             fixture.hold_starts()
             marker = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir.resolve()}"
             nested = fixture.request()
@@ -138,6 +142,40 @@ class ClientTests(unittest.TestCase):
                 f"verify step cannot run inside reserved step {grant.reservation} (pid {outer.owner.pid}); "
                 + "run it outside the outer step"])
             connect.assert_not_called()
+
+    def test_live_reservation_of_a_non_ancestor_does_not_skip_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            outer = fixture.request()
+            with fixture.loop_turn():
+                grant = only_admitted(fixture.server.handle_request(outer))
+            marker = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            nested = fixture.request()
+            with (mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}),
+                  mock.patch.object(client, "_acquire", return_value=wire.Refused("fixture admission")) as acquire):
+                self.assertIsInstance(client.outer_reservation(match_cpu_pool=True), client.NoOuterReservation)
+                self.assertEqual(client.admit(nested, lambda _wait: None, lambda: nested), wire.Refused("fixture admission"))
+            acquire.assert_called_once()
+
+    def test_reservation_pending_release_does_not_skip_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            pid = os.getppid()
+            start = records.process_start_time(pid)
+            assert start is not None
+            outer = fixture.request(owner=wire.Owner(pid, start))
+            with fixture.loop_turn():
+                grant = only_admitted(fixture.server.handle_request(outer))
+            marker = f"{grant.reservation}\t{pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            nested = fixture.request()
+            with (mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": marker}),
+                  mock.patch.object(client, "_acquire", return_value=wire.Refused("fixture admission")) as acquire):
+                self.assertIsInstance(client.outer_reservation(match_cpu_pool=True), client.OuterReservation)
+                fixture.fault.stage = "after_state_write"
+                with self.assertRaisesRegex(InjectedCrash, "after_state_write"):
+                    fixture.release(grant)
+                self.assertIsInstance(fixture.server.reservations[outer.episode].ending, service.ReleaseStatus)
+                self.assertIsInstance(client.outer_reservation(match_cpu_pool=True), client.NoOuterReservation)
+                self.assertEqual(client.admit(nested, lambda _wait: None, lambda: nested), wire.Refused("fixture admission"))
+            acquire.assert_called_once()
 
     def test_placement_status_cli_reads_current_closed_and_unknown_over_the_socket(self) -> None:
         from scripts.build_queue import admission_wire as status_wire, placement
@@ -1038,8 +1076,10 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
     def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
+        # A terminal family gives no name, so the worktree folder names the caller.
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}):
+                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}), \
+                mock.patch.object(records, "family_owner_name", return_value=""):
             identity = client.step_identity("nextest", "/work/queue-fixture")
         self.assertEqual(identity.name, "terminal · queue-fixture")
 
@@ -1062,7 +1102,7 @@ class ClientTests(unittest.TestCase):
                 with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
                     **environment, "CLAUDE_CODE_SESSION_ID": session,
                     "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
-                }):
+                }), mock.patch.object(records, "family_owner_name", return_value=""):
                     identity = client.step_identity("nextest", "")
                     self.assertEqual((identity.name, identity.unit), (name, owner_unit))
                     self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
@@ -1489,22 +1529,6 @@ class ClientTests(unittest.TestCase):
                                  [request, request])
                 self.doCleanups()
 
-    def test_verify_run_slot_ignores_inherited_leave_hooks(self) -> None:
-        with AdmissionFixture() as fixture:
-            owner = fixture.run_owner()
-            reply = wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 1, "fixture", fixture.server.host))
-            grant_after = wire.PROTOCOL_ACQUISITION_TIMING.reconnect_seconds + 1
-            transport = self.use_transport(fixture, Exchange(reply_bytes(reply), TimedChunk(grant_after, reply_bytes(wire.Ok()))))
-            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave", "BUILDLOG_MAC_IDLE_HOOK": "test-idle"}), \
-                    mock.patch.object(client, "_leave_queue", return_value=True) as hook, \
-                    redirect_stderr(io.StringIO()) as errors:
-                status = client.main(["verify-run-slot", "--pid", str(owner.pid)])
-            self.assertEqual(status, 0, errors.getvalue())
-            hook.assert_not_called()
-            self.assertEqual(fixture.clock.monotonic(), grant_after)
-            self.assertEqual(len(transport.requests), 1)
-            self.assertIn(records.run_limit_text(reply.reason), errors.getvalue())
-
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:
@@ -1565,6 +1589,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
                     self.assertEqual(errors.getvalue().count(
                         "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("queue reached again", errors.getvalue())
                     self.assertNotIn("step refused", errors.getvalue())
                     self.doCleanups()
 
@@ -2676,14 +2701,17 @@ class ClientTests(unittest.TestCase):
     def test_closed_connection_reconnects_immediately_with_same_episode_and_since(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
+            gpu_wait = reply_bytes(wait_reply(records.GpuSlotWait(1, 1), 1, "head", "GPU test slot"))
             transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), b""),
-                Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
+                Exchange(gpu_wait, gpu_wait, b""), Exchange(reply_bytes(WAIT) + reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()) as output:
                 result = client.admit(request, lambda _wait: None, lambda: request)
             self.assertEqual(result, GRANTED)
             self.assertEqual(transport.requests, [request] * 3)
             self.assertEqual(transport.attempts, [0, 0, 0])
             self.assertEqual(output.getvalue().count("admission service restarted; waiting again"), 1)
+            self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("queue reached again")],
+                ["queue reached again: GPU test slot", "queue reached again: free memory"])
 
     def test_silent_service_reports_after_120_seconds_and_keeps_waiting(self) -> None:
         with AdmissionFixture() as fixture:

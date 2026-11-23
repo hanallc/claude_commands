@@ -37,7 +37,7 @@ from scripts.accounts import accounts, moves, role_map, worker_names
 from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
-from scripts.agents import member_account, producer_transfer, restart, stop_resume, stop_results
+from scripts.agents import member_account, producer_transfer, restart, shutdown_record, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, process_start, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
@@ -277,6 +277,80 @@ class WorkerResumeTests(unittest.TestCase):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_named_producer_stop_holds_until_a_confirmed_resume(self) -> None:
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        identity = str(row.current_session)
+        held = stop_resume.StoppedOnPurpose(row.name)
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.StopFailed(identity, "fixture refused")) as stop,
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ResumeFailed(identity, "fixture refused")) as start):
+            self.assertEqual(shutdown.main(["stop", row.name]), 1)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            stop.return_value = stop_resume.NotRunning(identity)
+            self.assertEqual(shutdown.main(["stop", row.name]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.assert_not_called()
+
+            self.assertEqual(shutdown.main(["resume", row.name]), 1)
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.return_value = stop_resume.ClaudeUp(identity, "fixture-pane", "claude3")
+            self.assertEqual(shutdown.main(["resume", row.name]), 0)
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(stop_resume.resume_for_upkeep(row.id), stop_resume.ClaudeUp)
+
+            self.assertEqual(shutdown.main(["exit", row.name, "--why", "keep stopped"]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            exited = staff.snapshot().rows_by_id[row.id].exited
+            self.assertIsInstance(exited, staff.Exited)
+            assert isinstance(exited, staff.Exited)
+            self.assertEqual(exited.why, "keep stopped")
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+
+    def test_remote_producer_exit_stops_on_mac_and_saves_the_hold(self) -> None:
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("mac", self.root))
+        mac_state = self.root / "mac-shutdown"
+
+        def remote_stop(arguments: list[str], stdin: str, limit: remote.RemoteCallLimit) -> tuple[int, str]:
+            self.assertEqual(arguments, ["_unit-local"])
+            self.assertEqual(limit["kind"], "while link alive")
+            reply = io.StringIO()
+            with (patch.object(shutdown, "local_machine", return_value="mac"),
+                  patch.object(shutdown, "other_machine", return_value="natedev"),
+                  patch.object(remote, "local_machine", return_value="mac"),
+                  patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(mac_state)}),
+                  patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stdout(reply)):
+                code = shutdown.unit_local_command()
+            return code, reply.getvalue()
+
+        def stop_on_mac(reference: str, _kind: str = "") -> stop_resume.Stopped:
+            self.assertEqual(reference, row.id)
+            self.assertEqual(remote.local_machine(), "mac")
+            current = staff.snapshot().rows_by_id[row.id]
+            self.assertIsInstance(current.paused, staff.Paused)
+            self.assertIsInstance(current.exited, staff.Active)
+            return stop_resume.Stopped(str(row.current_session), 123)
+
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(shutdown, "local_machine", return_value="natedev"),
+              patch.object(shutdown, "other_machine", return_value="mac"),
+              patch.object(shutdown, "run_remote", side_effect=remote_stop) as run,
+              patch.object(stop_resume, "_stop", side_effect=stop_on_mac) as stop,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["exit", row.name, "--why", "maintenance"]), 0)
+        run.assert_called_once()
+        stop.assert_called_once()
+        self.assertIn("alpha: exited", output.getvalue())
+        current = staff.snapshot().rows_by_id[row.id]
+        self.assertIsInstance(current.exited, staff.Exited)
+        assert isinstance(current.exited, staff.Exited)
+        self.assertEqual(current.exited.why, "maintenance")
+        self.assertEqual(shutdown_record.read(), [])
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(mac_state)}):
+            self.assertEqual(shutdown_record.read(), [row.id])
+
     def test_producer_resume_uses_first_admission_after_a_family_change(self) -> None:
         class InterruptedResume(BaseException):
             """The command exits before its next step."""
@@ -5070,6 +5144,45 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
+
+    def test_resume_launches_in_the_saved_move_destination(self) -> None:
+        from scripts.worktree import worktrees
+
+        old = self.root / "old checkout"
+        new = self.root / "new checkout"
+        (old / "crates").mkdir(parents=True)
+        self.entry["cwd"] = str(old / "crates")
+        pane_record.write("agents", self.entry)
+        identity = worktrees.FolderIdentity.read(old)
+        _ = old.rename(new)
+        move = worktrees.WorktreeMove(old, new, "origin", "alpha", "test", worktrees.MoveOutput.LIVE_UNIT)
+        journal = worktrees.MoveJournal(move, identity, identity, "", Path(".git"), (), worktrees.MoveStage.FINISHED)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            worktrees.write_move(journal)
+            result = stop_resume.resume("alpha", why="worktree move")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(new / "crates"))
+
+    def test_resume_uses_the_saved_folder_with_an_incomplete_move_record(self) -> None:
+        from scripts.worktree import worktrees
+
+        saved = self.root / "saved checkout"
+        saved.mkdir()
+        self.entry["cwd"] = str(saved)
+        pane_record.write("agents", self.entry)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            record = worktrees.move_file(saved)
+            record.parent.mkdir(parents=True)
+            _ = record.write_text("{}")
+            result = stop_resume.resume("alpha", why="worktree move")
+            _ = record.write_text(json.dumps({"old": str(saved)}))
+            self.assertEqual(worktrees.moved_launch_folder(saved), saved)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(saved))
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")

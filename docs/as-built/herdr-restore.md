@@ -71,8 +71,8 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - A replacement closes its source only after resume publication proves the new conversation.
   A source pane that gains another conversation or program stays open and prints an anomaly.
   A failed start preserves the pane. A failed restore returns exit status 1.
-- Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
-  herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
+- Herdr keeps the restored layout. Herdr can also resume each pane on the server's account without the pane's `--env`.
+  Set `[session] resume_agents_on_restore = false` to disable native agent restore.
 - Before a power-off, run `agents stop --all`. It saves each local live staff row before its stop.
 - After login, run `agents restart`. Stop starts nothing.
 - `agents restart --all` uses the same selection and stop loop, then starts the selected rows.
@@ -85,9 +85,13 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   workspaces. Restoring into an existing server leaves focus and startup workspaces alone.
 - On natedev, `herdr-agents.service` is a transient unit that `systemd-run` creates.
   The upkeep timer restores producers through shared resume.
-- The herdr startup path adopts an answering server. Otherwise it starts one with
-  `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
+- The herdr startup path takes the shared reboot lock, then adopts an answering server. Otherwise it
+  starts one with `systemd-run` on Linux. On the Mac it starts the server directly from a desktop
   session, or opens an attach window to start it from a non-desktop session.
+  The standalone attach command connects in client mode after the server is ready.
+  Remote attach uses SSH to focus the tab on the target host.
+  The focus command uses the shared reboot lock to restore an absent server.
+  After focus succeeds, the local Herdr client attaches with local keybindings.
   Herdr can replay saved pane commands when its configuration allows agent restore.
   Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
   session labels and resume note. This is separate from `agents restart`.
@@ -139,10 +143,10 @@ Each upkeep run uses this order:
 1. Restore or adopt the shared herdr server.
 2. Save the shared layout.
 3. Refresh the detection rules.
-4. Resume each selected producer through `stop_resume.resume(str(row.id))`.
+4. Check and resume each selected producer through `stop_resume.resume_for_upkeep(row.id)`.
 
 `accounts.producer_upkeep_members()` reads the local staff snapshot.
-It selects active, local, unpaused producers from both families, without exit requests.
+It selects local, unpaused producers from both families, including producers with exit holds.
 Absent staff returns `()`.
 One `accounts.settings_report_scope()` covers the operation.
 Invalid producer settings exclude that producer and produce one warning per operation.
@@ -151,7 +155,7 @@ Each producer has its own tab in the configured `PRODUCER_WORKSPACE`, normally `
 Resume uses its current conversation, current `[producers]` settings, and family account.
 A live producer starts nothing.
 A paused producer stays stopped.
-An exit request also excludes the producer from upkeep.
+The resume path checks exit and pause holds under the producer's row lock.
 Upkeep does not admit a configured name that has no staff row.
 The [first-start contract](shutdown-and-restart.md#producer-launch-and-admission) defines admission.
 

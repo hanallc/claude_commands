@@ -350,6 +350,10 @@ always=always-there
         past = local_reset(self.now - timedelta(hours=1))
         notes: Notes = [self.note("codex2.md", "inactive", "0"), self.note("claude1.md", "active", "2"),
                         self.note("claude2.md", "active", "null"), self.note("codex1.md", "active", "0", past)]
+        with quota_alert.CONFIG.open("a", encoding="utf-8") as settings:
+            _ = settings.write("token_expiry.lead_days=30 7\n"
+                               + "token_expiry.hana_linux_runners.ends=2099-01-01\n"
+                               + "token_expiry.hana_macos_runner_query.ends=2099-01-01\n")
         self.assertEqual(self.alert(notes, self.now), [])
         self.assertEqual(self.sent, [])
 

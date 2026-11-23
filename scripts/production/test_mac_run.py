@@ -23,12 +23,12 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import floor_claims
+from scripts.mac_test import claim_state, floor_claims
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -113,6 +113,13 @@ case $command in
         if (( ${@[(Ie)merge-base]} && ${@[(Ie)--is-ancestor]} )); then
             [[ -n $MAC_RUN_CLONE_DESCENDANT && ${@[-2]} == $MAC_RUN_SHA && ${@[-1]} == $MAC_RUN_CLONE_DESCENDANT ]]
             exit $?
+        fi
+        if (( ${@[(Ie)remote]} && ${@[(Ie)get-url]} )); then
+            # Each fixture repository has a distinct origin, so it has a history key.
+            folder=${@[$((${@[(Ie)-C]} + 1))]}
+            [[ -e $folder/.git ]] || exit 2
+            print -r -- "https://example.invalid/${folder:t}.git"
+            exit 0
         fi
         if (( ${@[(Ie)rev-parse]} )); then
             code=0
@@ -387,7 +394,7 @@ class MacRunTests(unittest.TestCase):
         # The runner's session must not own the fixture's Mac block.
         seed_interpreter_cache(self.root / "cache")
         self.environment = {
-            **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
+            **{name: value for name, value in memory_gate_shell_environment().items() if name not in SESSION_SELECTORS},
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             "__ETC_ZSHENV_SOURCED": "1",
@@ -715,7 +722,7 @@ class MacRunTests(unittest.TestCase):
         )
         self.assert_claim_released()
 
-    def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
+    def test_claim_file_keyed_by_repository_lets_another_repository_run_beside_it(self) -> None:
         (self.repository / ".git").mkdir()
         other = self.root / "other"
         (other / ".git").mkdir(parents=True)
@@ -723,15 +730,18 @@ class MacRunTests(unittest.TestCase):
                                      "--worktree", str(other))
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
         claims = self.state_directory / "claims"
-        before = (claims / "other.json").read_bytes()
+        # A Mac claim file takes its name from the repository key.
+        other_key = "git-dir:" + str(other.resolve() / ".git")
+        other_claim = claims / f"{claim_state.mac_claim_stem(other_key, 0)}.json"
+        before = other_claim.read_bytes()
         self.clear_events()
 
         result = self.mac_run()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreater(len([event for event in self.events() if event["command"] in {"ssh", "scp"}]), 1)
-        self.assertEqual(sorted(path.name for path in claims.iterdir()), ["other.json"])
-        self.assertEqual((claims / "other.json").read_bytes(), before)
+        self.assertEqual(sorted(claims.iterdir()), [other_claim])
+        self.assertEqual(other_claim.read_bytes(), before)
         self.assert_claim_released()
 
     def test_success_releases_claim(self) -> None:

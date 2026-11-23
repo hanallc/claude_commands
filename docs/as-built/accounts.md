@@ -42,12 +42,33 @@ The agent-notes job runs these parts in separate processes:
 5. Unit recovery.
 6. Login reminders.
 7. Phase note pruning.
-8. Vault commits.
+8. Producer folder size checks.
+9. Vault commits.
 
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
+An invalid schedule block fails its part. The other due parts still run.
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
+
+## Producer folder sizes
+
+`Part.FOLDER_SIZE` checks active producers' recorded folders below `PRODUCER_FOLDER_ROOT`.
+A recorded document file identifies its parent folder.
+`parts.folder_size` sets a 3,600-second interval and a 60-second process limit.
+Each check reads `producer_folder_limit_mb` from `staff.conf`. The limit is a whole number of at least one and defaults to 10 MB.
+One MB is 1,000,000 bytes.
+The check counts the bytes of every regular file, including media. It skips symlinks.
+The size is an estimate. A folder change during the walk can cause one extra notice.
+A missing or unreadable folder or a failed metadata read produces one log line. The check continues with the next producer.
+The check measures every folder before it sends a notice. It writes each warning as soon as it occurs.
+The job sends one notice to the staff ID when a measured size exceeds the limit.
+The job saves each crossing in `agent-notes/job/folder-size.json` under the state directory.
+A send has a 5-second delivery limit and a 10-second process limit. The job saves the crossing state after each attempt.
+A retry uses the same message key. A queued notice counts as accepted.
+The job sends notices with fewer attempts first on the next pass.
+An interruption after Codex accepts a notice can cause a duplicate on retry.
+A measurement at or below the limit clears the crossing and permits a new notice after the next crossing.
 
 ## Claude quota expiry pushes
 
@@ -593,12 +614,11 @@ After the weekly reset, a low reading in the new window can show an alert again.
 If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
 The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
-The Accounts table has one row per account.
-It shows the weekly quota, reading status, reset, and credits.
-The roles column lists the roles that select the account as their default.
-It shows the role names in role order, with commas between them.
-The list stays on one line and ends with an ellipsis if it is too long.
-The tooltip shows the full list.
+The Accounts table shows the account, weekly quota, hourly rate, run-out time, role, next move, reset, and credits.
+Each role on an account has a row with its color swatch.
+When rows for one account are next to each other, the first row shows the account details.
+When sorting separates those rows, the account details appear at the start of each group.
+An account without a role has an empty role cell.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
 The page starts its forecast from the displayed weekly reading.
 It excludes history before the current weekly window or the last refill.
@@ -608,9 +628,16 @@ If the quota lasts until the reset, the run-out cell shows a dash with that expl
 The page shows forecast times in the user's time zone.
 
 The Roles table has one row per role.
-It lists each account under its role and places selected accounts first.
-Each account keeps its own next move and counts.
-The total row stays last.
+It shows the selected account for each role.
+Each role has a color swatch.
+Each count column shows the total for the role across all accounts.
+The count tooltip lists counts by account when any observed sessions run outside the selected account.
+The tooltip also lists accounts outside the selected account when their counts are unknown.
+If the role has no selected account, the tooltip lists the count for each observed account.
+If a role has no selected account, the account cell shows muted `no account` text.
+The next column shows the next move of the selected account as text.
+Only the Accounts table has the control that changes the next move.
+The total row stays last, including when the account list is empty.
 
 The Models table groups session counts by model ID and effort.
 
@@ -619,9 +646,9 @@ The Accounts table starts in account order. The Roles table starts in role order
 The quota, rate, run-out time, and reset sort from the smallest or earliest value.
 Credits sort from the largest balance. An unlimited balance comes first.
 Enabled accounts come first when you sort by the credits setting.
-The roles column sorts by the full list without regard to letter case.
-Accounts without selected roles sort last in both directions.
-The next column sorts by target account.
+The role column sorts by role name without regard to letter case.
+The next column sorts by its text without regard to letter case.
+`auto`, `none` and `unavailable` sort as words. Rows with no next move stay last.
 Role counts sort by the sum for the role, largest first.
 Missing values stay last in both directions.
 Select the active header again to reverse the order.
@@ -635,7 +662,7 @@ The shipped value of `role.producer` is `pink`.
 `staff_role_color` maps a staff row through those keys and `account_color`.
 Unknown or invalid colors use the normal text color.
 The value accepts a color name or a six-digit hex color.
-A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
+A board span with a valid configured color carries its key as `color_key`.
 Configured accounts and role groups have a color swatch on the console Accounts page.
 The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
@@ -656,11 +683,11 @@ A peer commit with the saved value and no order still needs a commit that record
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
-The Roles table shows each next move beside its account.
-Sorting moves the whole role row with its next moves.
+The Accounts table shows each next move beside its role.
+Sorting keeps each next move with its role.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
 A selected Codex workers line shows its first target, or `auto`, without a button.
-Other assignments show a minus icon. The total cell stays empty.
+Other assignments show a minus icon.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
 One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
@@ -800,3 +827,75 @@ Account and role changes preserve these boundaries:
 7. Mark an alert delivered only after successful delivery.
 8. Clear only alerts that precede the observation of a live session.
 9. Preserve shared settings and concurrent edits during local-key filtering.
+
+## Token end dates
+
+The Tokens table appears below Models on the Accounts page.
+It shows each token's purpose, end date, days left, and state.
+The page uses the user's time zone and shows the renewal steps below the table.
+Set a GitHub token's end date with `/tune showrunners token_expiry.<name>.ends <YYYY-MM-DD>`.
+The page warns during a reminder window and marks expired tokens as errors.
+The table includes the token that registers the Hana Linux CI runners.
+It also includes the token that checks runner availability for optional Hana macOS CI.
+
+The Linux renewal step runs `hana_runner_token.py reseal` from a plain natedev terminal.
+The helper authenticates with sudo before it reads the token from 1Password.
+It keeps the token in memory and atomically replaces the live credential with the sealed file.
+Ctrl+C before publication exits with status 130 and keeps the live credential.
+After publication starts, the helper replaces the credential or removes the temporary file on failure.
+
+### Mac fallback token
+
+The Mac notes timer publishes `Mac fallback token.md` in the shared account notes.
+The `mac_token.account` key in `config/showrunners.conf` sets the Claude account for display and renewal.
+A blank or invalid label prompts the user to set the account.
+The relay and timer use no account probe.
+The note stores the token file's modification time and the times of relay results.
+The timer records a fresh observation at most once an hour for the same file.
+The page marks data stale when the observation is more than one day old, missing, or in the future.
+Replacing the file starts a new record.
+The page estimates expiry as 365 days after the modification time.
+Copying the file or changing its timestamp can change this estimate.
+The table shows an active login failure until a relay succeeds.
+
+The relay puts the decoded value in its Claude child environment.
+The selected account folder remains in `CLAUDE_CONFIG_DIR`.
+The relay removes inherited credential, provider, endpoint, proxy, and TLS overrides.
+It tells Claude Code to ignore provider and endpoint overrides from settings files.
+Settings stored in the account folder can still select another credential, such as a gateway sign-in or an `apiKeyHelper`.
+The relay records the login result separately from the message delivery result.
+See https://code.claude.com/docs/en/authentication#authentication-precedence and https://code.claude.com/docs/en/network-config.
+
+
+In a plain Terminal or iTerm window, not in a herdr pane, run `mac-token-renew`.
+The zsh alias runs this command.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/whoami/mac_fallback_token.py renew
+```
+
+1. Approve browser access while signed in to the configured account.
+2. Copy the token that `setup-token` shows.
+3. Paste the token at the hidden prompt.
+4. Press Enter.
+
+The command refuses in these conditions.
+
+- Standard input or standard output is not a terminal, or `CLAUDECODE` is set.
+- `TERM_PROGRAM` is neither `Apple_Terminal` nor `iTerm.app`, or `SSH_CONNECTION`, `TMUX`, or `HERDR_ENV` is set.
+- `mac_token.gpg_recipient` is missing or has an invalid fingerprint.
+
+The command runs `setup-token` for the configured account.
+It passes the pasted token to GPG through standard input.
+GPG uses the 40-digit hexadecimal fingerprint in `mac_token.gpg_recipient`.
+GPG encrypts the token in a private temporary file.
+The command replaces `~/.config/claude/oauth-token.gpg` with one rename.
+After `setup-token` starts, the command clears the terminal screen, scrollback, and system clipboard when the command exits.
+The `pbcopy` utility clears only the system clipboard.
+If a clipboard history app or Universal Clipboard holds the token, clear it there too.
+The command publishes the new file date.
+It prints the account and estimated expiry in the user's zone.
+
+The relay child holds `CLAUDE_CODE_OAUTH_TOKEN` in its environment.
+Any process that runs as the same user can read the variable.
+The relay has used this design since 2026-10-01.

@@ -7,6 +7,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 from uuid import uuid4
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff, update_registration
 from scripts.production import test_waiting_why as fixtures
@@ -18,9 +19,7 @@ class WaitingActionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = fixtures.WaitingWhyTests('runTest')
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, fixtures.WaitingWhyTests('runTest'))
 
     def test_user_question_automatically_stores_its_text_for_each_type(self) -> None:
         doc = self.fixture.fixture.production
@@ -39,7 +38,7 @@ class WaitingActionTests(unittest.TestCase):
             _ = investigation.answer(owner, record.id, 'The cause is known.')
         for kind in review_items.REVIEW_TYPES:
             with self.subTest(kind=kind):
-                item = next(item for item in review_items.read(self.fixture.root, assign_ids=False) if item.type == kind)
+                item = next(item for item in review_items.read(self.fixture.root) if item.type == kind)
                 words = 'Which evidence resolves this ' + kind.value + '?'
                 status = change_page.DeliveryStatus(self.fixture.root)
                 if kind == review_items.ReviewType.CHANGE:
@@ -60,7 +59,7 @@ class WaitingActionTests(unittest.TestCase):
                     _ = review_actions.investigation_action(item, 'question', words, status)
                 else:
                     _ = review_actions.decision_action(item, 'question', words, status)
-                current = next(value for value in review_items.read(self.fixture.root, assign_ids=False) if value.key == item.key)
+                current = next(value for value in review_items.read(self.fixture.root) if value.key == item.key)
                 self.assertEqual(current.state, review_items.ReviewState.WAITING)
                 self.assertEqual(current.waiting_why, words)
 
@@ -74,7 +73,7 @@ class WaitingActionTests(unittest.TestCase):
         sent = review_submissions.submit(request)
         self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', sent.reply_token))
         root = self.fixture.root
-        item = next(item for item in review_items.read(root, assign_ids=False) if item.type == review_items.ReviewType.RESPONSE)
+        item = next(item for item in review_items.read(root) if item.type == review_items.ReviewType.RESPONSE)
         browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
         words = 'Which evidence shows the cause?'
         body = urlencode({'row': item.key, 'token': change_browser.row_token(browser, item.key),

@@ -52,6 +52,54 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Whole gate route
+
+The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
+The assignment must match the gate's placement episode and submitting process.
+The queue must confirm that the saved attempt is current.
+If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
+An assignment to `natedev` runs the gate on natedev.
+An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
+The AWS route refuses assigned gates that request type checks.
+An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
+The gate reads the guest switch after it confirms the `mac-linux` assignment.
+If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
+The guest test timer uses `run.time_limit_seconds`.
+The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
+When the test timer expires, the gate returns the guest's time-limit report.
+If the first guest probe fails, the route records a retry backoff for `mac-linux`.
+The route reads and writes this record independently of the placement registry.
+If the write fails, the route adds the write error to the probe failure.
+`mac_test.free_now` reads this backoff now.
+Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
+After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
+This one setting is for every machine. The `mac-linux` and AWS routes read it.
+The setting accepts whole numbers from 1 to 86400 seconds.
+The route takes the Mac repository claim before the first SSH request.
+The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
+If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
+The route sends no more cleanup requests.
+The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
+The queue's guestkeep change will retain the Mac claim until a later proof.
+If the guest starts no test run, the route returns `GuestNotStarted`.
+This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The new assignment goes into the same file, and the gate runs again on the assigned machine.
+The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
+If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
+A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
+If no named machine remains, the gate step stops with "Gate placement blocked".
+A refused placement during the retry stops the gate step with "Gate placement blocked".
+A failure after the guest armed the run is not placed again: the gate fails.
+`copies.py run` with named gate targets does not place the gate again yet.
+If the guest cannot return a result, the gate fails and reports the guest and the reason.
+If the guest returns a failure, the gate reports the guest and the failed jobs.
+A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
+When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
+If AWS refuses that unassigned run, natedev runs the selection.
+A current assignment to an unsupported target fails and reports the target.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
@@ -155,6 +203,7 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
 | `log_push_s` | `5` | Send progress logs. |
 | `result_poll_s` | `2` | Check remote results. |
+| `unreachable_wait_seconds` (`build_targets.conf`) | `600` | End a run whose box sends no new log for this long, counted from launch. The box ends. An assigned run fails with `unreachable`; a run with no assignment runs again on natedev. Paired trials are not checked. |
 | `observe_outage_s` | `180` | Keep polling a running box through a short AWS outage. |
 | `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
 | `api_timeout_s` | `30` | Bound each scaler API command. |
@@ -334,11 +383,18 @@ This record changes no selection and refuses no run.
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
-`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
-This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
-A red module runs once more alone, as in the gate.
-The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
-`--module` without `--tests-only` is refused.
+Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+Use the module names that the gate prints.
+A standalone named run waits for the build hold to clear and takes one local admission reservation.
+A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
+It reads the reservation from the state folder in the grant and checks that release has not started.
+The child runs one module at a time and takes no additional CPU slot.
+The Builds page shows the run while it holds the reservation.
+The reservation counts as one run under `max_runs.natedev.claude_commands`.
+Modules share the CPU slots and use the memory governor.
+A failed module can run once more alone.
+The named run has no time limit and creates no gate record or passed-tree entry.
+The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -1104,7 +1160,7 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **The governor controls starts.** A job can exceed the governor after admission.
   A memory peak does not kill the job or fail the gate.
-- **Module time limit.** The gate kills a module that reaches `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
+- **Module time limit.** For regular runs, the gate stops a module at `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
   Its result starts `killed: still running after 1800 s, the module time limit`, and the gate fails.
   This prevents a stalled module from holding every gate behind it.
 
@@ -1277,9 +1333,14 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
 
-The merge gate owns module folders through `temporary_build_folder` contexts.
-The contexts remove folders after success or an exception.
-Style lint uses the same context and keeps its standing Cargo target.
+The merge gate owns each module folder through a `tool_folder` context.
+The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
+The runner puts its config-read log, scratch root, and review root inside that folder.
+The runner supervisor removes these folders after it reaps the test processes, including after gate death on Linux.
+The gate repairs permissions if necessary when it removes the module folder.
+After gate death, recovery reports the retained gate folder for removal.
+Standalone runners keep separate leases for their folders.
+Style lint uses a temporary leased folder and keeps its standing Cargo target.
 Style review keeps its input folder because the review worker reads it after preparation exits.
 
 

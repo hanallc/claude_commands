@@ -30,6 +30,33 @@ The expiry template requires current approval before sending.
 
 Claude sends no weekly session alert, 30-minute repeat, showrunner relay, `Quota restored:` notice or instruction to start no new work. `/quota_ack` and its acknowledgement state are removed. `/quota_refresh` still refreshes readings when the user reports a reset; routing restoration is recorded in the moves journal without a session notice. A scheduled move consumes its entry when its group selection is recorded, keeps the usual safe shutdown/showrunner notices, and sends no phone alert.
 
+## Token notices
+
+The quota check sends one `quota.token_expiry` reminder per token in each configured window.
+The default windows start 30 and 7 days before the end date in the user's time zone.
+The key `token_expiry.lead_days` in `config/showrunners.conf` contains the day counts as a space-separated list.
+Each `token_expiry.<name>.ends` key supplies a token's end date as `YYYY-MM-DD`.
+The Mac fallback token gets its estimated end date from its metadata.
+If a check misses a window, it uses the current window.
+A missing or invalid date adds an anomaly to the log and leaves other reminders due.
+Saved Mac expiry attempts still apply to the same token and window.
+If two saved attempts refer to the same reminder, the quota check keeps the delivered attempt.
+
+A Mac relay login rejection sends the separate `quota.mac_token_login` reminder.
+A later successful relay suppresses the reminder for an earlier rejection.
+For the same token, a new reminder requires a successful relay after the claimed rejection.
+A check for an older token keeps the claim for a newer token.
+Both reminders say “Read the Accounts page.”
+Both Mac reminders require a Mac observation from the last 24 hours.
+
+During silence, the quota check skips these reminders and saves no attempt.
+The phone sender refuses these reminders if silence begins after the quota check.
+The first quota check after silence uses current data.
+A clear send failure removes the attempt so the next check can retry.
+An unconfirmed attempt can retry after 24 hours if the reminder is still due.
+Confirmed delivery ends retries for that window or login rejection.
+Each template requires current approval.
+
 ## Codex notices
 
 Workers use the same one-shot log: “when workers reach 1% switch to codex2” or “when workers reach 1% switch to claude”. Workers entries have no minute hold. A move to Claude holds there until the source account's weekly reset, even if Codex has room earlier. Entries run once in log order and leave the log after a recorded move; refused swaps keep them.

@@ -8,9 +8,12 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from typing import override
+from unittest.mock import patch
 
-
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.maintenance.test_vault_save import job_config_fixture
 from scripts.maintenance.vault_commit import main as tool_main, subject
 
 
@@ -26,7 +29,25 @@ def write(repo: str, rel: str, text: str) -> str:
     return path
 
 
-class Vault(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    root: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        config = self.root / "agent_notes.toml"
+        _ = config.write_text(job_config_fixture())
+        _ = (self.root / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=1\n")
+        self.enterContext(patch.dict(os.environ, {
+            **fixture_git_environment(self.root),
+            "AGENT_NOTES_JOB_CONFIG": str(config),
+            "CONF_DIR": str(self.root),
+        }, clear=True))
+
+
+class Vault(Fixture):
     """A repo with two generated notes and one hand-edited note, all committed."""
 
     repo: str = ""
@@ -35,9 +56,10 @@ class Vault(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.repo = os.path.realpath(tmp.name)
+        super().setUp()
+        repo = self.root / "vault"
+        repo.mkdir()
+        self.repo = str(repo.resolve())
         _ = sh(self.repo, "init", "-q", "-b", "main")
         _ = sh(self.repo, "config", "user.name", "test")
         _ = sh(self.repo, "config", "user.email", "test@example.invalid")
@@ -106,7 +128,7 @@ class Tool(Vault):
         self.assertIn("not in a git repo", err)
 
 
-class Subject(unittest.TestCase):
+class Subject(Fixture):
     def test_names_a_few_then_counts(self) -> None:
         self.assertEqual(subject("j", ["a.md", "b.md"]), "j: update a, b")
         five = [f"{n}.md" for n in "abcde"]
