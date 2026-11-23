@@ -1394,6 +1394,7 @@ Mark read clears the dot and adds a log entry.
 Mark read on an unparked Waiting for nate item with no open question also sets the state to Working.
 The same write logs the state change and saves a notice for the item's producer.
 The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
+For an item in a legacy keeper folder, the command also has `--keeper <keeper>`. For morty's folder, it has no `--keeper`.
 The existing sender delivers it with its retry and alert rules.
 The page applies the Working state from the response, so the row leaves Needs me in place.
 Mark read on any other item sends no message.
@@ -1465,9 +1466,13 @@ Close the linked item or change a filter to dismiss the section.
 An open question adds a Producer answering note below the saved state.
 The recipient runs the command in the message to save an answer: `the_list.py answer L<N> --keeper <keeper> --question <id> --text "<answer>"`.
 Morty can answer any List question.
-Without `--keeper`, the command uses the caller's List folder if it holds the item, and morty's folder if not.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
 Only morty can name a keeper other than itself or the caller.
 Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
+Without `--keeper`, `update` uses morty's folder. Only `--keeper` selects another folder.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
 The entry keeps the question ID, words, time, and saved recipient.

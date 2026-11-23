@@ -1321,7 +1321,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                                        recipient=page_action.recipient)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
             elif request.action == "read" and changed.state != item.state:
-                entries.append(ItemChange(moment, _next_step_notice(request, changed), PAGE_SOURCE))
+                entries.append(ItemChange(moment, _next_step_notice(keeper, request, changed), PAGE_SOURCE))
             elif request.action == "unpark":
                 reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
                           else UnparkNoChangeReason.NO_ACTIVE_PARKING)
@@ -1676,12 +1676,17 @@ def _waits_for_nate(item: ListItem, moment: datetime) -> bool:
             and not parking_active(item.parked_until, moment))
 
 
-def _next_step_notice(request: PageRequest, item: ListItem) -> PageFeedback:
-    """Ask the item's producer for the next step and save the producer as the recipient."""
-    producer = staff.snapshot().by_id(item.producer)
+def _next_step_notice(keeper: staff.StaffId, request: PageRequest, item: ListItem) -> PageFeedback:
+    """Ask the item's producer for the next step and save the producer as the recipient.
+
+    The command names a keeper other than morty, so it edits the item in that keeper's folder.
+    """
+    members = staff.snapshot()
+    producer = members.by_id(item.producer)
     name = shlex.quote(producer.name if producer is not None else item.producer)
+    keeper_option = "" if keeper in record_store.morty_ids(members) else f" --keeper {shlex.quote(keeper)}"
     words = (f"List page: nate read item {item.number}, so it is now Working. Write its next step: "
-             + f"`{_LAUNCHER} update --id {item.id} --source {name} --next-step \"<step>\"`.")
+             + f"`{_LAUNCHER} update --id {item.id}{keeper_option} --source {name} --next-step \"<step>\"`.")
     # The page words stay in form_words, so a retry matches the page request.
     return PageFeedback(request.request, words, action="read", form_words=request.words, recipient=item.producer)
 
@@ -2183,6 +2188,33 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     return status
 
 
+_KEEPER_HELP = "the staff ID of the record keeper"
+
+
+def _record_keeper(members: staff.StaffSnapshot, caller: staff.StaffRow, identity: str,
+                   chosen: staff.StaffId | None, *, command: str, any_keeper: bool) -> staff.StaffId:
+    """Return the record keeper whose folder a command on one item edits.
+
+    The chosen keeper comes first, and its List folder must exist.
+    With any_keeper, the default is morty, and the edit must check under the lock that the caller produces the item.
+    Without any_keeper, a legacy keeper's own folder comes before morty, as in change_page's question recovery.
+    Then only morty can name a keeper other than itself or the caller.
+    """
+    morty = producer_id(members, "morty")
+    if any_keeper:
+        keeper = chosen if chosen is not None else morty
+    else:
+        own = _store(caller.id)
+        held = own.valid_id(identity) and os.path.lexists(own.path(identity))
+        keeper = chosen if chosen is not None else caller.id if held else morty
+        if keeper not in (morty, caller.id) and caller.id != morty:
+            raise ListError(f"only the record keeper or morty can {command}")
+    # A missing folder is refused here, so the store lock creates no folder for an unknown keeper.
+    if chosen is not None and not _store(chosen).folder().is_dir():
+        raise ListError(f"no List folder for keeper {chosen}")
+    return keeper
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2191,7 +2223,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
     _ = answer.add_argument("--keeper", type=staff.StaffId,
-                            help="the staff ID of the record keeper (defaults to your folder if it holds the item, else morty's)")
+                            help=_KEEPER_HELP + " (defaults to your folder if it holds the item, else morty's)")
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2202,6 +2234,8 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--review-key", dest="reviews", action="append", type=ReviewByKey, default=[])
         elif name not in ("add", "list", "clean-evidence"):
             _ = command.add_argument("--id", required=True)
+        if name == "update":
+            _ = command.add_argument("--keeper", type=staff.StaffId, help=_KEEPER_HELP + " (defaults to morty's)")
         if name in ("add", "update"):
             _ = command.add_argument("--title", required=name == "add")
             _ = command.add_argument("--owner", required=name == "add")
@@ -2241,23 +2275,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
-            morty = producer_id(record, "morty")
-            target = cast(staff.StaffId | None, args.keeper)
-            own = _store(caller.id)
-            # A legacy keeper's own folder comes first, as in change_page's question recovery.
-            held = own.valid_id(identity) and os.path.lexists(own.path(identity))
-            keeper = target if target is not None else caller.id if held else morty
-            if keeper not in (morty, caller.id) and caller.id != morty:
-                raise ListError("only the record keeper or morty can answer")
-            answerer = _QuestionAnswerer(caller, morty)
+            keeper = _record_keeper(record, caller, identity, cast(staff.StaffId | None, args.keeper), command=name,
+                                    any_keeper=False)
+            answerer = _QuestionAnswerer(caller, producer_id(record, "morty"))
             result = page_question.answer(_ListQuestionStore(keeper, answerer=answerer), identity, question,
                                           cast(str, args.text))
             if isinstance(result, page_question.AnswerRefused):
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
-        keeper = producer_id(record, "morty")
-        assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
+        morty = producer_id(record, "morty")
+        keeper = morty
+        # Only morty updates every field of every item, in each keeper's folder.
+        assigned_to = AllItems.INCLUDED if caller.id == morty else caller.id
         if name == "list":
             include_closed = cast(bool, args.all)
             if assigned_to is AllItems.INCLUDED:
@@ -2276,10 +2306,17 @@ def main(argv: list[str] | None = None) -> int:
             identity = cast(str, args.id)
             if identity.isascii() and identity.isdecimal():
                 identity = f"L{identity}"
+            # A producer can name any keeper; _update with assigned_to=caller refuses items it does not produce.
+            keeper = _record_keeper(record, caller, identity, cast(staff.StaffId | None, args.keeper), command=name,
+                                    any_keeper=True)
+            reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
+            # A producer gets the field refusal below, because it never changes these fields.
+            if assigned_to is AllItems.INCLUDED and keeper != morty and reassigns:
+                raise ListError("move the item to morty's List before you change its producer or owner")
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
-                                              if value is not None and key not in {"command", "id", "source"})
+                                              if value is not None and key not in {"command", "id", "keeper", "source"})
                 _ = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source or "",
                             add_evidence=add_evidence or "", assigned_to=caller)
                 return 0
@@ -2289,7 +2326,7 @@ def main(argv: list[str] | None = None) -> int:
                               add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
-            return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
+            return _notify_producer_assignment(changed.item, changed.before.producer, morty, caller=caller.id)
         if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close"):
             raise ListError(f"only morty can run {name}")
         if name in ("park", "close"):

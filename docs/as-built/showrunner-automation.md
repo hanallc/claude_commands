@@ -572,6 +572,10 @@ Morty can answer any List question.
 Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
 Only morty can name a keeper other than itself or the caller.
 Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
+Without `--keeper`, `update` uses morty's folder. Only `--keeper` selects another folder.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.

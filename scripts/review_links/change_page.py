@@ -786,7 +786,7 @@ def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecord
             return listing
     except ValueError as error:
         raise StaleQuestionAttempt("The List question source is unavailable.") from error
-    keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+    keepers = record_store.morty_ids(staff.snapshot())
     if len(keepers) != 1:
         raise StaleQuestionAttempt("The List keeper is unavailable.")
     listing = replace(listing, owner=keepers[0])

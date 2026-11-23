@@ -1767,6 +1767,98 @@ class TheListTests(unittest.TestCase):
                     self.assertEqual(self.command(*args)[0], 0)
                 self.assertEqual(the_list.load(MORTY.id, item.id).next_step, "Check the page.")
 
+    def legacy_item(self, producer: staff.StaffRow, state: the_list.ItemState) -> the_list.ListItem:
+        """Add an item to morty's folder and copy it into bob's legacy folder."""
+        # Only morty's folder allocates numbers, so morty keeps an item with the same number.
+        item = self.add(changes={"state": state, "producer": producer.id})
+        legacy = the_list.folder(BOB.id)
+        legacy.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{item.id}.md", legacy / f"{item.id}.md")
+        return the_list.load(BOB.id, item.id)
+
+    def test_page_mark_read_notice_command_names_a_legacy_keeper(self) -> None:
+        # bob is the legacy keeper. bob or dwight produces the item in bob's folder.
+        for producer in (BOB, OTHER):
+            with self.subTest(producer=producer.name):
+                item = self.legacy_item(producer, the_list.ItemState.WAITING_FOR_NATE)
+                morty_item = the_list.load(MORTY.id, item.id)
+                read = the_list.mark_read_edit(BOB.id, item.id, source=the_list.PAGE_SOURCE,
+                                               update=the_list.ReadCurrentUpdate.CURRENT,
+                                               page_request=the_list.PageRequest("read", "read", "")).item
+                self.assertEqual(read.state, the_list.ItemState.WORKING)
+                notice = the_list.feedback_requests(read)["read"]
+                self.assertEqual(notice.recipient, producer.id)
+                self.assertIn(f"update --id {item.id} --keeper {BOB.id} --source {producer.name} --next-step",
+                              notice.words)
+                _, _, *args = shlex.split(notice.words.split("`")[1].replace("<step>", "Check the page."))
+                with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": producer.current_session}):
+                    self.assertEqual(self.command(*args), (0, "", ""))
+                self.assertEqual(the_list.load(BOB.id, item.id).next_step, "Check the page.")
+                self.assertEqual(the_list.load(MORTY.id, item.id), morty_item)
+
+    def test_update_keeper_refuses_an_item_that_the_producer_does_not_produce(self) -> None:
+        item = self.legacy_item(BOB, the_list.ItemState.WORKING)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, "--next-step", "Check it."),
+                             (1, "", f"the_list: {item.id} is assigned to another producer\n"))
+        self.assertEqual(the_list.load(BOB.id, item.id), item)
+        self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, "--next-step", "Check it.",
+                                      "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(BOB.id, item.id).next_step, "Check it.")
+        self.assertEqual(the_list.load(MORTY.id, item.id).next_step, item.next_step)
+
+    def test_update_refuses_a_new_producer_or_owner_in_a_legacy_folder(self) -> None:
+        item = self.legacy_item(BOB, the_list.ItemState.WORKING)
+        refusal = (1, "", "the_list: move the item to morty's List before you change its producer or owner\n")
+        for options in (("--producer", "dwight"), ("--owner", RUNNER.id)):
+            with self.subTest(options=options):
+                self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, *options,
+                                              "--source", "morty"), refusal)
+        # A producer never changes these fields, so it gets the field refusal.
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            status, output, errors = self.command("update", "--id", item.id, "--keeper", BOB.id, "--producer", "dwight")
+        self.assertEqual((status, output), (1, ""))
+        self.assertIn("producers can update only", errors)
+        self.assertIn("Refused options: --producer", errors)
+        self.assertEqual(the_list.load(BOB.id, item.id), item)
+        self.assertEqual(self.notices, [])
+
+    def test_update_without_keeper_edits_mortys_item(self) -> None:
+        # bob's own legacy folder holds a copy with the same number, and update still edits morty's item.
+        item = self.legacy_item(BOB, the_list.ItemState.WORKING)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--next-step", "Check it."), (0, "", ""))
+            updated = the_list.load(MORTY.id, item.id)
+            self.assertEqual(updated.next_step, "Check it.")
+            status, output, errors = self.command("update", "--id", item.id, "--unit", "example")
+        self.assertEqual((status, output), (1, ""))
+        self.assertIn("producers can update only", errors)
+        self.assertIn("Refused options: --unit", errors)
+        self.assertEqual(the_list.load(MORTY.id, item.id), updated)
+        self.assertEqual(the_list.load(BOB.id, item.id), item)
+
+    def test_page_mark_read_notice_for_mortys_item_skips_the_producers_legacy_copy(self) -> None:
+        item = self.legacy_item(BOB, the_list.ItemState.WAITING_FOR_NATE)
+        read = self.page_read(the_list.load(MORTY.id, item.id)).item
+        notice = the_list.feedback_requests(read)["read"]
+        self.assertIn(f"update --id {item.id} --source bob --next-step", notice.words)
+        _, _, *args = shlex.split(notice.words.split("`")[1].replace("<step>", "Check the page."))
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            self.assertEqual(self.command(*args), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).next_step, "Check the page.")
+        self.assertEqual(the_list.load(BOB.id, item.id), item)
+
+    def test_keeper_without_a_list_folder_is_refused_and_creates_no_folder(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        missing = staff.StaffId("no-such-keeper")
+        cases = ((OTHER, ("update", "--id", item.id, "--keeper", missing, "--next-step", "Check it."), "update"),
+                 (MORTY, ("answer", item.id, "--keeper", missing, "--question", "Q1", "--text", "Done."), "answer"))
+        for caller, args, name in cases:
+            with (self.subTest(command=name),
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": caller.current_session})):
+                self.assertEqual(self.command(*args), (1, "", f"the_list: no List folder for keeper {missing}\n"))
+                self.assertFalse(the_list.folder(missing).parent.exists())
+
     def test_page_mark_read_keeps_a_waiting_item_with_an_open_question(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WAITING_FOR_NATE})
         status = change_page.DeliveryStatus(self.root / "reviews")
