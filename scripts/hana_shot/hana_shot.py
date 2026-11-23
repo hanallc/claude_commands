@@ -1635,8 +1635,7 @@ def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> 
     except HoverDeadlineExpired:
         if owner.controllers:
             raise
-        limit = f"{deadline.limit:g}"
-        raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors within {limit} s") from None
+        raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors within {limit:g} s") from None
 
 
 # ---------------------------------------------------------------------------
