@@ -133,7 +133,7 @@ def step_index(index_path: Path) -> Generator[tuple[sqlite3.Connection, set[str]
 
 def index_step_evidence(index_path: Path, host: str, steps: tuple[str, ...],
                         call_ids: tuple[str, ...], before: datetime) -> dict[tuple[str, str], StepEvidence]:
-    """Read build shapes, compile evidence and test arguments for each call and step.
+    """Read build shapes, compile evidence, and test and check arguments for each call and step.
 
     The caller supplies call ids from peaks in its completion window.
     Dated attempts at or after before do not change earlier evidence.
@@ -181,7 +181,7 @@ def index_step_evidence(index_path: Path, host: str, steps: tuple[str, ...],
                             break
                     else:
                         decoded_arguments = cast(list[str], words)
-                        if name in TEST_STEPS:
+                        if name in TEST_STEPS or name == "check":
                             arguments = tuple(decoded_arguments)
                         if name == "build":
                             shape = build_shape(decoded_arguments)

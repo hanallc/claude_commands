@@ -36,7 +36,7 @@ The warning gives the path to the state file and names no command.
 
 ## Configuration digest
 
-`_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
+`config_digest` hashes the exact model registry text and `direct.conf` bytes at each call. A call costs about 30 microseconds, and verify_helper.py can run many recorder commands in one process.
 It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
 Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
 The same text and direct settings produce the same digest.

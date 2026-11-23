@@ -609,13 +609,13 @@ No configuration maps repositories to unit gates.
 `read_metadata` uses `GATE_METADATA` or runs `cargo metadata --no-deps --format-version 1`.
 `load_metadata` decodes it once through `verify_metadata.py` and saves the shell answers.
 The helper reads JSON on stdin and writes shell-quoted `NAME=value` answers.
-Requests cover members, example features, test targets, check targets, build targets, untested examples, workspace root, and target directory.
+Requests cover members, example features, test targets, build targets, untested examples, workspace root, and target directory.
 Queries and early doc exits need no metadata helper.
 `dev_features.py` reads the root manifest directly in the per-run helper, so an invalid dev-feature list refuses before Cargo.
 
-`take_check_targets` includes `--lib` only when a workspace member has a library target.
-A binary-only workspace therefore checks successfully.
-A dependency's library cannot select `--lib`, because this metadata read excludes dependencies.
+`verify.sh check` passes `--all-targets`, so it compiles test, example and bench code as well as libraries and binaries.
+A compile error in test code therefore stops at check, before lint or a gate.
+`--all-targets` selects only the targets that exist, so a binary-only workspace checks successfully.
 
 `hash_stream` uses `sha256sum`, or `shasum -a 256` when the former is unavailable.
 It returns failure when the hash command fails.
@@ -773,6 +773,7 @@ Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER
 The helper imports each Python program once and calls its existing `main` on the main thread.
 Each request carries the arguments, environment, working directory, and input text.
 The helper restores this state after each call.
+Each call runs in a copy of the helper's context, so a `ContextVar` value lasts for one call, as in its own process.
 It returns the exit status and captured output to the caller.
 The helper replays stderr when each call ends.
 The helper exits when its input pipe closes.
@@ -787,7 +788,7 @@ The detached step recorders from `invoke.sh` also keep their own processes.
 Shell fixtures and scripts with no line that starts `def main(` use their original process path.
 The helper finds that line with a text search, not a parse.
 The helper changes only the environment names that differ between calls.
-A failed helper request also uses that path.
+A failed helper request also uses that path. A `SystemExit` while the helper loads a program is a failed request.
 The change does not wrap or re-execute `verify.sh`.
 
 `VERIFY_PY_TRACE` retains one timing row for each helper call.
