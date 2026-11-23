@@ -23,6 +23,7 @@ from scripts.whoami import worker_usage
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner
@@ -877,7 +878,7 @@ class MacOutcomeTests(OutcomeFixture):
 
     def test_mac_outcomes_and_lifecycle_equal_local_rows_without_remote_checkout(self) -> None:
         before = {str(path.relative_to(self.mac_home)): path.read_bytes()
-                  for path in self.mac_home.rglob("*") if path.is_file()}
+                  for path in scratch_rglob(self.mac_home) if path.is_file()}
         run = self.mac_collect()
         for table in (*OUTCOME_TABLES, "openings", "edits"):
             with self.subTest(table=table):
@@ -895,7 +896,7 @@ class MacOutcomeTests(OutcomeFixture):
         self.assertEqual(self.cursor_for(self.remote_history(), "mac"), self.remote_history().stat().st_size)
         self.assertEqual(list(self.execution_directory.iterdir()), [])
         after = {str(path.relative_to(self.mac_home)): path.read_bytes()
-                 for path in self.mac_home.rglob("*") if path.is_file()}
+                 for path in scratch_rglob(self.mac_home) if path.is_file()}
         self.assertEqual(after, before)
         self.assert_outcomes_added(run.output, "history", 9, "mac")
         self.assert_family_state(run.output, "mac", "history", "ready")

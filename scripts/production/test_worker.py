@@ -50,6 +50,7 @@ from scripts.usage import agents_log
 
 from scripts.herdr import herdr
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 
 
 DETACHED_FIXTURE_DEAD_PID = 2 ** 22 + 12345
@@ -122,7 +123,7 @@ class DispatchAgent:
         row = staff.snapshot().by_current_session(process.current_identity)
         if row is None:
             backend = staff.CodexBackend(Path(process.environment["CODEX_HOME"])) if family == "codex" else staff.ClaudeBackend()
-            paths = (list((backend.codex_home / "sessions").rglob(f"*{process.current_identity}.jsonl"))
+            paths = (list(scratch_rglob(backend.codex_home / "sessions", f"*{process.current_identity}.jsonl"))
                      if isinstance(backend, staff.CodexBackend) else sessions.transcript_locations(process.current_identity))
             path = max(paths, key=lambda source: source.stat().st_mtime)
         else:
@@ -2556,7 +2557,7 @@ class WorkerCommandTests(unittest.TestCase):
         opened = self.opened()
         backend = staff.backend(opened.row)
         assert isinstance(backend, staff.CodexBackend)
-        for source in (backend.codex_home / "sessions").rglob(f"*{opened.row.current_session}.jsonl"):
+        for source in scratch_rglob(backend.codex_home / "sessions", f"*{opened.row.current_session}.jsonl"):
             source.unlink()
         self.assertIsInstance(worker.dispatch_receipt(opened.row, "first prompt", "first-dispatch", run=self.run_dir),
                               worker.DispatchEvidenceUnknown)
@@ -4149,7 +4150,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
                 saved_directory = outside / worker_lifecycle.DETACHED_RUNS_DIR
                 saved_directory.mkdir()
-                for path in directory.glob("*.json"):
+                for path in scratch_glob(directory, "*.json"):
                     _ = path.replace(saved_directory / path.name)
                 directory = saved_directory
             _ = staff.set_hold(opened.row.id, staff.Exited("TEST", "TEST", "Exit the worker.") if hold == "exit"
@@ -4157,7 +4158,7 @@ class WorkerCommandTests(unittest.TestCase):
             def supervises(pid: int, path: Path) -> bool:
                 del path
                 return alive and pid == 101
-            supervisors = {path.resolve(): frozenset({101}) for path in directory.glob("*.json")} if alive else {}
+            supervisors = {path.resolve(): frozenset({101}) for path in scratch_glob(directory, "*.json")} if alive else {}
             with (patch.object(detached_run_process, "supervises", side_effect=supervises),
                   patch.object(detached_run_process, "supervisor_records", return_value=supervisors)):
                 for scope in ((), ("--all-parents",)):
@@ -4172,7 +4173,7 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertEqual(cells[other.row.name][-1], "-")
                         self.assertEqual(cells[opened.row.name][5], expected)
                         # Only records that a live supervisor names are read, each once.
-                        for path in directory.glob("*.json"):
+                        for path in scratch_glob(directory, "*.json"):
                             self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), int(alive), str(path))
                         if location == "completed pass":
                             code, output, errors = self.command("list", "--json", *scope)

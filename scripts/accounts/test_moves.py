@@ -27,6 +27,7 @@ from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
 )
 from scripts.agents import inventory, stop_results
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
@@ -789,7 +790,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                     row, run = self.worker("worker-" + family + target, family)
                     if target.startswith("codex"):
                         role_map.write_role_map(role_map.RoleMapChange("workers", target, "fixture selection", datetime.now(timezone.utc).isoformat()))
-                    before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+                    before = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
                     result = accounts.move_workers(target, dry_run=True)
                     assert isinstance(result, accounts.GroupMoveDryRun)
                     same_family = target.startswith(family)
@@ -798,7 +799,7 @@ class WorkerGroupPendingTests(StaffTestCase):
                     if same_family:
                         self.assertIn(str(row.id), "\n".join(result.lines))
                         self.assertIn(target, "\n".join(result.lines))
-                    self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+                    self.assertEqual({path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}, before)
                     self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.stop_requests, [])
                     inbox = session_staff.inbox_path(row.id)

@@ -13,6 +13,7 @@ from scripts.build_queue import admission_records
 from scripts.production import gate
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib import build_folders
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
@@ -152,7 +153,7 @@ argparse.ArgumentParser.exit = checked_exit
         default_log.symlink_to(caller_log, target_is_directory=True)
         # The newest full gate recorded that only lib/test_second.py reads the config file.
         modules: list[dict[str, object]] = []
-        for path in sorted((self.checkout / "scripts").glob("*/test_*.py")):
+        for path in sorted(scratch_glob(self.checkout / "scripts", "*/test_*.py")):
             config_reads: list[str] = ["fixture_settings"] if path.name == "test_second.py" else []
             modules.append({"suite": path.parent.name, "module": path.name, "attempt": 1, "config_reads": config_reads})
         reads: dict[str, object] = {
@@ -173,9 +174,9 @@ argparse.ArgumentParser.exit = checked_exit
         log = cast(dict[str, str], json.loads(line))
         self.assertTrue(Path(log["buildlog"]).is_relative_to(log["tmpdir"]), log)
         self.assertFalse(Path(log["buildlog"]).is_relative_to(caller_log), log)
-        self.assertEqual(list(caller_log.rglob("fixture-log")), [])
+        self.assertEqual(list(scratch_rglob(caller_log, "fixture-log")), [])
         # The gate writes its own record to the caller's build log.
-        rows = [cast(dict[str, object], json.loads(line)) for path in caller_log.glob("*/*.jsonl")
+        rows = [cast(dict[str, object], json.loads(line)) for path in scratch_glob(caller_log, "*/*.jsonl")
                 for line in path.read_text().splitlines()]
         self.assertIn(("test-affected", "affected"), [(row.get("step"), row.get("selection")) for row in rows])
 

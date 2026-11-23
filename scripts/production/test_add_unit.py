@@ -6,6 +6,7 @@ from scripts.production.staff_test_support import unit_membership, fixture_membe
 
 from scripts.lib import build_folders, names
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_ls_files
 from scripts.lib.test_names import fixture_names
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.transcript_test_support import compressed_copy
@@ -507,7 +508,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         # An empty output takes the earlier target by rename, so the build cache stays warm.
         self.assertEqual(expected.output.stat().st_ino, inode)
         self.assertEqual((expected.output / "artifact").read_text(), "existing output\n")
-        self.assertEqual(list(worktree.parent.glob(".saved-target-*")), [])
+        self.assertEqual(list(scratch_glob(worktree.parent, ".saved-target-*")), [])
 
     def test_adopting_a_unit_home_retries_after_output_setup_fails(self) -> None:
         worktree = self.unrecorded_unit_home()
@@ -597,9 +598,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
             unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
         ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
         self.assertEqual(ignored.returncode, 0)
-        tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
-                                 capture_output=True, check=False)
-        self.assertNotEqual(tracked.returncode, 0)
+        with self.assertRaises(subprocess.CalledProcessError):
+            _ = scratch_ls_files(worktree, "--error-unmatch", ".unit.toml")
         self.assertNotIn("STAFF_ID", self.pane_environment())
         self.assert_observed_identity(row)
 

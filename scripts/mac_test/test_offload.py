@@ -55,6 +55,7 @@ from scripts.mac_test.offload_test_support import (
     CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 RUN_SUBPROCESS = subprocess.run
@@ -73,7 +74,7 @@ class GeneratedSourceTests(unittest.TestCase):
                 index = sessions / ".id"
                 index.mkdir()
                 (index / "offload-fixture").symlink_to(other_worker.name)
-                before = sorted(path.relative_to(sessions) for path in sessions.rglob("*"))
+                before = sorted(path.relative_to(sessions) for path in scratch_rglob(sessions))
                 with mock.patch.dict(os.environ, {
                     "SESSION_TEMP_ROOT": str(sessions if live_session else sessions / "absent"),
                     "CODEX_THREAD_ID": "offload-fixture",
@@ -97,7 +98,7 @@ class GeneratedSourceTests(unittest.TestCase):
                             with mock.patch.object(nix_env, 'ensure', return_value=nix_env.Refused('not approved')):
                                 self.assertFalse(offload.trusted_linux_source(folder))
                     self.assertFalse(folder.exists())
-                self.assertEqual(sorted(path.relative_to(sessions) for path in sessions.rglob("*")), before)
+                self.assertEqual(sorted(path.relative_to(sessions) for path in scratch_rglob(sessions)), before)
                 self.assertEqual(sentinel.read_text(), "another worker's source\n")
 
 
@@ -2110,7 +2111,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 with mock.patch.dict(os.environ, self.environment, clear=True):
                     offload.persist_attempt(request, offload.PassedOnMac(0), controller.attempt_evidence, time.monotonic())
                 rows = [cast(dict[str, object], json.loads(line))
-                        for path in (self.root / "buildlog").glob("*/*.jsonl")
+                        for path in scratch_glob(self.root / "buildlog", "*/*.jsonl")
                         for line in path.read_text().splitlines()]
                 attempt = [row for row in rows if row.get("kind") == "ssh_attempt"
                            and row.get("call_id") == "byte-record"][-1]

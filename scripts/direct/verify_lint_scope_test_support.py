@@ -10,6 +10,7 @@ from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_to
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
@@ -412,7 +413,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         _ = untracked.write_text(untracked_text, encoding="utf-8")
         self.run_git("add", "--force", "--", tracked.name)
         with self.assertRaises(subprocess.CalledProcessError) as missing:
-            self.run_git("ls-files", "--error-unmatch", "--", untracked.name)
+            _ = scratch_ls_files(self.root, "--error-unmatch", "--", untracked.name, environment=self.environment)
         self.assertEqual(missing.exception.returncode, 1)
         return tracked, untracked
 

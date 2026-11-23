@@ -22,6 +22,7 @@ from scripts.style import rules
 from scripts.style import style_ledger
 from scripts.style import unit_plans
 
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.style.style_plan_test_support import StylePlanFixture
 from scripts.production import proposal_issue
 from scripts.production.staff_test_support import fixture_member
@@ -173,7 +174,7 @@ class StylePlanTests(StylePlanFixture):
                     with self.assertRaisesRegex(OSError, "interrupted replacement"):
                         style_plan.atomic_write(target, b"incomplete")
                 self.assertEqual(target.read_bytes(), before)
-                self.assertEqual(tuple(target.parent.glob(f".{target.name}.*")), ())
+                self.assertEqual(tuple(scratch_glob(target.parent, f".{target.name}.*")), ())
         self.assertEqual(self.plan.read_bytes(), expected)
 
     def test_decision_ticket_text_separates_rule_findings_from_candidate_ideas(self) -> None:

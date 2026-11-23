@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypedDict, cast, override
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -218,7 +219,7 @@ class InstallCodexAgentsTests(unittest.TestCase):
         original = b"# Local Rust rules\r\nUntouched.\n"
         _ = local_rules.write_bytes(original)
         _ = self.home.joinpath("sentinel").write_bytes(b"keep")
-        before = {path.relative_to(self.home): path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
+        before = {path.relative_to(self.home): path.read_bytes() for path in scratch_rglob(self.home) if path.is_file()}
 
         for arguments in ((), ("--agents-file", str(self.target))):
             with self.subTest(arguments=arguments):
@@ -227,7 +228,7 @@ class InstallCodexAgentsTests(unittest.TestCase):
 
                 after = {
                     path.relative_to(self.home): path.read_bytes()
-                    for path in self.home.rglob("*") if path.is_file()
+                    for path in scratch_rglob(self.home) if path.is_file()
                 }
                 self.assertEqual(after, before)
                 self.assertFalse(self.target.exists())

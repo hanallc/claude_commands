@@ -19,6 +19,7 @@ from scripts.hooks import context_usage
 from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
@@ -78,10 +79,10 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         state = self.root / "showrunner" / "example" / "session" / "showrunner_state.json"
         state.parent.mkdir(parents=True)
         _ = state.write_text('{"next": ["merge alpha"]}\n', encoding="utf-8")
-        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        before = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
         self.assertEqual(self.run_hook({"session_id": SESSION, "hook_event_name": "PreCompact",
                                         "trigger": "auto"}), "")
-        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        self.assertEqual({path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}, before)
         self.assertEqual(self.logged(), [])
 
     def test_session_start_after_compaction_names_the_resume(self) -> None:

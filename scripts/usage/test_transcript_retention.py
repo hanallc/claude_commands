@@ -9,6 +9,7 @@ import tempfile
 from typing import BinaryIO, cast, override
 from unittest.mock import patch
 
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import compress_transcript, open_transcript
 from scripts.production import staff
@@ -75,7 +76,7 @@ class RetentionTests(StaffTestCase):
                 self.assertEqual(paths[str(member.current_session) + ".jsonl"].read_bytes(), content)
                 if dry_run:
                     self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_mode)
-                                      for path in root.rglob("*") if path.is_file()}, before)
+                                      for path in scratch_rglob(root) if path.is_file()}, before)
                 else:
                     self.assertFalse(paths["delete.jsonl"].exists())
                     self.assertFalse(paths["compressed-old.jsonl"].exists())

@@ -13,6 +13,7 @@ from unittest import mock
 
 from scripts.accounts import accounts, login_sittings as sittings
 from scripts.lib import conf
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.maintenance.schedule import ScheduleBusy, locked_history
 from scripts.notify import push_texts, review
 from scripts.message import send_budget
@@ -267,11 +268,11 @@ class LoginSittingsTests(unittest.TestCase):
         self.assertEqual([kind for _, kind in self.sent], ["safety", "safety"])
 
     def test_other_machine_reads_no_dates_and_creates_no_state(self) -> None:
-        before = sorted(self.root.rglob("*"))
+        before = sorted(scratch_rglob(self.root))
         self.assertEqual(self.run_pass(self.now, "mac"), [])
         self.assertEqual(self.peer_calls, [])
         self.assertEqual(self.sent, [])
-        self.assertEqual(sorted(self.root.rglob("*")), before)
+        self.assertEqual(sorted(scratch_rglob(self.root)), before)
 
     def test_local_dates_use_the_same_stored_rows_as_account_status(self) -> None:
         reports = [agent_accounts.Report("Claude", email="fixture-one",

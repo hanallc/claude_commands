@@ -33,6 +33,7 @@ from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_
 from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -50,7 +51,7 @@ class FirstDispatchArtifact:
 
 def snapshot_files(root: Path) -> dict[Path, bytes]:
     """Read regular files before a dispatch."""
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+    return {path.relative_to(root): path.read_bytes() for path in scratch_rglob(root)
             if path.is_file() and not path.is_symlink()}
 
 def changed_files(root: Path, before: dict[Path, bytes]) -> tuple[FirstDispatchArtifact, ...]:
@@ -533,10 +534,10 @@ printf '%s\\n' '{answer}'
         environment = self.launch_environment(session_dir, to or slot)
         if to:
             records = [cast(dict[str, object], json.loads(path.read_text()))
-                       for path in (self.root / "sessions").glob("*.json")]
+                       for path in scratch_glob(self.root / "sessions", "*.json")]
             session_id = next((str(row["sessionId"]) for row in records if row["name"] == to), "")
             if session_id:
-                transcript = next((self.root / ".claude/projects").rglob(f"{session_id}.jsonl"))
+                transcript = next(scratch_rglob(self.root / ".claude/projects", f"{session_id}.jsonl"))
                 environment.update({"STUB_TRANSCRIPT": str(transcript),
                                     "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
                                     "CLAUDE_WORKER_SEND_SCRIPT": str(self.root / "send"),

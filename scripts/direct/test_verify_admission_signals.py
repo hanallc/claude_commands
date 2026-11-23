@@ -12,6 +12,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_doc_test_support import VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.scratch_tree_test_support import scratch_glob
 
 
 CONNECT_OBSERVER = '''import os, runpy, sys
@@ -78,7 +79,7 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                 output, errors = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, output + errors)
                 self.assertEqual(processes_carrying(marker), set())
-                self.assertEqual(list((self.root / "slots").glob("*")), [])
+                self.assertEqual(list(scratch_glob(self.root / "slots", "*")), [])
                 with admission.loop_turn():
                     self.assertFalse(any(request.owner.pid == process.pid
                                          for request in admission.server.placement_requests.values()))

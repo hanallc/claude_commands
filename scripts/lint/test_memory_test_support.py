@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -100,7 +101,7 @@ class CommitConfigFixtureTests(unittest.TestCase):
             self.assertEqual(git(other, "rev-parse", "HEAD"), head)
             self.assertEqual((other / ".git/config").read_text(), config)
             self.assertEqual(git(folder, "log", "--format=%an %s"), "Config fixture known good configuration")
-            self.assertEqual(git(folder, "ls-files"), "build_admission.conf")
+            self.assertEqual(scratch_ls_files(folder, environment=isolated_git_environment()).stdout.strip(), "build_admission.conf")
 
     def test_a_folder_inside_a_repository_or_outside_the_temporary_root_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

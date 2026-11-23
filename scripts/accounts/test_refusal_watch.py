@@ -43,6 +43,7 @@ from scripts.agents import stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.agents.test_support import write_machine_config
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -335,7 +336,7 @@ class RefusalWatchTests(unittest.TestCase):
     def snapshot(self, *, without_plan: bool = False) -> dict[str, bytes]:
         plan = role_map.completion_plan_file()
         return {str(path.relative_to(self.home)): path.read_bytes()
-                for path in self.home.rglob("*")
+                for path in scratch_rglob(self.home)
                 if path.is_file() and not path.is_symlink() and path.suffix != ".lock" and not (without_plan and path == plan)}
 
     def saved_plan(self) -> bytes:
@@ -3509,7 +3510,7 @@ class RefusalWatchTests(unittest.TestCase):
 
         def listing() -> dict[str, tuple[int, int, int, int, str]]:
             entries: dict[str, tuple[int, int, int, int, str]] = {}
-            for path in self.home.rglob("*"):
+            for path in scratch_rglob(self.home):
                 stat = path.lstat()
                 entries[str(path.relative_to(self.home))] = (
                     stat.st_ino, stat.st_mode, stat.st_size, stat.st_mtime_ns,

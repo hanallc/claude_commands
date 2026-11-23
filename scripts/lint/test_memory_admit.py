@@ -59,6 +59,7 @@ from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.buildlog import index as file_marks
 from scripts.lib import test_hang_guard
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.message.roster import UnitLabels
 
 READY_FOR_ADMISSION = admission_records.ReadyForAdmission()
@@ -156,7 +157,7 @@ def sample_anon_once(sidecar: Path, maximum: Path) -> subprocess.CompletedProces
 
 
 def buildlog_rows(root: Path) -> list[dict[str, object]]:
-    return [cast(dict[str, object], json.loads(line)) for path in root.glob("*/*.jsonl")
+    return [cast(dict[str, object], json.loads(line)) for path in scratch_glob(root, "*/*.jsonl")
             for line in path.read_text().splitlines()]
 
 
@@ -3834,7 +3835,7 @@ class CurrentBlockerTests(MemoryQueueFixture):
         _ = (directory / 'broken.reservation').write_text('partial')
 
         def snapshot() -> dict[str, tuple[bytes, int]]:
-            return {str(path.relative_to(self.root)): (path.read_bytes() if path.is_file() else b'', path.stat().st_mtime_ns) for path in [self.root, *self.root.rglob('*')]}
+            return {str(path.relative_to(self.root)): (path.read_bytes() if path.is_file() else b'', path.stat().st_mtime_ns) for path in [self.root, *scratch_rglob(self.root)]}
         _ = self.blocker()
         before = snapshot()
         self.assertEqual(gate.blocker_fields(self.blocker()).get('session_id'), 'owner-id')
@@ -4285,7 +4286,7 @@ class StrictHeadRoomTests(MemoryQueueFixture):
             with self.subTest(need=need, free=free):
                 directory = gate.admission_dir(self.root)
                 for pattern in ("*.waiting", "*.reservation"):
-                    for path in directory.glob(pattern):
+                    for path in scratch_glob(directory, pattern):
                         path.unlink()
                 _ = self.running(100, 10, age=30)
                 self.readings[100] = admission_records.MeasuredMemory(10 * GIB, anonymous=admission_records.AnonymousRunUse(10 * GIB))
@@ -5002,7 +5003,7 @@ class ProcessRunUseTests(unittest.TestCase):
         scope = self.scope()
         for scoped_first in (True, False):
             with self.subTest(scoped_first=scoped_first):
-                for path in self.fixture.state_dir.glob("*.reservation"):
+                for path in scratch_glob(self.fixture.state_dir, "*.reservation"):
                     path.unlink()
                 _ = self.reservation("a" if scoped_first else "b", 100, scope=str(scope))
                 _ = self.reservation("b" if scoped_first else "a", 101)
@@ -5016,7 +5017,7 @@ class ProcessRunUseTests(unittest.TestCase):
         self.process(101, parent=100, resident=4 * GIB, anonymous=4 * GIB, swap=0)
         for kind in ("process tree", "scope tree", "same scope", "same process set"):
             with self.subTest(kind=kind):
-                for path in self.fixture.state_dir.glob("*.reservation"):
+                for path in scratch_glob(self.fixture.state_dir, "*.reservation"):
                     path.unlink()
                 parent_scope = child_scope = ""
                 child_pid = 101
@@ -5457,7 +5458,7 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"Granted|{captured[0]}\n")
         self.assertEqual(self.admission.server.reservations, {})
-        self.assertFalse(list(self.admission.state_dir.glob("*.reservation")))
+        self.assertFalse(list(scratch_glob(self.admission.state_dir, "*.reservation")))
 
     def test_launch_wait_limit_refuses_without_a_reservation(self) -> None:
         self.admission.free(0)

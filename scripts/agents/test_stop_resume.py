@@ -61,6 +61,7 @@ from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.agents.test_pane_record_recovery import FakeClient, fixture_launch_transcript
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account
@@ -703,7 +704,7 @@ class StopResumeTests(unittest.TestCase):
                                      [("dwight", world.identity, staff.SessionHome(world.home))])
                 self.assertEqual(world.arguments, [])
                 self.assertEqual(case.client.opened, [])
-                self.assertEqual(list((case.root / "panes").glob(".producer-admission-*")), [])
+                self.assertEqual(list(scratch_glob(case.root / "panes", ".producer-admission-*")), [])
 
         for reference, owned in (("dwight", True), ("old producer title", True), ("dwight", False)):
             with self.subTest(daemon_name=reference, owned=owned), producer_first_fixture("codex") as world:
@@ -813,14 +814,14 @@ class StopResumeTests(unittest.TestCase):
                     else:
                         world.case.client.rows[-1]["agent_session"] = {"kind": "id", "value": cast(pane_launch.NativePaneLaunch, foreign)["session_id"]}
                 if stage == "broken-registry":
-                    receipts = {path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}
+                    receipts = {path.name: path.read_text() for path in scratch_glob(world.case.root / "panes", ".producer-admission-*")}
                     with patch.dict(os.environ):
                         _ = os.environ.pop("MODELS_LAUNCH_CONFIGURATION", None)
                         os.environ["MODELS_CONFIG_FILE"] = str(world.case.root / "absent-models.conf")
                         failed = stop_resume.resume("dwight")
                     self.assertIsInstance(failed, stop_resume.ResumeFailed, failed)
                     self.assertEqual(staff.initial_snapshot().rows, ())
-                    self.assertEqual({path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}, receipts)
+                    self.assertEqual({path.name: path.read_text() for path in scratch_glob(world.case.root / "panes", ".producer-admission-*")}, receipts)
                 result = stop_resume.resume("dwight")
                 if stage == "named-before-retry":
                     self.assertIsInstance(result, stop_resume.ClaudeUp, result)
@@ -847,7 +848,7 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual([pane["pane_id"] for pane in world.case.client.rows
                                       if pane["pane_id"] in world.started_panes or pane["label"] == "dwight"], [world.pane])
                 self.assertTrue(pane_record.read("agents")[world.pane].get("producer_binding", False))
-                self.assertEqual(list((world.case.root / "panes").glob(".producer-admission-*")), [])
+                self.assertEqual(list(scratch_glob(world.case.root / "panes", ".producer-admission-*")), [])
                 if stage in resumed_stages:
                     self.assertIn("--resume", world.arguments[-1])
                     self.assertEqual(world.arguments[-1][world.arguments[-1].index("--resume") + 1], world.identity)
@@ -3283,7 +3284,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertFalse(log.exists(), "stop and move must never send")
         path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         self.assertTrue(path.exists())
-        requests = list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json"))
+        requests = list(scratch_glob(stall_watch.STATE_DIR, "*.prompt.cancel.json"))
         self.assertTrue(requests)
         for request in requests:
             record = cast(dict[str, object], json.loads(request.read_text()))
@@ -3336,11 +3337,11 @@ class StopResumeTests(unittest.TestCase):
             self.drain_prompt_cancellations()
         self.assertIn("stall-watch: retire:", errors.getvalue())
         path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
-        self.assertTrue(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")))
+        self.assertTrue(list(scratch_glob(stall_watch.STATE_DIR, "*.prompt.cancel.json")))
         _ = sender.write_text(original)
         self.drain_prompt_cancellations()
         self.assertFalse(path.exists())
-        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+        self.assertEqual(list(scratch_glob(stall_watch.STATE_DIR, "*.prompt.cancel.json")), [])
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
                                                       "--key", "stall-watch:prompt:production:alpha"])
 
@@ -3394,7 +3395,7 @@ class StopResumeTests(unittest.TestCase):
             key="stall-watch:prompt:production:alpha", since=200, alerted=False, tool="new-request", retiring=False))
         self.drain_prompt_cancellations()
         self.assertFalse(log.exists())
-        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+        self.assertEqual(list(scratch_glob(stall_watch.STATE_DIR, "*.prompt.cancel.json")), [])
         saved = stall_watch.saved_prompt(path)
         assert saved is not None
         self.assertEqual((saved["since"], saved["retiring"]), (200, False))
@@ -3433,7 +3434,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
                                                       "--key", "stall-watch:prompt:production:alpha"])
         self.assertFalse(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path.exists())
-        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+        self.assertEqual(list(scratch_glob(stall_watch.STATE_DIR, "*.prompt.cancel.json")), [])
 
     def test_missing_pane_recovery_does_not_duplicate_a_live_session(self) -> None:
         self.client.rows.clear()
@@ -3740,7 +3741,7 @@ class StopResumeTests(unittest.TestCase):
                 self.live.return_value = sessions.SessionNotLive()
                 self.process.return_value = sessions.SessionNotLive()
         self.kill.side_effect = signal_delivered
-        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        before = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("019b3a40-4250-7000-8000-000000000102", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
         self.assertTrue(all(0 < invocation.args[0] <= 0.1
@@ -3749,7 +3750,7 @@ class StopResumeTests(unittest.TestCase):
         expected = cast(dict[str, dict[str, object]], json.loads(before[launch_path]))
         expected["w1:p2"]["ended"] = True
         self.assertEqual(json.loads(launch_path.read_bytes()), expected)
-        after = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        after = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
         self.assertEqual(set(after), set(before))
         self.assertEqual({path: content for path, content in after.items() if path != launch_path},
                          {path: content for path, content in before.items() if path != launch_path})
@@ -4456,7 +4457,7 @@ class StopResumeTests(unittest.TestCase):
             saved, = moves.pending_move_requests()
             self.assertEqual(saved.member.reference, identity)
             self.assertNotEqual(saved.request.request_id, "a" * 32)
-            self.assertEqual(list((moves.store_file().parent / "move-results").glob("*.json")), [])
+            self.assertEqual(list(scratch_glob(moves.store_file().parent / "move-results", "*.json")), [])
             stopped.assert_called_once_with(identity)
             self.assertEqual(stop_resume.main(["retry"]), 0)
         self.assertEqual(moves.pending_move_requests(), ())
@@ -4532,7 +4533,7 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(log.read_text().count("not moved: a newer move ran"), 1)
                 self.assertFalse(moves.latest_request_path(identity).exists())
                 self.assertEqual([row["kind"] for row in moves.read_journal()], ["requested", "confirmed"])
-                self.assertEqual(list((moves.store_file().parent / "move-results").glob("*.json")), [])
+                self.assertEqual(list(scratch_glob(moves.store_file().parent / "move-results", "*.json")), [])
 
     def test_move_handoff_does_not_read_or_change_a_corrupt_journal(self) -> None:
         self.add_beta()
@@ -4546,7 +4547,7 @@ class StopResumeTests(unittest.TestCase):
             results = stop_resume.move_sessions([self.entry["session_id"], "sid-beta"], "claude4", why="move")
         self.detach.assert_called_once()
         stopped.assert_not_called()
-        self.assertEqual(list((path.parent / "move-results").glob("*.json")), [])
+        self.assertEqual(list(scratch_glob(path.parent / "move-results", "*.json")), [])
         send.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(results, [stop_resume.MoveHandedOff(identity) for identity in (self.entry["session_id"], "sid-beta")])
@@ -6753,7 +6754,7 @@ with (patch.object(stop_resume, "_build_holders", side_effect=[{"alpha": ("verif
                  "STALL_WATCH_STATE_DIR": str(self.root)}, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("lacks LiveSession", module.read_text())
-        cancellations = list(self.root.glob("*.prompt.cancel.json"))
+        cancellations = list(scratch_glob(self.root, "*.prompt.cancel.json"))
         self.assertEqual(len(cancellations), 1, result.stderr)
         cancellation = cast(dict[str, object], json.loads(cancellations[0].read_text()))
         self.assertEqual(cancellation["session_id"], "alpha")

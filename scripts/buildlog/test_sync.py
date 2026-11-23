@@ -29,6 +29,7 @@ from scripts.buildlog import store
 from scripts.buildlog import sync, vault_pull
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.lint.memory_test_support import config_environment
 
 
@@ -173,7 +174,7 @@ class SyncTests(unittest.TestCase):
         output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         copied = {str(path.relative_to(destination / "Mac")): path.read_text()
-                  for path in (destination / "Mac").rglob("*") if path.is_file()}
+                  for path in scratch_rglob(destination / "Mac") if path.is_file()}
         self.assertEqual(copied, {name: name for name in (
             "2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json", "latest-module-reads.json")})
 

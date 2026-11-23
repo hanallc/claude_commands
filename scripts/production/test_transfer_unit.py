@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.message import send
 from scripts.production import staff, staff_move, unit_config
 from scripts.production import stall_watch
@@ -90,7 +91,7 @@ class UnitTransferTests(UnitTransferFixture):
     def test_transfer_changes_only_the_staff_parent(self) -> None:
         row = unit_membership("demo", "alpha")
         parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
-        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        before = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
         with mock.patch.object(staff_move, "move_unit", wraps=staff_move.move_unit) as move_tab:
             result = self.transfer("apply")
             self.assert_ok(result)

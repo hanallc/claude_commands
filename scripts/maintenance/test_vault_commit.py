@@ -13,6 +13,7 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.maintenance.test_vault_save import job_config_fixture
 from scripts.maintenance.vault_commit import main as tool_main, subject
 
@@ -106,7 +107,7 @@ class Tool(Vault):
         code, _, _ = self.run_tool(self.a, self.b, new)
         self.assertEqual(code, 0)
         self.assertEqual(sh(self.repo, "status", "--porcelain"), "")
-        self.assertEqual(sh(self.repo, "ls-files", "gen").splitlines(), ["gen/a b.md", "gen/c.md"])
+        self.assertEqual(scratch_ls_files(Path(self.repo), "gen").stdout.splitlines(), ["gen/a b.md", "gen/c.md"])
 
     def test_a_held_lock_fails_softly_and_the_next_run_commits(self) -> None:
         _ = write(self.repo, "gen/b.md", "date_modified: 1\nbody b, changed\n")

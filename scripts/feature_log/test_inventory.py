@@ -31,6 +31,7 @@ from scripts.feature_log.inventory import (
     SourceTable,
     TagSource,
 )
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 
 PHASE_PATH = "docs/plans/widgets.md"
@@ -955,7 +956,7 @@ class InventoryTests(unittest.TestCase):
 
     def test_inventory_commands_leave_the_repository_unchanged(self) -> None:
         self.repo.write("dirty.txt", "An untracked local file.\n")
-        before = {path.relative_to(self.repo.path).as_posix(): path.read_bytes() for path in self.repo.path.rglob("*") if path.is_file()}
+        before = {path.relative_to(self.repo.path).as_posix(): path.read_bytes() for path in scratch_rglob(self.repo.path) if path.is_file()}
         _ = self.collect()
         identifiers = self.list_ids(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--claim", "alpha", "--limit", "0"]))
         shown = self.cli(["show", identifiers[0]])
@@ -963,7 +964,7 @@ class InventoryTests(unittest.TestCase):
         marked = self.cli(["mark", *identifiers, "--worker", "alpha", "--as", "internal", "--reason", "Reviewed implementation work"])
         self.assertEqual(marked.status, 0, marked.stderr)
         self.assertEqual(self.cli(["status", "--project", "cargo-liner"]).status, 1)
-        after = {path.relative_to(self.repo.path).as_posix(): path.read_bytes() for path in self.repo.path.rglob("*") if path.is_file()}
+        after = {path.relative_to(self.repo.path).as_posix(): path.read_bytes() for path in scratch_rglob(self.repo.path) if path.is_file()}
         self.assertEqual(after, before)
 
 

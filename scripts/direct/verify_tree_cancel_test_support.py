@@ -28,6 +28,7 @@ from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwners
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lib.scratch_tree_test_support import scratch_glob
 
 
 def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
@@ -297,11 +298,11 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
 
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
-        self.assertEqual(list((self.board / "token_waiters").glob("*")), [], "cancel kept its queue place")
+        self.assertEqual(list(scratch_glob(self.board / "token_waiters", "*")), [], "cancel kept its queue place")
         reservations = list(self.admission.caller_reservations())
         self.assertEqual(reservations, [], "cancel kept memory admission")
         self.assertEqual(self.admission.server.waiters, {}, "cancel kept a memory queue place")
-        self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
+        self.assertEqual(list(scratch_glob(self.root / "verify-steps", "*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
                                env=verify_test_environment(),
@@ -310,7 +311,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
 
     def assert_no_cache_verdict(self) -> None:
         for suffix in ("*.pass", "*.fail"):
-            self.assertEqual(list((self.board / "verify_cache").glob(suffix)), [],
+            self.assertEqual(list(scratch_glob(self.board / "verify_cache", suffix)), [],
                              "cancelled run recorded a cache verdict")
 
     def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> re.Match[str]:

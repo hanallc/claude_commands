@@ -13,6 +13,7 @@ from unittest import mock
 
 
 
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.production.rename_test_support import stop_at_staff_write
@@ -33,7 +34,7 @@ class ShowrunnerParentTests(StaffTestCase):
 
     def source_files(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for path in self.root.rglob("*") if path.is_file()}
+                for path in scratch_rglob(self.root) if path.is_file()}
 
     def test_attach_and_detach_subprocesses_find_staff_names(self) -> None:
         child, parent = self.members()
@@ -141,4 +142,4 @@ class ShowrunnerParentTests(StaffTestCase):
         self.assertEqual(capture, showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent_row.id), (leaf.id,), ()))
         self.assertEqual(showrunner_tree.edges_to_release("tools"), capture)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
-        self.assertEqual(list(state.glob("*/parent")), [])
+        self.assertEqual(list(scratch_glob(state, "*/parent")), [])

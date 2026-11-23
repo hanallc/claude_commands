@@ -28,6 +28,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
@@ -1215,13 +1216,13 @@ class ChildImports(unittest.TestCase):
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
         gate_records = [cast(dict[str, object], json.loads(line))
-                        for path in caller_log.rglob("*")
+                        for path in scratch_rglob(caller_log)
                         if path.is_file() and path != caller_log / "keep"
                         for line in path.read_text().splitlines()]
         self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
-        self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
-        self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])
+        self.assertEqual(list(scratch_glob(caller_log / "admission", "*.reservation")), [])
+        self.assertEqual(list(scratch_glob(caller_log / "admission", "*.waiting")), [])
 
     def test_tests_only_reuses_results_without_running_a_red_type_check(self) -> None:
         first = self.run_gate("--tests-only")

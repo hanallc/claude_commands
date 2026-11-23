@@ -12,6 +12,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -112,7 +113,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(lines.count("build queue not reachable; trying for 0.2 s"), 1)
             self.assertEqual(lines.count("build queue unreachable for 0.2 s; step stopped; cargo token given back"), 1)
             self.assertFalse((board / "locks/cargo.d").exists())
-            self.assertEqual(list((board / "token_waiters").glob(f"*.{process.pid}*")), [])
+            self.assertEqual(list(scratch_glob(board / "token_waiters", f"*.{process.pid}*")), [])
             self.assertFalse((self.root / "cargo-calls").exists())
             with admission.loop_turn():
                 self.assertEqual(admission.server.waiters, {})
@@ -157,7 +158,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(lines.count("build queue not reachable; trying for 0.2 s"), 1)
             self.assertEqual(lines.count("build queue unreachable for 0.2 s; step stopped; cargo token given back"), 1)
             self.assertFalse((board / "locks/cargo.d").exists())
-            self.assertEqual(list((board / "token_waiters").glob(f"*.{process.pid}*")), [])
+            self.assertEqual(list(scratch_glob(board / "token_waiters", f"*.{process.pid}*")), [])
             self.assertFalse((self.root / "cargo-calls").exists())
 
             wait_until(admission.callers_released, admission.state_dir)

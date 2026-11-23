@@ -22,6 +22,7 @@ from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents.test_support import write_machine_config
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -222,7 +223,7 @@ class RoleMapTests(unittest.TestCase):
 
     def files(self, home: Path) -> dict[str, bytes]:
         return {str(path.relative_to(home)): path.read_bytes()
-                for path in home.rglob("*") if path.is_file()}
+                for path in scratch_rglob(home) if path.is_file()}
 
     def test_scratch_home_reads_its_groups_and_workers_without_transport_or_cache_changes(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")

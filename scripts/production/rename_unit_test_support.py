@@ -32,6 +32,7 @@ from scripts.agents import shutdown
 from scripts.agents import pane_record
 from scripts.style import style_ledger
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
@@ -236,7 +237,7 @@ class UnitRenameFixture(StaffTestCase):
 
     def snapshot(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
+                for path in scratch_rglob(self.root) if path.is_file() and path != self.root / "herdr.jsonl"}
 
     def style_production(self) -> tuple[Path, Path, Path]:
         worktree = self.rust / "demo-names"

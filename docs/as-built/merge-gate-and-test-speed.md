@@ -543,6 +543,26 @@ The selector finds `glob`, `rglob`, `os.walk` and `git ls-files` calls, and the 
 A `walk` call on the imported `ast` module is not a folder scan.
 A scan root is known when the code builds it from `__file__`, an absolute path or an imported root.
 A scan with an unknown root, for example `Path.home()` or `Path()`, reads the whole repository.
+A test scans a temporary fixture folder with `scratch_glob`, `scratch_rglob` or `scratch_ls_files` from `scripts/lib/scratch_tree_test_support.py`.
+The selector counts a call to these imported names as no repository scan.
+Two call forms count: `scratch_glob(...)` after `from scripts.lib.scratch_tree_test_support import scratch_glob`, and `tree.scratch_glob(...)` after an import of the module with an `as` name or from `scripts.lib`.
+A full dotted call after `import scripts.lib.scratch_tree_test_support` keeps its scan.
+The selector keeps the scratch tree scans in a module with a star import.
+It also keeps those scans when the module assigns or deletes an attribute through an alias of the helper module or its package.
+A call keeps its scan when the module binds the called name anywhere else.
+The selector reads each binding in the module: an assignment, a `del`, a loop or comprehension target, a `with` or `except` name, a parameter, a `global` or `nonlocal` statement, a definition, and any other import.
+The selector also keeps those scans when a patch string names a helper function or a guard constant.
+If the selector cannot resolve the root of a scan it keeps, the scan covers the whole repository.
+At run time, each function raises `ValueError` when the root is in this checkout or the live `~/.claude`, or holds one.
+`scratch_ls_files` also raises `ValueError` when its environment sets `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or `GIT_COMMON_DIR`.
+`scratch_glob` and `scratch_rglob` reject patterns with a `..` part.
+They resolve the checkout paths once per call.
+They check the directories in the pattern before they enter them.
+They reuse each directory check for its results.
+They check symlink targets before they return those results.
+Keep a plain scan when the selector must cover repository files that a test copies into the fixture.
+The content read records and folder scan records of the full gate cover a copy that Python makes.
+A scan of real repository files stays a plain `glob`, `rglob` or `git ls-files` call.
 A helper call without an argument uses the parameter default as the folder.
 A default that is not a known path is an unknown root. A `None` default gives no folder, because the scan cannot use it.
 A `for` loop or a comprehension over a literal tuple, list or set of strings gives one scan root for each string.

@@ -20,6 +20,7 @@ from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
 from scripts.lib.file_lock import LockResult
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
@@ -131,7 +132,7 @@ class PlanSetupTests(CostFixture):
 
     def files(self) -> dict[Path, bytes | None]:
         return {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
-                for path in self.root.rglob('*')}
+                for path in scratch_rglob(self.root)}
 
     def prepare_hana(self) -> None:
         workload = conf.path('hana_aws')
@@ -778,13 +779,13 @@ shared_usd_per_month=1
 
     def run_plan(self, *arguments: str) -> tuple[int, str]:
         self.write_gate_configuration()
-        before = {path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}
+        before = {path: path.read_bytes() if path.is_file() else None for path in scratch_rglob(self.root)}
         output, errors = StringIO(), StringIO()
         argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--settings', str(self.settings),
                 '--directory', str(self.state), '--output', str(self.root / 'output'), '--plan', *arguments]
         with mock.patch.object(sys, 'argv', argv), redirect_stdout(output), redirect_stderr(errors):
             status = deploy.main()
-        self.assertEqual({path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}, before)
+        self.assertEqual({path: path.read_bytes() if path.is_file() else None for path in scratch_rglob(self.root)}, before)
         printed = output.getvalue()
         for secret in (OWNER.account, CREDENTIAL.access_key_id, CREDENTIAL.secret_access_key,
                        'fixture-scaler-key', 'fixture-scaler-secret', 'fixture-stack', 'fixture-private-physical'):

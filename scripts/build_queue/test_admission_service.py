@@ -66,6 +66,7 @@ from scripts.build_queue import admission_records as records, progress_profile a
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 
 
 def setUpModule() -> None:
@@ -135,7 +136,7 @@ class PlacementStatusTests(unittest.TestCase):
         fields = tuple(service.ServiceState.__dataclass_fields__)
         before = wire.encode_record({name: getattr(fixture.server, name) for name in fields})
         files = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
-            for path in fixture.state_dir.rglob("*") if path.is_file()}
+            for path in scratch_rglob(fixture.state_dir) if path.is_file()}
         next_pass = fixture.server.next_pass
         with mock.patch.object(fixture.server, "persist") as persist, \
                 mock.patch.object(fixture.server, "_record_caller_version") as record_version, \
@@ -149,7 +150,7 @@ class PlacementStatusTests(unittest.TestCase):
             record_version.assert_not_called()
         self.assertEqual(wire.encode_record({name: getattr(fixture.server, name) for name in fields}), before)
         self.assertEqual({str(path): (path.read_bytes(), path.stat().st_mtime_ns)
-            for path in fixture.state_dir.rglob("*") if path.is_file()}, files)
+            for path in scratch_rglob(fixture.state_dir) if path.is_file()}, files)
         self.assertEqual(fixture.server.next_pass, next_pass)
         self.assertIsInstance(reply, status_wire.PlacementStatusReply)
         assert isinstance(reply, status_wire.PlacementStatusReply)
@@ -782,7 +783,7 @@ class PlacementStatusTests(unittest.TestCase):
                         fields = tuple(service.ServiceState.__dataclass_fields__)
                         before = wire.encode_record({name: getattr(fixture.server, name) for name in fields})
                         files = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
-                            for path in fixture.state_dir.rglob("*") if path.is_file()}
+                            for path in scratch_rglob(fixture.state_dir) if path.is_file()}
                         peer, other = socket.socketpair()
                         with peer, other, mock.patch.object(fixture.server, "persist") as persist, \
                                 mock.patch.object(fixture.server, "_record_caller_version") as record_version:
@@ -799,7 +800,7 @@ class PlacementStatusTests(unittest.TestCase):
                             record_version.assert_not_called()
                         self.assertEqual(wire.encode_record({name: getattr(fixture.server, name) for name in fields}), before)
                         self.assertEqual({str(path): (path.read_bytes(), path.stat().st_mtime_ns)
-                            for path in fixture.state_dir.rglob("*") if path.is_file()}, files)
+                            for path in scratch_rglob(fixture.state_dir) if path.is_file()}, files)
 
 
 class EndedPlacementPruneTests(unittest.TestCase):
@@ -2642,7 +2643,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
 
                     def saved_files() -> dict[Path, bytes]:
                         return {path.relative_to(fixture.root): path.read_bytes()
-                                for path in fixture.root.rglob("*") if path.is_file() and not path.is_symlink()}
+                                for path in scratch_rglob(fixture.root) if path.is_file() and not path.is_symlink()}
 
                     before = saved_files()
                     with mock.patch.object(override_guard, "user_home", return_value=home):
@@ -3626,7 +3627,7 @@ class ProgressProfileServiceTests(unittest.TestCase):
             progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 80, 100))
             _ = fixture.run_pass()
             fixture.release(grant)
-            path, = fixture.server.progress_history.root.glob("*/*.json")
+            path, = scratch_glob(fixture.server.progress_history.root, "*/*.json")
             record = progress.read_profile_record(path)
             assert isinstance(record, progress.RecordedProfile)
             self.assertEqual(record.profile.phases[0].bins[4], 3 * GIB)
@@ -6550,7 +6551,7 @@ class ServiceTests(unittest.TestCase):
                         _ = fixture.server.handle_request(release)
                     saved = wire.parse_record(fixture.state_text(), service.ServiceState)
                     self.assertIsInstance(saved.reservations[request.episode].finalization, dict)
-                    self.assertFalse(list(fixture.state_dir.glob("*.reservation")))
+                    self.assertFalse(list(scratch_glob(fixture.state_dir, "*.reservation")))
                     self.assertFalse(fixture.history())
                 else:
                     def stop_after_durable_release(stage: str) -> None:

@@ -30,6 +30,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog import store
 from scripts.lib import conf, process_group, process_start
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -643,7 +644,7 @@ fi
         build = self.guest_home / 'build'
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
         self.assertFalse((main / '.git/mac-linux').exists())
-        self.assertEqual(list(build.rglob('mac-linux*')), [])
+        self.assertEqual(list(scratch_rglob(build, 'mac-linux*')), [])
         self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
 
     def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
@@ -1147,7 +1148,7 @@ fi
                 self.assertEqual(lock.read_text(), owner)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
                 self.assertFalse((self.guest_home / 'build').exists())
-                self.assertEqual(list(lock.parent.glob(f'{mac_linux.CANCEL_RECORD_PREFIX}.*')), [])
+                self.assertEqual(list(scratch_glob(lock.parent, f'{mac_linux.CANCEL_RECORD_PREFIX}.*')), [])
         finally:
             if attempts:
                 self.assertIsInstance(mac_linux.prove_guest_end(settings, attempts[0]), mac_linux.GuestEndProven)

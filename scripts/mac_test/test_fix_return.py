@@ -22,6 +22,7 @@ from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, c
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
 from scripts.lib import test_hang_guard
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 
 HOST = "fixture-host"
 REPOSITORY = eligibility.KnownRepository("claude")
@@ -170,7 +171,7 @@ class ReturnFixTests(unittest.TestCase):
         self.assertFalse((self.worktree / "out.log").exists())
         self.assertFalse((self.worktree / ".mac-test-mirror").exists())
         self.assertEqual((self.worktree / "target/build.txt").read_text(), "natedev build\n")
-        self.assertEqual(sorted(path.name for path in self.worktree.glob(".*mac-fix-*")), [])
+        self.assertEqual(sorted(path.name for path in scratch_glob(self.worktree, ".*mac-fix-*")), [])
         calls = (self.root / "rsync-calls").read_text()
         self.assertIn("--files-from", calls)
 
@@ -301,7 +302,7 @@ class RollForwardTests(unittest.TestCase):
 
     def files(self) -> dict[str, str]:
         return {str(path.relative_to(self.worktree)): path.read_text()
-                for path in sorted(self.worktree.rglob("*")) if path.is_file() and ".git" not in path.parts}
+                for path in sorted(scratch_rglob(self.worktree)) if path.is_file() and ".git" not in path.parts}
 
     def record(self) -> Path:
         return fix_return.git_folder_path(self.worktree, fix_return.RECORD_NAME)

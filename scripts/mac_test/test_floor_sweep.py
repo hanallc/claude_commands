@@ -16,6 +16,7 @@ from unittest import mock
 
 from scripts.mac_test import eligibility, offload
 from scripts.lib import conf
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.lint import sweep
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -301,7 +302,7 @@ class FloorSweepCommandTests(OffloadCommandFixture):
                 _ = process.communicate(timeout=20)
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
         self.assertFalse(self.claim_file.exists())
-        locks = list(self.state_directory.glob("floor-sweep-*.lock"))
+        locks = list(scratch_glob(self.state_directory, "floor-sweep-*.lock"))
         self.assertEqual(len(locks), 1)
         for path in [*locks, self.state_directory / "state.lock"]:
             with path.open("a+") as lock:

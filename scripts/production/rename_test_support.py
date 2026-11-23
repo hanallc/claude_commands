@@ -42,6 +42,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
@@ -497,7 +498,7 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
             pass
     productions: dict[str, Production] = {}
     for production_name in members:
-        candidates = [path for path in sorted(case.root.rglob(f"{production_name}-production.md"))
+        candidates = [path for path in sorted(scratch_rglob(case.root, f"{production_name}-production.md"))
                       if path.is_relative_to(Path(production_field(
                           path.read_text().splitlines(), "Showrunner checkout")).expanduser().resolve())]
         case.assertEqual(len(candidates), 1, f"{production_name}: expected one production document")
@@ -674,7 +675,7 @@ class ProductionRenameFixture(StaffTestCase):
 
     def snapshot(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for path in self.root.rglob("*") if path.is_file() and path != self.root / "herdr.jsonl"}
+                for path in scratch_rglob(self.root) if path.is_file() and path != self.root / "herdr.jsonl"}
 
     def run_command(self, *arguments: str, wrapper: str = "", **environment: str) -> subprocess.CompletedProcess[str]:
         return run_rename(["rename", *arguments], {**self.env, **environment}, self.checkout, wrapper)

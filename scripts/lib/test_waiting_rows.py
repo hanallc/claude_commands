@@ -19,6 +19,7 @@ from unittest import mock
 
 from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
 
@@ -554,7 +555,7 @@ waiting_rows.move_to(Path.cwd(), sys.argv[1], fast_forward=True)
         stopped = self.stop_move(target, "marker")
         self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), removed)
-        self.assertEqual(self.output("ls-files", "--", relative), "")
+        self.assertEqual(scratch_ls_files(self.checkout, "--", relative).stdout, "")
         waiting_rows.move_to(self.checkout, target)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
         self.assertEqual(file.read_text(), SETTINGS.replace("amount=2", "amount=3").replace("limit=5", "limit=7"))

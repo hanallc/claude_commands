@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.nightly_review import candidates
 from scripts.lib import file_lock
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.production import investigation, proposal_issue, staff, update_registration, waiting_why
 from scripts.production.production_doc import Refusal
 from scripts.production.record_store import state_root
@@ -117,7 +118,7 @@ class WaitingWhyTests(unittest.TestCase):
     def check_list(self, kind: review_items.ReviewType) -> None:
         item = self.enter_waiting(kind, WHY)
         self.remove_reason(item)
-        paths = [path for path in self.fixture.temporary.rglob('*') if path.is_file()]
+        paths = [path for path in scratch_rglob(self.fixture.temporary) if path.is_file()]
         before = {path: path.read_bytes() for path in paths}
         code, output, errors = self.command('list')
         self.assertEqual((code, errors), (0, ''))

@@ -21,6 +21,7 @@ from scripts.aws_target.ledger_test_support import CostFixture, text_setting, wr
 from scripts.aws_target.test_hana_box import FakeProvider
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 
 FIXTURE_GUEST_DIGEST = hana_render.GuestDigest('a' * 64)
@@ -638,7 +639,7 @@ class HanaSetupTests(CostFixture):
         for version in (1, 2):
             with self.subTest(version=version), self.root_replacement(version=version, plan=True) as (subject, aws, output):
                 def snapshot() -> dict[Path, bytes]:
-                    return {path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}
+                    return {path: path.read_bytes() for path in scratch_rglob(self.state) if path.is_file()}
 
                 before = snapshot()
                 self.assertTrue(subject.hana_setup())

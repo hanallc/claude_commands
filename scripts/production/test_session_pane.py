@@ -27,6 +27,7 @@ from scripts.message import sessions
 from scripts.production import unit_lookup
 from scripts.herdr.herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
 from scripts.herdr.fake_herdr import CommandResponse
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.production import fake_unit_host
 from scripts.message.sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
@@ -75,7 +76,7 @@ class SessionPaneTests(unittest.TestCase):
                                         target=unit_membership("show", "herdr").current_session)
                 sent = script_prompt(text)
                 submit.assert_called_once_with("agent", "prompt", "w1:p1", sent)
-                for path in (self.root / "conversation-pause" / "script-prompts").glob("*"):
+                for path in scratch_glob(self.root / "conversation-pause" / "script-prompts", "*"):
                     if path.name != ".lock":
                         then = time.time() - 6 * 3600 - 60
                         os.utime(path, (then, then))

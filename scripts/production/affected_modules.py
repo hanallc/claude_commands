@@ -71,7 +71,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 # Bump the extractor version whenever source-fact semantics change.
 CACHE_FORMAT_VERSION = 3
-EXTRACTOR_VERSION = 14
+EXTRACTOR_VERSION = 18
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 
@@ -137,6 +137,7 @@ class ScanPattern:
     pattern: str
     recursive: bool
     names: NameFilter = NameFilter()
+    scratch_tree: bool = False
 
 
 @dataclass(frozen=True)
@@ -543,27 +544,99 @@ def loop_variants(node: ast.Call, bound: LoopValues) -> list[ast.Call]:
     return variants
 
 
+# These functions refuse at run time a root that shares files with a checkout, so a call reads no repository file.
+SCRATCH_TREE_MODULE = "scripts.lib.scratch_tree_test_support"
+SCRATCH_TREE_FUNCTIONS = ("scratch_glob", "scratch_rglob", "scratch_ls_files")
+SCRATCH_TREE_SCANS = frozenset(f"{SCRATCH_TREE_MODULE}.{function}" for function in SCRATCH_TREE_FUNCTIONS)
+SCRATCH_TREE_PATCH_TARGETS = (
+    "CHECKOUTS", "GIT_REDIRECTS", "_refuse_checkout", "_scratch_paths", "_checked_paths", *SCRATCH_TREE_FUNCTIONS,
+)
+
+
+def scratch_tree_names(tree: ast.Module) -> frozenset[str]:
+    """Give the names that call the scratch tree functions, and that the module binds to nothing else."""
+    imported: set[str] = set()
+    bound: set[str] = set()
+    module_names: set[str] = set()
+    changed_objects: set[str] = set()
+    for node in ast.walk(tree):
+        # A patch target string can replace the run-time refusal, so the module keeps all its scans.
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and any(name in node.value for name in SCRATCH_TREE_PATCH_TARGETS)):
+            return frozenset()
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    return frozenset()
+                name = alias.asname or alias.name
+                target = f"{node.module}.{alias.name}"
+                module = node.level == 0 and target == SCRATCH_TREE_MODULE
+                function = node.level == 0 and node.module == SCRATCH_TREE_MODULE and alias.name in SCRATCH_TREE_FUNCTIONS
+                if node.level == 0 and (module or SCRATCH_TREE_MODULE.startswith(target + ".")):
+                    module_names.add(name + SCRATCH_TREE_MODULE.removeprefix(target))
+                (imported if module or function else bound).add(name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                # A plain import binds the first package name, so only an `as` name calls the module.
+                module = alias.name == SCRATCH_TREE_MODULE
+                if module or SCRATCH_TREE_MODULE.startswith(alias.name + "."):
+                    module_names.add(alias.asname + SCRATCH_TREE_MODULE.removeprefix(alias.name)
+                                     if alias.asname else SCRATCH_TREE_MODULE)
+                helper = module and alias.asname is not None
+                (imported if helper else bound).add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            changed_objects.add(ast.unparse(node.value))
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bound.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            bound.add(node.rest)
+    if module_names & changed_objects:
+        return frozenset()
+    return frozenset(imported - bound)
+
+
 def call_facts(node: ast.Call, name: str, parent: str, definitions: dict[str, Definition],
-               bindings: dict[str, ScanPath | UnrootedPath], aliases: dict[str, str], names: NameFilter
-               ) -> tuple[ScanCall | None, ScanPattern | None]:
+               bindings: dict[str, ScanPath | UnrootedPath], aliases: dict[str, str], names: NameFilter,
+               scratch_tree: frozenset[str]) -> tuple[ScanCall | None, ScanPattern | None]:
     """Give the scope call and the folder scan that one call makes."""
     target = ast.unparse(node.func)
     head = target.split(".", 1)[0]
     if target.startswith(("self.", "cls.")):
         target = parent + "." + target.split(".", 1)[1]
+    imported = False
     for alias, imported_name in aliases.items():
         if target == alias or target.startswith(alias + "."):
             target = imported_name + target.removeprefix(alias)
+            imported = True
             break
     for prefix in (name, parent):
         if f"{prefix}.{target}".lstrip(".") in definitions:
             target = f"{prefix}.{target}".lstrip(".")
             break
+    if target in SCRATCH_TREE_SCANS:
+        if head in scratch_tree:
+            return None, None
+        # A changed guard permits a scan. Keep the scan even when the root is unknown.
+        root = next((keyword.value for keyword in node.keywords if keyword.arg == "root"),
+                    node.args[0] if node.args else None)
+        directory = scan_path(root, bindings, aliases) if root is not None else UnrootedPath()
+        return None, ScanPattern(directory, "*", True, scratch_tree=True)
     arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
     keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
                      for keyword in node.keywords if keyword.arg is not None)
     call = None
-    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
+    if (target in definitions or (imported and (arguments or keywords))
+            or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords)))):
         call = ScanCall(target, arguments, keywords)
     if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
         directory = scan_path(node.func.value, bindings, aliases)
@@ -600,6 +673,7 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
 
     definitions_in(tree, "")
     shared = frozenset(declared)
+    scratch_tree = scratch_tree_names(tree)
     scopes: list[ScanScope] = []
     environments: dict[str, tuple[dict[str, ScanPath | UnrootedPath], dict[str, str]]] = {}
     for name, definition in definitions.items():
@@ -635,8 +709,12 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                     aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
                 elif isinstance(node, ast.ImportFrom):
                     module = "." * node.level + (node.module or "")
-                    aliases.update((alias.asname or alias.name, module + ("." if node.module else "") + alias.name)
-                                   for alias in node.names)
+                    prefix = module + ("." if node.module else "")
+                    for alias in node.names:
+                        if module == SCRATCH_TREE_MODULE and alias.name == "*":
+                            aliases.update((function, prefix + function) for function in SCRATCH_TREE_FUNCTIONS)
+                        else:
+                            aliases[alias.asname or alias.name] = prefix + alias.name
                 elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                     value = scan_path(node.value, bindings, aliases)
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -645,7 +723,7 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                 elif isinstance(node, ast.Call):
                     for variant in loop_variants(node, bound) if bound else [node]:
                         call, scan = call_facts(variant, name, parent, definitions, inherited if hidden else bindings,
-                                                aliases, loops.filters.get(id(node), NameFilter()))
+                                                aliases, loops.filters.get(id(node), NameFilter()), scratch_tree)
                         if call is not None:
                             calls.append(call)
                         if scan is not None:
@@ -790,11 +868,12 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
                 raise ValueError("invalid scan default")
             given.append((key, decoded_scan_path(path)))
         patterns: list[ScanPattern] = []
-        for path, pattern, recursive, excludes, keeps in scan_rows(scans, 5):
+        for path, pattern, recursive, excludes, keeps, scratch_tree in scan_rows(scans, 6):
             directory = decoded_scan_path(path)
-            if not isinstance(pattern, str) or not isinstance(recursive, bool):
+            if not isinstance(pattern, str) or not isinstance(recursive, bool) or not isinstance(scratch_tree, bool):
                 raise ValueError("invalid scan pattern")
-            patterns.append(ScanPattern(directory, pattern, recursive, NameFilter(scan_strings(excludes), scan_strings(keeps))))
+            patterns.append(ScanPattern(directory, pattern, recursive, NameFilter(scan_strings(excludes), scan_strings(keeps)),
+                                        scratch_tree))
         invocations: list[ScanCall] = []
         for target, arguments, keywords in scan_rows(calls, 3):
             if not isinstance(target, str) or not isinstance(arguments, list):
@@ -813,7 +892,8 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
 def encoded_scan_scopes(scopes: tuple[ScanScope, ...]) -> list[object]:
     return [[scope.name, scope.parameters,
              [[name, encoded_scan_path(path)] for name, path in scope.bindings],
-             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive, scan.names.excludes, scan.names.keeps]
+             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive, scan.names.excludes, scan.names.keeps,
+               scan.scratch_tree]
               for scan in scope.scans],
              [[call.target, [encoded_scan_path(path) for path in call.arguments],
                [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls],
@@ -939,6 +1019,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
     """Resolve scoped scans without following imports beyond a called helper."""
     repository_root = repo.resolve()
     scopes = {path: {scope.name: scope for scope in source.scan_scopes} for path, source in facts.items()}
+    scratch_sources = {path for path, source in facts.items()
+                       if any(scan.scratch_tree for scope in source.scan_scopes for scan in scope.scans)}
 
     def symbols(source: str, target: str) -> Iterator[tuple[str, str]]:
         level = len(target) - len(target.lstrip("."))
@@ -995,7 +1077,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         return origin
 
     def called_scans(source: str, scope: ScanScope, parameters: dict[str, RepositoryDirectory | UnrootedPath | OutsideRepository],
-                     follow_imports: bool, seen: frozenset[tuple[str, str]]) -> set[RepositoryScan]:
+                     follow_imports: bool, seen: frozenset[tuple[str, str]], *,
+                     scratch_only: bool = False) -> set[RepositoryScan]:
         key = source, scope.name
         if key in seen:
             return set()
@@ -1004,6 +1087,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         parameters = {**{name: directory(source, value, {}, frozenset()) for name, value in scope.defaults}, **parameters}
         result: set[RepositoryScan] = set()
         for scan in scope.scans:
+            if scratch_only and not scan.scratch_tree:
+                continue
             root = directory(source, scan.directory, parameters, frozenset())
             if isinstance(root, UnrootedPath):
                 result.add(RepositoryScan(".", scan.pattern, True, scan.names))
@@ -1014,13 +1099,20 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
             keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
             targets = [(source, call.target)] if call.target in scopes[source] else []
             local = bool(targets)
-            if not local and follow_imports and any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
-                targets = list(symbols(source, call.target))
+            target_scratch_only = scratch_only
+            if not local and follow_imports:
+                values = (*arguments, *keywords.values())
+                if any(isinstance(value, RepositoryDirectory) for value in values):
+                    targets = list(symbols(source, call.target))
+                elif scratch_sources and any(isinstance(value, UnrootedPath) for value in values):
+                    targets = [(path, name) for path, name in symbols(source, call.target) if path in scratch_sources]
+                    target_scratch_only = True
             for path, name in targets:
                 callee = scopes[path].get(name)
                 if callee is not None:
                     bound = {**dict(zip(callee.parameters, arguments)), **keywords}
-                    result.update(called_scans(path, callee, bound, follow_imports and local, seen))
+                    result.update(called_scans(path, callee, bound, follow_imports and local, seen,
+                                               scratch_only=target_scratch_only))
         return result
 
     return {path: frozenset(scan for scope in source.scan_scopes

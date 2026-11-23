@@ -40,6 +40,7 @@ from scripts.production.production_lifecycle_test_support import LifecycleFixtur
 from scripts.production.cli_fixture import production_paths
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.main_push_lock_test_support import publish_after_contender
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 
 
 def setUpModule() -> None:
@@ -118,7 +119,7 @@ class LifecycleTests(LifecycleFixture):
         before = exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()
         self.assertEqual(exclude.read_text().splitlines().count("production.log"), 1)
         self.assertEqual(self.git("check-ignore", "production.log"), "production.log")
-        self.assertEqual(self.git("ls-files", "production.log"), "")
+        self.assertEqual(scratch_ls_files(self.checkout, "production.log", environment=self.env).stdout, "")
         again = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
         self.assert_step(again, "ok")
         self.assertEqual((exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()), before)

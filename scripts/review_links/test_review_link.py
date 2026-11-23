@@ -26,6 +26,7 @@ from scripts.review_links import review_link, serve
 
 
 from typing import cast, override
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("review_link.py")
@@ -209,7 +210,7 @@ class ReviewLinkTests(unittest.TestCase):
             urls = review_link.snapshot_at(self.snapshots, [source])
         self.assertEqual(len(urls), 1)
         self.assertRegex(urls[0], r"^http://fixture\.example:8765/[a-z0-9]{6}/notes%20%23%25\.txt$")
-        shared_url.assert_called_once_with(self.snapshots, next(self.snapshots.glob("*/notes #%.txt")),
+        shared_url.assert_called_once_with(self.snapshots, next(scratch_glob(self.snapshots, "*/notes #%.txt")),
                                            host="fixture.example", port=8765)
 
     def test_missing_session_id_still_uses_a_flat_id(self) -> None:
@@ -608,7 +609,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 self.assertEqual(replaced, [source.name, ".index.json"])
                 self.assertEqual(destination.read_text(encoding="utf-8"), "new")
                 self.assertEqual(
-                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {file.relative_to(snapshots) for file in scratch_rglob(snapshots) if file.is_file()},
                     {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
                 )
 
@@ -629,7 +630,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 self.assertEqual(destination.read_text(encoding="utf-8"), "old")
                 self.assertEqual((snapshots / ".index.json").read_bytes(), index)
                 self.assertEqual(
-                    {file.relative_to(snapshots) for file in snapshots.rglob("*") if file.is_file()},
+                    {file.relative_to(snapshots) for file in scratch_rglob(snapshots) if file.is_file()},
                     {Path(".index.json"), Path(".index.lock"), destination.relative_to(snapshots)},
                 )
 

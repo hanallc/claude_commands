@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, override
 from unittest import mock
 from scripts.lib.file_module import load_file_module
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 if TYPE_CHECKING:
     from scripts.notify import review, pushover
@@ -173,9 +174,9 @@ class PushGateTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_a_delivery_of_another_message_or_without_a_marker_preserves_state(self) -> None:
-        before = set(self.root.rglob("*"))
+        before = set(scratch_rglob(self.root))
         self.assertEqual(self.delivered(), ("", ""))
-        self.assertEqual(set(self.root.rglob("*")), before)
+        self.assertEqual(set(scratch_rglob(self.root)), before)
         path = self.marker()
         before_marker = path.read_bytes()
         self.assertEqual(self.delivered(message="Another push"), ("", ""))

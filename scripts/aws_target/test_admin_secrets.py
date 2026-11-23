@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.aws_target import admin_secrets, box, deploy
 from scripts.lib import conf
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 
 VALUES = admin_secrets.AdminCredentials('test-admin-id', 'test-admin-secret', 'test-client-id', 'test-client-secret')
@@ -132,7 +133,7 @@ class AdminSecretTests(unittest.TestCase):
         self.assertEqual(requests, ['oauth/token', 'tailnet/-/acl'])
         for value in VALUES.secret_values():
             self.assertNotIn(value, output.getvalue() + errors.getvalue())
-            for path in self.root.rglob('*'):
+            for path in scratch_rglob(self.root):
                 if path.is_file():
                     self.assertNotIn(value.encode(), path.read_bytes())
 

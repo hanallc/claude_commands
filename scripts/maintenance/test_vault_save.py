@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from scripts.lib import land_main
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.maintenance import vault_commit, vault_save
 from scripts.maintenance.settings import Part
 
@@ -331,7 +332,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("show", "HEAD:bob/note.md"), "Reviewed content.")
         self.assertEqual(self.git("ls-tree", "HEAD", "remove.md"), "")
         self.assertEqual(self.git("diff", "--name-only", "HEAD"), "")
-        self.assertEqual(self.git("ls-files", "--others", "--exclude-standard"), "")
+        self.assertEqual(scratch_ls_files(self.vault, "--others", "--exclude-standard").stdout, "")
         self.assertFalse(manifest.exists())
 
     def interrupt_before_index_sync(self, digest: str) -> tuple[int, str, str]:

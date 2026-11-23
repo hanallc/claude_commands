@@ -30,6 +30,7 @@ from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, gate, staff
@@ -766,11 +767,11 @@ class GateRecoveryTests(MergeGateFixture):
             try:
                 wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
                 self.assertTrue(ready.is_file())
-                self.assertEqual(len(list(records.glob(f"{process.pid}-*.json"))), 1)
+                self.assertEqual(len(list(scratch_glob(records, f"{process.pid}-*.json"))), 1)
                 process.send_signal(signal.SIGTERM)
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
-                self.assertEqual(list(records.glob("*.json")), [])
+                self.assertEqual(list(scratch_glob(records, "*.json")), [])
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -793,7 +794,7 @@ class GateRecoveryTests(MergeGateFixture):
         result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(list(directory.glob("*.json")), [finished.path])
+        self.assertEqual(list(scratch_glob(directory, "*.json")), [finished.path])
         self.assertEqual(finished.path.read_text(), saved)
         self.assertEqual(canary.read_text(), "fixture data")
         self.assertNotIn(str(folder), result.stderr)

@@ -44,6 +44,7 @@ from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
 
@@ -551,7 +552,7 @@ class MergeGateFixture(unittest.TestCase):
         self.assertEqual(self.admission.server.reservations, {})
         self.assertEqual(self.admission.server.waiters, {})
         for suffix in ("reservation", "waiting", "max", "wave"):
-            self.assertEqual(list(self.admission_directory.glob("*." + suffix)), [], suffix)
+            self.assertEqual(list(scratch_glob(self.admission_directory, "*." + suffix)), [], suffix)
 
     @contextlib.contextmanager
     def observing_admission(self, observe: Callable[[admission_records.AdmissionWaitSnapshot], None]) -> Generator[None]:
@@ -679,7 +680,7 @@ class MergeGateFixture(unittest.TestCase):
         return self.git(checkout, "rev-parse", "HEAD")
 
     def gate_run_records(self) -> list[GateRunRecord]:
-        paths = sorted(Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl"))
+        paths = sorted(scratch_glob(Path(self.environment["BUILDLOG_DIR"]), "*/*.jsonl"))
         return [cast(GateRunRecord, cast(object, row))
                 for row in sweep.build_log_rows(paths) if row.get("kind") == "gate_run"]
 

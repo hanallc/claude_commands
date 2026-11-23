@@ -17,12 +17,14 @@ from unittest import mock
 
 from scripts.aws_target import cloud_gate
 from scripts.buildlog import index, store
+from scripts.lib import scratch_tree_test_support as scratch_tree
 from scripts.production import affected_modules as affected
 from scripts.production import gate, mac_gate_process
 from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
 
+ROOT = Path(__file__).resolve().parents[2]
 # A helper that copies a data folder, as a test fixture does.
 COPY_SCAN = ("from pathlib import Path\nROOT = Path(__file__).resolve().parents[2]\n"
              + "def copy_data():\n    return list((ROOT / 'scripts/data').rglob('*'))\n")
@@ -1195,6 +1197,163 @@ class RepositoryScanInferenceTests(unittest.TestCase):
         for body in bodies:
             with self.subTest(body=body):
                 self.assertEqual(self.scans(body), {affected.RepositoryScan(".", "*.py", True)})
+
+    def graph_scans(self, body: str, helper: str, helper_text: str) -> frozenset[affected.RepositoryScan]:
+        """Resolve the scans of the test file with one helper module that it imports."""
+        facts = {self.PATH: affected.extract_facts(self.HEADER + body, self.PATH),
+                 helper: affected.extract_facts(helper_text, helper)}
+        graph = affected.repository_scan_graph(Path("/fixture"), facts, {})
+        self.assertEqual(graph[helper], frozenset())
+        return graph[self.PATH]
+
+    def test_a_scratch_tree_call_is_no_repository_scan(self) -> None:
+        helper = "scripts/lib/scratch_tree_test_support.py"
+        text = (ROOT / helper).read_text(encoding="utf-8")
+        bodies = (
+            "from scripts.lib.scratch_tree_test_support import scratch_rglob\n"
+            + "def files(root):\n    return list(scratch_rglob(root))\ndef test():\n    return files(ROOT / 'docs')\n",
+            "from scripts.lib import scratch_tree_test_support as tree\n"
+            + "def test():\n    return list(tree.scratch_glob(ROOT / 'docs', '*.md'))\n",
+            "from scripts.lib.scratch_tree_test_support import scratch_rglob\n"
+            + "def files(case):\n    return sorted(scratch_rglob(case.root, '*.md'))\n",
+            "from scripts.lib.scratch_tree_test_support import scratch_ls_files\n"
+            + "def listed():\n    return scratch_ls_files(ROOT / 'docs', '--others').stdout\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(self.graph_scans(body, helper, text), frozenset())
+
+    def test_a_scan_function_with_the_scratch_tree_name_from_elsewhere_keeps_its_scan(self) -> None:
+        local = ("def scratch_rglob(root, pattern='*'):\n    return root.rglob(pattern)\n"
+                 + "FOUND = list(scratch_rglob(Path(os.environ['ROOT'])))\n")
+        self.assertEqual(self.scans(local), {affected.RepositoryScan(".", "*", True)})
+        helper = "scripts/checks/tree_support.py"
+        imported = ("from scripts.checks.tree_support import scratch_rglob\n"
+                    + "def test():\n    return list(scratch_rglob(ROOT / 'docs'))\n")
+        self.assertEqual(self.graph_scans(imported, helper, "def scratch_rglob(root, pattern='*'):\n    return root.rglob(pattern)\n"),
+                         {affected.RepositoryScan("docs", "*", True)})
+
+    def test_a_module_that_binds_or_patches_a_scratch_tree_name_keeps_its_scan(self) -> None:
+        helper = "scripts/lib/scratch_tree_test_support.py"
+        text = (ROOT / helper).read_text(encoding="utf-8")
+        imported = "from scripts.lib.scratch_tree_test_support import scratch_rglob\n"
+        bodies = (
+            imported + "def test():\n    for scratch_rglob in (lambda root: root.rglob('*'),):\n"
+            + "        return list(scratch_rglob(ROOT / 'docs'))\n",
+            imported + "def bind():\n    global scratch_rglob\n    scratch_rglob = lambda root: root.rglob('*')\n"
+            + "def test():\n    return list(scratch_rglob(ROOT / 'docs'))\n",
+            "from unittest import mock\nfrom scripts.lib import scratch_tree_test_support as tree\n" + imported
+            + "def test():\n    with mock.patch.object(tree, '_refuse_checkout'):\n"
+            + "        return list(scratch_rglob(ROOT / 'docs'))\n",
+            "import scripts.lib.scratch_tree_test_support\n"
+            + "def test():\n    return list(scripts.lib.scratch_tree_test_support.scratch_rglob(ROOT / 'docs'))\n",
+            imported + "from another_module import *\n"
+            + "def test():\n    return list(scratch_rglob(ROOT / 'docs'))\n",
+            "from scripts.lib import scratch_tree_test_support as tree\n" + imported
+            + "tree._refuse_checkout = lambda root: None\n"
+            + "def test():\n    return list(scratch_rglob(ROOT / 'docs'))\n",
+            "import scripts.lib.scratch_tree_test_support as tree\n"
+            + "tree.scratch_rglob = lambda root: root.rglob('*')\n"
+            + "def test():\n    return list(tree.scratch_rglob(ROOT / 'docs'))\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(self.graph_scans(body, helper, text), {affected.RepositoryScan("docs", "*", True)})
+
+    def test_scratch_tree_star_import_keeps_an_unknown_root(self) -> None:
+        imports = (
+            "from scripts.lib.scratch_tree_test_support import scratch_rglob\nfrom another_module import *\n",
+            "from scripts.lib.scratch_tree_test_support import *\n",
+        )
+        for statement in imports:
+            with self.subTest(statement=statement):
+                self.assertEqual(self.scans(statement + "def test(case):\n    return list(scratch_rglob(case.root))\n"),
+                                 {affected.RepositoryScan(".", "*", True)})
+
+    def test_scratch_tree_imported_wrapper_keeps_an_unknown_root(self) -> None:
+        helper = "scripts/checks/tree_support.py"
+        imported = "from scripts.checks.tree_support import files\n"
+        scratch_import = "from scripts.lib.scratch_tree_test_support import scratch_rglob\n"
+        wrapped = scratch_import + "def files(root):\n    return list(scratch_rglob(root))\n"
+        with_star = "from another_module import *\n" + wrapped
+        plain = "def files(root):\n    return list(root.rglob('*'))\n"
+        whole = {affected.RepositoryScan(".", "*", True)}
+        cases: tuple[tuple[str, str, set[affected.RepositoryScan]], ...] = (
+            ("case.root", with_star, whole),
+            ("root=case.root", with_star, whole),
+            ("ROOT / 'docs'", with_star, {affected.RepositoryScan("docs", "*", True)}),
+            ("Path('/scratch')", with_star, set()),
+            ("case.root", wrapped, set()),
+            ("case.root", plain, set()),
+        )
+        for argument, source, expected in cases:
+            with self.subTest(argument=argument, source=source):
+                body = imported + f"def test(case):\n    return files({argument})\n"
+                self.assertEqual(self.graph_scans(body, helper, source), expected)
+
+    def test_scratch_tree_guard_changes_keep_the_scan(self) -> None:
+        imported = "from scripts.lib.scratch_tree_test_support import scratch_rglob\n"
+        changes = (
+            "from unittest import mock\nfrom scripts.lib import scratch_tree_test_support as tree\n"
+            + "mock.patch.object(tree, 'CHECKOUTS', ()).start()\n",
+            "from unittest import mock\n"
+            + "mock.patch('scripts.lib.scratch_tree_test_support.CHECKOUTS', ()).start()\n",
+            "import scripts.lib.scratch_tree_test_support as t\nt.CHECKOUTS = ()\n",
+            "from scripts.lib import scratch_tree_test_support\nscratch_tree_test_support.CHECKOUTS = ()\n",
+            "import scripts.lib as lib\nlib.scratch_tree_test_support.CHECKOUTS = ()\n",
+            "from scripts import lib as package\npackage.scratch_tree_test_support.CHECKOUTS = ()\n",
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                body = imported + change + "def test(case):\n    return list(scratch_rglob(case.root))\n"
+                self.assertEqual(self.scans(body), {affected.RepositoryScan(".", "*", True)})
+
+    def test_a_scratch_tree_call_refuses_a_checkout_root(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            scratch = Path(folder)
+            _ = (scratch / "a.md").write_text("a\n", encoding="utf-8")
+            self.assertEqual(list(scratch_tree.scratch_glob(scratch, "*.md")), [scratch / "a.md"])
+            self.assertEqual(list(scratch_tree.scratch_rglob(scratch)), [scratch / "a.md"])
+            for variable in sorted(scratch_tree.GIT_REDIRECTS):
+                with self.subTest(variable=variable), self.assertRaisesRegex(ValueError, f"sets {variable}"):
+                    _ = scratch_tree.scratch_ls_files(scratch, environment={variable: str(ROOT / ".git")})
+        refusals = (
+            lambda: scratch_tree.scratch_glob(ROOT / "docs", "*.md"),
+            lambda: scratch_tree.scratch_rglob(ROOT.parent),
+            lambda: scratch_tree.scratch_ls_files(ROOT / "scripts"),
+        )
+        for refusal in refusals:
+            with self.subTest(refusal=refusal), self.assertRaisesRegex(ValueError, "is not a temporary fixture folder"):
+                _ = refusal()
+
+    def test_scratch_tree_patterns_refuse_parent_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            for scan in (scratch_tree.scratch_glob, scratch_tree.scratch_rglob):
+                with self.subTest(scan=scan), self.assertRaisesRegex(ValueError, "contains a parent directory"):
+                    _ = scan(Path(folder), "*/../outside")
+
+    def test_scratch_tree_patterns_refuse_checkout_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "file-link").symlink_to(__file__)
+            (root / "dir-link").symlink_to(ROOT / "docs", target_is_directory=True)
+            for scan in (scratch_tree.scratch_glob, scratch_tree.scratch_rglob):
+                for pattern in ("file-link", "dir-*/missing-name"):
+                    with (self.subTest(scan=scan, pattern=pattern),
+                          self.assertRaisesRegex(ValueError, "overlaps the checkout")):
+                        _ = list(scan(root, pattern))
+
+    def test_scratch_tree_glob_can_return_the_checked_root(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "scratch"
+            root.mkdir()
+            (root / "child").mkdir()
+            checkout = Path(folder) / "checkout"
+            checkout.mkdir()
+            with mock.patch.object(scratch_tree, "CHECKOUTS", (checkout,)):
+                for scan in (scratch_tree.scratch_glob, scratch_tree.scratch_rglob):
+                    with self.subTest(scan=scan):
+                        self.assertEqual(set(scan(root, "**")), {root, root / "child"})
 
     def test_the_loop_value_limit_allows_a_product_up_to_the_limit(self) -> None:
         scans = self.scans("def scan():\n    for first in ('a', 'b', 'c', 'd'):\n"

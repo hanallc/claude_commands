@@ -26,6 +26,7 @@ from unittest import mock
 
 from scripts.lib import conf, file_lock
 from scripts.aws_target import ledger
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
@@ -263,7 +264,7 @@ class TestTimesTests(unittest.TestCase):
             status, output, errors = run("seed-gate-times")
             self.assertEqual((status, errors), (0, ""))
             self.assertIn("Recent gate time keys:", output)
-            snapshots = self.log.glob(f"*/{gate_record.LATEST_MODULE_READS_NAME}")
+            snapshots = scratch_glob(self.log, f"*/{gate_record.LATEST_MODULE_READS_NAME}")
             self.assertEqual({path.parent.name for path in snapshots}, {"natedev", "Mac"})
             module_path = "scripts/tools/test_alpha.py"
             self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
@@ -966,7 +967,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         kept: TestTime = {"test": "Example.test_target", "s": 0.75, "status": "pass"}
         self.write_run([module_run("test_alpha.py", 8.0, tests=[kept])])
         self.write_run([module_run("test_alpha.py", 7.0)], epoch=EPOCH + 60)
-        path = next(self.log.glob("*/*.jsonl"))
+        path = next(scratch_glob(self.log, "*/*.jsonl"))
         entries = list(store.locked_rows(path))
         for entry in entries:
             remove_run_measurements(entry)

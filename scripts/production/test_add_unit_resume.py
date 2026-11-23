@@ -24,6 +24,7 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.agents.test_support import ShutdownTestCase
 
 
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
 from scripts.production.staff_test_support import fixture_runtime_id, unit_membership
 
@@ -58,7 +59,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], row.current_session)
         self.assertEqual(arguments[arguments.index("--model") + 1], "sonnet")
-        self.assertEqual(self.git("ls-files", ".unit.toml", cwd=worktree), "")
+        self.assertEqual(scratch_ls_files(worktree, ".unit.toml").stdout, "")
 
     def test_unreadable_staff_refuses_resume_before_closing_its_stopped_pane(self) -> None:
         prior = self.root / "prior-session"

@@ -18,6 +18,7 @@ from unittest.mock import patch
 from scripts.backup import state_backup
 from scripts.backup.state_backup import ALERT_KEY, READ_BLOCK_SIZE, LastBackup, checksum_path
 from scripts.lib.atomic_file import prepared_replacement
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
@@ -151,7 +152,7 @@ with open(os.environ["FIXTURE_SEND_LOG"], "a", encoding="utf-8") as log:
     def check_run_failed(self, result: subprocess.CompletedProcess[str], message: str) -> None:
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(message, result.stderr)
-        self.assertFalse(list(self.state.glob("backup-*")))
+        self.assertFalse(list(scratch_glob(self.state, "backup-*")))
 
     def alerts(self) -> list[list[str]]:
         return [cast(list[str], json.loads(row)) for row in self.send_log.read_text(encoding="utf-8").splitlines()]
@@ -430,7 +431,7 @@ os.execvp("mv", sys.argv)
         result = self.command("restore", str(archive), "--into", str(destination))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         restored = {path.relative_to(destination).as_posix(): sha256(path.read_bytes()).hexdigest()
-                    for path in destination.rglob("*") if path.is_file()}
+                    for path in scratch_rglob(destination) if path.is_file()}
         self.assertEqual(restored, last["manifest"]["files"])
         for folder in (self.mac_folder.parent, self.mac_folder, destination):
             self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)

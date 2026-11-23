@@ -32,6 +32,7 @@ from scripts.lint.memory_test_support import config_environment
 
 from scripts.hana_shot import hana_shot
 from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
+from scripts.lib.scratch_tree_test_support import scratch_glob
 
 
 class RecordingStopped(BaseException):
@@ -84,7 +85,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def records(self) -> list[Record]:
         return [cast(Record, json.loads(line))
-                for path in sorted(self.root.glob("*/*.jsonl"))
+                for path in sorted(scratch_glob(self.root, "*/*.jsonl"))
                 for line in path.read_text().splitlines()]
 
     def saved_launch(self, port: int, started: str, **facts: object) -> Path:
@@ -167,7 +168,7 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(launches.collect().added, 0)
         self.assertEqual(self.records(), rows)
         self.assertEqual(source.read_bytes(), original)
-        self.assertEqual(list(source.parent.glob("*.json")), [source])
+        self.assertEqual(list(scratch_glob(source.parent, "*.json")), [source])
 
     def test_launch_ignores_obsolete_wait_and_admission_record_fields(self) -> None:
         admission = self.root / "admission" / "launch-fixture.json"
@@ -364,19 +365,19 @@ class LaunchRecordingTests(unittest.TestCase):
         unpublished = stage in {RecordingStop.AFTER_PENDING_WRITE, RecordingStop.FAILED_FIRST_PUBLICATION}
         self.assertEqual(len(self.records()), 0 if unpublished else 1)
         self.assertTrue(pending.is_relative_to(self.root))
-        self.assertEqual(len(list(pending.glob("*"))), 1)
+        self.assertEqual(len(list(scratch_glob(pending, "*"))), 1)
         source.unlink()
 
         self.assertEqual(launches.collect().added, 1 if unpublished else 0)
         rows = self.records()
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]["mem_wait_s"])
-        self.assertEqual(list(pending.glob("*")), [])
+        self.assertEqual(list(scratch_glob(pending, "*")), [])
         self.assertEqual(index.update(), 1)
         _ = source.write_bytes(original)
         self.assertFalse(record.launch(source, self.worktree))
         self.assertEqual(self.records(), rows)
-        self.assertEqual(list(pending.glob("*")), [])
+        self.assertEqual(list(scratch_glob(pending, "*")), [])
         self.assertEqual(launches.collect().added, 0)
         self.assertEqual(index.update(), 0)
         self.assertEqual(source.read_bytes(), original)
@@ -415,13 +416,13 @@ class LaunchRecordingTests(unittest.TestCase):
 
         pending = record.pending_launch_root()
         self.assertEqual(len(self.records()), 1)
-        self.assertEqual(len(list(pending.glob("*"))), 1)
+        self.assertEqual(len(list(scratch_glob(pending, "*"))), 1)
         self.assertEqual(launches.collect().added, 1)
         rows = self.records()
         self.assertEqual(len(rows), 2)
         self.assertEqual(len({row["id"] for row in rows}), 2)
         self.assertTrue(all(row["mem_wait_s"] is None for row in rows))
-        self.assertEqual(list(pending.glob("*")), [])
+        self.assertEqual(list(scratch_glob(pending, "*")), [])
         self.assertEqual(index.update(), 2)
         self.assertEqual(launches.collect().added, 0)
         self.assertEqual(self.records(), rows)

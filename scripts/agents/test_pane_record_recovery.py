@@ -38,6 +38,7 @@ from scripts.production import unit_move
 from scripts.herdr import herdr
 from scripts.agents import pane_record
 from scripts.herdr import pane_launch
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.message import sessions
 
 
@@ -54,7 +55,7 @@ def fixture_launch_transcript(root: Path, entry: pane_launch.PaneLaunch, record:
             Path(entry.get("config_dir") or root / (".codex2" if kind == "codex" else ".claude3")))
     if not home.is_relative_to(root):
         home = root / (".codex2" if kind == "codex" else ".claude3")
-    for opposite in root.glob((".claude*" if kind == "codex" else ".codex*") + "/**/*" + identity + ".jsonl"):
+    for opposite in scratch_glob(root, (".claude*" if kind == "codex" else ".codex*") + "/**/*" + identity + ".jsonl"):
         opposite.unlink()
     target = (home / "sessions" / f"rollout-{identity}.jsonl" if kind == "codex" else
               home / "projects/fixture" / f"{identity}.jsonl")

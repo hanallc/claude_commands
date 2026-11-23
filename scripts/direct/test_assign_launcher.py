@@ -34,6 +34,7 @@ from scripts.message import send, sessions
 from scripts.agents import stop_resume
 from scripts.usage import agents_log
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lib.scratch_tree_test_support import scratch_glob, scratch_rglob
 
 def setUpModule() -> None:
     codex_fixture.setUpModule()
@@ -659,7 +660,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                 with patch.object(stop_resume, "stop", side_effect=stop_source):
                     result = invoke_assignment(arguments, os.environ.copy())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr +
-                                 "\n".join(path.read_text() for path in (self.session_dir / "phases/7").glob("*_agent.log")))
+                                 "\n".join(path.read_text() for path in scratch_glob(self.session_dir / "phases/7", "*_agent.log")))
                 self.assertEqual(self.native.finish(name), turn_end.TurnOutcome.DONE)
                 moved = staff.by_id(row.id)
                 assert moved is not None
@@ -1089,7 +1090,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                               ("--reply-file", ""),
                               ("--summary", str(reply_file))):
             with self.subTest(option=option, value=value):
-                files = {path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}
+                files = {path: path.read_bytes() for path in scratch_rglob(self.project) if path.is_file()}
                 submitted = self.native.agent.submitted.copy()
                 launched = self.native.fixture.world.launches.copy()
                 result = self.launch("implement", option, value, execution=InProcessAssignment())
@@ -1102,7 +1103,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                     self.assertIn("--reply-file", result.stderr)
                 self.assertEqual(self.native.agent.submitted, submitted)
                 self.assertEqual(self.native.fixture.world.launches, launched)
-                self.assertEqual({path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}, files)
+                self.assertEqual({path: path.read_bytes() for path in scratch_rglob(self.project) if path.is_file()}, files)
         _ = self.successful("implement", "--reply-file", str(reply_file))
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(self.turn_starts, 1)

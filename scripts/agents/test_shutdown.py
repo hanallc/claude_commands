@@ -18,6 +18,7 @@ from scripts.agents import pane_record, shutdown, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.lib import atomic_file
+from scripts.lib.scratch_tree_test_support import scratch_glob
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
@@ -302,7 +303,7 @@ class ProducerCommandsTests(unittest.TestCase):
                     if target in ("other-admission", "foreign-session-on-pane"):
                         self.assertEqual(json.loads(receipt.read_text()), saved)
                     else:
-                        self.assertEqual(list(receipt.parent.glob(receipt.name)), [])
+                        self.assertEqual(list(scratch_glob(receipt.parent, receipt.name)), [])
                     self.assertIn(f"{identity}: unchanged", output.getvalue())
                     if target == "split":
                         self.assertEqual([pane["pane_id"] for pane in case.client.panes()], ["w1:p8"])

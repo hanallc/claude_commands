@@ -34,6 +34,7 @@ from scripts.agents import stop_resume
 from scripts.agents.test_restart import showrunner, top_level, unit
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.agents.test_support import write_machine_config
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300
@@ -170,7 +171,7 @@ class AccountMoveTests(ShutdownTestCase):
     def disk_state(self) -> dict[str, bytes | str]:
         return {str(path.relative_to(self.root)): str(path.readlink()) if path.is_symlink() else
                 path.read_bytes() if path.is_file() else "directory"
-                for path in self.root.rglob("*")}
+                for path in scratch_rglob(self.root)}
 
 
     def cli(self, session: str = "move-id", target: str = "claude3") -> tuple[int, str, str]:

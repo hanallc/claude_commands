@@ -42,6 +42,7 @@ from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTe
 from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
                                               write_config_fixture)
 from scripts.lib import test_hang_guard
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 
 FIXTURE_STATUS = "\n".join((
     "mac: free",
@@ -1410,7 +1411,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         shared = home / ".local/state/build-hold"
         shared.parent.mkdir(parents=True)
         shared.symlink_to(self.holders, target_is_directory=True)
-        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        before = {path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(override_guard, "user_home", return_value=home), \
              mock.patch.object(sys, "argv", [build_targets.__file__, "check-local", "--session", "waiting-session"]), \
@@ -1418,7 +1419,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             code = build_targets.main()
         self.assertEqual(code, 2)
         self.assertIn(str(home / ".claude/scripts/build_hold/build_hold.py"), output.getvalue() + errors.getvalue())
-        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        self.assertEqual({path: path.read_bytes() for path in scratch_rglob(self.root) if path.is_file()}, before)
 
     def check_launch(self, session_id: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()

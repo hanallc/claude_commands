@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from scripts.lib.scratch_tree_test_support import scratch_rglob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -84,7 +85,7 @@ class BoardTextTests(unittest.TestCase):
         self.assertIn("[w7] handoff: role=test test the current run", read.stdout)
 
     def test_folder_free_commands_without_a_run_exit_two_with_one_error_and_no_writes(self) -> None:
-        before = sorted(self.directory.rglob("*"))
+        before = sorted(scratch_rglob(self.directory))
         for arguments in (("post", "w7", "status", "phase 16 tests"),
                           ("read", "--from", "w7"),
                           ("role", "w7", "test", "test the current run")):
@@ -93,7 +94,7 @@ class BoardTextTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(result.stderr.splitlines()), 1)
-                self.assertEqual(sorted(self.directory.rglob("*")), before)
+                self.assertEqual(sorted(scratch_rglob(self.directory)), before)
 
     def test_folder_argument_selects_the_named_run_over_the_environment(self) -> None:
         self.environment["UNIT_RUN_DIR"] = str(self.directory / "other-run")

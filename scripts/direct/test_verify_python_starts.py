@@ -11,7 +11,7 @@ import tempfile
 import shutil
 import subprocess
 import sys
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
@@ -23,6 +23,7 @@ from scripts.direct.tree_watch_test_support import TreeWatchFixture, write_works
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB, write_fixture_cargo_mend
+from scripts.lib.scratch_tree_test_support import scratch_ls_files
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -222,12 +223,10 @@ class VerifyOutputRootsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GIT_INDEX_FILE": str(index)}):
             _ = write_workspace(fixture)
         self.assertTrue(index.read_bytes() == before, "git add changed the caller's index")
-        staged = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "sample/src/lib.rs"],
-            cwd=fixture, env=environment, capture_output=True, text=True,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
-        self.assertEqual(staged.returncode, 0, staged.stderr)
+        try:
+            _ = scratch_ls_files(fixture, "--error-unmatch", "sample/src/lib.rs", environment=environment)
+        except subprocess.CalledProcessError as error:
+            self.fail(cast(str, error.stderr))
 
     def test_paired_keys_do_not_read_the_caller_bash_env(self) -> None:
         caller = Path(self.enterContext(tempfile.TemporaryDirectory()))
