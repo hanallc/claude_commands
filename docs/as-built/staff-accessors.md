@@ -323,6 +323,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
+| `scripts/review_links/console.py` | read | local_snapshot gives the staff rows for the page owner controls in the unavailable view; StaffRow (type) checks the shown owner |
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |

@@ -211,7 +211,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         directory = self.root / "brain"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
-        self.assertEqual(submissions.proposal_folder(producer),
+        self.assertEqual(submissions.proposal_folder(producer, self.members),
                          submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
 
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
@@ -2048,10 +2048,12 @@ class ReviewSubmissionTests(unittest.TestCase):
 
         with patch.object(staff, "snapshot", return_value=members):
             self.doc.unlink()
-            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" is missing\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(standard)
             _ = self.doc.write_bytes(b"\xff")
-            with self.assertRaisesRegex(submissions.SubmissionError, r"^Cannot read the production document for builds\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" cannot be read\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(draft)
             for name in ("pending.json", "receipt.json", ".indexed", "investigation.water"):
                 self.assertEqual(list(self.root.rglob(name)), [])
@@ -2084,8 +2086,10 @@ class ReviewSubmissionTests(unittest.TestCase):
                     _ = producer_doc.write_bytes(content)
                 for payload in (standard, list_page, review):
                     with self.subTest(page=payload.page, content=content):
+                        state = "cannot be read" if content else "is missing"
                         with self.assertRaisesRegex(submissions.SubmissionError,
-                                                    r"^Cannot read the production document for producer\.$"):
+                                                    rf"^The producer production document {re.escape(str(producer_doc))}"
+                                                    + rf" {state}\. builds must fix the producer staff row\.$"):
                             _ = submissions.submit(payload)
                 self.assertEqual({path: path.read_bytes() for path in self.root.rglob("receipt.json")}, before)
                 self.assertEqual(list(self.root.rglob("pending.json")), [])
@@ -2473,3 +2477,107 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(investigation.records(OWNER), [])
         self.assertEqual(self.questions(), [])
         self.assertEqual(self.proposals(), [])
+
+
+_NATEDEV = staff.StaffRow(staff.StaffId("natedev-staff"), "showrunner", "natedev", staff.StaffRoot(),
+                         current_session=staff.StaffId("natedev-session"),
+                         doc=staff.LiveDoc(local_machine(), Path("/natedev-production.md")))
+_SDLC = replace(_NATEDEV, id=staff.StaffId("sdlc-staff"), name="sdlc", parent=staff.ReportsTo(_NATEDEV.id))
+_BUILDS = replace(_NATEDEV, id=staff.StaffId("builds-staff"), name="builds", parent=staff.ReportsTo(_NATEDEV.id))
+_AWS = staff.StaffRow(staff.StaffId("aws-staff"), "unit", "aws", staff.ReportsTo(_BUILDS.id),
+                      current_session=staff.StaffId("aws-session"), unit_type=staff.UnitDetails("direct"))
+_MORTY = staff.StaffRow(staff.StaffId("morty-staff"), "producer", "morty", staff.StaffRoot(),
+                        current_session=staff.StaffId("morty-session"))
+
+
+@final
+class PageOwnerReasonTests(unittest.TestCase):
+    """Each route to a page owner returns the sentence that says why."""
+
+    root: Path = Path()
+    natedev: staff.StaffRow = _NATEDEV
+    sdlc: staff.StaffRow = _SDLC
+    builds: staff.StaffRow = _BUILDS
+    aws: staff.StaffRow = _AWS
+    morty: staff.StaffRow = _MORTY
+    members: staff.StaffSnapshot = staff.StaffSnapshot((_NATEDEV, _SDLC, _BUILDS, _AWS, _MORTY))
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def route(self, page: str, owner: str, members: staff.StaffSnapshot) -> submissions.PageOwnerRoute:
+        config = self.root / "console.conf"
+        owner_line = f"page.{page}.owner={owner}\n" if owner else ""
+        _ = config.write_text(f"page.{page}.label={page.replace('_', ' ').title()}\n{owner_line}"
+                              + f"owner.default={self.sdlc.id}\n", encoding="utf-8")
+        route = submissions.page_owners(page, conf.read(config), members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        return route
+
+    def test_reason_names_the_owner_that_takes_the_item(self) -> None:
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+                                      ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, self.members)
+                self.assertEqual((route.row, route.reason), (owner, expected))
+        config = self.root / "console.conf"
+        _ = config.write_text(f"page.rebuilds.owner={self.natedev.id}\n", encoding="utf-8")
+        route = submissions.page_owners("rebuilds", conf.read(config), self.members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        self.assertEqual(route.reason, "(why natedev? because natedev owns the Rebuilds page!)")
+
+    def test_reason_names_the_showrunner_of_a_unit_owner(self) -> None:
+        route = self.route("aws_machines", self.aws.id, self.members)
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because aws owns the Aws Machines page"
+                                                     + " and builds is its showrunner!)"))
+        worker = staff.StaffRow(staff.StaffId("worker-staff"), "worker", "fixer", staff.ReportsTo(self.aws.id),
+                                current_session=staff.StaffId("worker-session"))
+        route = self.route("aws_machines", worker.id, replace(self.members, rows=(*self.members.rows, worker)))
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because fixer owns the Aws Machines page"
+                                                     + " and builds is the nearest showrunner above it!)"))
+
+    def test_reason_names_the_owner_that_is_not_available_and_the_parent_that_takes_the_item(self) -> None:
+        retired = replace(self.members, pending_retire=(self.builds.id,))
+        expected = "(why natedev? because builds is not available and natedev is the nearest available showrunner above it!)"
+        for page, owner in (("builds", self.builds), ("aws_machines", self.aws)):
+            with self.subTest(page=page):
+                route = self.route(page, owner.id, retired)
+                self.assertEqual((route.row, route.reason), (self.natedev, expected))
+
+    def test_reason_names_the_default_owner_when_no_owner_in_the_chain_is_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.morty.id,))
+        route = self.route("list", self.morty.id, retired)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because morty is not available and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_page_has_no_owner(self) -> None:
+        route = self.route("disks", "", self.members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because the Disks page has no owner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_the_owner_is_not_on_the_staff_list(self) -> None:
+        route = self.route("disks", "missing-staff", self.members)
+        self.assertEqual((route.row, route.reason), (
+            self.sdlc, "(why sdlc? because the Disks page owner is not on the staff list and sdlc is the default owner!)"))
+
+    def test_reason_names_the_default_owner_when_a_unit_owner_has_no_showrunner(self) -> None:
+        orphan = replace(self.aws, parent=staff.StaffRoot())
+        members = staff.StaffSnapshot((self.natedev, self.sdlc, self.builds, orphan, self.morty))
+        route = self.route("aws_machines", orphan.id, members)
+        self.assertEqual((route.row, route.reason),
+                         (self.sdlc, "(why sdlc? because aws has no showrunner and sdlc is the default owner!)"))
+
+    def test_reason_names_the_parent_of_a_default_owner_that_is_not_available(self) -> None:
+        retired = replace(self.members, pending_retire=(self.sdlc.id,))
+        route = self.route("disks", "", retired)
+        self.assertEqual((route.row, route.reason), (self.natedev, "(why natedev? because the Disks page has no owner,"
+                                                     + " the default owner sdlc is not available, and natedev"
+                                                     + " is the nearest available showrunner above it!)"))
+
+    def test_no_available_owner_has_no_route_and_no_reason(self) -> None:
+        config = self.root / "console.conf"
+        _ = config.write_text("page.disks.label=Disks\nowner.default=missing-staff\n", encoding="utf-8")
+        owners = submissions.page_owners("disks", conf.read(config), self.members)
+        self.assertEqual(owners, submissions.PageOwners(submissions.PageOwnerUnavailable(),
+                                                        submissions.PageOwnerUnavailable()))

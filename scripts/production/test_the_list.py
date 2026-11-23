@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -708,8 +709,9 @@ class TheListTests(unittest.TestCase):
                 with self.subTest(command=name):
                     self.assertEqual(self.command(name, *args, "--source", "dwight"),
                                      (1, "", f"the_list: only morty can run {name}\n"))
-            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer"),
-                             (1, "", "the_list: only morty can run answer\n"))
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
+                                          "--keeper", MORTY.id),
+                             (1, "", "the_list: only the record keeper or morty can answer\n"))
         self.assertEqual(the_list.records(MORTY.id), [item])
         self.assertEqual(self.notices, [])
 
@@ -1130,6 +1132,28 @@ class TheListTests(unittest.TestCase):
         assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, text)
         self.assertEqual(saved.unread_since, START)
+
+    def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
+        first = self.add(number=1)
+        # Only morty's folder allocates numbers, so a legacy keeper's L1 is a copy of morty's record.
+        legacy = the_list.folder(OTHER.id)
+        legacy.mkdir(parents=True)
+        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{first.id}.md", legacy / f"{first.id}.md")
+        second = the_list.load(OTHER.id, first.id)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
+            _ = the_list.ask_question(keeper, item.id,
+                                      the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        first_open = the_list.load(MORTY.id, first.id)
+        self.assertEqual(self.command("answer", second.id, "--question", "Q1", "--text", "The second check.",
+                                      "--keeper", OTHER.id),
+                         (0, f"answered {second.id} Q1\n", ""))
+        self.assertEqual(the_list.load(MORTY.id, first.id), first_open)
+        saved = the_list.load(OTHER.id, second.id)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, "The second check.")
+        self.assertEqual(saved.log[-1].source, MORTY.name)
 
     def test_close_clears_unread_and_reopen_marks_a_new_update(self) -> None:
         item = self.add()

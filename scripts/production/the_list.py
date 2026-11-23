@@ -1755,6 +1755,7 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 @dataclass(frozen=True)
 class _ListQuestionStore:
     keeper: staff.StaffId
+    source: str
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
@@ -1774,7 +1775,7 @@ class _ListQuestionStore:
         self.save_request(replace(current, questions=(*current.questions, question)), self.ask_request, question)
 
     def save_request(self, item: ListItem, request: PageRequest, question: question_record.Question) -> None:
-        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), PAGE_SOURCE)
+        receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), self.source)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
     def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
@@ -1787,7 +1788,7 @@ class _ListQuestionStore:
             questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
                               for question in current.questions)
             moment = now()
-            entry = ItemChange(moment, QuestionAnswered(question_id), "morty")
+            entry = ItemChange(moment, QuestionAnswered(question_id), self.source)
             changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
             try:
                 _save(store, changed)
@@ -1803,7 +1804,7 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    questions = _ListQuestionStore(keeper, request)
+    questions = _ListQuestionStore(keeper, PAGE_SOURCE, request)
     with store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
@@ -2042,6 +2043,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
+    _ = answer.add_argument("--keeper", type=staff.StaffId,
+                            help="the staff ID of the record keeper (defaults to your staff ID)")
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2089,6 +2092,18 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session has no staff row")
         if caller.kind != "producer":
             raise ListError("the current session must be a producer")
+        if name == "answer":
+            identity, question = cast(str, args.id), cast(str, args.question)
+            target = cast(staff.StaffId | None, args.keeper)
+            keeper = caller.id if target is None else target
+            if keeper != caller.id and caller.id != producer_id(record, "morty"):
+                raise ListError("only the record keeper or morty can answer")
+            result = page_question.answer(_ListQuestionStore(keeper, caller.name), identity, question,
+                                          cast(str, args.text))
+            if isinstance(result, page_question.AnswerRefused):
+                raise ListError(result.reason)
+            print(f"answered {identity} {question}")
+            return 0
         keeper = producer_id(record, "morty")
         assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
         if name == "list":
@@ -2124,13 +2139,6 @@ def main(argv: list[str] | None = None) -> int:
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
         if assigned_to is not AllItems.INCLUDED and name != "add":
             raise ListError(f"only morty can run {name}")
-        if name == "answer":
-            identity, question = cast(str, args.id), cast(str, args.question)
-            result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
-            if isinstance(result, page_question.AnswerRefused):
-                raise ListError(result.reason)
-            print(f"answered {identity} {question}")
-            return 0
         assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
