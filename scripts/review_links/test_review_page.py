@@ -44,8 +44,7 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
