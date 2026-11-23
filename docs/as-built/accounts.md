@@ -412,12 +412,11 @@ An owned workers refusal checks `codex_can_work` before it selects another accou
 Remaining allowance or a positive balance with credits on keeps the current account working.
 Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
 The existing login fault notice stays unchanged.
-No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`.
+No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`, except at weekly zero with credits off, where a failed move counts as no room.
 Unknown capacity cannot confirm exhaustion.
 The flag starts only on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
-The credits-off path uses the same capacity rule.
-A failed move does not start no-worker mode while another account has allowance or permitted credits.
+On the refusal path, a failed move does not start no-worker mode while another account has allowance or permitted credits. On the credits-off zero path, a failed move counts as no room and can start the mode.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.
