@@ -140,7 +140,7 @@ type DeadlineStop = AcquisitionDeadline | CheckerFailure
 type CheckDeadline = Callable[[], DeadlineStop | None]
 type AdmissionRequest = wire.AdmitRequest | wire.LaunchRequest | wire.ServiceEstimateRequest
 type AdmissionReply = wire.Admitted | wire.LaunchAdmitted | wire.Refused
-type CallReply = AdmissionReply | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply
+type CallReply = AdmissionReply | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | status_wire.PlacementStatusReply
 
 
 @dataclass
@@ -887,7 +887,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, report_refusal: bool = True,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
-          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
+          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | status_wire.PlacementStatusReply:
     def refuse(reason: str, *, checker: bool = False) -> wire.Refused:
         return _refused(reason, checker=checker) if report_refusal else wire.Refused(reason)
 
@@ -897,15 +897,13 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         if reason:
             return refuse(reason)
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
-        wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
+        wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
         limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
         launch = isinstance(request, wire.LaunchRequest)
-        deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
-                    if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
+        deadline = CLOCK.monotonic() + limit if launch and limit > 0 else float("inf")
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
@@ -977,7 +975,7 @@ class ReconnectNotice:
 
 def _reconnect_wait_reason(reply: wire.Reply) -> str:
     wait = reply.wait if isinstance(reply, wire.PlacementWait) else reply
-    if isinstance(wait, (wire.Wait, wire.RepositorySlotWaiting)):
+    if isinstance(wait, wire.Wait):
         return wait.text
     if isinstance(wait, wire.PlacementResourceWait):
         return f"waiting for {wait.resource}: {wait.reason}"
@@ -1010,11 +1008,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
 
     placement_control = _waits_for_live_service(request)
     generation_query = isinstance(request, wire.BuildHistoryRequest)
-    slot_waiting = (wire.RepositorySlotWaiting(request.repository, tuple(range(1, request.maximum + 1)),
-                    request.maximum, f"slots.{request.machine}.{request.repository}.max")
-                    if isinstance(request, wire.RepositorySlotRequest) else None)
-    bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport,
-                                        wire.RepositorySlotRequest))
+    bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport))
     if bound_outage:
         retry.start_leave_schedule(configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig)
                                    else configuration.reconnect_seconds)
@@ -1023,17 +1017,14 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
         if retry.unreachable_deadline == float("inf"):
             retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
 
-    def deadline_reply(expired: DeadlineStop = AcquisitionDeadline.LAUNCH) -> wire.Refused | wire.RepositorySlotExpired:
+    def deadline_reply(expired: DeadlineStop = AcquisitionDeadline.LAUNCH) -> wire.Refused:
         if expired is AcquisitionDeadline.UNREACHABLE:
             assert not isinstance(configuration, wire.CleanupTiming)
             raise _unreachable(configuration, holds_step=not placement_control)
-        if slot_waiting is not None:
-            return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
     last_valid = last_notice = CLOCK.monotonic()
     reconnect = ReconnectNotice()
-    showed_slot = False
     while True:
         if retry.left_queue():
             return LeftQueue()
@@ -1077,24 +1068,13 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     reply = _parse_acquisition_reply(line, request)
                     if CLOCK.monotonic() > retry.deadline:
                         return deadline_reply()
-                    rejoined = reconnect.reached(reply)
+                    _ = reconnect.reached(reply)
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
                         if generation_query or placement_control:
                             return reply
                         return refuse(reply.reason)
-                    if slot_waiting is not None:
-                        if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired)):
-                            return reply
-                        if not isinstance(reply, wire.RepositorySlotWaiting):
-                            raise CheckerFailure("invalid repository slot answer")
-                        if (reply != slot_waiting or not showed_slot) and not rejoined:
-                            print(reply.text, file=sys.stderr)
-                        slot_waiting = reply
-                        showed_slot = True
-                        last_valid = CLOCK.monotonic()
-                        continue
                     if isinstance(request, status_wire.PlacementStatusRequest):
                         if isinstance(reply, status_wire.PlacementStatusReply):
                             return reply
@@ -1584,14 +1564,6 @@ def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.PrioritySe
 def request_id() -> str:
     """Keep replay identities inside the connecting account's namespace."""
     return f"uid:{os.getuid()}:{uuid.uuid4().hex}"
-
-
-def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotReady | wire.RepositorySlotExpired | wire.Refused:
-    """Wait on the queue connection without polling the repository pool."""
-    reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
-    if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired, wire.Refused)):
-        return reply
-    return wire.Refused("left the repository slot queue")
 
 
 def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],

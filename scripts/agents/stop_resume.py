@@ -2969,7 +2969,6 @@ def _load_batch_modules() -> None:
         "scripts.production.unit_names",
         # Launches can need these modules to check the target environment.
         "scripts.lib.copy_record",
-        "scripts.lib.slot_root",
         # Automatic moves use the admission queue and verify process records.
         "scripts.build_queue.admission_client",
         "scripts.build_queue.admission_protocol",

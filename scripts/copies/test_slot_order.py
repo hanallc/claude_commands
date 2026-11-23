@@ -1,4 +1,4 @@
-"""A copy run waits for memory before it holds a repository slot."""
+"""A copy run waits for memory before it holds a numbered copy."""
 from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext
@@ -614,7 +614,6 @@ placement_once
             self.assertEqual({request.run for request in memory}, {first.run})
             preparation = [request for request in memory if request.episode == first.episode]
             self.assertEqual({request.since for request in preparation}, {first.since})
-            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in requests))
             if since_age:
                 self.assertLess(first.since, started_at - since_age / 2)
 
@@ -1022,7 +1021,6 @@ placement_once
             verify_checkout, = (folder for folder, (_, process) in running.items() if process is verify_caller)
             self.assertNotIn(verify_checkout, wrapper_folders)
             self.assertEqual(build_slots.source_checkout(verify_checkout), tools.root)
-            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in self.requests))
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)

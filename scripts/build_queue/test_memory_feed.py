@@ -43,7 +43,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import write_private_slot_roots
+from scripts.lib.build_slots_test_support import write_private_build_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -384,7 +384,7 @@ class MemoryFeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
+        write_private_build_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
@@ -2165,28 +2165,6 @@ process.stdout.write(JSON.stringify({
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 self.assertEqual(page["decoder_revision"], "after")
 
-    def test_retired_copy_wait_does_not_reach_the_queued_table(self) -> None:
-        base = captured_reading()
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
-            base.explanation.now - 60, "natedev",
-            wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-        with mock.patch.object(admission_client, "view", return_value=base):
-            before = memory_feed.reading()
-        for identity in (
-            slot.identity,
-            replace(slot.identity, step="gate", job=StepJob("test-all", unit="widget")),
-        ):
-            with self.subTest(step=identity.step):
-                reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-                    cloud_gate_stale_pushes=3, repository_slots=(replace(slot, identity=identity),))
-                with mock.patch.object(admission_client, "view", return_value=reading):
-                    after = memory_feed.reading()
-                self.assertEqual(after["waiters"], before["waiters"])
-                self.assertEqual(after["reserved"], before["reserved"])
-                self.assertEqual(after["used"], before["used"])
-                self.assertEqual(after["waiting"], before["waiting"])
-
     def test_wrapped_verify_command_names_the_first_call_in_feed_notes(self) -> None:
         verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
         cases = (
@@ -2277,15 +2255,12 @@ process.stdout.write(JSON.stringify({
     def test_a_wait_without_a_name_source_keeps_other_waits_in_order(self) -> None:
         base = with_wait_reason(captured_reading(), admission_records.NeedsMemory())
         known = replace(base.view.waiting[0], step="check")
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("", "", "", ""), known.since + 1, "fixture",
-            wire.RepositorySlotWaiting("", (1,), 1, "fixture"))
         for step, folder, names in (("", "", []), (parse.step_name(["bash", "-c", ":"]), "/", ["fixture: bash"]),
                                     ("unknown", "/", ["fixture: unknown"])):
             with self.subTest(step=step, folder=folder):
                 missing = replace(known, pid=known.pid + 1, step=step, project="", folder=folder)
                 reading = cloud_reading(replace(base, view=replace(base.view, waiting=(missing, known))))
-                with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(slot,))):
+                with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["waiters"]],
                                  [*names, "fixture: check", "route-two"])
@@ -4434,7 +4409,7 @@ class BuildsPageProofTests(unittest.TestCase):
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
-            write_private_slot_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
+            write_private_build_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
             result = subprocess.run([executable, str(proof), *mode, directory],
                 env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)

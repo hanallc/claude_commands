@@ -3214,7 +3214,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     waiting_rows: list[WaitRow | CloudWaitRow] = [
         named_wait for visible in visible_waits
         if (named_wait := (cloud_waiters.get(entry.owner) if isinstance(entry := visible.source, wire.CloudRow) else
-                           waiters.get(entry.position) if isinstance(entry, queue_view.WaitingBuild) else None)) is not None]
+                           waiters.get(entry.position))) is not None]
     unmatched_priority_text = ""
     unmatched_priority_entries: list[admission_records.PriorityEntry] = []
     queued_priority_units: list[str] = []

@@ -186,49 +186,6 @@ class AdmitRequest(CallerCode):
 
 
 @dataclass(frozen=True)
-class RepositorySlotRequest(CallerCode):
-    """Wait for one attempt to acquire a repository slot."""
-    episode: str
-    owner: Owner
-    since: float
-    repository: str
-    machine: str
-    root: str
-    maximum: int
-    deadline: float
-    identity: Identity
-
-
-@dataclass(frozen=True)
-class RepositorySlotWaiting:
-    """The repository pool has no free slot for this waiter."""
-    repository: str
-    held: tuple[int, ...]
-    maximum: int
-    maximum_key: str
-
-    @property
-    def text(self) -> str:
-        return f"waits for a free {self.repository} slot ({len(self.held)} of {self.maximum} in use)"
-
-    @property
-    def expired_text(self) -> str:
-        held = ", ".join(f"{self.repository}-slot{number}" for number in self.held) or "none"
-        return f"slots: wait ended for {self.repository}; held slots: {held}; maximum {self.maximum} ({self.maximum_key})"
-
-
-@dataclass(frozen=True)
-class RepositorySlotReady:
-    """The first waiter can attempt to acquire a repository slot."""
-
-
-@dataclass(frozen=True)
-class RepositorySlotExpired:
-    """The repository slot wait ended before capacity became available."""
-    reason: str
-
-
-@dataclass(frozen=True)
 class VerifyRunSlotRequest(CallerCode):
     """Request one slot for the lifetime of the Verify process."""
     owner: Owner
@@ -715,20 +672,19 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
+Request = (VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
            | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
+Reply = (VerifyRunSlotWaiting
          | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
 _REQUESTS: dict[str, type] = {
-    "repository_slot": RepositorySlotRequest,
     "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
@@ -741,8 +697,6 @@ _REQUESTS: dict[str, type] = {
     _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
 REPLY_TYPES: dict[str, type] = {
-    "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
-    "repository_slot_expired": RepositorySlotExpired,
     "verify_run_slot_waiting": VerifyRunSlotWaiting,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "queue_moved": QueueMoved, "queue_move_conflict": QueueMoveConflict,

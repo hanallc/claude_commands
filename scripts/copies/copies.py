@@ -80,7 +80,7 @@ ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_check
 
 @dataclass(frozen=True)
 class AdmissionSourceCopy:
-    """A temporary source copy uses the real repository's slot pool."""
+    """A temporary source copy uses the real repository's numbered copies."""
 
     tree: Path
     source: Path

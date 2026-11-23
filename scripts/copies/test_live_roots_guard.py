@@ -1,4 +1,4 @@
-"""Keep copy operations outside live slot, gate, and session roots during tests."""
+"""Keep copy operations outside live build, gate, and session roots during tests."""
 from __future__ import annotations
 
 import json
@@ -20,7 +20,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 
 def live_roots() -> tuple[Path, ...]:
     values = conf.read_or_repository("build_folders").values()
-    root_keys = ("roots.build", "roots.slots", "roots.session", "roots.workspace")
+    root_keys = ("roots.build", "roots.session", "roots.workspace")
     configured = [Path(value).expanduser() for key, value in values.items()
                   if key in root_keys
                   or key.startswith(tuple(root + "." for root in root_keys))]

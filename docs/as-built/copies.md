@@ -17,7 +17,7 @@ The repo word and unit select the parent folder under the host's build root.
 The maker takes the lowest free existing number or creates the smallest missing number.
 An identical nested committed proof can reuse its held copy.
 A run can still wait for normal build admission.
-The AWS gate uses its separate slot path.
+The AWS gate takes its assigned numbered copy under `~/build/hana/aws-hana`.
 
 The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
 The sender accepts the main checkout or a model worktree linked to it.

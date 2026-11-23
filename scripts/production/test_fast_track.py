@@ -22,8 +22,7 @@ from typing import ClassVar, Literal, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, build_slots, conf, zone
+from scripts.lib import build_folders, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -335,7 +334,6 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def pin_configuration(self) -> None:
         config = self.config.parent
-        machine = host_name()
         self.env.update(CONF_DIR=str(config), USER_ZONE="UTC")
         _ = (config / "build_folders.conf").write_text(
             f"""# whole: 1..
@@ -349,27 +347,14 @@ roots.build={self.root / 'build'}
 roots.temporary=${{TMPDIR}}/builds
 roots.scratch={self.root / 'scratch'}
 roots.copies={self.root / 'copies'}
-roots.slot_cargo={self.root / 'cargo'}
-roots.slot_cargo.{machine}={self.root / 'cargo'}
-roots.slots={self.root / 'slots'}
-roots.slots.{machine}={self.root / 'slots'}
 roots.workspace={self.root / 'workspaces'}
 roots.session={self.root / 'session'}
 patterns.tool={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
-patterns.slot={{repository}}-slot{{slot}}
 # range: 0.001..60
 locks.probe_wait_seconds=0.25
 # range: 0.001..1
 locks.probe_retry_seconds=1
-# whole: 1..
-slots.{machine}.default_max=2
-# whole: 1..
-slots.{machine}.origin.max=2
-# whole: 1..
-slots.unused_days=7
-# range: 5e-324..
-slots.wait_seconds=30
 """,
         )
         _ = write_config_fixture(Path(self.env["COPIES_CONFIG"]),
@@ -399,12 +384,6 @@ owner.verify=verify
     def build_folder_state(self, path: Path) -> Literal["held", "free"]:
         with patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
             return build_folders.build_folder_state(path)
-
-    def test_fast_track_slot_roots_are_private(self) -> None:
-        with patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
-            self.assertEqual(build_slots.configured_slot_root(), self.root.resolve() / "slots")
-            settings = conf.read_or_repository("build_folders")
-            self.assertEqual(build_slots.slot_cargo_root(settings), self.root.resolve() / "cargo")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         if process_boundary_for_case(self):

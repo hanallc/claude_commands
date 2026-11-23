@@ -183,7 +183,7 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
         data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
-                "runner": "worker", "worker": "builder", "kind": "repository-slot",
+                "runner": "worker", "worker": "builder", "kind": "build-step",
                 "title": {"unit": "builder", "step": "Compile"}, "because": "builder", "runs_on": "builder", "why": "builder"}]}
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
@@ -291,8 +291,8 @@ class MemoryHoverTests(unittest.TestCase):
                          "reason": "waits for the build in the same Cargo folder",
                          "verify": {"verb": "check", "step": "check", "position": 1, "total": 1,
                                     "call": "verify check demo"}},
-                        {"kind": "repository-slot", "name": "demo build", "unit": "builder",
-                         "since": 100, "need": 0, "reason": "waits for a free slot",
+                        {"kind": "build-step", "name": "demo build", "unit": "builder",
+                         "since": 100, "need": 0, "reason": "waits for memory",
                          "verify": {"verb": "build", "step": "build", "position": 1, "total": 1,
                                     "call": "verify build demo"}}]}
         rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
@@ -329,7 +329,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_cargo_and_gate_tooltips_show_a_call_without_verify(self) -> None:
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
                           "reserved": 0, "call": "cargo nextest run -p demo"}],
-                "waiters": [{"kind": "repository-slot", "name": "demo test all", "need": 0,
+                "waiters": [{"kind": "build-step", "name": "demo test all", "need": 0,
                              "call": "gate.py --tests-only"}]}
         for key, call in (("row:fixture-run-0", "cargo nextest run -p demo"),
                           ("wait:fixture-wait-0", "gate.py --tests-only")):
@@ -1312,7 +1312,7 @@ function fitLabels() {}
         about = "Runs every test module"
         because = "Held by builder"
         data = {"waiters": [{"name": "Compile", "unit": "", "about": about, "runs_on": "Mac",
-            "kind": "repository-slot", "because": because, "because_parts": [
+            "kind": "build-step", "because": because, "because_parts": [
                 {"kind": "text", "text": "Held by "}, {"kind": "staff", "text": "builder"}]}]}
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))

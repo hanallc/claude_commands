@@ -46,22 +46,6 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
 
 
 class RecordedOwnerQueueTests(unittest.TestCase):
-    def test_repository_slot_wait_is_shown_without_a_memory_need(self) -> None:
-        with QueueFixture() as fixture:
-            model = queue_model(fixture)
-            base = model.reading
-            slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-                wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
-                base.explanation.now - 60, "natedev",
-                wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-            reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-                cloud_gate_stale_pushes=3, repository_slots=(slot,))
-            model = replace(model, reading=reading)
-            self.assertEqual(reading.explanation.totals, base.explanation.totals)
-            self.assertEqual(reading.explanation.room, base.explanation.room)
-            self.assertIn(slot, queue_view.waiting_builds(model))
-
-
     def test_detached_and_systemd_rows_resolve_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
         from scripts.production import staff
