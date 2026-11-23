@@ -1349,7 +1349,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+ const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() :
   banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
  row.style.scrollMarginTop=(inset+16)+'px';
  if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});

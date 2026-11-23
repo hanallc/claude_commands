@@ -21,7 +21,7 @@ QUESTION_WAITING = "The {owner_role} will answer this"
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
-HEADING_ACTIONS = '<div class="page-heading-actions">'
+HEADING_ACTIONS = '<div class="page-heading-actions" data-page-actions>'
 
 
 class OwnerNewItem(StrEnum):
@@ -35,9 +35,21 @@ class NoShownOwner:
     """There is no staff name to show in the page heading."""
 
 
+RESERVED_PAGE_ACTIONS = frozenset(("new-item", "owner"))
+
+
+def page_action_button(action: str, icon: str, label: str, dialog_id: str) -> str:
+    """Render one page action button. The frame opens its dialog when the button is pressed."""
+    if action in RESERVED_PAGE_ACTIONS:
+        raise ValueError(f"reserved page action: {action}")
+    action, label, dialog_id = (html.escape(value, quote=True) for value in (action, label, dialog_id))
+    return (f'<button type="button" class="page-action" data-page-action="{action}" aria-label="{label}" '
+            + f'title="{label}" aria-haspopup="dialog" aria-controls="{dialog_id}">' + icon_svg(icon) + '</button>')
+
+
 def owner_control(page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot, *,
-                  recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> str:
-    """Render the owner name and its New item button."""
+                  recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER, actions: tuple[str, ...] = ()) -> str:
+    """Render the owner name, the page action buttons and the New item button for the page action area."""
     from scripts.review_links import staff_names
 
     name = ""
@@ -54,29 +66,32 @@ def owner_control(page: str, owner: staff.StaffRow | NoShownOwner, members: staf
         label = html.escape(label, quote=True)
         button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
                   + icon_svg("message-circle-question") + '</button>')
-    return f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>'
+    return f'<div class="page-owner" data-page-owner="{page}">' + name + "".join(actions) + button + '</div>'
 
 
 def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
                dialog: Callable[[], str], *,
-               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER, actions: tuple[str, ...] = ()) -> bytes:
     """Add the shared owner control to one served console document."""
     main = re.search(rb"<main(?=[\s>])[^>]*>", content)
     if main is None or b'data-page-owner="' in content:
         return content
-    control = owner_control(page, owner, members, recipient=recipient).encode()
-    actions = HEADING_ACTIONS.encode()
+    control = owner_control(page, owner, members, recipient=recipient, actions=actions).encode()
+    # The action area comes just before the heading row. Only the area stays in view; the title scrolls.
+    # The script at the end of the row places the area before the browser shows the content after it.
+    area = HEADING_ACTIONS.encode() + control + b'</div>'
     heading = TITLE_ELEMENT.search(content, main.end())
     if heading is not None:
-        row = b'<div class="page-heading">' + heading[0] + actions + control + b'</div></div>'
+        row = area + b'<div class="page-heading">' + heading[0] + HEADING_MEASURE.encode() + b'</div>'
         content = content[:heading.start()] + row + content[heading.end():]
     else:
-        content = content[:main.end()] + actions + control + b'</div>' + content[main.end():]
+        row = area + b'<div class="page-heading">' + HEADING_MEASURE.encode() + b'</div>'
+        content = content[:main.end()] + row + content[main.end():]
     head = re.search(rb"<head(?=[\s>])[^>]*>", content)
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
     row_style = HEADING_STYLE.encode()
-    style = (OWNER_STYLE + HEADING_POSITION).encode()
+    style = (OWNER_STYLE + ACTIONS_SCRIPT).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
@@ -90,67 +105,196 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     return content
 
 
-HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
+HEADING_MEASURE = '<script>window.measurePageActions?.();</script>'
+# Without the script, the area takes its height above the title, so the title never goes under the controls.
+# When the full title and the controls fit on one line, the script puts the controls beside the title.
+HEADING_STYLE = ('.page-heading{box-sizing:border-box;display:flex;align-items:center;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
-                 + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
-                 + 'max-width:100%;margin-inline-start:auto}')
+                 + '[data-page-actions-beside]+.page-heading{min-height:var(--page-actions-height,0px);'
+                 + 'padding-inline-end:var(--page-actions-reserve,0px)}')
 
 
 # The stacking order, lowest to highest: page content with its own sticky bars (z-index 3 or lower),
-# the heading row (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
+# the action area (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
 # and the sticky status line (20).
+# Beside the title, the action area has no height, so it takes no layout space.
+# Its controls overflow it at the top right, and the heading row keeps space for them.
+# Only the area sticks; the title scrolls with the page.
+# A copy of the area shows in each open page window. The window rule in ACTIONS_SCRIPT adds and removes it.
 OWNER_STYLE = """<style>
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card,#1a1a19);color:var(--ink-2,#c3c2b7);border:1px solid var(--line,#34332f);border-radius:8px;cursor:pointer}
 .page-owner svg{width:18px;height:18px}
-:root{--page-heading-space:8px;--page-heading-top:var(--page-heading-space)}
-:is(.page-heading,main>.page-heading-actions){position:sticky;top:var(--page-heading-space);z-index:4;
-background:var(--bg,Canvas)}
-:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]{box-shadow:0 1px 0 var(--line)}
-:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]::before{content:'';position:absolute;
-inset:auto 0 100%;height:var(--page-heading-space);background:inherit}
+:root{--page-actions-space:8px;--page-actions-height:36px}
+[data-page-actions]{position:sticky;top:var(--page-actions-space);z-index:4;flex:0 0 100%;display:flex;
+justify-content:flex-end;align-items:flex-start;gap:8px;max-width:100%;margin-bottom:8px;color:var(--ink,CanvasText)}
+[data-page-actions][data-page-actions-beside]{height:0;margin-bottom:0}
+[data-page-actions]>*{background:var(--bg,Canvas);box-shadow:0 0 0 4px var(--bg,Canvas)}
+[data-page-window-actions]{position:fixed;margin:0;pointer-events:none}
+[data-page-window-actions]>*{background:none;box-shadow:none;pointer-events:auto}
 </style>"""
 
 
-# The heading row sticks with a space above it. At scroll zero it stays in its normal place.
-# A stuck row shows an opaque band in the space and a line under it. Neither takes layout space.
-# A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
-HEADING_POSITION = """<script>
+# The script sets the sizes that the heading row and other sticky parts use.
+# A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
+# The window rule: while a page window (a modal dialog) is open, the rest of the page is inert.
+# Thus each open window gets a copy of the action area at the same place, above the window.
+# The window keeps the copy until it closes. --page-window-top tells windows where to start below it.
+# A screenshot address names the open window, so the capture shows the page as the user sees it.
+ACTIONS_SCRIPT = """<script>
 function stickyPageStatusHeight(){
  const banner=document.querySelector('[data-page-status]');
  return banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
 }
-function pageHeadingSpace(){
- return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+function pageActionsSpace(){
+ return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
 }
-function stuckPageHeadingBottom(){
- const row=document.querySelector('.page-heading,main>.page-heading-actions');
- return pageHeadingSpace()+row.getBoundingClientRect().height+stickyPageStatusHeight();
+function pageActionsArea(){
+ return document.querySelector('[data-page-actions]:not([data-page-window-actions])');
 }
-document.addEventListener('DOMContentLoaded',()=>{
- const root=document.documentElement.style;
- const row=document.querySelector('.page-heading,main>.page-heading-actions');
- const banner=document.querySelector('[data-page-status]');
- const set=(name,pixels)=>{if(root.getPropertyValue(name)!==pixels+'px') root.setProperty(name,pixels+'px');};
- // The row is stuck when its sticky top clips it.
- new IntersectionObserver(entries=>row.toggleAttribute('data-page-heading-stuck',entries.at(-1).intersectionRatio<1),
-  {root:document,rootMargin:-(pageHeadingSpace()+1)+'px 0px 0px 0px',threshold:1}).observe(row);
- const place=()=>{
-  set('--page-status-height',stickyPageStatusHeight());
-  set('--page-heading-height',row.getBoundingClientRect().height);
- };
- const resize=new ResizeObserver(place);
- resize.observe(row);
- if(banner){
-  resize.observe(banner);
-  // The clock writes the same state each second; only a new state can change the position.
-  new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) place();})
-   .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
+// The area has no height; this box holds the controls that overflow it.
+function pageActionsBox(area=pageActionsArea()){
+ const home=area.getBoundingClientRect();
+ let left=home.right,bottom=home.top;
+ for(const control of area.children){
+  const box=control.getBoundingClientRect();
+  left=Math.min(left,box.left);bottom=Math.max(bottom,box.bottom);
  }
- place();
-},{once:true});
+ return {top:home.top,left,right:home.right,bottom,width:home.right-left,height:bottom-home.top};
+}
+function stuckPageActionsBottom(){
+ const area=pageActionsArea();
+ return area ? pageActionsSpace()+pageActionsBox(area).height+stickyPageStatusHeight() : stickyPageStatusHeight();
+}
+// The full title and the controls must fit on one line, or the controls stay above the title.
+function measurePageActions(){
+ const root=document.documentElement, home=pageActionsArea();
+ if(!home) return;
+ const row=home.nextElementSibling, title=row?.querySelector(':scope>h1');
+ const set=(name,pixels)=>{if(root.style.getPropertyValue(name)!==pixels+'px') root.style.setProperty(name,pixels+'px');};
+ const box=pageActionsBox(home);
+ let beside=box.width>0;
+ if(title && beside){
+  const style=title.getAttribute('style');
+  title.style.cssText+=';flex:none;width:max-content';
+  beside=title.getBoundingClientRect().width+box.width+12<=row.clientWidth;
+  if(style===null) title.removeAttribute('style'); else title.setAttribute('style',style);
+ }
+ if(home.hasAttribute('data-page-actions-beside')!==beside) home.toggleAttribute('data-page-actions-beside',beside);
+ set('--page-status-height',stickyPageStatusHeight());
+ set('--page-actions-height',box.height);
+ set('--page-actions-reserve',beside ? box.width+12 : 0);
+}
+(()=>{
+ const root=document.documentElement, windows=[];
+ let clicked=null, reopen='', reopenClick=null;
+ // Remove the window name from the address before the page reads it.
+ const named=location.hash.match(/(?:^#|&)console-window=([^&]*)/);
+ if(named){
+  try{reopen=decodeURIComponent(named[1]);}catch(_){}
+  const hash=location.hash.replace(named[0],named[0].startsWith('#') ? '#' : '').replace(/^#&/,'#');
+  history.replaceState(history.state,'',location.pathname+location.search+(hash==='#' ? '' : hash));
+ }
+ document.addEventListener('click',event=>{
+  clicked=event.target instanceof Element ? event.target : null;
+  setTimeout(()=>{clicked=null;});
+ },true);
+ // A link that opens no window must not move the page.
+ addEventListener('click',event=>{if(event===reopenClick) event.preventDefault();});
+ // A page action button opens its dialog. When the dialog closes, focus goes back to the button.
+ // A press on the copy inside the open dialog moves the focus to the first control of the dialog.
+ document.addEventListener('click',event=>{
+  const button=event.target instanceof Element ? event.target.closest('[data-page-action]') : null;
+  const dialog=button && document.getElementById(button.getAttribute('aria-controls'));
+  if(!(dialog instanceof HTMLDialogElement)) return;
+  if(dialog.open){
+   const controls=dialog.querySelectorAll('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])');
+   const first=[...controls].find(control=>!control.closest('[data-page-window-actions]') && !control.disabled);
+   (first ?? dialog).focus({preventScroll:true});
+   return;
+  }
+  bindConsoleDialog(dialog,()=>dialog.close());
+  dialog.addEventListener('close',()=>button.focus({preventScroll:true}),{once:true});
+  dialog.showModal();
+ });
+ function place(){
+  if(!windows.length) return;
+  const home=pageActionsArea();
+  if(!home) return;
+  const box=home.getBoundingClientRect();
+  for(const {copy} of windows) Object.assign(copy.style,{top:box.top+'px',left:box.left+'px',width:box.width+'px'});
+  root.style.setProperty('--page-window-top',pageActionsBox(home).bottom+pageActionsSpace()+'px');
+ }
+ document.addEventListener('beforetoggle',event=>{
+  const dialog=event.target, home=pageActionsArea();
+  if(!(dialog instanceof HTMLDialogElement) || !home) return;
+  const index=windows.findIndex(entry=>entry.dialog===dialog);
+  if(event.newState==='open'){
+   if(index>=0) return;
+   const copy=home.cloneNode(true);
+   copy.toggleAttribute('data-page-window-actions',true);
+   copy.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
+   // The control that opened the window names it in a screenshot address.
+   const launcher=clicked?.closest('[data-window-place],a[href]');
+   windows.push({dialog,copy,place:launcher ? launcher.dataset.windowPlace ?? launcher.getAttribute('href') : ''});
+   // The copy comes last, so the window keeps its own first focus.
+   dialog.append(copy);
+   place();
+  }else if(index>=0){
+   windows.splice(index,1)[0].copy.remove();
+   if(windows.length) place();
+   else root.style.removeProperty('--page-window-top');
+  }
+ },true);
+ addEventListener('resize',place);
+ addEventListener('scroll',place,{passive:true});
+ window.pageCapturePlace=(except)=>{
+  const address=location.pathname+location.search+location.hash;
+  const shown=windows.filter(entry=>entry.dialog!==except && entry.dialog.open).at(-1)?.place;
+  return shown ? address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(shown) : address;
+ };
+ function openNamed(){
+  if(!reopen) return true;
+  let launcher=null;
+  try{
+   launcher=document.querySelector('[data-window-place="'+CSS.escape(reopen)+'"]')
+    || document.querySelector('a[href="'+CSS.escape(reopen)+'"]');
+  }catch(_){reopen='';return true;}
+  if(!launcher) return false;
+  reopen='';
+  reopenClick=new MouseEvent('click',{bubbles:true,cancelable:true,button:0,view:window});
+  launcher.dispatchEvent(reopenClick);
+  reopenClick=null;
+  return true;
+ }
+ if(reopen){
+  // The page can add its controls after it loads its data. The screenshot waits only for the load event.
+  const watch=new MutationObserver(()=>{if(openNamed()) watch.disconnect();});
+  document.addEventListener('DOMContentLoaded',()=>{
+   if(!openNamed()) watch.observe(root,{childList:true,subtree:true});
+  },{once:true});
+  addEventListener('load',()=>{openNamed();watch.disconnect();reopen='';},{once:true});
+ }
+ document.addEventListener('DOMContentLoaded',()=>{
+  const home=pageActionsArea(), banner=document.querySelector('[data-page-status]');
+  if(!home) return;
+  const row=home.nextElementSibling, title=row?.querySelector(':scope>h1');
+  const measure=()=>{measurePageActions();place();};
+  const resize=new ResizeObserver(measure);
+  resize.observe(home);
+  for(const control of home.children) resize.observe(control);
+  if(title){resize.observe(row);resize.observe(title);}
+  if(banner){
+   resize.observe(banner);
+   // The clock writes the same state each second; only a new state can change the position.
+   new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) measure();})
+    .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
+  }
+  measure();
+ },{once:true});
+})();
 </script>"""
 
 
@@ -376,12 +520,13 @@ inset 0 0 0 100vmax light-dark(rgb(0 0 0 / 32%),rgb(0 0 0 / 64%))}
 
 # The title, status and content share one centered column and page background.
 # A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
+# The heading row with its title also sets the column, so the action area script measures the final width.
 # A page that measures its layout uses the desktop gutter.
 STYLE = (BUTTON_STATES
          + ':root{scrollbar-gutter:stable}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
-         + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
+         + 'main:has(>.page-status,>.page-heading>h1):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
          + HEADING_STYLE
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
@@ -398,7 +543,7 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .page-status[data-state=Failed] .page-status-state{color:var(--error)}
 .page-status[data-state=Paused] .page-status-state{color:var(--ink-3)}
 .page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;z-index:20;padding:4px 0;
-top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px))}
+top:calc(var(--page-actions-space,0px) + var(--page-actions-height,0px))}
 .page-status-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
@@ -441,8 +586,8 @@ def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
 
 CONSOLE_DIALOG_STYLE = '''
 [data-console-dialog] {
- position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
- width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
+ position: fixed; inset: var(--page-window-top, 0px) 0 0; box-sizing: border-box; margin: auto; padding: 0;
+ width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px - var(--page-window-top, 0px));
  color: var(--ink, #f0efec); background: var(--card, #1a1a19); border: 1px solid var(--line, #34332f);
  border-radius: 12px; box-shadow: 0 20px 60px #0006; overflow: hidden;
  font: 15px/1.45 system-ui, sans-serif;
@@ -451,7 +596,7 @@ CONSOLE_DIALOG_STYLE = '''
 [data-console-dialog] [hidden] { display: none; }
 [data-console-dialog]::backdrop { background: #0009; }
 .console-dialog-frame { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; margin: 0;
- max-height: calc(100dvh - 34px); }
+ max-height: calc(100dvh - 34px - var(--page-window-top, 0px)); }
 .console-dialog-frame > :is(header, footer) { padding-inline: 24px; }
 .console-dialog-frame > header {
  display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-block: 20px 16px;
@@ -474,7 +619,10 @@ CONSOLE_DIALOG_STYLE = '''
 
 
 CONSOLE_DIALOG_SCRIPT = '''
+// A dialog takes one binding. A second call for the same dialog does nothing.
 function bindConsoleDialog(dialog,close){
+ if(dialog.dataset.consoleDialogBound) return;
+ dialog.dataset.consoleDialogBound='true';
  dialog.querySelector('[data-close]').addEventListener('click',()=>close());
  dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
  let pressedBackdrop=false;
@@ -576,10 +724,12 @@ ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
 [data-image-zoom]{cursor:zoom-in}
 [data-image-zoom-dialog]{position:fixed;inset:0;box-sizing:border-box;width:100vw;height:100dvh;
-max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;outline:none;overflow:hidden}
+max-width:none;max-height:none;margin:0;padding:var(--page-window-top,16px) 16px 16px;border:0;background:#000d;
+outline:none;overflow:hidden}
 [data-image-zoom-dialog][open]{display:grid;place-items:center}
 [data-image-zoom-dialog]::backdrop{background:transparent}
-[data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100dvh - 32px);
+[data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;
+max-height:calc(100dvh - 16px - var(--page-window-top,16px));
 border:0;border-radius:0;cursor:zoom-out}
 '''
 

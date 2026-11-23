@@ -44,7 +44,7 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.probe_test_support import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
@@ -5593,6 +5593,39 @@ window.fetch=async(url)=>{
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]])
 
+    def test_new_item_opens_above_the_record_window_and_its_screenshot_shows_the_window(self) -> None:
+        from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest('Chrome or Firefox is required for the window rule.')
+        owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
+        markup = page_frame.with_owner(browser_markup(self.root).encode(), 'review', owner,
+                                       staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const dialog=document.querySelector('#record-item-dialog'),row=document.querySelector('[data-list-item]');
+  row.querySelector('.list-toggle').click();
+  await until(()=>dialog.open,'the record window');
+  await painted();
+  check(onTop(dialog.querySelector('[data-close]')),'The action area does not cover the record window Close button.');
+  check(dialog.getBoundingClientRect().top>=actionsBottom(),'The record window starts below the action area.');
+  check(pressNewItem('over the record window')!==null,'The press reaches New item.');
+  const capture=await newItemOver(dialog,'the record window');
+  check(new URLSearchParams(capture.place.split('#')[1] || '').get('item')===row.dataset.key,
+   'The screenshot address names the open item: '+capture.place);
+  await closeNewItem(dialog,'the record window');
+  await opensAgain(capture.place,doc=>doc.querySelector('#record-item-dialog')?.open===true,'the record window');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = markup.replace(b'</body>', b'<script>' + (WINDOW_PROBE + probe).encode() + b'</script></body>', 1)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({review_page.PAGE_PATH: page}, review_page.PAGE_PATH, browser), [[]])
+
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_owner_button_is_the_only_title_action(self) -> None:
         owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
@@ -5603,6 +5636,7 @@ window.fetch=async(url)=>{
  const failures=[];
  try{
   const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const actions=document.querySelector('[data-page-actions]');
   const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
@@ -5612,10 +5646,11 @@ window.fetch=async(url)=>{
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
    const atRight=Math.abs(o.right-r.right)<=1;
-   if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
+   if(innerWidth!==width || row.querySelector('button') || actions.querySelectorAll('button').length!==1 ||
+      !actions.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
       n.left<r.left-1 || !atRight ||
-      (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
+      (beside ? n.left<t.right+4 : width===1280 || o.bottom+4>t.top)){
     failures.push('The owner button is the only title action and fits at '+width+' px.');
    }
    if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){

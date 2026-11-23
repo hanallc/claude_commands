@@ -184,26 +184,58 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
-The heading row holds the page title, the heading actions, the owner name and the New item button.
-On a page without a title, the actions wrapper holds the owner controls.
-The row is sticky near the top of the page, with an opaque page background, and content scrolls under it.
-A stuck row has an 8 px space (`--page-heading-space`) above it, so the title does not touch the top edge.
-An opaque band in the page background fills that space, and content does not show in it.
-While the row is stuck, a thin `--line` box shadow shows under it.
-The band and the line take no layout space, and neither shows at scroll zero.
-A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
+Each page has one action area at the top right: `<div class="page-heading-actions" data-page-actions>`.
+The area holds the owner name and the New item button, which is last.
+The heading row (`.page-heading`) holds the page title and follows the area.
+On a page without a title, the heading row is empty.
+Only the action area is sticky. The title scrolls with the page.
+The area sticks 8 px (`--page-actions-space`) below the top edge.
+Without the script, the area takes its height above the title, so the title never goes under the controls.
+A script at the end of the heading row measures the row before the browser reads the content after it.
+When the full title and the controls fit on one line, the script puts the controls beside the title.
+Then the area has no height (`data-page-actions-beside`), and the heading row keeps space for the controls.
+The script sets `--page-actions-height` and `--page-actions-reserve` from the size of the controls.
+The owner group in the area has one opaque page background with a 4 px edge, and content scrolls under it.
+A page can add action buttons between the owner name and New item.
+`page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
+`owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.
+A press on a page action button opens its dialog with `showModal()` and binds it with `bindConsoleDialog`.
+`bindConsoleDialog` binds each dialog one time. A second call for the same dialog does nothing.
+When the dialog closes, focus goes back to the button that opened it, and the page does not scroll.
+A press on the copy of the button inside its own open dialog moves the focus to the first control of the dialog.
+A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
 Nothing steps while the page scrolls: each part moves by at most the scroll distance.
-The status line never covers the owner name or button, and the row never covers the status line.
-Scrolling never changes the layout of the content, and at scroll zero the row stays in its normal place.
-On a narrow page the row can wrap to more lines.
-The AWS region filter sticks directly below the heading row and any sticky status line.
-The Images group index sticks 16 px below the heading row and any sticky status line.
+The status line never covers the owner name or button, and the area never covers the status line.
+Scrolling never changes the layout of the content, and at scroll zero the area stays in its normal place.
+The AWS region filter sticks directly below the action area and any sticky status line.
+The Images group index sticks 16 px below the action area and any sticky status line.
 The stacking order, from lowest to highest, is as follows:
 1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
-2. The heading row (z-index 4).
+2. The action area (z-index 4).
 3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
 4. The sticky Late or Failed status line (z-index 20).
-An item jump places the focused row below the heading row and the status line.
+An item jump places the focused row below the action area and the status line.
+The window rule in `page_frame.py` keeps New item available while a page window is open.
+A page window is a `<dialog>` that a page opens with `showModal()`.
+These are the windows:
+1. The picture zoom window in `page_frame.py`.
+2. The New item window in `new_item_dialog.py`.
+3. The List review box in `list_page.py`.
+4. The record window of the shared record table in `record_table.py`.
+5. The Accounts color picker in `accounts_page.py`.
+A modal dialog makes the rest of the page inert, and a popover shown after it is also inert.
+Thus the frame adds a copy of the action area to each window when the window starts to open (`beforetoggle`).
+The copy is the last child of the window, at the same place as the area, and the window removes it when it closes.
+The copy has the same labels as the area. It has no `id` attributes.
+The controls in the copy have no plate and no edge, so each part of the copy that shows is a control.
+The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
+Each window starts below the area: the frame sets `--page-window-top` while a window is open.
+The keyboard reaches the copy in the window: press Tab after the last control of the window.
+Escape, the backdrop and the focus return of each window do not change.
+New item opened over another window opens above it.
+When New item closes, the window under it stays open, and focus goes back to the New item button in that window.
+A press on the New item button in the copy inside the New item window moves focus to the words box.
+In the Saved state the words box is hidden, so the press moves focus to **Done**.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
@@ -647,6 +679,12 @@ If a named local document cannot be read, Send reports the reason and leaves the
 Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
+The screenshot shows the page as the user sees it, with the window under New item open.
+`window.pageCapturePlace()` adds `console-window=NAME` to the address for the top open window.
+NAME is the `data-window-place` value or the `href` of the control that opened the window.
+When the page loads, the frame removes the parameter from the address and clicks that control again.
+A link that the frame clicks again does not move the page.
+The record window keeps its own place in the address (`item=`).
 The dialog keeps **Send** available while it takes the screenshot.
 Send uses page data if the preview is still pending.
 Send saves the capture intent with the native item and links the List draft to it.
@@ -1266,8 +1304,9 @@ A Validating card lets the user ask the validator a question.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
-The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
-On a desktop, the List centers the dialog horizontally, 16 px from the top.
+At the console's phone breakpoint, the dialog fills the screen below the action area, including on the direct List page.
+On a desktop, the List centers the dialog horizontally. Its top is at `--page-window-top`, 8 px below the action area.
+When no action area is set, the top is 16 px.
 The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
@@ -1651,7 +1690,8 @@ Each card shows, in this order:
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
-It fits the view with a 16px margin and never exceeds the image's natural size.
+It fits the view below the action area and never exceeds the image's natural size.
+Its top margin is `--page-window-top`, 8 px below the action area, and the other margins are 16 px.
 Escape or a click on the backdrop or image closes it.
 The page keeps its scroll position and returns focus to the image link.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
