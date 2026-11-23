@@ -70,11 +70,12 @@ An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Wi
 Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
-Each producer names its one top priority item with `the_list.py top-priority --id L<n>`, and nate changes it on the Studio page when it is not correct.
-Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-A producer other than morty asks morty to add, close, park, or assign its items.
-It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
+Name your top priority item with `the_list.py top-priority --id L<n>`.
+Nate can change the top priority item on the Studio page.
+Add your own items with `the_list.py add`. Park or close your own item only on nate's word, and quote his words in `--source`. Ask morty only to assign an item to a different producer.
+Ask morty to record updates and decisions that you cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.

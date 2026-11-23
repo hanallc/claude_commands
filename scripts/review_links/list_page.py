@@ -1188,8 +1188,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         else:
             counts = counts_strip(members, names)
     producer_control = view.producer(members, producers)
+    action_path = f' data-list-path="{view.path}"' if view.path != PAGE_PATH else ''
     content = (STYLE + view.style + page_frame.title(view.title, "list")
-               + f'<div data-list data-list-path="{view.path}" data-refresh-seconds="{seconds}"'
+               + f'<div data-list{action_path} data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
@@ -1345,6 +1346,7 @@ const chipFor=data=>{
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
+const actionPath=content.dataset.listPath || location.pathname;
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
 function listRequestSignal(){
@@ -1721,7 +1723,7 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(content.dataset.listPath,{method:'POST',body:data});
+    const response=await fetch(actionPath,{method:'POST',body:data});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1805,7 +1807,7 @@ function bindFeedbackForm(form){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
       if(parks) query.set('park-request',attempt.request);
-      const response=await fetch(content.dataset.listPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+      const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
      }catch(_){}
