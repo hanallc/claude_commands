@@ -289,6 +289,12 @@ Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
 Unavailable remote identity remains uncertain.
 Remote memory remains unavailable and contributes zero to local admission accounting.
+A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
+A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
+The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
+A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
+The page (`guestRow` in `memory_live.html`) shows both in the running table.
+The target cell of an unconfirmed row shows `mac-linux (not confirmed)`, and its hover shows `Guest attempt  not confirmed`.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.

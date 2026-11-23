@@ -637,6 +637,53 @@ class MemoryFeedTests(unittest.TestCase):
             + '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
             + '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
 
+    def test_consumed_unconfirmed_guest_gate_shows_one_mac_linux_row(self) -> None:
+        base = captured_reading()
+        now = base.explanation.now
+        consumed = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, assignment_host="linux-guest",
+            assignment_target="mac-linux", job=StepJob("gate"),
+            execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        # Before the consume, the queue has no start time and the gate starts nothing on the guest.
+        available = replace(consumed, session_id="available-session", started_at=0.0)
+        native = GatePlacementStep("mac-session", "fixture mac gate", "gate", "/Mac/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8300, started_at=now - 20, assignment_host="mac", mac_placement="episode/native-attempt",
+            job=StepJob("gate"))
+        running = (consumed, available, native)
+        explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+            0, 0, 0, owner=str(index)) for index, step in enumerate(running))
+        reading = replace(base, view=replace(base.view, running=running),
+                          explanation=replace(base.explanation, running=explained))
+        build = queue_view.MacBuild(8302, native.folder, native.started_at, "merge gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=native.mac_placement)
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (build,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            page = memory_feed.reading()
+        remote = [row for row in page["walk"] if row.get("keep_text") == "remote memory is unavailable"]
+        guest = next(row for row in remote if row["started_at"] == consumed.started_at)
+        self.assertEqual((guest.get("machine"), guest.get("guest_unconfirmed")), ("mac-linux", True))
+        self.assertNotIn("guest_run", guest)
+        waiting = next(row for row in remote if row["started_at"] == 0)
+        self.assertEqual(waiting.get("machine"), "linux-guest")
+        self.assertNotIn("guest_unconfirmed", waiting)
+        host_row = next(row for row in remote if row["pid"] == native.pid)
+        mac_row = next(row for row in page["walk"] if row["pid"] == build.pid)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        counts = {name: table.count(f'data-tip="row:{row.get("key")}" tabindex="0"')
+                  for name, row in (("guest", guest), ("waiting", waiting), ("host", host_row), ("mac", mac_row))}
+        # The Mac host run shows once, as its Mac build row; the guest run shows once, as its queue row.
+        self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
+        self.assertIn('<strong class="machine" data-machine="mac-linux">mac-linux (not confirmed)</strong>', table)
+        text = "\n".join(tips["walk"][page["walk"].index(guest)])
+        self.assertIn("Runs on  mac-linux", text)
+        self.assertIn("Guest attempt  not confirmed", text)
+        self.assertNotIn("unavailable", text.splitlines()[0])
+
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
