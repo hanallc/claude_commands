@@ -10,7 +10,7 @@
 # On Linux, the verbs share a run identity. The first failure ends the list.
 #
 # Commands:
-#   check [<package>]      check workspace libraries and binaries
+#   check [<package>]      check every workspace target, test code included
 #   test [<package>]       run package tests; try the Mac, else natedev
 #   lint [<package>]       repair and format code; check TOML and run Clippy
 #   doc [<package>]        document the staged workspace; deny warnings
@@ -39,7 +39,8 @@
 # Help check:
 # Usage: verify check [<package>] [--keep-going] [--features <list>]
 #
-# Check workspace libraries and binaries without producing executables.
+# Check every workspace target without producing executables: libraries,
+# binaries, tests, examples and benches.
 # A named package must exist. Cargo resolves features for the whole workspace.
 # --keep-going continues after a crate fails.
 # Names without a slash in --features belong to the named package.
@@ -543,7 +544,28 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
+# A fresh index reads the working files without flags from the real index.
+prepared_copy_matches_index() (
+    local repo=$1 expected=${2:-} indexed working git_dir temporary
+    indexed=$(git -C "$repo" write-tree) || return
+    [[ -z "$expected" || "$indexed" == "$expected" ]] || return 1
+    git_dir=$(git -C "$repo" rev-parse --absolute-git-dir) || return
+    temporary=$(mktemp -d "$git_dir/verify-index.XXXXXX") || return
+    trap 'rm -f -- "$temporary/index" "$temporary/index.lock"; rmdir -- "$temporary"' EXIT
+    export GIT_INDEX_FILE="$temporary/index"
+    local -a index_git=(git -C "$repo" -c core.sparseCheckout=false -c core.splitIndex=false)
+    "${index_git[@]}" read-tree "$indexed" || return
+    "${index_git[@]}" add -A -- . || return
+    working=$("${index_git[@]}" write-tree) || return
+    [[ "$working" == "$indexed" ]]
+)
+
 VERIFY_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" ]] &&
+        ! prepared_copy_matches_index "$VERIFY_REPO_ROOT" 2>/dev/null; then
+    printf '%s\n' 'verify.sh: the prepared copy has edits outside the index. Stage or commit them first.' >&2
+    exit 2
+fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
     exit 2
@@ -595,6 +617,19 @@ fi
 collect_child() {
     kill -s "$2" "$1" 2>/dev/null || return 0
     wait "$1" 2>/dev/null || true
+}
+
+# Remove the tool folder $2 with build_folders.py remove. An empty $2 does nothing.
+# $1 names the removal in the line that a failure prints.
+# Status 1 means that another process holds the lock. The folder stays for collection.
+# Status 2 means that build_folders.py printed its error. Neither status prints a line here.
+# A higher status prints one line. Return 0, so the step status stays the exit status of the call.
+remove_tool_folder() {
+    local what=$1 folder=$2 status=0
+    [[ -n "$folder" ]] || return 0
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || status=$?
+    (( status <= 2 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
+    return 0
 }
 
 # shellcheck disable=SC2329 # The EXIT trap calls this function.
@@ -652,12 +687,11 @@ verify_helper() {
         return 0
     fi
     (
-    if [[ "${1:-}" == --stdin ]]; then
-        shift
-        set -- 1 "$@"
-    else
-        set -- 0 "$@"
-    fi
+    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+    case "${1:-}" in
+        --stdin|--require-helper) ;;
+        *) set -- --normal "$@" ;;
+    esac
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
         if [[ "$2" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$2" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
             export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
@@ -679,10 +713,10 @@ verify_helper() {
             } < <(command env -0 && printf '\0')
         fi
     fi
-    local input="" has_input=$1 status output errors entry
+    local input="" helper_mode=$1 status output errors entry
     local forwarded=()
     shift
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         input="$(cat; printf '\001')"
         input="${input%$'\001'}"
     fi
@@ -722,11 +756,15 @@ verify_helper() {
             exec 72>&-
         fi
     fi
+    if [[ "$helper_mode" == --require-helper ]]; then
+        printf 'verify.sh: the Python helper could not run %s %s\n' "${1##*/}" "${2:-}" >&2
+        return 2
+    fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
         exec 73< <(printf '%s\0' "${forwarded[@]}")
         export VERIFY_RESULT_ENVIRONMENT_FD=73
     fi
-    if [[ "$has_input" == 1 ]]; then
+    if [[ "$helper_mode" == --stdin ]]; then
         printf '%s' "$input" | "$PY" "$@"
     else
         "$PY" "$@"
@@ -793,12 +831,19 @@ LINT_QUEUE_PLACEMENT=1
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$BUILD_HELPER_ROOT/build_targets/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$BUILD_HELPER_ROOT/direct/local_release_wait.py}"
 STEP_RECORD_SCRIPT="$BUILD_HELPER_ROOT/direct/step_record.py"
+# Finish records that read a copy before its lease ends.
+if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" || "${COPIES_STEP_SOURCE:-}" == "$VERIFY_REPO_ROOT" ]]; then
+    BUILDLOG_SYNC=1
+fi
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
 finish_verify_run() {
     if [[ -n "$FINAL_PASS_START" ]]; then
-        env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}" || true
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            exec env -u BUILDLOG_CALL_ID "$PY" "$FINAL_PASS_SCRIPT" finish "${BASH_SOURCE[0]}" "$FINAL_PASS_START" "$1" "${FINAL_FEATURES:-}"
+        ) || true
         FINAL_PASS_START=""
     fi
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
@@ -908,6 +953,8 @@ run() {
     if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         exit "$status"
     fi
+    # The EXIT trap reads this status: a return with it is a step failure.
+    LAST_STEP_STATUS=$status
     return "$status"
 }
 
@@ -950,8 +997,7 @@ run_step() {
     fi
     local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
-    local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD="" VERIFY_SLOT_CAPACITY_FILE=""
-    local slot_deadline=""
+    local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD=""
     if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
         build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
         return 2
@@ -986,7 +1032,6 @@ run_step() {
                 "$(git rev-parse --show-toplevel)" == "$COPIES_STEP_SOURCE" ]]; then
             VERIFY_SLOT_SOURCE=$COPIES_STEP_SOURCE
         fi
-        if [[ -n "$VERIFY_SLOT_SOURCE" ]]; then VERIFY_SLOT_CAPACITY_FILE="$step_log.slot-full"; fi
     fi
     attempt=1
     while :; do
@@ -1013,6 +1058,8 @@ run_step() {
         [[ $- != *m* ]] || monitor=1
         set -m
         (
+            # The step and all of its children use the run output streams.
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
             set +m
             if (
                 step_token_before=${TOKEN_HELD:-0}
@@ -1041,15 +1088,6 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
-        if [[ -s "$VERIFY_SLOT_CAPACITY_FILE" ]]; then
-            status=0
-            if [[ -z "$slot_deadline" ]]; then slot_deadline=$(< "$VERIFY_SLOT_CAPACITY_FILE"); fi
-            rm -f -- "$VERIFY_SLOT_CAPACITY_FILE"
-            wait_for_step_folder "$slot_deadline" || status=$?
-            if (( status != 0 )); then rm -f "$step_log"; return "$status"; fi
-            : > "$step_log"
-            continue
-        fi
         if [[ -n "$VERIFY_SLOT_SOURCE" && "${CMD:-}" != doc ]]; then
             VERIFY_SLOT_EXECUTED_TREE=$VERIFY_SLOT_TREE
         fi
@@ -1189,13 +1227,19 @@ read_metadata() {
     if [[ -n "${GATE_METADATA:-}" ]]; then
         printf '%s\n' "$GATE_METADATA"
     else
-        cargo metadata --no-deps --format-version 1
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            cargo metadata --no-deps --format-version 1
+        )
     fi
 }
 
 set_gate_metadata() {
     export BUILDLOG_OUTPUT_ROOTS=""
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
+    GATE_METADATA="$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo metadata --no-deps --format-version 1
+    )" || { GATE_METADATA=""; return 1; }
     BUILDLOG_OUTPUT_ROOTS="$(verify_helper --stdin "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
         <<< "$GATE_METADATA" 2>/dev/null)" || BUILDLOG_OUTPUT_ROOTS=""
 }
@@ -1221,7 +1265,6 @@ load_metadata() {
         doc) if [[ -n "$package" ]]; then requests+=("member:$package"); fi; requests+=(target-directory) ;;
     esac
     case "$CMD" in
-        check) requests+=(check-targets) ;;
         test)
             for ((index=0; index<${#words[@]}; index++)); do
                 if [[ "${words[index]}" == --features ]]; then
@@ -1323,17 +1366,6 @@ take_test_targets() {
             TEST_SELECTION+=("$word")
         fi
     done <<< "$TEST_TARGETS"
-}
-
-CHECK_SELECTION=()
-take_check_targets() {
-    local word
-    load_metadata
-    while IFS= read -r word; do
-        if [[ -n "$word" ]]; then
-            CHECK_SELECTION+=("$word")
-        fi
-    done <<< "$CHECK_TARGETS"
 }
 
 # Qualify each feature name in a comma list with the package, leaving names
@@ -1952,7 +1984,7 @@ finish_hold_wait() {
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
+        remove_tool_folder "hold-wait folder removal" "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
@@ -1975,6 +2007,7 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
+LAST_STEP_STATUS=""
 RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
@@ -2127,9 +2160,13 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
     exit "$TREE_CHANGED_STATUS"
+}
+
+remove_tree_watch() {
+    local folder="$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
+    remove_tool_folder "tree-watch folder removal" "$folder"
 }
 
 start_tree_watch() {
@@ -2137,20 +2174,22 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { remove_tree_watch; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
-    "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
-        ${scope[@]+"${scope[@]}"} -- <<< "$GATE_METADATA" >/dev/null 2>&1 &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
+            ${scope[@]+"${scope[@]}"} --
+    ) <<< "$GATE_METADATA" >/dev/null 2>&1 &
     TREE_WATCH_PID=$!
 }
 
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
 }
 
 # Match the checkout selection for Python on standard input.
@@ -2160,7 +2199,10 @@ doc_staged_helper() {
     while :; do
         if [[ -f "${folder%/}/scripts/lib/py" ]]; then
             if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
-                VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
+                (
+                    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                    VERIFY_PY_HELPER=DOC_STEP_PY exec "$PY" - "$script" "$@" < "$script"
+                )
                 return
             fi
             break
@@ -2194,6 +2236,7 @@ with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
     sys.stdin.read(1)
 '
     coproc DOC_COPY {
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         if [[ -n "$ssh_caller" ]]; then
             VERIFY_PY_HELPER=SSH_SOURCE_PY exec "$PY" -c "$ssh_source_py" "$STEP_COPIES_SCRIPT" "$top" "$tree" "$ssh_caller"
         fi
@@ -2322,8 +2365,7 @@ forward_mac_runner_signal() {
     if [[ "$signal_name" == INT ]]; then signal_name=TERM; fi
     find_mac_runner_pid
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
@@ -2456,6 +2498,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PRIOR_JOB=${!:-}
     MAC_RUNNER_LAUNCHING=1
     (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         if [[ -n "$MAC_SOURCE_ROOT" && "$runner_root" == "$MAC_SOURCE_ROOT" ]]; then
             if [[ "$runner" != /* ]]; then runner=$PWD/$runner; fi
             cd -- "$runner_root" || exit $?
@@ -2465,7 +2508,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         fi
         VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-    ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
+    ) > >(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec tee -a /dev/fd/9
+    ) 2> >(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec tee -a /dev/fd/9 >&2
+    ) &
     MAC_RUNNER_PID=$!
     MAC_RUNNER_LAUNCHING=0
     if wait "$MAC_RUNNER_PID"; then
@@ -2504,6 +2553,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
+    if [[ "$selected_is_mac" == 1 && "$result_usable" == 0 ]]; then
+        local launch
+        launch=$(verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" placement-status --launch-only \
+            --episode "$PLACEMENT_EPISODE" --attempt "$PLACEMENT_ATTEMPT") || launch=unknown
+        # not_started: the runner reported a settled refusal: no test started and no Mac cleanup is open.
+        if [[ "$launch" != available && "$launch" != not_started ]]; then
+            result_word=lost result_reason=cleanup_unconfirmed result_usable=1
+        fi
+    fi
     if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
@@ -2544,6 +2602,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
+            if [[ "$selected_is_mac" == 1 && "$result_word" == lost \
+                    && "$result_reason" == cleanup_unconfirmed ]]; then
+                echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
+                exit 2
+            fi
             if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;
@@ -3078,15 +3141,26 @@ wait_for_placement() {
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment
     fi
-    "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" \
-        "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target" &
+    local -a request=("$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID"
+                     "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target")
+    if [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]]; then
+        "${request[@]}" &
+    else
+        (
+            close_verify_exit_stderr
+            exec "${request[@]}"
+        ) &
+    fi
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || true
     HOLD_WAITER_PID=""
 }
 
 wait_for_claim_recovery() {
-    sleep "${BUILD_TARGETS_POLL_S:-15}" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec sleep "${BUILD_TARGETS_POLL_S:-15}"
+    ) &
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || true
     HOLD_WAITER_PID=""
@@ -3127,34 +3201,6 @@ take_local_placement() {
     if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
     export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
     export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-}
-
-wait_for_step_folder() {
-    local deadline=$1 status=0
-    release_token || return $?
-    if [[ ! -f "$VERIFY_SLOT_CAPACITY_FILE.memory-released" ]]; then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "$PLACEMENT_OWNER_PID" --reason "could not release memory before the folder wait" >/dev/null || true
-        build_check_record_failure 'could not release memory before the folder wait'
-        return 2
-    fi
-    rm -f -- "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
-    step_state waiting_hold
-    "$PY" "$STEP_COPIES_SCRIPT" wait-slot --repo "$VERIFY_SLOT_SOURCE" --step "$CMD" \
-        --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE" --deadline "$deadline" --pid "$$" &
-    HOLD_WAITER_PID=$!
-    wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    if (( status != 0 )); then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "$PLACEMENT_OWNER_PID" --reason "the folder wait ended" >/dev/null || return $?
-        return "$status"
-    fi
-    # Closing the attempt allows the same episode to ask for memory again.
-    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" finish-step --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-        --status 75 --reason "repository slot capacity" >/dev/null || return $?
-    unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
-    PLACEMENT_OUTCOME=retry
 }
 
 route_test() {
@@ -3208,9 +3254,7 @@ route_test() {
             require_nextest
         fi
         collect_routing_wait
-        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then
-            exit "$LOOKUP_STATUS"
-        fi
+        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then exit "$LOOKUP_STATUS"; fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
@@ -3345,7 +3389,10 @@ start_copy_watch() {
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi
-    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}"
+    ) &
     COPY_WATCH_PID=$!
 }
 
@@ -3372,7 +3419,7 @@ stop_copy_watch() {
             esac
         done < "$COPY_WATCH_DIR/result"
     fi
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$COPY_WATCH_DIR"
+    remove_tool_folder "copy-watch folder removal" "$COPY_WATCH_DIR"
     COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
     if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         BUILDLOG_MAC_COPY="$COPY_WORD"
@@ -3586,8 +3633,8 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
-# placement that failed before its step started. A fix pass that still changes
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or an
+# admission or placement failure. A fix pass that still changes
 # the tree at the limit can leave more fixes for the next call.
 # An incomplete fix pass can also leave fixes for the next call.
 lint_failure_is_the_tree() {
@@ -3962,8 +4009,11 @@ acquire_token() {
         if (( TOKEN_WAITERS_AHEAD == 0 )); then
             # Two tries 3 s apart, then the queue is read again.
             pause=1
-            bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                exec bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+                    --pid $$ --hold "$TOKEN_HOLD_S" --wait 3
+            ) >/dev/null 2>&1 &
             TOKEN_WAITER_PID=$!
             status=0
             wait "$TOKEN_WAITER_PID" || status=$?
@@ -4081,15 +4131,18 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
+    # The admission service uses the sidecar to tell that the guard allowed the step.
+    if sidecar := os.environ.pop("BUILDLOG_SCOPE_SIDECAR", ""):
+        Path(sidecar).write_text(os.environ["BUILDLOG_STEP_SCOPE"] + "\n")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
+os.environ.pop("BUILDLOG_DEFER_SCOPE_SIDECAR", None)
 sys.exit(shell_status(subprocess.call(command)))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
-eval "$(declare -f buildlog_release_memory | sed '1s/buildlog_release_memory/buildlog_release_step_only/')"
 eval "$(declare -f buildlog_write_step | sed '1s/buildlog_write_step/buildlog_write_worktree_step/')"
 
 buildlog_write_step() {
@@ -4105,17 +4158,6 @@ buildlog_write_step() {
         "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
-buildlog_release_memory() {
-    if [[ ! -s "${VERIFY_SLOT_CAPACITY_FILE:-/nonexistent}" ]]; then
-        buildlog_release_step_only "$@"
-        return
-    fi
-    # Keep the assignment current until the wait ends. This prevents a new grant.
-    if verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" release-step-memory \
-            --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" >/dev/null; then
-        : > "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
-    fi
-}
 renew_token() {
     local status=0
     bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
@@ -4130,6 +4172,7 @@ start_token_renewer() {
     renew_token || return 1
     local renew_parent=${BASHPID:-$$}
     (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
         # Bash can retain pipeline jobs that this subshell cannot wait for.
         # Stop and collect only the sleep that this renewer started.
@@ -4167,7 +4210,7 @@ stop_token_renewer() {
 buildlog_exec() {
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
         set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
-            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"
+            --step "$CMD" -- "$@"
     fi
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
         local TOKEN_RENEWER_PID="" step_status=0
@@ -4177,6 +4220,7 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            BUILDLOG_DEFER_SCOPE_SIDECAR=1 \
             VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
@@ -4190,7 +4234,6 @@ buildlog_exec() {
 # run_once releases the reservation and sampler before this call.
 buildlog_retry_unstarted_step() {
     BUILDLOG_RETRY_STEP=0
-    if [[ -s "${VERIFY_SLOT_CAPACITY_FILE:-/nonexistent}" ]]; then return 75; fi
     [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
     rm -f "$HOLD_WAIT_DIR/token-lost"
     # shellcheck disable=SC2034 # invoke.sh reads this callback result.
@@ -4215,14 +4258,19 @@ release_token() {
     # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
         if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-            bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                exec bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$
+            ) >/dev/null 2>&1 || true
         fi
         TOKEN_HELD=0
     fi
     [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
     local release_status=0
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
-        || release_status=$?
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$
+    ) >/dev/null || release_status=$?
     # An ownership identity change permits reclaim. Preserve the original step result.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
@@ -4283,24 +4331,25 @@ refresh_test_build_inputs() {
 TEST_BUILD_INPUTS_READY=0
 
 eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
+
 build_hold_wait_local() {
-    local status=0
+    local status=0 held_before=${TOKEN_HELD:-0}
     if ! build_hold_applies || build_hold_nothing_held; then
         return 0
     fi
     step_state waiting_hold
     phase_wait_start hold "build hold"
-    # A step without the token (before the first take, or after a Mac trip) only waits.
-    if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
-        build_hold_wait_local_only "$@" || status=$?
-        phase_wait_finish hold
+    if [[ "$held_before" == 1 ]]; then release_token || return $?; fi
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        build_hold_wait_local_only "$@"
+    ) || status=$?
+    phase_wait_finish hold
+    if [[ "$held_before" != 1 ]]; then
         if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
         if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
         return 0
     fi
-    release_token || return $?
-    build_hold_wait_local_only "$@" || status=$?
-    phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
     record_token_wait
@@ -4323,7 +4372,22 @@ if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
 fi
+save_verify_exit_stderr() {
+    VERIFY_EXIT_STDERR_FD=""
+    # Find a free descriptor before duplicating stderr.
+    {
+        local fd=74
+        while [[ -e "/dev/fd/$fd" || -L "/dev/fd/$fd" ]]; do
+            fd=$((fd + 1))
+        done
+        if eval "exec $fd>&1"; then
+            VERIFY_EXIT_STDERR_FD=$fd
+        fi
+    } 1>&2 2>/dev/null || true
+}
+
 run_log_tee() {
+    [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
     # Keep readers alive while verify_interrupted stops the step and records its result.
     # An early reader exit can cause SIGPIPE during cleanup.
     trap '' INT TERM HUP
@@ -4347,6 +4411,9 @@ stop_interrupted_run_log() {
     for pid in "${RUN_LOG_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
     RUN_LOG_PIDS=()
 }
+
+# Save the original stderr before the run log redirects it.
+save_verify_exit_stderr
 
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
@@ -4398,8 +4465,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
@@ -4434,45 +4500,111 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
+
+finish_exit_diagnostics() {
+    [[ -n "$exit_diagnostics" ]] || return 0
+    if [[ -s "$exit_diagnostics" && -n "${VERIFY_EXIT_STDERR_FD:-}" ]]; then
+        # Forward diagnostics only after cleanup releases the token and lease.
+        VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+            cat -- "$exit_diagnostics" 2>/dev/null >&"$VERIFY_EXIT_STDERR_FD" || true
+    fi
+    rm -f -- "$exit_diagnostics" || true
+}
+
+# A failed step returns from run() with the status it recorded, and errexit
+# stops verify.sh at that return. Any other failed command that is not an
+# exit is an unexpected stop, such as a failed helper. It gives no verdict:
+# report it with its function and command, and keep its run log as
+# stopped.log in the cache folder. Each stop replaces the older log, and
+# finish_run sees no run log to record. Known limit: a caller can handle a
+# step failure, and then a different return can stop with the same status.
+# That return reads as a step failure.
+report_stop() {
+    local command=$1 caller=$2 kept=""
+    case "$command" in
+        exit|"exit "*) return 0 ;;
+        return|"return "*) [[ "$EXIT_STATUS" != "$LAST_STEP_STATUS" ]] || return 0 ;;
+    esac
+    if [[ -n "$RUN_LOG" ]]; then
+        if [[ -n "$CACHE_DIR" ]] && mv -f -- "$RUN_LOG" "$CACHE_DIR/stopped.log"; then
+            kept="; run log kept: $CACHE_DIR/stopped.log"
+        else
+            rm -f -- "$RUN_LOG"
+        fi
+        RUN_LOG=""
+    fi
+    printf 'verify.sh: stopped by a failed command (status %s) in %s: %s%s\n' "$EXIT_STATUS" "$caller" "$command" "$kept" >&2
+}
+
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it. $2 is the command
 # that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
 # hold stop ends the run-log readers, runs this trap with the status of the
 # last command, often 0. Only an exit command completes a run, so any other
 # command records the run as interrupted (status 128: the signal is
-# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
-# so one failed cleanup command does not end the trap with its status.
+# unknown here) and writes no pass. A failed step reaches this trap as an
+# exit or as the return of run(); report_stop handles every other failed
+# command. Cleanup is best effort: errexit is off, so one failed cleanup
+# command does not end the trap with its status.
 verify_exit() {
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     EXIT_STATUS=$1
     set +e
+    local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
-        interrupt_hold_wait
-        verify_cleanup interrupted
-    elif (( EXIT_STATUS == 0 )); then
-        verify_cleanup completed
+        interrupt_hold_wait >&2
+        verify_cleanup interrupted >&2
+        finish_verify_run "$EXIT_STATUS" >&2
+        printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" >&2
     else
-        verify_cleanup error
+        if (( EXIT_STATUS == 0 )); then outcome=completed; else report_stop "$2" "${FUNCNAME[1]:-main}"; fi
+        local exit_output=""
+        # Keep result messages on stdout and release resources before writing to the pipe.
+        exit_output="$(mktemp "${TMPDIR:-/tmp}/verify-result.XXXXXX" 2>/dev/null)" || exit_output=""
+        [[ -n "$exit_output" ]] && {
+            verify_cleanup "$outcome"
+            finish_verify_run "$EXIT_STATUS"
+            :
+        } >>"$exit_output" || {
+            verify_cleanup "$outcome"
+            finish_verify_run "$EXIT_STATUS"
+        }
+        # Cleanup is complete. Keep its status if a signal arrives during replay.
+        trap ':' INT TERM HUP
+        if [[ -n "$exit_output" ]]; then
+            if [[ -s "$exit_output" ]]; then
+                VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+                    cat -- "$exit_output" 2>/dev/null || true
+            fi
+            rm -f -- "$exit_output" || true
+        fi
     fi
-    finish_verify_run "$EXIT_STATUS"
+    finish_exit_diagnostics
     exit "$EXIT_STATUS"
 }
+# The hold folder is removed during cleanup. Keep diagnostics in the run's temp folder.
+exit_diagnostics="$(mktemp "${TMPDIR:-/tmp}/verify-exit.XXXXXX" 2>/dev/null)" || exit_diagnostics=""
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
-    interrupt_hold_wait
+    interrupt_hold_wait >&2
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
-    verify_cleanup interrupted
-    finish_verify_run "$EXIT_STATUS"
+    verify_cleanup interrupted >&2
+    finish_verify_run "$EXIT_STATUS" >&2
+    finish_exit_diagnostics
     stop_interrupted_run_log
     if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
         trap - INT TERM HUP
@@ -4484,7 +4616,10 @@ trap 'verify_interrupted 2' INT
 trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 if [[ -n "${COPIES_RUN_PID:-}" ]]; then
-    "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$" &
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$"
+    ) &
     COPY_RUN_WATCH_PID=$!
 fi
 
@@ -4656,7 +4791,8 @@ run_lint_held_sequence() {
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
     lint_rewrite fmt_cargo --all
-    workspace_taplo
+    # The subshell hides run()'s status, so exit with the step failure here.
+    workspace_taplo || exit "$?"
     lint_copy_return || exit 1
     workspace_taplo --check || exit "$?"
     lint_status=0
@@ -4858,8 +4994,7 @@ case "$CMD" in
         done
         take_features "${CHECK_ARGS[@]}"
         require_member "$PKG"
-        take_check_targets
-        run cargo check --workspace "${CHECK_SELECTION[@]}" "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
+        run cargo check --workspace --all-targets "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
     build)
         PKG="$VERIFY_PACKAGE"
@@ -4914,17 +5049,18 @@ case "$CMD" in
         DOC_COPY_LEASE_FD=""
         DOC_SOURCE_KEY=""
         if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
-            if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
-                DOC_TREE=$(doc_tree)
-            else
-                DOC_SOURCE=$(doc_tree source)
-                read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
-            fi
+            DOC_SOURCE=$(doc_tree source)
+            read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
         fi
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
         LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]] &&
+                ! prepared_copy_matches_index "$DOC_REPO_TOP" "$DOC_TREE" 2>/dev/null; then
+            printf '%s\n' 'verify.sh: the prepared copy changed during the build. No doc pass was recorded.' >&2
+            exit "$TREE_CHANGED_STATUS"
+        fi
         doc_record
         ;;
     example)
@@ -4946,13 +5082,16 @@ case "$CMD" in
         ;;
     final)
         if [[ -n "$PINNED_TARGET" || "$MAC_ONLY" == 1 || "$LOCAL_ONLY" == 1 ]]; then
-            VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY "$PY" -c '
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                VERIFY_PY_HELPER=FINAL_CLEAN_TREE_PY exec "$PY" -c '
 from pathlib import Path
 import sys
 with open(Path(sys.argv[1]).resolve().parent / "lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.final_pass import clean_tree
 clean_tree()
-' "${FINAL_PASS_SCRIPT%/*}" || exit 2
+' "${FINAL_PASS_SCRIPT%/*}"
+            ) || exit 2
         fi
         [[ $# -eq 0 ]] || { command_help final >&2; exit 2; }
         FINAL_FEATURES="$(merge_dev_features "")"

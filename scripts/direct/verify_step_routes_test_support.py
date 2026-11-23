@@ -11,6 +11,7 @@ from typing import cast, override
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, ASSIGNED_RUNNER_SETUP
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
 
 
 TARGETS = r'''
@@ -177,18 +178,13 @@ class VerifyStepRoutesFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        VerifyStepRouteTools.setUpClass()
-        cls.addClassCleanup(VerifyStepRouteTools.doClassCleanups)
+        register_fixture_class_cleanup(cls.addClassCleanup, VerifyStepRouteTools).setUpClass()
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
-        self.addCleanup(self.clean_fixture)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.events = self.fixture.root / "route-events"
         self.mac_events = self.fixture.root / "mac-events"
-
-    def clean_fixture(self) -> None:
-        self.assertTrue(self.fixture.doCleanups())
 
     def run_verify(self, *words: str) -> subprocess.CompletedProcess[str]:
         admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)

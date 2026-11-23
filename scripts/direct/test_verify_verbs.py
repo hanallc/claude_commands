@@ -173,7 +173,7 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         self.environment["BUILDLOG_OFF"] = "0"
         result = self.verify("check", "--features", "foo")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("check --workspace --lib --bins --features foo,extra", self.calls_made())
+        self.assertIn("check --workspace --all-targets --features foo,extra", self.calls_made())
         self.assertEqual([(row["package"], row["command"]) for row in self.recorded_calls()],
                          [("workspace", "check --features foo")])
 

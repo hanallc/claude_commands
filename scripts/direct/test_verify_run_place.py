@@ -5,6 +5,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, v
 
 from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import unittest
 from unittest import mock
 
 from scripts.agents import detached_runs
-from scripts.build_queue import admission_protocol as wire, admission_service as service
+from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.process_start import Started, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -202,6 +203,54 @@ fi
         expected = wire.RunIdentity(probe["pid"], owner.start_time)
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
+
+    def limit_runs_to_one(self, fixture: AdmissionFixture) -> None:
+        """Write a run limit of one with the exempt unit the reader requires."""
+        config = fixture.root / "build_admission.conf"
+        _ = config.write_text(config.read_text()
+            + f"\nmax_runs.{fixture.server.host}.fixture=1\nmax_runs.exempt_unit=natemerge\n")
+
+    def finish_verify_step(self, fixture: AdmissionFixture, probe: RunProbe, run: wire.RunIdentity) -> wire.Owner:
+        reading = fixture.proc.owner_start(probe["pid"])
+        assert isinstance(reading, service.LiveOwnerIdentity)
+        owner = wire.Owner(probe["pid"], reading.start_time)
+        fixture.proc.register(owner)
+        request = fixture.request(owner=owner, episode=probe["name"], run=run)
+        request = replace(request,
+            identity=replace(request.identity, verify=records.VerifyCall("check", "verify check", 1, 1)))
+        _ = fixture.finish_step(request)
+        return owner
+
+    def test_verify_local_grant_checks_an_inherited_run_before_using_it_as_slot_owner(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.limit_runs_to_one(fixture)
+            run = fixture.run_owner()
+            memory_run = f"{run.pid}:{run.start_time}"
+            process = self.start(self.script(fixture), "check", BUILDLOG_RUN=memory_run)
+            probe = self.probe(process)
+            self.assertEqual(probe["run"], memory_run)
+            self.assertFalse(fixture.server.verify_run_slots)
+            owner = self.finish_verify_step(fixture, probe, run)
+            self.assertEqual(list(fixture.server.verify_run_slots.values()), [service.VerifyRunSlot("fixture", owner)])
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_nested_verify_uses_the_live_ancestor_slot_at_limit_one(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.limit_runs_to_one(fixture)
+            process = self.start(self.script(fixture), "outer")
+            outer = self.probe(process)
+            run = self.identity(fixture, outer)
+            owner = self.finish_verify_step(fixture, outer, run)
+            self.proceed(process)
+            inner = self.probe(process)
+            self.assertNotEqual(inner["pid"], outer["pid"])
+            _ = self.finish_verify_step(fixture, inner, run)
+            self.assertEqual(list(fixture.server.verify_run_slots.values()), [service.VerifyRunSlot("fixture", owner)])
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
 
     def test_startup_does_not_read_the_caller_bash_env(self) -> None:
         with AdmissionFixture() as fixture:

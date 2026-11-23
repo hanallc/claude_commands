@@ -15,6 +15,7 @@ from types import UnionType
 from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 
 if TYPE_CHECKING:
+    from scripts.message.unit_labels import UnitLabels
     from scripts.production.staff import StaffId, StaffSnapshot
 
 # Literal unions use typing.Union on Python 3.13.
@@ -92,6 +93,16 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         return {**record, "source_key": source}
     if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
         del record["verify"]
+    if (writing and schema.__module__ == "scripts.build_queue.admission_wire" and schema.__name__ == "Identity"
+            and record.get("what") == ""):
+        # An identity with no caller text keeps the wire shape of the clients from before the what field.
+        del record["what"]
+    if writing and schema.__name__ == "KnownPlacementStatus":
+        # A status reply carries the launch facts only when the caller asks for them.
+        if record.get("permission") == {"kind": "LaunchPermissionNotReported"}:
+            del record["permission"]
+        if record.get("report") == {"kind": "NoTerminalReport"}:
+            del record["report"]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.
@@ -166,11 +177,39 @@ def select_queue_name(*candidates: object) -> str:
     return next((name for value in candidates if (name := public_queue_text(value))), UNKNOWN_CALLER)
 
 
-def wait_line_name(unit: str, caller: str, folder: str, step: str, *, fallback_name: str = "") -> str:
-    """Name a waiting step in queue order."""
-    owner = select_queue_name(unit, caller, Path(folder).name, fallback_name)
-    shown_step = public_queue_text(step)
-    return f"{owner} · {shown_step}" if shown_step else owner
+ROW_SEPARATOR = ": "
+
+
+def row_text(owner: object, what: object) -> str:
+    """Name a queue row `<owner>: <what>`: who started the work, then what it does.
+
+    An unusable owner shows the unknown caller label; an unusable or repeated what shows the owner alone."""
+    shown_owner, shown_what = select_queue_name(owner), public_queue_text(what)
+    return shown_owner + ROW_SEPARATOR + shown_what if shown_what and shown_what != shown_owner else shown_owner
+
+
+def owner_name(identity: UnitLabels | None, unit: str, *later: str) -> str:
+    """Name who started the work: a unit, the staff showrunner or session, then each later name in order."""
+    showrunner = public_queue_text(identity.showrunner) if identity is not None else ""
+    for candidate in (unit, identity.unit if identity is not None else ""):
+        shown = public_queue_text(candidate)
+        if showrunner:
+            shown = public_queue_text(shown.removeprefix(showrunner + "-"))
+        if shown:
+            return shown
+    staff_owner = public_queue_text(identity.owner_text) if identity is not None else ""
+    return staff_owner or next((shown for name in later if (shown := public_queue_text(name))), "")
+
+
+def row_what(what: str, step: str) -> str:
+    """What the work does: the caller's own usable text, such as the mac_queue_run --what text, or else the step."""
+    return public_queue_text(what) or step
+
+
+def wait_line_name(unit: str, caller: str, folder: str, step: str, *, identity: UnitLabels | None = None,
+                   fallback_name: str = "") -> str:
+    """Name a waiting step `<owner>: <step>`; owner_name picks the owner, then the folder name, then the fallback."""
+    return row_text(owner_name(identity, unit, caller, Path(folder).name, fallback_name), step)
 
 
 def ci_label(template: str, runner: str, job: str) -> str:
@@ -256,7 +295,9 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
 CARGO_FOLDER_SUFFIX = "_cargo_folder"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX)
+BUILD_SPACE_SUFFIX = "_build_space"
+RUN_LIMIT_SUFFIX = "_run_limit"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, BUILD_SPACE_SUFFIX, RUN_LIMIT_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -280,10 +321,15 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
         wait = cast(dict[str, object], item)
         if wait.get("kind") == "GpuSlotWait":
             head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "RunLimitWait":
+            head = f"{wait['used']} of {wait['limit']} {wait['repository']} runs on {wait['machine']}"
+            suffix = RUN_LIMIT_SUFFIX
         elif wait.get("kind") == "NatedevHeld":
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
         elif wait.get("kind") == "CargoFolderWait":
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
+        elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
+            head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

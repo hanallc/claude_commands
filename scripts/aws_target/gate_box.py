@@ -12,9 +12,9 @@ from enum import StrEnum
 import math
 
 from scripts.lib.python_startup import sitecustomize as python_startup
+from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SuiteMode
 
 if TYPE_CHECKING:
-    from scripts.production.gate_routes import GateRun
     from scripts.test_times import gate_record
 
 
@@ -63,7 +63,7 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
-from scripts.production.merge_gate import process_memory_mib, test_module_environment
+from scripts.production.gate import process_memory_mib, test_module_environment
 
 
 def paired_trial():
@@ -233,9 +233,8 @@ GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
-transfer_retries = {BOX_CURL_RETRY!r} if (
-    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
-) else ()
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
 ''' + r'''secret_file = root / 'transfer-secrets'
 try:
     descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -299,7 +298,7 @@ memory_thread = None
 cpu_started = None
 try:
     repo = root / 'repo'
-    from scripts.production import merge_gate
+    from scripts.production import gate as gate_runner
     from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
@@ -317,15 +316,15 @@ try:
         cpu_started = busy_cpu_seconds()
         result['gate_started_at'] = time.time()
         if links.get('production'):
-            gate = merge_gate.run_suites(repo, full=gate_request.get('full', False), machine=merge_gate.WholeMachine(timings),
-                                        time_limit=(merge_gate.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
+            gate = gate_runner.run_suites(repo, full=gate_request.get('full', False), machine=gate_runner.WholeMachine(timings),
+                                        time_limit=(gate_runner.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
                                                     if float(links.get('gate_time_limit_s', 0)) > 0 else
-                                                    merge_gate.gate_record.NoGateTimeLimit('no passing history on the controller')),
+                                                    gate_runner.gate_record.NoGateTimeLimit('no passing history on the controller')),
                                         module_time_limit_s=links['module_time_limit_s'],
-                                        selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
-                                        mode=merge_gate.SuiteMode(links['mode']))
+                                        selected=gate_runner.SelectedModules(tuple(gate_request['modules'])),
+                                        mode=gate_runner.SuiteMode(links['mode']))
         else:
-            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+            gate = gate_runner.run_suites(repo, full=True, machine=gate_runner.WholeMachine(timings),
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
@@ -712,7 +711,6 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.gate_routes import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -745,7 +743,6 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.gate_routes import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 
@@ -808,7 +805,7 @@ def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected
     """Classify a record from the assignment."""
     if split:
         return "subset"
-    return "affected" if mode == "targeted-test" else "full"
+    return "affected" if SuiteMode.step(mode) == SuiteMode.TARGETED.value else "full"
 
 
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
@@ -817,7 +814,6 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.gate_routes import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
@@ -832,7 +828,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': SuiteMode.step(mode),
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

@@ -97,6 +97,11 @@ mount_timeout_seconds=15
         self.assertEqual(settings.guard_grace_seconds, self.settings.guard_grace_seconds)
         self.assertIn(f"{self.config_path}: guard_grace_seconds='0'", warnings.getvalue())
 
+    def test_image_build_refuses_an_invalid_switch(self) -> None:
+        _ = self.config_path.write_text(self.config_path.read_text().replace('enabled=off', 'enabled=of'))
+        with self.assertRaisesRegex(conf.Unusable, "enabled='of'"):
+            _ = guest.read_settings(conf.read(self.config_path), recover_invalid=False)
+
     def test_guard_releases_only_a_fresh_permit(self) -> None:
         _ = self.permit.write_text(json.dumps(asdict(self.fresh())))
         self.assertEqual(self.guard(guest.read_permit(self.permit), 0), guest.GuardAction.RELEASE)
@@ -197,6 +202,7 @@ mount_timeout_seconds=15
         guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
         arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
             mounted=True, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
+        self.assertIn('--collect', arguments[:arguments.index('--')])
         self.assertIn('--slice=hana-work-' + self.generation + '.slice', arguments)
         self.assertIn('--uid=hana-runner', arguments)
         self.assertIn('--property=CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', arguments)

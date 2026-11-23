@@ -47,6 +47,31 @@ These fields do not change the recipient, reply name, or message key.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
+`send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
+Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
+Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
+The session then gets one short notice: `N held messages from the review in <path>, under "Released at HH:MM:SS <zone>". Read them at your own pace.` (`Read it` for one message.)
+A send that ends a hold puts the notice above the new message.
+A failed append keeps the messages held. A send that carries a new message fails; other paths print one stderr line.
+When an urgent message replaces every held message by its key, nothing is filed and the urgent message goes plain.
+An unconfirmed delivery cuts the file back to its size before the append and keeps the messages held.
+If the file changed after the append, the file stays as it is and stderr gets one line.
+No code deletes the file; the agent reads it.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a unique name match, it gives a `session:` address.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
+
 ### Replies to relay sockets
 
 The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
@@ -191,7 +216,8 @@ The gate permits only an exact match. A missing template id or failed gate check
 | --- | --- |
 | `check --title T (--action A \| --no-action) --text B [--priority N]` | Dry full review (including the second check). Prints the outcome and logs `dry`. Exits 0. A `Session:` line at the start of `--text` is kept. |
 | `replay [--limit N]` | Reviews sent pushes again from `pushover.jsonl`, newest first. Logs `replay`. Posts nothing. |
-| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Dry-reviews every catalog example. Exits 1 if any fails. See the catalog section. |
+| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Reviews each selected example. Uses any current user approval when `--approve` has no `--user-spec`. Exits 1 if any review fails. |
+| `texts --ask --id X` | Prints each example and saves an approval request for the current herdr pane and Claude session. |
 | `sample <transcripts…> [--limit 20] [--since ISO]` | Dry-reviews recent replies. See the nightly section. |
 | `release --identity I -- SOURCE` | Prints one `ReleaseOutcome` word. |
 | `due` | Posts expired holds (legacy, see below). |
@@ -330,7 +356,8 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
@@ -344,7 +371,7 @@ New escalate holds retain their registered template and values.
   The result requires no action. The failure text includes an action.
   The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
   Silence keeps only the newest push and delivers it when silence ends.
-  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `merge_gate.conf` at use.
+  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
   A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.
@@ -359,7 +386,16 @@ New escalate holds retain their registered template and values.
 - `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
-  - `texts --approve` writes passing examples only.
+  - `texts --approve` writes approvals for examples that pass review or have a current user approval.
+  - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
+    The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
+  - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
+    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
+    The function deletes the request before it saves the user's exact words under `text-approvals`.
+    The prompt hook still needs to call this function before it can record live approvals.
+  - A matching text ID and fingerprint let `texts --approve --id X` skip the reviewer.
+    The command records `user-prompt: <words> (<session>, <time>)` and an empty list of objections for each example.
   - `--approve --user-spec SOURCE` writes every example whatever the verdict. The `reviewer` field is `user-spec: <source>; reviewer: <model>` and `objections` lists `{rule, quote}`. The command still exits 1 when there are objections.
   - Approving an id keeps records only for its current examples.
   - Hand-written user-spec entries use `push_texts.fingerprint(entry)`.
@@ -417,8 +453,6 @@ Literal counters and owner notices keep their existing rules.
 The notifier detaches one supervised notice job with explicit HOME, XDG, configuration and repeat-state paths. The supervisor owns its process group, including delivery children, and kills descendants at its configured deadline or normal completion on Linux and macOS. Delivery subprocesses inherit this group. There is no nested drain worker or alarm. The nonblocking drain lock prevents overlap. Scheduling progress records admitted attempts, never inspection: insufficient budget leaves the sender cursor and notice order unchanged. An admitted attempt persists its claim and rotation to the tail of the sender’s notice list, then advances the sender cursor before discovery or delivery. Discovery and delivery share one bounded child attempt. A new attempt starts only when the supervisor deadline leaves its full configured budget plus subprocess cleanup; otherwise it stays pending for the next job. No synchronous launcher fallback runs.
 
 With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
-
-`scripts/lib/py scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
 
 ### Permission root cause: `scripts/message/rca.py`
 
@@ -577,8 +611,8 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 **Reviewer behaviour:**
 - Without explicit instruction the reviewer repeats the action line at the top of the body. `validate` removes it, along with an `Action: ` prefix on the action.
-- The reviewer is not deterministic and not always stable on its own rewrite. Approve a catalog text only after three passing runs. Example values decide the verdict as much as templates do: names that are unrealistic or contradict each other fail review.
-- Changing a template or an example value invalidates its approval. Rerun `review.py texts --id <id>`, then `--approve`.
+- Reviewer results can vary between runs. For reviewer approval, wait for three passing runs. Use realistic and consistent example values.
+- A change to a template or example value invalidates its approval. Get a new approval for the new fingerprint.
 - `--user-spec` without `--approve`, or with an empty source, is a usage error. The reviewer objects to the user's four-line holdout text on every run, and those objections are recorded, never applied.
 
 **Holds and the gate:**

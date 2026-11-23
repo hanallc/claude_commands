@@ -327,7 +327,7 @@ def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
         row = unit_runs.run_owner(first, record)
         if isinstance(row, unit_runs.RunOwnerUnrecorded) or isinstance(row.worktree, staff.WorktreeUnfilled):
             continue
-        worktree = str(row.worktree.path)
+        worktree = str(row.worktree.path.resolve())
         started = first.get("run_started_at")
         at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
         if worktree not in newest or at > newest[worktree].at:
@@ -339,7 +339,7 @@ def read_run_states(*, record: staff.StaffSnapshot | None = None) -> RunStates:
         if isinstance(row.run, staff.OpenRun) and not isinstance(row.worktree, staff.WorktreeUnfilled):
             if unit_runs.run_is_open(row.run.path):
                 path = directory / f"{row.run.path.name}.jsonl"
-                records[str(row.worktree.path)] = RunRecord(path, UnitState.RUNNING)
+                records[str(row.worktree.path.resolve())] = RunRecord(path, UnitState.RUNNING)
     return RunStates(records)
 
 

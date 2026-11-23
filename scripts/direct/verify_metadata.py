@@ -81,11 +81,6 @@ def package_has_library(package: CargoPackage) -> bool:
                for target in package["targets"])
 
 
-def check_targets(meta: CargoMetadata) -> str:
-    selection = ["--lib"] if any(package_has_library(package) for package in meta["packages"]) else []
-    return "\n".join([*selection, "--bins"])
-
-
 def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> str:
     if not package_name:
         packages = [package for package in meta["packages"] if package["id"] in meta["workspace_members"]]
@@ -180,8 +175,6 @@ def answer(meta: CargoMetadata, request: str) -> str:
         return example_features(meta, arguments[0], arguments[1])
     if name == "test-targets" and len(arguments) == 2:
         return test_targets(meta, arguments[0], arguments[1])
-    if name == "check-targets" and not arguments:
-        return check_targets(meta)
     if name == "build-targets" and len(arguments) == 3:
         return build_targets(meta, arguments[0], arguments[1], arguments[2])
     if name == "untested-examples" and len(arguments) == 1:

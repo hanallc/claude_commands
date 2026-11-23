@@ -51,7 +51,8 @@ if (gateMode) args.shift();
 const [callerFolder, previousPage, comparison] = args;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const queueDragProof = previousPage === '--queue-drag';
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
@@ -153,7 +154,57 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
-  const server = createServer((req, res) => {
+  let queueFixture = null;
+  let unnamedPlace = 0;
+  let confirmedQueueLine = null;
+  const undoAnchors = new Map();
+  const server = createServer(async (req, res) => {
+    if (req.url === '/console/builds/queue-move') {
+      const json = (status, result) => {
+        res.writeHead(status, {'Content-Type':'application/json'});
+        res.end(JSON.stringify(result));
+      };
+      if (!queueFixture) return json(403, {});
+      if (req.method === 'GET') return json(200, {token:'fixture-token', highlight_seconds:20});
+      req.setEncoding('utf8');
+      let body = '';
+      for await (const part of req) body += part;
+      const request = JSON.parse(body);
+      const {revision, row_id, destination} = request;
+      const rows = queueFixture.waiters;
+      const ordered = rows.filter(row => row.move);
+      const members = ordered.map(row => row.move);
+      const unnamed = {row_id:'unnamed-wait'};
+      members.splice(unnamedPlace, 0, unnamed);
+      const line = () => ({revision:queueFixture.move_revision, members});
+      if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
+      const undo = request.kind === 'QueueUndoRequest';
+      if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
+      assert.deepEqual(Object.keys(request).sort(), undo
+        ? ['kind', 'move_request_id', 'request_id', 'revision', 'row_id', 'token']
+        : ['destination', 'kind', 'request_id', 'revision', 'row_id', 'token']);
+      const previous = undoAnchors.get(request.move_request_id);
+      const drop = undo
+        ? previous === null ? {kind:'QueueHeadDrop'} : {kind:'QueueDrop', neighbor:previous, side:'after'}
+        : destination;
+      if (drop.kind !== 'QueueHeadDrop' && !members.some(item => item.row_id === drop.neighbor)) {
+        return json(409, {reason:'The old neighbor left the queue.', line:line()});
+      }
+      const index = members.findIndex(item => item.row_id === row_id);
+      undoAnchors.set(request.request_id, members[index - 1]?.row_id ?? null);
+      const [member] = members.splice(index, 1);
+      const next = drop.kind === 'QueueHeadDrop' ? 0
+        : members.findIndex(item => item.row_id === drop.neighbor) + (drop.side === 'after' ? 1 : 0);
+      members.splice(next, 0, member);
+      unnamedPlace = members.indexOf(unnamed);
+      const byId = new Map(ordered.map(row => [row.move.row_id, row]));
+      const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
+      let place = 0;
+      queueFixture.waiters = rows.map(item => item.move ? shown[place++] : item);
+      queueFixture.move_revision += '1';
+      confirmedQueueLine = line();
+      return json(200, {line:confirmedQueueLine});
+    }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
     res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
@@ -403,6 +454,11 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
+        await checkQueueDrag(navigate, evaluate, call);
+        if (queueDragProof) {
+          console.log(JSON.stringify({shot:join(folder, 'drag-dark.png')}));
+          break browserProof;
+        }
         await checkHeadcounts(navigate, evaluate, call);
         if (headcountComparison) console.log(JSON.stringify({pass:true,comparison:'headcount'}));
         else {
@@ -413,6 +469,202 @@ try {
         if(ws) ws.close();
         chrome.kill('SIGTERM');
         await exited;
+      }
+
+      async function checkQueueDrag(navigate, evaluate, call) {
+        const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
+        const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
+        unnamedPlace = 0;
+        queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
+          waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
+            name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
+            showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],
+            since:fixtureTime - (14 - index * 3) * 60, pid:500 + index,
+            need:1.2 + index / 10, machine:'natedev', place:index + 1,
+            move:{row_id:unit}}))};
+        if (!queueDragProof) {
+          const cloud = readings.cloud.waiters.find(row => row.kind === 'cloud');
+          queueFixture.waiters.push({...cloud, kind:'cloud', name:'cloud fixture', pid:600});
+        }
+        servedReading = queueFixture;
+        await navigate('memory_live.html');
+        await evaluate('window.render = window.renderReading; true');
+        await evaluate(`new Promise(resolve => {
+          const walk = document.querySelector('#walk');
+          const ready = () => walk.querySelector('[data-move-id="typesafe"]');
+          if (ready()) return resolve(true);
+          const observer = new MutationObserver(() => {
+            if (ready()) { observer.disconnect(); resolve(true); }
+          });
+          observer.observe(walk, {childList:true, subtree:true});
+        })`);
+        const snapshot = () => evaluate(`({
+          handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
+          lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,
+          places:[...document.querySelectorAll('tr.wait td.place')].map(cell => cell.textContent),
+          line:document.querySelector('#queue-status').textContent,
+          action:document.querySelector('#queue-action').hidden ? '' : document.querySelector('#queue-action').textContent
+        })`);
+        await evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'center'}); true");
+        const point = selector => evaluate(`(() => {
+          const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+          return {x:box.left+box.width/2, y:box.top+box.height/2};
+        })()`);
+        const grip = unit => point(`.queue-grip[data-move-id="${unit}"]`);
+        const cell = (unit, name) => point(`tr[data-tip="wait:${unit}"] .${name}`);
+        const start = await grip('typesafe');
+        const target = await cell('unit-board', 'place');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
+        const preview = await snapshot();
+        assert.deepEqual(preview.handles,['natemerge','typesafe','unit-board','aws','postmaster']);
+        assert.equal(preview.lifted,'typesafe');
+        assert.ok(await evaluate(`(() => {
+          const bounds = selector => document.querySelector(selector).getBoundingClientRect();
+          const emphasis = bounds('.queue-emphasis.lift');
+          const chart = bounds('.wrow.queue-lift');
+          const table = bounds('tr.queue-lift');
+          return emphasis.left === chart.left && emphasis.right >= table.right &&
+            emphasis.top === chart.top && Math.abs(emphasis.top - table.top) < 1;
+        })()`));
+        assert.deepEqual(preview.places, queueDragProof ? ['1','2','3','4','5'] : ['1','2','3','4','5','cloud']);
+        await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
+        assert.deepEqual(await snapshot(),preview);
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...target, button:'left', buttons:0, clickCount:1});
+        const waitForLine = line => evaluate(`new Promise(resolve => {
+          const node = document.querySelector('#queue-status');
+          const ready = () => node.textContent === ${JSON.stringify(line)};
+          if (ready()) return resolve(true);
+          const observer = new MutationObserver(() => {
+            if (ready()) { observer.disconnect(); resolve(true); }
+          });
+          observer.observe(node, {childList:true, characterData:true, subtree:true});
+        })`);
+        await waitForLine('typesafe · test affected moved from 5 to 2');
+        assert.equal((await snapshot()).action,'Undo');
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 2 to 5');
+        assert.deepEqual((await snapshot()).handles, units);
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowUp', bubbles:true}));
+          return true;
+        })()`);
+        assert.equal((await snapshot()).line, 'Place 1');
+        await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
+        await waitForLine('unit-board · test affected moved from 2 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unit-board', 'unnamed-wait', 'natemerge']);
+        assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('unit-board · test affected moved from 1 to 2');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('unit-board · test affected moved from 2 to 3');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        const moveStart = await grip('typesafe');
+        const moveTarget = await cell('aws', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...moveStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
+        queueFixture = structuredClone(queueFixture);
+        queueFixture.move_revision += 'joined';
+        queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
+          name:'remote startup', machine:'mac', reason:'remote startup',
+          move:{row_id:'remote-start', movable:false}});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('The queue changed.');
+        assert.deepEqual((await snapshot()).handles, []);
+        assert.ok(await evaluate('queueReading(latest).move_revision !== ' + JSON.stringify(queueFixture.move_revision)));
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        queueFixture.move_revision += 'new-unit';
+        queueFixture.waiters.splice(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+          name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
+          move:{row_id:'new-unit'}});
+        await evaluate('pageRefresh.refresh(true)');
+        const retryStart = await grip('typesafe');
+        const retryTarget = await cell('new-unit', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...retryTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...retryTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 7 to 3');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
+        assert.deepEqual(await evaluate(`['remote-start', 'typesafe'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '3']);
+        const nextStart = await grip('typesafe');
+        const nextTarget = await cell('postmaster', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
+        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left',
+          waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
+        assert.ok(await evaluate(`Boolean(document.querySelector('tr[data-tip="wait:remote-start"]'))`));
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...nextTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('The queue changed.');
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
+
+        queueFixture.move_revision += 'mac-only';
+        queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          order_note:'Newest eligible copy starts first',
+          move:{row_id:'mac-only', movable:false}});
+        await evaluate('pageRefresh.refresh(true)');
+        const macStart = await grip('typesafe');
+        const macTarget = await cell('natemerge', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...macStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...macTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...macTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 2 to 1');
+        assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');
+        assert.ok(!(await snapshot()).handles.includes('mac-only'));
+        assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
+        assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
+
+        unnamedPlace = 1;
+        queueFixture.move_revision += 'head-undo';
+        await evaluate('pageRefresh.refresh(true)');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="typesafe"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('typesafe · test affected moved from 1 to 2');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unnamed-wait', 'natemerge', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 2 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['typesafe', 'unnamed-wait', 'natemerge']);
+        assert.deepEqual((await snapshot()).handles.slice(0, 2), ['typesafe', 'natemerge']);
+
+        if (queueDragProof) {
+          const clip = await evaluate(`(() => {
+            const walk = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk .queue-title').getBoundingClientRect().top + scrollY - 10;
+            const bottom = document.querySelector('#queue-feedback').getBoundingClientRect().bottom + scrollY + 12;
+            return {x:Math.max(0,walk.left-10),y:top,width:Math.min(innerWidth-walk.left,walk.width+20),height:bottom-top,scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
+        }
+        queueFixture = null;
+        servedReading = base;
       }
 
       async function checkHeadcounts(navigate, evaluate, call) {
@@ -1468,7 +1720,7 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
+            assert.deepEqual(macProof.map(row=>row.name),['hana: build','trunk: nextest','cargo-liner: nextest']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
@@ -1904,7 +2156,7 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
             })()`);
-            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
@@ -2395,7 +2647,7 @@ try {
               scroll:tip.scrollWidth,client:tip.clientWidth};
           })()`);
           if(version==='after') {
-            assert.equal(state.title,'fps nextest');
+            assert.equal(state.title,'fps: nextest');
             assert.equal(state.duration,'running 10 min');
             assert.ok(state.width<=24*16+22,JSON.stringify(state));
             assert.ok(state.scroll<=state.client,JSON.stringify(state));
@@ -2455,10 +2707,9 @@ try {
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
                 waiters:[{key:'fractional-wait',name:'fractional',first_in_line:true,need:1.06,free:1.04,head_room:{rows:[
                   {label:'Queue cap',gib:5.2},{label:'− Builds',gib:3.12},
-                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}},
-                  {key:'fractional-slot',name:'slot',kind:'repository-slot',need:0,runs_on:'natedev'}]};
+                  {label:'− Build reserved',gib:1.04},{label:'= Free',gib:1.04}]}}]};
               window.renderReading(fractional);
-              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait','wait:fractional-slot']
+              return {...Object.fromEntries(['g-builds','cap','room','swap','swap-pool:outside','walkhead','row:fractional-run','wait:fractional-wait']
                 .map(key=>[key,tooltipRows(key,fractional)])),
                 legend:Object.fromEntries(['builds','reserved','room'].map(key=>[key,document.querySelector('#v-cap-'+key).textContent]))};
             })()`);
@@ -2481,8 +2732,6 @@ try {
             assert.equal(swap['Swap coming back'],'1.0 GiB');
             assert.equal(swap.Target,'2.0 GiB');
             assert.equal(amounts(review.walkhead).Priority,'research, cables');
-            assert.equal(amounts(review['wait:fractional-slot'])['Waits for'],'build slot');
-            assert.ok(!review['wait:fractional-slot'].some(row=>['Needs','Free','Short by'].includes(row.label)));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 123 · 2 min'));
             assert.ok(review['row:fractional-run'].some(row=>row.label==='codex · 456 · 2 min'));
             const reserveProof = await evaluate(`(() => {

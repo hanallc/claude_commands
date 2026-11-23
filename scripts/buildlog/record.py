@@ -605,8 +605,9 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
     return f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
 
 
-def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
-    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+def keep_log(source: bytes | Path, host: str, epoch: float, record_id: str) -> str:
+    """Keep a log from its bytes, or from a file that is copied in parts."""
+    return _keep_compressed(source, _log_relative_path(host, epoch, record_id))
 
 
 def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
@@ -614,8 +615,9 @@ def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
     return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
 
 
-def _keep_compressed(data: bytes, relative: str) -> str:
+def _keep_compressed(source: bytes | Path, relative: str) -> str:
     import gzip
+    import shutil
 
     target = store.root() / relative
     if target.is_file():
@@ -626,7 +628,11 @@ def _keep_compressed(data: bytes, relative: str) -> str:
     try:
         with partial.open("wb") as handle:
             with gzip.GzipFile(fileobj=handle, mode="wb") as compressed:
-                _ = compressed.write(data)
+                if isinstance(source, Path):
+                    with source.open("rb") as data:
+                        shutil.copyfileobj(data, compressed)
+                else:
+                    _ = compressed.write(source)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(partial, target)
@@ -1440,6 +1446,81 @@ def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"
     })
 
 
+class HandMadeFile(TypedDict):
+    """A file that the model check read, with its sha256 at the check and at run start."""
+    path: str
+    sha256_check: str
+    sha256_run: str | None
+
+
+class HandMadeFields(TypedDict):
+    """What hand_made.py knows about one attempt. Each time is UTC ISO 8601, or None when not reached.
+
+    The row, not the exit code, tells a refusal from a program exit: a program can exit with any code.
+    A refusal has a refusal text and no status; a program exit has a status.
+    """
+    why: str
+    argv: list[str]
+    cwd: str
+    machines: list[str]
+    machine: str | None
+    files: list[HandMadeFile]
+    verdict: Literal["yes", "no"] | None
+    reason: str | None
+    refusal: str | None
+    status: int | None
+    check_model: str
+    check_effort: str
+    check_account: str | None
+    check_started_at: str | None
+    check_ended_at: str | None
+    placed_at: str | None
+    sha_checked_at: str | None
+    run_started_at: str | None
+    run_ended_at: str | None
+    # Each machine that failed before the run, in order; the run went back to the other named machines.
+    failed_machines: list[str]
+    queue_wait_s: float | None
+    log: str | None
+    step: str
+    test_width: int | None
+    peak_mem_bytes: int | None
+
+
+def caller_account() -> str | None:
+    """The account folder name of the calling session, when it has one."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CODEX_HOME")
+    return Path(folder).name if folder else None
+
+
+def hand_made(record_id: str, started: float, fields: HandMadeFields, *, tree_start: str | None) -> None:
+    """Append one hand made attempt; this adds where, when, for whom and the checkout facts.
+
+    The checkout is not trusted, so its git facts and tree key run no program that it names. tree_start
+    must come from treekey.tree_key with checkout_programs=False.
+    """
+    from scripts.buildlog import treekey
+
+    host = store.host_name()
+    directory = fields["cwd"]
+    record: dict[str, object] = {
+        "kind": "hand_made",
+        "v": RECORD_VERSION,
+        "id": record_id,
+        "host": host,
+        "target": recorded_target(host),
+        "started_at": store.utc_iso(started),
+        "ended_at": store.utc_iso(time.time()),
+        **fields,
+        **git_facts(directory),
+        **tree_facts(tree_start, treekey.tree_key(directory, checkout_programs=False)),
+        "caller": caller(sys.stdout.isatty()),
+        "account": caller_account(),
+        **who(),
+    }
+    store.append_line(store.host_file(host, started), record)
+
+
 def hold_build(args: list[str]) -> None:
     import hashlib
 
@@ -1556,7 +1637,6 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         if command == "step":
-            detach()
             step(rest)
         elif command == "test-phase-context":
             print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
@@ -1579,4 +1659,8 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     _ = sys.modules.setdefault("scripts.buildlog.record", sys.modules[__name__])
+    # A detach changes the whole process, so only the process of a step may do it.
+    # A caller that runs main in its own process (verify_helper.py) keeps its session and pipes.
+    if sys.argv[1:2] == ["step"]:
+        detach()
     sys.exit(main(sys.argv[1:]))

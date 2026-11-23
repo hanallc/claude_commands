@@ -129,12 +129,53 @@
       "Bash(git config filter.*)",
       "Bash(git config credential.*)",
       "Bash(git config url.*)",
+      "Bash(git config set core.*)",
+      "Bash(git config set alias.*)",
+      "Bash(git config set filter.*)",
+      "Bash(git config set credential.*)",
+      "Bash(git config set url.*)",
       "Bash(git config --global*)",
       "Bash(git config --system*)",
       "Bash(git config --local*)",
       "Bash(git config --worktree*)",
       "Bash(git config --file*)",
       "Bash(git config -f *)",
+      "Bash(git push*--no-v*)",
+      "Bash(git * push*--no-v*)",
+      "Bash(git -c hook.*)",
+      "Bash(git * -c hook.*)",
+      "Bash(git *--config-env*hook.*)",
+      "Bash(git config hook.*)",
+      "Bash(git config * hook.*)",
+      "Bash(git config set hook.*)",
+      "Bash(git config unset hook.*)",
+      "Bash(HOME=*git*push*)",
+      "Bash(* HOME=*git*push*)",
+      "Bash(env HOME=*git*push*)",
+      "Bash(env * HOME=*git*push*)",
+      "Bash(export HOME=*)",
+      "Bash(XDG_CONFIG_HOME=*git*push*)",
+      "Bash(* XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env * XDG_CONFIG_HOME=*git*push*)",
+      "Bash(export XDG_CONFIG_HOME=*)",
+      "Bash(GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(* GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env * GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(export GIT_CONFIG_GLOBAL=*)",
+      "Bash(GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(* GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env * GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(export GIT_CONFIG_COUNT=*)",
+      "Bash(GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(* GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env * GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(export GIT_CONFIG_PARAMETERS=*)",
+      "Bash(git send-pack*)",
+      "Bash(git * send-pack*)",
       "Bash(rg --pre*)",
       "Bash(rg * --pre*)",
       "Bash(gpg -d*)",
@@ -322,6 +363,16 @@
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-push-gate.py\"",
             "timeout": 120
+          }
+        ]
+      },
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-review-hold-send.py\"",
+            "timeout": 10
           }
         ]
       }
@@ -525,7 +576,7 @@
       "**Default / protected branches**: main is the default branch; no repo has branch protection or a ruleset, so a force push or a delete on main is not blocked by GitHub",
       "**CI/CD deploy targets**: None configured",
       "**Network posture**: None configured",
-      "**Source control**: the user's own GitHub account natepiano. PRIVATE: natepiano/hana (~/rust/hana and its worktrees), natepiano/nixos (/etc/nixos on natedev, ~/nixos on the Mac). PUBLIC: natepiano/bevy_brp, natepiano/claude_commands (~/.claude), natepiano/cargo-liner, natepiano/nate_style, natepiano/obsidian_knife, natepiano/nateroids, natepiano/bevy, natepiano/bevy_hana, natepiano/rust-template, natepiano/gltf-ibl-sampler-egui and the user's other natepiano/* repos. Also hanallc/hanadocs (~/rust/hanadocs), the user's docs vault. Each is cloned under ~/rust unless noted; pushing a repo's own work to its own remote is routine. PUBLIC repos take no secrets or confidential material.",
+      "**Source control**: the user's own GitHub account natepiano and the user's own GitHub organization hanallc (natepiano is its only member and admin). PRIVATE: hanallc/nixos (/etc/nixos on natedev, ~/nixos on the Mac), hanallc/hanadocs (~/rust/hanadocs), the user's docs vault, and hana (~/rust/hana and its worktrees) at natepiano/hana or hanallc/hana. PUBLIC: claude_commands (~/.claude) at natepiano/claude_commands or hanallc/claude_commands, natepiano/bevy_brp, natepiano/cargo-liner, natepiano/nate_style, natepiano/obsidian_knife, natepiano/nateroids, natepiano/bevy, natepiano/bevy_hana, natepiano/rust-template, natepiano/gltf-ibl-sampler-egui and the user's other natepiano/* and hanallc/* repos. Each is cloned under ~/rust unless noted; pushing a repo's own work to its own remote is routine. PUBLIC repos take no secrets or confidential material.",
       "**Trusted internal domains**: None configured",
       "**Trusted cloud buckets**: None configured",
       "**Key internal services**: None configured",
@@ -540,9 +591,9 @@
       "**Trusted repo**: ~/rust/bevy_brp and its remote https://github.com/natepiano/bevy_brp (PUBLIC — only this repo's own work should be pushed there; confidential material and secrets are never cleared into it by visibility)",
       "**Org-specific CLIs**: None configured",
       "**routine under natepiano/ prefix qualifiers**: publishing to crates.io as bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros is this repo's own routine publish workflow",
-      "**Trusted repo**: ~/rust/hana and its remote git@github.com:natepiano/hana (PRIVATE, owned by the user). Its git worktrees are part of it: ~/rust/hana_catalyst and every production unit worktree under ~/rust (such as ~/rust/tool-based-ui-trunk, ~/rust/tool-based-ui-geometry-material, ~/rust/widget-enhancements).",
+      "**Trusted repo**: ~/rust/hana and its remote git@github.com:natepiano/hana or git@github.com:hanallc/hana (PRIVATE, owned by the user). Its git worktrees are part of it: ~/rust/hana_catalyst and every production unit worktree under ~/rust or ~/worktrees/hana (such as ~/rust/hana_catalyst-trunk, ~/rust/widget-enhancements, ~/worktrees/hana/trunk/worktree, ~/worktrees/hana/startup/worktree, ~/worktrees/hana/widget/enhancements).",
       "**Production merge branches in hana**: a branch like init/catalyst, checked out in ~/rust/hana_catalyst, is the working branch of the showrunner session. Editing, committing, merging unit checkpoints into it and pushing it are its routine job, and so is starting a helper agent to write and commit fixes there that the user asked for. Only main is protected.",
-      "**Machine configuration**: /etc/nixos (natepiano/nixos, PRIVATE) is the user's own NixOS/nix-darwin configuration; running its read-only checks (`check`, nixfmt --check, statix, deadnix, nix eval), committing to its main and pushing it are routine. ~/.claude (natepiano/claude_commands, PUBLIC) holds the user's own commands, scripts and settings; committing and pushing there is routine.",
+      "**Machine configuration**: /etc/nixos (hanallc/nixos, PRIVATE) is the user's own NixOS/nix-darwin configuration; running its read-only checks (`check`, nixfmt --check, statix, deadnix, nix eval), committing to its main and pushing it are routine. ~/.claude (claude_commands at natepiano/claude_commands or hanallc/claude_commands, PUBLIC) holds the user's own commands, scripts and settings; committing and pushing there is routine.",
       "**cargo-berth**: the user's own coordination tool for their local worktrees (~/rust/cargo-liner and its worktrees, ~/rust/hana and its worktrees). Its ledger under each repo's .git/cargo-berth is local state the user's sessions share by design. Every cargo-berth verb (claim with --before/--after/--defer/--override/--proposal, sequence, resolve, release, renew, retire) is routine work for any session in the user's repos. The showrunner session decides integration order for its production: the user delegated that authority to it, and a unit that records the order the showrunner chose is doing routine work. The user asked for cargo-berth, its skills (~/.claude/commands, ~/.claude/docs) and the berth memories to drop the human-approval handshake for overlap answers and to name an optional approver session instead; that work in ~/rust/berth-fix (branch fix/berth) is their requested design change.",
       "Starting Codex workers with `bash ~/.claude/scripts/direct/implement.sh` and the unit's own prompt files is a unit director's routine work.",
       "When the user asks, deleting obsolete folders under /tmp/claude, /tmp/mat-test-* and /tmp/style-sync-lint-* is routine cleanup: only folders with no file changed in 24 hours, that no running process uses, and that belong to no live Claude session. Never /tmp/claude/unit or /tmp/claude/delegate: those hold paused units' run state, and only tmp_sweep.py cleans them."
@@ -552,5 +603,6 @@
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
   },
-  "precomputeCompactionEnabled": false
+  "precomputeCompactionEnabled": false,
+  "cleanupPeriodDays": 3650
 }

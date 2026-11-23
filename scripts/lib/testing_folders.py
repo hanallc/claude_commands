@@ -20,22 +20,19 @@ BUILDLOG_ENV = "BUILDLOG_DIR"
 def test_run_folder() -> Generator[Path]:
     """Set TMPDIR for one run and restore the caller's temporary parent afterward.
 
-    A run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
     The session root is an absent folder in the run folder, so no fixture launch makes a live session folder.
     """
-    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV, SESSION_ROOT_ENV)}
+    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, SESSION_ROOT_ENV)}
     old_tempdir = tempfile.tempdir
     inherited = build_folders.inherited_temporary_parent().resolve()
     parent = (inherited.parent if str(inherited) == previous[RUN_FOLDER_ENV]
               else inherited / "test-runs")
     parent.mkdir(parents=True, exist_ok=True)
     build_folders.sweep_temporary_build_folders(parent)
-    request = build_folders.UniqueBuildFolder("test-run-", build_folders.ExplicitBuildParent(parent))
+    request = build_folders.UniqueBuildFolder("r", build_folders.ExplicitBuildParent(parent))
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)
         os.environ[RUN_FOLDER_ENV] = str(path)
-        if not previous[BUILDLOG_ENV]:
-            os.environ[BUILDLOG_ENV] = str(path / "buildlog")
         os.environ[SESSION_ROOT_ENV] = str(path / "session")
         tempfile.tempdir = None
         try:
@@ -50,13 +47,23 @@ def test_run_folder() -> Generator[Path]:
 
 
 def start_test_run() -> None:
-    """Keep the bootstrap allocation until normal interpreter exit."""
+    """Keep the bootstrap allocation until normal interpreter exit.
+
+    A direct run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
+    """
     owner = os.getpid()
+    caller_log = os.environ.get(BUILDLOG_ENV)
     lifetime = test_run_folder()
-    _ = lifetime.__enter__()
+    path = lifetime.__enter__()
+    if not caller_log:
+        os.environ[BUILDLOG_ENV] = str(path / "buildlog")
 
     def finish() -> None:
         if os.getpid() == owner:
+            if caller_log is None:
+                _ = os.environ.pop(BUILDLOG_ENV, None)
+            else:
+                os.environ[BUILDLOG_ENV] = caller_log
             _ = lifetime.__exit__(None, None, None)
 
     _ = atexit.register(finish)

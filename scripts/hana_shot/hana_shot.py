@@ -35,7 +35,6 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 from scripts.lib import build_folders
@@ -57,6 +56,8 @@ DRAWN_BY_SHOW = "hana_mimesis_tools::show::DrawnByShow"
 NAME = "bevy_ecs::name::Name"
 VIEW_VISIBILITY = "bevy_camera::visibility::ViewVisibility"
 INHERITED_VISIBILITY = "bevy_camera::visibility::InheritedVisibility"
+VISIBILITY = "bevy_camera::visibility::Visibility"
+TOOLTIPS = "hana_diegetic::widgets::tooltip::controller::Tooltips"
 OUTSIDE_FIT_BOUNDS = "hana_lagrange::fit::target::OutsideFitBounds"
 SWITCH_SLIDER = "hana_catalyst::switch::SwitchSlider"
 TOOL_PREFIX = "hana_catalyst::identity::Tool<"
@@ -106,75 +107,6 @@ class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
 
 
-class ExitSignal(BaseException):
-    """A catchable process signal that should unwind the active shot."""
-
-    def __init__(self, number: int) -> None:
-        super().__init__(number)
-        self.number: int = number
-
-
-@dataclass(frozen=True)
-class ExitSignalsEnabled:
-    """The first exit signal may unwind the active operation."""
-
-
-@dataclass(frozen=True)
-class ExitSignalsDeferred:
-    """Cleanup must finish before an exit signal unwinds the operation."""
-
-
-@dataclass(frozen=True)
-class DeferredExitSignal:
-    """The first exit signal received while cleanup was protected."""
-
-    number: int
-
-
-@dataclass(frozen=True)
-class ExitSignalsLatched:
-    """An unwind or final cleanup has begun; later exit signals do nothing."""
-
-
-class ExitSignalLatch:
-    """Make the first exit signal unwind once, after any cleanup in progress."""
-
-    def __init__(self) -> None:
-        self.state: ExitSignalsEnabled | ExitSignalsDeferred | DeferredExitSignal | ExitSignalsLatched
-        self.state = ExitSignalsEnabled()
-
-    def reset(self) -> None:
-        self.state = ExitSignalsEnabled()
-
-    def latch(self) -> None:
-        self.state = ExitSignalsLatched()
-
-    def interrupt(self, number: int) -> None:
-        if isinstance(self.state, ExitSignalsEnabled):
-            self.state = ExitSignalsLatched()
-            raise ExitSignal(number)
-        if isinstance(self.state, ExitSignalsDeferred):
-            self.state = DeferredExitSignal(number)
-
-    @contextmanager
-    def defer_during_cleanup(self) -> Generator[None, None, None]:
-        deferring = isinstance(self.state, ExitSignalsEnabled)
-        if deferring:
-            self.state = ExitSignalsDeferred()
-        try:
-            yield
-        finally:
-            if deferring and isinstance(self.state, ExitSignalsDeferred):
-                self.state = ExitSignalsEnabled()
-            elif deferring and isinstance(self.state, DeferredExitSignal):
-                deferred = self.state
-                self.state = ExitSignalsLatched()
-                raise ExitSignal(deferred.number)
-
-
-EXIT_SIGNAL_LATCH = ExitSignalLatch()
-
-
 class BrpCallError(Failure):
     """A JSON-RPC error answer from Hana."""
 
@@ -182,6 +114,10 @@ class BrpCallError(Failure):
         super().__init__(f"{method} failed ({code}): {message}")
         self.code: int = code
         self.message: str = message
+
+
+class HoverDeadlineExpired(Failure):
+    """The one --hover deadline passed before the help was ready."""
 
 
 class RpcError(TypedDict):
@@ -624,6 +560,28 @@ class ResolvedTargetFace(NamedTuple):
 
 
 @dataclass(frozen=True)
+class NoHover:
+    """Capture without moving the pointer."""
+
+
+NO_HOVER = NoHover()
+
+
+class HoverTarget(NamedTuple):
+    selector: str
+
+
+class TooltipOwner(NamedTuple):
+    entity: int
+    controllers: tuple[int, ...]
+
+
+class ShownHoverHelp(NamedTuple):
+    target: int
+    controllers: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Shot:
     """One normalized shot request, from a stored view or from the command line."""
 
@@ -640,6 +598,7 @@ class Shot:
     window: str | None = None
     setup: str | None = None
     settle: int = 0
+    hover: NoHover | HoverTarget = NO_HOVER
 
     @property
     def yaw(self) -> float:
@@ -680,6 +639,22 @@ class ConfiguredCallTimeout:
 
 
 CONFIGURED_CALL_TIMEOUT = ConfiguredCallTimeout()
+
+
+@dataclass(frozen=True)
+class HoverDeadline:
+    selector: str
+    limit: float
+    expires: float
+
+    def expired(self) -> HoverDeadlineExpired:
+        return HoverDeadlineExpired(f"help for {self.selector} did not become ready to capture within {self.limit:g} s")
+
+    def remaining(self) -> float:
+        seconds = self.expires - time.monotonic()
+        if seconds <= 0:
+            raise self.expired()
+        return seconds
 
 
 # ---------------------------------------------------------------------------
@@ -725,17 +700,25 @@ class TargetEvidence:
 class Brp:
     """JSON-RPC over HTTP to one Hana instance; each call uses its own connection."""
 
-    def __init__(self, port: int, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    def __init__(self, port: int, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                 hover_deadline: HoverDeadline | NoHover = NO_HOVER) -> None:
         self.settings: conf.ConfigRead = conf.read("hana_shot") if isinstance(settings, UseConfiguredValue) else settings
         self.port: int = port
         self.host: str = self.settings.text("host")
         self.call_timeout: float = self.settings.number("call_timeout_seconds")
         self.target_evidence: TargetEvidence = TargetEvidence()
+        self.hover_deadline: HoverDeadline | NoHover = hover_deadline
 
     def call(self, method: str, params: object = None,
              timeout: float | ConfiguredCallTimeout = CONFIGURED_CALL_TIMEOUT) -> object:
         if isinstance(timeout, ConfiguredCallTimeout):
             timeout = self.call_timeout
+        hover_deadline = self.hover_deadline
+        deadline_limits_call = False
+        if isinstance(hover_deadline, HoverDeadline):
+            remaining = hover_deadline.remaining()
+            deadline_limits_call = remaining <= timeout
+            timeout = min(timeout, remaining)
         body: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
         if params is not None:
             body["params"] = params
@@ -744,6 +727,8 @@ class Brp:
             connection.request("POST", "/", json.dumps(body), {"content-type": "application/json"})
             raw = connection.getresponse().read()
         except TimeoutError as exc:
+            if deadline_limits_call and isinstance(hover_deadline, HoverDeadline):
+                raise hover_deadline.expired() from exc
             if method == "brp_extras/screenshot":
                 raise CaptureTimeout(
                     f"screenshot gave no answer in {timeout:.0f} s; stopped without resending "
@@ -758,6 +743,8 @@ class Brp:
         error = reply.get("error")
         if error is not None:
             raise BrpCallError(method, error["code"], error["message"])
+        if isinstance(hover_deadline, HoverDeadline):
+            _ = hover_deadline.remaining()
         return reply.get("result")
 
     def query(self, params: dict[str, object]) -> list[QueryRow]:
@@ -877,8 +864,7 @@ class Session:
         return camera_state(rows[0]["components"])
 
     def close(self) -> None:
-        """Latch exit signals, restore the window, then end the keep-awake."""
-        EXIT_SIGNAL_LATCH.latch()
+        """Restore the window and end the keep-awake."""
         self.restore_window_and_end_keep_awake()
 
     def restore_window_and_end_keep_awake(self) -> None:
@@ -1130,13 +1116,12 @@ def resolve(session: Session, text: str) -> list[Target]:
             root = require_one(session, outer, roots)
         except Failure as exc:
             raise Failure(f"{text}: outer {exc}") from exc
-        parents = session.brp.query({"data": {"components": [CHILD_OF]}})
-        parent_map = {row["entity"]: cast(int, row["components"][CHILD_OF]) for row in parents}
-        scope = descendants(parent_map, root.entity)
+        parents = read_parents(session.brp)
+        scope = descendants(parents, root.entity)
         if DRAWN_BY_SHOW in session.registered_components:
             for row in session.brp.query({"data": {"components": [DRAWN_BY_SHOW]}}):
                 if row["components"][DRAWN_BY_SHOW] == root.entity:
-                    scope.update(descendants(parent_map, row["entity"]))
+                    scope.update(descendants(parents, row["entity"]))
         return [Target(target.entity, text, target.has_aabb) for target in resolve(session, inner) if target.entity in scope]
     selector = parse_selector(text)
     evidence = session.brp.target_evidence
@@ -1254,11 +1239,16 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
 # Hierarchy crop
 
 
-def start_bounds(session: Session) -> tuple[Future[list[QueryRow]], Future[list[QueryRow]]]:
+def read_parents(brp: Brp) -> dict[int, int]:
+    return {row["entity"]: cast(int, row["components"][CHILD_OF])
+            for row in brp.query({"data": {"components": [CHILD_OF]}})}
+
+
+def start_bounds(session: Session) -> tuple[Future[dict[int, int]], Future[list[QueryRow]]]:
     has = [OUTSIDE_FIT_BOUNDS]
     if RAY_CAST_BACKFACES in session.registered_components:
         has.append(RAY_CAST_BACKFACES)
-    parents = worker_pool().submit(session.brp.query, {"data": {"components": [CHILD_OF]}})
+    parents = worker_pool().submit(read_parents, session.brp)
     boxes = worker_pool().submit(session.brp.query, {
         "data": {
             "components": [AABB, GLOBAL_TRANSFORM],
@@ -1269,16 +1259,16 @@ def start_bounds(session: Session) -> tuple[Future[list[QueryRow]], Future[list[
     return parents, boxes
 
 
-def finish_bounds(futures: tuple[Future[list[QueryRow]], Future[list[QueryRow]]]) -> Bounds:
-    parents: dict[int, int] = {}
-    for row in futures[0].result():
-        parents[row["entity"]] = cast(int, row["components"][CHILD_OF])
+def finish_bounds(futures: tuple[Future[dict[int, int]], Future[list[QueryRow]]], *,
+                  include_outside_fit: tuple[int, ...] = ()) -> Bounds:
+    parents = futures[0].result()
+    outside_fit_members = {entity for root in include_outside_fit for entity in descendants(parents, root)}
     boxes: dict[int, tuple[list[float], AabbValue]] = {}
     pass_through: set[int] = set()
     backfaces: set[int] = set()
     for row in futures[1].result():
         components = row["components"]
-        if row.get("has", {}).get(OUTSIDE_FIT_BOUNDS, False):
+        if row.get("has", {}).get(OUTSIDE_FIT_BOUNDS, False) and row["entity"] not in outside_fit_members:
             continue
         if not visible(components.get(VIEW_VISIBILITY), components.get(INHERITED_VISIBILITY)):
             continue
@@ -1376,7 +1366,7 @@ def inverse_affine_point(matrix: list[float], point: Vec3) -> Vec3:
     )
 
 
-def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | None:
+def project(clip_from_view: list[float], view: Vec3, *, check_depth: bool = False) -> tuple[float, float] | None:
     """Normalized device x and y of a view-space point, or None behind the camera."""
     x, y, z = view
     m = clip_from_view
@@ -1385,16 +1375,18 @@ def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | No
     clip_w = m[3] * x + m[7] * y + m[11] * z + m[15]
     if clip_w <= 1e-6:
         return None
+    if check_depth and not 0 <= m[2] * x + m[6] * y + m[10] * z + m[14] <= clip_w:
+        return None
     return clip_x / clip_w, clip_y / clip_w
 
 
-def project_bounds(bounds: Bounds, root: int, state: CameraState) -> ProjectedBounds:
+def project_bounds(bounds: Bounds, root: int, state: CameraState, *, own_aabb: bool = False) -> ProjectedBounds:
     """Project front-facing corners of visible boxes under the target."""
     width, height = state.size
     left, top, right, bottom = math.inf, math.inf, -math.inf, -math.inf
     any_box = False
     behind = False
-    for entity in descendants(bounds.parents, root):
+    for entity in (root,) if own_aabb else descendants(bounds.parents, root):
         entry = bounds.boxes.get(entity)
         if entry is None:
             continue
@@ -1405,7 +1397,8 @@ def project_bounds(bounds: Bounds, root: int, state: CameraState) -> ProjectedBo
             for sy in (-1.0, 1.0):
                 for sz in (-1.0, 1.0):
                     local = (center[0] + sx * half[0], center[1] + sy * half[1], center[2] + sz * half[2])
-                    ndc = project(state.clip_from_view, inverse_affine_point(state.transform, affine_point(transform, local)))
+                    ndc = project(state.clip_from_view, inverse_affine_point(state.transform, affine_point(transform, local)),
+                                  check_depth=own_aabb)
                     if ndc is None:
                         behind = True
                         continue
@@ -1416,12 +1409,13 @@ def project_bounds(bounds: Bounds, root: int, state: CameraState) -> ProjectedBo
     return ProjectedBounds(left, top, right, bottom, behind, any_box)
 
 
-def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence) -> Rect:
-    """Pixel rectangle around the visible boxes under root, as the fit measures them."""
+def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence, *,
+                   tooltips: tuple[int, ...] = (), own_aabb: bool = False) -> Rect:
+    """Measure the crop target and include the visible help."""
     if state.viewport_set:
         raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
     width, height = state.size
-    projected = project_bounds(bounds, root, state)
+    projected = project_bounds(bounds, root, state, own_aabb=own_aabb)
     if not projected.has_boxes:
         raise Failure(
             "the target has no visible mesh bounds to crop to"
@@ -1429,13 +1423,20 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, 
             + next_step("rerun with --crop none to shoot without a crop")
         )
     left, top, right, bottom = projected[:4]
-    if projected.behind_camera:
+    help_bounds = [project_bounds(bounds, controller, state) for controller in tooltips]
+    if projected.behind_camera or any(not help.has_boxes or help.behind_camera for help in help_bounds):
+        # Screen help can render without world boxes.
         left, top, right, bottom = 0.0, 0.0, float(width), float(height)
+    else:
+        for help in help_bounds:
+            left, top = min(left, help.left), min(top, help.top)
+            right, bottom = max(right, help.right), max(bottom, help.bottom)
     x0 = max(0, math.floor(left) - padding)
     y0 = max(0, math.floor(top) - padding)
     x1 = min(width, math.ceil(right) + padding)
     y1 = min(height, math.ceil(bottom) + padding)
-    if x1 - x0 < 2 or y1 - y0 < 2:
+    minimum = 1 if own_aabb else 2
+    if x1 - x0 < minimum or y1 - y0 < minimum:
         raise Failure("the crop is empty: the target is off screen")
     return Rect(x0, y0, x1 - x0, y1 - y0)
 
@@ -1559,6 +1560,82 @@ def locate_target(session: Session, target: Target, state: CameraState, bounds: 
         "scale_factor": scale, "window": {"width": width / scale, "height": height / scale},
         "clipped": projected.behind_camera or (left, top, right, bottom) != projected[:4], "occluded": occluded,
     }
+
+
+def tooltip_owner(session: Session, target: Target, parents: dict[int, int]) -> TooltipOwner:
+    """The nearest entity on the target's chain with tooltip controllers, else the target with none yet."""
+    entity = target.entity
+    visited: set[int] = set()
+    while entity not in visited:
+        visited.add(entity)
+        components = session.brp.components(entity, [TOOLTIPS])
+        controllers = cast(list[int], components.get(TOOLTIPS, []))
+        if controllers:
+            return TooltipOwner(entity, tuple(controllers))
+        if entity not in parents:
+            break
+        entity = parents[entity]
+    return TooltipOwner(target.entity, ())
+
+
+def wait_hover_frame(session: Session, deadline: HoverDeadline) -> None:
+    frame = frame_number(session.brp.diagnostics())
+    interval = session.frame_seconds()
+    while True:
+        time.sleep(min(interval, deadline.remaining()))
+        if frame_number(session.brp.diagnostics()) > frame:
+            return
+
+
+def move_pointer_to_target(session: Session, location: LocateReply, owner: ProjectedBounds,
+                           deadline: HoverDeadline) -> None:
+    click, window = location["click"], location["window"]
+    scale = location["scale_factor"]
+    last_x, last_y = window["width"] - 1 / scale, window["height"] - 1 / scale
+    x, y = click["x"], click["y"]
+    # Start at the edge with the most space outside the owner.
+    gap, start_x, start_y = max((
+        (owner.left / scale, 0.0, y), (owner.top / scale, x, 0.0),
+        (last_x - owner.right / scale, last_x, y), (last_y - owner.bottom / scale, x, last_y),
+    ), key=lambda approach: approach[0])
+    if gap <= 0 or owner.behind_camera:
+        start_x, start_y = max(((0.0, y), (x, 0.0), (last_x, y), (x, last_y)),
+                               key=lambda point: math.dist(point, (x, y)))
+    for step in (0.0, 1 / 3, 2 / 3, 1.0):
+        position = [start_x + step * (x - start_x), start_y + step * (y - start_y)]
+        _ = session.brp.call("brp_extras/move_mouse", {"position": position})
+        wait_hover_frame(session, deadline)
+
+
+def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> ShownHoverHelp:
+    limit = session.settings.number("settle_seconds")
+    deadline = HoverDeadline(hover.selector, limit, time.monotonic() + limit)
+    hover_session = Session(Brp(session.brp.port, settings=session.settings, hover_deadline=deadline))
+    hover_session.frame_ms = session.frame_ms
+    target = require_one(hover_session, hover.selector, resolve(hover_session, hover.selector))
+    bounds_reads = start_bounds(hover_session)
+    parents = bounds_reads[0].result()
+    owner = tooltip_owner(hover_session, target, parents)
+    bounds = finish_bounds(bounds_reads, include_outside_fit=(owner.entity,))
+    location = locate_target(hover_session, target, state, bounds)
+    # A deadline before the pointer arrives is not a missing help: Hana had no hover to spawn it.
+    move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
+    try:
+        while True:
+            # Some help, such as a rear jack's, spawns only while its target is hovered.
+            if not owner.controllers:
+                owner = tooltip_owner(hover_session, target, parents)
+            shown = tuple(
+                controller for controller in owner.controllers
+                if hover_session.brp.components(controller, [VISIBILITY]).get(VISIBILITY) in ("Inherited", "Visible")
+            )
+            wait_hover_frame(hover_session, deadline)
+            if shown:
+                return ShownHoverHelp(target.entity, shown)
+    except HoverDeadlineExpired:
+        if owner.controllers:
+            raise
+        raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors within {limit:g} s") from None
 
 
 # ---------------------------------------------------------------------------
@@ -1739,21 +1816,27 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
     session.last_move = move_key
     session.last_state = settled.state
 
+    hover_help = hover_for_shot(session, shot.hover, settled.state) if isinstance(shot.hover, HoverTarget) else shot.hover
     staging = staging_path(final)
     remote = remote_file(session)
     params: dict[str, object] = {"path": str(staging) if remote is None else remote.path, "camera": session.camera}
     crop_kind = "none"
     rect: Rect | None = None
     if shot.crop == "entity" and target is not None:
-        if target.has_aabb:
+        if target.has_aabb and isinstance(hover_help, NoHover):
             params["entity"] = target.entity
             params["padding"] = shot.padding
             crop_kind = "entity"
         else:
-            # Visibility is read after the move: parts culled from the old pose show in the new one.
+            # Read the mesh bounds after the camera and tooltip change.
+            tooltips = hover_help.controllers if isinstance(hover_help, ShownHoverHelp) else ()
+            outside_fit = (hover_help.target, *tooltips) if isinstance(hover_help, ShownHoverHelp) else ()
+            if target.has_aabb:
+                outside_fit = (*outside_fit, target.entity)
             rect = hierarchy_rect(
-                finish_bounds(start_bounds(session)), target.entity, settled.state, shot.padding,
-                session.brp.target_evidence,
+                finish_bounds(start_bounds(session), include_outside_fit=outside_fit),
+                target.entity, settled.state, shot.padding,
+                session.brp.target_evidence, tooltips=tooltips, own_aabb=target.has_aabb,
             )
             crop_kind = "rect"
 
@@ -1849,8 +1932,7 @@ def keep_visible(session: Session) -> None:
         session.wait_frames(hana_shot_settings.whole("window_frames"))
         session.window_level = prepared_window
     except BaseException:
-        with EXIT_SIGNAL_LATCH.defer_during_cleanup():
-            session.restore_window_and_end_keep_awake()
+        session.restore_window_and_end_keep_awake()
         raise
 
 
@@ -2724,6 +2806,7 @@ class Arguments(argparse.Namespace):
     port: int = 0
     view: list[str] | None = None
     target: str | None = None
+    hover: str | None = None
     mode: str | None = None
     face: str | None = None
     yaw: float | None = None
@@ -2863,6 +2946,9 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
             raise Refused(f"no views to shoot in {path}")
     else:
         shots = [shot_from_arguments(args, hana_shot_settings=hana_shot_settings)]
+    if args.hover is not None:
+        _ = parse_selector(args.hover)
+        shots = [replace(shot, hover=HoverTarget(args.hover)) for shot in shots]
     invocation.orientation = shots[0].orientation
     invocation.shot = shots[0]
     with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp:
@@ -3297,6 +3383,7 @@ def arguments(argv: list[str], *,
     shot = commands.add_parser("shot", help="frame and capture one or more views")
     add_run_flags(shot)
     _ = shot.add_argument("--view", action="append", help="stored view name (repeat, or 'all')")
+    _ = shot.add_argument("--hover", metavar="SELECTOR", help="show the target's hover help before capture")
     add_shot_flags(shot, hana_shot_settings=hana_shot_settings)
 
     pose = commands.add_parser("pose", help="read or set the orbit camera pose")
@@ -3350,10 +3437,6 @@ def arguments(argv: list[str], *,
     return parser.parse_args(normalized, namespace=Arguments())
 
 
-def exit_for_signal(number: int, _frame: FrameType | None) -> None:
-    EXIT_SIGNAL_LATCH.interrupt(number)
-
-
 def main(argv: list[str]) -> int:
     hana_shot_settings = conf.read("hana_shot")
     try:
@@ -3387,10 +3470,6 @@ def main(argv: list[str]) -> int:
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
     if invocation is not None and args.face is not None:
         invocation.orientation = TargetFace(args.face)
-    EXIT_SIGNAL_LATCH.reset()
-    _ = signal.signal(signal.SIGINT, exit_for_signal)
-    _ = signal.signal(signal.SIGTERM, exit_for_signal)
-    _ = signal.signal(signal.SIGHUP, exit_for_signal)
     exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
@@ -3420,12 +3499,11 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
-    except ExitSignal as exc:
-        exit_code = 128 + exc.number
-        error = f"terminated by {signal.Signals(exc.number).name}"
-        print(f"hana_shot: {error}", file=sys.stderr)
-        if invocation is not None:
-            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, error))
+    except KeyboardInterrupt:
+        exit_code = 130
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, "interrupted (Ctrl-C)"))
+        raise
     except Exception as exc:
         if invocation is not None:
             invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))

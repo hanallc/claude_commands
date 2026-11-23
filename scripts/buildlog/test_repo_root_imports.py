@@ -13,6 +13,7 @@ from typing import cast
 
 from scripts.buildlog.test_index import use_test_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 use_test_log()
 
@@ -29,7 +30,6 @@ class RepoRootImportTests(unittest.TestCase):
             ("step_context.py", (), [], 2),
             ("health.py", health_prefix, [], 0),
             ("port_lint.py", (), [], 2),
-            ("width_trial.py", (), ["--help"], 0),
         )
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -80,7 +80,7 @@ print("module_names " + json.dumps(names))
 """
         with tempfile.TemporaryDirectory() as temporary:
             environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-            environment["HERDR_BIN"] = "/nonexistent/herdr"
+            environment["HERDR_BIN"] = MISSING_HERDR_BIN
             processes = [(entry, subprocess.Popen(
                 [sys.executable, "-c", source, str(scripts / entry),
                  *(str((scripts / entry).parent / name) for name in watched)],

@@ -6,23 +6,53 @@ try:
 except FileNotFoundError:
     pass
 
+import sys
+
+def _usage() -> str:
+    from scripts.agents import set_model
+
+    return f"""usage: agents COMMAND
+  agents help
+  agents status [ACCOUNT] [--json] [--here]
+  agents pause NAME [--finish-step] --why TEXT
+  agents exit NAME [--finish-step] --why TEXT
+  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
+  agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
+  agents resume --production SHOWRUNNER
+  agents retire NAME [--to PRODUCER]
+  agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
+  agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
+  agents reboot [--dry-run]
+  agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
+  agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
+  agents remove-stray NAME SESSION
+  agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+"""
+
+if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
+    from scripts.agents import status_entry
+
+    raise SystemExit(status_entry.main(sys.argv[1:], usage=_usage))
+
 import argparse
 import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, moves
 from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import set_model
@@ -47,7 +77,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
-from scripts.worktree.worktrees import release_worktree_pair
+from scripts.worktree import worktrees
 from scripts.agents import (
     producer_lifecycle,
     producer_transfer,
@@ -55,28 +85,18 @@ from scripts.agents import (
     restart_support,
     shutdown_record,
     stop_resume,
+    status_entry,
     remote_control,
     remote,
     pane_record,
-)
-from scripts.agents.inventory import (
-    CheckoutState,
-    Host,
-    InvalidInventory,
-    Inventory,
-    Session,
-    inventory,
-    parse_inventory,
 )
 from scripts.agents.remote import other_machine, run_remote as run_remote, local_machine
 from scripts.agents.stop_results import StopResult, ResumeResult
 from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import (
-    Account,
     UnknownAccountName,
     UnreadableAccount,
     named_claude_account,
-    own_claude_account,
 )
 
 
@@ -111,108 +131,6 @@ class CommandLine(argparse.Namespace):
     job: str = ""
 
 
-class UnreachableMachine(TypedDict):
-    machine: str
-    unreachable: Literal[True]
-
-class UnavailableMachine(TypedDict):
-    machine: str
-    status: Literal["unavailable"]
-    rc: int
-    reason: str
-
-MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
-
-
-def _selected_account(requested: str | None) -> Account:
-    return own_claude_account() if requested is None else named_claude_account(requested)
-
-def _host_text(host: Host) -> str:
-    match host["kind"]:
-        case "unit":
-            return f"unit {host['unit']} (herdr {host['session_name']})"
-        case "legacy tmux" | "legacy tmux unit":
-            return f"{host['kind']} {host['session_name']} (manual recovery)"
-        case "herdr":
-            return f"herdr {host['herdr_session']}"
-        case "ghostty" | "zed":
-            desktop = host["desktop"]
-            return (
-                f"{host['kind']} on {desktop['name']}"
-                if desktop["kind"] == "named"
-                else host["kind"]
-            )
-        case kind:
-            return kind
-
-def _checkout_text(checkout: CheckoutState) -> str:
-    if checkout["kind"] == "not a checkout":
-        return "not a checkout"
-    head = checkout["head"]
-    name = head["name"] if head["kind"] == "branch" else head["commit"][:12]
-    upstream = checkout["upstream"]
-    tracking = (
-        f"ahead {upstream['ahead']}"
-        if upstream["kind"] == "tracking"
-        else "no upstream"
-    )
-    return f"{name} {tracking}, {len(checkout['dirty'])} dirty"
-
-def _session_lines(session: Session, _report: Inventory) -> list[str]:
-    summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
-    summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
-    lines = [summary]
-    lines.extend(f"    timer {timer}" for timer in session["timers"])
-    return lines
-
-def _inventory_lines(report: Inventory) -> list[str]:
-    lines = [f"{report['machine']}:"]
-    for session in report["sessions"]:
-        lines.extend(_session_lines(session, report))
-    lines.extend(
-        f"  unknown account · {item['pid']} {item['name']} · {item['reason']}"
-        for item in report["unattributed"]
-    )
-    if not report["sessions"] and not report["unattributed"]:
-        lines.append(f"  no sessions on {report['label']}")
-    return lines
-
-def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
-    return {
-        "machine": machine,
-        "status": "unavailable",
-        "rc": rc,
-        "reason": reason.strip() or "remote command failed",
-    }
-
-def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
-    local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
-    reports: list[MachineStatusReport] = [local]
-    if here:
-        return reports
-    arguments = ["status", selected.login, "--json", "--here"]
-    status, output = run_remote(arguments)
-    machine = other_machine()
-    if status == 255:
-        reports.append({"machine": machine, "unreachable": True})
-        return reports
-    if status != 0:
-        reports.append(_unavailable(machine, status, output))
-        return reports
-    try:
-        remote = parse_inventory(output)
-    except InvalidInventory as error:
-        reports.append(_unavailable(machine, status, str(error)))
-        return reports
-    if only:
-        remote["sessions"] = [session for session in remote["sessions"]
-            if session["session_id"] in only or (session["kind"] == "worker"
-                and session["owner"]["kind"] == "director" and session["owner"]["session_id"] in only)]
-        remote["unattributed"] = []
-    reports.append(remote)
-    return reports
-
-
 def wait_for_workers(record: staff.StaffSnapshot) -> None:
     """Name local worker turns and wait until each turn ends."""
     from scripts.herdr import worker_panes
@@ -238,27 +156,6 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         if not waiting:
             return
         time.sleep(1)
-
-
-USAGE = f"""usage: agents COMMAND
-  agents help
-  agents status [ACCOUNT] [--json] [--here]
-  agents pause NAME [--finish-step] --why TEXT
-  agents exit NAME [--finish-step] --why TEXT
-  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
-  agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
-  agents resume PRODUCER --resend-opening-prompt
-  agents resume --production SHOWRUNNER
-  agents retire NAME [--to PRODUCER]
-  agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
-  agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
-  agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
-  agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
-  agents remove-stray NAME SESSION
-  agents transfer NAME [--model MODEL --effort EFFORT]
-  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
-"""
 
 
 def _result_code(result: StopResult | ResumeResult) -> int:
@@ -563,6 +460,7 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
+    why = options.why
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -579,7 +477,7 @@ def _lifecycle(options: CommandLine) -> int:
         rows = [row] if row is not None else []
         if not rows:
             if options.command == "resume":
-                return _result_code(stop_resume.resume(options.session, why=options.why, to=options.to))
+                return _result_code(stop_resume.resume(options.session, why=why, to=options.to))
             raise staff.StaffNotFound(staff.StaffId(options.session))
     code = 0
     for row in rows:
@@ -606,17 +504,28 @@ def _lifecycle(options: CommandLine) -> int:
                     try:
                         if isinstance(row.paused, staff.Paused):
                             _ = staff.resume(str(row.id))
-                        result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                        result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
-                        if started and isinstance(row.exited, staff.Exited):
+                        if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
                     finally:
                         if not started and isinstance(row.paused, staff.Paused):
                             _ = staff.set_hold(str(row.id), row.paused)
             continue
+        if options.command == "exit" and row.kind == "producer":
+            if _worktree_is_remote(row):
+                outcome = unit_remote_command("exit-producer", row, record, why=why)
+                stopped = outcome["code"]
+            else:
+                result = stop_resume.stop_producer(row.id, why, deadline=worker_lifecycle.effective_deadline())
+                stopped = 0 if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)) else _result_code(result)
+            if not stopped:
+                print(f"{row.name}: exited")
+            code = max(code, stopped)
+            continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
-        held = row if already_exited else staff.pause(str(row.id), options.why)
+        held = row if already_exited else staff.pause(str(row.id), why)
         remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
@@ -633,7 +542,7 @@ def _lifecycle(options: CommandLine) -> int:
             if stopped:
                 continue
             if not already_exited:
-                held = staff.exit(str(row.id), options.why)
+                held = staff.exit(str(row.id), why)
         else:
             _ = _message(row, "Finish your current turn. Hold at the prompt. Do not start new work. Wait for agents resume.")
         print(f"{row.name}: {'exited' if isinstance(held.exited, staff.Exited) else 'paused'}")
@@ -656,8 +565,10 @@ def _restart_account(requested: str | None) -> restart.AllRestartAccounts | acco
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["status"]:
+        return status_entry.main(arguments, usage=_usage)
     if not arguments or arguments in (["help"], ["--help"], ["-h"]):
-        print(USAGE, end="")
+        print(_usage(), end="")
         return 0
     if arguments[0] == set_model.LOCAL_COMMAND:
         try:
@@ -667,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
-    parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
+    parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
@@ -719,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("target", metavar="ACCOUNT")
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--why", default="")
+    command = commands.add_parser("reboot")
+    _ = command.add_argument("--dry-run", action="store_true")
     command = commands.add_parser("restart")
     _ = command.add_argument("--why", default=restart.DEFAULT_RESTART_CAUSE)
     _ = command.add_argument("--all", action="store_true")
@@ -726,10 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--only", default="")
     _ = command.add_argument("--here", action="store_true")
     _ = command.add_argument("account", nargs="?")
-    command = commands.add_parser("status")
-    _ = command.add_argument("account", nargs="?")
-    _ = command.add_argument("--json", action="store_true", dest="as_json")
-    _ = command.add_argument("--here", action="store_true")
+    status_entry.add_arguments(commands.add_parser("status"))
     command = commands.add_parser("records")
     _ = command.add_argument("--json", action="store_true", dest="as_json")
     _ = command.add_argument("--here", action="store_true")
@@ -748,7 +658,10 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.run(options.role, options.model, options.effort)
         except (OSError, ValueError, conf.Unusable, staff.StaffRefused) as error:
             return set_model.report_error(error)
+    locks = ExitStack()
     try:
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move") and not options.dry_run:
+            locks.enter_context(herdr.reboot_lock())
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
@@ -759,10 +672,15 @@ def main(argv: list[str] | None = None) -> int:
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
+        if options.command == "reboot":
+            from scripts.agents import reboot
+
+            return reboot.run(dry_run=options.dry_run)
         if options.command == "stop" and options.all:
-            return restart.stop_all(dry_run=options.dry_run,
-                                    only=tuple(item for item in options.only.split(",") if item),
-                                    account=_restart_account(options.account))
+            selection = restart.BulkCommand("stop", account=options.account, all_rows=True,
+                only=tuple(item for item in options.only.split(",") if item), dry_run=options.dry_run)
+            return restart.run_command(lambda: restart.stop_all(dry_run=selection.dry_run,
+                                    only=selection.only, account=_restart_account(selection.account)), selection)
         if options.command == "move":
             move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
             if options.dry_run:
@@ -771,9 +689,11 @@ def main(argv: list[str] | None = None) -> int:
                 move_arguments.extend(("--why", options.why))
             return accounts.main(move_arguments)
         if options.command == "restart":
-            return restart.restart(stop_all=options.all, dry_run=options.dry_run,
-                                   only=tuple(item for item in options.only.split(",") if item),
-                                   account=_restart_account(options.account), why=options.why)
+            selection = restart.BulkCommand(account=options.account, all_rows=options.all,
+                only=tuple(item for item in options.only.split(",") if item), why=options.why,
+                dry_run=options.dry_run, here=options.here)
+            return restart.run_command(lambda: restart.restart(stop_all=selection.all_rows, dry_run=selection.dry_run,
+                                   only=selection.only, account=_restart_account(selection.account), why=selection.why), selection)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
@@ -814,21 +734,6 @@ def main(argv: list[str] | None = None) -> int:
             result = remote_control.fix(options.session, options.pid, options.proc_start,
                                         options.who, options.account or "")
             return int(isinstance(result, remote_control.Failed))
-        if options.command == "status":
-            selected = _selected_account(options.account)
-            reports = _status(selected, options.here)
-            if options.as_json:
-                print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
-            else:
-                print(f"{selected.label} · {selected.login}")
-                for report in reports:
-                    if "sessions" in report:
-                        print("\n".join(_inventory_lines(report)))
-                    elif "unreachable" in report:
-                        print(f"{report['machine']}: unreachable")
-                    else:
-                        print(f"{report['machine']}: unavailable (rc {report['rc']})")
-            return 0
         if options.command == "rename":
             if (producer_lifecycle.pending_rename(options.old)
                     or producer_lifecycle.pending_admission(options.old)
@@ -853,9 +758,10 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        row = record.by_member_reference(options.session) or record.by_path(options.session)
+        member = record.by_member_reference(options.session)
         matches = [member for member in record.rows if member.name == options.session]
-        row = row or (matches[0] if len(matches) == 1 else None)
+        named = matches[0] if len(matches) == 1 else None
+        row = member or record.by_path(options.session) or named
         if options.dry_run:
             target = stop_resume.stop_target(options.session)
             if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
@@ -866,15 +772,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row.name if row is not None else options.session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
-        result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
+        deadline = worker_lifecycle.effective_deadline()
+        target = member or named
+        result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
+                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
+    except herdr.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except staff.StaffRefused as error:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
     except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount,
-            InvalidInventory, herdr_types.HerdrFailure) as error:
+            herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
+    finally:
+        locks.close()
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -1220,7 +1134,7 @@ def retirement_find_unit(production_name: str, given: str, *,
         raise ValueError(f"{member.name}: staff worktree is unfilled")
     branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
     if unit_machine_is_local(location.machine) and location.path.is_dir():
-        branch = retirement_branch(location.path)
+        branch = retirement_branch(location.path) or branch
     return RetiringUnit(production, member.name, location.path, branch, member)
 
 def retirement_last_session(unit: RetiringUnit) -> str:
@@ -1244,9 +1158,83 @@ def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf
         commits.append(remote.stdout.split()[0])
     return commits
 
+def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path | None:
+    """Find a checkout that is rebasing the unit branch."""
+    listed = retirement_git(unit, "worktree", "list", "--porcelain", "-z", settings=settings)
+    if listed.returncode:
+        raise OSError(f"cannot list Git worktrees: {retirement_failure(listed)}")
+    checkouts: list[Path | None] = []
+    for section in listed.stdout.split("\0\0"):
+        entry, *fields = section.split("\0")
+        if entry.startswith("worktree "):
+            checkouts.append(None if "bare" in fields else Path(entry.removeprefix("worktree ")))
+    if not checkouts:
+        return None
+    primary, *linked = checkouts
+    resolved = retirement_git(unit, "rev-parse", "--path-format=absolute", "--git-common-dir", settings=settings)
+    if resolved.returncode:
+        raise OSError(f"cannot read the common Git folder: {retirement_failure(resolved)}")
+    common = Path(resolved.stdout.removesuffix("\n"))
+    try:
+        entries = tuple((common / "worktrees").iterdir())
+    except FileNotFoundError:
+        entries = ()
+    expected = f"refs/heads/{unit.branch}"
+    for git_dir in (common, *entries):
+        if git_dir == common and primary is None:
+            continue
+        for operation in ("rebase-merge", "rebase-apply"):
+            try:
+                branch = (git_dir / operation / "head-name").read_text(encoding="utf-8").removesuffix("\n")
+            except FileNotFoundError:
+                continue
+            if branch != expected:
+                continue
+            if git_dir == common:
+                return primary
+            pointer = (git_dir / "gitdir").read_text(encoding="utf-8", errors="surrogateescape").removesuffix("\n")
+            checkout = Path(os.path.abspath(git_dir / pointer)).parent
+            if checkout in linked:
+                return checkout
+    return None
+
+
+def _merge_leaves_target_tree_unchanged(unit: RetiringUnit, ref: str, merge_ref: str,
+                                        *, settings: conf.ConfigRead) -> bool:
+    """Check that a merge of the branch leaves the merge tree unchanged."""
+    branch = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", settings=settings)
+    if branch.returncode:
+        raise OSError(f"cannot resolve commit {ref}: {retirement_failure(branch)}")
+    target = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{merge_ref}^{{commit}}", settings=settings)
+    if target.returncode:
+        raise OSError(f"cannot resolve commit {merge_ref}: {retirement_failure(target)}")
+    drivers = retirement_git(unit, "config", "--get-regexp", r"^merge\..+\.driver$", settings=settings)
+    if drivers.returncode == 0:
+        return False
+    if drivers.returncode != 1:
+        raise OSError(retirement_failure(drivers))
+
+    target_commit = target.stdout.strip()
+    merged = retirement_git(unit, "merge-tree", "--write-tree", target_commit, branch.stdout.strip(), settings=settings)
+    merged_tree = merged.stdout.partition("\n")[0]
+    if merged.returncode:
+        if merged.returncode == 1 and merged_tree:
+            conflict_tree = retirement_git(unit, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                                           f"{merged_tree}^{{tree}}", settings=settings)
+            if conflict_tree.returncode == 0 and conflict_tree.stdout.strip() == merged_tree:
+                return False
+        raise OSError(retirement_failure(merged))
+    current = retirement_git(unit, "rev-parse", f"{target_commit}^{{tree}}", settings=settings)
+    if current.returncode:
+        raise OSError(retirement_failure(current))
+    return bool(merged_tree) and merged_tree == current.stdout.strip()
+
+
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
-    """Keep uncommitted work and commits outside the merge branch."""
+    """Keep uncommitted work and branch content missing from the merge branch."""
     present = unit.worktree.is_dir()
+    if unit.branch and (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+        return [f"branch {unit.branch} is rebasing in {rebasing}"]
     if not present and (not check_absent_branch or not unit.branch):
         return []
     found: list[str] = []
@@ -1263,11 +1251,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
     merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
     if not merge_refs:
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
+    # The fetched origin commit comes last when origin has the branch.
+    merge_target = merge_refs[-1]
     for ref in refs:
         commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip():
+        if commits.stdout.strip() and not _merge_leaves_target_tree_unchanged(unit, ref, merge_target, settings=settings):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found
@@ -1277,17 +1267,27 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     failed: list[str] = []
-    if unit.worktree.exists():
-        result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
-        release_worktree_pair(unit.worktree)
-        print(f"removed: worktree {unit.worktree}")
+    if not unit.branch and not os.path.lexists(unit.worktree):
+        return failed
+    try:
+        layout = worktrees.worktree_output(unit.worktree)
+        worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
+        if isinstance(layout, worktrees.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
+            worktrees.retire(unit.name)
+    except (OSError, ValueError, worktrees.Refused) as error:
+        return [str(error)]
+    if os.path.lexists(unit.worktree):
+        return failed
     if unit.branch:
-        if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
+        if (rebasing := retirement_rebase(unit, settings=settings)) is not None:
+            return [f"branch {unit.branch} is rebasing in {rebasing}"]
+        local = retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings)
+        if local.returncode not in (0, 1):
+            return [retirement_failure(local)]
+        if local.returncode == 0:
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
-                failed.append(retirement_failure(result))
+                return [retirement_failure(result)]
         observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
@@ -1324,7 +1324,8 @@ def retirement_journal(row: staff.StaffRow) -> Path:
 
 
 def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSnapshot,
-                        *, merge_branch: str = "", zone: str = "UTC", finish_step: bool = False) -> LocalUnitOutcome:
+                        *, merge_branch: str = "", zone: str = "UTC", finish_step: bool = False,
+                        why: str | None = None) -> LocalUnitOutcome:
     """Run machine-bound work and require an attributed remote answer."""
     location = row.worktree
     assert not isinstance(location, staff.WorktreeUnfilled)
@@ -1335,6 +1336,8 @@ def unit_remote_command(action: str, row: staff.StaffRow, record: staff.StaffSna
             raise ValueError(f"worktree belongs to this machine: {location.machine}")
         payload = {"action": action, "identity": str(row.id), "merge_branch": merge_branch, "zone": zone, "finish_step": finish_step,
                    "rows": [member.to_json() for member in record.rows]}
+        if why is not None:
+            payload["why"] = why
         status, output = run_remote(["_unit-local"], stdin=json.dumps(payload), limit=remote.WhileLinkAlive(kind="while link alive"))
         if status == 255:
             raise ValueError("remote command is unreachable or has no status")
@@ -1377,7 +1380,15 @@ def unit_local_command() -> int:
         try:
             if not unit_machine_is_local(location.machine):
                 raise ValueError(f"worktree belongs to {location.machine}")
-            if fields["action"] == "stop":
+            if fields["action"] == "exit-producer" and row.kind == "producer":
+                with staff.row_operation(str(row.id)):
+                    current = staff.initial_snapshot().rows_by_id.get(row.id)
+                    if current is None or current.current_session != row.current_session or current.worktree != location:
+                        raise ValueError("the producer changed before the stop")
+                    stopped = stop_resume.stop_producer(row.id, str(fields["why"]),
+                        deadline=worker_lifecycle.effective_deadline(), save_exit_after_stop=True)
+                result["code"] = int(bool(_result_code(stopped)))
+            elif fields["action"] == "stop":
                 if fields.get("finish_step"):
                     _finish_tasks(row, record)
                 reasons = stop_resume.stop_unit_workers(row.id, record)
@@ -1459,7 +1470,8 @@ def unit_local_command() -> int:
                     _ = unit_config.write_parked(row.id, replace(config, retired=facts))
             else:
                 raise ValueError("unknown remote lifecycle action")
-        except (OSError, ValueError, herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound,
+                herdr_types.HerdrFailure, unit_config.ConfigRefused, conf.Unusable, subprocess.SubprocessError) as error:
             result["code"] = 1
             print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}")
     result["output"] = output.getvalue()
@@ -1753,7 +1765,9 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     pair = unit_config.place(member.row.id, worktree, cleanup=False)
     if isinstance(pair, unit_config.Both) and not pair.same:
         raise RecoveryRefused(f"{pair.worktree} and {pair.parked}: configurations differ; no file was changed")
-    return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session)
+    branch = (location.branch.value if isinstance(location, staff.RemovedWorktree)
+              and isinstance(location.branch, staff.ParkedBranch) else member.row.name)
+    return RetiredUnitRecovery(production, name, worktree, branch, saved.plan, member.row.current_session)
 
 def recovery_resume_record(production: Production, name: str) -> Path:
     try:
@@ -1789,35 +1803,41 @@ def recovery_refusals(unit: RetiredUnitRecovery) -> list[str]:
             refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id}")
     except (RetirementRefused, OSError) as error:
         refused.append(f"{unit.name}: {error}")
-    if unit.worktree.exists() and not recovery_has_worktree(unit):
+    pending = worktrees.pending_checkout(unit.worktree, unit.production.checkout, unit.branch)
+    if os.path.lexists(unit.worktree) and not (pending or recovery_has_worktree(unit)):
         refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
-    elif not unit.worktree.exists():
-        if recovery_git(unit, "branch", "--list", unit.branch):
+    elif pending or not unit.worktree.exists():
+        if not pending and recovery_git(unit, "branch", "--list", unit.branch):
             refused.append(f"branch {unit.branch} still exists; retire did not finish")
         if recovery_git(unit, "ls-remote", "--heads", "origin", unit.branch):
             refused.append(f"origin {unit.branch} still exists; retire did not finish")
     return refused
 
 def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
-    # The row name is both the branch and the add_unit name.
-    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.branch,
-                 "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
+    arguments = [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.name,
+                 "--resume", unit.session_id, "--cwd", str(unit.worktree), "--join-recovery-locks",
+                 *unit_config.plan_arguments(unit.plan)]
     if isinstance(unit.account, accounts.NamedAccount):
         arguments.extend(["--account", unit.account.label])
     return arguments
 
 def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
-    if recovery_has_worktree(unit):
-        return
+    had_checkout = recovery_has_worktree(unit)
     branch = (build_folders.ExistingWorktreeBranch(unit.branch)
               if recovery_git(unit, "branch", "--list", unit.branch)
               else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
     try:
-        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
-            unit.worktree, unit.production.checkout, branch))
-    except (OSError, ValueError) as error:
+        record = worktrees.checkout_record(unit.worktree)
+        layout = (record.layout if record is not None and record.stage is worktrees.MakeStage.MAKING
+                  else worktrees.unit_checkout_output(
+                      unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
+        _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
+                                      layout, owner=unit.name, merge_branch=unit.production.merge_branch,
+                                      allow_existing=True)
+    except (OSError, ValueError, worktrees.Refused) as error:
         raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
-    print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
+    if not had_checkout:
+        print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
 
 def recovery_launch(unit: RetiredUnitRecovery) -> None:
     if recovery_is_running(unit) and not add_unit.pending_opening(unit.production, unit.name, unit.session_id):
@@ -1905,7 +1925,10 @@ def recovery_apply(name: str, *,
     try:
         record = staff.initial_snapshot()
         row = named_staff_unit(name, record)
-        with staff.row_operation(str(row.id)):
+        with staff.session_operation(row.current_session, native_key=moves.native_row_key(row.current_session)) as record:
+            current = record.by_current_session(row.current_session)
+            if current is None or current.id != row.id:
+                raise RecoveryRefused(f"{row.name}: recovery could not lock the current staff row")
             unit = recovery_find_unit(unit_production_name(row, record), str(row.id), record=record)
             completed = completion_receipt.read_receipt(recovery_resume_record(unit.production, unit.name).with_suffix(".done"),
                                                     record)
@@ -2336,14 +2359,17 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
+                layout_destination = worktrees.unit_rename_destination(folder, row.name, request.name)
                 target = _unit_rename_target(folder.name, row.name, request.name) if changed else folder.name
-                destination = folder.with_name(target) if target is not None else folder
+                destination = layout_destination or (folder.with_name(target) if target is not None else folder)
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
                 branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
                                   _unit_rename_target(branch, row.name, request.name))
-                if changed and target is None:
+                if layout_destination is not None and not isinstance(request.move, UnitBranchMove):
+                    renamed_branch = request.name + "-" + folder.name if branch == row.name + "-" + folder.name else branch
+                if changed and target is None and layout_destination is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if changed and renamed_branch is None:
                     print(f"anomaly: branch {branch} does not end with -{row.name}", file=sys.stderr)
@@ -2364,15 +2390,8 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
             if not isinstance(row.worktree, staff.WorktreeUnfilled):
                 changed = unit_move.move_idle_folder(row.id, row.worktree.path, branch=request.move.branch) or changed
         if pending is not None:
-            if not unit_move.rename_complete(staff.snapshot(), row, pending):
-                changed = unit_move.move_idle_folder(row.id, pending.destination, branch=pending.branch) or changed
-                record = staff.snapshot()
-                if (current := record.by_id(row.id)) is None:
-                    raise RenameRefused(f"{row.id}: the staff row is unavailable after the rename")
-                row = current
-            if unit_move.finish_rename(row, pending):
-                pending = None
-                changed = True
+            changed = unit_move.continue_rename(row, pending) or changed
+            pending = unit_move.pending_rename(row.id)
         notice = rename_notice_path(row.id)
         if notice.exists() and pending is None:
             fields = unit_move.json_object(read_json(notice))
@@ -2452,7 +2471,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktrees.Refused) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from io import StringIO
 import json
@@ -22,6 +22,7 @@ from scripts.buildlog import store
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
@@ -30,7 +31,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
 from scripts.mac_test.test_mac_queue_run import queue_fixture
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
 
@@ -192,7 +193,7 @@ from pathlib import Path
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.mac_test import mac_gate
-from scripts.production.merge_gate import SuiteMode
+from scripts.production.gate_routes import SuiteMode
 from scripts.production import gate_routes
 
 repo, callback, fd = sys.argv[1:]
@@ -201,7 +202,7 @@ if wrapper := os.environ.pop('MAC_GATE_QUEUE_WRAPPER', ''):
     os.environ['MAC_GATE_QUEUE_ENTRY'] = mac_gate.QUEUE_COMMAND[1]
     mac_gate.QUEUE_COMMAND = (sys.executable, wrapper)
 cancellation = gate_routes.MacGateCancellation(int(fd)) if fd else mac_gate.USE_CALLER_PROCESS_LIFETIME
-print(mac_gate.route(Path(repo), mode=SuiteMode.MERGE_GATE, full=True,
+print(mac_gate.route(Path(repo), mode=SuiteMode.GATE, full=True,
                      module_time_limit_s=30, cancellation=cancellation), flush=True)
 """
 
@@ -252,6 +253,8 @@ class MacGateTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {'GATE_STATE_DIR': str(self.root / 'gate-state')})))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         _ = gate.checked_git(self.repo, 'init', '-q')
@@ -278,7 +281,7 @@ class MacGateTests(unittest.TestCase):
               mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command))),
               mock.patch.object(mac_gate, 'MAC_TIME_LIMIT_S', timeout)):
             selection = gate.TreeSelection((module_path(job),), self.tree)
-            return mac_gate.route(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            return mac_gate.route(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                   module_time_limit_s=30, selected=selection)
 
     def test_returns_pass_and_test_failure(self) -> None:
@@ -348,7 +351,7 @@ class MacGateTests(unittest.TestCase):
                 folder = self.root / f'mac-gate-{kind}'
                 if kind == 'dirty':
                     _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# dirty fixture\n')
-                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
                 cloud_gate.save(folder / 'request.json', request)
                 cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
@@ -369,12 +372,13 @@ class MacGateTests(unittest.TestCase):
 
     def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         clone = self.exercise_bundle(self.repo, folder, request, expected=False)
 
         home = self.root / 'mac home'
-        remote = home / mac_gate.REMOTE_ROOT / folder.name
+        argv_file = folder / 'argv.json'
+        remote = home / mac_gate.REMOTE_ROOT / argv_file.with_suffix('.json.attempt').read_text()
         entry = remote / 'mac_gate.py'
         remote.mkdir(parents=True)
         entry.with_suffix('.py.new').touch()
@@ -386,7 +390,6 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 """)
         environment = {**os.environ, 'HOME': str(home), 'ZDOTDIR': str(home),
                        'PYTHONPATH': str(self.root / 'local-pythonpath')}
-        argv_file = folder / 'argv.json'
         stage = cast(list[str], json.loads(argv_file.read_text()))
         self.assertEqual(stage[:2], ['/bin/zsh', '-c'])
         stop = argv_file.with_suffix('.json.close').read_text()
@@ -402,8 +405,31 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                 self.assertEqual(json.loads(result.stdout),
                                  [str(home / '.claude'), str(entry), action, str(remote), *arguments])
 
-    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *, expected: bool) -> str:
-        argv_file = folder / 'argv.json'
+    def test_prepare_after_retained_cleanup_uses_a_fresh_remote_attempt(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
+        cloud_gate.save(folder / 'request.json', request)
+        _ = self.exercise_bundle(self.repo, folder, request, expected=False)
+        first = folder / 'argv.json'
+        first_attempt = first.with_suffix('.json.attempt').read_text()
+        retained = subprocess.CompletedProcess(['ssh'], 0, mac_gate.CheckoutCleanup.RETAINED + '\n', '')
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(subprocess, 'run', return_value=retained) as ssh):
+            self.assertEqual(mac_gate.lifecycle('cleanup', first, folder, '1'), 0)
+        cleanup_command = cast(list[str], ssh.call_args.args[0])
+        self.assertIn(first_attempt, cleanup_command[-1])
+        retry = folder / 'retry.json'
+        retry_command = self.exercise_bundle(self.repo, folder, request, expected=False, argv_file=retry)
+        retry_attempt = retry.with_suffix('.json.attempt').read_text()
+        self.assertNotEqual(first_attempt, retry_attempt)
+        self.assertIn(retry_attempt, retry_command)
+        self.assertIn(retry_attempt, retry.with_suffix('.json.close').read_text())
+        self.assertEqual(first.with_suffix('.json.attempt').read_text(), first_attempt)
+
+    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *,
+                        expected: bool, argv_file: Path | None = None) -> str:
+        if argv_file is None:
+            argv_file = folder / 'argv.json'
         _ = (folder / 'local-repo').write_text(str(self.repo))
         captured = subprocess.run
         clone_commands: list[str] = []
@@ -445,9 +471,10 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
               mock.patch.object(subprocess, 'run', side_effect=send)):
             self.assertEqual(mac_gate.lifecycle('prepare', argv_file, folder, '1'), 0)
         self.assertEqual(reconciled_hosts, ['fixture-mac'])
+        attempt = argv_file.with_suffix('.json.attempt').read_text()
         self.assertEqual(registered, [
             copies.RemoteMirror('fixture-owner', copies.SelectedRepository('fixture-project'),
-                                'fixture-mac', str(clone), folder.name, task='gate:' + folder.name),
+                                'fixture-mac', str(clone), folder.name, task='gate:' + attempt),
         ])
         self.assertEqual(argv_file.with_suffix('.json.checkout').read_text(), str(clone))
         self.assertEqual(argv_file.with_suffix('.json.lease').read_text(), str(lease))
@@ -461,7 +488,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def test_checkout_probe_rejects_a_nonzero_remote_status(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         error = subprocess.CalledProcessError(3, ['ssh'], output=f"{request['commit']}\npresent\npresent\n")
         with (mock.patch.object(subprocess, 'check_output', side_effect=error),
               self.assertRaises(subprocess.CalledProcessError)):
@@ -504,6 +531,61 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertIsNone(unrelated.poll())
         self.assertFalse(temporary.exists())
         self.assertFalse(root.exists())
+
+    def ended_gate_with_group(self, job_pid: int, temporary: Path) -> mac_gate.MacGateRecovery:
+        config = self.root / 'config'
+        _ = write_config_fixture(config / 'mac_gate.conf', 'terminate_grace_seconds=3\n')
+        _ = write_config_fixture(config / 'build_admission.conf', 'program_stop_seconds=5\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {'HOME': str(self.root), 'CONF_DIR': str(config)})))
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        folder.mkdir(parents=True)
+        cloud_gate.save(folder / 'checkout.json', {'path': str(self.repo)})
+        cloud_gate.save(folder / 'task-ended.json', {str(self.repo): 'fixture hold'})
+        guest = self.sleeping_process()
+        owner = process_start(guest.pid)
+        assert isinstance(owner, Started)
+        guest.kill()
+        _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
+        recovery = mac_gate.MacGateRecovery(folder / 'run.json', str(self.repo), guest.pid, owner.start)
+        recovery.folders.append(str(temporary))
+        recovery.add_group(job_pid)
+        return recovery
+
+    def test_receipt_clears_the_journal_and_stops_a_live_group_with_a_kept_checkout(self) -> None:
+        job = self.sleeping_process()
+        temporary = self.root / 'gate-temporary'
+        temporary.mkdir()
+        recovery = self.ended_gate_with_group(job.pid, temporary)
+        folder = recovery.path.parent
+        self.assertIn(job.pid, recovery.groups)
+        with mock.patch.object(scratch, 'end') as end:
+            with mock.patch.object(mac_gate, 'process_start', return_value=Started('reused')):
+                with self.assertRaisesRegex(GateRefused, 'Cannot prove ownership'):
+                    _ = mac_gate.stop_checkout(folder)
+            self.assertTrue(recovery.path.exists())
+            self.assertIsNone(job.poll())
+            self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_not_called()
+        self.assertEqual(job.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+        self.assertFalse(recovery.path.exists())
+        self.assertTrue((folder / 'task-ended.json').is_file())
+        self.assertEqual(mac_gate.read_checkout(folder), self.repo)
+        self.assertTrue(self.repo.is_dir())
+
+    def test_receipt_clears_the_journal_when_the_gate_build_folder_is_gone(self) -> None:
+        job = self.sleeping_process()
+        temporary = self.root / 'absent-gate-temporary'
+        recovery = self.ended_gate_with_group(job.pid, temporary)
+        self.assertFalse(temporary.exists())
+        self.assertTrue(recovery.path.exists())
+        job.kill()
+        _ = job.wait(timeout=TEST_HANG_GUARD_SECS)
+        with mock.patch.object(scratch, 'end') as end:
+            self.assertEqual(mac_gate.stop_checkout(recovery.path.parent), mac_gate.CheckoutCleanup.RETAINED)
+        end.assert_not_called()
+        self.assertFalse(recovery.path.exists())
+        self.assertFalse(temporary.exists())
 
     def test_retained_checkout_keeps_its_registration_until_removal(self) -> None:
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
@@ -576,6 +658,106 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             self.assertEqual(errors.getvalue().splitlines(), [notice])
             self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
             unregister.assert_called_once_with('fixture-mac', checkout)
+
+    def test_ended_lifecycle_stops_the_old_attempt_with_the_installed_gate(self) -> None:
+        home = self.root / 'Mac home'
+        folder = home / mac_gate.REMOTE_ROOT / 'mac-gate-old'
+        folder.mkdir(parents=True)
+        argv = self.root / 'argv.json'
+        checkout = self.root / 'removed checkout'
+        _ = argv.with_suffix('.json.checkout').write_text(str(checkout))
+        cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
+        _ = (folder / 'mac_gate.py').write_text("raise SystemExit('Old gate script')\n")
+        shim = home / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        installed = home / '.claude/scripts/mac_test/mac_gate.py'
+        installed.parent.mkdir()
+        _ = installed.touch()
+        write_stdlib_tool(shim, 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        run = subprocess.run
+
+        def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[:-1], ['ssh', '-n', '-o', 'BatchMode=yes', 'fixture-mac'])
+            self.assertTrue(capture_output and text and not check)
+            expanded = run(['/bin/sh', '-c', command[-1]], capture_output=True, text=True,
+                           timeout=TEST_HANG_GUARD_SECS, check=True)
+            words = cast(list[str], json.loads(expanded.stdout))
+            self.assertEqual(words, [str(installed), 'stop', str(folder), '--checkout', str(checkout)])
+            with mock.patch.object(sys, 'argv', words), redirect_stdout(StringIO()) as output:
+                status = mac_gate.main()
+            return subprocess.CompletedProcess(command, status, output.getvalue(), '')
+
+        with (mock.patch.dict(os.environ, {**copies_environment(home), 'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(subprocess, 'run', side_effect=ssh),
+              mock.patch.object(scratch, 'end', return_value=[]) as end,
+              mock.patch.object(copies, 'unregister_remote') as unregister):
+            self.assertEqual(mac_gate.lifecycle('cleanup-ended', argv, self.root / folder.name, '0'), 0)
+            self.assertFalse(folder.exists())
+            self.assertEqual(unregister.call_args_list, [mock.call('localhost', str(checkout)),
+                                                         mock.call('fixture-mac', str(checkout))])
+            unregister.reset_mock()
+            checkout.mkdir()
+            self.assertEqual(mac_gate.lifecycle('cleanup-ended', argv, self.root / folder.name, '0'), 0)
+            unregister.assert_not_called()
+            checkout.rmdir()
+            checkout.symlink_to(self.root / 'missing')
+            self.assertEqual(mac_gate.lifecycle('cleanup-ended', argv, self.root / folder.name, '0'), 0)
+            unregister.assert_not_called()
+            checkout.unlink()
+            self.assertEqual(mac_gate.lifecycle('cleanup-ended', argv, self.root / folder.name, '0'), 0)
+            unregister.assert_called_once_with('fixture-mac', str(checkout))
+        end.assert_called_once_with('gate:mac-gate-old')
+
+    def test_inline_checkout_waits_for_its_legacy_test_processes(self) -> None:
+        folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-inline'
+        repo = folder / 'repo'
+        repo.mkdir(parents=True)
+        pid = 21815
+        identity = Started('old test')
+        in_use = tmp_sweep.ProcessUsesKnown([(str(repo / 'target/test'), pid, 'test')])
+        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+              mock.patch.object(scratch, 'end', return_value=[]) as end,
+              mock.patch.object(folder_audit, 'process_uses', return_value=in_use) as scan,
+              mock.patch.object(mac_gate, 'process_start', side_effect=[identity, Started('reused')]),
+              mock.patch.object(os, 'kill') as kill):
+            with self.assertRaisesRegex(GateRefused, 'Test processes still use the Mac checkout'):
+                _ = mac_gate.stop_checkout(folder)
+            kill.assert_not_called()
+            end.assert_not_called()
+            self.assertTrue(repo.is_dir())
+            scan.assert_called_with([repo])
+        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+              mock.patch.object(scratch, 'end', return_value=[]),
+              mock.patch.object(folder_audit, 'process_uses',
+                                side_effect=[in_use, in_use, tmp_sweep.ProcessUsesKnown([])]),
+              mock.patch.object(mac_gate, 'process_start', return_value=identity),
+              mock.patch.object(os, 'kill') as kill):
+            self.assertEqual(mac_gate.stop_checkout(folder), mac_gate.CheckoutCleanup.REMOVED)
+            kill.assert_called_once_with(pid, signal.SIGKILL)
+        self.assertFalse(folder.exists())
+
+    def test_installed_stop_accepts_old_attempts_without_a_journal_or_script(self) -> None:
+        checkout = self.root / 'retained checkout'
+        checkout.mkdir()
+        with (mock.patch.dict(os.environ, copies_environment(self.root)),
+              mock.patch.object(scratch, 'end', return_value=[]),
+              mock.patch.object(copies, 'unregister_remote') as unregister):
+            for has_receipt in (False, True):
+                with self.subTest(has_receipt=has_receipt):
+                    folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-old'
+                    folder.mkdir(parents=True)
+                    args = ['mac_gate.py', 'stop', str(folder)]
+                    expected = mac_gate.CheckoutCleanup.REMOVED
+                    if has_receipt:
+                        cloud_gate.save(folder / 'checkout.json', {'path': str(checkout)})
+                        args.extend(('--checkout', str(checkout)))
+                        expected = mac_gate.CheckoutCleanup.RETAINED
+                    with mock.patch.object(sys, 'argv', args), redirect_stdout(StringIO()) as output:
+                        self.assertEqual(mac_gate.main(), 0)
+                    self.assertEqual(output.getvalue().strip(), expected)
+                    self.assertEqual(folder.exists(), has_receipt)
+            unregister.assert_not_called()
+        self.assertTrue(checkout.is_dir())
 
     def test_missing_close_script_checks_the_mac_checkout_path(self) -> None:
         folder = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
@@ -736,6 +918,14 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertEqual(empty, MacGateExclusions(()))
         _ = path.write_text('scripts/fixture/test_absent.py\nscripts/fixture/test_one.py\n')
         self.assertEqual(mac_gate.read_modules(self.repo), MacGateExclusions(('scripts/fixture/test_one.py',)))
+
+    def test_listed_production_modules_exist(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        entries = (checkout / mac_gate.MODULE_LIST).read_text().splitlines()
+        missing = [name for line in entries
+                   if (name := line.partition('#')[0].strip()).startswith('scripts/production/')
+                   and not (checkout / name).is_file()]
+        self.assertEqual(missing, [])
 
     def test_list_writer_excludes_failures_and_count_mismatches(self) -> None:
         mac = (module_job('one'), module_job('tests', tests=11), module_job('skips', skips=1),
