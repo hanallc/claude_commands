@@ -843,6 +843,10 @@ function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
 }
 function ciRow(row) { return row.ci || !!row.ci_label; }
+// A guest row is the queue row of a gate run on mac-linux. Its gate consumed the launch permission.
+// An unconfirmed row has no confirmed guest attempt yet.
+function guestRow(row) { return !!row.guest_run || !!row.guest_unconfirmed; }
+function guestState(row) { return row.guest_unconfirmed ? "not confirmed" : "running"; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
@@ -909,12 +913,13 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
-  const guestFields = row.guest_run ? [field('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
+  const guestFields = guestRow(row) ? [field('Runs on', row.machine),
+    field('Guest attempt', row.guest_run?.attempt || guestState(row))] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && namesGuest
     ? [field('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
-    : stepTitle(row, unavailable && !row.guest_run ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+    : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
@@ -1823,11 +1828,11 @@ function renderWalk(d) {
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const targetCell = (machine, named) => {
+  const targetCell = (machine, named, state = "running") => {
     if (!named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
     const targets = machine && !named.includes(machine) ? [...named, machine] : named;
     const labels = targets.map(target => target === machine
-      ? `<strong class="machine" data-machine="${esc(target)}">${esc(target)} (running)</strong>`
+      ? `<strong class="machine" data-machine="${esc(target)}">${esc(target)} (${esc(state)})</strong>`
       : `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ");
     const content = machine ? labels : `<span class="wait-target">${labels || "—"}</span>`;
     return `<td class="machine" data-machine="${esc(targets.join(" or "))}">${content}</td>`;
@@ -1839,7 +1844,7 @@ function renderWalk(d) {
       (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
-  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.guest_run || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
@@ -1849,7 +1854,8 @@ function renderWalk(d) {
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    const target = targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined);
+    const target = targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : guestRow(r) ? [r.machine] : undefined,
+      guestRow(r) ? guestState(r) : undefined);
     cells(stageText(r),
       r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, target, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
