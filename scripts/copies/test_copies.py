@@ -29,6 +29,7 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, build_slots, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.git_test_support import commit_repository
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
@@ -2280,6 +2281,23 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
         self.assertEqual({key: value for key, value in self.snapshot(self.source).items() if not key.startswith(".git/")}, before)
         self.assertEqual((self.source / ".git/index").read_bytes(), source_index)
+
+    def test_an_inherited_git_dir_never_reaches_the_copy_git_commands(self) -> None:
+        other = self.base / "other-repository"
+        other.mkdir()
+        _ = self.git(other, "init", "-q", "-b", "main")
+        _ = (other / "other.txt").write_text("other\n")
+        _ = commit_repository(other, "other first")
+        before = (self.git(other, "for-each-ref"), self.snapshot(other))
+        _ = (self.source / "tracked.txt").write_text("working edit\n")
+        # A hook or a test runner can export the Git folder of another repository.
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}), \
+                copies.standing(self.owner_id, self.source, copies.WorktreeSource(self.head, self.source)) as tree:
+            self.assertEqual((tree / "tracked.txt").read_text(), "working edit\n")
+            self.assertEqual(copies.git(tree, "log", "-1", "--format=%s").decode().strip(),
+                             f"gate: uncommitted {self.source} at {self.head[:7]}")
+            self.assertEqual(copies.commit_at(tree, "HEAD^"), self.head)
+        self.assertEqual((self.git(other, "for-each-ref"), self.snapshot(other)), before)
 
     def test_apply_changes_refuses_an_untracked_nested_repository(self) -> None:
         nested = self.source / "nested"

@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_remotes, git_rescue, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_environment, git_index, git_remotes, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -64,6 +64,8 @@ LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+# worktree_objects sets this, so Git writes working file objects into the copy.
+COPY_OBJECTS: ContextVar[Path | None] = ContextVar("copy_objects", default=None)
 
 
 @dataclass(frozen=True)
@@ -263,12 +265,21 @@ MergePolicy = NoMerge | MergeRevision
 NO_MERGE = NoMerge()
 
 
+def _git_environment() -> dict[str, str]:
+    """Drop an inherited GIT_DIR and the other repository variables, and keep the copy object folder."""
+    environment = git_environment.repository_environment()
+    objects = COPY_OBJECTS.get()
+    if objects is not None:
+        environment["GIT_OBJECT_DIRECTORY"] = str(objects)
+    return environment
+
+
 def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
     """Run Git with the private index and retain its preparation errors."""
     timeout = load_config().git_timeout_seconds
     try:
         result = subprocess.run(["git", "-C", str(source), *arguments],
-                                env={**os.environ, "GIT_INDEX_FILE": str(index)},
+                                env={**_git_environment(), "GIT_INDEX_FILE": str(index)},
                                 capture_output=True, timeout=timeout,
                                 pass_fds=(build_folders.build_folder_lock_fd(index.parent),))
     except subprocess.TimeoutExpired as error:
@@ -493,7 +504,8 @@ def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
         # Git children inherit the busy lock. Keep automatic maintenance synchronous.
         result = subprocess.run(["git", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
                                  "-C", str(repo), *arguments], input=data,
-                                capture_output=True, timeout=timeout, pass_fds=COMMAND_LOCKS.get())
+                                capture_output=True, timeout=timeout, pass_fds=COMMAND_LOCKS.get(),
+                                env=_git_environment())
     except subprocess.TimeoutExpired as error:
         raise CopyError(f"git {' '.join(arguments)} in {repo}: timed out after {timeout:g} seconds") from error
     if result.returncode:
@@ -1091,15 +1103,11 @@ def worktree_objects(tree: Path, worktree: Path) -> Generator[None]:
     alternates = objects / "info/alternates"
     with alternates.open("a") as output:
         _ = output.write(source_objects + "\n")
-    previous = os.environ.get("GIT_OBJECT_DIRECTORY")
-    os.environ["GIT_OBJECT_DIRECTORY"] = str(objects)
+    token = COPY_OBJECTS.set(objects)
     try:
         yield
     finally:
-        if previous is None:
-            _ = os.environ.pop("GIT_OBJECT_DIRECTORY", None)
-        else:
-            os.environ["GIT_OBJECT_DIRECTORY"] = previous
+        COPY_OBJECTS.reset(token)
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,7 @@ from typing import Never, cast, override
 from unittest import mock
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
-from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_environment, git_files, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -109,6 +109,8 @@ class FolderFormTests(unittest.TestCase):
             _ = folders.repo_word(self.root)
 
     def test_repo_word_uses_the_configured_git_timeout(self) -> None:
+        # Read the repository variables before the fake replaces Git.
+        _ = git_environment.repository_environment()
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
                 [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
             self.assertEqual(folders.repo_word(self.root), "widget")

@@ -11,7 +11,11 @@ def _repository_variables() -> frozenset[str]:
     # Git lists these variables, and clears them itself when it enters another repository.
     listing = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True,
                              cwd="/", timeout=30).stdout
-    return frozenset(listing.split())
+    variables = frozenset(listing.split())
+    # The cache keeps a result for the whole process. Refuse output that is not the list, for example a test fake.
+    if "GIT_DIR" not in variables:
+        raise RuntimeError(f"git rev-parse --local-env-vars did not list GIT_DIR; output: {listing!r}")
+    return variables
 
 
 def repository_environment() -> dict[str, str]:
