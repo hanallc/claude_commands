@@ -1222,6 +1222,26 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual((identity.name, identity.unit), (name, owner_unit))
                     self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
 
+    def test_a_step_that_does_not_say_who_started_it_is_refused_before_the_queue(self) -> None:
+        with AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+            request = fixture.request(step="check")
+            arguments = ["place-step", "--once", "--pid", str(request.owner.pid), "--episode", request.episode,
+                "--since", str(request.since), "--repo-root", str(fixture.root),
+                "--assignment-file", str(fixture.root / "assignment.json"), "--", "cargo", "check"]
+            with fixture.serving(), \
+                 mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                     request.profile, step_estimator.ReusableEstimate())), \
+                 mock.patch.object(records, "request_owner",
+                                   return_value=records.OwnerNotGiven("systemd · cargo-liner-install7.service")), \
+                 redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                self.assertEqual(client.main(arguments), 2)
+                with fixture.loop_turn():
+                    self.assertNotIn(request.episode, fixture.server.placement_requests)
+                    self.assertNotIn(request.episode, fixture.server.waiters)
+        self.assertEqual(errors.getvalue(), "build queue refused the step: it does not say who started it"
+            + " (systemd · cargo-liner-install7.service). Set BUILDLOG_OWNER_STAFF_ID to the owner's staff id,"
+            + " or CLAUDE_SESSION_NAME to a name when no staff member owns the work.\n")
+
     def use_transport(self, fixture: AdmissionFixture, *exchanges: Exchange) -> ScriptedTransport:
         transport = ScriptedTransport(fixture.clock, *exchanges)
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))

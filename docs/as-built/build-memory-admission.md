@@ -1028,6 +1028,19 @@ The function returns one type for each result, and uses the first rule that matc
 6. Other callers: `OwnerNotGiven("script · <outermost script file>")`, else `script · <command of the process>`.
 The service uses the same function for a scope with no recorded caller, and shows the program text.
 It reads the family of the oldest scope process.
+`admission_client.refuse_unowned` refuses an `OwnerNotGiven` request in `step_request`, before the request enters the queue.
+`admission_client.py place-step` prints `OWNER_REFUSAL` and exits 2. The text names the program and says to set
+`BUILDLOG_OWNER_STAFF_ID` to a staff id, or `CLAUDE_SESSION_NAME` to a name when no staff member owns the work.
+`queue_place.py`, and the cargo wrapper through it, prints `memory admission check failed (<OWNER_REFUSAL text>); step refused`
+and `queue place: ...`, and exits 1.
+The client refuses these callers when they set no owner variable and the worktree has no owner record:
+- A family with a process in a systemd `.service` unit and no tty, such as an agent probe under `systemd-run` or a timer.
+- A family under an agent with no session.
+- A family in another scope, such as a `run-*.scope`, with no tty.
+The documented probe form `systemd-run --user --scope ...` passes: the scope keeps the environment of the caller,
+so the session variable of the caller names the owner.
+The service form `systemd-run --user --wait --pipe ...` starts with the environment of the user manager, which has no owner variable.
+For raw cargo or `verify.sh` in a folder that has no owner record, add `-E CLAUDE_CODE_SESSION_ID` or `-E CLAUDE_SESSION_NAME`.
 These callers always give an owner, also under systemd or with no session:
 - The merge gate and the nightly gate: `default_owner(<unit>)` around the suites.
 - `gate.py --tests-only` and `--affected` (targeted_test): `default_owner(copies.source_owner(repo))`.

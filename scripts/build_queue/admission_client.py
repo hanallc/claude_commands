@@ -1903,6 +1903,19 @@ def owned_identity(step: str, worktree: str, owner: records.QueueCaller | record
                          identity["folder"], identity.get("unit", ""))
 
 
+OWNER_REFUSAL = ("build queue refused the step: it does not say who started it ({program}). "
+                 "Set BUILDLOG_OWNER_STAFF_ID to the owner's staff id, or CLAUDE_SESSION_NAME to a name "
+                 "when no staff member owns the work.")
+
+
+def refuse_unowned(owner: records.QueueCaller | records.OwnerNotGiven) -> None:
+    """Refuse a request that does not say who started it, before it enters the queue."""
+    from scripts.build_queue import admission_records as records
+
+    if isinstance(owner, records.OwnerNotGiven):
+        raise CheckerFailure(OWNER_REFUSAL.format(program=owner.program))
+
+
 def verify_call() -> records.VerifyStep:
     """Read the verify call facts from the shell that starts the step."""
     from scripts.build_queue import admission_records as records
@@ -1942,6 +1955,7 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
         records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
     caller = records.request_owner(estimate.profile.worktree or os.getcwd())
+    refuse_unowned(caller)
     identity = replace(owned_identity(estimate.profile.step, estimate.profile.worktree, caller), verify=verify_call())
     if isinstance(estimate.profile, records.ProgramProfile):
         identity = replace(identity, folder=estimate.profile.worktree)
