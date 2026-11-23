@@ -57,7 +57,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "UNIT_RUN_ROOT": str(self.session_dir.parent),
             "SCRATCH_ROOT": str(self.session_dir.parent / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(self.session_dir.parent / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.session_dir.parent / "scratch-holds.json"),
         })))
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):

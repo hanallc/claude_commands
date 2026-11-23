@@ -1792,7 +1792,7 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 
 ### Scratch folders (`scripts/lib/scratch.py`, `scripts/hooks/pre-tool-use-scratch-guard.py`)
 
-`scratch.conf` holds the default lifetime, visible root, hold file, repository depth, excluded folders, and random suffix length.
+`scratch.conf` holds the default lifetime, hold file, repository depth, excluded folders, and random suffix length.
 The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
 `CONF_DIR` selects the configuration folder.
 
@@ -1800,13 +1800,12 @@ The folder audit reads clone age from `hana_instances.conf` and the Mac disk flo
 It reads its other limits and default state folder from `lint.conf` through the same reader.
 The audit and temporary sweep share `folder_remove_after_seconds`.
 The audit and repository scan share `scratch.conf` `repo_skip`.
-The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
-`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new [--task <task> | --until <when>] [--name <word>]` makes a folder and prints its path.
 `scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
 The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
@@ -1847,7 +1846,6 @@ The folder stays with its hold marked ended.
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
-`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
@@ -1860,7 +1858,7 @@ Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/ses
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.
 It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
-In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+In ~/rust, `config/rust_roots.txt` and `scratch` name kept folders.
 Every folder in ~/rust/scratch is loose.
 In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
 The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
