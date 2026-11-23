@@ -90,11 +90,11 @@ Each control has one name across the console.
 Use one shared function for a control that appears on multiple pages.
 A console phase reads this section before it starts.
 
-Review opens a record in a dialog.
-The List expands the record below its row.
-The record dialog and the New item dialog use the same frame.
+Review and The List open a record below its summary row.
+A refresh updates the open row at once.
+The open row keeps its place on the screen, the draft, focus, and text selection.
+The New item dialog uses the console dialog frame.
 Select **Close**, press Esc, or select the backdrop to close the dialog.
-The record stays in the table while its dialog is open.
 
 Staff names use the current role colors from the Accounts reader.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
@@ -442,30 +442,44 @@ The console shell inlines the icons and makes no CDN, font, script, or styleshee
 
 ### Review page
 
-An open item shows its detail and actions in the item dialog.
-A refresh updates the table and stores the latest detail for the open item.
-Outside the delivery window, a refresh that changes the detail offers **Show updates**. The detail and its signed form stay in place until the user selects it.
-The dialog keeps edits made during a save, including the field selection.
-A save response from before the dialog closed cannot replace the reopened detail.
-The dialog reserves space for the update notice outside the scrolling body.
-Actions on a changed record require the latest detail.
-The draft stays editable during the refresh and is available when the new detail opens.
+Select a Review row to show its detail and actions below the summary.
+A refresh updates the table and the open row at once; there is no **Show updates** step.
+Review and The List use the shared `record_table` function `preserveRecordRowTop` around each refresh, detail load, and save result.
+The function measures the open row before and after the update and scrolls by the difference.
+It turns off scroll anchoring while it sets its top space, and its scroll target keeps the current fraction of a pixel.
+Firefox scrolls by whole pixels from a fractional position, so the row stays within 0.1 px there too.
+The open row keeps edits made during a save, including the field selection.
+A save response from before the row closed cannot replace the reopened detail.
+The draft stays editable during the refresh and stays in the new detail.
 The next open shows the latest detail.
-The dialog shows its own saved result immediately.
+A question or feedback on a change or a proposal keeps its row open, and the row shows its own saved result immediately.
+A Tell that completes a proposal keeps the completed result in its open row.
+Every other save fades the row out during the save and closes it.
 If the response has no detail, the page requests the detail immediately.
-A confirmed Park or Close closes the dialog, even if the detail cannot refresh.
+A confirmed action that closes the item closes the row, even if the detail cannot refresh.
 The response reports whether message delivery is pending.
-The dialog applies refreshes automatically through the first refresh that reports delivery ended.
-The setting page_delivery_window_seconds limits the time for automatic refreshes.
+Each refresh in the delivery window asks for the delivery state, through the first refresh that reports delivery ended.
+The setting page_delivery_window_seconds limits the delivery window.
 Review publishes the current question delivery notice before it reports that delivery ended.
 Linked and standalone Review cards reserve a 52 pixel status row above the body.
 The row shows the save failure and **Show updates** without moving the shown detail.
 A long failure reason ends in an ellipsis, and its title contains the full reason.
 The old form cannot submit while the update waits.
 The card keeps edits when the user selects **Show updates**.
-The dialog shows a refresh error outside the body and keeps the shown detail and draft.
-If the item leaves the list, the dialog keeps the last detail and disables the actions.
-Close returns focus to the item when its row is present.
+The open row shows a refresh error below the detail and keeps the shown detail and draft.
+If a refresh removes the open item, its row leaves the table.
+An item link in the address to an item that is not on the Review page closes the open row and shows the missing item notice.
+A `data-record-jump` link inside a card to a missing item keeps the row open and shows the link notice in the row.
+A linked item that a save handed off stays hidden until a snapshot shows it in its new state.
+The exception is a row that its own save kept open with the result.
+That row stays open and listed until the user closes it or opens another item.
+A refresh, a chip that keeps the row listed, Back or Forward to the same open item, or a link to that item never ends it.
+After that, a new link to the item shows no row until the snapshot arrives.
+Closing the row returns focus to its toggle when focus was in the open row.
+The open row's log scrolls in its own area, like the List log, with the same `list_log_max_height_rem` limit.
+A refresh, a detail load, or a save result keeps the log's first visible entry at the same place.
+The question and answer show below the log, in the log column.
+The log then keeps at least 8 rem of height.
 
 The For you Type chip follows All.
 It uses the same action reader as the console notifier.
@@ -663,7 +677,8 @@ After a lost response for a pending capture, Send retries the original payload, 
 The dialog keeps any edits for a new Send.
 Review refreshes the saved row.
 The List refreshes its records after the save.
-Both pages keep the address, scroll position, and focus while the dialog holds edits.
+Both pages keep the address and focus while an open item holds edits.
+The open row keeps its place on the screen.
 Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.
@@ -920,7 +935,8 @@ A change with the showrunner appears in All as soon as the page reads the saved 
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh keeps the open item and its draft, including the Assign choice.
-The dialog keeps the reading position when new text or log entries appear above it.
+The open row keeps its place on the screen when new text or log entries appear above it.
+Its log keeps the first visible entry at the same place.
 If the assignee becomes unavailable, Assign keeps the choice and shows “not available”.
 Approve refuses an unavailable assignee.
 Select another option to approve.
@@ -1363,7 +1379,13 @@ Bold delimiters require adjacent text and a valid whitespace or punctuation boun
 Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
-Mark read clears the dot and adds a log entry without sending a message.
+Mark read clears the dot and adds a log entry.
+Mark read on an unparked Waiting for nate item with no open question also sets the state to Working.
+The same write logs the state change and saves a notice for the item's producer.
+The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
+The existing sender delivers it with its retry and alert rules.
+The page applies the Working state from the response, so the row leaves Needs me in place.
+Mark read on any other item sends no message.
 All actions use the record keeper and item ID from the signed form.
 Ask question and feedback can mark the update read after the action saves.
 The form signature includes the identity of the unread update that the row shows.
@@ -1519,7 +1541,9 @@ The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
-The notice tells the record keeper which action Nate completed.
+The notice tells its recipient which action Nate completed.
+The recipient is the item's producer for Mark read and the record keeper for each other action.
+The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Feedback sends the user's words without changing the item state or parking time.
@@ -1574,7 +1598,8 @@ A repeated POST retries a pending request without adding another pending log ent
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows the record keeper and send time until the next log entry from that keeper.
+The Update cell shows “sent to <recipient>” with its time until the next log entry from another writer.
+The recipient is the record keeper, or the item's producer for a Mark read notice.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
