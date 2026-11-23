@@ -5276,7 +5276,7 @@ observer.observe(original.parentElement,{childList:true});
 
                 edited = the_list.update(MORTY.id, item.id, {"title": "New title"}, source="morty")
                 target = change_page.list_question_target(Path(claimed.source.path), edited.id, edited.number,
-                                                          edited.title, MORTY.id)
+                                                          edited.title, MORTY.id, keeper=MORTY.id)
                 with status.locked(), self.subTest(check="state after edit"):
                     view = change_page.question_delivery_view(status, target.saved(edited.questions[0]))
                     self.assertEqual(view.state, previous_state)

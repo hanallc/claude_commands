@@ -433,10 +433,11 @@ class QuestionDeliveryTarget:
 
 
 def list_question_target(path: Path, item: str, number: int, title: str,
-                         recipient: staff.StaffId, *,
+                         recipient: staff.StaffId, *, keeper: staff.StaffId,
                          alert_owner: staff.StaffId | None = None) -> QuestionDeliveryTarget:
+    # The command names the record's folder, so a recipient never answers a same-number record in its own folder.
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-               + 'answer {item} --question {question_id} --text "<answer>"')
+               + f'answer {{item}} --keeper {shlex.quote(keeper)} --question {{question_id}} --text "<answer>"')
     return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner)
 
 
@@ -1061,7 +1062,8 @@ def _claim_recovered_page_question(status: DeliveryStatus, record: QuestionAttem
         with listing.locked(), status.locked():
             fields, question = _open_list_question(listing, record)
             target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
-                                          record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
+                                          record.recipient_id, keeper=listing.owner,
+                                          alert_owner=staff.StaffId(fields["owner"]))
             return _recover_saved_question(status, target, record, (question,))
     return NoMessageDelivery()
 

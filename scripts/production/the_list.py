@@ -1913,7 +1913,7 @@ def _list_question_target(keeper: staff.StaffId, item: ListItem, recipient: staf
                           ) -> change_page.QuestionDeliveryTarget:
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
-                                           recipient, alert_owner=owner)
+                                           recipient, keeper=keeper, alert_owner=owner)
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:

@@ -1442,7 +1442,7 @@ An open question adds a Producer answering note below the saved state.
 The recipient runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
 Morty can answer any List question.
 Without `--keeper`, the command uses the caller's List folder if it holds the item, and morty's folder if not.
-Only morty can use `--keeper <staff-id>` to answer in another keeper's folder.
+Only morty can name a keeper other than itself or the caller.
 Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
