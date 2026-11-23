@@ -434,6 +434,13 @@ class HandMadeTests(AttemptCase):
         self.assertLessEqual(shown.items(), cast(dict[str, str], json.loads(lines[0][len(prefix):])).items())
         self.assertNotIn("RUSTFLAGS", self.calls[0][-1])
 
+    def test_the_private_sccache_server_gets_the_size_of_the_shared_cache(self) -> None:
+        # Without the size, the private server takes the sccache default and removes the oldest files of the
+        # shared cache folder down to that size when it starts.
+        with mock.patch.dict(os.environ, {"SCCACHE_CACHE_SIZE": "77G"}):
+            status, _ = self.attempt((sys.executable, "-c", "import os; print(os.environ.get('SCCACHE_CACHE_SIZE'))"))
+        self.assertEqual((status, self.output.getvalue()), (0, b"77G\n"))
+
     def test_the_run_starts_the_first_path_match_and_no_later_one(self) -> None:
         first, second = self.root / "a", self.root / "b"
         for folder in (first, second):

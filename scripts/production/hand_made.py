@@ -65,9 +65,11 @@ UV_VALUE_LETTERS = "CPfipw"
 # Long options of env that take the next word as their value. env accepts a unique start of each name.
 ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
 # Variables that the program also gets when they are set; the model sees each one with its value.
+# SCCACHE_CACHE_SIZE gives the private sccache server of the read limit the size of the shared cache. Without it,
+# that server takes the sccache default and removes the oldest files of the shared cache folder when it starts.
 SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PATH", "BINDGEN_EXTRA_CLANG_ARGS",
-                             "SCCACHE_DIR", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE",
-                             "NIX_LDFLAGS"})
+                             "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CC", "CXX",
+                             "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
 PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
 # The characters that split a word into values, as in --config build.target-dir="/tmp/x".
