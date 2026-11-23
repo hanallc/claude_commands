@@ -77,37 +77,79 @@ class BuildSpaceTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIn(head.episode, fixture.server.reservations)
 
+    def build_space_events(self, fixture: AdmissionFixture) -> list[dict[str, object]]:
+        path = fixture.state_dir / "queue_times.jsonl"
+        if not path.exists():
+            return []
+        with path.open("rb") as handle:
+            return [row for row in store.whole_rows(handle, 0)
+                    if row.get("kind") in ("build_space_hold", "build_space_clear")]
+
+    def disk(self, fixture: AdmissionFixture, free: list[int | None]) -> None:
+        """Serve the build floor from free[0] GiB; None makes the reading fail."""
+        output = self.configure_floor(fixture)
+
+        def read_build_space(path: Path) -> os.statvfs_result:
+            self.assertEqual(path, output)
+            if free[0] is None:
+                raise OSError("fixture disk offline")
+            return os.statvfs_result((4096, 4096, 100000000, 90000000, free[0] * GIB // 4096, 0, 0, 0, 0, 255))
+
+        _ = fixture.enter_context(mock.patch.object(os, "statvfs", side_effect=read_build_space))
+
     def test_a_build_space_hold_records_one_timed_event_when_it_starts_and_one_when_it_ends(self) -> None:
         with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
-            output = self.configure_floor(fixture)
-            free = 125 * GIB
-
-            def read_build_space(path: Path) -> os.statvfs_result:
-                self.assertEqual(path, output)
-                return os.statvfs_result((4096, 4096, 100000000, 90000000, free // 4096, 0, 0, 0, 0, 255))
-
-            def events() -> list[dict[str, object]]:
-                with (fixture.state_dir / "queue_times.jsonl").open("rb") as handle:
-                    return [row for row in store.whole_rows(handle, 0) if row.get("kind") in gate.BUILD_SPACE_EVENTS]
-
-            with mock.patch.object(os, "statvfs", side_effect=read_build_space):
-                started = fixture.clock.now()
-                _ = fixture.run_pass()
-                fixture.clock.advance(60)
-                _ = fixture.run_pass()
-                # A restarted service knows no earlier pass; the log already has the start.
-                fixture.server.build_space_held = None
-                _ = fixture.run_pass()
-                free = 151 * GIB
-                fixture.clock.advance(60)
-                ended = fixture.clock.now()
-                _ = fixture.run_pass()
-                _ = fixture.run_pass()
-            self.assertEqual(events(), [
+            free: list[int | None] = [151]
+            self.disk(fixture, free)
+            _ = fixture.run_pass()
+            self.assertEqual(self.build_space_events(fixture), [], "no hold, so no event")
+            free[0] = 125
+            fixture.clock.advance(60)
+            started = fixture.clock.now()
+            _ = fixture.run_pass()
+            fixture.clock.advance(60)
+            _ = fixture.run_pass()
+            fixture.restart()
+            _ = fixture.run_pass()
+            free[0] = None
+            _ = fixture.run_pass()
+            free[0] = 151
+            fixture.clock.advance(60)
+            ended = fixture.clock.now()
+            _ = fixture.run_pass()
+            _ = fixture.run_pass()
+            self.assertEqual(self.build_space_events(fixture), [
                 {"kind": "build_space_hold", "hold": {"kind": "BuildSpaceLow", "free_gib": 125, "floor_gib": 150},
                  "at": started},
                 {"kind": "build_space_clear", "at": ended},
             ])
+
+    def test_a_hold_that_ends_while_the_service_is_down_records_its_end_at_the_first_pass(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            free: list[int | None] = [None]
+            self.disk(fixture, free)
+            _ = fixture.run_pass()
+            fixture.server.close()
+            free[0] = 151
+            fixture.clock.advance(600)
+            fixture.server = fixture.new_server()
+            ended = fixture.clock.now()
+            _ = fixture.run_pass()
+            events = self.build_space_events(fixture)
+            self.assertEqual([event["kind"] for event in events], ["build_space_hold", "build_space_clear"])
+            self.assertEqual(events[0]["hold"], {"kind": "BuildSpaceUnreadable", "error": "fixture disk offline"})
+            self.assertEqual(events[1]["at"], ended)
+
+    def test_a_floor_removed_during_a_hold_records_the_end(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            self.disk(fixture, [125])
+            _ = fixture.run_pass()
+            write_memory_config(fixture.root / "build_admission.conf", free_floor_gib=None)
+            fixture.clock.advance(3600)
+            _ = fixture.run_pass()
+            _ = fixture.run_pass()
+            self.assertEqual([event["kind"] for event in self.build_space_events(fixture)],
+                             ["build_space_hold", "build_space_clear"])
 
     def test_failed_space_read_holds_new_steps_and_keeps_running_work(self) -> None:
         with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:

@@ -1711,8 +1711,11 @@ class AdmissionServer:
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
-        # The build space hold of the last pass; None until the first natedev reading.
-        self.build_space_held: bool | None = None
+        # The build space hold of the last pass. A start reads it from the last snapshot,
+        # so a restart writes no second start, and a hold that ended while the service was down gets its end.
+        previous = queue_snapshot.read_queue_snapshot(state_dir)
+        self.build_space_held: bool = (isinstance(previous, queue_snapshot.QueueSnapshot)
+                                       and not isinstance(previous.inputs.build_space, records.NoBuildSpaceHold))
         self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
         try:
             self.boot_id: str = boot_identity(proc.path)
@@ -2805,7 +2808,7 @@ class AdmissionServer:
         inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
-            self._record_build_space(inputs.build_space)
+        self._record_build_space(inputs.build_space)
         ci_holds = self._ci_hold_reasons()
         held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
         if held_owners:

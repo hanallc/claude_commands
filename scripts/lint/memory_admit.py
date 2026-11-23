@@ -1467,14 +1467,6 @@ def token_gap_recorded(rows: Iterator[dict[str, object]], event: dict[str, objec
     return False
 
 
-BUILD_SPACE_EVENTS = ("build_space_hold", "build_space_clear")
-
-
-def build_space_recorded(rows: Iterator[dict[str, object]], event: dict[str, object]) -> bool:
-    """True when the newest build space event already has this kind, as after a service restart."""
-    return next((row.get("kind") for row in rows if row.get("kind") in BUILD_SPACE_EVENTS), None) == event["kind"]
-
-
 def append_queue_time(directory: Path, event: dict[str, object], now: float) -> None:
     """Append under the history lock; a token gap can be retried after a stop."""
     path = directory / "queue_times.jsonl"
@@ -1485,9 +1477,6 @@ def append_queue_time(directory: Path, event: dict[str, object], now: float) -> 
             previous = chain((last,), rows)
             if event.get("kind") == "token_gap":
                 if token_gap_recorded(previous, event):
-                    return
-            elif event.get("kind") in BUILD_SPACE_EVENTS:
-                if build_space_recorded(previous, event):
                     return
             elif "event_id" in event:
                 event_at = event.get("admitted_at", event.get("ended_at", now))

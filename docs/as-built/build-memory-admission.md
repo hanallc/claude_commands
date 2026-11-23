@@ -578,8 +578,14 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+4. `build_space_hold` records the start of a build space hold, with the hold: low space or an unreadable disk.
+5. `build_space_clear` records the end of that hold.
 
-Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
+Each pass compares its build space hold with the last pass and writes an event only at a change.
+A restart reads the last hold from `admission/queue.json`, so it writes no second start. A hold that ended while the service was down gets its end at the first pass.
+These two events carry no `pid`.
+
+Each step event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
 A token wait ends an interval with `TokenReturn`. It does not complete the step.
 A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
