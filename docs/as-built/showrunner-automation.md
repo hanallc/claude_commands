@@ -541,7 +541,7 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
-The CLI requires a producer staff row for the current session.
+The CLI requires a producer staff row for commands other than confirmation.
 Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
@@ -616,7 +616,21 @@ Use `--repeat ''` to remove the repeat and keep one scheduled run.
 Use `update --state Working`, `park`, or `close` to remove the schedule.
 The record keeps its earlier log entries when the schedule changes or ends.
 A producer can change its own schedules. Morty can change all schedules.
-The CLI stores the schedule for later delivery.
+Herdr upkeep checks the List on natedev after it restores the shared server.
+The job uses its existing lock and interval.
+On the first check at or after the start, the List saves the run and sets the item to Working.
+The owner receives the instruction. The producer receives a copy.
+Each notice uses a saved key so a retry can recover a delivery that `send.py` accepted.
+If several runs became due while upkeep was off, the List sends the latest one and keeps the next start.
+
+Use `the_list.py confirm --id L<n>` to confirm the current run.
+The start message includes `--run` to select that exact run.
+The owner or morty can confirm. On the Mac, the command forwards the confirmation to natedev.
+If the confirmation time passes, the List sends one phone text to nate and a second message to the producer.
+The List starts this time limit when it saves the run as Working.
+It stores the result on the same log line as the start.
+After confirmation or timeout, a repeat returns to Scheduled if runs remain.
+The item stays open when the series ends.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
@@ -666,6 +680,7 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 | `done_when_max_chars` | 160 characters for done-when |
 | `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
 | `series_run_limit` | 730 runs per series, including the start |
+| `confirm_wait_minutes` | 15 minutes for the owner to confirm a scheduled run |
 
 The CLI refuses a write if the applicable text setting is missing, invalid, or too small for the supplied text.
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.

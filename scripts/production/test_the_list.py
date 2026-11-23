@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
-from scripts.message import send_result
+from scripts.message import send_result, session_send
 from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
@@ -71,7 +71,7 @@ class TheListTests(unittest.TestCase):
         _ = os.environ.pop("CONF_DIR", None)
         self.list_config = self.root / ".claude/config/the_list.conf"
         self.list_config.parent.mkdir(parents=True)
-        settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730}
+        settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730, "confirm_wait_minutes": 15}
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in settings.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
@@ -258,6 +258,134 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.parked_until, the_list.NoTimestamp.UNSET)
         self.assertEqual(saved.schedule, the_list.ScheduledRun(
             datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles")), "Check the total."))
+
+    def test_scheduled_run_cycle(self) -> None:
+        sender = self.root / "send.py"
+        sent = self.root / "sent.jsonl"
+        attempted = self.root / "attempted.jsonl"
+        _ = sender.write_text(r"""from pathlib import Path
+import json
+import sys
+
+args = sys.argv[1:]
+log = Path(__file__).with_name("sent.jsonl")
+attempted = log.with_name("attempted.jsonl")
+key = args[args.index("--key") + 1]
+to = args[args.index("--to") + 1]
+with attempted.open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+rows = log.read_text().splitlines() if log.exists() else []
+if any(key in json.loads(row) for row in rows):
+    print("SKIPPED: key already accepted")
+    sys.exit(0)
+with log.open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+if "Lose receipt" in args[-1] and key.endswith(":producer_start"):
+    sys.exit(3)
+if to == "user":
+    print("KEPT: held during silence")
+elif key.endswith(":owner_start"):
+    print("QUEUED: owner is offline")
+    sys.exit(1)
+else:
+    print("SENT: delivered")
+""")
+        cases = (
+            ("confirmed", "", 730, 0, RUNNER),
+            ("timeout", "", 730, 0, MORTY),
+            ("count", "FREQ=DAILY;COUNT=2", 730, 0, MORTY),
+            ("until", "FREQ=DAILY;UNTIL=20261117T180000Z", 730, 0, RUNNER),
+            ("cap", "FREQ=DAILY", 2, 0, RUNNER),
+            ("missed", "FREQ=DAILY;COUNT=4", 730, 2, RUNNER),
+            ("Lose receipt", "", 730, 0, RUNNER),
+        )
+        config = self.list_config.read_text().replace("confirm_wait_minutes=15", "confirm_wait_minutes=2")
+        with patch.object(session_send, "SEND_SCRIPT", sender):
+            for case, rule, limit, missed_days, caller in cases:
+                with self.subTest(case=case):
+                    _ = self.list_config.write_text(config.replace("series_run_limit=730", f"series_run_limit={limit}"))
+                    for path in (sent, attempted):
+                        _ = path.write_text("")
+                    scheduled = the_list.ScheduledRun(START, "Compare the account predictions.")
+                    schedule = the_list.ScheduledSeries(scheduled, repeat_rule.parse(rule)) if rule else scheduled
+                    item = self.add(case, changes={"state": the_list.ItemState.SCHEDULED,
+                                                   "schedule": schedule, "producer": BOB.id})
+                    due = START + timedelta(days=missed_days)
+                    tick = due + timedelta(minutes=1) if missed_days else due
+                    with patch.object(the_list, "now", return_value=START - timedelta(seconds=1)):
+                        the_list.fire_scheduled()
+                    self.assertEqual(sent.read_text(), "")
+                    with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
+                        the_list.fire_scheduled()
+                        working = the_list.load(MORTY.id, item.id)
+                        self.assertIs(working.state, the_list.ItemState.WORKING)
+                        self.assertEqual(len(working.log), len(item.log) + 1)
+                        self.assertIn("Instruction sent", str(working.log[-1].what))
+                        starts = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+                        self.assertEqual([args[args.index("--to") + 1] for args in starts],
+                                         [f"staff:{RUNNER.id}", f"staff:{BOB.id}"])
+                        for args in starts:
+                            message = args[args.index("--text") + 1]
+                            self.assertIn(f"Scheduled List item {item.number} starts now: {case}", message)
+                            self.assertIn(scheduled.words, message)
+                            self.assertIn(due.isoformat(), message)
+                        self.assertIsInstance(working.run_delivery, the_list.RunDelivery)
+                        assert isinstance(working.run_delivery, the_list.RunDelivery)
+                        run_key = working.run_delivery.key
+                        if case == "Lose receipt":
+                            the_list.fire_scheduled()
+                            sends = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+                            self.assertEqual(sends, [*starts, starts[1]])
+                        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+                            code, _, error = self.command("confirm", "--id", item.id)
+                        self.assertEqual(code, 1)
+                        self.assertIn("only the owner or morty", error)
+                        if case != "timeout":
+                            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": caller.current_session}):
+                                result = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(result, (0, f"confirmed {item.id}\n", ""))
+                    with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2, seconds=-1)):
+                        the_list.fire_scheduled()
+                    self.assertEqual(len(sent.read_text().splitlines()), 2)
+                    with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2)):
+                        if case == "timeout":
+                            code, _, error = self.command("confirm", "--id", item.id)
+                            self.assertEqual(code, 1)
+                            self.assertIn("the confirmation time has passed", error)
+                        the_list.fire_scheduled()
+                        the_list.fire_scheduled()
+                    changed = the_list.load(MORTY.id, item.id)
+                    self.assertEqual(len(changed.log), len(item.log) + 1)
+                    rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+                    if case == "timeout":
+                        self.assertIn("No confirmation", str(changed.log[-1].what))
+                        self.assertEqual([args[args.index("--to") + 1] for args in rows],
+                                         [f"staff:{RUNNER.id}", f"staff:{BOB.id}", "user", f"staff:{BOB.id}"])
+                        self.assertEqual(rows[2][rows[2].index("--text-id") + 1], "nate.adhoc")
+                        self.assertIn("has no confirmation", rows[3][-1])
+                    else:
+                        self.assertIn("Confirmed", str(changed.log[-1].what))
+                        self.assertEqual(rows, starts)
+                    if rule:
+                        self.assertIs(changed.state, the_list.ItemState.SCHEDULED)
+                        next_time = due + timedelta(days=1)
+                        self.assertIn(f"next {next_time.isoformat()}", the_list.table(MORTY.id))
+                        with patch.object(the_list, "now", return_value=next_time):
+                            the_list.fire_scheduled()
+                            code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(code, 1)
+                            self.assertIn("no matching scheduled run", error)
+                            self.assertEqual(self.command("confirm", "--id", item.id),
+                                             (0, f"confirmed {item.id}\n", ""))
+                        changed = the_list.load(MORTY.id, item.id)
+                        self.assertEqual(len(changed.log), len(item.log) + 2)
+                        self.assertIn(next_time.isoformat(), str(changed.log[-1].what))
+                        self.assertEqual(len(sent.read_text().splitlines()), 4)
+                        with patch.object(the_list, "now", return_value=next_time + timedelta(days=1)):
+                            the_list.fire_scheduled()
+                        self.assertEqual(len(sent.read_text().splitlines()), 4)
+                    self.assertIs(changed.state, the_list.ItemState.WORKING)
+                    self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
 
     def test_repeat_series_limit_uses_the_live_setting(self) -> None:
         start = "2026-11-30T17:00:00Z"

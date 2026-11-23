@@ -32,7 +32,7 @@ def upkeep() -> None:
     from scripts.accounts import accounts
     from scripts.agents import shutdown_record, stop_resume
     from scripts.herdr import detection_rules, herdr
-    from scripts.production import gate
+    from scripts.production import gate, staff, the_list
     from scripts.production.gate_modules import GateRefused
 
     try:
@@ -52,6 +52,10 @@ def upkeep() -> None:
         running = {session["name"] for session in herdr.live_sessions()}
         herdr.save_shared_layout(running)
         _ = detection_rules.refresh(running, herdr.reload_agent_rules)
+        try:
+            the_list.fire_scheduled()
+        except (OSError, ValueError, staff.StaffRefused, subprocess.SubprocessError) as error:
+            print(f"herdr-upkeep: scheduled List items: {error}", file=sys.stderr)
         producers = accounts.producer_upkeep_members()
         if producers:
             offset = int(time.time() // cadence.interval_seconds) % len(producers)
