@@ -790,7 +790,6 @@ class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
-    slot: NotRequired[int | Literal["—"]]
     tokens: NotRequired[int]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
@@ -1022,7 +1021,6 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     stage: queue_view.MacBuildStage
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
-    slot: int | Literal["—"]
     slot_folder: NotRequired[str]
     slot_machine: NotRequired[str]
 
@@ -1495,10 +1493,6 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
         return "—"
 
 
-class SlotNotes(SlotPlace):
-    slot: int | Literal["—"]
-
-
 def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
     """The slot folder and machine of a step in slot number; empty for a step in no slot."""
     if number == "—":
@@ -1507,10 +1501,9 @@ def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotP
     return {"slot_folder": key, "slot_machine": machine}
 
 
-def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
-    """A run's slot number, and the slot folder and machine when the run is in a slot."""
-    number = build_slot_number(folder, machine, roots, home=home)
-    return {"slot": number, **slot_place(number, folder, machine)}
+def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotPlace:
+    """The slot folder and machine when the run is in a slot; the Disks page finds the run by them."""
+    return slot_place(build_slot_number(folder, machine, roots, home=home), folder, machine)
 
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
@@ -2906,7 +2899,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "state": "", "pid": pid, "detail": detail, "used": use,
                      **(build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                         home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))
-                        if step is not None else SlotNotes(slot="—")),
+                        if step is not None else SlotPlace()),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": step.started_at if step is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),

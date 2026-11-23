@@ -181,11 +181,11 @@ __PAGE_FRAME_STYLE__
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
-/* The one machine color map. A name matches without case, so the hover words "Mac" and "AWS" match too.
+/* The one machine color map. Each name matches without case, so the hover words "Mac" and "AWS" match too.
    mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws is the AWS box, so it takes the aws color. */
-.machine[data-machine="natedev"] { color: var(--machine-natedev); }
-.machine:is([data-machine="mac" i], [data-machine="mac-linux"]) { color: var(--machine-mac); }
-.machine:is([data-machine="aws" i], [data-machine="hana-aws"]) { color: var(--machine-aws); }
+.machine[data-machine="natedev" i] { color: var(--machine-natedev); }
+.machine:is([data-machine="mac" i], [data-machine="mac-linux" i]) { color: var(--machine-mac); }
+.machine:is([data-machine="aws" i], [data-machine="hana-aws" i]) { color: var(--machine-aws); }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
@@ -280,7 +280,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-tokens dl { display: grid; grid-template-columns: repeat(2, max-content); gap: 0 6px; margin: 0; }
 .walk-tokens dt { text-align: left; }
 .walk-tokens dd { margin: 0; text-align: right; }
-.walk { --row-line: 20px; --row-inset: 3px; --track-height: 18px; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+/* --queue-heading-gap is the space between the queued heading and the table; fitWalkDetails reads it. */
+.walk { --row-line: 20px; --row-inset: 3px; --track-height: 18px; --queue-heading-gap: 16px; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .walk-chart { margin-right: var(--details); }
 .walk-chart { min-width: 0; position: relative; }
 .walk-chart-head { height: 30px; }
@@ -292,7 +293,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; line-height: var(--row-line); }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
-.wrow.wait .row-label .name { white-space: normal; overflow-wrap: anywhere; }
+.wrow.wait .row-label .name { white-space: normal; }
 .wrow:has(.queue-grip) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
@@ -347,13 +348,14 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 /* A waiting step and its targets size the Step and Target columns (fitWalkDetails). In a tight pane they wrap
-   inside them. A step breaks between words, and a target list breaks only between machines, never inside hana-aws. */
+   inside them. A step breaks between words, and a target list breaks only between machines, never inside hana-aws.
+   The column is never narrower than the widest word or machine name. */
 .walk-table .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; }
 .walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; white-space: normal; }
 .walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
 .walk-table .wait-target .machine { white-space: nowrap; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
-.walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
+.walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - var(--queue-heading-gap)); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
 .walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
 .walk.beside .wrow.room::after { width: calc(100% + var(--details)); }
@@ -1105,7 +1107,7 @@ function queueRowLabels(row) {
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const showrunner = unit ? ownerText(row.showrunner) : "";
   return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: unit ? row.title?.step || "" : "", verify: row.verify?.verb || ""};
+    step: unit && row.title?.unit ? row.title.step : "", verify: row.verify?.verb || ""};
 }
 function rowLabel({name, unit = "", owner = ""}, note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? staffName(unit) : esc(name)}</span></span>` +
@@ -1465,7 +1467,7 @@ function renderBuildLimits(limits) {
   const headings = machines.map(([key, name]) => {
     const data = limits[key];
     const {unattributed, unattributed_kept = 0} = data;
-    return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}>${esc(name)}
+    return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}><span class="machine" data-machine="${key}">${esc(name)}</span>
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
     ${data.facts ? `<div class="build-limit-facts">${esc(data.facts)}</div>` : ""}
     ${!unattributed ? "" : key === "mac"
@@ -1945,8 +1947,6 @@ function canvasFont(element) {
 
 const MIN_TRACK_WIDTH = 160;
 const TABLE_CAP_GAP = 12;
-// The space between the queued heading and the table; the heading's CSS max-width uses the same 16px.
-const QUEUE_HEADING_GAP = 16;
 function fitWalkDetails() {
   const walk = $("walk");
   const table = walk.querySelector(".walk-table");
@@ -1971,11 +1971,15 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    // Waiting steps and targets size their columns, so each stays on one line. In a tight pane they wrap.
-    const rows = name !== "duration" && walk.classList.contains("tight") ? "tr:not(.wait)" : "tr";
-    const widths = [...table.querySelectorAll(`${rows} > .${name}`)].map(cell => {
+    // Waiting steps and targets size their columns, so each stays on one line. In a tight pane they wrap,
+    // so only the widest word of a waiting step or the widest machine name of a waiting list counts.
+    const tight = name !== "duration" && walk.classList.contains("tight");
+    const widths = [...table.querySelectorAll(`tr > .${name}`)].map(cell => {
       context.font = canvasFont(cell);
-      return context.measureText(cell.textContent).width + parseFloat(getComputedStyle(cell).paddingRight);
+      const machines = [...cell.querySelectorAll(".machine")].map(machine => machine.textContent);
+      const parts = !tight || !cell.closest("tr.wait") ? [cell.textContent]
+        : machines.length ? machines : cell.textContent.split(/\s+/);
+      return Math.max(...parts.map(part => context.measureText(part).width)) + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
       const header = table.querySelector("th.duration");
@@ -2002,14 +2006,15 @@ function fitWalkDetails() {
       context.measureText(words.slice(index).join(" ")).width)));
   }));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
-  // Waiting names wrap within the width set by running rows and Free.
-  const labels = [...walk.querySelectorAll(".wrow:not(.wait) .row-label :is(.name, .owner)")];
+  // Running rows and Free set the label column. A longer waiting name wraps at a space, so only its widest word counts.
+  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner)")].flatMap(label =>
+    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
-  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
     context.font = canvasFont(label);
-    return context.measureText(label.textContent).width;
+    return context.measureText(text).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
@@ -2041,6 +2046,7 @@ function fitWalkDetails() {
   walk.classList.add("beside");
   walk.classList.remove("measuring");
   measureColumn("duration");
+  measureColumn("step");
   measureColumn("machine");
   // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
   const range = track.getBoundingClientRect();
@@ -2050,7 +2056,8 @@ function fitWalkDetails() {
   let headingRight = 0;
   if (heading) {
     context.font = canvasFont(heading);
-    headingRight = heading.getBoundingClientRect().left + Math.ceil(context.measureText(heading.textContent).width) + QUEUE_HEADING_GAP;
+    headingRight = heading.getBoundingClientRect().left + Math.ceil(context.measureText(heading.textContent).width)
+      + parseFloat(getComputedStyle(walk).getPropertyValue("--queue-heading-gap"));
   }
   const capLeft = range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
   const tableLeft = !hasCap(latest) ? tableRight : Math.max(capLeft, Math.min(tableRight, headingRight));

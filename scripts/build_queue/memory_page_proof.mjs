@@ -515,8 +515,9 @@ try {
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
             machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'guest-attempt'},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
-          Object.assign(waiting, {unit:'queue',showrunner:'builds',caller:'impl3',
-            title:{unit:'queue',step:'test affected'},targets:['natedev','hana-aws']});
+          // admin-console is longer than every running label, so its widest word sets the label column.
+          Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
+            title:{unit:'admin-console',step:'test affected'},targets:['natedev','hana-aws']});
           const ci = {key:'shot-ci',name:'hana CI',ci:true,admitted:true,started_at:reading.read_at-120,
             machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
           reading.walk = [rust, guest, mac, ci];
@@ -524,60 +525,76 @@ try {
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
-          await navigate(shootBefore ? 'before.html' : 'memory_live.html');
-          const rows = await evaluate(`(() => {
-            const walk = document.querySelector('#walk');
-            const name = row => row.querySelector('.name').textContent;
-            const owner = row => row.querySelector('.owner').textContent;
-            const chart = key => walk.querySelector('.wrow[data-tip="' + key + '"]');
-            const table = key => walk.querySelector('tr[data-tip="' + key + '"]');
-            const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
-            const box = walk.closest('.card').getBoundingClientRect();
-            return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
-              names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
-                table(key).querySelector('.step').textContent,table(key).querySelector('td.machine').textContent]),
-              colors:[chart(keys[0]),chart(keys[4])].map(row => [
-                row.querySelector('.name [data-color-text]')?.dataset.colorText,
-                row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
-              waitingTargetLines:(() => {
-                const list = table(keys[4]).querySelector('.wait-target');
-                return list ? Math.round(list.getBoundingClientRect().height / parseFloat(getComputedStyle(list).lineHeight)) : 0;
-              })(),
-              headingCut:(() => {
-                const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
-                return label.scrollWidth > label.clientWidth;
-              })(),
-              cutSteps:[...walk.querySelectorAll('tbody .step .cell-text')]
-                .filter(text => text.scrollWidth > text.clientWidth).map(text => text.textContent),
-              // A machine name is a Target cell with no list in it, or one name in a waiting list.
-              machineColors:[...walk.querySelectorAll('tbody td.machine:not(:has(.machine)), tbody td.machine .machine')]
-                .filter(name => !['', '—'].includes(name.textContent)).map(name => [name.textContent, getComputedStyle(name).color,
-                  getComputedStyle(name.closest('tr')).color]),
-              clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
-          })()`);
-          if (!shootBefore) {
-            await assertRowCenters(evaluate);
-            assert.deepEqual(rows.headers, runningHeaders);
-            assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest','natedev'],
-              ['queue','builds','','gate','mac-linux'],[mac.name,'','','',mac.machine || '—'],['hana CI','','','','natedev'],
-              ['queue','builds','','test affected','natedev or hana-aws']]);
-            assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-            assert.equal(rows.waitingTargetLines, 1, 'The waiting Target list wraps.');
-            assert.equal(rows.headingCut, false, 'The queued heading is cut.');
-            assert.deepEqual(rows.cutSteps, [], 'A Step cell is cut.');
-            assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
-              'A Target machine name has no machine color.');
-            const macColor = 'rgb(' + reading.colors.dark.machines.mac.slice(1).match(/../g)
-              .map(part => parseInt(part, 16)).join(', ') + ')';
-            assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
-              'The mac-linux Target has no mac color.');
+          // At 900 px the walk is tight: waiting cells wrap, but no word and no machine name is cut or split.
+          let rows;
+          for (const width of shootBefore ? [1440] : [1440, 900]) {
+            await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            rows = await evaluate(`(() => {
+              const walk = document.querySelector('#walk');
+              const name = row => row.querySelector('.name').textContent;
+              const owner = row => row.querySelector('.owner').textContent;
+              const chart = key => walk.querySelector('.wrow[data-tip="' + key + '"]');
+              const table = key => walk.querySelector('tr[data-tip="' + key + '"]');
+              const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
+              const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
+              const box = walk.closest('.card').getBoundingClientRect();
+              return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
+                tight:walk.classList.contains('tight'),
+                names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
+                  table(key).querySelector('.step').textContent,table(key).querySelector('td.machine').textContent]),
+                colors:[chart(keys[0]),chart(keys[4])].map(row => [
+                  row.querySelector('.name [data-color-text]')?.dataset.colorText,
+                  row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
+                waitingNameLines:lines(chart(keys[4]).querySelector('.name')),
+                waitingTargetLines:(() => {
+                  const list = table(keys[4]).querySelector('.wait-target');
+                  return list ? lines(list) : 0;
+                })(),
+                headingCut:(() => {
+                  const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
+                  return label.scrollWidth > label.clientWidth;
+                })(),
+                cutSteps:[...walk.querySelectorAll('tbody .step .cell-text')]
+                  .filter(text => text.scrollWidth > text.clientWidth).map(text => text.textContent),
+                splitMachines:[...walk.querySelectorAll('tr.wait .wait-target .machine')]
+                  .filter(machine => machine.getClientRects().length > 1).map(machine => machine.textContent),
+                // A machine name is a Target cell with no list in it, or one name in a waiting list.
+                machineColors:[...walk.querySelectorAll('tbody td.machine:not(:has(.machine)), tbody td.machine .machine')]
+                  .filter(name => !['', '—'].includes(name.textContent)).map(name => [name.textContent, getComputedStyle(name).color,
+                    getComputedStyle(name.closest('tr')).color]),
+                clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
+            })()`);
+            if (!shootBefore) {
+              await assertRowCenters(evaluate);
+              assert.deepEqual(rows.headers, runningHeaders);
+              assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest','natedev'],
+                ['queue','builds','','gate','mac-linux'],[mac.name,'','','',mac.machine || '—'],['hana CI','','','','natedev'],
+                ['admin-console','builds','','test affected','natedev or hana-aws']]);
+              assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
+              assert.equal(rows.tight, width === 900, `The walk at ${width} px has the wrong tight state.`);
+              assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
+              assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
+              assert.deepEqual(rows.splitMachines, [], `A waiting machine name breaks at ${width} px.`);
+              assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
+                'A Target machine name has no machine color.');
+              const macColor = 'rgb(' + reading.colors.dark.machines.mac.slice(1).match(/../g)
+                .map(part => parseInt(part, 16)).join(', ') + ')';
+              assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
+                'The mac-linux Target has no mac color.');
+              if (width === 1440) {
+                assert.equal(rows.waitingTargetLines, 1, 'The waiting Target list wraps.');
+                assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              }
+            }
+            if (queueRowsProof) {
+              const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
+              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
+              await writeFile(output, Buffer.from(shot.data,'base64'));
+            }
           }
           if (queueRowsProof) {
-            const output = join(folder, shootBefore ? 'before.png' : 'after.png');
-            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
-            await writeFile(output, Buffer.from(shot.data,'base64'));
-            console.log(JSON.stringify({pass:true,rows:rows.names,output}));
+            console.log(JSON.stringify({pass:true,rows:rows.names}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
@@ -2306,7 +2323,7 @@ try {
             [301, '', 'held caller', '', 'held caller'],
             [302, '', 'unregistered session', '', 'unregistered session'],
             [304, '', 'hana: nextest', '', 'hana: nextest'],
-            [200, 'fixture unit', 'fixture unit', 'fixture showrunner', 'recorded local'],
+            [200, '', 'fixture unit', 'fixture showrunner', 'recorded local'],
             [700002, 'nextest', 'fixture unit', 'fixture showrunner', 'recorded cloud'],
             [303, 'nextest', 'fixture unit', 'fixture showrunner', 'recorded slot'],
           ]);

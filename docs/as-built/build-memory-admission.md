@@ -2285,10 +2285,11 @@ The Builds page uses the same staff colors in the row and its hover.
 Rows without a unit show their plain name and leave the small text and `Step` empty.
 This includes Build tools, unowned Mac builds, compiler cache, unowned processes, and CI.
 The small text is empty when the showrunner is the same name as the unit.
+`Step` shows the step only when the feed's `title.unit` names a unit. When the step text is the unit, the feed sends an empty `title.unit`, so `Step` stays empty and the unit does not show twice.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
 For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Target`, `vCPU`, and `Tokens`.
 The waiting table uses `#` and `Waiting`, and omits `Tokens`.
-The table has no `Unit` column and no `Slot` column.
+The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
 On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
@@ -2297,12 +2298,13 @@ The feed's `machine` field is the one source for that machine.
 The row hover lists the other machines that the step named, under `Named targets`.
 A waiting row's `Target` cell lists each machine that can take the step, joined by `or`.
 Waiting rows size the `Step` and `Target` columns too, so each step and each list shows on one line; a new waiting row can move the columns to their right.
-In a tight pane only running rows size these columns. A waiting step then breaks between words, and a waiting list breaks between machines, never inside a machine name.
-Each machine name on the page shows in its machine color: in the `Target` cells, the hover's `Runs on` and `Named targets`, Target availability, and the top costs.
+In a tight pane a waiting step breaks between words, and a waiting list breaks between machines, never inside a machine name.
+There, a waiting cell sizes its column by its widest word or widest machine name, so no word is cut.
+Each machine name on the page shows in its machine color: in the `Target` cells, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
 The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
 `mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` is the AWS box, so it uses the `aws` color.
-The hover words `Mac` and `AWS` match their machines without case.
-The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. With no room, the heading ends in an ellipsis and its hover gives the full text.
+Every match in the map ignores case, so the hover words `Mac` and `AWS` match their machines.
+The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. The `--queue-heading-gap` CSS property holds the gap between the heading and the table, and `fitWalkDetails` reads it. With no room, the heading ends in an ellipsis and its hover gives the full text.
 `Verify` shows the Rust verify verb when the feed records a Verify call.
 `Step` shows the feed's `title.step`, which uses the build step names from `config/build_steps.conf`.
 The hover shows the starting session under `Caller` and the running row's detail under `Detail`.
@@ -2326,12 +2328,13 @@ Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
 In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
-The label column is as wide as the widest running label or the Free row.
-A longer queued name wraps inside that width.
+The label column is as wide as the widest running label, the Free row, or the widest word of a queued label.
+A longer queued name wraps at a space inside that width, so a one-word unit name such as `admin-console` never breaks.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
 It also fails when a `Target` machine name has no machine color, or a `mac-linux` cell does not show the `mac` color.
+It checks the queued rows at 1440 px and in a tight pane at 900 px. It fails when a waiting unit name takes two lines, a Step cell is cut, or a waiting machine name breaks.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
