@@ -469,9 +469,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                     {"id": builds.id, "name": builds.name, "proposal": False},
                     {"id": other.id, "name": other.name, "proposal": False}]
         for page, default, reason in (
-                ("review", owner, f"{owner.name} owns the Review page."),
-                ("aws_machines", builds, "aws owns the AWS Machines page. Its showrunner builds gets new items."),
-                ("list", other, f"{other.name} owns the List page.")):
+                ("review", owner, f"(why {owner.name}? because {owner.name} owns the Review page!)"),
+                ("aws_machines", builds,
+                 "(why builds? because aws owns the AWS Machines page and builds is its showrunner!)"),
+                ("list", other, f"(why {other.name}? because {other.name} owns the List page!)")):
             with self.subTest(page=page):
                 options = self.new_item_http(query=f"?page={page}")
                 fields = cast(dict[str, object], json.loads(options.body))
@@ -2950,9 +2951,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                 # A Send to a selected chip reads the page only to choose the List draft path or the standard path.
                 if page not in ("list", "review"):
                     continue
+                proposal_names = [row["name"] for row in recipients if row["proposal"]]
+                self.assertCountEqual(proposal_names, [showrunner.name, producer.name])
                 for kind in kinds:
                     for row in recipients:
-                        if kind == new_item_dialog.SubmissionKind.PROPOSAL and not row["proposal"]:
+                        if kind == new_item_dialog.SubmissionKind.PROPOSAL and row["name"] not in proposal_names:
                             continue
                         with self.subTest(page=page, kind=kind, name=row["name"]):
                             request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
@@ -2991,7 +2994,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(request_id=request.request_id):
                     reply = self.new_item_http(self.new_item_body(request), finished=True)
                     self.assertEqual(reply.status, 400, reply.body)
-                    self.assertEqual(json.loads(reply.body), {"error": f"morty's production document {document} cannot be read. You must fix morty's staff row."})
+                    self.assertEqual(json.loads(reply.body), {"error": f"The morty production document {document} cannot be read. You must fix the morty staff row."})
             self.assertEqual(update_registration.question_records_for_owner(producer.id), [])
             send.assert_not_called()
 

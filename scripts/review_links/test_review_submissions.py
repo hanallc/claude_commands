@@ -1889,12 +1889,12 @@ class ReviewSubmissionTests(unittest.TestCase):
 
         with patch.object(staff, "snapshot", return_value=members):
             self.doc.unlink()
-            with self.assertRaisesRegex(submissions.SubmissionError, rf"^builds's production document {re.escape(str(self.doc))}"
-                                        + r" is missing\. producer must fix builds's staff row\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" is missing\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(standard)
             _ = self.doc.write_bytes(b"\xff")
-            with self.assertRaisesRegex(submissions.SubmissionError, rf"^builds's production document {re.escape(str(self.doc))}"
-                                        + r" cannot be read\. producer must fix builds's staff row\.$"):
+            with self.assertRaisesRegex(submissions.SubmissionError, rf"^The builds production document {re.escape(str(self.doc))}"
+                                        + r" cannot be read\. producer must fix the builds staff row\.$"):
                 _ = submissions.submit(draft)
             for name in ("pending.json", "receipt.json", ".indexed", "investigation.water"):
                 self.assertEqual(list(self.root.rglob(name)), [])
@@ -1929,8 +1929,8 @@ class ReviewSubmissionTests(unittest.TestCase):
                     with self.subTest(page=payload.page, content=content):
                         state = "cannot be read" if content else "is missing"
                         with self.assertRaisesRegex(submissions.SubmissionError,
-                                                    rf"^producer's production document {re.escape(str(producer_doc))}"
-                                                    + rf" {state}\. builds must fix producer's staff row\.$"):
+                                                    rf"^The producer production document {re.escape(str(producer_doc))}"
+                                                    + rf" {state}\. builds must fix the producer staff row\.$"):
                             _ = submissions.submit(payload)
                 self.assertEqual({path: path.read_bytes() for path in self.root.rglob("receipt.json")}, before)
                 self.assertEqual(list(self.root.rglob("pending.json")), [])
@@ -2355,21 +2355,31 @@ class PageOwnerReasonTests(unittest.TestCase):
         return route
 
     def test_reason_names_the_owner_that_takes_the_item(self) -> None:
-        for page, owner, expected in (("list", self.morty, "morty owns the List page."),
-                                      ("builds", self.builds, "builds owns the Builds page.")):
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+                                      ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
             with self.subTest(page=page):
                 route = self.route(page, owner.id, self.members)
                 self.assertEqual((route.row, route.reason), (owner, expected))
+        config = self.root / "console.conf"
+        _ = config.write_text(f"page.rebuilds.owner={self.natedev.id}\n", encoding="utf-8")
+        route = submissions.page_owners("rebuilds", conf.read(config), self.members).route
+        assert isinstance(route, submissions.PageOwnerRoute)
+        self.assertEqual(route.reason, "(why natedev? because natedev owns the Rebuilds page!)")
 
     def test_reason_names_the_showrunner_of_a_unit_owner(self) -> None:
         route = self.route("aws_machines", self.aws.id, self.members)
-        self.assertEqual((route.row, route.reason),
-                         (self.builds, "aws owns the Aws Machines page. Its showrunner builds gets new items."))
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because aws owns the Aws Machines page"
+                                                     + " and builds is its showrunner!)"))
+        worker = staff.StaffRow(staff.StaffId("worker-staff"), "worker", "fixer", staff.ReportsTo(self.aws.id),
+                                current_session=staff.StaffId("worker-session"))
+        route = self.route("aws_machines", worker.id, replace(self.members, rows=(*self.members.rows, worker)))
+        self.assertEqual((route.row, route.reason), (self.builds, "(why builds? because fixer owns the Aws Machines page"
+                                                     + " and builds is the nearest showrunner above it!)"))
 
     def test_reason_names_the_owner_that_is_not_available_and_the_parent_that_takes_the_item(self) -> None:
         retired = replace(self.members, pending_retire=(self.builds.id,))
-        for page, owner, expected in (("builds", self.builds, "builds is not available, so natedev gets this item."),
-                                      ("aws_machines", self.aws, "builds is not available, so natedev gets this item.")):
+        expected = "(why natedev? because builds is not available and natedev is the nearest available showrunner above it!)"
+        for page, owner in (("builds", self.builds), ("aws_machines", self.aws)):
             with self.subTest(page=page):
                 route = self.route(page, owner.id, retired)
                 self.assertEqual((route.row, route.reason), (self.natedev, expected))
@@ -2378,30 +2388,31 @@ class PageOwnerReasonTests(unittest.TestCase):
         retired = replace(self.members, pending_retire=(self.morty.id,))
         route = self.route("list", self.morty.id, retired)
         self.assertEqual((route.row, route.reason),
-                         (self.sdlc, "morty is not available, so the default owner sdlc gets this item."))
+                         (self.sdlc, "(why sdlc? because morty is not available and sdlc is the default owner!)"))
 
     def test_reason_names_the_default_owner_when_the_page_has_no_owner(self) -> None:
         route = self.route("disks", "", self.members)
         self.assertEqual((route.row, route.reason),
-                         (self.sdlc, "The Disks page has no owner, so the default owner sdlc gets this item."))
+                         (self.sdlc, "(why sdlc? because the Disks page has no owner and sdlc is the default owner!)"))
 
     def test_reason_names_the_default_owner_when_the_owner_is_not_on_the_staff_list(self) -> None:
         route = self.route("disks", "missing-staff", self.members)
         self.assertEqual((route.row, route.reason), (
-            self.sdlc, "The Disks page owner is not on the staff list, so the default owner sdlc gets this item."))
+            self.sdlc, "(why sdlc? because the Disks page owner is not on the staff list and sdlc is the default owner!)"))
 
     def test_reason_names_the_default_owner_when_a_unit_owner_has_no_showrunner(self) -> None:
         orphan = replace(self.aws, parent=staff.StaffRoot())
         members = staff.StaffSnapshot((self.natedev, self.sdlc, self.builds, orphan, self.morty))
         route = self.route("aws_machines", orphan.id, members)
         self.assertEqual((route.row, route.reason),
-                         (self.sdlc, "aws has no showrunner, so the default owner sdlc gets this item."))
+                         (self.sdlc, "(why sdlc? because aws has no showrunner and sdlc is the default owner!)"))
 
     def test_reason_names_the_parent_of_a_default_owner_that_is_not_available(self) -> None:
         retired = replace(self.members, pending_retire=(self.sdlc.id,))
         route = self.route("disks", "", retired)
-        self.assertEqual((route.row, route.reason), (self.natedev, "The Disks page has no owner, and the default "
-                                                     + "owner sdlc is not available, so natedev gets this item."))
+        self.assertEqual((route.row, route.reason), (self.natedev, "(why natedev? because the Disks page has no owner,"
+                                                     + " the default owner sdlc is not available, and natedev"
+                                                     + " is the nearest available showrunner above it!)"))
 
     def test_no_available_owner_has_no_route_and_no_reason(self) -> None:
         config = self.root / "console.conf"

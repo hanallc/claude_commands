@@ -1020,7 +1020,7 @@ class _UnreadableOwnerDocument(OSError):
         state = "is missing" if isinstance(error, FileNotFoundError) else "cannot be read"
         parent = members.parent_of(owner)
         fixer = parent.name if parent is not None else "You"
-        super().__init__(f"{owner.name}'s production document {document} {state}. {fixer} must fix {owner.name}'s staff row.")
+        super().__init__(f"The {owner.name} production document {document} {state}. {fixer} must fix the {owner.name} staff row.")
 
 
 def owner_is_active(row: staff.StaffRow) -> bool:
@@ -1103,7 +1103,9 @@ def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapsh
     values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
-    route = _page_owner_route(values.get(label_key) or page, designated, default, members)
+    # A page outside the console navigation, such as rebuilds, has no label setting.
+    label = values.get(label_key) or page.replace("_", " ").title()
+    route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
         return PageOwners(shown, route)
@@ -1126,9 +1128,10 @@ def _page_owner_route(label: str, designated: staff.StaffId, default: staff.Staf
             row = _available_page_owner(candidate, members, allow_producer=allow_producer)
             if isinstance(row, staff.StaffRow):
                 if identity == designated:
-                    return PageOwnerRoute(row, _owner_chain_reason(label, owner, row, missed))
-                return PageOwnerRoute(row, _default_owner_reason(label, designated, owner, missed, row,
-                                                                 members.by_id(default)))
+                    cause = _owner_chain_cause(label, owner, row, missed, members)
+                else:
+                    cause = _default_owner_cause(label, designated, owner, missed, row, members.by_id(default))
+                return PageOwnerRoute(row, f"(why {row.name}? because {cause}!)")
             skipped = members.by_id(candidate)
             if (identity == designated and skipped is not None
                     and (skipped.kind == "showrunner" or skipped.kind == "producer" and allow_producer)):
@@ -1136,29 +1139,31 @@ def _page_owner_route(label: str, designated: staff.StaffId, default: staff.Staf
     return PageOwnerUnavailable()
 
 
-def _owner_chain_reason(label: str, owner: staff.StaffRow | None, route: staff.StaffRow,
-                        missed: list[staff.StaffRow]) -> str:
+def _owner_chain_cause(label: str, owner: staff.StaffRow | None, route: staff.StaffRow,
+                       missed: list[staff.StaffRow], members: staff.StaffSnapshot) -> str:
     if missed:
-        return f"{missed[0].name} is not available, so {route.name} gets this item."
+        return f"{missed[0].name} is not available and {route.name} is the nearest available showrunner above it"
     if owner is None or owner == route:
-        return f"{route.name} owns the {label} page."
-    return f"{owner.name} owns the {label} page. Its showrunner {route.name} gets new items."
+        return f"{route.name} owns the {label} page"
+    relation = "its showrunner" if members.parent_of(owner) == route else "the nearest showrunner above it"
+    return f"{owner.name} owns the {label} page and {route.name} is {relation}"
 
 
-def _default_owner_reason(label: str, designated: staff.StaffId, owner: staff.StaffRow | None,
-                          missed: list[staff.StaffRow], route: staff.StaffRow,
-                          default: staff.StaffRow | None) -> str:
+def _default_owner_cause(label: str, designated: staff.StaffId, owner: staff.StaffRow | None,
+                         missed: list[staff.StaffRow], route: staff.StaffRow,
+                         default: staff.StaffRow | None) -> str:
     if not designated:
-        cause = f"The {label} page has no owner"
+        cause = f"the {label} page has no owner"
     elif owner is None:
-        cause = f"The {label} page owner is not on the staff list"
+        cause = f"the {label} page owner is not on the staff list"
     elif missed:
         cause = f"{missed[0].name} is not available"
     else:
         cause = f"{owner.name} has no showrunner"
     if default is None or default == route:
-        return f"{cause}, so the default owner {route.name} gets this item."
-    return f"{cause}, and the default owner {default.name} is not available, so {route.name} gets this item."
+        return f"{cause} and {route.name} is the default owner"
+    return (f"{cause}, the default owner {default.name} is not available,"
+            + f" and {route.name} is the nearest available showrunner above it")
 
 
 def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot, *,
