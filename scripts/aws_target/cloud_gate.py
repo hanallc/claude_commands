@@ -187,7 +187,7 @@ def launch_error_code(reason: str) -> str:
 class ModuleProgress:
     """Keep the module total and the names of completed test modules."""
     _header = re.compile(r'Runner: ([0-9]{1,9}) modules, whole machine, [0-9]{1,9} CPUs')
-    _result = re.compile(r'(\S+) exit=-?[0-9]{1,9} seconds=[0-9]{1,12}\.[0-9]{1,9}(?: stopped)?')
+    _result = re.compile(r'(.+) exit=-?[0-9]{1,9} seconds=[0-9]{1,12}\.[0-9]{1,9}(?: stopped)?')
 
     def __init__(self) -> None:
         self.total = 0
