@@ -5202,7 +5202,7 @@ class ServiceTests(unittest.TestCase):
             fixture_cgroup = gate.builds_slice_cgroup()
             probing = threading.Event()
             probed = threading.Event()
-            probe_waits: list[bool] = []
+            probe_finished: list[bool] = []
             loop_reads: list[Path] = []
             child_prints: list[str] = []
             # An empty PATH cannot find printenv; the child reads only the variable under test.
@@ -5233,7 +5233,7 @@ class ServiceTests(unittest.TestCase):
             def probe_update(values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
                 # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
                 probing.set()
-                probe_waits.append(probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                probe_finished.append(probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
                 refill_update(values, **keywords)
 
             with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
@@ -5245,7 +5245,7 @@ class ServiceTests(unittest.TestCase):
                 finally:
                     _ = update_probe.stop()
                 self.assertNotIn("ADMISSION_PATCH_DICT_PROBE", os.environ)
-            self.assertEqual(probe_waits, [True])
+            self.assertEqual(probe_finished, [True])
             self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
             self.assertEqual(child_prints, [f"{fixture_cgroup}\n"])
 

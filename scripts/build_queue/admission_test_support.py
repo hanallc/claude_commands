@@ -379,7 +379,7 @@ class GaplessRefill:
             self.environ[key] = value
         if cleared:
             for key in [key for key in self.environ if key not in target]:
-                # The loop thread can remove the same key first, for example ADMISSION_SOURCE_RELOAD.
+                # Another thread can remove the same key first.
                 with suppress(KeyError):
                     del self.environ[key]
 
