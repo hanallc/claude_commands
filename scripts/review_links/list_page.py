@@ -10,7 +10,7 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
@@ -981,9 +981,39 @@ def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner
               for label, identity, count in choices)]
 
 
+type ProducerControl = Callable[[staff.StaffSnapshot, Counter[the_list.ItemOwner]], str]
+
+
+def producer_chip_row(members: staff.StaffSnapshot, producers: Counter[the_list.ItemOwner]) -> str:
+    """Render the Producer chips."""
+    return record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+
+
+class ProducerPlacement(Enum):
+    """Where a List view puts its Producer control."""
+
+    ABOVE_FILTERS = "above the filters"
+    BESIDE_WORDS = "beside the words box"
+
+
+@dataclass(frozen=True)
+class ListView:
+    """The page around the List rows: its names, its style and its Producer control."""
+
+    title: str
+    log_name: str
+    style: str
+    producer: ProducerControl
+    placement: ProducerPlacement
+
+
+LIST_VIEW = ListView("The List", "list", '', producer_chip_row, ProducerPlacement.BESIDE_WORDS)
+
+
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes:
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK,
+           view: ListView = LIST_VIEW) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -1054,16 +1084,19 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+    producer_control = view.producer(members, producers)
+    content = (STYLE + view.style + page_frame.title(view.title, "list")
+               + f'<div data-list data-list-path="{PAGE_PATH}" data-refresh-seconds="{seconds}"'
+               + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + (producer_control if view.placement is ProducerPlacement.ABOVE_FILTERS else '')
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
                + '<div class="list-producer-filter">'
-               + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+               + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
@@ -1085,7 +1118,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
                + '<script>' + SCRIPT + '</script>')
-    return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
+    return page_frame.rendered(change_page.document(content, view.title), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
@@ -1584,7 +1617,7 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    const response=await fetch(content.dataset.listPath,{method:'POST',body:data});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1668,7 +1701,7 @@ function bindFeedbackForm(form){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
       if(parks) query.set('park-request',attempt.request);
-      const response=await fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+      const response=await fetch(content.dataset.listPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
      }catch(_){}
@@ -1852,6 +1885,10 @@ function applyListSnapshot(fresh){
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter && !nextFooter.childNodes.length)
   nextFooter.replaceChildren(...footer.childNodes);
+ for(const picture of content.querySelectorAll('img[data-keep-src]')){
+  const next=fresh.querySelector('img[data-keep-src="'+CSS.escape(picture.dataset.keepSrc)+'"]');
+  for(const name of ['src','srcset']) next?.setAttribute(name,picture.getAttribute(name));
+ }
  restoreEvidenceDetails(fresh);
  const key=tableView.openItem?.dataset.key;
  const nextItem=key && rowIn(fresh,key);
@@ -1879,7 +1916,8 @@ function applyListSnapshot(fresh){
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
 const reviewMotion=createCardMotion(()=>content);
-const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
+const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
+ ? window.frameElement : null;
 let activeReview,savedReview,refreshingReview=false;
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
