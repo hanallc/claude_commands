@@ -1932,7 +1932,7 @@ frame.addEventListener('load',async()=>{
         log = self.legacy_log(*(
             "- 2026-11-16 18:10:00+00:00 Feedback to morty: " + row + " — nate via List" for row in rows))
         for label in ("Feedback for morty", "Feedback sent to morty", "Feedback could not reach morty"):
-            self.assertIn(label, log)
+            self.assertIn(label, without_role_colors(log))
         self.assertEqual(log.count("Read the <strong>result</strong> &lt;today&gt;."), 3)
         self.assertNotIn("&quot;request&quot;", log)
 
@@ -3057,6 +3057,107 @@ window.fetch=(url,options)=>{
             self.assertEqual(saved.log[-1].what, receipt)
             self.assertEqual(replace(saved, log=saved.log[:-1]), delivered)
             self.assertEqual(send.call_count, 1)
+
+    def test_mark_read_on_a_waiting_item_sends_its_producer_one_next_step_request(self) -> None:
+        root = self.root / "reviews"
+        item, fields = self.waiting_dwight_item()
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery, state = list_page.save_action(root, urlencode(fields), include_detail=True)
+            assert state is not None
+            self.assertEqual((state["item_state"], state["unread"]), ("Working", "false"))
+            send.assert_not_called()
+            list_page.deliver(delivery)
+            self.assertEqual(send.call_count, 1)
+            recipient, _, message = cast(tuple[str, object, str], send.call_args.args[:3])
+            self.assertEqual(recipient, DWIGHT.id)
+            self.assertTrue(message.startswith("List page: nate read item 107, so it is now Working. Write its next step:"))
+            self.assertNotIn("\n", message)
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(send.call_count, 1)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
+        body = list_page.render(root, include_counts=False).decode()
+        self.assertIn("Feedback sent to dwight", without_role_colors(body))
+
+    def waiting_dwight_item(self) -> tuple[the_list.ListItem, dict[str, str]]:
+        item = self.add("Read the waiting result", the_list.ItemState.WAITING_FOR_NATE, number=107)
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        return item, self.fields(item, "read")
+
+    def test_mark_read_notice_goes_to_its_saved_producer_after_a_producer_move(self) -> None:
+        root = self.root / "reviews"
+        item, fields = self.waiting_dwight_item()
+        _ = list_page.submit(root, urlencode(fields))
+        moved = the_list.move_open_producer(MORTY.id, item.id, DWIGHT.id, MORTY.id, source="morty")
+        self.assertEqual(moved.producer, MORTY.id)
+        log = list_page.render(root, include_counts=False).decode().split('<ol class="list-log">', 1)[1]
+        self.assertIn("Feedback for dwight", without_role_colors(log.split("</ol>", 1)[0]))
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.recover_pending()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[0], DWIGHT.id)
+
+    def test_mark_read_alert_leaves_out_the_producer_and_keeps_morty(self) -> None:
+        item, fields = self.waiting_dwight_item()
+        delivery = list_page.submit(self.root / "reviews", urlencode(fields))
+        with (patch.object(change_page, "send_with_retries",
+                           return_value=[change_page.DeliveryFailure(DWIGHT.id, "offline")]),
+              patch.object(list_page, "alert_showrunners", return_value=(DWIGHT, MORTY)),
+              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+            list_page.deliver(delivery)
+        self.assertEqual(cast(tuple[str, ...], alert.call_args.kwargs["recipients"]), (MORTY.id,))
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
+        self.assertEqual((feedback.state, feedback.alerted_to), ("alerted", "morty"))
+
+    def test_mark_read_on_a_waiting_item_with_an_open_question_sends_no_message(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Answer the waiting question", the_list.ItemState.WAITING_FOR_NATE)
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            list_page.deliver(list_page.submit(root, urlencode(self.fields(item, "question", words="Did it pass?"))))
+        asked = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result."}, source="morty")
+        with patch.object(change_page, "send_to_staff") as send:
+            delivery, state = list_page.save_action(root, urlencode(self.fields(asked, "read")), include_detail=True)
+            list_page.deliver(delivery)
+            send.assert_not_called()
+        assert state is not None
+        self.assertEqual((state["item_state"], state["open_question"]), ("Waiting for nate", "true"))
+        self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_mark_read_moves_a_waiting_row_out_of_needs_me_in_place(self) -> None:
+        root = self.root / "reviews"
+        items = [self.add(f"Waiting result {number}", the_list.ItemState.WAITING_FOR_NATE, number=number)
+                 for number in (1, 2)]
+        initial = list_page.render(root, include_counts=False).decode()
+        with patch.object(change_page, "send_to_staff"):
+            _, state = list_page.save_action(root, urlencode(self.fields(items[0], "read")), include_detail=True)
+        assert state is not None
+        steps = r'''
+ const item=number=>document.querySelector('[data-number="'+number+'"]');
+ const count=chip=>document.getElementById('filter-show-'+chip).dataset.filterCount;
+ const pressed=chip=>document.getElementById('filter-show-'+chip).getAttribute('aria-pressed');
+ show('needs-me');
+ await finishRowMotion();
+ check(!item(1).hidden && !item(2).hidden && count('needs-me')==='2','Both waiting rows start in Needs me.');
+ if(!recordIsOpen(item(1))) item(1).querySelector('.list-toggle').click();
+ const address=location.href,top=scrollY,otherTop=item(2).getBoundingClientRect().top;
+ submit('read',recordDetails(item(1)).querySelector('form'));
+ finishPost(READ_RESPONSE);
+ await flush();
+ await finishRowMotion();
+ check(item(1).hidden && item(1).dataset.state==='Working','The read row leaves Needs me as Working.');
+ check(count('needs-me')==='1' && count('working')==='1','The counts move the row from Needs me to Working.');
+ check(pressed('needs-me')==='true' && !item(2).hidden,'Needs me stays selected with the other row.');
+ check(scrollY===top,'The page keeps its scroll position.');
+ check(location.href===address.replace(/&item=[^&]*/,''),'The address keeps its filters and releases only the item.');
+ check(item(2).getBoundingClientRect().top<=otherTop,'The other row keeps its place or moves up.');
+ show('working');
+ await finishRowMotion();
+ check(!item(1).hidden && item(1).querySelector('.list-state').textContent==='Working',
+  'Working shows the read row with its new state.');
+'''.replace('READ_RESPONSE', json.dumps(state).replace('<', r'<'))
+        self.browser_action_sequence(steps, add_item=False, markup=initial, reduced_motion=True)
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Remove this item now")
@@ -6643,17 +6744,20 @@ window.fetch=async(path,options={})=>{
         self.assertEqual(failures, [])
 
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
-        _ = self.add("Delivery notice")
+        item = self.add("Delivery notice")
+        _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
         cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
             (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
             (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=DWIGHT.id), "sent to dwight", ("dwight",)),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=MORTY.id), "sent to morty", ("morty",)),
             (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent; sdlc told", ("sdlc",)),
             (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent; <unknown> told", ()),
             (the_list.PageFeedback("request", "Words", "alerted"), "not sent; no showrunner for alert", ()),
         )
         for feedback, text, colored in cases:
-            with (self.subTest(state=feedback.state, recipient=feedback.alerted_to),
-                  patch.object(the_list, "sent_to_morty", return_value=NOW),
+            with (self.subTest(state=feedback.state, action=feedback.action, alerted_to=feedback.alerted_to),
+                  patch.object(the_list, "sent_notice_time", return_value=NOW),
                   patch.object(the_list, "feedback_requests", return_value={feedback.request: feedback})):
                 body = list_page.render(self.root / "reviews").decode()
                 cell = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
@@ -6686,7 +6790,7 @@ window.fetch=async(path,options={})=>{
                     if action == "tell":
                         self.assertEqual(item.log[-1].what, the_list.MarkedRead())
                     self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
-                    self.assertEqual(the_list.sent_to_morty(item), NOW)
+                    self.assertEqual(the_list.sent_notice_time(item), NOW)
                     body = list_page.render(root).decode()
                     if action == "remove":
                         self.assertNotIn(f'data-key="{MORTY.id}/{item.id}"', body)
@@ -6694,7 +6798,7 @@ window.fetch=async(path,options={})=>{
                         self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
                         self.assertIn('data-feedback-form', body)
                         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
-                        self.assertIn("Feedback for morty", log)
+                        self.assertIn("Feedback for morty", without_role_colors(log))
                         self.assertIn(html.escape(words.splitlines()[0]), log)
                         self.assertNotIn(fields["request"], log)
                     list_page.deliver(delivery)
@@ -6953,7 +7057,7 @@ window.fetch=async(_path,options={})=>{
                     with self.assertRaisesRegex(OSError, "fixture save failed"):
                         _ = list_page.submit(root, urlencode(fields))
                 saved = the_list.load(MORTY.id, item.id)
-                self.assertEqual(isinstance(the_list.sent_to_morty(saved), datetime), published)
+                self.assertEqual(isinstance(the_list.sent_notice_time(saved), datetime), published)
                 self.assertEqual(fields["request"] in the_list.feedback_requests(saved), published)
                 with patch.object(change_page, "send_to_staff") as send:
                     if published:
@@ -6997,7 +7101,7 @@ window.fetch=async(_path,options={})=>{
         current = the_list.load(MORTY.id, item.id)
         self.assertEqual(current.latest_status, "Morty edited during delivery")
         self.assertEqual(tuple(the_list.feedback_requests(current).values())[-1].state, "sent")
-        self.assertIs(the_list.sent_to_morty(current), the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.sent_notice_time(current), the_list.NoTimestamp.UNSET)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
