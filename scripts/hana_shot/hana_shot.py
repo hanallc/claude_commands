@@ -739,12 +739,12 @@ class Brp:
             raise Failure(f"no Hana answers on port {self.port}: {exc}") from exc
         finally:
             connection.close()
-        if isinstance(hover_deadline, HoverDeadline):
-            _ = hover_deadline.remaining()
         reply = cast(RpcReply, json.loads(raw))
         error = reply.get("error")
         if error is not None:
             raise BrpCallError(method, error["code"], error["message"])
+        if isinstance(hover_deadline, HoverDeadline):
+            _ = hover_deadline.remaining()
         return reply.get("result")
 
     def query(self, params: dict[str, object]) -> list[QueryRow]:
@@ -1618,9 +1618,8 @@ def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> 
     owner = tooltip_owner(hover_session, target, parents)
     bounds = finish_bounds(bounds_reads, include_outside_fit=(owner.entity,))
     location = locate_target(hover_session, target, state, bounds)
-    move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
-
     try:
+        move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
         while True:
             # Some help, such as a rear jack's, spawns only while its target is hovered.
             if not owner.controllers:

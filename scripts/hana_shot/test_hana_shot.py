@@ -1711,17 +1711,27 @@ class LocateTests(HanaShotTest):
 
     def test_hover_deadline_stops_a_pointer_step_when_frames_stall(self) -> None:
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
-        self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
-        self.fake.tooltip_visibility = {2001: ["Inherited"]}
-        self.fake.pointer_frame_stall_seconds = 1.0
+        for has_help, code, error in ((True, 1, "help for name:Tool body did not become ready"),
+                                      (False, 2, "has no tooltip controller on the target or its ancestors within 0.5 s")):
+            with self.subTest(has_help=has_help):
+                self.fake.calls.clear()
+                self.fake.tooltip_read_frames.clear()
+                if has_help:
+                    self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
+                else:
+                    _ = self.fake.named_entities[-1]["components"].pop(hana_shot.TOOLTIPS, None)
+                self.fake.tooltip_visibility = {2001: ["Inherited"]}
+                # The stall from the subtest before must not reach this one's camera settle.
+                self.fake.frame_stalled_until = 0.0
+                self.fake.pointer_frame_stall_seconds = 1.0
 
-        result = self.shot("--mode", "home", "--hover", "name:Tool body")
+                result = self.shot("--mode", "home", "--hover", "name:Tool body")
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("help for name:Tool body did not become ready", result.stderr)
-        self.assertEqual(len(self.fake.methods("brp_extras/move_mouse")), 1)
-        self.assertEqual(self.fake.tooltip_read_frames, [])
-        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(len(self.fake.methods("brp_extras/move_mouse")), 1)
+                self.assertEqual(self.fake.tooltip_read_frames, [])
+                self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
 
     def test_hover_approaches_the_tooltip_owner_from_a_window_edge(self) -> None:
         for half_width in (3.0, 7.0):
