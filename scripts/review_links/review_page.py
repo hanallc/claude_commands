@@ -27,7 +27,7 @@ from scripts.production import change_review, change_routing, proposal_issue, st
 from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
-from scripts.review_links import new_item_dialog, review_submissions
+from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
 from scripts.review_links import question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
@@ -237,7 +237,7 @@ class ReviewSnapshot:
         if view is ReviewBodyView.TABLE:
             return body
         entry = next(entry for entry in self.entries if entry['key'] == key)
-        return render_card(self, entry, body.decode())
+        return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
     def linked_card(self, root: Path, key: str, *, view: ReviewBodyView = ReviewBodyView.CARD) -> bytes:
         """Serve an active or completed card."""
@@ -255,7 +255,7 @@ class ReviewSnapshot:
         if view is ReviewBodyView.TABLE:
             return body
         entry = card_entry(item, self.members, self.names)
-        return render_card(self, entry, body.decode())
+        return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
     def render_body(self, item: ReviewItem, assets: Mapping[str, str]) -> bytes:
         body = CARD_ERROR
@@ -894,7 +894,9 @@ def icon(kind: ReviewType) -> str:
 
 
 def section(heading: str, text: str) -> str:
-    return '<section><h3>'+heading+'</h3>'+change_browser.question_paragraphs(text)+'</section>'
+    paragraphs = change_browser.question_paragraphs(text)
+    empty = '' if paragraphs else ' data-empty-review-section'
+    return '<section'+empty+'><h3>'+heading+'</h3>'+paragraphs+'</section>'
 
 
 def answer_section(text: str) -> str:
@@ -1101,19 +1103,18 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     return build_snapshot(root).render(show=show)
 
 
-def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str) -> bytes:
+def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str, *, waiting_why: str) -> bytes:
     """Serve one expanded Review card with its own document styles."""
-    settings = json.dumps({'entry': entry, 'titleLimit': snapshot.title_limit,
+    if entry['state'] == ReviewState.WAITING and waiting_why:
+        entry = {**entry, 'waitingWhy': waiting_why}
+    settings = json.dumps({'entry': entry, 'titleText': change_page.CODE_SPAN.sub(r"\1", entry['title']),
                            'zone': snapshot.zone.key, 'later': dict(snapshot.later),
                            'requestTimeoutSeconds': snapshot.request_timeout_seconds})
     content = (record_table.STYLE + record_table.DATE_TIME_STYLE + STYLE + CARD_VIEW_STYLE
-               + f'<div data-review-card class="list-table" {snapshot.card_motion.attributes()}>'
+               + f'<div data-review-card {snapshot.card_motion.attributes()}>'
                + '<div class="record-dialog-status" data-review-card-updates>'
                + '<span role="status" data-review-card-notice></span>'
-               + '<button type="button" data-show-record-updates hidden>Show updates</button></div>'
-               + '<table aria-label="Review card">'
-               + CARD_COLUMNS + '</table></div>'
-               + '<template data-card-icon>' + icon(entry['type']) + '</template>'
+               + '<button type="button" data-show-record-updates hidden>Show updates</button></div></div>'
                + '<template data-card-body>' + body + '</template>'
                + '<div data-card-settings hidden>' + html.escape(settings) + '</div>'
                + '<script>' + record_table.DATE_TIME_SCRIPT + page_frame.MOTION_SCRIPT
@@ -1197,7 +1198,8 @@ def repeats_response_followup(item: ReviewItem, outcome: str, words: str, status
     path = source.record.path
     page = status.metadata_page(change_page.ReviewPage(path, path.parent, (path.stem,), ''))
     return (isinstance(page, change_page.UserQuestionPage) and page.saved.get('kind') == 'question'
-            and page.saved.get('question_id') == reply.reply_token and page.saved.get('question_text') == pending['text'])
+            and reply_tokens.matches_reference(reply.reply_token_sha256, page.saved.get('question_id', ''))
+            and page.saved.get('question_text') == pending['text'])
 
 
 def submit_response(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus,
@@ -1210,7 +1212,7 @@ def submit_response(item: ReviewItem, outcome: str, words: str, status: change_p
     if outcome == 'read':
         with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
             _ = verify_revision()
-            update_registration.review_sent_question(source.record, scope, 'read', '', '')
+            update_registration.review_sent_question(source.record, scope, 'read', '')
         return change_page.NoMessageDelivery(), 'got it'
     words = new_item_dialog.read_words(words, 'Your words')
     delivery, _ = review_actions.sent_question_action(item, source.record, scope, 'question', words, status,
@@ -1436,7 +1438,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-handoff>:is(span,time){white-space:nowrap}
 .review-handoff>.staff-name{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
-@media(max-width:960px){:is([data-review],[data-review-card]) .list-row td:last-child::before{content:'Age: '}
+@media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 @media(max-width:800px){[data-review]>:is(.page-status,.record-filter-words){flex-basis:100%}
 [data-review]>.record-filter-words{margin-top:8px}
@@ -1445,11 +1447,37 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 </style>'''
 
 CARD_VIEW_STYLE = '''<style>
-:root{scrollbar-gutter:stable}
+:root:has([data-review-card]){overflow:hidden;scrollbar-gutter:auto}
+:root:not(.layout-measuring) main:has(>[data-review-card]){max-width:none;padding:0}
+.review-box{position:relative;box-sizing:border-box;display:flex;flex-direction:column;max-height:100dvh;padding:24px;background:var(--card)}
+.review-box-header{flex:none}
+.review-box-header h1{margin:0 0 8px;padding-right:84px;font-size:24px;white-space:pre-line;overflow-wrap:anywhere}
+.review-box-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;color:var(--ink-3);font-size:13px}
+.review-box-scroll{min-height:var(--review-body-min,0px);overflow:auto;scrollbar-gutter:stable}
+:is(.review-box,.review-box-scroll){scrollbar-width:thin;
+scrollbar-color:color-mix(in srgb,var(--ink-3) 45%,var(--card)) transparent}
+.review-box[data-whole-scroll]{overflow:auto}
+.review-box[data-whole-scroll] .review-box-scroll{flex:none;overflow:visible}
+.review-box .review-panel{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+column-gap:24px;row-gap:0;border:0;padding:0}
+.review-box .review-panel>div{min-width:0}
+.review-box :is([data-title-fallback],[data-empty-review-section],section:has(>.list-log:empty)){display:none}
+.review-box .review-panel:not(:has(.review-handoff,[data-review-body]>:not([data-empty-review-section])))
+>div:nth-child(2){grid-column:1/-1}
+.review-box .review-source{margin:12px 0 0!important}
+.review-box-footer{position:relative;flex:none;margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}
+.review-box-footer form{margin:0}
+.review-box-footer textarea{margin:0;max-height:9rem}
+.review-box .later-menu{position:static}
+.review-box [data-later-menu]{bottom:calc(100% + 6px)}
+@media(max-width:799px){.review-box .review-panel{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:560px){
+.review-box .review-actions{flex-direction:row;flex-wrap:wrap;gap:8px}
+.review-box .review-action-group>div>button{font-size:14px;min-height:36px;padding-inline:10px}
+.review-box-footer textarea{max-height:4rem}
+}
+.review-box [data-review-card-updates]{padding-inline:0}
 [data-review-card-notice]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-main{max-width:1060px;padding:0}
-[data-review-card] .list-row{cursor:default}
-@media(max-width:560px){:root:not(.layout-measuring) main{padding:0 12px 12px}}
 </style>'''
 
 REVIEW_CARD_SCRIPT = r'''
@@ -1469,6 +1497,9 @@ function updateHandoffAges(root=document){
   if(stamp.textContent!==label) stamp.textContent=label;
  }
 }
+const reviewUrgency=entry=>({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'})[entry.urgency] || '';
+const reviewWaiting=entry=>entry.state==='Waiting' && entry.waitingWhy
+ ? '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
 function reviewCardSummary(entry,titleLimit,icon){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
@@ -1483,22 +1514,21 @@ function reviewCardSummary(entry,titleLimit,icon){
  const age=handoff ? ' · Validating for <time data-validating-age datetime="'+escapeText(handoff)+'">'
   +reviewAge(Date.parse(handoff),true)+'</time>' : '';
  const handoffLine=validating && entry.owner ? '<span class="review-handoff">With '+colored(entry.ownerName,entry.ownerHtml)+age+'</span>' : '';
- const waitingLine=entry.state==='Waiting' && entry.waitingWhy ?
-  '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
+ const urgency=reviewUrgency(entry);
  const cells=['<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
   +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
   icon+typeLabel,colored(entry.ownerName,entry.ownerHtml)
   +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
-  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+waitingLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
+  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+reviewWaiting(entry)+(urgency ? '<small>'+escapeText(urgency)+'</small>' : ''),
   '<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+stateLabel+'</span>',stamp];
  node.innerHTML='<tr class="list-row">'+cells.map((cell,at)=>'<td'+(at===0 ? ' class="record-id"' : '')+' data-label="'+['Id','Type','Owner','Item','State','Age'][at]+'">'+cell+'</td>').join('')
   +'</tr><tr data-detail id="'+panel+'" hidden><td colspan="6"><p data-record-loading role="status">Loading the item…</p></td></tr>';
  return node;
 }
-function updateTitleFallback(panel){
- const fallback=panel.querySelector('[data-title-fallback]');
- if(!fallback) return;
- const body=panel.querySelector('[data-review-body]').cloneNode(true);
+const plainReviewText=text=>text.replace(/\s+/g,' ').trim();
+function reviewBodyText(element,omitHeading=false){
+ const body=element.cloneNode(true);
+ if(omitHeading) body.querySelector(':scope > h3')?.remove();
  body.querySelectorAll('[data-title-fallback],[data-title-ignore],.list-log,form,button,input,select,textarea,label,script,style')
   .forEach(node=>node.remove());
  const blocks=new Set('ADDRESS ARTICLE ASIDE BLOCKQUOTE BR DD DETAILS DIALOG DIV DL DT FIELDSET FIGCAPTION FIGURE FOOTER H1 H2 H3 H4 H5 H6 HEADER HGROUP HR LI MAIN MENU NAV OL P PRE SECTION SUMMARY TABLE TBODY TD TFOOT TH THEAD TR UL'.split(' '));
@@ -1507,8 +1537,13 @@ function updateTitleFallback(panel){
   const text=[...node.childNodes].map(bodyText).join('');
   return blocks.has(node.nodeName) ? ' '+text+' ' : text;
  };
- const plain=text=>text.replace(/\s+/g,' ').trim();
- fallback.hidden=plain(bodyText(body)).includes(plain(fallback.querySelector('p').textContent));
+ return plainReviewText(bodyText(body));
+}
+function updateTitleFallback(panel){
+ const fallback=panel.querySelector('[data-title-fallback]');
+ if(!fallback) return;
+ fallback.hidden=reviewBodyText(panel.querySelector('[data-review-body]'))
+  .includes(plainReviewText(fallback.querySelector('p').textContent));
 }
 function laterTimes(now,zone,settings){
  const today=zoneParts(zone,now);
@@ -1626,7 +1661,8 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
    const latest=reviewDrafts.get(key);
    const unchanged=latest?.stamp===atConflict?.stamp;
    const draft=unchanged ? atConflict?.draft : latest?.draft;
-   const fresh=recordDetails(row)?.querySelector('[data-review-form]');
+   const fresh=recordDetails(row)?.querySelector('[data-review-form]')
+    ?? row?.querySelector('.review-box-footer [data-review-form]');
    if(fresh?.elements.feedback){
     if(atConflict && unchanged){
      restoreReviewDraft(fresh,atConflict.draft);
@@ -1678,32 +1714,73 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,undone=failed,d
 
 CARD_VIEW_SCRIPT = r'''(() => {
 const frame=window.frameElement;
-const card=document.querySelector('[data-review-card]'),table=card.querySelector('table');
-const notice=card.querySelector('[data-review-card-notice]'),showUpdates=card.querySelector('[data-show-record-updates]');
+const card=document.querySelector('[data-review-card]'),updates=card.querySelector('[data-review-card-updates]');
+const notice=updates.querySelector('[data-review-card-notice]'),showUpdates=updates.querySelector('[data-show-record-updates]');
 function report(text){
  notice.textContent=text;
  notice.title=text;
 }
 const motion=createCardMotion(()=>card);
+const boxFrame=frame?.closest('[data-list-review-dialog]') ? frame : null;
+function fitReviewBox(){
+ const box=card.firstElementChild;
+ const header=box.querySelector('.review-box-header'),footer=box.querySelector('.review-box-footer');
+ const detail=box.querySelector('[data-review-detail]'),menu=footer?.querySelector('[data-later-menu]');
+ const style=getComputedStyle(box),oldMin=box.style.getPropertyValue('--review-body-min');
+ const minBody=footer ? Math.max(96,menu?.offsetHeight || 0) : 0;
+ const fixedHeight=parseFloat(style.paddingTop)+header.getBoundingClientRect().height+parseFloat(style.paddingBottom)
+  +(footer ? parseFloat(getComputedStyle(footer).marginTop)+footer.getBoundingClientRect().height : 0);
+ const min=minBody+'px';
+ box.style.setProperty('--review-body-min',min);
+ const height=Math.ceil(fixedHeight+Math.max(minBody,detail.getBoundingClientRect().height));
+ boxFrame?.style.setProperty('--review-card-height',height+'px');
+ const whole=fixedHeight+minBody>document.documentElement.clientHeight;
+ box.toggleAttribute('data-whole-scroll',whole);
+ if(whole && min!==oldMin && menu?.contains(document.activeElement))
+  document.activeElement.scrollIntoView({block:'nearest'});
+}
+const resizeBox=new ResizeObserver(fitReviewBox);
+window.addEventListener('resize',fitReviewBox);
+function showCard(row){
+ row.querySelector('.review-box-header').append(updates);
+ card.replaceChildren(row);
+ resizeBox.disconnect();
+ for(const element of row.querySelectorAll('.review-box-header,[data-review-detail],.review-box-footer,[data-later-menu]'))
+  resizeBox.observe(element,{box:'border-box'});
+ fitReviewBox();
+}
 function mountCard(page,replaceCard=false){
- const {entry,titleLimit,zone,later:settings,requestTimeoutSeconds}=JSON.parse(page.querySelector('[data-card-settings]').textContent);
- const row=reviewCardSummary({...entry,order:0},titleLimit,page.querySelector('[data-card-icon]').innerHTML);
- const id=document.createElement('span');
- id.className='list-toggle';id.textContent=entry.id;
- row.querySelector('.list-toggle').replaceWith(id);
- row.querySelector('.list-row').classList.add('open');
- row.querySelector('[data-detail]').hidden=false;
+ const {entry,titleText,zone,later:settings,requestTimeoutSeconds}=JSON.parse(page.querySelector('[data-card-settings]').textContent);
+ const row=document.createElement('article');
+ row.className='review-box';
+ Object.assign(row.dataset,{listItem:'',key:entry.key,state:entry.state,type:entry.type});
+ const type=entry.type==='for-you' ? 'For you' : entry.type[0].toUpperCase()+entry.type.slice(1);
+ const state=entry.actionStatus==='withdrawn' ? 'Withdrawn' : entry.state,urgency=reviewUrgency(entry);
+ row.innerHTML='<header class="review-box-header"><h1>'+escapeText(entry.title)+'</h1><div class="review-box-meta">'
+  +'<span>'+escapeText(entry.id)+'</span><span>'+type+'</span><span>'+colored(entry.ownerName,entry.ownerHtml)+'</span>'
+  +'<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+state+'</span>'
+  +(entry.filed ? '<time datetime="'+new Date(entry.filed*1000).toISOString()+'">'+reviewAge(entry.filed*1000)+'</time>' : '')
+  +reviewWaiting(entry)+(urgency ? '<span>'+escapeText(urgency)+'</span>' : '')+'</div></header>'
+  +'<div class="review-box-scroll" role="region" aria-label="Review details" tabindex="0"><div data-review-detail></div></div>';
+ row.openDetails=row.querySelector('[data-review-detail]');
  installReviewBody(row,page.querySelector('[data-card-body]').innerHTML);
- const previous=table.tBodies[0];
+ const title=plainReviewText(titleText);
+ for(const section of row.querySelectorAll('[data-review-body] > section,[data-review-body] > .change-text > section')){
+  if(!section.querySelector('a[href]') && reviewBodyText(section,true)===title) section.dataset.emptyReviewSection='';
+ }
+ const form=row.querySelector('[data-review-form]');
+ if(form?.elements.feedback){
+  const footer=document.createElement('footer');
+  footer.className='review-box-footer';footer.append(form);row.append(footer);
+ }else form?.remove();
  if(replaceCard){
-  const form=row.querySelector('[data-review-form]');
-  if(form) setCardSubmitting(form,true);
-  return motion.switchCard(previous,row,()=>previous.replaceWith(row)).then(()=>{
-   if(form) setCardSubmitting(form,false);
+  if(form?.elements.feedback) setCardSubmitting(form,true);
+  return motion.switchCard(card.firstElementChild,row,()=>showCard(row)).then(()=>{
+   if(form?.elements.feedback) setCardSubmitting(form,false);
    return bindCard(row,zone,settings,requestTimeoutSeconds);
   });
  }
- table.append(row);
+ showCard(row);
  return bindCard(row,zone,settings,requestTimeoutSeconds);
 }
 function bindCard(row,zone,settings,requestTimeoutSeconds){
@@ -1723,7 +1800,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   const focus=document.activeElement;
   showUpdates.hidden=true;
   if(hadFocus && (focus===showUpdates || focus===document.body))
-   table.querySelector('[name="feedback"]')?.focus({preventScroll:true});
+   card.querySelector('[name="feedback"]')?.focus({preventScroll:true});
  };
  const busy=active=>{
   setCardSubmitting(form,active);
@@ -1841,23 +1918,81 @@ let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
-function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys,now=Date.now()}){
+function rowOwners(entry){
+ return isInvestigation(entry) && entry.sourceOwner!==entry.owner ? [entry.owner,entry.sourceOwner] : [entry.owner];
+}
+function rowTypes(entry){return isInvestigation(entry) ? ['',entry.type,'investigations'] : ['',entry.type];}
+function rowShow(entry){return entry.actionStatus==='withdrawn' ? '' : entry.state==='Open' ? 'open' : entry.state;}
+function typeChipShow(show,type){
+ return type==='for-you' || type==='response' && show==='Validating' ? 'open' : show;
+}
+function availableForFilters(entry,{query,keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
  return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=now) &&
-  matchesOwner(entry,owner) &&
-  (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
-  (!sourceOwner || entry.sourceOwner===sourceOwner) &&
-  (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
-  (show==='all' || (entry.state===(show==='open' ? 'Open' : show) && entry.actionStatus!=='withdrawn'));
+  (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query));
+}
+function ownerHasType(entry,{owner,type}){
+ return rowOwners(entry).includes(owner) && rowTypes(entry).includes(type);
 }
 function isListed(entry,filters){
+ const {owner,show,type,sourceOwner}=filters;
  const key=entry.key,departure=saved.get(key);
  if(pendingSaves.get(key)?.departing) return false;
  if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
- return (!departure || entry.type==='for-you' || departure.handed && entry.state!=='Open') && matches(entry,filters);
+ return (!departure || entry.type==='for-you' || departure.handed && entry.state!=='Open') &&
+  availableForFilters(entry,filters) && (!owner || rowOwners(entry).includes(owner)) &&
+  rowTypes(entry).includes(type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
+  (show==='all' || show===rowShow(entry));
 }
-function matching(filters){return allEntries().filter(entry=>isListed(entry,filters));}
+function updateReviewChips(rows,filters,matches,shown){
+ const {owner,show,type}=filters;
+ const allOwners={...filters,owner:'',sourceOwner:''};
+ const allShows={...filters,show:'all'},allTypeShows={...allShows,type:''};
+ const anyOwnerShows={...allOwners,show:'all'},anyOwnerTypeShows={...anyOwnerShows,type:''};
+ const owners=new Map(),types=new Map(),shows=new Map();
+ const anyOwnerTypeCounts=new Map(),anyOwnerShowCounts=new Map();
+ const eligibleOwners=new Set(),ownerTypes=new Set();
+ const add=(counts,choices)=>{
+  for(const value of choices) counts.set(value,(counts.get(value) ?? 0)+1);
+ };
+ for(const item of rows){
+  const row=item.dataset,ownersForRow=rowOwners(row),typesForRow=rowTypes(row),state=rowShow(row);
+  const showsForRow=state ? ['all',state] : ['all'];
+  const typesForClick=typesForRow.filter(kind=>showsForRow.includes(typeChipShow(show,kind)));
+  if(availableForFilters(row,filters)){
+   if(typesForRow.includes(type)) for(const id of ownersForRow) eligibleOwners.add(id);
+   if(ownersForRow.includes(owner)) for(const kind of typesForRow) ownerTypes.add(kind);
+  }
+  if(matches(item,allOwners)) add(owners,['',...ownersForRow.filter(Boolean)]);
+  if(matches(item,allTypeShows)) add(types,typesForClick);
+  if(matches(item,allShows)) add(shows,showsForRow);
+  if(owner && matches(item,anyOwnerTypeShows)) add(anyOwnerTypeCounts,typesForClick);
+  if(owner && matches(item,anyOwnerShows)) add(anyOwnerShowCounts,showsForRow);
+ }
+ content.querySelectorAll('[data-owner-chip]').forEach(button=>{
+  const id=button.dataset.ownerChip;
+  button.hidden=Boolean(id) && id!==owner && !eligibleOwners.has(id);
+  button.querySelector('b').textContent=id===owner ? shown : owners.get(id) ?? 0;
+ });
+ const showCounts=owner && !ownerTypes.has(type) ? anyOwnerShowCounts : shows;
+ content.querySelectorAll('[data-show-chip]').forEach(button=>{
+  const value=button.dataset.showChip;
+  button.hidden=['response','for-you'].includes(type) && value==='Validating';
+  const count=value===show ? shown : showCounts.get(value) ?? 0;
+  button.querySelector('b').textContent=count;
+  button.toggleAttribute('data-empty-count',count===0);
+ });
+ content.querySelectorAll('[data-type-chip]').forEach(button=>{
+  const kind=button.dataset.typeChip;
+  if(kind==='investigations') button.hidden=type!=='investigations';
+  button.setAttribute('aria-pressed',String(kind===type));
+  // A State reset checks the current Type before the new Type applies.
+  const resetsState=typeChipShow(show,kind)!==show;
+  const resetsOwner=owner && (!ownerTypes.has(kind) || resetsState && !ownerTypes.has(type));
+  const counts=resetsOwner ? anyOwnerTypeCounts : types;
+  button.querySelector('b').textContent=kind===type ? shown : counts.get(kind) ?? 0;
+ });
+}
 function savedEntry(key,result){
  const entry=index.get(key);if(!entry) return;
  if(result.state==='Done' && entry.type!=='for-you'){index.delete(key);return;}
@@ -1902,19 +2037,21 @@ const view=createRecordTable({content:()=>content,
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
   return button ? button.dataset.ownerChip : owner;
  },
- selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
+ selectOwner:(rows,filters)=>!filters.owner || rows.some(({dataset:entry})=>
+  availableForFilters(entry,filters) && ownerHasType(entry,filters)) ? filters.owner : '',
  resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
  visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(items,filters)=>{
-  const {type,show,owner,query,keys,now}=filters;
+ applied:(items,filters,{rows,matches,count})=>{
+  const {type,show}=filters;
   content.querySelector('table').pageData=()=>({
    columns:['Id','Type','Owner','Source','Item','State','Filed'],
    rows:(function*(){
-    for(const {dataset:entry} of items){
-     if(!isListed(entry,filters)) continue;
+    for(const item of items){
+     if(!index.has(item.dataset.key) || !matches(item,filters)) continue;
+     const entry=item.dataset;
      yield [entry.id,entry.type,entry.ownerName,entry.sourceName,entry.title,entry.state,
       new Date(entry.filed*1000).toISOString()];
     }
@@ -1923,28 +2060,7 @@ const view=createRecordTable({content:()=>content,
   content.dataset.show=show;loadBodies();
   const actionNotices=content.querySelector('[data-for-you-notices]');
   actionNotices.hidden=type!=='for-you' || !actionNotices.children.length;
-  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys,now}));
-  content.querySelectorAll('[data-owner-chip]').forEach(button=>{
-   const id=button.dataset.ownerChip;
-   button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
-   button.querySelector('b').textContent=matching(view.ownerChipSelection(filters,id)).length;
-  });
-  const eligible=matching({...filters,show:'all'});
-  const stateCounts=new Map();
-  for(const {state,actionStatus} of eligible)
-   if(actionStatus!=='withdrawn') stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
-  content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   const show=button.dataset.showChip;
-   button.hidden=['response','for-you'].includes(type) && show==='Validating';
-   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
-   button.querySelector('b').textContent=count;
-   button.toggleAttribute('data-empty-count',count===0);
-  });
-  content.querySelectorAll('[data-type-chip]').forEach(button=>{
-   if(button.dataset.typeChip==='investigations') button.hidden=type!=='investigations';
-   button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=matching({...filters,type:button.dataset.typeChip}).length;
-  });
+  updateReviewChips(rows,filters,matches,count);
  }
 });
 async function afterRowAnimations(run,current=()=>true){
@@ -2224,8 +2340,9 @@ function bindForm(row){
 }
 function bind(){view.replace(false);}
 content.addEventListener('click',event=>{
- if((content.dataset.show==='Validating' && event.target.closest('[data-type-chip="response"]')) ||
-    (content.dataset.show!=='open' && event.target.closest('[data-type-chip="for-you"][aria-pressed="false"]')))
+ const chip=event.target.closest('[data-type-chip][aria-pressed="false"]');
+ const show=content.dataset.show;
+ if(chip && typeChipShow(show,chip.dataset.typeChip)!==show)
   document.getElementById('review-show-open').click();
 },true);
 function revealNewItem(){

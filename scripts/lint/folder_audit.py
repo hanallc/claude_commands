@@ -714,13 +714,7 @@ def check_cargo_output_location(path: Path) -> None:
     if home_identity not in parents:
         return
     settings = conf.read("build_folders")
-    configured = settings.value("roots.build", str, default="", recover_invalid=False)
-    # Older configurations name the cargo directory inside the build root.
-    if configured:
-        build = Path(configured).expanduser().resolve()
-    else:
-        slot_cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser()
-        build = slot_cargo.parent.resolve()
+    build = Path(settings.text("roots.build")).expanduser().resolve()
     protected = {directory_identity(parent.stat()) for parent in (home, *home.parents)}
     try:
         build_identity = directory_identity(build.stat())

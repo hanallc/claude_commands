@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
+from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
@@ -32,6 +32,7 @@ FORM_TOKEN = "fixture-form-token"
 RESTARTED_TOKEN = "fixture-after-restart"
 CAPTURE_KEY = "f" * 32
 DISPLAY_WORDS = "The nextest row stops updating during shard 2."
+OWNER_REASON = "(why builds? because builds owns the Builds page!)"
 
 
 SHELL = '''
@@ -668,9 +669,32 @@ OWNER_OPTIONS_PROBE = r"""
         'To shows the full recipient set.');
   const selected = () => recipients.querySelector('input:checked')?.value;
   check(selected() === 'builds-staff', 'To starts on the page owner.');
+  const reason = dialog.querySelector('[data-owner-reason]');
+  const group = dialog.querySelector('[data-recipient-group]');
+  const description = () => document.getElementById(group.getAttribute('aria-describedby'));
+  const reasonShown = () => !reason.hidden && description()?.textContent === __OWNER_REASON__
+   && reason.contains(description());
+  check(reasonShown(), 'The To group describes why the page owner is the target.');
+  const emoji = reason.querySelector('[aria-hidden="true"]');
+  check(emoji?.textContent === '\u{1F986}' && !description().contains(emoji),
+        'The duck follows the reason and stays out of the description.');
+  const legend = group.querySelector('legend').getBoundingClientRect(), box = group.getBoundingClientRect();
+  const chips = recipients.getBoundingClientRect();
+  const lines = [...description().getClientRects(), ...emoji.getClientRects()];
+  const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  check(lines.length && lines[0].top < legend.bottom, 'The reason starts on the To line.');
+  check(lines.every(rect => !overlaps(rect, legend) && rect.bottom <= chips.top
+                    && rect.left >= box.left - 0.5 && rect.right <= box.right + 0.5),
+        'The reason never clips or overlaps the To legend or chips.');
+  check(Math.abs(Math.max(...lines.map(rect => rect.right)) - box.right) < 1,
+        'The reason sits at the right side of the To line.');
   const alternate = inputs().find(input => input.value === 'cargo-liner');
   alternate.click();
   check(selected() === alternate.value, 'To accepts another recipient.');
+  check(reason.hidden && !group.hasAttribute('aria-describedby'), 'Another recipient hides the reason.');
+  inputs().find(input => input.value === 'builds-staff').click();
+  check(reasonShown(), 'The page owner chip shows the reason again.');
+  alternate.click();
   dialog.querySelector('[name="include_page"]').click();
   const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
   const status = dialog.querySelector('[data-recipients-status]');
@@ -697,7 +721,8 @@ OWNER_OPTIONS_PROBE = r"""
 def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
     probe = (script.replace("__RECIPIENTS__", json.dumps(RECIPIENTS))
              .replace("__PHOTO__", json.dumps(photo)).replace("__PNG__", PNG).replace("__WIDTH__", str(width))
-             .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS)))
+             .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS))
+             .replace("__OWNER_REASON__", json.dumps(OWNER_REASON)))
     page = (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
             f'<style>{console_theme.CSS}</style></head><body>{SHELL}</body></html>').encode()
@@ -1218,10 +1243,11 @@ class DialogFixture:
     screenshot: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
     reject_first_send: bool = True
     retire_recipient_on_restart: bool = False
+    owner_reason: str = ""
 
     def environment(self) -> dict[str, str]:
         return {"SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "review"),
-                "CONF_DIR": str(self.root / "config")}
+                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config")}
 
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
@@ -1275,7 +1301,8 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 recipients = RECIPIENTS
                 if fixture.retire_recipient_on_restart and fixture.token == RESTARTED_TOKEN:
                     recipients = [row for row in RECIPIENTS if row["id"] != OTHER_RECIPIENT]
-                self.send_json(200, {"token": fixture.token, "page_owner": OWNER, "recipients": recipients})
+                self.send_json(200, {"token": fixture.token, "page_owner": OWNER,
+                                     "page_owner_reason": fixture.owner_reason, "recipients": recipients})
             elif self.path == "/complete":
                 _ = finished.wait(60)
                 self.response(204, "image/png", b"")
@@ -1323,7 +1350,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
                 image = fixture.screenshot if fields.get("capture_key") == CAPTURE_KEY else new_item_dialog.NO_PAGE_SCREENSHOT
-                with patch.dict(os.environ, fixture.environment()), patch.object(Path, "home", return_value=fixture.root):
+                with (patch.dict(os.environ, fixture.environment()),
+                      patch.object(Path, "home", return_value=fixture.root),
+                      patch.object(reply_tokens, "platform", "linux")):
                     item = review_submissions.submit(request, screenshot=image,
                         capture_requested=request.page == "list" and "capture_key" in fields)
             except new_item_dialog.SubmissionScreenshotExpired as error:
@@ -1369,6 +1398,21 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 
 class NewItemDialogTests(unittest.TestCase):
+    def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
+        token = "a" * 43
+        details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),
+                                                  reply_tokens.digest(token))
+        fields = new_item_dialog.stored_submission(details)
+        self.assertEqual(fields.get("reply_token_sha256"), reply_tokens.digest(token))
+        self.assertNotIn(token, json.dumps(fields))
+        del fields["reply_token_sha256"]
+        fields["reply_token"] = token
+        restored = new_item_dialog.read_submission(fields)
+        self.assertEqual(restored, details)
+        new_item_dialog.require_reply_token(restored, token)
+        with self.assertRaises(new_item_dialog.SubmissionError):
+            new_item_dialog.require_reply_token(restored, "b" * 43)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_token_refresh_clears_a_retired_recipient(self) -> None:
         fixture = self.check_recipient_draft("refresh")
@@ -1453,10 +1497,10 @@ class NewItemDialogTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        fixture = DialogFixture(temporary)
-        capture_dialogs(temporary / "options.png", {1440: fixture},
-                        pages={1440: fixture_page(1440, photo=False, script=OWNER_OPTIONS_PROBE)})
-        self.assertEqual(fixture.results, [])
+        fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in (1440, 390)}
+        capture_dialogs(temporary / "options.png", fixtures,
+                        pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: []})
 
     def test_render_mounts_one_dialog_with_five_types(self) -> None:
         markup = new_item_dialog.render()

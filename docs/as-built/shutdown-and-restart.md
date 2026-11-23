@@ -252,6 +252,7 @@ Unknown liveness keeps the request and reports the cause.
 Both commands name each file with a decode error and continue with valid files.
 Legacy reports supply display data only.
 Both commands show a fresh batch command for an off-target legacy member.
+The command uses `--group` when the legacy report names a group.
 `retry` starts a new move for each saved request that still needs a move.
 The journal writer rolls back an incomplete append before it releases the journal lock.
 The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.

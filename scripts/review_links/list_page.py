@@ -19,7 +19,6 @@ from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
-from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
@@ -96,27 +95,6 @@ class ListRecord(NamedTuple):
 
 def page_url() -> str:
     return PAGE_PATH
-
-
-def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
-    """Save the List row once and link it to the native Review item."""
-    keeper = created.saved.owner
-    # Keep the saved Evidence URL so a retry can find a row from an earlier version.
-    evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": created.saved.key})
-    folder = the_list.folder(keeper)
-    folder.mkdir(parents=True, exist_ok=True)
-    with exclusive(folder / ".new-item.lock"):
-        item = next((item for item in the_list.records(keeper, include_closed=True)
-                     if any(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Added"
-                            and entry.what.fields.get("evidence") == evidence for entry in item.log)), None)
-        if item is None:
-            words = created.saved.words
-            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
-            item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE,
-                                changes={"latest_status": words, "evidence": evidence})
-        if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
-            item = the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)
-        return ListRecord(keeper, item)
 
 
 def records(*, include_closed: bool = False) -> list[ListRecord]:
@@ -253,7 +231,7 @@ def log_field_html(field: str, value: object, today: datetime, names: staff_name
 
 
 def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   fields: Mapping[str, object], evidence_id: str) -> str:
+                   fields: Mapping[str, object], evidence_id: str, keeper_label: str) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
     question: Literal["Question", "Answer"] | None = None
@@ -265,8 +243,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
                 for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
-        label = {"pending": "Feedback for morty", "sent": "Feedback sent to morty",
-                 "alerted": "Feedback could not reach morty"}[content.state]
+        label = {"pending": "Feedback for ", "sent": "Feedback sent to ",
+                 "alerted": "Feedback could not reach "}[content.state] + keeper_label
         body = label + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
@@ -302,6 +280,8 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
                   unread_answers: frozenset[str]) -> str:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
+    keeper = names.members.by_id(record.keeper)
+    keeper_label = html.escape(keeper.name) if keeper is not None else "the record keeper"
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
@@ -311,7 +291,7 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
             rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}")))
+                                                    f"list-evidence-{row_id}-{index}", keeper_label)))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
@@ -393,10 +373,12 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
-def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") -> str:
+def feedback_form(entry: ListRecord, secret: str, *, keeper_name: str, parking_label: str = "") -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
+    keeper_label = html.escape(keeper_name, quote=True)
+    words_label = f"Your words for {keeper_label} about this item"
     parked = '' if parking_label else ' hidden'
     note = 'Parked until ' + parking_label if parking_label else ''
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
@@ -407,10 +389,10 @@ def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") ->
             + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>Until delivered</button>'
             + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
-            + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
+            + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
-            + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
+            + f'<button name="action" value="tell" disabled>Tell {keeper_label}</button></div></form>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -587,7 +569,9 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     sections = '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>' if links else ''
     sections += review_links(item, reviews, today)
     questions = panel_questions(item, today, unread_answers, visibility.failed)
-    form = feedback_form(entry, secret, parking_label=parking_label)
+    keeper = names.members.by_id(entry.keeper)
+    form = feedback_form(entry, secret, keeper_name=keeper.name if keeper is not None else "the record keeper",
+                         parking_label=parking_label)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
         entry, sections + questions + form, today, names, unread_answers)
 
@@ -643,7 +627,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     sent = the_list.sent_to_morty(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        notice = "sent to " + names.html("morty")
+        keeper = names.members.by_id(entry.keeper)
+        notice = "sent to " + (names.html(keeper.id, keeper.name) if keeper is not None else "the record keeper")
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
@@ -808,12 +793,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
                 review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
                 include_detail: bool = False) -> tuple[ListActionSubmission, SavedActionState | None]:
-    """Accept signed item actions and save their notices for morty."""
+    """Accept signed item actions for the record keeper."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if (set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"}
             or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
-    keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
+    keeper = staff.StaffId(fields["keeper"][0])
+    identity, request = fields["id"][0], fields["request"][0]
     if re.fullmatch(r"L[1-9]\d*", identity) is None:
         raise question_record.AnswerRefused("the List request does not match this page")
     prefix = ListFormRequestPrefix.parse(request)
@@ -823,42 +809,39 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, prefix.format())
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
-    morty = staff.snapshot().by_id(staff.StaffId(keeper))
-    if morty is None or morty.kind != "producer" or morty.name != "morty":
-        raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
     read_edit = None
     if action == "read":
-        read_edit = the_list.mark_read_edit(morty.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
+        read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
         delivery = change_page.NoMessageDelivery()
     else:
-        delivery = _submit_action(root, morty, identity, request, prefix, action, words, until, status)
+        delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status)
     if not include_detail:
         return delivery, None
     try:
-        item = read_edit.item if read_edit is not None else the_list.load(morty.id, identity)
-        state = action_state(morty.id, item, status=status, review_records=review_records, include_detail=True)
+        item = read_edit.item if read_edit is not None else the_list.load(keeper, identity)
+        state = action_state(keeper, item, status=status, review_records=review_records, include_detail=True)
     except Exception as error:
         print(f"review-links List saved {identity}: {error}", file=sys.stderr)
         return delivery, None
     return delivery, state
 
 
-def _submit_action(root: Path, morty: staff.StaffRow, identity: str, request: str,
+def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: str,
                    prefix: ListFormRequestPrefix, action: str, words: str, until: str,
                    status: change_page.DeliveryStatus | None) -> ListActionSubmission:
-    item = the_list.load(morty.id, identity)
+    item = the_list.load(keeper, identity)
     if action == "question":
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        question = the_list.ask_question(keeper, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
-            _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
         notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
-        changed = the_list.close(morty.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
+        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
@@ -866,19 +849,19 @@ def _submit_action(root: Path, morty: staff.StaffRow, identity: str, request: st
         assert parked_until is not the_list.NoTimestamp.UNSET
         label = parking_notice_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
-        changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
+        changed = the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
-        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
+        changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "tell" and words and len(words) <= 10000:
-        saved = the_list.save_feedback(morty.id, identity,
+        saved = the_list.save_feedback(keeper, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
-        _mark_seen_update_read(morty.id, item, saved.read_update)
-        return ListFeedbackDelivery(morty.id, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
+        _mark_seen_update_read(keeper, item, saved.read_update)
+        return ListFeedbackDelivery(keeper, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
-        raise question_record.AnswerRefused("enter words for morty")
+        raise question_record.AnswerRefused("enter words for the record keeper")
     saved_notice = the_list.feedback_requests(changed).get(request)
-    delivery = (ListFeedbackDelivery(morty.id, identity, request)
+    delivery = (ListFeedbackDelivery(keeper, identity, request)
                 if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
@@ -1097,24 +1080,26 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
                + counts + '</div>'
                + page_frame.CONSOLE_DIALOG_ASSETS
-               + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
-               + '<button type="button" data-close autofocus>Close</button></div></dialog>'
+               + '<dialog data-list-review-dialog aria-label="Review card">'
+               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
                + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
-[data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
-border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
-[data-list-review-dialog]::backdrop{background:#0009}
-.list-review-close{display:flex;justify-content:flex-end;padding:8px 12px}
-.list-review-close button{margin:0;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+[data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));
+max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
+background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
+[data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
+.list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
+font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 108px);border:0}
-:root:has([data-list-review-dialog][open][data-fullscreen]){overflow:hidden;scrollbar-gutter:auto}
+max-height:calc(100dvh - 98px);border:0}
+:root:has([data-list-review-dialog][open]){overflow:hidden}
+:root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
+:root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:100dvh;border:0;border-radius:0;margin:0}
-[data-list-review-dialog][data-fullscreen][open]{display:grid;grid-template-rows:auto minmax(0,1fr)}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
@@ -1190,7 +1175,7 @@ background:var(--ink-2);border-radius:50%}
 .list-eta{display:block;position:relative;min-width:0}
 .list-eta-text{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .list-eta:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-.list-eta-full{display:none;position:absolute;inset-block-start:calc(100% + 4px);inset-inline-end:0;z-index:1;
+.list-eta-full{display:none;position:absolute;inset-block-start:calc(100% + 4px);inset-inline-end:0;z-index:5;
 width:max-content;max-width:min(28rem,calc(100vw - 4rem));padding:6px 8px;background:var(--card);
 border:1px solid var(--line);border-radius:6px;overflow-wrap:anywhere}
 .list-eta:focus-visible .list-eta-full{display:block}
@@ -1228,7 +1213,6 @@ const chipFor=data=>{
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
-let createdItem='';
 function listRequestSignal(){
  return AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
 }
@@ -1239,7 +1223,7 @@ function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
  if(saving) return;
  if(savedReview) void refreshSavedReview();
- else if(refreshNeeded || createdItem) void pageRefresh.refresh(true);
+ else if(refreshNeeded) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
 const unparkMessages={
@@ -1770,7 +1754,8 @@ function bindFeedbackForm(form){
       if(saved && item.hidden){
        const status=content.querySelector('[data-hidden-action-status]');
        const top=target.getBoundingClientRect().top;
-       const inset=document.querySelector('[data-page-status]').offsetHeight+12;
+       const inset=(typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom()
+        : document.querySelector('[data-page-status]').offsetHeight)+12;
        if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
@@ -1881,11 +1866,6 @@ async function refresh(_supersede=false,current=()=>true){
  await tableView.settled();
  if(saving || dateTimePickerOpen(document) || !current()) return;
  refreshNeeded=false;
- const revealCreated=createdItem && rowIn(fresh,createdItem);
- if(revealCreated && tableView.openItem){
-  tableView.closeCard(tableView.openItem.dataset.key);
-  tableView.applyAction();
- }
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
@@ -1924,13 +1904,6 @@ function applyListSnapshot(fresh){
   const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
   const button=action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
- }
- if(createdItem && content.querySelector('[data-list-item][data-key="'+CSS.escape(createdItem)+'"]')){
-  const place=new URL(location.href),fragment=new URLSearchParams(place.hash.slice(1));
-  fragment.set('jump',createdItem);place.hash=fragment.toString();
-  history.replaceState(history.state,'',place);
-  createdItem='';
-  tableView.followItemLink({inheritFilters:true});
  }
  void loadListCounts();
 }
@@ -1986,7 +1959,7 @@ function closeReviewCard(){
  reviewMotion.finish();
  reviewDialog.close();
  card.restoreHost?.();
- card.remove();
+ card.frame.remove();
  reviewClose.disabled=false;
  if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
 }
@@ -2023,14 +1996,10 @@ document.addEventListener('click',event=>{
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=link.href;
- const observer=new ResizeObserver(([entry])=>frame.style.setProperty('--review-card-height',Math.ceil(entry.borderBoxSize[0].blockSize)+'px'));
- const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog(),
-  remove:()=>{observer.disconnect();frame.remove();}};
+ const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog()};
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;
-  const main=doc?.querySelector('main');
-  if(main) observer.observe(main,{box:'border-box'});
   doc?.addEventListener('keydown',event=>{
    if(event.key==='Escape' && !event.defaultPrevented && activeReview===card){
     event.preventDefault();closeReviewCard();
@@ -2051,16 +2020,11 @@ tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-document.addEventListener('review-item-saved',event=>{
- if(typeof event.detail?.list_key!=='string' || !event.detail.list_key) return;
+function refreshAfterNewItem(){
  listSaveVersion++;
  refreshAfterListSave(true);
-});
-document.addEventListener('review-item-created',event=>{
- if(typeof event.detail?.list_key!=='string') return;
- createdItem=event.detail.list_key;
- listSaveVersion++;
- refreshAfterListSave(false);
-});
+}
+document.addEventListener('review-item-saved',refreshAfterNewItem);
+document.addEventListener('review-item-created',refreshAfterNewItem);
 void loadListCounts();
 })();''')

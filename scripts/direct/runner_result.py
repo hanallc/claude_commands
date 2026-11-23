@@ -5,10 +5,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Literal, cast, get_args
+from typing import Final, Literal, cast, get_args
 
 
 ResultWord = Literal["passed", "failed", "lost", "declined", "prelaunch_failed", "hana_command_admission_refused"]
+MAC_HISTORY_KEY_UNAVAILABLE: Final = "history_key_unavailable"
+MAC_HISTORY_KEY_UNAVAILABLE_STATUS: Final = 15
+
+
+def is_mac_history_refusal(status: int, reason: str) -> bool:
+    """Check the status and reason of a Mac history refusal."""
+    return status == MAC_HISTORY_KEY_UNAVAILABLE_STATUS and reason == MAC_HISTORY_KEY_UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -53,8 +60,11 @@ def read_result(path: Path, status: int, selected_is_mac: bool) -> UsableRunnerR
     word = cast(ResultWord, words[0])
     if word == "passed" and status != 0 or word == "failed" and status == 0:
         return UnusableRunnerResult()
-    if word == "prelaunch_failed" and (selected_is_mac or status in (0, 75)):
-        return UnusableRunnerResult()
+    if word == "prelaunch_failed":
+        valid = (is_mac_history_refusal(status, fields.get("reason", ""))
+                 if selected_is_mac else status not in (0, 75))
+        if not valid:
+            return UnusableRunnerResult()
     if word == "hana_command_admission_refused" and (selected_is_mac or status != 75 or not fields.get("reason")):
         return UnusableRunnerResult()
     return UsableRunnerResult(word, fields.get("reason", ""), fields.get("seconds", ""),
