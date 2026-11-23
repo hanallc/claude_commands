@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import select
 import shutil
 import signal
@@ -39,9 +40,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import (
-    change_review, change_routing, delivery_state, investigation, producer_map, session_staff, showrunners, staff, the_list,
-)
+from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
@@ -657,7 +656,7 @@ document.body.append(result);
         self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
+    def test_browser_new_item_refreshes_without_opening_a_row(self) -> None:
         root = self.root / "reviews"
         _ = self.add("An existing List item")
         initial = page_frame.with_owner(list_page.render(root, include_counts=False), "list", MORTY,
@@ -678,7 +677,7 @@ window.fetch=async (path,options={})=>{
  requests.push([request.pathname+request.search,options.body && JSON.parse(options.body)]);
  if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
  if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:created});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -720,13 +719,21 @@ window.fetch=async (path,options={})=>{
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
- await until(document.body,()=>row() && !row().hidden && recordIsOpen(row()));
+ await until(document.body,row);
+ check(row().hidden && !recordIsOpen(row()),'Send preserves the search and keeps the new row closed.');
+ check(!new URLSearchParams(location.hash.slice(1)).has('jump'),'Send adds no jump to the address.');
  check(reads===1,'The New item save refreshes the List once after the row save ends.');
  check(!dialog.open,'Send closes the dialog.');
  const saved=requests.find(([,body])=>body?.words);
  check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
        'Send uses the shared endpoint and the selected List owner.');
- check(row().textContent.includes('A new List item'),'The filtered List reveals the saved row.');
+ const searchField=document.querySelector('#list-search');
+ await new Promise(done=>{
+  searchField.addEventListener('filterchange',done,{once:true});
+  searchField.value='';searchField.dispatchEvent(new Event('input',{bubbles:true}));
+ });
+ row().querySelector('.list-toggle').click();
+ check(recordIsOpen(row()),'A click opens the row.');
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
  document.body.append(result);
 })();
@@ -735,6 +742,85 @@ window.fetch=async (path,options={})=>{
             with self.subTest(status=status):
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
                     "status": status, "body": body})))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_new_item_question_keeps_the_filters_and_the_scroll(self) -> None:
+        # List item 237: a question sent from the New item dialog cleared the filters and jumped to the end.
+        root = self.root / "reviews"
+        for number in range(1, 25):
+            item = self.add(f"Needs me item {number}", number=number)
+            _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+        for number in range(25, 31):
+            _ = self.add(f"Working item {number}", number=number)
+        markup = list_page.render(root, include_counts=False)
+        self.assertRegex(markup.decode(), r'data-filter-value="needs-me"[^>]*data-filter-count="24"')
+        initial = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)),
+                                        new_item_dialog.render).decode()
+        _ = self.add("A Working item after the send", number=31)
+        fresh = list_page.render(root, include_counts=False).decode()
+        setup = r"""<script>
+const owner=__OWNER__,fresh=__FRESH__;
+let reads=0;
+window.setInterval=()=>0;
+window.fetch=async (path,options={})=>{
+ if(path===location.pathname){
+  if(options.method==='POST') return Response.json({});
+  reads++;
+  return new Response(fresh);
+ }
+ const request=new URL(path,location.href);
+ if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
+ if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
+};
+</script>""".replace("__OWNER__", json.dumps(MORTY.id)).replace(
+            "__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=(target,test)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(test()){observer.disconnect();resolve();}});
+  observer.observe(target,{subtree:true,childList:true,attributes:true});
+  if(test()){observer.disconnect();resolve();}
+ });
+ const frames=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const needsMe=()=>document.querySelector('[data-filter-value="needs-me"]');
+ needsMe().click();
+ const row=()=>document.querySelector('[data-list-item][data-number="18"]');
+ row().querySelector('.list-toggle').click();
+ const summaryTop=()=>row().querySelector('.list-row').getBoundingClientRect().top;
+ scrollBy({top:summaryTop()-150,behavior:'instant'});
+ await frames();
+ const hash=location.hash,top=summaryTop(),scroll=scrollY;
+ const params=new URLSearchParams(hash.slice(1));
+ check(needsMe().getAttribute('aria-pressed')==='true' && params.get('show')==='needs-me' &&
+  params.get('item')===row().dataset.key && recordIsOpen(row()) && scroll>0,
+  'Needs me is on and the page is scrolled to the open row. Found '+hash+' at '+scroll+' px.');
+ const dialog=document.querySelector('#review-new-item');
+ document.querySelector('.page-heading-actions [data-owner-new]').click();
+ const recipient=()=>dialog.querySelector('[name="recipient_id"]:checked');
+ await until(dialog,recipient);
+ dialog.querySelector('[name="kind"][value="question"]').click();
+ dialog.querySelector('[name="include_page"]').click();
+ const words=dialog.querySelector('textarea');
+ words.value='Why did the check fail?';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ dialog.querySelector('[type="submit"]').click();
+ await until(dialog,()=>!dialog.open);
+ await until(document.body,()=>document.querySelector('[data-list-item][data-number="31"]'));
+ await frames();
+ check(reads===1,'The question refreshes the List once. Found '+reads+' reads.');
+ check(needsMe().getAttribute('aria-pressed')==='true','The Needs me chip stays on.');
+ check(location.hash===hash,'The address keeps its filters. Expected '+hash+'. Found '+location.hash+'.');
+ check(scrollY===scroll,'The page keeps its scroll. Expected '+scroll+' px. Found '+scrollY+' px.');
+ check(recordIsOpen(row()) && summaryTop()===top,
+  'The open row keeps its top. Expected '+top+' px. Found '+summaryTop()+' px.');
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>"""
+        self.browser_actions(initial, setup, probe, reduced_motion=True, window_size=(1280, 720))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_retry_refreshes_without_revealing_the_saved_row(self) -> None:
@@ -760,7 +846,7 @@ window.fetch=async (path,options={})=>{
  }
  sends.push(payload);
  if(sends.length===1) throw new TypeError('The response was lost.');
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:savedKey});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -817,11 +903,13 @@ window.fetch=async (path,options={})=>{
         owner = replace(MORTY, name="cargo-liner")
         markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
                                        "list", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        setup = f"<script>Date.now=()=>{int(NOW.timestamp() * 1000)};</script>"
         probe = """<script>
 (async()=>{
  const failures=[];
  try{
   await document.fonts.ready;
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
   const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-owner-new]');
   const heading=title.parentElement.getBoundingClientRect(), bounds=title.getBoundingClientRect();
   const line=parseFloat(getComputedStyle(title).lineHeight);
@@ -846,7 +934,7 @@ window.fetch=async (path,options={})=>{
 </script>"""
         for in_console in (False, True):
             with self.subTest(in_console=in_console):
-                self.browser_answer_visibility(markup.decode(), "", probe, reload_console=in_console,
+                self.browser_answer_visibility(markup.decode(), setup, probe, reload_console=in_console,
                                                viewport_width=320)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
@@ -2101,26 +2189,6 @@ document.body.append(result);
                     self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
                                                  window_size=(width, 700))
 
-    def test_new_item_takes_the_mapped_producer_of_its_recipient(self) -> None:
-        def created(recipient: staff.StaffRow, request: str) -> review_page.PublishedSubmission:
-            saved = SimpleNamespace(owner=OWNER.id, recipient_id=recipient.id, words="Check the chart.\nMore words.",
-                                    key=f"question/{recipient.id}/{request}")
-            return cast(review_page.PublishedSubmission, cast(object, SimpleNamespace(saved=saved, key=f"review-{request}")))
-
-        unmapped = list_page.add_submission(created(OWNER, "Q1"))
-        self.assertEqual((unmapped.keeper, unmapped.item.producer, unmapped.item.title),
-                         (OWNER.id, OWNER.id, "Check the chart."))
-        _ = (self.root / "config" / "producer_map.conf").write_text(
-            f"{OWNER.id} = {DWIGHT.id}  # sdlc = dwight\n", encoding="utf-8")
-        mapped = list_page.add_submission(created(OWNER, "Q2"))
-        self.assertEqual((mapped.keeper, mapped.item.producer), (OWNER.id, DWIGHT.id))
-        errors = io.StringIO()
-        with redirect_stderr(errors), patch.object(producer_map, "producer_for", side_effect=staff.StaffUnreadable("no staff")):
-            unread = list_page.add_submission(created(OWNER, "Q3"))
-        self.assertEqual((unread.keeper, unread.item.producer), (OWNER.id, OWNER.id))
-        self.assertEqual(errors.getvalue(),
-                         "list_page: no producer map lookup; the keeper stays the producer: no staff\n")
-
     def test_log_entries_share_one_label_column(self) -> None:
         self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)
 
@@ -2154,12 +2222,13 @@ document.body.append(result);
             "eta": the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))})
 
     def fixture_items(self) -> list[the_list.ListItem]:
-        items = [self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58),
-                 self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10)),
-                 self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1)),
-                 self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41),
-                 self.add("Read the delivered page", the_list.ItemState.DONE, number=63),
-                 self.add("Removed task", number=54)]
+        paused = self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41)
+        removed = self.add("Removed task", number=54)
+        waiting = self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58)
+        done = self.add("Read the delivered page", the_list.ItemState.DONE, number=63)
+        status = self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10))
+        latest = self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1))
+        items = [waiting, status, latest, paused, done, removed]
         _ = the_list.mark_read(MORTY.id, items[0].id, source="nate")
         _ = the_list.update(MORTY.id, items[1].id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, items[3].id, {"producer": DWIGHT.id}, source="morty")
@@ -2206,11 +2275,11 @@ document.body.append(result);
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
-        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE, number=59)
+        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE)
         _ = the_list.park(MORTY.id, parked.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         parked_markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(re.findall(r'<tbody data-list-item [^>]*data-number="(\d+)"', parked_markup),
-                         ["58", "105", "106", "63", "59", "41"])
+                         ["58", "105", "106", "63", "107", "41"])
         self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
         self.assertNotIn('<h3>Closing words</h3>', body)
         _ = the_list.reopen(MORTY.id, "L54", source="nate")
@@ -2458,7 +2527,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", keeper_name=MORTY.name)
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -3046,7 +3115,7 @@ window.fetch=(url,options)=>{
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, keeper_name=MORTY.name)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -3097,6 +3166,20 @@ window.fetch=(url,options)=>{
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_list_adds_the_next_number_after_a_page_remove(self) -> None:
+        first = self.add("Keep the first item", number=206)
+        removed = self.add("Remove the highest item", number=207)
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(self.fields(removed, "remove")))
+        saved = the_list.load(MORTY.id, removed.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.log[:-2], removed.log)
+        self.assertEqual([entry.item.id for entry in list_page.records()], [first.id])
+        self.assertEqual(the_list.load(MORTY.id, removed.id), saved)
+        # The counter keeps the removed number used even when its file is gone.
+        (the_list.folder(MORTY.id) / f"{removed.id}.md").unlink()
+        self.assertEqual([self.add(f"Add item {number}").number for number in (208, 209)], [208, 209])
 
     def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Park this item now")
@@ -3374,6 +3457,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Check the other item", number=2)
         self.browser_action_sequence(r"""
  const toggle=form.querySelector('[data-later-toggle]');
@@ -3408,7 +3492,7 @@ window.fetch=async(_path,options={})=>{
  check(!row.hidden,'Unpark returns the item to Working');
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
         self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3966,15 +4050,16 @@ window.fetch=async(_path,options={})=>{
     def test_browser_list_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
         root = self.root / 'reviews'
         for number in range(7, 28):
-            if number != 13:
-                _ = self.add(f'List item {number}', number=number)
+            title = 'A row that returns above the open item' if number == 13 else f'List item {number}'
+            _ = self.add(title, number=number)
+        _ = the_list.close(MORTY.id, 'L13', 'The row returns later.', source='nate')
 
         def page() -> str:
             return list_page.render(root, include_counts=False).decode().replace(
                 '</head>', '<style>.list-row td { line-height: 22px; }</style></head>')
 
         initial = page()
-        _ = self.add('An added row above the open item', number=13)
+        _ = the_list.reopen(MORTY.id, 'L13', source='nate')
         added = page()
         _ = the_list.close(MORTY.id, 'L12', 'The work has finished.', source='nate')
         removed_above = page()
@@ -4313,10 +4398,10 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
         root = self.root / "reviews"
-        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         for number in range(1, 17):
             state = the_list.ItemState.DELIVERED if number == 5 else the_list.ItemState.WORKING
             _ = self.add(f"List item {number}", state, number=number)
+        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         before = list_page.render(root, include_counts=False).decode()
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
         _ = the_list.update(MORTY.id, parked.id, {"state": the_list.ItemState.WORKING}, source="morty")
@@ -4532,6 +4617,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_switching_rows_moves_a_lost_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4549,10 +4635,11 @@ observer.observe(original.parentElement,{childList:true});
  check(aboveOnly(),'Opening another row moves the notice above the table.');
  row.querySelector('.list-toggle').click();
  check(inlineOnly(),'Opening the first row returns the notice to its details.');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4575,7 +4662,7 @@ observer.observe(original.parentElement,{childList:true});
  check(!shows(1) && shows(2),'Closing row one does not restore the older notice.');
  second.querySelector('.list-toggle').click();
  check(status.hidden,'opening the latest failed row hides the notice above the table');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_clears_the_list_save_notice(self) -> None:
@@ -5347,6 +5434,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence("""
@@ -5363,10 +5451,11 @@ observer.observe(original.parentElement,{childList:true});
  submit('remove');
  finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
  check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence(r"""
@@ -5388,7 +5477,7 @@ observer.observe(original.parentElement,{childList:true});
  check(updateKey()===original && first()==='1','the restored Update key puts the row first');
  restore?.finish();await flush();
  check(!animation() && first()==='1','the correct order remains after the animation');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_closed_response_clears_unread_when_the_server_reports_read(self) -> None:
@@ -5462,6 +5551,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
  document.querySelector('[data-sort="0"]').click();
@@ -5499,7 +5589,7 @@ observer.observe(original.parentElement,{childList:true});
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_respects_reduced_motion(self) -> None:
@@ -6683,6 +6773,66 @@ window.fetch=async(path,options={})=>{
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
+
+    def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
+        root = self.root / "reviews"
+        for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):
+            with self.subTest(keeper=keeper):
+                # Only morty's folder allocates numbers, so move the new record into the legacy keeper's folder.
+                item = the_list.add(MORTY.id, "Read the legacy List item", owner=keeper, source="nate", changes={})
+                legacy = the_list.folder(keeper)
+                legacy.mkdir(parents=True, exist_ok=True)
+                _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
+                markup = list_page.render(root, include_counts=False).decode()
+                self.assertIn(f'data-key="{keeper}/{item.id}"', markup)
+                member = staff.local_snapshot().by_id(keeper)
+                keeper_name = member.name if member is not None else "the record keeper"
+                self.assertIn(f'Tell {keeper_name}</button>', markup)
+
+                def submit(action: str, *, words: str = "", until: str = "") -> list_page.ListActionSubmission:
+                    current = the_list.load(keeper, item.id)
+                    request, token = list_page.signed_item_request(
+                        list_page.ListRecord(keeper, current), list_page.form_secret(root))
+                    return list_page.submit(root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action=action, words=words,
+                        until=until)))
+
+                self.assertIsInstance(submit("read"), change_page.NoMessageDelivery)
+                self.assertIs(the_list.load(keeper, item.id).unread_since, the_list.NoTimestamp.UNSET)
+                told = submit("tell", words="Read this result.")
+                assert isinstance(told, list_page.ListFeedbackDelivery)
+                self.assertEqual(told.keeper, keeper)
+                parked = submit("park", until="2026-12-03")
+                assert isinstance(parked, list_page.ListFeedbackDelivery)
+                self.assertEqual(parked.keeper, keeper)
+                unparked = submit("unpark")
+                assert isinstance(unparked, list_page.ListUnparkSubmission)
+                self.assertIs(unparked.outcome, list_page.UnparkOutcome.CLEARED)
+                asked = submit("question", words="Which check passed?")
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                self.assertEqual(asked.delivery.recipients, (keeper,))
+                self.assertEqual(the_list.load(keeper, item.id).questions[0].words, "Which check passed?")
+                if member is not None and member.kind == "producer":
+                    with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                        list_page.deliver(asked)
+                    attempt = change_page.read_question_attempt(asked.status.path(asked.delivery.page, asked.delivery.row))
+                    send.assert_called_once_with(keeper, attempt.message, attempt.message_id)
+                    command = attempt.message.split("Answer with this command: ", 1)[1].splitlines()[0]
+                    arguments = ["The smoke test passed." if word == "<answer>" else word
+                                 for word in shlex.split(command)[2:]]
+                    with (patch.object(staff, "caller_identity", return_value=member.current_session),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(the_list.main(arguments), 0)
+                    answered = the_list.load(keeper, item.id)
+                    answer = answered.questions[0].answer
+                    assert isinstance(answer, question_record.Answer)
+                    self.assertEqual(answer.text, "The smoke test passed.")
+                    self.assertEqual(answered.log[-1].source, member.name)
+                    self.assertEqual(answered.unread_since, NOW)
+                removed = submit("remove")
+                assert isinstance(removed, list_page.ListFeedbackDelivery)
+                self.assertEqual(removed.keeper, keeper)
+                self.assertIs(the_list.load(keeper, item.id).state, the_list.ItemState.CLOSED)
 
     def test_signed_feedback_logs_words_and_uses_the_shared_sender(self) -> None:
         root = self.root / "reviews"
