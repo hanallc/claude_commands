@@ -14,7 +14,7 @@ from scripts.lint.memory_test_support import admission_configuration_fixture, ad
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import io
 import json
 import math
@@ -1299,7 +1299,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
-        from scripts.mac_test import claim_state
+        from scripts.mac_test import claim_state, mac_test
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
@@ -1324,13 +1324,15 @@ class LocalHoldPlacementTests(unittest.TestCase):
                  mock.patch.object(claim_state, "state_paths", return_value=paths):
                 waiting = install(OwningSession("waiting-session"))
                 self.assertEqual(eligibility(waiting), placement.AllowedHost())
-                _ = paths.block.write_text(json.dumps({
-                    "version": 2, "holder": "nate", "for": "release work", "since": "2026-11-22T16:50:00+00:00",
-                    "expires": "2099-01-01T00:00:00+00:00", "session": "holder-session", "showrunner": None,
-                    "state": "active", "ci": "off_by_this_block", "free_message": {"kind": "not_needed"}}),
-                    encoding="utf-8")
+                since = datetime.now(UTC)
+                mac_test.write_block(paths.block, claim_state.ActiveMacBlock(
+                    "nate", "release work", since, since + timedelta(hours=1),
+                    claim_state.RecordedSession("holder-session", "nate"), mac_test.NO_SHOWRUNNER,
+                    "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
                 self.assertEqual(eligibility(waiting), placement.TemporaryExclusion("blocked"))
                 self.assertEqual(eligibility(install(OwningSession("holder-session"))), placement.AllowedHost())
+                _ = paths.block.write_text("{", encoding="utf-8")
+                self.assertEqual(eligibility(waiting), placement.TemporaryExclusion("state"))
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement
