@@ -75,10 +75,18 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def assert_unchanged_placement_poll(self, fixture: AdmissionFixture, request: wire.PlacementRequest | str,
+                                        initial: wire.PlacementWait) -> None:
+        with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \
+                mock.patch.object(fixture.server, "persist", wraps=fixture.server.persist) as persisted:
+            self.assertEqual(fixture.connect(request).replies(), [initial])
+            self.assertEqual((passed.call_count, persisted.call_count), (0, 0))
+
     def test_identical_placement_poll_returns_the_published_position_without_writes(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
 
         with PlacementFixture() as fixture:
+            peer = fixture.fixture_owner(os.getpid(), "fixture-peer")
             fixture.free(0)
             fixture.hold_starts()
             request = placement_request(fixture)
@@ -87,13 +95,67 @@ class PlacementStatusTests(unittest.TestCase):
             initial, = fixture.connect(request).replies()
             assert isinstance(initial, wire.PlacementWait)
             self.assertEqual(initial.position, 1)
-            caller = records.run_owner(os.getpid(), str(records.process_start_time(os.getpid())))
+            caller = records.run_owner(peer.pid, peer.start_time)
             self.assertEqual(fixture.server.caller_versions[caller], request.code_version)
-            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \
-                    mock.patch.object(fixture.server, "persist", wraps=fixture.server.persist) as persisted:
-                self.assertEqual(fixture.connect(request).replies(), [initial])
-                passed.assert_not_called()
-                persisted.assert_not_called()
+            self.assert_unchanged_placement_poll(fixture, request, initial)
+
+    def test_identical_placement_poll_without_identity_uses_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            del cast(dict[str, object], envelope["data"])["identity"]
+            encoded = json.dumps(envelope) + "\n"
+            initial, = fixture.connect(encoded).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(fixture.server.placement_requests[request.episode].identity.step, request.profile.step)
+            self.assert_unchanged_placement_poll(fixture, encoded, initial)
+
+    def test_identical_placement_poll_with_a_canonicalized_cargo_folder_uses_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            fixture.hold_starts()
+            cargo = fixture.root / "cargo"
+            cargo.mkdir()
+            alias = fixture.root / "alias"
+            alias.symlink_to(cargo, target_is_directory=True)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),),
+                cargo_folder=placement.CargoFolder(alias)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(fixture.server.placement_requests[request.episode].constraints.cargo_folder,
+                             placement.CargoFolder(cargo))
+            self.assert_unchanged_placement_poll(fixture, request, initial)
+
+    def test_placement_poll_with_an_ended_execution_reading_returns_closed(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.LocalPlacementGranted)
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            self.assertEqual(evidence.processes[request.owner.pid].start, request.owner.start_time)
+            self.assertIn(request.episode, server.reservations)
+            fixture.clock.advance(1)
+            peer = fixture.connect(request)
+            server.system_reader = FixedSystemReader(replace(evidence, lifetimes={request.episode: gate.EndedStep()},
+                read_at=fixture.clock.now(), started_monotonic=fixture.clock.monotonic()))
+            os.eventfd_write(server.reading_events, 1)
+            closed, = peer.replies()
+            assert isinstance(closed, wire.DispatchStatus), type(closed)
+            self.assertEqual(closed.state, placement.ClosedAssignment("local execution has ended"))
 
     def test_identical_placement_poll_returns_the_grant_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request

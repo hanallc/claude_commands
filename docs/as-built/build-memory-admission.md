@@ -212,7 +212,10 @@ An unavailable key permits placement and sends no source key with the copy.
 `wait_for_placement` polls after each configured waiting interval, which is one second by default.
 Changes to the queue files do not trigger a poll.
 The service publishes placement waits and grants after each pass.
-An identical poll uses the current published reply without a pass or a state write if the caller version matches.
+The service matches poll bytes before it fills in the caller identity or resolves the Cargo folder.
+Matching polls can use a published wait until the next pass.
+The service checks the latest evidence for the owner and assignment lifetime before it reuses a grant or assignment.
+Reuse needs no pass or state write if the caller version matches.
 A pending configuration change uses the regular request path.
 `Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.

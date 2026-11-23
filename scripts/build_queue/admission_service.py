@@ -1392,7 +1392,7 @@ def durable_copy(value: object) -> object:
 @dataclass(frozen=True)
 class PublishedPlacement:
     request: wire.PlacementRequest
-    encoded_request: str
+    request_bytes: bytes
     assignment: records.SavedPlacementAssignment | None
     reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
 
@@ -1463,6 +1463,7 @@ class Connection:
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
     version: int = 1
+    placement_request_bytes: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -1776,6 +1777,7 @@ class AdmissionServer:
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
+        self.placement_request_bytes: dict[str, bytes] = {}
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -3368,13 +3370,28 @@ class AdmissionServer:
     def _publish_placement_replies(self) -> dict[str, PublishedPlacement]:
         replies: dict[str, PublishedPlacement] = {}
         for episode, request in self.placement_requests.items():
-            if not self._placement_owner_live(request.owner):
+            request_bytes = self.placement_request_bytes.get(episode)
+            if request_bytes is None or not self._placement_owner_live(request.owner):
                 continue
             assignment = self.assignments.get(self.current_assignments.get(episode, ""))
             reply = self._placement_reply(request, self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
             if not isinstance(reply, wire.DispatchStatus):
-                replies[episode] = PublishedPlacement(request, wire.encode_request(request), assignment, reply)
+                replies[episode] = PublishedPlacement(request, request_bytes, assignment, reply)
         return replies
+
+    def _published_placement_is_current(self, published: PublishedPlacement) -> bool:
+        request = published.request
+        assignment = self.assignments.get(self.current_assignments.get(request.episode, ""))
+        if assignment is not published.assignment:
+            return False
+        if assignment is None:
+            return True
+        if self._ended_claim_holder(assignment):
+            return False
+        if isinstance(published.reply, wire.PlacementWait):
+            return True
+        return (self._placement_owner_live(request.owner)
+                and isinstance(self._assignment_state(assignment), placement.CurrentAssignment))
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -4086,6 +4103,7 @@ done
             if (request := self.placement_requests.get(episode)) is not None:
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
+            _ = self.placement_request_bytes.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -5188,6 +5206,7 @@ done
                 elif saved is None:
                     self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
+                    _ = self.placement_request_bytes.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
                 self._prune_host_evidence()
@@ -5196,13 +5215,14 @@ done
             return [wire.Ok()]
         if isinstance(request, wire.PlacementRequest):
             previous = self.placement_requests.get(request.episode)
+            request_bytes = connection.placement_request_bytes if isinstance(connection, Connection) else None
+            if request_bytes is None:
+                request_bytes = wire.encode_request(request).encode().removesuffix(b"\n")
             if (isinstance(self.pending_configuration, NoPass) and isinstance(self.published, PublishedReplies)
                     and (published := self.published.placements.get(request.episode)) is not None
-                    and published.request is previous and published.encoded_request == wire.encode_request(request)):
-                assignment = self.assignments.get(self.current_assignments.get(request.episode, ""))
-                # A retry can settle a remote attempt after its claim holder ends.
-                if assignment is published.assignment and (assignment is None or not self._ended_claim_holder(assignment)):
-                    return [published.reply]
+                    and published.request is previous and published.request_bytes == request_bytes
+                    and self._published_placement_is_current(published)):
+                return [published.reply]
             identity = self._placement_identity(request)
             members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
             request = replace(request, identity=self._named_identity(identity, members=members))
@@ -5234,6 +5254,7 @@ done
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
             self.placement_requests[request.episode] = request
+            self.placement_request_bytes[request.episode] = request_bytes
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
             if self._placement_waiting(request):
@@ -5954,6 +5975,8 @@ done
                     if not (isinstance(connection.request, NoRequest) or _refreshes(connection.request, request)):
                         raise ValueError("one request for admission per connection")
                     connection.request = request
+                if isinstance(request, wire.PlacementRequest):
+                    connection.placement_request_bytes = line
                 connection.received = b""
                 if (not isinstance(self.system_reader, NoSystemReader)
                         and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))

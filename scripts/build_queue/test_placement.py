@@ -753,11 +753,13 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual((row.pid, row.since, row.placement_candidates),
                                  (request.owner.pid, request.since, recorded))
                 fixture.clock.advance(2)
+                _ = fixture.run_pass()
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
                                  placement.TemporaryExclusion("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
                 claim = adopt_assignment(fixture, request, assignment)
                 execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
