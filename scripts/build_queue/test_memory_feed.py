@@ -541,7 +541,8 @@ class MemoryFeedTests(unittest.TestCase):
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         _tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="wait:{row.get("key")}" tabindex="0"'), 1)
-        self.assertIn('data-machine="natedev or mac-linux or hana-aws"', table)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="wait:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("dim", "natedev"), ("dim", "mac-linux"), ("dim", "hana-aws")])
 
     def test_gate_wait_row_shows_the_recorded_mac_linux_exclusion(self) -> None:
         for guest in (placement.TemporaryExclusion("backoff until 15:30 EST"),
