@@ -91,7 +91,8 @@ class InjectedGuest:
 
     def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
                _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
-               count: bool) -> list[str]:
+               count: bool, link: int) -> list[str]:
+        del link
         self.events.append(f"run count={count}")
         return [self.stream_program, "-c", GUEST_RUN, str(self.status), mac_linux.RUN_START,
                 mac_linux.RUN_LOCKED if self.locked else "", self.setup_error,

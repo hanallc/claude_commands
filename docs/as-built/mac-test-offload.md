@@ -77,6 +77,8 @@ The route reports `not started` with the refusal reason before any upload or ret
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
+natedev holds the SSH input open for the whole run.
+When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 
 The Mac Linux route runs the suite in a numbered copy.

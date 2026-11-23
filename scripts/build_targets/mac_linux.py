@@ -3,7 +3,8 @@
 Wait for proof that the guest run ended.
 If the wait expires, fail the route. The guest keeps its run lock until the run ends.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
-Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
+Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death.
+When this process ends by any signal, the link to the guest ends, and the guest ends the run. The guest timeout still ends the run.
 """
 from __future__ import annotations
 
@@ -612,6 +613,11 @@ if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
     fi
     exit 1
 fi
+# natedev holds the link open for the run. If the link ends first, end the run group, which frees the run lock.
+{{ while read -r _; do :; done; kill -KILL 0; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
+watcher=$!
+trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
+exec </dev/null
 commit={shlex.quote(source.commit)}
 origin_main={shlex.quote(source.origin_main)}
 tree=$(git rev-parse --verify "$commit^{{tree}}")
@@ -851,12 +857,15 @@ def empty_delta_header(repo: Path, source: CheckoutSource, basis: DeltaBundle, p
 
 # Without a count argument, the SSH output is the stream output. With one, send the SSH result to
 # descriptor 3, use descriptor 4 to collect the byte count, and print the count last.
+# After the bundle, the SSH input stays open while natedev holds the link (guest_link). The guest ends the run
+# when its input ends first.
 STREAM_SOURCE = '''
 prefix=$1
 base=$2
 header=$3
 count=$4
-shift 4
+exec {link}<&"$5"
+shift 5
 bundle() {
     if [ -n "$header" ]; then
         printf '%s' "$header" && git pack-objects --stdout </dev/null
@@ -868,23 +877,55 @@ bundle() {
         git bundle create - "${refs[@]}"
     fi
 }
+send() {
+    if [ -n "$count" ]; then
+        { cat && bundle; } | tee >(wc -c >&4) || exit
+    else
+        { cat && bundle; } || exit
+    fi
+    exec cat <&"$link"
+}
+linked_ssh() {
+    exec {input}< <(send)
+    sender=$!
+    "$@" <&"$input" {input}<&- 3>&- 4>&-
+    status=$?
+    exec {input}<&-
+    kill "$sender" 2>/dev/null
+    return "$status"
+}
 if [ -z "$count" ]; then
-    { cat && bundle; } | "$@"
+    linked_ssh "$@"
     exit
 fi
 exec 3>&1
 size=$(
     exec 4>&1
-    { cat && bundle; } | tee >(wc -c >&4) | "$@" >&3 3>&- 4>&-
+    linked_ssh "$@" >&3
 ) || exit "$?"
 printf '\\n%s\\n' "$size"
 '''
 
 
-def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes,
-                        timeout: int) -> subprocess.CompletedProcess[bytes]:
+@contextmanager
+def guest_link() -> Generator[int]:
+    """Hold the link to the guest run for the block, and yield the descriptor that the stream reads.
+
+    The link ends when the block ends, or when this process ends by any signal. The guest then ends a run that
+    is still active, and so frees the run lock with no cleanup from natedev.
+    """
+    link, hold = os.pipe()
+    try:
+        yield link
+    finally:
+        os.close(hold)
+        os.close(link)
+
+
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int) -> subprocess.CompletedProcess[bytes]:
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True) as stream:
+                          stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
         try:
             output, errors = stream.communicate(bootstrap, timeout=timeout)
         except BaseException as error:
@@ -902,11 +943,11 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
 
 
 def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt,
-                     prefix: str, send: BundleSend, *, count: bool) -> list[str]:
-    """The local command that sends the bootstrap and the bundle to the armed guest run."""
+                     prefix: str, send: BundleSend, *, count: bool, link: int) -> list[str]:
+    """The local command that sends the bootstrap and the bundle to the armed guest run, then holds the link."""
     command = settings.command(run_shell(settings, source, bootstrap_bytes, armed))
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
-            'count' if count else '', *command]
+            'count' if count else '', str(link), *command]
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
@@ -931,8 +972,11 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestNoAnswer(f'the guest did not arm the run: {error}') from error
-                        arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send, count=True)
-                        stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
+                        with guest_link() as link:
+                            arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
+                                                         count=True, link=link)
+                            stream = stream_guest_bundle(repo, arguments, bootstrap,
+                                                         settings.transfer_timeout_seconds, link)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1043,10 +1087,12 @@ class GuestCommand:
         prefix = self.refs.enter_context(bundle_refs(repo, source, request['attempt']))
         send = bundle_send(repo, source, bundle, prefix)
         self.armed = arm_guest(self.settings, request['attempt'])
-        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False)
+        link = self.refs.enter_context(guest_link())
+        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False,
+                                     link=link)
         with bootstrap.open('rb') as stdin:
             self.process = subprocess.Popen(arguments, cwd=repo, stdin=stdin, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, start_new_session=True)
+                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,))
         try:
             wait_for_start(self.process, request['attempt'])
         except BaseException as error:
@@ -1058,7 +1104,7 @@ class GuestCommand:
         return self.process
 
     def finish(self, failure: BaseException | None = None) -> None:
-        """Prove the end of an armed run, then remove the bundle refs.
+        """Prove the end of an armed run, then end the guest link and remove the bundle refs.
 
         failure is the error that ended the run early, if any. A stream that still runs is stopped, and the
         guest kills a run that still holds the lock. An interrupt does not stop the proof; the first one is
