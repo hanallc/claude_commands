@@ -81,6 +81,7 @@ class ReadCurrentCodexReadings:
 
 READ_CURRENT_CODEX_READINGS = ReadCurrentCodexReadings()
 UNKNOWN_REFUSAL_WINDOW = refusals.UnknownWindow()
+QUEUED_WORKERS_OUTCOME = "workers wait for their queued move"
 
 
 def codex_alert_pass(home: Path | NoWorkersHome, reports: list[Report], observed_at: datetime) -> CodexAlertPassReadings:
@@ -1918,7 +1919,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     assert reset is not None
     if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
         return ZeroEpisodeNotice(id="quota.codex_workers_stay",
-                                 values={"account": label, "outcome": "workers wait for their queued move"})
+                                 values={"account": label, "outcome": QUEUED_WORKERS_OUTCOME})
     chosen = _zero_destination(label, now, prefer_weekly_room=True,
                                included_only=isinstance(credits, agent_accounts.CreditsOn))
     if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
@@ -1977,8 +1978,12 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
         return ZeroEpisodeNotice(id="quota.codex_refused", values={"account": label})
-    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={
-        "account": label, "outcome": f"we're in self-actualize mode; worker work moves to {_units_account()}"})
+    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={"account": label, "outcome": _self_actualize_outcome()})
+
+
+def _self_actualize_outcome() -> str:
+    """Give the workers-stay outcome when no-worker mode starts."""
+    return f"we're in self-actualize mode; worker work moves to {_units_account()}"
 
 
 def _units_account() -> str:
@@ -2054,8 +2059,13 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
     if "file" in values:
         values["file"] = note_file.note_name(label)
     if notice["id"] == "quota.codex_workers_stay":
-        # An episode saved before the one-line text also holds reset, reason and fallback.
-        values = {"account": values["account"], "outcome": values["outcome"]}
+        # An episode saved before the one-line text also holds reset, reason and fallback, and old outcome words.
+        outcome = values["outcome"]
+        if outcome == "work could not move":
+            return ZeroEpisodeNotice(id="quota.codex_refused", values={"account": values["account"]})
+        outcome = {"work moves to Claude": _self_actualize_outcome(),
+                   "workers wait for their next entry": QUEUED_WORKERS_OUTCOME}.get(outcome, outcome)
+        values = {"account": values["account"], "outcome": outcome}
     if workers_queued:
         if notice["id"] == "quota.paid_credits":
             return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in

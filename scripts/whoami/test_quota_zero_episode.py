@@ -907,19 +907,37 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.assertEqual(self.zero_pushes()[-1].message,
                          "codex1 is empty; we're in self-actualize mode; worker work moves to the units account")
 
-    def test_an_old_saved_workers_stay_notice_renders_as_one_line(self) -> None:
+    def test_an_old_saved_workers_stay_notice_renders_with_the_new_words(self) -> None:
+        cases = (("work moves to Claude", "quota.codex_workers_stay",
+                  "codex1 is empty; we're in self-actualize mode; worker work moves to claude3"),
+                 ("workers wait for their next entry", "quota.codex_workers_stay",
+                  "codex1 is empty; workers wait for their queued move"),
+                 ("work could not move", "quota.codex_refused", None))
+        for outcome, expected_id, expected_message in cases:
+            with self.subTest(outcome=outcome):
+                self.phone.reset_mock()
+                _ = self.note(1, "off")
+                self.select_units("claude3")
+                stamp = self.now.isoformat(timespec="seconds")
+                old = quota_alert.ZeroEpisodeNotice(id="quota.codex_workers_stay", values={
+                    "account": "codex1", "reset": "Tue 2026-10-20 00:58 AST", "reason": "No other Codex account has room.",
+                    "outcome": outcome, "fallback": "New coding work uses Claude until the earliest Codex refill."})
+                with quota_alert.state_file() as state:
+                    state["codex_zero"] = {"codex1": quota_alert.CodexZeroEpisode(since=stamp,
+                        weekly_reset=(self.now + timedelta(days=2)).isoformat(), credits="off", phone="due",
+                        forecast_at=stamp, notice=old)}
+                _ = self.alert(spare_left=0)
+                pushes = self.zero_pushes()
+                self.assertEqual([push.id for push in pushes], [expected_id])
+                if expected_message is not None:
+                    self.assertEqual(pushes[0].message, expected_message)
+
+    def test_a_units_selection_that_is_not_claude_names_the_units_account_in_words(self) -> None:
         _ = self.note(1, "off")
-        stamp = self.now.isoformat(timespec="seconds")
-        old = quota_alert.ZeroEpisodeNotice(id="quota.codex_workers_stay", values={
-            "account": "codex1", "reset": "Tue 2026-10-20 00:58 AST", "reason": "No other Codex account has room.",
-            "outcome": "work moves to Claude", "fallback": "New coding work uses Claude until the earliest Codex refill."})
-        with quota_alert.state_file() as state:
-            state["codex_zero"] = {"codex1": quota_alert.CodexZeroEpisode(since=stamp,
-                weekly_reset=(self.now + timedelta(days=2)).isoformat(), credits="off", phone="due",
-                forecast_at=stamp, notice=old)}
-        _ = self.alert(spare_left=0)
-        stay = [push for push in self.zero_pushes() if push.id == "quota.codex_workers_stay"]
-        self.assertEqual([push.message for push in stay], ["codex1 is empty; work moves to Claude"])
+        with mock.patch.object(accounts, "group_label", return_value="codex2"):
+            _ = self.alert(spare_left=0)
+        self.assertEqual(self.zero_pushes()[-1].message,
+                         "codex1 is empty; we're in self-actualize mode; worker work moves to the units account")
 
     def test_failed_claude_switch_sends_the_codex_refused_text(self) -> None:
         """F006: a failed routing update cannot claim that new work moved to Claude."""
