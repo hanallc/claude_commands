@@ -24,6 +24,7 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.hooks import herdr_tab_title  # noqa: E402
 from scripts.hooks.herdr_tab_title import StopPayload  # noqa: E402
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 REAL_RETITLE = herdr.Herdr.retitle
 REAL_PANES = herdr.Herdr.panes
@@ -48,7 +49,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.enterContext(patch.dict("os.environ", {
             "HOME": str(root / "home"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "NOTIFIER_STATE_DIR": str(root / "notifier"),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
             "SHOWRUNNER_" + "UNIT": "", "SHOWRUNNER_" + "UNIT_ID": ""}))
         _ = fixture_member("showrunner", name="fixture-owner")

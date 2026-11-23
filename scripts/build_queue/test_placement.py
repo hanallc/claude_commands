@@ -26,9 +26,10 @@ from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.aws_target import hana_placement as hana
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
-from scripts.build_queue import admission_client as client, queue_snapshot
+from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
+from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
@@ -37,7 +38,7 @@ from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
@@ -166,8 +167,7 @@ def mac_linux_and_natedev_request(fixture: PlacementFixture, *, natedev: bool = 
         "targets=mac-linux,natedev\nkind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=guest.conf\n"
         + "enabled.mac-linux=on\nkind.natedev=local\nplatform.natedev=linux\n")
     _ = write_config_fixture(fixture.root / "guest.conf", template="mac_test")
-    guest = placement.PlacementCandidate(
-        placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", FIXTURE_MAC_SCOPE, 1))
+    guest = mac_linux_candidate()
     request = placement_request(fixture)
     candidates = (guest, local_candidate(fixture)) if natedev else (guest,)
     return replace(request, constraints=replace(request.constraints, candidates=candidates))
@@ -178,6 +178,25 @@ def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) ->
     if not isinstance(reply, wire.Assignment):
         raise AssertionError(f"placement did not assign the eligible destination: {reply!r}")
     return reply.assignment
+
+
+def guest_gate(fixture: PlacementFixture, assignment: placement.PlacementAssignment) -> wire.Owner:
+    """Start a fixture gate process as a child of the placement owner, as copies.py starts the gate."""
+    process = fixture.proc.spawn(used=0)
+    write_process(fixture.proc.path, process.pid, parent=assignment.owner.pid, start=process.start_time)
+    return process
+
+
+def consume_guest_permission(fixture: PlacementFixture, assignment: placement.PlacementAssignment,
+                             gate_process: wire.Owner, *, held: bool | Exception = True) -> list[wire.Reply]:
+    """Send the guest gate's consume. The local Mac claim state gives `held` for the gate's claim."""
+    destination = assignment.destination
+    claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+        mac_test.MAC_LINUX_CLAIM_ID_PREFIX + "fixture", assignment.episode, assignment.attempt)
+    holder = placement.ClaimHolderIdentity(assignment.owner.host, gate_process.pid, gate_process.start_time)
+    with mock.patch.object(mac_run, "claim_held", return_value=held,
+                           side_effect=held if isinstance(held, Exception) else None):
+        return fixture.server.handle_request(wire.ConsumePermission("guest-launch", assignment, claim, holder))
 
 
 def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementRequest, hana.HanaControlTransport]:
@@ -717,7 +736,8 @@ class PlacementTests(unittest.TestCase):
                     guest.destination.host, "host-generation-a", 700001, "guest-start"))
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
                     placement.PrelaunchRefused("fixture")))
-                granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
+                with mock.patch.object(mac_run, "claim_held", return_value=True):
+                    granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
                 self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
                 wrong = replace(assignment, attempt="another-attempt")
                 _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
@@ -1376,6 +1396,192 @@ class PlacementTests(unittest.TestCase):
             assert isinstance(replacement, wire.LocalPlacementGranted), replacement
             self.assertEqual(replacement.assignment.destination.target, "natedev")
             self.assertNotEqual(replacement.assignment.attempt, declined.attempt)
+
+    def test_a_consumed_guest_assignment_stays_current_while_its_holder_lives(self) -> None:
+        # The gate consumes the launch permission. The guest stays busy past the remote start hold
+        # and after copies.py ends, until the gate ends.
+        hold_seconds = 120
+        with PlacementFixture() as fixture:
+            fixture.configure(remote_start_hold_seconds=hold_seconds)
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            destination = assignment.destination
+            self.assertEqual(destination.target, "mac-linux")
+            gate_process = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, gate_process)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            def passes(count: int) -> None:
+                for _ in range(count):
+                    fixture.clock.advance(60)
+                    _ = publish_candidate(fixture, request)
+                    _ = fixture.run_pass()
+
+            passes(hold_seconds // 60 + 3)
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), key)
+            fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+            passes(2)
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), key)
+
+            other = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = publish_candidate(fixture, other)
+            wait, = fixture.server.handle_request(other)
+            assert isinstance(wait, wire.PlacementWait), wait
+            self.assertEqual(wait.eligibility[0].eligibility, placement.TemporaryExclusion("busy"))
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            running, = (row for row in view.reading.view.running if row.assignment_target == "mac-linux")
+            self.assertEqual(running.assignment_host, destination.host)
+
+            fixture.end_owner(gate_process)
+            passes(1)
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
+    def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
+        # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            gate_process = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, gate_process)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+            _ = fixture.run_pass()
+            reading = fixture.server.system_evidence
+            assert isinstance(reading, service.SystemEvidence)
+            self.assertIn(gate_process.pid, reading.processes)
+
+            live, = fixture.server.handle_request(wire.ClaimFailure("gate-live", assignment, MAC_LINUX_NO_ANSWER))
+            assert isinstance(live, wire.DispatchStatus), live
+            self.assertEqual(live.state, placement.CurrentAssignment())
+
+            fixture.end_owner(gate_process)
+            fixture.server.system_reader = FixedSystemReader(reading)
+            settled, = fixture.server.handle_request(wire.ClaimFailure("gate-ended", assignment, MAC_LINUX_NO_ANSWER))
+            assert isinstance(settled, wire.DispatchStatus), settled
+            self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+            self.assertIsInstance(settled.permission, placement.PermissionConsumed)
+            self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now() + 180))
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
+    def test_a_guest_attempt_stays_current_after_its_gate_ends_while_its_owner_lives(self) -> None:
+        # A pass that reads the ended gate and fresh guest evidence leaves the attempt to copies.py.
+        with PlacementFixture() as fixture:
+            def ended_gate() -> tuple[wire.PlacementRequest, placement.PlacementAssignment]:
+                request = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                gate_process = guest_gate(fixture, assignment)
+                granted, = consume_guest_permission(fixture, assignment, gate_process)
+                self.assertIsInstance(granted, wire.FirstAuthorization)
+                fixture.end_owner(gate_process)
+                fixture.clock.advance(60)
+                _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
+                self.assertEqual(fixture.server.current_assignments.get(assignment.episode),
+                                 execution_identity.attempt_key(assignment.episode, assignment.attempt))
+                return request, assignment
+
+            _, reported = ended_gate()
+            settled, = fixture.server.handle_request(wire.ClaimFailure("gate-ended", reported, MAC_LINUX_NO_ANSWER))
+            assert isinstance(settled, wire.DispatchStatus), settled
+            self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now() + 180))
+
+            request, silent = ended_gate()
+            fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+            _ = fixture.run_pass()
+            self.assertNotIn(silent.episode, fixture.server.current_assignments)
+
+    def test_a_gate_newer_than_the_system_reading_consumes_its_guest_permission(self) -> None:
+        # copies.py starts the gate after the last system reading, so that reading does not show the holder.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            reading = fixture.server.system_evidence
+            assert isinstance(reading, service.SystemEvidence)
+            fixture.server.system_reader = FixedSystemReader(reading)
+            gate_process = guest_gate(fixture, assignment)
+            self.assertNotIn(gate_process.pid, reading.processes)
+            granted, = consume_guest_permission(fixture, assignment, gate_process)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+
+    def test_a_gate_whose_pid_named_another_process_in_the_reading_consumes_its_guest_permission(self) -> None:
+        # The last system reading shows the gate pid with the start time of an earlier process.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            gate_process = guest_gate(fixture, assignment)
+            write_process(fixture.proc.path, gate_process.pid, parent=1, start="earlier-process")
+            _ = fixture.run_pass()
+            reading = fixture.server.system_evidence
+            assert isinstance(reading, service.SystemEvidence)
+            self.assertEqual(reading.processes[gate_process.pid].start, "earlier-process")
+            write_process(fixture.proc.path, gate_process.pid, parent=assignment.owner.pid, start=gate_process.start_time)
+            fixture.server.system_reader = FixedSystemReader(reading)
+            granted, = consume_guest_permission(fixture, assignment, gate_process)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+
+    def test_a_holder_the_fresh_read_does_not_confirm_keeps_the_guest_permission(self) -> None:
+        # The last system reading shows the holder pid with the start time of an earlier process.
+        # The fresh read then refuses a holder that is not a descendant or that states a start that is not live.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        cases = (("not a descendant", False, None), ("not the live start", True, "not-the-live-start"))
+        for case, descendant, stated_start in cases:
+            with self.subTest(case), PlacementFixture() as fixture:
+                request = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                gate_process = guest_gate(fixture, assignment)
+                write_process(fixture.proc.path, gate_process.pid, parent=1, start="earlier-process")
+                _ = fixture.run_pass()
+                reading = fixture.server.system_evidence
+                assert isinstance(reading, service.SystemEvidence)
+                self.assertEqual(reading.processes[gate_process.pid].start, "earlier-process")
+                parent = assignment.owner.pid if descendant else 1
+                write_process(fixture.proc.path, gate_process.pid, parent=parent, start=gate_process.start_time)
+                fixture.server.system_reader = FixedSystemReader(reading)
+                holder = wire.Owner(gate_process.pid, stated_start or gate_process.start_time)
+                refused, = consume_guest_permission(fixture, assignment, holder)
+                assert isinstance(refused, wire.DispatchStatus), refused
+                self.assertEqual(refused.reason, "claim holder is not a live coordinator descendant")
+                self.assertEqual(refused.state, placement.CurrentAssignment())
+                self.assertEqual(refused.permission, placement.PermissionAvailable())
+
+    def test_a_guest_consume_without_the_held_claim_keeps_the_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            refused, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment), held=False)
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.reason, "the exact claim is not adopted")
+            self.assertEqual(refused.state, placement.CurrentAssignment())
+            self.assertEqual(refused.permission, placement.PermissionAvailable())
+
+    def test_a_guest_consume_with_unreadable_claim_state_keeps_the_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            unreadable = claim_state.ClaimStateUnreadable(fixture.root / "claims", OSError("fixture read error"))
+            refused, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment), held=unreadable)
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.reason, f"adoption evidence is unavailable: {unreadable}")
+            self.assertEqual(refused.state, placement.CurrentAssignment())
+            self.assertEqual(refused.permission, placement.PermissionAvailable())
 
     def test_a_second_decline_ends_the_guest_for_the_run(self) -> None:
         # A cause that does not clear must not repeat on the same guest: the second decline ends the guest for the run.
@@ -2118,8 +2324,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
+            window = conf.read(settings).whole("permit_max_seconds")
             self.commit_settings(settings)
-            _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+            _ = settings.write_text(good.replace(f"permit_max_seconds={window}", "permit_max_seconds=broken"))
             warnings = io.StringIO()
 
             def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
@@ -2136,8 +2343,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
                 self.assertEqual(evidence.eligibility, ALLOWED_HOST)
                 start.assert_called_once()
-                self.assertEqual(warnings.getvalue().count("enabled='broken'"), 1)
-                self.assertTrue(hana_spend.read_settings(conf.read(settings)).enabled)
+                self.assertEqual(warnings.getvalue().count("permit_max_seconds='broken'"), 1)
+                self.assertEqual(hana_spend.read_settings(conf.read(settings)).permit_max_seconds, window)
 
                 _ = settings.write_text(good.replace("mount_timeout_seconds=15", "mount_timeout_seconds=broken"))
                 with mock.patch.object(conf, "_committed_files", return_value=()):
@@ -2147,6 +2354,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     self.assertEqual(start.call_count, 2)
                     with self.assertRaisesRegex(conf.Unusable, "mount_timeout_seconds"):
                         _ = hana_spend.read_settings(conf.read(settings))
+
+                # An unattended reader counts an invalid switch as off; it does not recover the committed value.
+                _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, placement.FixedExclusion("off"))
+                self.assertEqual(start.call_count, 2)
 
     def test_linux_kinds_recovers_the_committed_command(self) -> None:
         with PlacementFixture() as fixture:
@@ -3012,6 +3226,92 @@ class MacOrderTests(unittest.TestCase):
                     _ = worker.probe_next()
                     _ = fixture.run_pass()
                 self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])
+
+
+NatedevCause = records.HeadCause | records.WaitReason | wire.CloudSlotWait | wire.PlacementEvidenceWait | wire.PlacementResourceWait
+
+
+class NatedevOnlyHoldTests(unittest.TestCase):
+    """Rule 9: a natedev guard holds natedev only. A free Mac takes a waiting run that allows the Mac."""
+
+    def mac_takes_the_run_after_a_natedev_wait(
+            self, fixture: PlacementFixture,
+            hold_natedev: Callable[[wire.PlacementRequest], wire.PlacementRequest] = lambda request: request,
+    ) -> NatedevCause:
+        """Make the run wait on natedev while the Mac is busy, then free the Mac. Return the natedev cause."""
+        mac_only = placement_request(fixture)
+        request = hold_natedev(replace(mac_only, constraints=replace(mac_only.constraints,
+            candidates=(local_candidate(fixture), *mac_only.constraints.candidates))))
+        _ = publish_candidate(fixture, mac_only, placement.TemporaryExclusion("busy"))
+        waiting = fixture.connect(request).replies()[-1]
+        assert isinstance(waiting, wire.PlacementWait), waiting
+        _ = publish_candidate(fixture, mac_only)
+        _ = fixture.run_pass()
+        mac = mac_only.constraints.candidates[0].destination
+        self.assertIn(request.episode, fixture.server.current_assignments, "the free Mac did not take the run")
+        self.assertEqual(fixture.server.assignments[fixture.server.current_assignments[request.episode]]
+                         .assignment.destination, mac)
+        # The next request of the run gets the Mac assignment, not the natedev wait.
+        reply, = fixture.server.handle_request(request)
+        assert isinstance(reply, wire.Assignment), reply
+        self.assertEqual(reply.assignment.destination, mac)
+        self.assertNotIn(request.episode, fixture.server.reservations)
+        wait = waiting.wait
+        if isinstance(wait, wire.Wait):
+            return wait.reason.cause if isinstance(wait.reason, records.HeadAdmissionStatus) else wait.reason
+        return wait
+
+    def test_a_natedev_build_space_hold_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), PlacementFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", free_floor_gib="150")
+            _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",
+                                                        return_value=records.BuildSpaceLow(125, 150)))
+            self.assertEqual(self.mac_takes_the_run_after_a_natedev_wait(fixture), records.BuildSpaceLow(125, 150))
+
+    def test_full_or_pressured_natedev_memory_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure), PlacementFixture() as fixture:
+                _ = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+                fixture.allow_next_start()
+                if pressure:
+                    fixture.hold_starts()
+                else:
+                    fixture.free(2 * GIB)
+                self.assertIsInstance(self.mac_takes_the_run_after_a_natedev_wait(fixture),
+                                      records.MemoryPressure if pressure else records.NeedsMemory)
+
+    def test_a_full_natedev_gpu_slot_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf",
+                                gpu_test_slots="1", gpu_test_repositories="fixture")
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+            fixture.allow_next_start()
+            self.assertEqual(self.mac_takes_the_run_after_a_natedev_wait(fixture), records.GpuSlotWait(1, 1))
+
+    def test_a_natedev_build_hold_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            def hold_natedev(request: wire.PlacementRequest) -> wire.PlacementRequest:
+                # The local candidate is first, so this is the natedev build hold reading.
+                _ = publish_candidate(fixture, request, placement.TemporaryExclusion("blocked"))
+                return request
+
+            cause = self.mac_takes_the_run_after_a_natedev_wait(fixture, hold_natedev)
+            assert isinstance(cause, wire.PlacementResourceWait), cause
+            self.assertEqual((cause.resource, cause.reason), ("natedev", "blocked"))
+
+    def test_an_occupied_natedev_cargo_folder_never_keeps_a_free_mac_from_a_run_that_allows_it(self) -> None:
+        with PlacementFixture() as fixture:
+            folder = fixture.root / "target"
+            granted, = fixture.connect(with_cargo_folder(local_cargo_request(fixture), str(folder))).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            fixture.allow_next_start()
+
+            def same_folder(request: wire.PlacementRequest) -> wire.PlacementRequest:
+                return replace(request, constraints=replace(request.constraints,
+                                                            cargo_folder=placement.CargoFolder(folder)))
+
+            self.assertIsInstance(self.mac_takes_the_run_after_a_natedev_wait(fixture, same_folder),
+                                  placement.CargoFolderWait)
 
 
 class PassGapTests(unittest.TestCase):

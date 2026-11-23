@@ -11,7 +11,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import importlib
 import io
 import json
 import os
@@ -393,6 +392,10 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
     return AnyTarget()
 
 
+# The command kind of a hand made run. The Mac takes it as a Mac run, and the guest line takes it as a gate step.
+HAND_MADE_KIND: CommandKind = "run"
+
+
 def mac_run_bypasses_repository_policy(target: LocalTarget | SshTarget, kind: str) -> bool:
     """A Mac run has no repository step policy."""
     return isinstance(target, SshTarget) and target.platform == "macos" and kind in MAC_RUN_KINDS
@@ -445,7 +448,7 @@ def fixed_remote_candidates(
     from scripts.mac_test import eligibility
 
     if target.name == eligibility.MAC_LINUX_TARGET:
-        return (fixed_mac_linux_candidate(target, settings, repo_root, command, rule),)
+        return (fixed_mac_linux_candidate(target, settings, repo_root, kind, command, rule),)
 
     provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
     policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
@@ -516,10 +519,10 @@ def fixed_remote_candidates(
         slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
 
 
-def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path,
+def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path, kind: CommandKind,
                                command: tuple[str, ...], rule: AnyTarget | NatedevOnly
                                ) -> placement.PlacementCandidate:
-    """Name the single guest slot for a supported gate."""
+    """Name the single guest slot for a supported gate or a hand made run (kind HAND_MADE_KIND)."""
     from scripts.build_queue import placement
     from scripts.build_queue.admission_jobs import StepJob
     from scripts.build_targets import mac_linux
@@ -531,7 +534,8 @@ def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, rep
     job = gate_job_for_command(command)
     if isinstance(rule, NatedevOnly):
         policy = placement.FixedExclusion(rule.reason)
-    elif not isinstance(job, StepJob) or job.step not in ("test-affected", "test-all", "test-modules", "test-nightly", "integrate"):
+    elif kind != HAND_MADE_KIND and (not isinstance(job, StepJob) or job.step not in (
+            "test-affected", "test-all", "test-modules", "test-nightly", "integrate")):
         policy = placement.FixedExclusion("command")
     else:
         try:
@@ -1595,11 +1599,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
 
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
+    from scripts.lib.release_waiter import local_release_waiter
 
-    # This CLI's import root excludes the worker module.
-    # Use importlib at the typed provider boundary.
-    release_waiter = cast(Callable[[Path, Path], LocalHoldWait], getattr(
-        importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
     _ = pid
     if not leave_hook and not caller:
         leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
@@ -1627,7 +1628,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
-        release_events = notifications.enter_context(release_waiter(
+        release_events = notifications.enter_context(local_release_waiter(
             build_hold.holder_directory(), build_hold.release_directory()))
         context = LOCAL_HOLD_WAIT.set(release_events)
         _ = notifications.callback(LOCAL_HOLD_WAIT.reset, context)

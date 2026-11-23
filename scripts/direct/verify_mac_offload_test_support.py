@@ -42,7 +42,7 @@ from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib.release_waiter import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1375,7 +1375,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
-            "collect_child", "verify_helper",
+            "collect_child", "remove_tool_folder", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",

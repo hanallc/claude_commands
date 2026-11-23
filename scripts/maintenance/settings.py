@@ -88,6 +88,11 @@ def configuration() -> dict[str, object]:
     return table(tomllib.loads(configuration_path().read_text(encoding="utf-8")))
 
 
+def part_cadence(part: Part) -> Schedule | InvalidPartSchedule:
+    """Read one part's schedule and do not check the other settings."""
+    return part_schedule(part, table(configuration().get("parts", {})).get(part.value))
+
+
 def usage_only_intervals() -> UsageIntervals:
     """Read both Mac usage intervals from one configuration."""
     key = "interval_seconds"

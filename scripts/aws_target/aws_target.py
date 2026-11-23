@@ -27,7 +27,7 @@ from typing import cast, final
 from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
-from scripts.aws_target.config import read_settings
+from scripts.aws_target.config import AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
@@ -50,6 +50,11 @@ SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
 HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
+
+
+def machine_settings() -> tuple[conf.ConfigRead, conf.ConfigRead]:
+    """Read the cloud gate and Hana settings, whose enabled keys switch the two AWS machines."""
+    return conf.read_or_repository('cloud_gate'), conf.read_or_repository('hana_aws')
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -593,6 +598,8 @@ class AccountRefresh:
         self.clock = clock
 
     def tick(self) -> None:
+        if not isinstance(aws_switch(*machine_settings()), AwsOn):
+            return
         now = int(self.clock())
         configuration = conf.read(self.settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
@@ -645,7 +652,11 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
 
 
 def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool = False) -> int:
-    """Read prices and placement scores and check billed hours."""
+    """Read prices and placement scores and check billed hours, only while AWS is on."""
+    cloud_gate_settings, hana_settings = machine_settings()
+    # With AWS off, no charge refresh runs, so a provisional bill would give false hours-gap notices.
+    if not isinstance(aws_switch(cloud_gate_settings, hana_settings), AwsOn):
+        return 0
     status = 0
     read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot
     for label, operation in (('price snapshot', read_prices), ('hours-gap check', hours_gap_notices)):
@@ -657,6 +668,8 @@ def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool 
                 continue
             print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
             status = max(status, 1)
+    if not isinstance(aws_switch(cloud_gate_settings), AwsOn):
+        return status
     try:
         placement_snapshot(settings_path, directory)
     except Exception as error:
