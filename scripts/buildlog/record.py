@@ -1477,6 +1477,8 @@ class HandMadeFields(TypedDict):
     sha_checked_at: str | None
     run_started_at: str | None
     run_ended_at: str | None
+    # Each machine that failed before the run, in order; the run went back to the other named machines.
+    failed_machines: list[str]
     queue_wait_s: float | None
     log: str | None
     step: str
