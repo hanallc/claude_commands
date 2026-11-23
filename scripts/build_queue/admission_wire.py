@@ -187,7 +187,7 @@ class RunPlace:
 
 @dataclass(frozen=True)
 class Identity:
-    """The caller identity holds its session, step, folder, and unit."""
+    """The caller identity holds its session, step, folder, and unit, and the caller's own text for the work."""
     session_id: str
     name: str
     step: str
@@ -195,6 +195,7 @@ class Identity:
     unit: str = ""
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    what: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -979,7 +980,7 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
     return encode_envelope(reply, REPLY_TYPES, version)
 
 
-def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
+def read_assignment_text(path: Path) -> str:
     def open_assignment(name: str, flags: int) -> int:
         return os.open(name, flags | os.O_NONBLOCK)
 
@@ -989,10 +990,27 @@ def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
         data = stream.read(ASSIGNMENT_MAX_BYTES + 1)
     if len(data) > ASSIGNMENT_MAX_BYTES:
         raise AdmissionUnavailable("the assignment file exceeds its size limit")
-    reply = parse_reply(data.decode("utf-8"))
+    return data.decode("utf-8")
+
+
+def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
+    reply = parse_reply(read_assignment_text(path))
     if isinstance(reply, (Assignment, LocalPlacementGranted)):
         return reply
     raise AdmissionUnavailable("file contains no assigned attempt")
+
+
+def assignment_what(path: Path) -> str:
+    """The `what` text that a caller writes in the assignment file before placement; empty when it gave none.
+
+    mac_queue_run writes `episode`, `pid` and `what`. A placement replaces the file only after its request
+    carries the text to the queue, and the queue record keeps the text."""
+    try:
+        value = cast(object, json.loads(read_assignment_text(path)))
+    except (OSError, ValueError, AdmissionUnavailable):
+        return ""
+    what = cast(dict[str, object], value).get("what") if isinstance(value, dict) else ""
+    return what if isinstance(what, str) else ""
 
 
 def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> None:

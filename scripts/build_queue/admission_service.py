@@ -1026,10 +1026,14 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
 
     def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
         # A scope with no recorded caller gets its owner from the family of its oldest process.
-        name = evidence.session_name or ("" if evidence.session_id or not evidence.members
-                                         else records.family_owner_name(evidence.members[0].pid, proc.path))
-        return records.queue_caller(evidence.session_id, "", name, "", evidence.folder,
-                                    members=staff_members, unit=unit)
+        if evidence.session_name or evidence.session_id or not evidence.members:
+            return records.queue_caller(evidence.session_id, "", evidence.session_name, "",
+                                        members=staff_members, unit=unit)
+        family = records.family_owner(evidence.members[0].pid, proc.path)
+        if isinstance(family, records.StaffOwner):
+            return records.queue_caller("", family.member_id, family.name, "", members=staff_members, unit=unit)
+        name = family.program if isinstance(family, records.OwnerNotGiven) else family.name
+        return records.queue_caller(evidence.session_id, "", name, "", members=staff_members, unit=unit)
 
     unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))
                     if isinstance(evidence := row.activity, ScopeProcesses) else row for row in unowned)
@@ -1728,8 +1732,8 @@ class ServiceEstimatedAdmission(wire.AdmitRequest):
 def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
-    return codec.wait_line_name(row.get("unit", ""), row.get("session_name", ""),
-                                      row.get("folder", ""), row.get("step", ""))
+    what = codec.row_what(row.get("what", ""), row.get("step", ""))
+    return codec.wait_line_name(row.get("unit", ""), row.get("session_name", ""), row.get("folder", ""), what)
 
 
 @cache
@@ -1924,14 +1928,14 @@ class AdmissionServer:
                 row = record.queue_waiter
                 if not row.get("ci_runner"):
                     caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
-                        row.get("folder") or record.worktree, row.get("unit", ""), members=members)
+                                                 row.get("unit", ""), members=members)
                     record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
                     state.reservations[episode] = record
                 self.writes.register(record)
             for key, place in state.places.items():
                 identity = place.queue_identity
                 caller = self._stored_caller(identity["session_id"], identity["session_name"],
-                                             identity["folder"], identity.get("unit", ""), members=members)
+                                             identity.get("unit", ""), members=members)
                 state.places[key] = replace(place, queue_identity={
                     **identity, "session_name": caller.name, "unit": caller.unit})
             self.reservations, self.places = state.reservations, state.places
@@ -2717,6 +2721,8 @@ class AdmissionServer:
         }
         if isinstance(place, WaiterPlace) and place.episode == request.episode and place.move_id:
             row["move_id"] = place.move_id
+        if identity.what:
+            row["what"] = identity.what
         if isinstance(identity.verify, records.VerifyCall):
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
@@ -3427,7 +3433,8 @@ class AdmissionServer:
                 records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
                 project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                 route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
-                job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner]))
+                job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner],
+                what=row.get("what", "")))
             ordered.append((path, row))
         head, line = reading.explanation.head, reading.explanation.line
         if isinstance(head, records.HeadExplanation):
@@ -3498,7 +3505,8 @@ class AdmissionServer:
                 confirmed_guest_run=confirmed,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
-                    if assignment.destination.provider == "mac" or confirmed is not None else ""))
+                    if assignment.destination.provider == "mac" or confirmed is not None else "",
+                what=identity.what))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -3563,7 +3571,7 @@ class AdmissionServer:
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
-                took_place=took_place))
+                took_place=took_place, what=row.get("what", "")))
         move_line = self._current_move_line(ordered, self._movable_wait_ids())
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
@@ -5577,14 +5585,13 @@ done
             runner=request.runner)
 
     @staticmethod
-    def _stored_caller(session: str, name: str, folder: str, unit: str, *,
+    def _stored_caller(session: str, name: str, unit: str, *,
                        members: records.QueueStaff) -> records.QueueCaller:
-        caller = records.queue_caller(session, "", "", "", folder, members=members, unit=unit)
+        caller = records.queue_caller(session, "", "", "", members=members, unit=unit)
         return replace(caller, name=codec.resolve_queue_caller(stored_caller=name, staff_caller=caller.name))
 
-    def _named_identity(self, identity: wire.Identity, *, members: records.QueueStaff, folder: str = "") -> wire.Identity:
-        caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit,
-                                     members=members)
+    def _named_identity(self, identity: wire.Identity, *, members: records.QueueStaff) -> wire.Identity:
+        caller = self._stored_caller(identity.session_id, identity.name, identity.unit, members=members)
         return replace(identity, name=caller.name, unit=caller.unit)
 
     @staticmethod
@@ -5714,9 +5721,8 @@ done
                 if (refused := self._register_cloud_group(request.place, group)) is not None:
                     return self._mutation_reply(key, refused)
             if not isinstance(request, ServiceEstimatedAdmission):
-                folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
                 members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
-                request = replace(request, identity=self._named_identity(request.identity, members=members, folder=folder))
+                request = replace(request, identity=self._named_identity(request.identity, members=members))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))

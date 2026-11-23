@@ -707,7 +707,8 @@ class NatedevRun:
             raise Refused(hand_made_limit.BWRAP_MISSING)
         environment = program_environment()
         with ExitStack() as held:
-            lock = hand_made_limit.held_output(self.program.argv, self.program.repo, environment, held)
+            lock = hand_made_limit.held_output(self.program.argv, self.program.repo, environment, held,
+                                               note_outside=True)
             refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
             if refusal:
                 raise Refused(refusal)

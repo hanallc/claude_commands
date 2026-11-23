@@ -38,12 +38,18 @@ For a task clone, it finds the parent's record and requires `test_hana_clone: tr
 `copies.py clone` records the checkout HEAD as `source_commit` after its Git reset.
 `registered_copy` requires a readable `copy_record.Registered` record.
 Its `source_path` must resolve to a directory under a trusted root.
+A `copies.py run` snapshot qualifies with the same proof, at any location. Its checkout is `<tool folder>/source`.
+`copy_record.snapshot_source` reads the `snapshot-origin.json` binding beside the checkout.
+The folder that holds the binding must belong to the user, and no group or other user can write in it.
+The binding must name that checkout and a full commit id.
+Its `repository` and `source_commit` take the place of the record fields.
+A snapshot whose `.envrc` differs from `source_commit`, from a worktree edit or a merge, requires explicit approval.
 Git resolves `.envrc` at `source_commit` and hashes the copy's file with `hash-object --no-filters`.
 Approval requires equal blob hashes.
 Both Git commands run in the trusted source repository without `GIT_*` environment variables.
 The copy supplies no Git configuration or filters.
 Missing, malformed, unreadable or mismatching evidence requires explicit approval.
-Older clones without `source_commit` and folders outside the configured copy locations do not qualify.
+Older clones without `source_commit` do not qualify. Copies and clones outside the configured copy locations do not qualify.
 `scripts/lib/copy_record.py` uses only the standard library.
 Importing it does not reach scratch or herdr.
 The helper imports it only when it checks a copy.
