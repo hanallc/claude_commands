@@ -55,7 +55,7 @@ from scripts.production.production_doc import (
 )
 from scripts.feature_log import feature_log
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
-                                  review_link)
+                                  reply_tokens, review_link)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -171,6 +171,11 @@ class NoImageQuestionDispatch:
     """The record has no send mark for this image question."""
 
 
+class ScopedReplyCommand(TypedDict):
+    key: str
+    token_sha256: str
+
+
 class StoredReviewMessage(TypedDict):
     saved: bool
     source: str
@@ -181,6 +186,7 @@ class StoredReviewMessage(TypedDict):
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
     submission_request: NotRequired[str]
     submission_delivered: NotRequired[bool]
+    scoped_reply: NotRequired[ScopedReplyCommand]
 
 
 class StoredDeliveryCloseout(TypedDict):
@@ -237,6 +243,19 @@ class NoFailedDelivery:
 NO_FAILED_DELIVERY = NoFailedDelivery()
 
 
+@dataclass(frozen=True)
+class DeliveryConfirmed:
+    """The transport accepted the message."""
+
+
+@dataclass(frozen=True)
+class DeliveryUnconfirmed:
+    """This call has no confirmed transport result."""
+
+
+type DeliveryOutcome = DeliveryConfirmed | FailedDelivery | DeliveryUnconfirmed
+
+
 QuestionOutcome = Literal["answer", "followup", "skip", "question", "feedback"]
 
 
@@ -252,6 +271,7 @@ class StoredUserAnswer(TypedDict):
     kind: NotRequired[QuestionOutcome]
     question_id: NotRequired[str]
     question_text: NotRequired[str]
+    scoped_reply: NotRequired[ScopedReplyCommand]
 
 
 @dataclass(frozen=True)
@@ -294,7 +314,8 @@ class UserQuestionPage(ReviewPage):
             if request.startswith('For: '):
                 request = request.partition('\n')[2]
             _ = self.saved.setdefault('question_text', request)
-            self.saved['message'] = self.saved['message'].replace(reply_command(key), reply_command(key, identity))
+            if 'scoped_reply' not in self.saved:
+                self.saved['message'] = self.saved['message'].replace(reply_command(key), reply_command(key, identity))
 
 
 @dataclass(frozen=True)
@@ -2520,7 +2541,8 @@ def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = 
 def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
                       pause: float, *, key: str,
                       skipped: set[staff.StaffId] | None = None,
-                      errors: tuple[type[Exception], ...] = SEND_ERRORS) -> list[DeliveryFailure]:
+                      errors: tuple[type[Exception], ...] = SEND_ERRORS,
+                      confirm: bool = False) -> list[DeliveryFailure]:
     """Retry only failed sends. The sender keeps queued and unconfirmed sends."""
     remaining = recipients
     failures: list[DeliveryFailure] = []
@@ -2531,6 +2553,8 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
         for target in remaining:
             try:
                 result = send_to_staff(target, sender, message, key=key)
+                if result == "pending" and confirm:
+                    failures.append(DeliveryFailure(target, "The sender has not confirmed delivery."))
                 if result == "skipped" and skipped is not None:
                     skipped.add(target)
             except errors as error:
@@ -2598,14 +2622,14 @@ def check_review_question_source(page: ReviewPage, row: str, question: OpenQuest
                     if 'review_submission' not in current.item:
                         return
                     submission = new_item_dialog.read_submission(current.item['review_submission'])
-                    if submission.reply_token == question.question_id:
+                    if reply_tokens.matches_reference(submission.reply_token_sha256, question.question_id):
                         return
         elif isinstance(page, ReviewMessagePage):
             if path.parent.name in ('investigations', 'archive') and re.fullmatch(r"I\d+", row):
                 item = investigation.read_review_record(path)
                 if item.id == row and item.state == investigation.InvestigationState.OPEN:
                     if (not isinstance(item.submission, new_item_dialog.ReviewSubmission)
-                            or item.submission.reply_token == question.question_id):
+                            or reply_tokens.matches_reference(item.submission.reply_token_sha256, question.question_id)):
                         return
             elif path.name.endswith('.review.json'):
                 reviews = delivery_state.read_fields(path)
@@ -2615,10 +2639,10 @@ def check_review_question_source(page: ReviewPage, row: str, question: OpenQuest
                         return
             else:
                 issue = Issue(path, record_store.read_header(path, strict=True))
-                if not proposal_issue.review_is_done(issue) and proposal_issue.review_mark(issue) == review_events.ReviewMark.WAITING:
+                if proposal_issue.pending_review_reply(issue):
                     submission = proposal_issue.review_submission(issue)
                     if (not isinstance(submission, new_item_dialog.ReviewSubmission)
-                            or submission.reply_token == question.question_id):
+                            or reply_tokens.matches_reference(submission.reply_token_sha256, question.question_id)):
                         return
         elif any(record["#"] == row and not record.get("Verdict") for record in change_review.review_rows(path)):
             return
@@ -2627,16 +2651,44 @@ def check_review_question_source(page: ReviewPage, row: str, question: OpenQuest
     raise ClosedQuestionSource("The Review question is no longer open.")
 
 
+@dataclass(frozen=True)
+class OutboundReviewMessage:
+    text: str = field(repr=False)
+    token: str = field(default="", repr=False)
+
+    def redact(self, error: str) -> str:
+        return error.replace(self.token, "[reply token]") if self.token else error
+
+
+def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
+    """Derive the scoped reply token from its current native note."""
+    from scripts.review_links import review_submissions
+
+    page = delivery.page
+    scoped = page.saved.get("scoped_reply") if isinstance(page, (ReviewMessagePage, UserQuestionPage)) else None
+    if scoped is None:
+        return OutboundReviewMessage(delivery.message)
+    prefix, separator, command = delivery.message.rpartition("\n")
+    if command != reply_command(scoped["key"]):
+        raise ValueError("The saved Review reply command does not match its key.")
+    proof = review_submissions.current_reply_proof(scoped["key"])
+    if proof.sha256 != scoped["token_sha256"]:
+        raise reply_tokens.UnavailableReplyToken("The note has a different reply token.")
+    token = reply_tokens.derive(proof)
+    return OutboundReviewMessage(prefix + separator + reply_command(scoped["key"], token), token)
+
+
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
                             question: OpenQuestion) -> None:
     """Use the same send loop for a question stored in Review delivery slots."""
     page, row = delivery.page, delivery.row
     started = False
     finished = False
+    outbound = OutboundReviewMessage(delivery.message)
     key = review_delivery_key(page.review_list, row, intent.attempt)
 
     def authorize() -> None:
-        nonlocal started, finished
+        nonlocal started, finished, outbound
         with status.locked():
             slots = status.slots(page, row)
             if intent not in slots.intents() or review_open_question(page, slots, intent) != question:
@@ -2653,16 +2705,17 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
                     finished = True
                     raise StaleQuestionAttempt("The Review question has a delivery result.")
                 started = True
+            outbound = outbound_review_message(delivery)
 
     def send(recipient: staff.StaffId | MissingRecipient) -> DeliveryFailure | QuestionSendState:
         if isinstance(recipient, MissingRecipient):
             return DeliveryFailure(recipient, "no showrunner to send to")
         try:
-            outcome = send_to_staff(recipient, SENDER, delivery.message, key=key)
+            outcome = send_to_staff(recipient, SENDER, outbound.text, key=key)
         except UnconfirmedSend:
             return QuestionSendState.UNKNOWN
         except Exception as error:
-            return DeliveryFailure(recipient, str(error))
+            return DeliveryFailure(recipient, outbound.redact(str(error)))
         return QuestionSendState.UNKNOWN if outcome == "pending" else QuestionSendState.SENT
 
     try:
@@ -2681,6 +2734,9 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
                 slots = status.slots(page, row)
                 if intent in slots.intents() and review_open_question(page, slots, intent) == question:
                     status.finish_intent_locked(delivery, slots, intent)
+            return
+        if isinstance(error, reply_tokens.UnavailableReplyToken):
+            _defer_question_error(status, status.path(page, row), row, error, delivery=delivery)
             return
         if QuestionSendState.UNKNOWN in run.results.values():
             status.defer_question(status.path(page, row), delivery)
@@ -2731,23 +2787,29 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
 
 def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
     """Deliver each saved message and report exhausted attempts to its showrunner."""
+    _ = deliver_with_outcome(delivery, status)
+
+
+def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> DeliveryOutcome:
+    """Send the message and return the result of this attempt."""
     if isinstance(delivery, NoMessageDelivery):
-        return
+        return DeliveryUnconfirmed()
     if isinstance(delivery, PageQuestionSend):
         deliver_page_question(delivery, status)
-        return
+        return DeliveryUnconfirmed()
     tracked_review = False
+    page = delivery.page
+    confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
     tries, pause = 0, 0.0
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
         ownership = status.request_attempts.get(delivery.attempt)
         if ownership is not None and ownership.state == "sending":
-            return
+            return DeliveryUnconfirmed()
         intent = next((intent for intent in slots.intents() if intent.attempt == delivery.attempt), None)
         if intent is None:
             _ = status.request_attempts.pop(delivery.attempt, None)
-            return
-        page = delivery.page
+            return DeliveryUnconfirmed()
         question = review_open_question(page, slots, intent)
         if isinstance(question, NoQuestion):
             settings = conf.read("review_links")
@@ -2765,15 +2827,24 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
                 if tracked_review:
                     _ = status.request_attempts.pop(delivery.attempt, None)
                     if not status.start_review_dispatch_locked(delivery, slots, intent):
-                        return
+                        return DeliveryUnconfirmed()
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(page, delivery.row), "sending")
     if isinstance(question, OpenQuestion):
         deliver_review_question(delivery, status, intent, question)
-        return
-    key = review_delivery_key(page.review_list, delivery.row, delivery.attempt)
-    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause, key=key)
-                if delivery.recipients
-                else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
+        return DeliveryUnconfirmed()
+    try:
+        outbound = outbound_review_message(delivery)
+    except (OSError, ValueError) as error:
+        reason = " ".join(str(error).splitlines())
+        failures = [DeliveryFailure(recipient, reason) for recipient in delivery.recipients]
+        if not failures:
+            failures = [DeliveryFailure(MissingRecipient(), reason)]
+    else:
+        key = review_delivery_key(page.review_list, delivery.row, delivery.attempt)
+        failures = (send_with_retries(SENDER, delivery.recipients, outbound.text, tries, pause,
+                                       key=key, confirm=confirm) if delivery.recipients
+                    else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
+        failures = [replace(failure, error=outbound.redact(failure.error)) for failure in failures]
     result = (FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, failures[-1].error)
               if failures else NoFailedDelivery())
     showrunners_for_alert = delivery.alert_recipients
@@ -2785,17 +2856,21 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
             showrunners_for_alert = ()
     routes = [(failure, tuple(recipient for recipient in showrunners_for_alert if recipient != failure.recipient))
               for failure in failures]
-    if tracked_review:
-        alerts = pending_delivery_alerts(delivery, failures, tries, showrunners_for_alert)
+    alerts = pending_delivery_alerts(delivery, failures, tries, showrunners_for_alert) if tracked_review else ()
+    try:
         status.record(delivery, result, alerts=alerts)
-        if alerts:
-            status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
-    else:
-        status.record(delivery, result)
+    except (OSError, ValueError) as error:
+        if not confirm or not isinstance(result, FailedDelivery):
+            raise
+        print(f"review-links delivery result {delivery.row}: {error}", file=sys.stderr)
+        return result
+    if alerts:
+        status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
     for failure, recipients in routes:
         if not tracked_review or not recipients:
             _ = alert_delivery_failures([failure], tries, source=delivery.page.review_list, row=delivery.row,
                                         message=delivery.message, recipients=recipients, attempt=delivery.attempt)
+    return result if isinstance(result, FailedDelivery) else DeliveryConfirmed()
 
 
 def pending_delivery_alerts(delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int,

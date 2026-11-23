@@ -549,12 +549,13 @@ const filterControl={
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
  value(button){return button.dataset.filterValue;},
  ownerId(button){return this.value(button)==='all' ? '' : staffChipId(this.value(button));},
+ setCount(button,count){
+  button.dataset.filterCount=String(count);
+  button.querySelector('b').textContent=String(count);
+ },
  setCounts(row,counts){
-  for(const button of this.buttons(row)){
-   const count=Object.hasOwn(counts,button.dataset.filterValue) ? counts[button.dataset.filterValue] : 0;
-   button.dataset.filterCount=String(count);
-   button.querySelector('b').textContent=String(count);
-  }
+  for(const button of this.buttons(row))
+   this.setCount(button,Object.hasOwn(counts,this.value(button)) ? counts[this.value(button)] : 0);
  },
  setVisible(row,values){
   const visible=new Set(values),buttons=this.buttons(row);
@@ -1214,39 +1215,29 @@ function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
-function countChip(values,name,value,data,selection){
- if(options.countFacet?.(name,data,selection,value)===false) return;
- values[value]=(values[value] ?? 0)+1;
-}
 function matches(item,selection,counts){
  if(selection.keys.size && !selection.keys.has(item.dataset.key)) return false;
- const data=item.dataset,visible=options.visible;
- if(visible && !counts) return visible(data,selection);
+ const data=item.dataset;
+ if(options.visible) return options.visible(data,selection);
  const chip=options.eligibleChip(data,selection.query,selection);
- if(!chip) return visible ? visible(data,selection) : false;
+ if(!chip) return false;
  let excluded=0;
  const fieldValue=field=>field==='chip' ? chip : data[field];
  for(const [name,field,bit] of options.filterFacets){
   const chosen=selection[name] ?? selection.filters[name];
   if(!chosen || (name==='show' && chosen==='all')) continue;
-  const raw=fieldValue(field),actual=options.encodedStaffFields && isStaffChipFilter(name) ? decodeURIComponent(raw) : raw;
-  if(chosen===actual || chosen===options.facetAlternates?.[name]?.(data)) continue;
-  excluded|=bit;
+  // A staff field holds an encoded identity; a selection holds the decoded identity.
+  const raw=fieldValue(field),actual=isStaffChipFilter(name) ? decodeURIComponent(raw) : raw;
+  if(chosen!==actual) excluded|=bit;
  }
  if(counts) for(const [name,field,,countMask] of options.filterFacets){
   if(excluded & countMask) continue;
   const values=counts[name];
-  countChip(values,name,'all',data,selection);
-  const raw=fieldValue(field);
-  const value=filterChipValue(name,!options.encodedStaffFields && isStaffChipFilter(name) ? encodeIdentity(raw) : raw);
-  if(value!=='all') countChip(values,name,value,data,selection);
-  const alternate=options.facetAlternates?.[name]?.(data);
-  if(alternate && alternate!==raw){
-   const other=filterChipValue(name,isStaffChipFilter(name) ? encodeIdentity(alternate) : alternate);
-   countChip(values,name,other,data,selection);
-  }
+  values.all=(values.all ?? 0)+1;
+  const value=filterChipValue(name,fieldValue(field));
+  if(value!=='all') values[value]=(values[value] ?? 0)+1;
  }
- return visible ? visible(data,selection) : !excluded;
+ return !excluded;
 }
 const normalizeWords=value=>options.normalizeWords?.(value) ?? value.trim().toLowerCase();
 function currentSelection(overrides={}){
@@ -1275,7 +1266,9 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
- if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:normalizeWords(query),keys}) ?? owner;
+ // Use one clock read for the rows, the owner selection, and the counts.
+ const now=Date.now();
+ if(normalizeOwner) owner=options.selectOwner?.(rows,currentSelection({now})) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  if(chipRow('type')) filterSelection('type').set(type,null);
@@ -1284,8 +1277,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- // Use the same time to check parking for the rows and counts.
- const active=currentSelection({now:Date.now()});
+ const active=currentSelection({now});
  const counts=options.filterFacets && Object.fromEntries(options.filterFacets.map(([name])=>[name,Object.create(null)]));
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -1384,7 +1376,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
- options.applied?.(selection,active);
+ options.applied?.(selection,active,{rows,matches,count});
  const reset=options.emptyFilters && noResults ? resetSelection(active.now) : null;
  const canResetToResults=reset!==null && rows.some(item=>matches(item,reset));
  const filteredEmpty=options.emptyFilters && updateEmptyResult(table,{
@@ -1477,8 +1469,9 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(bannerHeight+16)+'px';
+ const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ row.style.scrollMarginTop=(inset+16)+'px';
  if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
@@ -1562,7 +1555,7 @@ function bind(){
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
  preserveRecordRowTop,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,get openItem(){return openItem;},get dialogItem(){return openItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,get openItem(){return openItem;},get dialogItem(){return openItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return (dialog ? dialog.open : openItem && !openItem.hidden) && location.hash===placeHash && openItem?.dataset.key===key &&
    opened.has(key) && detailMissing.hidden && viewDetail.contains(form) &&

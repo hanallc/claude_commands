@@ -18,7 +18,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.lib import berth_board
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
 from scripts.lib import test_hang_guard
@@ -149,7 +149,7 @@ class ReturnFixTests(unittest.TestCase):
 
     def return_fix(self, sent: offload.TreeKey) -> fix_return.FixResult:
         config = eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
+            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10, UNREACHABLE_WAIT_FIXTURE_SECONDS), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=1, default_target_budget_gib="24", values={},
         )
         request = offload.OffloadRequest(
