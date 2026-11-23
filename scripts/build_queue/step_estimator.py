@@ -243,10 +243,15 @@ class OwnerGone:
 
 
 @dataclass(frozen=True)
+class HandedOff:
+    """The grant only held the place until the command sent its own first step; no step ended."""
+
+
+@dataclass(frozen=True)
 class OutcomeNotRecorded:
     pass
 
-FinalOutcome = Completed | Failed | Killed | OwnerGone
+FinalOutcome = Completed | Failed | Killed | OwnerGone | HandedOff
 
 HistoryOutcome = FinalOutcome | OutcomeNotRecorded
 
@@ -526,6 +531,8 @@ def history_outcome(raw: object) -> HistoryOutcome:
             return Killed()
         case "owner_gone":
             return OwnerGone()
+        case "handed_off":
+            return HandedOff()
         case _:
             return OutcomeNotRecorded()
 

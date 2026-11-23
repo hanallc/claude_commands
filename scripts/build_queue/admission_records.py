@@ -330,7 +330,7 @@ class TestPhaseNeed:
     form: TestPhaseNeedForm
     margin: float
 
-FinalOutcomeName = Literal["completed", "failed", "killed", "owner_gone"]
+FinalOutcomeName = Literal["completed", "failed", "killed", "owner_gone", "handed_off"]
 
 
 class QueueLifeIdentity(TypedDict):
@@ -350,7 +350,7 @@ class FinalizationIntent(TypedDict):
     scoped: bool
     outcome: FinalOutcomeName
     ended_at: str
-    end_kind: NotRequired[Literal["step_end", "token_return"]]
+    end_kind: NotRequired[Literal["step_end", "token_return", "handoff"]]
     history_start: NotRequired[int]
     queue_identity: NotRequired[QueueLifeIdentity]
     status: NotRequired[int]

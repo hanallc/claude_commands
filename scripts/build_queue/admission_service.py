@@ -477,6 +477,7 @@ class NotEnding:
 class ReleaseStatus:
     request_id: str
     status: int
+    ending: wire.ReleaseEnding = "result"
 
 
 @dataclass(frozen=True)
@@ -1611,9 +1612,13 @@ def _notify(message: str) -> None:
 
 
 def finalization_outcome(ending: ReservationEnding
-                         ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded, gate.StepEnd | gate.TokenReturn]:
+                         ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded,
+                                    gate.StepEnd | gate.TokenReturn | gate.HandOff]:
     if isinstance(ending, TokenWaiting):
         return step_estimator.Completed(), 0, gate.TokenReturn()
+    if isinstance(ending, ReleaseStatus) and ending.ending == "handed_off":
+        # The handoff status is not a step result: the step goes on under the command's own admission.
+        return step_estimator.HandedOff(), gate.OUTCOME_NOT_RECORDED, gate.HandOff()
     if isinstance(ending, ReleaseStatus):
         return (step_estimator.Completed() if ending.status == 0 else
                 step_estimator.Killed() if ending.status >= 128 else step_estimator.Failed()), ending.status, gate.StepEnd()
@@ -5731,7 +5736,7 @@ done
                     self._handed_off(record.run, _local_step(record))
                 else:
                     self._released(record.run, _local_step(record), request.status)
-                self._end(episode, ReleaseStatus(key, request.status))
+                self._end(episode, ReleaseStatus(key, request.status, request.ending))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         elif isinstance(request, wire.WidthRequest):
             if request.width <= 0:
