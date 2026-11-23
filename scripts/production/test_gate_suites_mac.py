@@ -22,6 +22,7 @@ from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement
 from scripts.build_queue import test_placement as placement_fixture
+from scripts.build_queue.admission_test_support import Exchange, FakeClock, ScriptedTransport, reply_bytes
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog.store import host_name
@@ -45,6 +46,7 @@ HOOKS = "scripts/hooks/test_first.py"
 LIB_FIRST = "scripts/lib/test_first.py"
 LIB_SECOND = "scripts/lib/test_second.py"
 MESSAGE = "scripts/message/test_first.py"
+LIVE_PLACEMENT_STATUS = admission_client.placement_status
 
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
@@ -299,10 +301,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.placement_status.side_effect = partial(self.fixture_status, queue)
         return request, reply
 
-    def fixture_status(self, queue: placement_fixture.PlacementFixture, episode: str, attempt: str, *,
-                       wait_for_service: bool) -> admission_wire.PlacementStatusReply:
+    def fixture_status(self, queue: placement_fixture.PlacementFixture, episode: str, attempt: str
+                       ) -> admission_wire.PlacementStatusReply:
         """Read the placement status from the fixture queue in place of the admission socket."""
-        self.assertFalse(wait_for_service)
         status, = queue.connect(admission_wire.PlacementStatusRequest(episode, attempt)).replies()
         assert isinstance(status, admission_wire.PlacementStatusReply), status
         return status
@@ -320,8 +321,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         return reply, admitted
 
     def queue_state(self, reply: admission_wire.LocalPlacementGranted) -> placement.AssignmentState:
-        status = admission_client.placement_status(
-            reply.assignment.episode, reply.assignment.attempt, wait_for_service=False).status
+        status = admission_client.placement_status(reply.assignment.episode, reply.assignment.attempt).status
         assert isinstance(status, admission_wire.KnownPlacementStatus), status
         return status.state
 
@@ -482,7 +482,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.GATE, full=True, module_time_limit_s=30,
                                      selected=gate.ALL_MODULES, gate_job=job, type_dirs=("scripts",))
-        self.placement_status.assert_called_once_with("episode", "attempt", wait_for_service=False)
+        self.placement_status.assert_called_once_with("episode", "attempt")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
@@ -615,7 +615,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         path = self.write_gate_assignment(old)
         self.set_placement_status(old, placement.ClosedAssignment("replaced"))
         self.assert_gate_refuses_placement(path, "The gate placement attempt is stale: replaced")
-        self.placement_status.assert_called_once_with("episode", "old-attempt", wait_for_service=False)
+        self.placement_status.assert_called_once_with("episode", "old-attempt")
 
     def test_gate_refuses_a_placement_for_another_owner_or_episode(self) -> None:
         assignment = self.gate_assignment("mac-linux")
@@ -631,7 +631,29 @@ class MacGateSuitesTests(GateSuitesFixture):
         path = self.write_gate_assignment(self.gate_assignment("mac-linux"))
         self.placement_status.side_effect = admission_wire.AdmissionUnavailable("fixture service unavailable")
         self.assert_gate_refuses_placement(path, "Cannot query the gate placement status: fixture service unavailable")
-        self.placement_status.assert_called_once_with("episode", "attempt", wait_for_service=False)
+        self.placement_status.assert_called_once_with("episode", "attempt")
+
+    def test_gate_waits_for_a_slow_placement_status(self) -> None:
+        # The service answers one placement request at a time, so a status answer can come after the query time limit.
+        self.configure_gate("silence_seconds=1\n")
+        assignment = self.gate_assignment("mac-linux")
+        path = self.write_gate_assignment(assignment)
+        status = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+            assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+        clock = FakeClock()
+        transport = ScriptedTransport(clock, Exchange(TimeoutError(), reply_bytes(status)))
+        self.placement_status.side_effect = LIVE_PLACEMENT_STATUS
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(admission_client, "CLOCK", clock),
+              mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
+              redirect_stderr(io.StringIO()) as errors):
+            placed = gate.current_gate_placement(SuiteMode.GATE, StepJob("integrate", unit="fixture"))
+        target = gate.placement_target(placed)
+        self.assertEqual(target, "mac-linux")
+        self.assertGreater(clock.monotonic(), admission_records.read_memory_config().query_timeout_seconds)
+        self.assertIn("admission service not answering", errors.getvalue())
+        self.assertEqual(len(transport.requests), 1)
+        self.placement_status.assert_called_once_with("episode", "attempt")
 
     def test_gate_refuses_a_status_that_does_not_confirm_the_placement(self) -> None:
         assignment = self.gate_assignment("aws", provider="scaler")
@@ -737,12 +759,11 @@ class MacGateSuitesTests(GateSuitesFixture):
             admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest_assignment.episode, guest_assignment.since),
                 first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
-            def guest_or_queue_status(episode: str, attempt: str, *,
-                                      wait_for_service: bool) -> admission_wire.PlacementStatusReply:
+            def guest_or_queue_status(episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
                 if attempt == guest_assignment.attempt:
                     return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
                         guest_assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
-                return self.fixture_status(queue, episode, attempt, wait_for_service=wait_for_service)
+                return self.fixture_status(queue, episode, attempt)
 
             def settle(refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
                 self.assertEqual((refusal.assignment, refusal.reason), (guest_assignment, MAC_LINUX_NO_ANSWER))
