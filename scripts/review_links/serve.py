@@ -1897,7 +1897,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            view=view)
                 content = owned_document(content, "list")
         except (OSError, ValueError) as error:
-            print(f"review-links {view.page}: {error}", file=sys.stderr)
+            print(f"review-links {view.log_name}: {error}", file=sys.stderr)
             self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)

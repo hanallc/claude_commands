@@ -265,8 +265,7 @@ Review retains typed text across refresh and holds replacement during an active 
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-Accounts, AWS, Builds, Disks, Images, List and Review put the title and status line in the same place.
-The Studio renders through the List code with `page_frame.title(..., "list")`, so its title and status line are where the List puts them.
+Accounts, AWS, Builds, Disks, Images, List, Studio and Review put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -1638,7 +1637,7 @@ The navigation label is Studio, with the Lucide `clapperboard` icon, and the pag
 Its `config/console.conf` block follows the List block.
 `studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
 `list_page.LIST_VIEW` keeps the List output unchanged.
-The Studio has no Producer chip row. The Owner and Show rows and the words box stay.
+The Studio shows its Producer row as picture tabs above the filters, not beside the words box. The Owner and Show rows and the words box stay.
 `ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
 A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
 

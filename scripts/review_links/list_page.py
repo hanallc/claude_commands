@@ -1001,8 +1001,7 @@ class ListView:
     """The page around the List rows: its names, its style and its Producer control."""
 
     title: str
-    # The name in the server log line.
-    page: str
+    log_name: str
     style: str
     producer: ProducerControl
     placement: ProducerPlacement
