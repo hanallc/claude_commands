@@ -10,6 +10,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import blind as preference
 from scripts.issue_score import evaluate, questions, records, score_issues
@@ -24,8 +25,7 @@ class BlindTests(ConfiguredTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
 
     def disagreements(self, count: int = 28) -> str:
         paths: list[Path] = []

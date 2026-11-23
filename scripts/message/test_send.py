@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.message.test_send_budget import write_configs
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -8339,8 +8340,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"

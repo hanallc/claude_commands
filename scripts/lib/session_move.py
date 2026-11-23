@@ -42,6 +42,10 @@ class MoveRefused(ValueError):
     """A source cannot move without risking its data or another path."""
 
 
+class NoDestination(MoveRefused):
+    """No record names a destination, so the source stays where it is and loses nothing."""
+
+
 class LiveSource(MoveRefused):
     """A running session or another process uses the source."""
 
@@ -139,7 +143,7 @@ def transcript_cwd(session_id: str) -> str:
             raise MoveRefused(f"{source}: zstd decompression failed with status {error.returncode}") from error
         if cwd:
             return cwd
-    raise MoveRefused(f"{session_id}: no working folder in a transcript")
+    raise NoDestination(f"{session_id}: no working folder in a transcript")
 
 
 def is_directory(path: Path) -> bool:
@@ -1847,7 +1851,7 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
                 summary.keep_live(leaf.source, error, journaled=isinstance(error, JournaledLiveSource))
             else:
                 kept(leaf.source, error)
-                summary.refused_other += 1
+                summary.refused_other += int(not isinstance(error, NoDestination))
             if isinstance(error, CopyWriteFailed):
                 print(f"session_move: copy write failed at {leaf.source}", file=sys.stderr, flush=True)
             if isinstance(error, (JournaledLiveSource, CopyWriteFailed)):
