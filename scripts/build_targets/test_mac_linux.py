@@ -1362,10 +1362,13 @@ fi
         command = settings.command('true')
         alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
         mac_hop = list(command[:-2])
-        self.assertEqual(mac_hop[-4:], alive)
-        self.assertEqual(command[-2], 'fixture-mac')
         guest_hop = shlex.split(command[-1])
-        self.assertEqual(guest_hop[guest_hop.index('-l') - 4:guest_hop.index('-l')], alive)
+        guest_hop = guest_hop[:guest_hop.index('-l')]
+        self.assertEqual(command[-2], 'fixture-mac')
+        for hop in (mac_hop, guest_hop):
+            # ssh uses the first value of an option, so each hop names each keepalive option once.
+            self.assertEqual(hop[-4:], alive)
+            self.assertEqual([word for word in hop if word.startswith('ServerAlive')], alive[1::2])
 
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user

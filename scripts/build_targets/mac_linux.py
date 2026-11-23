@@ -125,8 +125,8 @@ class GuestSettings:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
     def command(self, shell: str) -> tuple[str, ...]:
-        # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A busy Mac can be
-        # silent for more than 30 s under load.
+        # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A Mac under heavy
+        # load can be slow to answer a keepalive check.
         mac, guest = self.ssh_hops
         ssh = (*SSH, *eligibility.server_alive_options(self.unreachable_wait_seconds))
         return (*ssh, mac, shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
