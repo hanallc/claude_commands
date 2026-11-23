@@ -6747,7 +6747,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_mac_locked_forward_to_natedev_asks_only_on_the_delivering_host(self) -> None:
         _, mac_test_conf, _ = self.mac_in_use()
         _ = write_config_fixture(mac_test_conf, "offload=off\n")
-        self.assert_mac_locked_sent("hana", "--machine", "natedev")
+        code, output, sent = self.mac_locked_main("hana", "--machine", "natedev")
+        self.assertEqual(code, 0)
+        self.assertIn("SENT: to the user", output)
+        sent.assert_called_once()
+        # The delivering host adds the off-on-purpose check, so the forward keeps the caller's check.
+        self.assertEqual(cast(send.Options, sent.call_args.args[0]).clears_when, "true")
         self.assert_mac_locked_not_sent()
 
     def test_mac_locked_skip_on_natedev_is_a_confirmed_skip_on_the_mac(self) -> None:

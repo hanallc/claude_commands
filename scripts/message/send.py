@@ -175,6 +175,7 @@ from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
     from scripts.message import roster
     from scripts.accounts import accounts
+    from scripts.mac_test.mac_test import AskingSession, NoAskingSession
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
@@ -4737,14 +4738,16 @@ def template_values(options: Options) -> dict[str, str]:
     return {key: item for key, _, item in (value.partition("=") for value in options.values)}
 
 
-def mac_locked_check(sender: str, clears_when: str) -> str:
+def mac_locked_check(asking: AskingSession | NoAskingSession, clears_when: str) -> str:
     """The clear check that a mac.locked push stores.
 
     It passes when the user turns the Mac off, or when the caller's check passes.
     """
+    from scripts.mac_test import mac_test
+
     scripts = Path(__file__).resolve().parents[1]
-    asking = ["--asking", sender] if sender else []
-    off = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose", *asking])
+    named = ["--asking", asking.name] if isinstance(asking, mac_test.AskingSession) else []
+    off = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose", *named])
     return f"{off} || {shlex.join(['/bin/sh', '-c', clears_when])}"
 
 
@@ -5929,7 +5932,7 @@ def main(argv: list[str]) -> int:
                     print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
                     return EXIT["skipped"]
                 if options.clears_when:
-                    options = options._replace(clears_when=mac_locked_check(sender or "", options.clears_when))
+                    options = options._replace(clears_when=mac_locked_check(asking, options.clears_when))
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
