@@ -263,7 +263,12 @@ A second renewal caller prints `already claimed by <id>` and exits with code 0.
 A busy renewal lock permits usage reads.
 Renewal tries each expired local Claude account at most once per hour.
 A renewal error prints one diagnostic and preserves the usage messages and saved readings.
-The refresher writes no notes, sends no quota alerts, and runs neither the Codex pacer nor account moves.
+Then it completes the Mac's own group members that are off the current group selection.
+This step runs at most once in each `parts.refusals.interval_seconds`, the cadence of the natedev refusal pass.
+It reads a completion plan that the natedev refusal pass writes, and it completes only the groups in that plan.
+It does nothing when the plan is unreadable or older than three refusal intervals.
+It never changes a group selection.
+The refresher writes no notes, sends no quota alerts, and runs neither the Codex pacer nor refusal moves.
 Natedev owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
 
@@ -758,7 +763,7 @@ Historical jobs remain keyed by session id in `~/.local/state/accounts/unit_watc
 
 Watcher inventories read live sessions and `staff.json` membership. They neither collect nor read a desktop snapshot. Maintenance now runs through the separate agent-notes job; a `--dry-run` still writes nothing.
 
-The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused Claude session can move its group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
+The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused Claude session can move its group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check. It completes only the Mac's own off-target group members.
 
 The board and group moves share one staff member list. Each live member uses its process account. Timer registrations do not decide membership. Absent registration targets are checked separately.
 
