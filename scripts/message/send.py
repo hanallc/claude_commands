@@ -777,6 +777,13 @@ class Result(NamedTuple):
     receiver: str = ""
 
 
+class RepeatGuardHeld(Result):
+    """The repeat guard took responsibility for the owner notice."""
+
+
+REPEAT_GUARD_REPORT = "SEND_HOLD: repeat-guard"
+
+
 class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
@@ -3431,21 +3438,22 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
             return None, "", ""
 
 
+# The relay guard replaces this text with the approved message, so the model never types the message.
+RELAY_MESSAGE_STAND_IN = "approved text"
+
+
 def relay_prompt(message: Message) -> str:
     lines = [
         "You are a relay that delivers one message. Make exactly one SendMessage call:",
         f"- to: {json.dumps(message.to)}",
         f"- summary: {json.dumps(quote_sender_lines(message.summary))}",
-        "- message: the text between the BEGIN and END lines below, copied exactly. Keep every character, space, "
-        + "line break, backtick and placeholder as written. Add nothing, drop nothing, reword nothing. Leave out "
-        + "the BEGIN and END lines.",
+        f"- message: {json.dumps(RELAY_MESSAGE_STAND_IN)}",
     ]
     if not message.to.startswith("uds:"):
         lines.append("If that call fails because the name matched no session or more than one, call ListAgents once, "
                      + f"then make the call once more with `to` set to the row whose name is exactly "
                      + f"{json.dumps(message.to)}, followed by its [ref]. If no row has that name, stop.")
-    lines += ["Then stop: reply with one line, the SendMessage result. Call no other tool.",
-              "----- BEGIN MESSAGE -----", agent_text(message, via_relay=True), "----- END MESSAGE -----"]
+    lines.append("Then stop: reply with one line, the SendMessage result. Call no other tool.")
     return "\n".join(lines)
 
 
@@ -3510,7 +3518,8 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
-def _log_relay_mismatch(target: object, sent: object, approved: str, *, summary_changed: bool) -> None:
+def _log_relay_mismatch(target: object, sent: object, *, summary_changed: bool) -> None:
+    approved = RELAY_MESSAGE_STAND_IN
     target_limit = 256
     record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
                            to_truncated=len(as_str(target)) > target_limit)
@@ -3540,8 +3549,8 @@ def read_relay(observed: RelayTransportResponse, text: str, *, summary: str | No
         inputs = as_dict(call.get("input"))
         target, sent = inputs.get("to"), inputs.get("message")
         summary_changed = summary is not None and inputs.get("summary") != summary
-        if target != observed.target or sent != text or summary_changed:
-            _log_relay_mismatch(target, sent, text, summary_changed=summary_changed)
+        if target != observed.target or sent != RELAY_MESSAGE_STAND_IN or summary_changed:
+            _log_relay_mismatch(target, sent, summary_changed=summary_changed)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
@@ -3562,7 +3571,7 @@ def read_relay(observed: RelayTransportResponse, text: str, *, summary: str | No
             return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
-    changed = (inputs.get("to") != observed.target or inputs.get("message") != text
+    changed = (inputs.get("to") != observed.target or inputs.get("message") != RELAY_MESSAGE_STAND_IN
                or (summary is not None and inputs.get("summary") != summary))
     tool_id = as_str(call.get("id"))
     approved_forward = forward == RelayRequestForwarded(tool_id, text)
@@ -4606,6 +4615,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
     command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
+    error_lines = err.splitlines()
+    repeat_guard_held = REPEAT_GUARD_REPORT in error_lines
+    if repeat_guard_held:
+        err = "\n".join(line for line in error_lines if line != REPEAT_GUARD_REPORT)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
@@ -4622,6 +4635,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
+    if parsed.outcome == "held" and repeat_guard_held:
+        return RepeatGuardHeld("held", f"on {host}: {detail}", failure, receiver)
     return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
@@ -5529,7 +5544,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     elif isinstance(claim_result, RepeatPending):
         new_message_result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
-        new_message_result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
+        new_message_result = RepeatGuardHeld("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif review_error:
         new_message_result = Result("failed", review_error)
     elif isinstance(review_route, review_hold.AlreadyKeptForReview):
@@ -5888,6 +5903,8 @@ def main(argv: list[str]) -> int:
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
             print(f"{outcome.upper()}: {result.detail}")
+            if options.report_recipient and isinstance(result, RepeatGuardHeld):
+                print(REPEAT_GUARD_REPORT, file=sys.stderr)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):
