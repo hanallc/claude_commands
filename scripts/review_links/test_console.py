@@ -200,12 +200,13 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review", "placement_disk"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "studio",
+                                        "review", "placement_disk"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 27)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 10)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 9)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 29)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 11)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 10)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -278,6 +279,19 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((page_frame.ICONS / "torus.svg").is_file())
         self.assertIn('class="lucide lucide-torus"', console.icon_svg("torus"))
 
+    def test_repository_config_puts_the_studio_after_the_list_with_the_list_owner(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
+        self.assertEqual(pages[pages.index("list") + 1], "studio")
+        self.assertEqual((settings["page.studio.label"], settings["page.studio.title"]), ("Studio", "The Studio"))
+        self.assertEqual(settings["page.studio.url"], "python:scripts.review_links.studio_page:page_url")
+        self.assertEqual(settings["page.studio.owner"], settings["page.list.owner"])
+        self.assertNotIn("status.studio.age_limit_seconds", settings)
+        self.assertIn(settings["page.studio.icon"], console.ICON_NAMES)
+        self.assertTrue((page_frame.ICONS / "clapperboard.svg").is_file())
+        self.assertIn('class="lucide lucide-clapperboard"', console.icon_svg("clapperboard"))
+
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
         folder.mkdir(parents=True)
@@ -295,14 +309,16 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
-        self.assertIsInstance(pages[3].destination, console.AvailablePage)
-        self.assertIsInstance(pages[5].destination, console.UnavailablePage)
+        self.assertEqual([page.identity for page in pages], ["placement_disk", "review", "studio", "list", "images", "disks",
+                                                             "builds", "aws_machines", "aws", "accounts"])
+        self.assertIsInstance(pages[4].destination, console.AvailablePage)
+        self.assertIsInstance(pages[6].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
-        self.assertEqual(markup.pages, ["placement_disk", "review", "list", "images", "disks", "builds", "aws_machines", "aws", "accounts"])
+        self.assertEqual(markup.pages, ["placement_disk", "review", "studio", "list", "images", "disks", "builds", "aws_machines",
+                                        "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -314,7 +330,8 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list", "review", "placement_disk"])
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "aws_machines", "builds", "disks", "images", "list",
+                                                             "studio", "review", "placement_disk"])
         self.assertIsInstance(pages[3].destination, console.UnavailablePage)
         self.assertIsInstance(pages[-2].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())

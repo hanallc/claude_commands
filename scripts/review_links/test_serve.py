@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, studio_page, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -93,7 +93,8 @@ def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = write_config_fixture(configuration / "change_review.conf")
     _ = write_config_fixture(configuration / "review_links.conf",
-        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
+        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n"
+        + f"studio_avatar_root={configuration / 'studio-avatars'}\n")
     _ = write_config_fixture(configuration / "console.conf",
         "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
         + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
@@ -687,7 +688,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             HttpReply(200, "image/png", image.png))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_shared_dialog_opens_from_all_ten_served_console_pages(self) -> None:
+    def test_shared_dialog_opens_from_all_eleven_served_console_pages(self) -> None:
         from scripts.build_queue import memory_files
         from scripts.disks import disks_page
         from scripts.review_links.test_new_item_dialog import DialogFixture, capture_dialogs
@@ -717,6 +718,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "placement_disk": placement_disk.PAGE_PATH,
             "rebuilds": f"/console/{change_page.REBUILDS_NAME}",
             "review": review_page.PAGE_PATH,
+            "studio": studio_page.PAGE_PATH,
         }
         probe = b"""<script>
 (async ()=>{
@@ -745,7 +747,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(page=page):
                     response = self.request(path)
                     self.assertEqual(response.status, 200, response.body)
-                    self.assertIn(f'data-page-owner="{page}"'.encode(), response.body)
+                    # The Studio document keeps the List New item flow.
+                    owner_page = serve.CONSOLE_DOCUMENTS.get(path, page)
+                    self.assertIn(f'data-page-owner="{owner_page}"'.encode(), response.body)
                     self.assertIn(f'aria-label="New item for {owner.name}"'.encode(), response.body)
                     documents[index] = response.body.replace(b"</body>", probe + b"</body>")
                     fixtures[index] = DialogFixture(self.root)
@@ -4957,6 +4961,48 @@ class ReviewLinksServerTests(unittest.TestCase):
             failed = self.request(list_page.PAGE_PATH)
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
+
+    def test_studio_serves_the_list_rows_under_picture_tabs(self) -> None:
+        _, item = self.list_keeper_item("Read the Studio page")
+        response = self.request(studio_page.PAGE_PATH)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertIn(b"<title>The Studio</title>", response.body)
+        self.assertIn(b'<div class="studio-tabs">', response.body)
+        self.assertIn(item.title.encode(), response.body)
+        self.assertEqual(response.body.count(b'data-filter-row="producer"'), 1)
+        self.assertIn(f'data-list-path="{list_page.PAGE_PATH}"'.encode(), response.body)
+        with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
+            self.assertEqual(self.request(studio_page.PAGE_PATH).status, 503)
+
+    def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
+        avatars = self.root.parent.resolve() / "studio-avatars"
+        pictures = avatars / "all"
+        pictures.mkdir(parents=True)
+        picture = b"RIFF\x10\x00\x00\x00WEBPVP8 fixture"
+        _ = (pictures / "01-64.webp").write_bytes(picture)
+        _ = (pictures / "02-64.webp").write_bytes(b"x" * (studio_page.MAX_AVATAR_BYTES + 1))
+        (pictures / "03-64.webp").symlink_to(self.outside)
+        (avatars / "a898cb38-dbac-4751-b72b-d0b14ab9c38d").symlink_to(pictures, target_is_directory=True)
+        _ = self.enterContext(patch.object(studio_page, "avatar_root", return_value=avatars))
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        served = self.request(f"{studio_page.AVATAR_PATH}/all/01-64.webp")
+        self.assertEqual((served.status, served.content_type, served.body), (200, "image/webp", picture))
+        self.assertEqual(served.headers["cache-control"], "max-age=86400, immutable")
+        self.assertEqual(served.headers["x-content-type-options"], "nosniff")
+        for name in ("all/01-32.webp", "all/1-64.webp", "all/04-64.webp", "all/02-64.webp", "all/03-64.webp",
+                     "a898cb38-dbac-4751-b72b-d0b14ab9c38d/01-64.webp", "outside/01-64.webp",
+                     "all/../all/01-64.webp", "all/01-64.webp/x", "all/01-64.png"):
+            with self.subTest(name=name):
+                self.assertEqual(self.request(f"{studio_page.AVATAR_PATH}/{name}").status, 404)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        connection.request("GET", f"{studio_page.AVATAR_PATH}/all/01-64.webp", headers={"Host": "elsewhere.invalid"})
+        response = connection.getresponse()
+        _ = response.read()
+        self.assertEqual(response.status, 403)
+        with (patch.object(self.server, "verified_tailscale_address", ""),
+              patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
+            self.assertEqual(self.request(f"{studio_page.AVATAR_PATH}/all/01-64.webp").status, 403)
 
     def test_list_serves_published_review_links_and_counts_in_separate_requests(self) -> None:
         case = self.review_fixture(changes=1)

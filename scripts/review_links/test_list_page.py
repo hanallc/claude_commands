@@ -42,7 +42,7 @@ from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, page_frame, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names, studio_page
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -1062,8 +1062,55 @@ if(example.filterOn){
 }
 ''')
 
-    def browser_row_expansion(self, steps: str) -> None:
-        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+    def studio_avatars(self, *producers: staff.StaffId) -> Path:
+        """Point the Studio at a temporary avatar root with one picture for All and for each producer."""
+        root = self.root / "avatars"
+        for folder in ("all", *producers):
+            (root / folder).mkdir(parents=True)
+            for size in studio_page.SIZES:
+                _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
+        with (self.root / "config/review_links.conf").open("a") as settings:
+            _ = settings.write(f"studio_avatar_root={root}\n")
+        return root
+
+    def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
+        _ = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        listing = list_page.render(self.root / "reviews").decode()
+        studio = studio_page.render(self.root / "reviews").decode()
+        row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
+        self.assertIn('<div class="list-producer-filter">' + row, listing)
+        self.assertIn('<h1 class="page-title">The List</h1>', listing)
+        self.assertIn('<title>The List</title>', listing)
+        self.assertNotIn('studio-tabs', listing)
+        self.assertEqual(studio.count('data-filter-row="producer"'), 1)
+        self.assertIn('<div class="studio-tabs">' + row, studio)
+        self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
+        self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
+        self.assertIn('<title>The Studio</title>', studio)
+        self.assertEqual(studio.count('<tbody data-list-item'), listing.count('<tbody data-list-item'))
+        tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
+        self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
+        self.assertIn('<span class="studio-name">dwight</span><b>2</b>', tab)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
+        _ = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        self.browser_row_expansion(r'''
+ const tab=chip('producer','staff:'+DWIGHT);
+ check(tab.closest('.studio-tabs') && tab.querySelector('img[data-keep-src]'),'The producer filter is a picture tab.');
+ const others=rows.filter(row=>!row.hidden && row.dataset.producer!==DWIGHT);
+ tab.click();
+ const shown=rows.filter(row=>!row.hidden);
+ check(shown.length && shown.every(row=>row.dataset.producer===DWIGHT),'The tab shows only its producer rows.');
+ check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'The fragment names the producer.');
+ chip('producer','all').click();
+ check(others.length && others.every(row=>!row.hidden),'All shows the other producer rows again.');
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)), studio_page.render)
+
+    def browser_row_expansion(self, steps: str, render: list_page.ListRender = list_page.render) -> None:
+        markup = render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};

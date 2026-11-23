@@ -45,7 +45,7 @@ from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names, studio_page
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -86,7 +86,7 @@ def published_console_page(root: Path, path: str) -> str:
 CONSOLE_DOCUMENTS = {
     accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
-    placement_disk.PAGE_PATH: "placement_disk",
+    placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
 }
 
 
@@ -1042,30 +1042,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(owned, 'text/html; charset=utf-8', prepared)
             return None
         if route.path == list_page.PAGE_PATH:
-            if route.query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
-                self.list_counts(include_linked_reviews=route.query == list_page.COUNTS_AND_LINKS_QUERY)
-                return None
-            fields = parse_qs(route.query)
-            if "item-state" in fields:
-                self.list_action_state(fields)
-                return None
-            delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
-            try:
-                with server.list_store_access(), server.staff_read_scope():
-                    live = server.mode is ServerMode.LIVE
-                    reviews = server.list_review_records()
-                    content = list_page.render(root, include_counts=live, defer_counts=True,
-                                               status=server.delivery_status,
-                                               review_records=(list_page.LinkedReviewRead.AFTER_RENDER
-                                                               if live and reviews is list_page.LinkedReviewRead.FROM_DISK
-                                                               else reviews))
-                    content = owned_document(content, "list")
-            except (OSError, ValueError) as error:
-                print(f"review-links list: {error}", file=sys.stderr)
-                self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
-                return None
-            self.html_response(200, content, delivery_pending=delivery)
+            self.list_document(route.query, list_page.render)
             return None
+        if route.path == studio_page.PAGE_PATH:
+            self.list_document(route.query, studio_page.render)
+            return None
+        if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
+            return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
         if route.path == images.PAGE_PATH:
             try:
                 with server.staff_read_scope():
@@ -1891,11 +1874,50 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         return self.attachment_response(content, media)
 
-    def attachment_response(self, content: bytes, media: str) -> BinaryIO:
+    def list_document(self, query: str, render: list_page.ListRender) -> None:
+        """Answer a List view: the page, or the List counts and item state it reads."""
+        server = cast(ReviewLinksServer, self.server)
+        if query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
+            self.list_counts(include_linked_reviews=query == list_page.COUNTS_AND_LINKS_QUERY)
+            return
+        fields = parse_qs(query)
+        if "item-state" in fields:
+            self.list_action_state(fields)
+            return
+        delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
+        try:
+            with server.list_store_access(), server.staff_read_scope():
+                live = server.mode is ServerMode.LIVE
+                reviews = server.list_review_records()
+                content = render(server.root, include_counts=live, defer_counts=True,
+                                 status=server.delivery_status,
+                                 review_records=(list_page.LinkedReviewRead.AFTER_RENDER
+                                                 if live and reviews is list_page.LinkedReviewRead.FROM_DISK
+                                                 else reviews))
+                content = owned_document(content, "list")
+        except (OSError, ValueError) as error:
+            print(f"review-links list: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
+            return
+        self.html_response(200, content, delivery_pending=delivery)
+
+    def studio_avatar(self, relative: str) -> BinaryIO | None:
+        """Serve one Studio picture from the avatar root."""
+        if self.tailscale_refusal() or not self.same_origin():
+            self.send_error(403)
+            return None
+        try:
+            content = studio_page.avatar(relative)
+        except (OSError, ValueError):
+            self.send_error(404)
+            return None
+        return self.attachment_response(content, "image/webp", cache="max-age=86400, immutable")
+
+    def attachment_response(self, content: bytes, media: str, *, cache: str = "no-store") -> BinaryIO:
         self.send_response(200)
         self.send_header("Content-Type", media)
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
