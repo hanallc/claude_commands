@@ -23,7 +23,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
-    VerifyCommand, command_job, command_program, parse_command_program, verify_command,
+    VerifyCommand, command_job, command_program, parse_command_program, read_step_names, verify_command,
 )
 from scripts.mac_test import claim_state
 
@@ -158,6 +158,7 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
     name = 'test-affected' if affected else 'gate'
     resolved_job = command_job(command)
     job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
+    what = read_step_names().shown(job.step) if isinstance(job, StepJob) else ""
     config = records.read_memory_config()
     first = config.program_first_peaks.get(name)
     if first is None:
@@ -178,7 +179,7 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
             break
     def refresh() -> wire.AdmitRequest:
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
-        return replace(request, identity=replace(request.identity, job=job))
+        return replace(request, identity=replace(request.identity, job=job, what=what))
     return queue_place.RefreshedRequest(refresh)
 
 

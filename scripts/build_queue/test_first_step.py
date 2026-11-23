@@ -11,6 +11,7 @@ from unittest import mock
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, mac_linux_candidate,
     placement_request, publish_candidate,
@@ -128,18 +129,20 @@ class FirstStepTests(unittest.TestCase):
             self.assertIsInstance(admitted.grant, first_step.HandedOff)
 
     def test_named_gate_places_one_request_and_exports_the_assignment(self) -> None:
-        self.check_gate_placement(use_default=False)
+        self.check_gate_placement((*GATE_COMMAND[:2], "--affected"),
+                                  ("test-affected", "test-affected", "test affected"), use_default=False)
 
     def test_default_claude_gate_places_one_request_and_exports_the_assignment(self) -> None:
-        self.check_gate_placement(use_default=True)
+        self.check_gate_placement(GATE_COMMAND, ("gate", "test-all", "test all"), use_default=True)
 
-    def check_gate_placement(self, *, use_default: bool) -> None:
+    def check_gate_placement(self, command: tuple[str, ...], expected_identity: tuple[str, str, str], *,
+                             use_default: bool) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             configured = conf.read("build_targets").text("targets").split(",")
             expected = tuple(name for name in configured if name not in ("mac", "hana-aws"))
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
-                targets = first_step.gate_targets(GATE_COMMAND, source=source) if use_default else expected[::-1]
+                targets = first_step.gate_targets(command, source=source) if use_default else expected[::-1]
                 if use_default:
                     self.assertEqual(targets, expected)
                     for arguments in (("--tests-only", "--module=fixture/test_gate.py"),
@@ -170,16 +173,19 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel,
                   forbid_admission_calls()):
-                with first_step.admitted_run(GATE_COMMAND, source, targets=targets) as admitted:
+                with first_step.admitted_run(command, source, targets=targets) as admitted:
                     self.assertEqual(len(requests), 1)
                     request = requests[0]
                     self.assertEqual(request.constraints.candidates, (remote, local))
-                    self.assertEqual(request.constraints.command, GATE_COMMAND)
+                    self.assertEqual(request.constraints.command, command)
                     self.assertEqual(request.run, wire.RunIdentity(os.getpid(), "123"))
-                    self.assertEqual(request.identity.job, command_job(GATE_COMMAND))
+                    job = request.identity.job
+                    self.assertEqual(job, command_job(command))
+                    assert isinstance(job, StepJob)
+                    self.assertEqual((request.identity.step, job.step, request.identity.what), expected_identity)
                     self.assertIsInstance(request.profile, records.ProgramProfile)
                     assert isinstance(request.local, wire.LocalAdmissionContext)
-                    self.assertEqual(request.local.argv, ("gate",))
+                    self.assertEqual(request.local.argv, (expected_identity[0],))
 
                     saved = client.read_assignment(admitted.assignment_file).assignment
                     self.assertEqual(saved.owner, request.owner)
