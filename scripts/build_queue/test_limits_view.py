@@ -272,6 +272,9 @@ class BuildLimitsTests(unittest.TestCase):
                                               (targets.Free(),), held, eligibility.NO_BACKOFF)
             with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": "/nonexistent"}):
                 mac = limits_view.read_mac(snapshot, limits_view.Origins())
+            # A kept claim has no working session, so it never shows under Running.
+            self.assertEqual([claim.working_session for claim in mac.claims],
+                             ["" if claim.use is limits_view.MacClaimUse.KEPT else "build" for claim in mac.claims])
             shown = limits_view.build_limits(head_reading(), (), (), {}, {}, background, UTC, mac=mac)
             rendered = test_memory_hover.MemoryHoverTests().page_expression("""(() => {
                 renderBuildLimits(data.build_limits);
