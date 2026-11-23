@@ -123,6 +123,9 @@ def peer_exchanges() -> tuple[PeerExchange, ...]:
 
 
 def configured_peers() -> tuple[SyncPeer, ...]:
+    """Name each SSH target that keeps its own buildlog store behind one SSH host."""
+    from scripts.mac_test.eligibility import MAC_LINUX_TARGET
+
     override = os.environ.get("BUILDLOG_PEER", "")
     if override:
         return (SyncPeer("mac", override, legacy_override=True),)
@@ -130,7 +133,8 @@ def configured_peers() -> tuple[SyncPeer, ...]:
         return ()
     peers: list[SyncPeer] = []
     for target in read_targets():
-        if isinstance(target, SshTarget):
+        # The Mac's Linux guest keeps no buildlog store: each guest gate run has a temporary home.
+        if isinstance(target, SshTarget) and target.name != MAC_LINUX_TARGET:
             host = conf.read(target.settings).values().get("host", "")
             if not host or host.startswith("-") or any(character.isspace() for character in host):
                 raise ValueError(f"invalid sync host for {target.name}")

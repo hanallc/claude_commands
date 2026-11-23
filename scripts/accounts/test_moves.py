@@ -124,7 +124,7 @@ class MoveJournalTests(unittest.TestCase):
             tool="claude" if tool == "claude" else "codex", subject=subject, move_id="transition-1")
 
     def requested(self) -> moves.RequestedMove:
-        return {**self.common(), "kind": "requested", "from": "codex1", "to": "codex2",
+        return {**self.common(), "kind": "requested", "scope": "group", "from": "codex1", "to": "codex2",
             "why": "quota refusal", "window": "unknown", "cause": "refusal"}
 
     def test_replay_evidence_excludes_failed_requests_and_includes_scheduled_claude_routes(self) -> None:
@@ -240,7 +240,7 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(route["why"], "refusal")
 
     def test_every_transition_kind_round_trips_without_losing_its_semantics(self) -> None:
-        entries: list[moves.MoveEntry] = [
+        entries: list[moves.MoveWriteEntry] = [
             self.requested(),
             moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", worker="worker-a"),
             moves.ConfirmedMove(**self.common(tool="claude", subject="conversation: unit"),

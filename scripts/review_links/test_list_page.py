@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import select
 import shutil
 import signal
@@ -77,8 +78,11 @@ async function reviewCardPosition(card){
  }
  const main=card.querySelector('main').getBoundingClientRect().height;
  const frame=win.frameElement;
- return {top,left,main,height:frame?.getBoundingClientRect().height ?? win.innerHeight,
-  resized:!frame || Number.parseFloat(frame.style.getPropertyValue('--review-card-height'))===Math.ceil(main),
+ const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
+ const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
+ const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
+ return {top,left,main,height,requested,
+  resized:!frame || Math.abs(height-(fullscreen ? win.parent.innerHeight : Math.min(requested,win.parent.innerHeight-98)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
   dark:win.matchMedia('(prefers-color-scheme:dark)').matches};
 }
@@ -115,12 +119,12 @@ async function checkReviewCardConflict(card,layout,check,advance){
   const after=await reviewCardPosition(card);
   const marker=notice.textContent;
   check(before.dark && after.dark,'The Review card uses dark mode.');
-  check(before.resized && after.resized,'The linked card height follows the measured document.');
+  check(before.resized && after.resized,'The frame takes the height the card requests, up to the cap.');
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
-   before.main===after.main && before.height===after.height,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
-  if(layout==='short') check(before.main<win.parent.innerHeight-108,'The short card fits below the iframe height cap.');
-  if(layout==='cap') check(before.main>before.height && Math.abs(before.height-(win.parent.innerHeight-108))<1,
+   before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
+  if(layout==='short') check(before.requested<win.parent.innerHeight-98,'The short card fits below the iframe height cap.');
+  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-(win.parent.innerHeight-98))<1,
    'The tall card reaches the iframe height cap.');
   if(layout==='phone') check(win.top.innerWidth===390 && win.frameElement.closest('dialog').hasAttribute('data-fullscreen'),
    'The phone card fills the List dialog at 390 pixels.');
@@ -140,6 +144,9 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(form().elements.revision.value!==revision && notice.textContent===marker &&
    form().elements.feedback.value===edited && card.querySelector('[data-review-body]').textContent.includes(nextBody),
    'Show updates applies the new revision and keeps the edit and failure reason.');
+  const words=card.querySelectorAll('textarea');
+  check(words.length===1 && words[0]===form().elements.feedback && !words[0].readOnly,
+   'Show updates keeps one editable draft.');
   return {before,after};
  }finally{
   win.fetch=request;
@@ -655,7 +662,7 @@ document.body.append(result);
         self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
+    def test_browser_new_item_refreshes_without_opening_a_row(self) -> None:
         root = self.root / "reviews"
         _ = self.add("An existing List item")
         initial = page_frame.with_owner(list_page.render(root, include_counts=False), "list", MORTY,
@@ -676,7 +683,7 @@ window.fetch=async (path,options={})=>{
  requests.push([request.pathname+request.search,options.body && JSON.parse(options.body)]);
  if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
  if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:created});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -718,13 +725,21 @@ window.fetch=async (path,options={})=>{
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
- await until(document.body,()=>row() && !row().hidden && recordIsOpen(row()));
+ await until(document.body,row);
+ check(row().hidden && !recordIsOpen(row()),'Send preserves the search and keeps the new row closed.');
+ check(!new URLSearchParams(location.hash.slice(1)).has('jump'),'Send adds no jump to the address.');
  check(reads===1,'The New item save refreshes the List once after the row save ends.');
  check(!dialog.open,'Send closes the dialog.');
  const saved=requests.find(([,body])=>body?.words);
  check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
        'Send uses the shared endpoint and the selected List owner.');
- check(row().textContent.includes('A new List item'),'The filtered List reveals the saved row.');
+ const searchField=document.querySelector('#list-search');
+ await new Promise(done=>{
+  searchField.addEventListener('filterchange',done,{once:true});
+  searchField.value='';searchField.dispatchEvent(new Event('input',{bubbles:true}));
+ });
+ row().querySelector('.list-toggle').click();
+ check(recordIsOpen(row()),'A click opens the row.');
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
  document.body.append(result);
 })();
@@ -733,6 +748,85 @@ window.fetch=async (path,options={})=>{
             with self.subTest(status=status):
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
                     "status": status, "body": body})))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_new_item_question_keeps_the_filters_and_the_scroll(self) -> None:
+        # List item 237: a question sent from the New item dialog cleared the filters and jumped to the end.
+        root = self.root / "reviews"
+        for number in range(1, 25):
+            item = self.add(f"Needs me item {number}", number=number)
+            _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+        for number in range(25, 31):
+            _ = self.add(f"Working item {number}", number=number)
+        markup = list_page.render(root, include_counts=False)
+        self.assertRegex(markup.decode(), r'data-filter-value="needs-me"[^>]*data-filter-count="24"')
+        initial = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)),
+                                        new_item_dialog.render).decode()
+        _ = self.add("A Working item after the send", number=31)
+        fresh = list_page.render(root, include_counts=False).decode()
+        setup = r"""<script>
+const owner=__OWNER__,fresh=__FRESH__;
+let reads=0;
+window.setInterval=()=>0;
+window.fetch=async (path,options={})=>{
+ if(path===location.pathname){
+  if(options.method==='POST') return Response.json({});
+  reads++;
+  return new Response(fresh);
+ }
+ const request=new URL(path,location.href);
+ if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
+ if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
+};
+</script>""".replace("__OWNER__", json.dumps(MORTY.id)).replace(
+            "__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=(target,test)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(test()){observer.disconnect();resolve();}});
+  observer.observe(target,{subtree:true,childList:true,attributes:true});
+  if(test()){observer.disconnect();resolve();}
+ });
+ const frames=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const needsMe=()=>document.querySelector('[data-filter-value="needs-me"]');
+ needsMe().click();
+ const row=()=>document.querySelector('[data-list-item][data-number="18"]');
+ row().querySelector('.list-toggle').click();
+ const summaryTop=()=>row().querySelector('.list-row').getBoundingClientRect().top;
+ scrollBy({top:summaryTop()-150,behavior:'instant'});
+ await frames();
+ const hash=location.hash,top=summaryTop(),scroll=scrollY;
+ const params=new URLSearchParams(hash.slice(1));
+ check(needsMe().getAttribute('aria-pressed')==='true' && params.get('show')==='needs-me' &&
+  params.get('item')===row().dataset.key && recordIsOpen(row()) && scroll>0,
+  'Needs me is on and the page is scrolled to the open row. Found '+hash+' at '+scroll+' px.');
+ const dialog=document.querySelector('#review-new-item');
+ document.querySelector('.page-heading-actions [data-owner-new]').click();
+ const recipient=()=>dialog.querySelector('[name="recipient_id"]:checked');
+ await until(dialog,recipient);
+ dialog.querySelector('[name="kind"][value="question"]').click();
+ dialog.querySelector('[name="include_page"]').click();
+ const words=dialog.querySelector('textarea');
+ words.value='Why did the check fail?';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ dialog.querySelector('[type="submit"]').click();
+ await until(dialog,()=>!dialog.open);
+ await until(document.body,()=>document.querySelector('[data-list-item][data-number="31"]'));
+ await frames();
+ check(reads===1,'The question refreshes the List once. Found '+reads+' reads.');
+ check(needsMe().getAttribute('aria-pressed')==='true','The Needs me chip stays on.');
+ check(location.hash===hash,'The address keeps its filters. Expected '+hash+'. Found '+location.hash+'.');
+ check(scrollY===scroll,'The page keeps its scroll. Expected '+scroll+' px. Found '+scrollY+' px.');
+ check(recordIsOpen(row()) && summaryTop()===top,
+  'The open row keeps its top. Expected '+top+' px. Found '+summaryTop()+' px.');
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>"""
+        self.browser_actions(initial, setup, probe, reduced_motion=True, window_size=(1280, 720))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_retry_refreshes_without_revealing_the_saved_row(self) -> None:
@@ -758,7 +852,7 @@ window.fetch=async (path,options={})=>{
  }
  sends.push(payload);
  if(sends.length===1) throw new TypeError('The response was lost.');
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:savedKey});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -815,11 +909,13 @@ window.fetch=async (path,options={})=>{
         owner = replace(MORTY, name="cargo-liner")
         markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
                                        "list", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        setup = f"<script>Date.now=()=>{int(NOW.timestamp() * 1000)};</script>"
         probe = """<script>
 (async()=>{
  const failures=[];
  try{
   await document.fonts.ready;
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
   const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-owner-new]');
   const heading=title.parentElement.getBoundingClientRect(), bounds=title.getBoundingClientRect();
   const line=parseFloat(getComputedStyle(title).lineHeight);
@@ -844,7 +940,7 @@ window.fetch=async (path,options={})=>{
 </script>"""
         for in_console in (False, True):
             with self.subTest(in_console=in_console):
-                self.browser_answer_visibility(markup.decode(), "", probe, reload_console=in_console,
+                self.browser_answer_visibility(markup.decode(), setup, probe, reload_console=in_console,
                                                viewport_width=320)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
@@ -992,14 +1088,23 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         listing = self.root / f"{change_review.PREFIX}sdlc.md"
         _ = doc.write_text(f'# Production\n- **Showrunner checkout:** `{self.root}`\n- **Change review:** `{listing}`\n')
         now = datetime.now(UTC)
+        title = "Check the complete title of a linked review that opens in the List with its own header and controls"
+        instructions = "Open the linked change." + " Read each field before you answer." * 36
+        tall_title = [f"Title line {line}" for line in range(1, 13)]
+        short_title = "Check the `status` field."
+        check_url = "https://example.com/check"
         original = (change_review.BODY.replace("\n## Reviewed",
-            f"| C1 | Check the List review overlay | {now.date().isoformat()} | Open the linked change. |\n\n## Reviewed")
+            f"| C1 | {title} | {now.date().isoformat()} | Open the linked change. |\n"
+            + f"| C3 | {'<br>'.join(tall_title)} | {now.date().isoformat()} | Open the card. |\n"
+            + f"| C4 | {short_title} | {now.date().isoformat()} | {short_title} |\n"
+            + f"| C5 | {check_url} | {now.date().isoformat()} | {check_url} |\n\n## Reviewed")
             + "| C2 | A completed change | works | 2026-11-15 |\n")
         members = staff.StaffSnapshot((MORTY, DWIGHT, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc)), OTHER))
         item = self.add("Check the linked reviews", number=111)
         _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
-        _ = self.add("An unrelated List row", number=112)
-        waiting = investigation.file(OWNER.id, "Check the waiting review", "What caused the error?",
+        extra = self.add("Check the linked reviews at short heights", number=112)
+        _ = the_list.link(MORTY.id, extra.id, ("sdlc/C3", "sdlc/C4", "sdlc/C5"), source="morty")
+        waiting = investigation.file(OWNER.id, "Check the waiting review", "Check the waiting review",
                                      waiting_why="The owner checks the error.")
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
         waiting_item = self.add("Check the linked reviews that are waiting", number=113)
@@ -1020,6 +1125,7 @@ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const params=new URLSearchParams(location.search);
 const shot=params.has('shot');
 const waitingKey=WAITING_KEY;
+const expectedTitle=REVIEW_TITLE,tallTitle=TALL_TITLE;
 CONFLICT_CHECK
 const advance=async()=>{
  if(!(await fetch('/advance-overlay',{method:'POST'})).ok) throw new Error('The source change could not be updated.');
@@ -1027,12 +1133,13 @@ const advance=async()=>{
 const report=async()=>{await fetch('/results',{method:'POST',body:JSON.stringify(failures)});};
 const listFrame=document.querySelector('iframe:not([hidden])');
 const direct=!listFrame;
+const short=params.has('short') || (direct && innerWidth===500);
 const animationFrames=win=>new Promise(resolve=>win.requestAnimationFrame(()=>win.requestAnimationFrame(resolve)));
 async function inspect(){
  const doc=listFrame?.contentDocument || document,win=doc.defaultView;
  const dialog=doc.querySelector('[data-list-review-dialog]');
  const row=()=>doc.querySelector('[data-number="111"]');
- const link=key=>[...win.recordDetails(row()).querySelectorAll('a[data-list-review-card]')].find(link=>
+ const link=(key,item=row())=>[...win.recordDetails(item).querySelectorAll('a[data-list-review-card]')].find(link=>
   new URL(link.href).searchParams.get('body')===key);
  const changed=(node,ready,description)=>new Promise((resolve,reject)=>{
   const observer=new win.MutationObserver(checkReady);
@@ -1052,6 +1159,25 @@ async function inspect(){
   if(!frame) throw new Error('The card frame is missing.');
   return new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
  };
+ async function inspectLater(cardDoc){
+  const cardWin=cardDoc.defaultView,box=cardDoc.querySelector('.review-box');
+  const foot=box.querySelector('.review-box-footer'),height=foot.getBoundingClientRect().height;
+  const later=foot.querySelector('[data-later-toggle]'),menu=foot.querySelector('[data-later-menu]');
+  const menuFits=()=>{
+   const bounds=menu.getBoundingClientRect();
+   return bounds.top>=box.getBoundingClientRect().top-box.scrollTop &&
+    bounds.bottom<=foot.getBoundingClientRect().top && menu.scrollHeight<=menu.clientHeight;
+  };
+  later.click();
+  await animationFrames(cardWin);
+  check(menuFits() && !menu.hidden,'The Later menu fits above the footer without scrolling.');
+  menu.querySelector('[data-later-choose]').click();
+  await animationFrames(cardWin);
+  check(menuFits() && menu.hasAttribute('data-choosing'),'The calendar fits above the footer without scrolling.');
+  check(foot.getBoundingClientRect().height===height,'The calendar keeps the footer height.');
+  later.click();
+  await animationFrames(cardWin);
+ }
  check(!dialog.querySelector('iframe'),'List loads no card before a click.');
  for(const cell of doc.querySelectorAll('.record-id')){
   if(cell.closest('tbody').hidden) continue;
@@ -1072,12 +1198,19 @@ async function inspect(){
  const waitingCard=await readCard(waitingLink);
  check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
   'The summary opens the linked Waiting card.');
+ check(waitingCard.querySelector('.review-box-meta').textContent.includes('The owner checks the error.'),
+  'The metadata shows the Waiting reason.');
+ check(!waitingCard.querySelector('[data-review-body] section').getClientRects().length,
+  'The body hides the section that repeats the title.');
  dialog.querySelector('button').click();
  const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
- check(!done.querySelector('[data-review-form] textarea'),'The Done card has no action.');
- check(!done.querySelector('[data-review-index]') &&
-  win.recordIsOpen(row()),'The Review dialog loads one card and the List row stays expanded.');
+ check(!done.querySelector('[data-review-form]'),'The Done card has no action form.');
+ const shortBody=done.querySelector('.review-box-scroll');
+ check(shortBody.scrollHeight<=shortBody.clientHeight,'The short card fits without scrolling.');
+ check(!done.querySelector('[data-review-body] section').getClientRects().length,'The empty check section is hidden.');
+ check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
+ check(win.recordIsOpen(row()),'The Review dialog leaves the List row expanded.');
  const close=dialog.querySelector('button');
  done.body.tabIndex=-1;done.body.focus();
  done.body.dispatchEvent(new done.defaultView.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
@@ -1089,6 +1222,32 @@ async function inspect(){
  const form=ready.querySelector('[data-review-form]');
  check(!!form.querySelector('[value="works"]') && !!form.querySelector('[value="feedback"]') &&
   !!form.querySelector('[data-later-toggle]'),'The card shows the Review actions.');
+ const head=ready.querySelector('.review-box-header'),body=ready.querySelector('.review-box-scroll');
+ const foot=form.closest('footer'),panel=body.querySelector('.review-panel');
+ check(head.querySelector('h1').textContent===expectedTitle && !ready.querySelector('.list-row'),
+  'The header shows the full title without a table row.');
+ const box=ready.querySelector('.review-box'),frame=ready.defaultView.frameElement;
+ if(box.hasAttribute('data-whole-scroll')){
+  check(!direct && (short || params.has('cap')),'Only a short window scrolls the whole card.');
+  box.scrollTop=box.scrollHeight;
+  const bounds=foot.getBoundingClientRect();
+  check(box.scrollTop>0 && body.scrollTop===0 && bounds.top>=0 && bounds.bottom<=frame.clientHeight,
+   'Scrolling the card brings the entire footer into view.');
+  box.scrollTop=0;
+ }else{
+  const top=head.getBoundingClientRect().top,bottom=foot.getBoundingClientRect().bottom;
+  const needsScroll=body.scrollHeight>body.clientHeight;
+  body.scrollTop=body.scrollHeight;
+  check((body.scrollTop>0)===needsScroll && box.scrollTop===0 && ready.scrollingElement.scrollTop===0,
+   'Only the card body scrolls when its content exceeds its height.');
+  check(head.getBoundingClientRect().top===top && foot.getBoundingClientRect().bottom===bottom,
+   'The header and feedback controls stay fixed.');
+  check(bottom<=frame.clientHeight && body.clientHeight>=96,
+   'The frame contains the entire footer and at least 96 pixels of the body.');
+ }
+ await inspectLater(ready);
+ const columns=ready.defaultView.getComputedStyle(panel).gridTemplateColumns.split(' ').length;
+ check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
  if(phone){
@@ -1103,10 +1262,36 @@ async function inspect(){
    'The desktop dialog is centered horizontally and starts 16 pixels from the top.');
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
- if(direct || params.has('cap')){
+ if(short && !direct){
+  close.click();
+  const extra=doc.querySelector('[data-number="112"]');
+  extra.querySelector('.list-toggle').click();
+  const tall=await readCard(link('sdlc/C3',extra));
+  await animationFrames(tall.defaultView);
+  const box=tall.querySelector('.review-box'),scroll=tall.querySelector('.review-box-scroll');
+  const tallFoot=tall.querySelector('.review-box-footer'),title=box.querySelector('h1');
+  check(title.textContent===tallTitle && box.scrollHeight>box.clientHeight,
+   'The box scrolls with the full 12-line title.');
+  box.scrollTop=box.scrollHeight;
+  const bounds=tallFoot.getBoundingClientRect(),viewport=box.getBoundingClientRect();
+  check(box.scrollTop>0 && scroll.scrollTop===0 && bounds.top>=viewport.top && bounds.bottom<=viewport.bottom,
+   'Scrolling the box brings the whole footer into view.');
+  close.click();
+  const compact=await readCard(link('sdlc/C4',extra));
+  await animationFrames(compact.defaultView);
+  check(!compact.querySelector('[data-review-body] section').getClientRects().length,
+   'The body hides text that matches an inline code title.');
+  await inspectLater(compact);
+  close.click();
+  const repeated=await readCard(link('sdlc/C5',extra));
+  const checkLink=repeated.querySelector('[data-review-body] a[href="https://example.com/check"]');
+  check(checkLink?.getClientRects().length,'The check link stays visible when it matches the title.');
+ }
+ if(!short && (direct || params.has('cap'))){
   await checkReviewCardConflict(ready,direct ? 'phone' : 'cap',check,advance);
   await report();return;
  }
+ if(short){await report();return;}
  if(shot){
   check(win.matchMedia('(prefers-color-scheme:dark)').matches,'The desktop uses dark mode.');
   await report();return;
@@ -1244,7 +1429,7 @@ async function inspect(){
   for(const realm of [win,cardWin]){
    const animate=realm.Element.prototype.animate;
    realm.Element.prototype.animate=function(keyframes,options){
-    if(this.matches('[data-review-card] tbody, [data-list-review-dialog] iframe'))
+    if(this.matches('.review-box, [data-list-review-dialog] iframe'))
      fades.push([this.tagName,options.duration]);
     return animate.call(this,keyframes,options);
    };
@@ -1301,7 +1486,7 @@ async function inspect(){
   releaseRefresh();
  }
  await refreshed;
- if(!phone) check(JSON.stringify(fades)===JSON.stringify([['TBODY',180],['TBODY',260],['IFRAME',180]]),
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260],['IFRAME',180]]),
   'The overlay uses the configured card fade durations.');
  check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
   row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
@@ -1320,7 +1505,8 @@ const inspectPage=()=>{void inspect().catch(error=>{failures.push(String(error))
 if(direct) inspectPage();
 else listFrame.addEventListener('load',inspectPage,{once:true});
 if(direct || shot){const image=new Image();image.hidden=true;image.src='/complete';document.body.append(image);}
-</script>'''.replace('WAITING_KEY', json.dumps(waiting_key)).replace('CONFLICT_CHECK', REVIEW_CARD_CONFLICT_CHECK)
+</script>'''.replace('WAITING_KEY', json.dumps(waiting_key)).replace('CONFLICT_CHECK', REVIEW_CARD_CONFLICT_CHECK).replace(
+            'REVIEW_TITLE', json.dumps(title)).replace('TALL_TITLE', json.dumps("\n".join(tall_title)))
         standalone_probe = '<script>' + REVIEW_CARD_CONFLICT_CHECK + r'''
 (async()=>{
  const failures=[];
@@ -1339,12 +1525,15 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
             + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
             + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
-        for size in ("1440,1000", "1440,620", "600,900", "390,900", "standalone", *(("screenshot",) if proof else ())):
+        for size in ("1440,1000", "1440,620", "1474,600", "600,900", "390,900", "500,800",
+                     "standalone", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 initial = original
                 if size == "1440,620":
                     initial = original.replace("Open the linked change.",
                                                "Open the linked change. " + "Check each recorded result. " * 160)
+                elif size in ("1474,600", "600,900", "390,900", "500,800", "screenshot"):
+                    initial = original.replace("Open the linked change.", instructions)
                 _ = listing.write_text(initial)
                 browser_root = root / size.replace(",", "x")
                 results: list[list[str]] = []
@@ -1354,7 +1543,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                     @override
                     def html_response(self, status: int, content: bytes, *,
                                       delivery_pending: bool | None = None) -> None:
-                        if self.path == list_page.PAGE_PATH + "?direct=1":
+                        if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
                         super().html_response(status, content, delivery_pending=delivery_pending)
 
@@ -1399,6 +1588,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                       patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
                       patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
                       patch.object(change_page, "deliver"), patch.object(change_review, "_commit"),
+                      patch.object(change_page, "feature_review_id", return_value=""),
                       patch.object(change_review, "lists_directory", return_value=self.root),
                       patch.object(staff, "snapshot", return_value=members),
                       patch.object(list_page, "counts_strip", return_value=""),
@@ -1409,7 +1599,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                         viewport = "1440,1000" if size in ("screenshot", "standalone") else size
                         width, height = map(int, viewport.split(","))
                         route = destination
-                        if size == "390,900":
+                        if size == "500,800":
+                            route = list_place.replace("#", "?direct=1&short=1#", 1)
+                        elif size == "1474,600":
+                            route += "&short=1"
+                        elif size == "390,900":
                             route = list_place.replace("#", "?direct=1#", 1)
                         elif size == "1440,620":
                             route += "&cap=1"
@@ -2132,12 +2326,13 @@ document.body.append(result);
             "eta": the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))})
 
     def fixture_items(self) -> list[the_list.ListItem]:
-        items = [self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58),
-                 self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10)),
-                 self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1)),
-                 self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41),
-                 self.add("Read the delivered page", the_list.ItemState.DONE, number=63),
-                 self.add("Removed task", number=54)]
+        paused = self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41)
+        removed = self.add("Removed task", number=54)
+        waiting = self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58)
+        done = self.add("Read the delivered page", the_list.ItemState.DONE, number=63)
+        status = self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10))
+        latest = self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1))
+        items = [waiting, status, latest, paused, done, removed]
         _ = the_list.mark_read(MORTY.id, items[0].id, source="nate")
         _ = the_list.update(MORTY.id, items[1].id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, items[3].id, {"producer": DWIGHT.id}, source="morty")
@@ -2184,11 +2379,11 @@ document.body.append(result);
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
-        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE, number=59)
+        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE)
         _ = the_list.park(MORTY.id, parked.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         parked_markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(re.findall(r'<tbody data-list-item [^>]*data-number="(\d+)"', parked_markup),
-                         ["58", "105", "106", "63", "59", "41"])
+                         ["58", "105", "106", "63", "107", "41"])
         self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
         self.assertNotIn('<h3>Closing words</h3>', body)
         _ = the_list.reopen(MORTY.id, "L54", source="nate")
@@ -2436,7 +2631,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", keeper_name=MORTY.name)
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -3024,7 +3219,7 @@ window.fetch=(url,options)=>{
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, keeper_name=MORTY.name)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -3075,6 +3270,20 @@ window.fetch=(url,options)=>{
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_list_adds_the_next_number_after_a_page_remove(self) -> None:
+        first = self.add("Keep the first item", number=206)
+        removed = self.add("Remove the highest item", number=207)
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(self.fields(removed, "remove")))
+        saved = the_list.load(MORTY.id, removed.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.log[:-2], removed.log)
+        self.assertEqual([entry.item.id for entry in list_page.records()], [first.id])
+        self.assertEqual(the_list.load(MORTY.id, removed.id), saved)
+        # The counter keeps the removed number used even when its file is gone.
+        (the_list.folder(MORTY.id) / f"{removed.id}.md").unlink()
+        self.assertEqual([self.add(f"Add item {number}").number for number in (208, 209)], [208, 209])
 
     def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Park this item now")
@@ -3352,6 +3561,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Check the other item", number=2)
         self.browser_action_sequence(r"""
  const toggle=form.querySelector('[data-later-toggle]');
@@ -3386,7 +3596,7 @@ window.fetch=async(_path,options={})=>{
  check(!row.hidden,'Unpark returns the item to Working');
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
         self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3944,15 +4154,16 @@ window.fetch=async(_path,options={})=>{
     def test_browser_list_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
         root = self.root / 'reviews'
         for number in range(7, 28):
-            if number != 13:
-                _ = self.add(f'List item {number}', number=number)
+            title = 'A row that returns above the open item' if number == 13 else f'List item {number}'
+            _ = self.add(title, number=number)
+        _ = the_list.close(MORTY.id, 'L13', 'The row returns later.', source='nate')
 
         def page() -> str:
             return list_page.render(root, include_counts=False).decode().replace(
                 '</head>', '<style>.list-row td { line-height: 22px; }</style></head>')
 
         initial = page()
-        _ = self.add('An added row above the open item', number=13)
+        _ = the_list.reopen(MORTY.id, 'L13', source='nate')
         added = page()
         _ = the_list.close(MORTY.id, 'L12', 'The work has finished.', source='nate')
         removed_above = page()
@@ -4291,10 +4502,10 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
         root = self.root / "reviews"
-        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         for number in range(1, 17):
             state = the_list.ItemState.DELIVERED if number == 5 else the_list.ItemState.WORKING
             _ = self.add(f"List item {number}", state, number=number)
+        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         before = list_page.render(root, include_counts=False).decode()
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
         _ = the_list.update(MORTY.id, parked.id, {"state": the_list.ItemState.WORKING}, source="morty")
@@ -4510,6 +4721,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_switching_rows_moves_a_lost_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4527,10 +4739,11 @@ observer.observe(original.parentElement,{childList:true});
  check(aboveOnly(),'Opening another row moves the notice above the table.');
  row.querySelector('.list-toggle').click();
  check(inlineOnly(),'Opening the first row returns the notice to its details.');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4553,7 +4766,7 @@ observer.observe(original.parentElement,{childList:true});
  check(!shows(1) && shows(2),'Closing row one does not restore the older notice.');
  second.querySelector('.list-toggle').click();
  check(status.hidden,'opening the latest failed row hides the notice above the table');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_clears_the_list_save_notice(self) -> None:
@@ -5325,6 +5538,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence("""
@@ -5341,10 +5555,11 @@ observer.observe(original.parentElement,{childList:true});
  submit('remove');
  finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
  check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence(r"""
@@ -5366,7 +5581,7 @@ observer.observe(original.parentElement,{childList:true});
  check(updateKey()===original && first()==='1','the restored Update key puts the row first');
  restore?.finish();await flush();
  check(!animation() && first()==='1','the correct order remains after the animation');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_closed_response_clears_unread_when_the_server_reports_read(self) -> None:
@@ -5440,6 +5655,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
  document.querySelector('[data-sort="0"]').click();
@@ -5477,7 +5693,7 @@ observer.observe(original.parentElement,{childList:true});
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_respects_reduced_motion(self) -> None:
@@ -6661,6 +6877,66 @@ window.fetch=async(path,options={})=>{
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
+
+    def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
+        root = self.root / "reviews"
+        for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):
+            with self.subTest(keeper=keeper):
+                # Only morty's folder allocates numbers, so move the new record into the legacy keeper's folder.
+                item = the_list.add(MORTY.id, "Read the legacy List item", owner=keeper, source="nate", changes={})
+                legacy = the_list.folder(keeper)
+                legacy.mkdir(parents=True, exist_ok=True)
+                _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
+                markup = list_page.render(root, include_counts=False).decode()
+                self.assertIn(f'data-key="{keeper}/{item.id}"', markup)
+                member = staff.local_snapshot().by_id(keeper)
+                keeper_name = member.name if member is not None else "the record keeper"
+                self.assertIn(f'Tell {keeper_name}</button>', markup)
+
+                def submit(action: str, *, words: str = "", until: str = "") -> list_page.ListActionSubmission:
+                    current = the_list.load(keeper, item.id)
+                    request, token = list_page.signed_item_request(
+                        list_page.ListRecord(keeper, current), list_page.form_secret(root))
+                    return list_page.submit(root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action=action, words=words,
+                        until=until)))
+
+                self.assertIsInstance(submit("read"), change_page.NoMessageDelivery)
+                self.assertIs(the_list.load(keeper, item.id).unread_since, the_list.NoTimestamp.UNSET)
+                told = submit("tell", words="Read this result.")
+                assert isinstance(told, list_page.ListFeedbackDelivery)
+                self.assertEqual(told.keeper, keeper)
+                parked = submit("park", until="2026-12-03")
+                assert isinstance(parked, list_page.ListFeedbackDelivery)
+                self.assertEqual(parked.keeper, keeper)
+                unparked = submit("unpark")
+                assert isinstance(unparked, list_page.ListUnparkSubmission)
+                self.assertIs(unparked.outcome, list_page.UnparkOutcome.CLEARED)
+                asked = submit("question", words="Which check passed?")
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                self.assertEqual(asked.delivery.recipients, (keeper,))
+                self.assertEqual(the_list.load(keeper, item.id).questions[0].words, "Which check passed?")
+                if member is not None and member.kind == "producer":
+                    with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                        list_page.deliver(asked)
+                    attempt = change_page.read_question_attempt(asked.status.path(asked.delivery.page, asked.delivery.row))
+                    send.assert_called_once_with(keeper, attempt.message, attempt.message_id)
+                    command = attempt.message.split("Answer with this command: ", 1)[1].splitlines()[0]
+                    arguments = ["The smoke test passed." if word == "<answer>" else word
+                                 for word in shlex.split(command)[2:]]
+                    with (patch.object(staff, "caller_identity", return_value=member.current_session),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(the_list.main(arguments), 0)
+                    answered = the_list.load(keeper, item.id)
+                    answer = answered.questions[0].answer
+                    assert isinstance(answer, question_record.Answer)
+                    self.assertEqual(answer.text, "The smoke test passed.")
+                    self.assertEqual(answered.log[-1].source, member.name)
+                    self.assertEqual(answered.unread_since, NOW)
+                removed = submit("remove")
+                assert isinstance(removed, list_page.ListFeedbackDelivery)
+                self.assertEqual(removed.keeper, keeper)
+                self.assertIs(the_list.load(keeper, item.id).state, the_list.ItemState.CLOSED)
 
     def test_signed_feedback_logs_words_and_uses_the_shared_sender(self) -> None:
         root = self.root / "reviews"
