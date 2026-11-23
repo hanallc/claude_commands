@@ -2111,7 +2111,7 @@ document.body.append(result);
         self.assertEqual((unmapped.keeper, unmapped.item.producer, unmapped.item.title),
                          (OWNER.id, OWNER.id, "Check the chart."))
         _ = (self.root / "config" / "producer_map.conf").write_text(
-            f"# sdlc -> dwight\n{OWNER.id}={DWIGHT.id}\n", encoding="utf-8")
+            f"{OWNER.id} = {DWIGHT.id}  # sdlc = dwight\n", encoding="utf-8")
         mapped = list_page.add_submission(created(OWNER, "Q2"))
         self.assertEqual((mapped.keeper, mapped.item.producer), (OWNER.id, DWIGHT.id))
         errors = io.StringIO()

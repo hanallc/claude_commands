@@ -1,4 +1,4 @@
-"""Check a producer_map row against the staff record and name it for the comment above the row."""
+"""Check a producer_map row against the staff record and name it for the comment at the end of the row."""
 from __future__ import annotations
 
 from scripts.lib import conf
@@ -14,7 +14,7 @@ def _name(identity: str, members: staff.StaffSnapshot) -> str:
 
 
 def _comment(key: str, value: str, members: staff.StaffSnapshot) -> str:
-    return f"# {_name(key, members)} -> {_name(value, members)}"
+    return f"# {_name(key, members)} = {_name(value, members)}"
 
 
 def name_comment(key: str, value: str) -> str:

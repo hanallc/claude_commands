@@ -28,9 +28,8 @@ WAITING_PATHS = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
 ORDER_PATH = "config/settings-orders.json"
 RegistryReplay = Callable[[str, str, str], str]
-# Each row of this stem has a "# <name> -> <name>" comment on the line above it.
+# Each row of this stem is "<key> = <value>  # <name> = <name>", so a reader sees the names.
 NAMED_ROWS = "producer_map"
-NAME_COMMENT = re.compile(r"# .+ -> .+")
 
 
 def model_color_host(key: str) -> str:
@@ -78,27 +77,25 @@ def model_color_value(value: str) -> bool:
     return re.fullmatch(r"#[0-9a-f]{6}", value) is not None
 
 
-def append_setting(source: str, key: str, value: str, comment: str = "") -> str:
-    """Append the row; a name comment, when given, goes on the line above it."""
+def _append_line(source: str, line: str) -> str:
+    """Add the line at the end; a last line with no newline gets one first."""
     ending = "\n" if source and not source.endswith("\n") else ""
-    above = f"{comment}\n" if comment else ""
-    return f"{source}{ending}{above}{key}={value}\n"
+    return f"{source}{ending}{line}\n"
 
 
-def _name_comment_above(lines: list[str], line: int) -> bool:
-    return line > 0 and NAME_COMMENT.fullmatch(lines[line - 1].rstrip("\r\n")) is not None
+def append_setting(source: str, key: str, value: str) -> str:
+    return _append_line(source, f"{key}={value}")
 
 
 def named_row(source: str, key: str, value: str, comment: str) -> str:
-    """Write a named row and put its current name comment on the line above it."""
+    """Write a named row with its current name comment at the end of the line."""
+    row = f"{key} = {value}  {comment}"
     setting = conf.settings(source).get(key)
     if setting is None:
-        return append_setting(source, key, value, comment)
-    lines = replace_value(source, setting.line, value).splitlines(keepends=True)
-    if _name_comment_above(lines, setting.line):
-        lines[setting.line - 1] = f"{comment}\n"
-    else:
-        lines.insert(setting.line, f"{comment}\n")
+        return _append_line(source, row)
+    lines = source.splitlines(keepends=True)
+    body = lines[setting.line].rstrip("\r\n")
+    lines[setting.line] = row + lines[setting.line][len(body):]
     return "".join(lines)
 
 
@@ -399,26 +396,12 @@ def replay_settings(path: str, head: str, local: str, target: str | None,
     head_lines = head.splitlines(keepends=True)
     baseline = head_lines.copy()
     target_lines = (target or "").splitlines(keepends=True)
-    named = Path(path).stem == NAMED_ROWS
     for key, setting in conf.settings(local).items():
         old, new = before.get(key), incoming.get(key)
-        # A named row takes its name comment with it; the head keeps its own comment, if any.
-        comment = lines[setting.line - 1] if named and _name_comment_above(lines, setting.line) else ""
-        head_comment = head_lines[old.line - 1] if old and _name_comment_above(head_lines, old.line) else ""
         if isinstance(save := saves.get(key), AcceptedSave):
             line = lines[setting.line]
             same_save = new and new.value == save.value and settled.get(key) == save.order
-            if comment and key not in settled:
-                # The waiting row keeps its own name comment in the target.
-                if new is None:
-                    target_lines.extend(("\n" if target_lines and not target_lines[-1].endswith("\n") else "",
-                                         comment, replace_value(line, 0, save.value)))
-                elif _name_comment_above(target_lines, new.line):
-                    target_lines[new.line - 1] = comment
-                else:
-                    # One list entry holds both lines, so the target line numbers stay valid.
-                    target_lines[new.line] = comment + target_lines[new.line]
-            elif (key not in settled or same_save) and re.search(r"[ \t]#", line.partition("=")[2]):
+            if (key not in settled or same_save) and re.search(r"[ \t]#", line.partition("=")[2]):
                 if new:
                     ending = "\n" if target_lines[new.line].endswith("\n") else ""
                     target_lines[new.line] = replace_value(line, 0, save.value).rstrip("\r\n") + ending
@@ -426,14 +409,10 @@ def replay_settings(path: str, head: str, local: str, target: str | None,
                     target_lines.extend(("\n" if target_lines and not target_lines[-1].endswith("\n") else "",
                                          replace_value(line, 0, save.value)))
             lines[setting.line] = head_lines[old.line] if old else ""
-            if comment:
-                lines[setting.line - 1] = head_comment
         elif old is None and new and new.value == setting.value and (
                 saves or (conf.full_model_color_key(Path(path).stem, key) and model_color_value(setting.value)
                           and lines[setting.line].rstrip("\r\n") == target_lines[new.line].rstrip("\r\n"))):
             lines[setting.line] = ""
-            if comment:
-                lines[setting.line - 1] = ""
         elif old and setting.value != old.value:
             baseline[old.line] = replace_value(baseline[old.line], 0, setting.value)
             if new and new.value == old.value:

@@ -120,8 +120,8 @@ def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
                 # The record is filed, so the map never fails the Send.
                 print(f"list_page: no producer map lookup; the keeper stays the producer: {error}", file=sys.stderr)
             else:
-                if isinstance(producer, staff.StaffRow):
-                    changes["producer"] = producer.id
+                if isinstance(producer, producer_map.MappedProducer):
+                    changes["producer"] = producer.producer.id
             item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE, changes=changes)
         if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
             item = the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)

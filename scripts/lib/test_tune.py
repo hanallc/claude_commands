@@ -349,7 +349,7 @@ class TuneTests(PublicationTestCase):
                 "producer_map", MODELS.id, BOB.id, "tune(producer_map): models reports to bob"))
             assert isinstance(saved, live_settings.StagedSave)
             self.assertEqual(saved.replaced_value, "")
-            self.assertEqual(rows.read_text(), f"{MAP_HEADER}# models -> bob\n{MODELS.id}={BOB.id}\n")
+            self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
             self.assertTrue(live_settings.write_mac("producer_map", MODELS.id, BOB.id, order=saved.order))
             # An unrelated commit reaches main first; the waiting row and its comment stay live across the pull.
             _ = (peer / "other.txt").write_text("peer\n")
@@ -362,9 +362,9 @@ class TuneTests(PublicationTestCase):
             assert isinstance(remapped, live_settings.StagedSave)
             self.assertEqual(remapped.replaced_value, BOB.id)
             self.assertEqual(live_settings.publish(repo.checkout, wait=True), ["main: pushed", "mac: pulled"])
-        self.assertIn(shlex.join(["--name-comment", "# models -> bob", "producer_map", MODELS.id, BOB.id]),
+        self.assertIn(shlex.join(["--name-comment", "# models = bob", "producer_map", MODELS.id, BOB.id]),
                       repo.ssh_log.read_text())
-        expected = f"{MAP_HEADER}# models -> dwight\n{MODELS.id}={DWIGHT.id}\n"
+        expected = f"{MAP_HEADER}{MODELS.id} = {DWIGHT.id}  # models = dwight\n"
         self.assertEqual(rows.read_text(), expected)
         self.assertEqual(repo.git(repo.origin, "show", "main:config/producer_map.conf"), expected.rstrip("\n"))
         self.assertEqual(repo.git(repo.origin, "show", "main:other.txt"), "peer")
@@ -376,8 +376,8 @@ class TuneTests(PublicationTestCase):
         with (mock.patch.dict(os.environ, {**repo.env, live_settings.SAVE_ORDER_ENV: "1"}, clear=True),
                 mock.patch("platform.system", return_value="Darwin"),
                 mock.patch.object(staff, "snapshot", side_effect=AssertionError("the Mac reads no staff record"))):
-            self.assertEqual(live_settings.main(["--name-comment", "# models -> bob", "producer_map", MODELS.id, BOB.id]), 0)
-        self.assertEqual(rows.read_text(), f"{MAP_HEADER}# models -> bob\n{MODELS.id}={BOB.id}\n")
+            self.assertEqual(live_settings.main(["--name-comment", "# models = bob", "producer_map", MODELS.id, BOB.id]), 0)
+        self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
 
     def test_natedev_checks_a_row_even_with_a_name_comment(self) -> None:
         repo = self.repository
@@ -385,22 +385,22 @@ class TuneTests(PublicationTestCase):
         errors = io.StringIO()
         with (mock.patch.dict(os.environ, repo.env, clear=True), mock.patch("platform.system", return_value="Linux"),
                 mock.patch.object(staff, "snapshot", return_value=MEMBERS), redirect_stderr(errors)):
-            self.assertEqual(live_settings.main(["--name-comment", "# dwight -> bob", "producer_map", DWIGHT.id, BOB.id]), 1)
+            self.assertEqual(live_settings.main(["--name-comment", "# dwight = bob", "producer_map", DWIGHT.id, BOB.id]), 1)
             self.assertEqual(rows.read_text(), MAP_HEADER)
-            self.assertEqual(live_settings.main(["--name-comment", "# wrong -> names", "producer_map", MODELS.id, BOB.id]), 0)
+            self.assertEqual(live_settings.main(["--name-comment", "# wrong = names", "producer_map", MODELS.id, BOB.id]), 0)
         self.assertIn("not the staff id of an active showrunner or unit", errors.getvalue())
-        self.assertEqual(rows.read_text(), f"{MAP_HEADER}# models -> bob\n{MODELS.id}={BOB.id}\n")
+        self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
 
     def test_a_waiting_remap_keeps_its_name_comment_across_a_pull(self) -> None:
         repo = self.repository
         rows = self.commit_producer_map()
-        published = f"{MAP_HEADER}# models -> bob\n{MODELS.id}={BOB.id}\n"
+        published = f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n"
         _ = rows.write_text(published)
         _ = repo.git(repo.checkout, "commit", "-qam", "Map models to bob")
         _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
         peer = repo.root / "peer"
         _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
-        remapped = f"{MAP_HEADER}# models -> dwight\n{MODELS.id}={DWIGHT.id}\n"
+        remapped = f"{MAP_HEADER}{MODELS.id} = {DWIGHT.id}  # models = dwight\n"
         with (mock.patch.dict(os.environ, repo.env, clear=True),
                 mock.patch.object(staff, "snapshot", return_value=MEMBERS)):
             saved = live_settings.stage_save(live_settings.WaitingChange(

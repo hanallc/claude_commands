@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import platform
@@ -9,6 +10,7 @@ import secrets
 import subprocess
 import sys
 from dataclasses import dataclass
+from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from typing import Literal, cast
 
@@ -16,12 +18,41 @@ from scripts.lib import conf, main_publish
 from scripts.production import investigation, producer_map, staff, the_list
 from scripts.review_links import for_you, new_item_dialog, review_page
 
-FEEDBACK = "feedback"
-LABELS = {str(kind): label for kind, label, _ in new_item_dialog.KINDS}
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
-FORM = "/new_item <type> <assignee> <description> [<extra info>]"
+FORM = "/new_item <type> <assignee> <description> [extra, such as a time]"
 MAY_BE_FILED = "The item may be filed. Check the List before a retry."
+
+
+class ItemType(StrEnum):
+    BUG = "bug"
+    QUESTION = "question"
+    INVESTIGATION = "investigation"
+    PROPOSAL = "proposal"
+    EFFICIENCY = "efficiency"
+    FEEDBACK = "feedback"
+
+
+# The console server takes four kinds. Feedback and efficiency file as an investigation.
+FILED_KINDS: dict[ItemType, new_item_dialog.SubmissionKind] = {
+    ItemType.BUG: new_item_dialog.SubmissionKind.BUG,
+    ItemType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
+    ItemType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL,
+    ItemType.EFFICIENCY: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.FEEDBACK: new_item_dialog.SubmissionKind.INVESTIGATION,
+}
+
+
+class Outcome(IntEnum):
+    """The exit code tells the command doc what to do next."""
+
+    FILED = 0
+    FAILED = 1
+    REFUSED = 2
+    NO_PRODUCER = 3
+    UNKNOWN_NAME = 4
+    USAGE = 5
 
 
 class ServerUnavailable(Exception):
@@ -49,21 +80,66 @@ class Options:
 
 
 @dataclass(frozen=True)
-class Assignee:
-    """The member that nate named and the To row recipient that receives the item."""
-
-    member: staff.StaffRow
-    recipient: Recipient
-
-
-@dataclass(frozen=True)
 class Refusal:
     reason: str
 
 
-def filed_kind(item_type: str) -> new_item_dialog.SubmissionKind:
-    """Feedback files as an investigation, as the New item window does."""
-    return new_item_dialog.SubmissionKind.INVESTIGATION if item_type == FEEDBACK else new_item_dialog.SubmissionKind(item_type)
+def usage() -> str:
+    return "\n".join((
+        FORM,
+        f"Types: {', '.join(ItemType)}",
+        "Assignee: a producer, a showrunner or a unit",
+    ))
+
+
+def unit_of(member: staff.StaffRow, members: staff.StaffSnapshot) -> str:
+    """Name a unit with its showrunner: "tile, a unit of cargo-liner"."""
+    showrunner = producer_map.showrunner_of(member, members)
+    return member.name if showrunner == member else f"{member.name}, a unit of {showrunner.name}"
+
+
+def _which_one(name: str, matches: list[str] | tuple[str, ...]) -> str:
+    return f'More than one session has the name "{name}": {", ".join(matches)}. Which one?'
+
+
+def unknown_name(unknown: producer_map.UnknownMember, members: staff.StaffSnapshot) -> str:
+    """Ask about a name that is not known, with the nearest name as a guess."""
+    if unknown.matches:
+        return _which_one(unknown.reference, unknown.matches)
+    rows = [row for kind in producer_map.ASSIGNEE_KINDS for row in staff.active(members, kind)]
+    line = f'No session has the name "{unknown.reference}".'
+    guess = difflib.get_close_matches(unknown.reference.casefold(), {row.name.casefold() for row in rows}, n=1)
+    if not guess:
+        return line
+    named = [row for row in rows if row.name.casefold() == guess[0]]
+    if len(named) > 1:
+        # A "yes" to a name that many sessions share would only get this question next.
+        return f"{line} {_which_one(named[0].name, [members.qualified_name(row) for row in named])}"
+    return f"{line} Do you mean {unit_of(named[0], members)}? yes / a different name"
+
+
+def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, members: staff.StaffSnapshot) -> str:
+    """Ask nate which producer; the answer replaces a stale row, else it maps the showrunner of a unit."""
+    if isinstance(missing, producer_map.StaleRow):
+        question = f"{missing.reason()} Which producer for {missing.holder.name}?"
+    else:
+        showrunner = producer_map.showrunner_of(member, members)
+        question = (f"{member.name} has no producer yet." if showrunner == member else
+                    f"{member.name} is a unit of {showrunner.name}. Neither has a producer yet.") + " Which producer?"
+    producers = " / ".join(row.name for row in staff.active(members, "producer"))
+    return f"{question}\n{producers}"
+
+
+def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_map.MappedProducer,
+                members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
+    """Say who does the work, who tracks it and why, and the List item number."""
+    to = unit_of(member, members) + (", this session" if this_session else "")
+    producer = ""
+    if member.kind != "producer":
+        why = "set for" if mapped.set_by == member else "from"
+        producer = f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
+    number = list_key.partition("/")[2].removeprefix("L")
+    return f"{item_type.value.capitalize()} → {to}.{producer} List item {number}."
 
 
 def console_address() -> for_you.ConsoleAddress:
@@ -131,33 +207,17 @@ def read_options(address: for_you.ConsoleAddress) -> Options:
     return Options(token, tuple(recipients))
 
 
-def _names(rows: tuple[Recipient, ...] | tuple[staff.StaffRow, ...]) -> str:
+def _names(rows: tuple[Recipient, ...]) -> str:
     return ", ".join(row.name for row in rows) or "none"
 
 
-def resolve(reference: str, options: Options, members: staff.StaffSnapshot) -> Assignee | Refusal:
-    """A To row name or id files to that recipient; a unit files to its first recipient up the owner chain."""
-    folded = reference.casefold()
-    listed = [row for row in options.recipients if row.id == reference.lower() or row.name.casefold() == folded]
-    if len(listed) > 1:
-        return Refusal(f"{reference}: more than one To row match; use a staff id: "
-                       + ", ".join(f"{row.name} {row.id}" for row in listed))
-    member = members.by_id(listed[0].id) if listed else None
-    if listed and member is not None:
-        return Assignee(member, listed[0])
-    unit = producer_map.find_member(reference, members, ("unit",))
-    if isinstance(unit, staff.StaffRow):
-        by_id = {row.id: row for row in options.recipients}
-        recipient = next((by_id[identity] for identity in investigation.owner_chain(unit.id, members)
-                          if identity in by_id), None)
-        if recipient is None:
-            return Refusal(f"{unit.name}: no showrunner or producer above this unit is in the To row: "
-                           + _names(options.recipients))
-        return Assignee(unit, recipient)
-    if unit.matches:
-        return Refusal(unit.reason(("unit",)))
-    return Refusal(f"{reference}: not in the To row and not an active unit. To row: {_names(options.recipients)}. "
-                   + f"Active units: {_names(staff.active(members, 'unit'))}.")
+def recipient_for(member: staff.StaffRow, options: Options, members: staff.StaffSnapshot) -> Recipient | Refusal:
+    """The member, or the first owner above it, that is in the To row receives the item."""
+    by_id = {row.id: row for row in options.recipients}
+    found = next((by_id[identity] for identity in investigation.owner_chain(member.id, members) if identity in by_id), None)
+    if found is None:
+        return Refusal(f"{member.name}: neither it nor an owner above it is in the To row: {_names(options.recipients)}")
+    return found
 
 
 def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipient: Recipient, words: str) -> bytes:
@@ -169,33 +229,22 @@ def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipie
     }).encode()
 
 
-def words_text(description: str, extra: str) -> str:
-    return description.strip() + (f"\n\n{extra.strip()}" if extra.strip() else "")
+def words_text(item_type: ItemType, description: str, extra: str) -> str:
+    """A type that files as another server kind names itself first; feedback files as the window files it."""
+    marked = FILED_KINDS[item_type].value != item_type.value and item_type != ItemType.FEEDBACK
+    first = f"{item_type.value.capitalize()}: {description.strip()}" if marked else description.strip()
+    return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
 
 
-def set_unit(list_key: str, unit: staff.StaffRow, members: staff.StaffSnapshot) -> None:
-    """Name the unit on the List item; a unit producer row overrides the producer from the recipient."""
+def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.MappedProducer) -> None:
+    """The List item names a unit assignee and takes the assignee's producer, not the recipient's."""
     keeper, _, identity = list_key.partition("/")
     item = the_list.load(staff.StaffId(keeper), identity)
-    changes: the_list.ItemChanges = {"unit": unit.name}
-    producer = producer_map.producer_for(unit.id, members)
-    if isinstance(producer, staff.StaffRow) and producer.id != item.producer:
-        changes["producer"] = producer.id
-    _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
-
-
-def usage() -> str:
-    try:
-        recipients = _names(read_options(console_address()).recipients)
-    except (ServerUnavailable, ValueError) as error:
-        recipients = f"unavailable: {error}"
-    return "\n".join((
-        f"Usage: {FORM}",
-        f"Types: {', '.join(LABELS)}. Feedback files as an investigation.",
-        f"Assignee: a To row name or staff id. To row: {recipients}.",
-        "A unit name is allowed. The item goes to the unit's showrunner, and the List item names the unit.",
-        "Extra info, such as timing instructions, follows the description after a blank line.",
-    ))
+    changes: the_list.ItemChanges = {"unit": member.name} if member.kind == "unit" else {}
+    if mapped.producer.id != item.producer:
+        changes["producer"] = mapped.producer.id
+    if changes:
+        _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
 
 
 class Arguments(argparse.Namespace):
@@ -203,57 +252,65 @@ class Arguments(argparse.Namespace):
     assignee: str = ""
     description: str = ""
     extra: str = ""
+    session: str = ""
 
 
 def main(arguments: list[str] | None = None) -> int:
     argv = sys.argv[1:] if arguments is None else arguments
-    if platform.system() == "Darwin":
-        # The List unit field is written on natedev, so the Mac sends the whole command there.
-        return main_publish.forward("review_links/new_item.py", argv, label="new_item",
-                                    ssh_program=os.environ.get("ZONE_SSH") or "ssh")
     if not argv:
         print(usage())
-        return 0
+        return Outcome.USAGE
+    if platform.system() == "Darwin":
+        # The List fields are written on natedev, so the Mac sends the whole command there with its session.
+        return main_publish.forward("review_links/new_item.py", [*argv, "--session", staff.caller_identity()],
+                                    label="new_item", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
     parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__)
-    _ = parser.add_argument("item_type", type=str.lower, choices=list(LABELS))
+    _ = parser.add_argument("item_type", type=str.lower, choices=[kind.value for kind in ItemType])
     _ = parser.add_argument("assignee")
     _ = parser.add_argument("description")
     _ = parser.add_argument("extra", nargs="?", default="")
+    _ = parser.add_argument("--session", default=staff.caller_identity(), help=argparse.SUPPRESS)
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.description.strip():
         parser.error("the description is empty")
+    item_type = ItemType(args.item_type)
     try:
+        members = staff.snapshot()
+        member = producer_map.find_member(args.assignee, members, producer_map.ASSIGNEE_KINDS)
+        if isinstance(member, producer_map.UnknownMember):
+            print(unknown_name(member, members))
+            return Outcome.UNKNOWN_NAME
+        mapped = producer_map.producer_for(member.id, members)
+        if isinstance(mapped, producer_map.NoProducer):
+            print(producer_question(member, mapped, members))
+            return Outcome.NO_PRODUCER
         address = console_address()
         options = read_options(address)
-        members = staff.snapshot()
-        assignee = resolve(args.assignee, options, members)
-        if isinstance(assignee, Refusal):
-            print(f"new_item: {assignee.reason}", file=sys.stderr)
-            return 2
-        member = assignee.member
-        if member.kind != "producer" and isinstance(producer_map.producer_for(member.id, members), producer_map.NoProducer):
-            mapped = producer_map.map_member(member, members)
-            print(f"{member.name} has no producer. Pass {mapped.id} ({members.qualified_name(mapped)}) to producer_map.py set. "
-                  + f"Active producers: {_names(staff.active(members, 'producer'))}.")
-            return 3
+        recipient = recipient_for(member, options, members)
+        if isinstance(recipient, Refusal):
+            print(f"new_item: {recipient.reason}", file=sys.stderr)
+            return Outcome.REFUSED
         reply = exchange(address, "POST", review_page.NEW_ITEM_PATH, request_body(
-            options, filed_kind(args.item_type), assignee.recipient, words_text(args.description, args.extra)))
-        item_id, list_key = reply.fields.get("id"), reply.fields.get("list_key")
-        if reply.status != 200 or not isinstance(item_id, str) or not isinstance(list_key, str):
+            options, FILED_KINDS[item_type], recipient, words_text(item_type, args.description, args.extra)))
+        list_key = reply.fields.get("list_key")
+        if reply.status != 200 or not isinstance(list_key, str):
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
-            return 1
+            return Outcome.FAILED
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
-        return 1
-    filed = f"{LABELS[args.item_type]} {item_id} to {member.name}; List {list_key}"
-    if member.kind == "unit":
+        return Outcome.FAILED
+    caller = members.by_current_session(args.session) if args.session else None
+    filed = result_line(item_type, member, mapped, members,
+                        this_session=caller is not None and caller.id == member.id, list_key=list_key)
+    if member.id != recipient.id:
         try:
-            set_unit(list_key, member, members)
+            set_assignee(list_key, member, mapped)
         except (OSError, ValueError, staff.StaffRefused) as error:
-            print(f"new_item: filed {filed}, but the List unit field was not set: {error}", file=sys.stderr)
-            return 1
+            print(f"new_item: filed, but the List item does not name the assignee and its producer: {filed} {error}",
+                  file=sys.stderr)
+            return Outcome.FAILED
     print(filed)
-    return 0
+    return Outcome.FILED
 
 
 if __name__ == "__main__":

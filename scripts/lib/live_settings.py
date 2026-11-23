@@ -47,7 +47,7 @@ class NewModelColor:
 
 @dataclass(frozen=True)
 class NamedRow:
-    """A producer_map row: its current value, None when new, and the name comment for the line above it."""
+    """A producer_map row: its current value, None when new, and the name comment at the end of its line."""
 
     value: str | None
     comment: str
