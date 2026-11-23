@@ -37,7 +37,7 @@ from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
@@ -670,7 +670,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                       1, 1, 1, "1", {"slots": "2"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")

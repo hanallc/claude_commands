@@ -10,6 +10,7 @@ Review links let a session on natedev or on the Mac show files to the user in a 
 | `scripts/review_links/review_link.py` | The publisher. It copies files into a snapshot folder, renders Markdown and prints the URLs. |
 | `scripts/review_links/serve.py` | The server. It serves the snapshot root on the Tailscale address and deletes old snapshots. |
 | `scripts/review_links/test_review_link.py`, `test_serve.py` | unittest suites. The publisher tests use a fake `tailscale` on `PATH` and a temporary home. The server tests bind `127.0.0.1` on port 0. |
+| `scripts/review_links/test_review_links_conf.py` | A source scan. It fails when a module in `scripts/review_links/` reads a key that has no row in `config/review_links.conf`. |
 | `/etc/nixos/modules/common/review-links.nix` | The shared job `nate.jobs.review-links` for both machines. |
 | `/etc/nixos/modules/linux/review-links.nix` | The natedev restart settings and the firewall line. |
 
@@ -2212,9 +2213,12 @@ One document listener also handles code blocks from page updates.
 ### Builds queue moves
 
 The Builds page requests a token with `GET /console/builds/queue-move`.
-Move and Kill requests use the shared `builds_operator(peer)` check.
+The token request, Move requests and Undo requests use the shared `builds_operator(peer)` check.
 The check uses the TCP peer and rejects tagged nodes.
-By default, the operator is the owner of the untagged local Tailscale node.
+The `operator_login` setting in `config/review_links.conf` names the operator.
+Its value is a Tailscale login name, or `local-node-owner` for the owner of the untagged local Tailscale node.
+The setting starts at `local-node-owner`.
+An empty value refuses each of these requests with HTTP 403.
 The console also checks the Tailscale address and Host.
 The JSON POST requires the same Origin and a console token.
 The console limits the request size and time with `build_queue.conf`.
