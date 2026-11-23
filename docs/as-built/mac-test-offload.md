@@ -36,10 +36,13 @@ The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
 The caller reads guest standard error while the run is active and keeps all its bytes for the result.
 The start line for the current guest attempt triggers one execution report for its queue assignment.
-The report uses the queue query timeout.
-The caller collects the report before it returns.
+The caller limits the configuration wait to the SSH connection timeout.
+The report uses the queue query timeout from the time the caller reads the start line.
+The caller waits for the report only until its deadline.
+After a stream failure, the caller stops SSH before it collects the report.
 A report failure or timeout prints one warning and leaves the guest run active.
 If the placement caller supplies `BUILDLOG_PLACEMENT_SIDECAR`, it names the placement request's progress sidecar.
+The caller removes the sidecar variable from the guest SSH environment.
 The guest sends runner records on the reply descriptor.
 The route publishes each change to the module count.
 The count excludes type checks.

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import replace
 from datetime import timedelta
 import errno
@@ -20,7 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Timer
+from threading import Event, Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -52,6 +52,8 @@ import subprocess
 import sys
 
 host, command = sys.argv[-2:]
+if os.environ.get('FIXTURE_CHECK_SIDECAR'):
+    assert 'BUILDLOG_PLACEMENT_SIDECAR' not in os.environ
 if host == 'fixture-mac':
     sys.exit(subprocess.call(['bash', '-c', command]))
 assert host == 'fixture-guest'
@@ -680,6 +682,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             + 'run.time_limit_seconds=7\n',
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
+        _ = (config / 'build_admission.conf').write_text(
+            '# range: 0.01..\nquery_timeout_seconds=1\n', encoding='utf-8')
         _ = (config / 'machines.conf').write_text(
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
@@ -803,7 +807,9 @@ fi
     def test_started_guest_reports_once_for_its_placement(self) -> None:
         reports: list[wire.ExecutionReport] = []
 
-        def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
             reports.append(request)
             return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 
@@ -840,6 +846,14 @@ fi
         self.assertIsInstance(result, GateRun)
         self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 3))
 
+    def test_guest_ssh_does_not_receive_the_placement_sidecar(self) -> None:
+        sidecar = self.root / 'placement.cgroup'
+        with patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar), 'FIXTURE_CHECK_SIDECAR': '1'}):
+            result = self.route()
+            self.assertEqual(os.environ.get('BUILDLOG_PLACEMENT_SIDECAR'), str(sidecar))
+        self.assertIsInstance(result, GateRun, result)
+        self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 3))
+
     def guest_dispatch(self) -> mac_linux.GuestGateDispatch:
         destination = self.placed.destination
         claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
@@ -855,7 +869,9 @@ fi
 
         caller, guest = socket.socketpair()
         with caller, guest:
-            def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
+            def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+                self.assertGreater(deadline, time.monotonic())
+                self.assertEqual(timeout, 1)
                 reports.append(request)
                 caller.sendall(b's')
                 return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
@@ -939,6 +955,69 @@ fi
                 report = wire.parse_request(request_file.readline())
         self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
         self.assertIsInstance(report, wire.ExecutionReport)
+
+    def test_stalled_report_config_read_does_not_hold_the_guest_result(self) -> None:
+        read = conf.read
+        entered = Event()
+        release = Event()
+        finished = Event()
+
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                entered.set()
+                _ = release.wait(3)
+                finished.set()
+            return read(file)
+
+        start = mac_linux.run_start_line('stream-attempt')
+        program = f'import sys; print({start!r}, file=sys.stderr); print("reply")'
+        try:
+            with (patch.object(conf, 'read', read_config),
+                  patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.2),
+                  patch.object(mac_linux, 'send_guest_execution', side_effect=send_guest_execution),
+                  redirect_stderr(io.StringIO()) as errors):
+                result = self.run_guest_stream(program, self.root / 'placement.cgroup')
+                self.assertTrue(entered.is_set())
+                self.assertFalse(finished.is_set(), 'The guest waited for the report configuration read.')
+                self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
+                self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed:'), 1)
+        finally:
+            release.set()
+            if entered.is_set():
+                self.assertTrue(finished.wait(1))
+        self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed:'), 1)
+
+    def test_timed_out_stream_stops_ssh_while_the_report_is_stalled(self) -> None:
+        entered = Event()
+        release = Event()
+        finished = Event()
+        stop = mac_linux.stop_ssh_process
+
+        def report(*_args: object, **_kwargs: object) -> None:
+            entered.set()
+            _ = release.wait(3)
+            finished.set()
+            raise wire.AdmissionUnavailable('fixture late refusal')
+
+        def stop_ssh(process: subprocess.Popen[bytes]) -> None:
+            stop(process)
+            self.assertTrue(entered.is_set())
+            self.assertFalse(finished.is_set(), 'SSH cleanup waited for the report.')
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+
+        start = mac_linux.run_start_line('stream-attempt')
+        program = f'import signal, sys; print({start!r}, file=sys.stderr, flush=True); signal.pause()'
+        with (patch.object(mac_linux, 'report_guest_start', report),
+              patch.object(mac_linux, 'stop_ssh_process', stop_ssh),
+              redirect_stderr(io.StringIO()) as errors):
+            try:
+                with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'exceeded 1 seconds'):
+                    _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=1)
+            finally:
+                release.set()
+                if entered.is_set():
+                    self.assertTrue(finished.wait(1))
+            self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed:'), 1, errors.getvalue())
 
     def test_stream_timeout_preserves_stderr_already_read(self) -> None:
         diagnostic = b'diagnostic: \xff\r\n'
@@ -1212,7 +1291,7 @@ fi
             'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
             'from scripts.build_queue import admission_wire',
             'mac_linux.consume_launch_permission = lambda claim, assignment: None',
-            'mac_linux.report_guest_start = lambda armed, dispatch: None',
+            'mac_linux.report_guest_start = lambda armed, dispatch, **timing: None',
             'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
             '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED,',
             '                assignment=admission_wire.read_assignment(Path(sys.argv[2])).assignment)'))
@@ -1720,7 +1799,8 @@ fi
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         def interrupt_source(process: subprocess.Popen[bytes], bootstrap: bytes, _timeout: int,
-                             _armed: mac_linux.ArmedGuestAttempt, _dispatch: mac_linux.GuestGateDispatch
+                             _armed: mac_linux.ArmedGuestAttempt, _dispatch: mac_linux.GuestGateDispatch,
+                             _reports: ExitStack
                              ) -> tuple[bytes, bytes]:
             assert process.stdin is not None and process.stderr is not None
             _ = process.stdin.write(bootstrap)
