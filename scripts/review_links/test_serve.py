@@ -1700,11 +1700,18 @@ class ReviewLinksServerTests(unittest.TestCase):
                 version = reply.headers.get("x-builds-page-version", "")
                 self.assertTrue(version)
                 self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(), reply.body)
-                head = self.request(route, method="HEAD")
-                self.assertEqual(head.status, 200)
-                self.assertEqual(head.headers.get("x-builds-page-version"), version)
-                self.assertEqual(head.body, b"")
                 versions.append(version)
+                with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
+                      client.makefile("rb") as head_reply):
+                    client.sendall((f"HEAD {route} HTTP/1.0\r\n"
+                                    "Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+                    raw = head_reply.read()
+                head, delimiter, body = raw.partition(b"\r\n\r\n")
+                self.assertTrue(delimiter)
+                status_line, _, raw_headers = head.partition(b"\r\n")
+                self.assertEqual(status_line.split()[1:2], [b"200"])
+                self.assertEqual(parse_headers(BytesIO(raw_headers))["X-Builds-Page-Version"], version)
+                self.assertEqual(len(body), 0, "HEAD sent a response body")
         self.assertEqual(len(set(versions)), 2)
 
     def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
