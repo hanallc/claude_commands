@@ -4980,6 +4980,30 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertNotIn("budget", row)
             self.assertTrue(row["is_head"])
 
+    def test_admitted_row_counts_the_token_waiting_row_it_passed(self) -> None:
+        with AdmissionFixture() as fixture:
+            first = fixture.request(since=fixture.clock.now() - 5)
+            grant = only_admitted(fixture.server.handle_request(first))
+            fixture.clock.advance(10)
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-wait", grant.reservation))
+            waiting = fixture.server.handle_request(replace(first, episode="token-wait-reconnect"))[0]
+            assert isinstance(waiting, wire.Wait)
+            self.assertIsInstance(waiting.reason, records.TokenWaitingWaiter)
+            later = fixture.request(since=fixture.clock.now())
+            _ = only_admitted(fixture.server.handle_request(later))
+            rows = {row["pid"]: row for row in self.events(fixture, "admitted")}
+            self.assertEqual(rows[later.owner.pid]["passed"],
+                             codec.snapshot_value(gate.PassedRows(0, 1, 0, 0, 0, 0)))
+            # A token-waiting row is not a queued row, so the later step is still the first queued row.
+            self.assertTrue(rows[later.owner.pid]["is_head"])
+
+    def test_an_outbox_admission_saved_without_passed_decodes_as_not_recorded(self) -> None:
+        saved = cast(dict[str, object], codec.snapshot_value(
+            service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0))))
+        del saved["passed"]
+        pending = codec.parse_snapshot_value(saved, service.PendingAdmission)
+        self.assertEqual(pending, service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedNotRecorded()))
+
     def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
         for boundary in ("after_state_write", "after_admitted_append"):
             with self.subTest(boundary=boundary), AdmissionFixture() as fixture:

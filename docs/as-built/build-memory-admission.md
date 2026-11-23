@@ -628,9 +628,32 @@ The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, `is_head`, and `passed`.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+`is_head` is true when the step was the first queued row in queue order.
+A token-waiting row is not a queued row.
+A false `is_head` does not show that the step went past a row that waits for memory.
+The first queued row is often a step that waits for its repository run limit.
+
+`passed` is a `PassedRows` object. It counts the earlier rows that the step went past, by cause.
+`passed_rows` reads the walk of the pass that admitted the step.
+The walk records the `run_limit` cause on each row as `HeldByRunLimit`, so `passed_rows` does not repeat rule 8.
+A row that the same pass admits is not a passed row.
+Each passed row has one cause. The first cause in this list that applies is the cause:
+
+1. `run_limit`: the row waits for its repository run limit, or waits behind such a row (rule 8).
+2. `cargo_token`: the row left to wait for the Cargo token.
+3. `other_machine`: the row is not routed to natedev, or a remote start is pending for it.
+4. `gpu`: the row waits for a GPU test slot.
+5. `folder`: the row waits for a busy Cargo folder.
+6. `memory`: any other held local row.
+
+The walk never starts a step past a local row that waits for memory, so `memory` is always 0.
+A nonzero `memory` is a walk fault.
+A cloud admission is not in the local walk and has no `passed`.
+`read_queue_lifetimes` reads a row without `passed` as `PassedNotRecorded`, not as zero counts.
 
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
