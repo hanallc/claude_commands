@@ -457,6 +457,8 @@ class WaiterPlace:
     move_id: str = field(default="", kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
     run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
+    # The saved job start keeps the place of a CI step through a service restart.
+    ci_job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -465,7 +467,7 @@ def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | w
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         queue_identity=gate.queue_life_identity(row), move_id=row.get("move_id", ""),
-        ci_runner=row.get("ci_runner", ""), run=run)
+        ci_runner=row.get("ci_runner", ""), run=run, ci_job_start=records.waiter_job_start(row))
 
 
 @dataclass(frozen=True)
@@ -1688,6 +1690,7 @@ class StateIntents:
 class ServiceEstimatedAdmission(wire.AdmitRequest):
     """Keep the runner separate from the unit used for priority."""
     runner: str = field(kw_only=True)
+    job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def wait_line_name(waiting: WaitingAdmission) -> str:
@@ -2150,13 +2153,13 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(waiting.row, records.NormalOrder())
             run = waiting.request.run if isinstance(waiting.request, wire.AdmitRequest) else wire.NO_RUN
-            row["order_since"] = self._run_order_since(row["since"], run)
+            row["order_since"] = self._order_since(row["since"], run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
-            row["order_since"] = self._run_order_since(row["since"], request.run)
+            row["order_since"] = self._order_since(row["since"], request.run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return rows
 
@@ -2175,8 +2178,10 @@ class AdmissionServer:
                 grant = self.reservations.get(place.episode)
                 row: records.Waiter = (grant.queue_waiter if grant is not None else
                     {**place.queue_identity, "need": 0, "ci_runner": place.ci_runner})
+                if isinstance(place.ci_job_start, records.JobStart):
+                    row = {**row, "ci_job_start": place.ci_job_start}
                 ranked = gate.rank_waiter({**row, "move_id": place.move_id,
-                    "order_since": self._run_order_since(place.since, place.run)}, records.NormalOrder())
+                    "order_since": self._order_since(place.since, place.run, place.ci_job_start)}, records.NormalOrder())
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
@@ -2402,7 +2407,9 @@ class AdmissionServer:
         if key not in self.run_places and self._run_alive(run):
             self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
-    def _run_order_since(self, since: float, run: wire.RunIdentity | wire.NoRun) -> float:
+    def _order_since(self, since: float, run: wire.RunIdentity | wire.NoRun, job_start: records.CiJobStart) -> float:
+        """Rank a step at the earliest of its arrival, the first step of its run, and the start of its CI job."""
+        since = records.job_order_since(since, job_start)
         if isinstance(run, wire.RunIdentity):
             place = self.run_places.get(records.run_owner(run.pid, run.start_time))
             if place is not None:
@@ -2494,6 +2501,8 @@ class AdmissionServer:
             row["job"] = identity.job
         if isinstance(request, ServiceEstimatedAdmission):
             row["ci_runner"] = request.runner
+            if isinstance(request.job_start, records.JobStart):
+                row["ci_job_start"] = request.job_start
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -3195,7 +3204,7 @@ class AdmissionServer:
             represented.add(owner)
             waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
-                records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
+                records.MachineChoiceWait(), row.get("unit", ""),
                 project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                 route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner],
@@ -3332,6 +3341,7 @@ class AdmissionServer:
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
                 reason, row.get("unit", ""), route=records.waiter_route(row),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
+                ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 what=row.get("what", "")))
@@ -5353,7 +5363,7 @@ done
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
             isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
-            runner=request.runner)
+            runner=request.runner, job_start=request.job_start)
 
     @staticmethod
     def _stored_caller(session: str, name: str, unit: str, *,

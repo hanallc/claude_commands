@@ -13,11 +13,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import TextIO, cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_client, admission_protocol as wire
 from scripts.build_queue import queue_place
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
@@ -399,6 +400,34 @@ class JobStartTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue().count("::warning::"), 1 if warning else 0, errors.getvalue())
                 if warning:
                     self.assertTrue(errors.getvalue().startswith(warning), errors.getvalue())
+
+    def test_queue_job_start_converts_boot_time_to_the_queue_clock(self) -> None:
+        self.assertEqual(ci_cargo_front.queue_job_start(100.0, now=1_000_000.0, boot_now=400.0),
+                         records.JobStart(999_700.0))
+        self.assertEqual(ci_cargo_front.queue_job_start(None, now=1_000_000.0, boot_now=400.0), records.NO_JOB_START)
+
+    def test_a_ci_step_reads_its_job_start_once_and_sends_it_on_the_queue_clock(self) -> None:
+        class FixedClock:
+            def now(self) -> float:
+                return 1_000_000.0
+
+        sent: list[wire.ServiceEstimateRequest] = []
+
+        def refuse(request: wire.ServiceEstimateRequest) -> None:
+            sent.append(request)
+            raise queue_place.QueuePlaceRefused("stopped by the test")
+
+        read = mock.Mock(return_value=100.0)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(ci_cargo_front, "job_start", read), \
+             mock.patch.object(admission_client, "CLOCK", FixedClock()), \
+             mock.patch.object(time, "clock_gettime", return_value=400.0), \
+             mock.patch.object(queue_place, "held_reservation", side_effect=refuse), \
+             mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stderr(io.StringIO()):
+            self.assertEqual(ci_cargo_front.run_cargo("cargo", ["build"], "", Path(folder)), 1)
+        read.assert_called_once()
+        request, = sent
+        self.assertEqual(request.since, 1_000_000.0)
+        self.assertEqual(request.job_start, records.JobStart(999_700.0))
 
 
 class RunnerHomeTests(unittest.TestCase):
