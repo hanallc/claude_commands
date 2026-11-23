@@ -435,10 +435,12 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, RankedWaiter]], QueuePriority | NoQueuePriority]:
     ranked: list[tuple[Path, RankedWaiter]] = []
+    entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
     for path, row in rows:
         unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
-        position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
+        run = row.get("build_run", NoLiveBuildRun())
+        # A waiter takes the first entry that covers its run or its unit.
+        position = next((index for index, entry in enumerate(entries) if records.entry_covers(entry, unit, run)), -1)
         order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
     return sort_waiters(ranked), context.priority

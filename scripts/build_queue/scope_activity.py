@@ -47,6 +47,13 @@ class ProcessIdentity(Protocol):
 
 
 @dataclass(frozen=True)
+class RunIdentity:
+    """The run identity holds a process identifier and start time."""
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
 class NoLiveBuildRun:
     """The process has no identified live build run."""
 

@@ -2380,6 +2380,27 @@ process.stdout.write(JSON.stringify({
                 decoded = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
                 self.assertEqual(decoded["queued_priority_units"], expected)
 
+    def test_a_run_entry_marks_only_the_row_of_its_run(self) -> None:
+        reading = queued_reading(reservation_reading(), ())
+        waiting = list(reading.view.waiting)
+        waiting[1] = replace(waiting[1], run=LiveBuildRun(201, "fixture-start", 0.0))
+        entry: admission_records.RunPriorityEntry = {"kind": "RunPriorityEntry",
+            "run": wire.RunIdentity(201, "fixture-start"), "unit": "research", "step": "nextest",
+            "why": "/build:bump --run 2", "set_at": reading.explanation.now, "set_by": "merge-session",
+            "asker": admission_records.StaffAsker("natemerge")}
+        reading = replace(reading, view=replace(reading.view, waiting=tuple(waiting)), explanation=replace(
+            reading.explanation, priority=admission_records.QueuePriority((entry,))))
+        labels = {step.session_id: unit_labels.UnitLabels(step.unit, "fixture-runner", step.unit)
+                  for step in reading.view.waiting}
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            payload = memory_feed.reading()
+        line = 'research · nextest (one run) (natemerge: "/build:bump --run 2")'
+        self.assertEqual({row["pid"]: row.get("priority_lines", []) for row in payload["waiters"]},
+                         {200: [], 201: [line], 202: [], 203: []})
+        self.assertEqual(payload["queued_priority_units"], ["research"])
+        self.assertEqual(payload["unmatched_priority_lines"], [])
+
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(
             reservation_reading(), admission_records.StartSpacingWait(110))))
@@ -2393,12 +2414,12 @@ process.stdout.write(JSON.stringify({
                       mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
                     page = memory_feed.reading()
                 for row in (*page["walk"], *page["waiters"]):
-                    expected = "queue priority: research (the user's bump)" if priority and row["unit"] == "research" else ""
-                    self.assertEqual(row.get("priority_text", ""), expected)
+                    expected = ["research (the user's bump)"] if priority and row["unit"] == "research" else []
+                    self.assertEqual(row.get("priority_lines", []), expected)
                     self.assertEqual([entry["unit"] for entry in row.get("priority_entries", [])],
                                      ["research"] if expected else [])
-                self.assertEqual(page["unmatched_priority_text"],
-                    "queue priority: research (the user's bump)" if priority and unit == "other" else "")
+                self.assertEqual(page["unmatched_priority_lines"],
+                    ["research (the user's bump)"] if priority and unit == "other" else [])
                 self.assertEqual([row for row in page["waiters"] if "head_room" in row], [])
                 self.assertNotIn("head_text", page)
 

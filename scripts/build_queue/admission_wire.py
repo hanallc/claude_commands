@@ -15,6 +15,7 @@ from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.scope_activity import RunIdentity as RunIdentity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)
@@ -67,13 +68,6 @@ class UnsupportedVersion(ValueError):
 @dataclass(frozen=True)
 class Owner:
     """The owner identity holds a process identifier and start time."""
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
-class RunIdentity:
-    """The run identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
@@ -310,20 +304,45 @@ class MineRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class WholeUnit:
+    """The priority raises every step of the unit."""
+
+
+WHOLE_UNIT = WholeUnit()
+
+
+@dataclass(frozen=True)
+class OneRun:
+    """The priority raises only the steps of this run; the step names it on the page."""
+    run: RunIdentity
+    step: str
+
+
+@dataclass(frozen=True)
+class WordsNotGiven:
+    """The caller gave no --words; the service refuses unless a plain shell asked."""
+
+
+WORDS_NOT_GIVEN = WordsNotGiven()
+
+
+@dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
-    """The request sets queue priority for a unit with a reason and actor."""
+    """The request sets queue priority for a unit or one run, with the user's words and the actor."""
     request_id: str
     unit: str
-    why: str
+    why: str | WordsNotGiven
     actor: str
+    target: WholeUnit | OneRun = WHOLE_UNIT
 
 
 @dataclass(frozen=True)
 class PriorityClearRequest(CallerCode):
-    """The request clears queue priority with an actor and optional unit."""
+    """The request clears queue priority with an actor, optional unit, and the user's words."""
     request_id: str
     actor: str
     unit: str = ""
+    why: str | WordsNotGiven = WORDS_NOT_GIVEN
 
 
 @dataclass(frozen=True)
@@ -726,6 +745,8 @@ Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | V
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
+# An older service must refuse a one-run bump before it can raise the whole unit.
+_ONE_RUN_PRIORITY = "priority_run_set"
 _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
     "verify_run_slot": VerifyRunSlotRequest,
@@ -737,7 +758,7 @@ _REQUESTS: dict[str, type] = {
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
-    _GROUPED_CLOUD_ADMIT: AdmitRequest,
+    _GROUPED_CLOUD_ADMIT: AdmitRequest, _ONE_RUN_PRIORITY: PrioritySetRequest,
 }
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
@@ -800,6 +821,8 @@ def _write_wire_record(value: object) -> object:
         del record["session"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
+    if record.get("kind") == "PrioritySetRequest" and record.get("target") == {"kind": "WholeUnit"}:
+        del record["target"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
         del record["state"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
@@ -873,6 +896,8 @@ def encode_request(request: Request) -> str:
             and isinstance(request.place.group, CloudGroup)):
         # An older service must refuse the request before it can grant one slot.
         return encode_envelope(request, {_GROUPED_CLOUD_ADMIT: AdmitRequest})
+    if isinstance(request, PrioritySetRequest) and isinstance(request.target, OneRun):
+        return encode_envelope(request, {_ONE_RUN_PRIORITY: PrioritySetRequest})
     return encode_envelope(request, _REQUESTS)
 
 

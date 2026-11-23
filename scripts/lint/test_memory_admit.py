@@ -2669,7 +2669,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             assert not isinstance(saved, admission_records.NoQueuePriority)
             self.assertNotIn("until", wire.encode_record(saved))
             self.assertEqual([entry["unit"] for entry in saved.entries], ["first", "second"])
-            self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id")), [wire.Ok()])
+            self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id", why="clear words")), [wire.Ok()])
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
             self.assertEqual([step.pid for step in reading.reading.view.waiting], [300, 400])

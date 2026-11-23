@@ -158,8 +158,11 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_priority_tooltips_color_each_name_before_joining(self) -> None:
         entries = [{"unit": name} for name in ("builder", "helper", "<unknown>")]
-        data = {"unmatched_priority_entries": entries,
-                "walk": [{"name": "Compile", "priority_entries": entries, "queued": True}]}
+        # One bump line for a unit entry and one for a run entry.
+        lines = ['builder (natemerge: "natemerge can bump at will")',
+                 'helper · nextest (one run) (nate (plain shell): "typed by nate in a plain shell")']
+        data = {"unmatched_priority_entries": entries, "unmatched_priority_lines": lines,
+                "walk": [{"name": "Compile", "priority_entries": entries, "priority_lines": lines, "queued": True}]}
         for key in ("walkhead", "row:fixture-run-0"):
             with self.subTest(key=key):
                 body = str(self.page_expression("(()=>{" + self.role_setup()
@@ -168,6 +171,8 @@ class MemoryHoverTests(unittest.TestCase):
                 priority = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Priority")
                 self.assertEqual("".join(priority.itertext()), "builder, helper, <unknown>")
                 self.assertEqual([span.text for span in priority.findall("span")], ["builder", "helper"])
+                self.assertEqual(["".join(grid[index + 1].itertext()) for index, cell in enumerate(grid)
+                                  if cell.text == "Bump"], lines)
 
     def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
         data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
