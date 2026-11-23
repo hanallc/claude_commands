@@ -295,6 +295,11 @@ def role_map_cache_file() -> Path:
     return groups_file().with_name("role_map_cache.json")
 
 
+def completion_plan_file() -> Path:
+    """The groups that the natedev refusal pass permits other machines to complete."""
+    return groups_file().with_name("completion_plan.json")
+
+
 @dataclass(frozen=True)
 class LoginHome:
     path: Path

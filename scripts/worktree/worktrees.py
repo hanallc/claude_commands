@@ -594,30 +594,6 @@ def release_worktree_pair(path: Path) -> None:
         print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
 
 
-def _legacy_output(checkout: Path) -> Path | UnassignedOutput:
-    settings = conf.read_or_repository("build_folders").values("roots.slot_cargo", "roots.cargo_paths")
-    cargo_root = settings.get("roots.slot_cargo")
-    mirror_root = settings.get("roots.cargo_paths")
-    if not cargo_root or not mirror_root:
-        return UnassignedOutput()
-    root = Path(os.path.expandvars(cargo_root)).expanduser().resolve()
-    mirror = Path(os.path.expandvars(mirror_root)).expanduser()
-    if not mirror.is_absolute() or not checkout.is_dir() or not checkout.name:
-        return UnassignedOutput()
-    entry = mirror.joinpath(*checkout.parts[1:])
-    output = entry.parent.resolve() / entry.name
-    if root not in output.parents or output.is_symlink() or not output.is_dir():
-        return UnassignedOutput()
-    return output
-
-
-def clean_legacy_output(checkout: Path) -> None:
-    """Report the output assigned by the former Cargo mirror."""
-    output = _legacy_output(checkout)
-    if isinstance(output, Path):
-        report_retained_folder(output, "the legacy checkout ended")
-
-
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     from scripts.agents import remote
     from scripts.production import session_staff
@@ -664,8 +640,6 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if checkout_present:
         if isinstance(record.layout, RecordedWorktreeOutput):
             report_retained_folder(checked_output(record.layout), "the checkout landed")
-        else:
-            clean_legacy_output(path)
         reason = "the checkout landed and requires manual review"
         report_retained_folder(path, reason)
         return Kept(path, reason)
@@ -727,8 +701,12 @@ def create_checkout(path: Path, source: Path,
                     layout: RecordedWorktreeOutput | UnassignedOutput, *,
                     owner: str = "", merge_branch: str = "", allow_empty: bool = False,
                     allow_existing: bool = False, fixed_base: bool = False,
-                    use_recorded_branch: bool = False) -> Path:
-    """Finish a recorded checkout or make one through the shared allocator."""
+                    use_recorded_branch: bool = False, record_adoption: bool = False,
+                    carry_envrc_permission: bool = False) -> Path:
+    """Finish a recorded checkout or make one through the shared allocator.
+
+    Unit admission opts in to setting up and recording an existing checkout.
+    """
     path = path.absolute()
     repo = main_checkout(source)
     with move_lock():
@@ -750,6 +728,14 @@ def create_checkout(path: Path, source: Path,
         start = branch.start_point if isinstance(branch, build_folders.NewWorktreeBranch) else f"refs/heads/{branch.name}"
         if record is None:
             if registered and allow_existing:
+                if record_adoption:
+                    if not isinstance(layout, RecordedWorktreeOutput):
+                        raise ValueError(f"{path}: adoption requires a worktree output assignment")
+                    output = checked_output(layout)
+                    base = checkout_base(path, "HEAD")
+                    ensure_target_link(path, output)
+                    record = new_record(path, branch.name, repo, base, owner, merge_branch)
+                    write_record(replace(record, layout=layout))
                 return path
             if exists and not (allow_empty and empty_checkout_path(path)):
                 raise FileExistsError(f"{path}: editable repository destination is occupied")
@@ -782,6 +768,8 @@ def create_checkout(path: Path, source: Path,
             write_record(record)
         _finish_checkout(path, source, branch, replace(record, owner=owner, merge_branch=merge_branch),
                          registered=registered)
+    if carry_envrc_permission:
+        _allow_copied_envrc(source, path)
     return path
 
 
@@ -863,6 +851,44 @@ class FrozenWorktreeSource:
     commit: str
 
 
+def _allow_copied_envrc(source: Path, checkout: Path) -> None:
+    """Allow the new checkout's .envrc when the source has the same allowed bytes."""
+    new_rc = checkout / ".envrc"
+    try:
+        if not (new_rc.is_symlink() or new_rc.is_file()) or (direnv := shutil.which("direnv")) is None:
+            return
+        direnv = os.path.realpath(direnv)
+        source_rc = source / ".envrc"
+        if (
+            not new_rc.is_symlink() and not source_rc.is_symlink() and source_rc.is_file()
+            and (contents := new_rc.read_bytes()) == source_rc.read_bytes()
+        ):
+            status = subprocess.run([direnv, "status", "--json"], cwd=source,
+                                    capture_output=True, check=True, timeout=5)
+            match cast(object, json.loads(status.stdout)):
+                case {"state": {"foundRC": {"path": str(found), "allowed": int(allowed)}}} if (
+                    found == str(source_rc) and type(allowed) is int and allowed == 0
+                    and not source_rc.is_symlink() and not new_rc.is_symlink()
+                    and source_rc.read_bytes() == contents == new_rc.read_bytes()
+                ):
+                    _ = subprocess.run([direnv, "allow", str(checkout)],
+                                       capture_output=True, check=True, timeout=5)
+                    try:
+                        if not new_rc.is_symlink() and new_rc.read_bytes() == contents:
+                            return
+                    except OSError:
+                        pass
+                    # A missing .envrc makes direnv search parent folders.
+                    if new_rc.is_file():
+                        _ = subprocess.run([direnv, "deny", str(checkout)],
+                                           capture_output=True, check=True, timeout=5)
+                case _:
+                    pass
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    print(f"make: .envrc not allowed. Run direnv allow {shlex.quote(str(checkout))}", file=sys.stderr)
+
+
 def make(repo: str, unit: str, short_name: str, snapshot: staff.StaffSnapshot | FrozenWorktreeSource) -> Path:
     """Make a named worktree from the selected source."""
     path = build_folders.worktree_path(repo, unit, short_name)
@@ -877,7 +903,8 @@ def make(repo: str, unit: str, short_name: str, snapshot: staff.StaffSnapshot | 
         start = "HEAD"
     return create_checkout(path, source, build_folders.NewWorktreeBranch(f"{unit}-{short_name}", start),
                            output_record(repo, unit, short_name), owner=owner, merge_branch=merge_branch,
-                           fixed_base=isinstance(snapshot, FrozenWorktreeSource), use_recorded_branch=True)
+                           fixed_base=isinstance(snapshot, FrozenWorktreeSource), use_recorded_branch=True,
+                           carry_envrc_permission=True)
 
 
 def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, retain_record: bool = False,
@@ -893,16 +920,11 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         raise ValueError(f"{path}: cannot remove the main checkout")
     layout = worktree_output(path)
     reason = "the checkout is selected for removal"
-    if isinstance(layout, RecordedWorktreeOutput):
-        output = checked_output(layout)
-        output_reason = reason
-    else:
-        output = _legacy_output(path)
-        output_reason = "the legacy checkout ended"
+    output = checked_output(layout) if isinstance(layout, RecordedWorktreeOutput) else UnassignedOutput()
 
     def report_output() -> None:
         if isinstance(output, Path):
-            report_retained_folder(output, output_reason)
+            report_retained_folder(output, reason)
 
     if before_report is None:
         report_output()

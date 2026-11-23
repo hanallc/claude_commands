@@ -28,6 +28,7 @@ from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixtu
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 BACKEND = '''import json, os, sys, socket
@@ -136,7 +137,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": os.environ.get("PATH", os.defpath),
-            "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+            "HERDR_BIN": MISSING_HERDR_BIN}, clear=True)))
         super().setUp()
         _ = self.fixture
 

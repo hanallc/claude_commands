@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+from contextvars import copy_context
 import io
 import json
 import os
@@ -15,7 +16,7 @@ from unittest.mock import patch
 from scripts.lib import session_folder, unit_runs  # noqa: E402
 from scripts.lib.session_folder import Member
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.lib.unit_runs_test_support import bind_private_run_roots, start_new_command
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 
@@ -130,8 +131,7 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(result.stderr.splitlines(), ["anomaly: import test"])
 
     def test_director_prints_each_anomaly_once_but_keeps_changed_causes(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        start_new_command(self)
         _ = fixture_member("showrunner", name="anomaly-fixture")
         first, second = self.root / "first", self.root / "second"
         for run in (first, second):
@@ -148,6 +148,16 @@ class UnitRunsTest(StaffTestCase):
             f"anomaly: {first}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
             f"anomaly: {second}: this run has no owner because {unit_runs.STATE_FILE} names no staff row",
             f"anomaly: {first}: run owner gone: unit staff row is unavailable"])
+
+    def test_each_command_prints_an_anomaly_once(self) -> None:
+        # verify_helper.py runs each call in a copy of its context, as a new process starts a new context.
+        def command() -> None:
+            for _ in range(2):
+                unit_runs.report_anomaly("anomaly: once in each command")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            for _ in range(2):
+                copy_context().run(command)
+        self.assertEqual(errors.getvalue().splitlines(), ["anomaly: once in each command"] * 2)
 
 
 
