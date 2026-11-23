@@ -7,9 +7,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from scripts.lib import atomic_file, file_lock
+
+if TYPE_CHECKING:
+    from scripts.accounts import accounts
 
 WINDOW = timedelta(hours=24)
 
@@ -101,9 +104,6 @@ def busy_by_role(rows: Iterable[tuple[Iterable[str], Iterable[object]]]) -> dict
     return {role: busy for role, busy in totals.items() if role not in unknown}
 
 
-def sample_now(now: datetime) -> None:
+def sample(reading: accounts.StatusReading, now: datetime) -> None:
     """Record the busy counts of the same reading the Roles board shows; a role with an unknown count is left out."""
-    from scripts.accounts import accounts
-
-    reading = accounts.read_status(source=accounts.StoredUsageOnly())
     record(busy_by_role((row.roles, row.role_counts) for row in reading.rows), now)

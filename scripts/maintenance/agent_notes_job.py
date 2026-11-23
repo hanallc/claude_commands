@@ -138,12 +138,19 @@ def _perform(part: Part) -> int:
         if part is Part.NOTES:
             for line in agent_notes.update(include_warnings=False):
                 print(line)
-            from scripts.accounts import role_activity
+            from scripts.accounts import accounts, forecast_log, role_activity
+            now = datetime.now(timezone.utc)
             # The notes are written. Any other error fails this part with its traceback, so a defect shows.
             try:
-                role_activity.sample_now(datetime.now(timezone.utc))
+                reading = accounts.read_status(source=accounts.StoredUsageOnly())
             except (OSError, ValueError) as error:
-                print(f"role activity: {' '.join(str(error).split())}")
+                print(f"account status: {' '.join(str(error).split())}")
+            else:
+                for name, sample in (("role activity", role_activity.sample), ("forecast log", forecast_log.sample)):
+                    try:
+                        sample(reading, now)
+                    except (OSError, ValueError) as error:
+                        print(f"{name}: {' '.join(str(error).split())}")
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
             from scripts.lib import live_settings, mac_wake

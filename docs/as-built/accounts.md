@@ -70,6 +70,20 @@ The job sends notices with fewer attempts first on the next pass.
 An interruption after Codex accepts a notice can cause a duplicate on retry.
 A measurement at or below the limit clears the crossing and permits a new notice after the next crossing.
 
+## Forecast log
+
+The notes part of the agent notes job keeps a log to check the empty-at forecast (List item 235).
+The log is `~/.local/state/accounts/forecast_log.jsonl`, and `scripts/accounts/forecast_log.py` writes it.
+The job reads the account status once and gives it to the role activity sampler and to this log.
+Each account with a known percent left gets one `forecast` line each hour.
+The line has the percent left, the use per hour, the empty-at time and the weekly reset, from the same `weekly_forecast` inputs as the Accounts page.
+Each pass also compares each account with its last pass in `forecast_log.state.json` and writes the real events:
+- `empty`: the first reading at 0% left, at the time of that reading.
+- `reset`: a later weekly reset, at the old reset time; or a rise of 1 point or more in percent left, at the time of that reading.
+- `roles`: a change to the account's roles, for example an account move.
+The log keeps 35 days. It stores account labels only, never a login.
+A file or data error prints one line and does not stop the notes part.
+
 ## Claude quota expiry pushes
 
 Natedev sends the Claude low quota and expiry pushes.

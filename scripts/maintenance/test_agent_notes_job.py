@@ -125,16 +125,33 @@ class JobTests(unittest.TestCase):
         self.assertLessEqual(calls[0], after)
         self.assertEqual(output.getvalue(), "fixture sitting reminder\nfixture safety reminder\n")
 
-    def test_notes_part_prints_a_role_activity_error_and_still_succeeds(self) -> None:
-        from scripts.accounts import role_activity
+    def test_notes_part_prints_a_sampler_error_and_still_runs_the_other_sampler(self) -> None:
+        from scripts.accounts import accounts, forecast_log, role_activity
+        from scripts.whoami import agent_notes
+
+        reading = accounts.StatusReading((), (), (), timezone.utc, datetime.now(timezone.utc))
+        with (patch.object(agent_notes, "update", return_value=["fixture note"]),
+              patch.object(accounts, "read_status", return_value=reading) as read,
+              patch.object(role_activity, "sample", side_effect=OSError("disk\nfull")) as roles,
+              patch.object(forecast_log, "sample") as forecasts,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(job._perform(Part.NOTES), 0)  # pyright: ignore[reportPrivateUsage]
+        read.assert_called_once_with(source=ANY)
+        roles.assert_called_once_with(reading, ANY)
+        forecasts.assert_called_once_with(reading, ANY)
+        self.assertEqual(output.getvalue(), "fixture note\nrole activity: disk full\n")
+
+    def test_notes_part_prints_a_status_read_error_and_still_succeeds(self) -> None:
+        from scripts.accounts import accounts, forecast_log
         from scripts.whoami import agent_notes
 
         with (patch.object(agent_notes, "update", return_value=["fixture note"]),
-              patch.object(role_activity, "sample_now", side_effect=OSError("disk\nfull")) as sample,
+              patch.object(accounts, "read_status", side_effect=OSError("no\nstore")),
+              patch.object(forecast_log, "sample") as forecasts,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(job._perform(Part.NOTES), 0)  # pyright: ignore[reportPrivateUsage]
-        sample.assert_called_once_with(ANY)
-        self.assertEqual(output.getvalue(), "fixture note\nrole activity: disk full\n")
+        forecasts.assert_not_called()
+        self.assertEqual(output.getvalue(), "fixture note\naccount status: no store\n")
 
     def test_logins_part_uses_its_configured_interval_and_deadline_in_the_job(self) -> None:
         original = self.config.read_text()

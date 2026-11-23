@@ -60,12 +60,11 @@ class RoleActivityTests(unittest.TestCase):
                 (("workers",), (accounts.NoRoleCount(),))]
         self.assertEqual(role_activity.busy_by_role(rows), {"units": 7, "showrunners": 2})
 
-    def test_sample_now_records_the_known_roles_while_the_session_registry_is_unreadable(self) -> None:
+    def test_a_sample_records_the_known_roles_while_the_session_registry_is_unreadable(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, NOW, claude_registry_unreadable=True)
         rows = (_row("claude1", "units", accounts.UnknownRoleCounts()),
                 _row("codex1", "workers", accounts.RoleSessionCounts(2, 1, 0, 0)))
-        with patch.object(accounts, "read_status", return_value=replace(reading, rows=rows)):
-            role_activity.sample_now(NOW)
+        role_activity.sample(replace(reading, rows=rows), NOW)
         self.assertEqual([dict(sample.busy) for sample in role_activity.read(NOW)], [{"workers": 2}])
 
     def test_a_sample_after_now_stays_when_the_clock_steps_back(self) -> None:
