@@ -6,15 +6,14 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import clean_up_fixture, set_up_fixture
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_untested_examples as example_workspace
 
 
 class FinalTargetTests(example_workspace.ExampleWorkspaceFixture):
     def test_cleanup_stops_admission_before_removing_configuration(self) -> None:
-        case = example_workspace.ExampleWorkspaceFixture()
-        case.setUp()
-        self.addCleanup(case.doCleanups)
+        case = set_up_fixture(self.addCleanup, example_workspace.ExampleWorkspaceFixture())
         fixture = caller_admission(case, case.root, case.environment)
         configuration = case.root / "lint.conf"
         close = fixture.server.close
@@ -26,7 +25,7 @@ class FinalTargetTests(example_workspace.ExampleWorkspaceFixture):
         case.tearDown()
         self.assertTrue(configuration.is_file())
         with mock.patch.object(fixture.server, "close", side_effect=close_with_configuration) as stopped:
-            case.doCleanups()
+            clean_up_fixture(case)
         stopped.assert_called_once_with()
         self.assertTrue(fixture.server.closed)
         self.assertFalse(case.root.exists())
