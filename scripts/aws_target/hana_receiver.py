@@ -341,11 +341,20 @@ class ReceiverSettings:
     control_poll_seconds: int
 
 
-def read_settings(configuration: conf.ConfigRead) -> ReceiverSettings:
+@dataclass(frozen=True)
+class ReceiverUnitSettings:
+    receiver: ReceiverSettings
+    guest_service_memory_min_mib: int
+
+
+def read_settings(configuration: conf.ConfigRead) -> ReceiverUnitSettings:
     settings = ReceiverSettings(configuration.whole('aws_timeout_s'), configuration.whole('control_poll_seconds'))
     if min(settings.aws_timeout_s, settings.control_poll_seconds) <= 0:
         raise ValueError('Hana receiver intervals must be positive')
-    return settings
+    memory_min_mib = configuration.whole('guest_service_memory_min_mib')
+    if memory_min_mib <= 0:
+        raise ValueError('Hana guest service memory protection must be positive')
+    return ReceiverUnitSettings(settings, memory_min_mib)
 
 
 def read_document(content: bytes) -> dict[str, object]:
@@ -478,7 +487,7 @@ def installed_main() -> None:
         raise SystemExit('Hana receiver refused the control message') from None
 
 
-def render_files(settings: ReceiverSettings) -> tuple[guest.GuestFile, ...]:
+def render_files(settings: ReceiverUnitSettings) -> tuple[guest.GuestFile, ...]:
     unit = f'''[Unit]
 Description=Hana root control receiver
 After=network-online.target
@@ -489,15 +498,17 @@ Before=hana-tools.service
 Type=simple
 User=root
 UMask=0077
+OOMScoreAdjust=-1000
+MemoryMin={settings.guest_service_memory_min_mib}M
 Environment=PATH={guest.SYSTEM_BIN}
 Environment=CONF_DIR={RUNTIME}/config
 ExecStart={guest.SYSTEM_BIN}/python3 {guest.CONTROL}/receiver.py
 Restart=on-failure
-RestartSec={settings.control_poll_seconds}
+RestartSec={settings.receiver.control_poll_seconds}
 
 [Install]
 WantedBy=multi-user.target
 '''
     return (guest.GuestFile(guest.CONTROL / 'receiver.py', receiver_program(), 0o600),
-        guest.GuestFile(guest.CONTROL / 'receiver.json', json.dumps(asdict(settings)) + '\n', 0o600),
+        guest.GuestFile(guest.CONTROL / 'receiver.json', json.dumps(asdict(settings.receiver)) + '\n', 0o600),
         guest.GuestFile(Path('/etc/systemd/system/hana-receiver.service'), unit, 0o644))

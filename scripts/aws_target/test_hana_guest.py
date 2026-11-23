@@ -167,19 +167,21 @@ class HanaGuestTests(unittest.TestCase):
             guest.stop_work(run)
         self.assertEqual(commands[-1], ['systemctl', 'poweroff', '--no-block'])
 
-    def test_command_uses_its_own_slice_and_configured_resource_limits(self) -> None:
+    def test_command_uses_its_own_slice_without_cpu_or_memory_caps(self) -> None:
         settings = replace(self.settings, enabled=True)
         guest.write_permit(settings, self.fresh(), paths=self.paths, clock=self.clock)
         arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
             mounted=True, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
         self.assertIn('--slice=hana-work-' + self.generation + '.slice', arguments)
         self.assertIn('--uid=hana-runner', arguments)
-        self.assertIn('--property=CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', arguments)
-        self.assertIn('--property=MemoryMax=' + str(settings.step_memory_gib * 1024**3), arguments)
+        self.assertNotIn('CPUQuota=', ' '.join(arguments))
+        self.assertNotIn('MemoryMax=', ' '.join(arguments))
+        self.assertIn('--property=KillMode=control-group', arguments)
         self.assertEqual(arguments[-3:], ['--', 'cargo', 'check'])
         parent = self.files()[guest.WORK_SLICE].content
-        self.assertIn('CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', parent)
-        self.assertIn('MemoryMax=' + str(settings.step_memory_gib * 1024**3), parent)
+        self.assertIn('[Slice]\n', parent)
+        self.assertNotIn('CPUQuota=', parent)
+        self.assertNotIn('MemoryMax=', parent)
 
     def test_command_refuses_missing_disk_disabled_mode_and_stale_permission(self) -> None:
         enabled = replace(self.settings, enabled=True)
@@ -206,9 +208,12 @@ class HanaGuestTests(unittest.TestCase):
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
-        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1))[-1].content
+        receiver = hana_receiver.render_files(hana_receiver.read_settings(conf.read(self.config_path)))[-1].content
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
+            service = unit.split('[Service]\n', 1)[1].split('\n[', 1)[0].splitlines()
+            self.assertIn('OOMScoreAdjust=-1000', service)
+            self.assertIn(f'MemoryMin={self.settings.guest_service_memory_min_mib}M', service)
 
     def test_no_tool_setup_omits_only_the_tool_unit(self) -> None:
         files = {file.path.name: file for file in guest.render_files(

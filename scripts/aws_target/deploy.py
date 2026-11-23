@@ -487,6 +487,15 @@ class Deployment:
                 if confirmed.state != 'stopped':
                     raise DeploymentRefused('Hana stop confirmation is incomplete; repeat approved setup')
                 spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
+            instance_type = ledger.text(instances[0], 'InstanceType')
+            types = ledger.rows(api.call('describe-instance-types', '--instance-types', instance_type), 'InstanceTypes')
+            if len(types) != 1 or types[0].get('InstanceType') != instance_type:
+                raise DeploymentRefused('Hana instance type confirmation differs')
+            memory_mib = ledger.instant(ledger.mapping(types[0].get('MemoryInfo')), 'SizeInMiB')
+            if memory_mib == 0:
+                raise DeploymentRefused('Hana instance memory must be positive')
+            saved['memory_mib'] = memory_mib
+            write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
         provider = AwsHanaProvider.from_settings(self.settings_path, self.directory, conf.path('hana_aws'))
         hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
             clock=self.clock).register(hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region))

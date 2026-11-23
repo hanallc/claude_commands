@@ -2519,7 +2519,7 @@ class AdmissionServer:
         key = self.host_evidence_key(request, destination)
         self.placement_host_keys[(request.episode, destination)] = key
         if destination.provider == 'ssh':
-            from scripts.aws_target import hana_placement
+            from scripts.aws_target import hana_placement, remote
             from scripts.build_targets import target_config
 
             for target in target_config.read_targets():
@@ -2528,10 +2528,18 @@ class AdmissionServer:
                 if isinstance(key.settings, placement.ExplicitProviderSettings):
                     target = replace(target, settings=key.settings.path)
                 transport = target_config.read_execution_transport(target)
-                if (isinstance(transport, hana_placement.HanaControlTransport)
-                        and request.profile.peak.bytes > conf.read(transport.settings).whole('step_memory_gib') * 1024 ** 3):
-                    # Memory belongs to this request, not the shared host evidence.
-                    return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
+                if isinstance(transport, hana_placement.HanaControlTransport):
+                    setup = target_config.ssh_target_state_directory('aws') / 'hana' / 'setup.json'
+                    try:
+                        memory_mib = remote.read_record(setup).get('memory_mib')
+                        reserve_mib = conf.read(transport.settings).whole('os_reserve_gib') * 1024
+                        fits = (type(memory_mib) is int and memory_mib > reserve_mib
+                                and request.profile.peak.bytes <= (memory_mib - reserve_mib) * 1024 ** 2)
+                    except (OSError, ValueError):
+                        fits = False
+                    if not fits:
+                        # Check memory for each request before using shared host evidence.
+                        return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
                 break
         if destination.provider == "local" and not self.background_local_evidence:
             try:

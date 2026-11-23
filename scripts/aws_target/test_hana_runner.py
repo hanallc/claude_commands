@@ -368,7 +368,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
             if wrapper.stderr is not None:
                 wrapper.stderr.close()
 
-    def test_command_accepts_once_and_preserves_resource_limits(self) -> None:
+    def test_command_accepts_once_without_step_bounds(self) -> None:
         first = self.receive(self.envelope)
         self.assertTrue(first.accepted)
         self.assertFalse(first.terminated)
@@ -376,8 +376,8 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         self.assertEqual(len(self.supervisor.starts), 1)
         arguments = self.supervisor.starts[0]
         self.assertIn('--uid=hana-runner', arguments)
-        self.assertIn('--property=CPUQuota=400%', arguments)
-        self.assertIn('--property=MemoryMax=25769803776', arguments)
+        self.assertFalse(any(argument.startswith(('--property=CPUQuota=', '--property=MemoryMax=')) for argument in arguments))
+        self.assertIn('--property=KillMode=control-group', arguments)
         self.assertIn(str(receiver.RUNTIME / 'runner.py'), arguments)
 
     def test_fence_acknowledgement_prevents_a_delayed_command(self) -> None:

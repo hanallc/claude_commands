@@ -96,8 +96,12 @@ It checks the shutdown fence and starts the command under the shared lock.
 Its start callback spawns the process and returns immediately.
 The caller waits for command completion outside the lock.
 It prepares an unprivileged command with a separate slice under `hana-work.slice`.
-Both the parent slice and each command enforce `step_cpu_limit` and `step_memory_gib` from configuration.
-The initial limits are 4 vCPUs and 24 GiB RAM.
+Commands can use all guest CPUs and memory. The command and its slice set no CPU quota or memory cap.
+Systemd sets `OOMScoreAdjust=-1000` and `MemoryMin` from `guest_service_memory_min_mib` for the guard, watchdog, and receiver.
+Hana setup saves the EC2 instance type's memory as `memory_mib` in `hana/setup.json`.
+Admission subtracts `os_reserve_gib` and excludes requests that exceed the remaining memory.
+Admission also excludes requests when the saved memory is unavailable.
+The image defines the command limits and guest service protection. A change to these settings needs a new image.
 Phase F2 must use this command path after checking the actual data mount.
 `test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
 No safety test needs AWS or a running systemd manager.

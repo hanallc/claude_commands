@@ -5,6 +5,7 @@ from dataclasses import replace
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
+import json
 import threading
 import time
 from typing import cast, override
@@ -25,7 +26,12 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
     settings = fixture.root / 'hana.conf'
     _ = settings.write_text('execution_transport=hana-control\nhost=fixture-hana\n# whole: 1..\n'
-        + 'aws_timeout_s=7\n# whole: 1..\nstep_memory_gib=24\n')
+        + 'aws_timeout_s=7\n# whole: 1..\nos_reserve_gib=2\n')
+    state = fixture.root / 'targets'
+    _ = cast(object, fixture.enter_context(mock.patch.dict('os.environ', {'BUILD_TARGETS_STATE_DIR': str(state)})))
+    setup = state / 'aws' / 'hana' / 'setup.json'
+    setup.parent.mkdir(parents=True)
+    _ = setup.write_text(json.dumps({'version': 1, 'memory_mib': 32 * 1024}))
     return target_config.SshTarget('fixture-hana', 'linux', settings)
 
 
@@ -303,7 +309,7 @@ class HanaQueueTests(unittest.TestCase):
                         self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
 
     def test_memory_eligibility_is_per_request_with_shared_host_evidence_in_both_orders(self) -> None:
-        for order in ((1, 40), (40, 1)):
+        for order in ((29, 31), (31, 29)):
             with self.subTest(order=order), PlacementFixture() as fixture:
                 target = hana_target(fixture)
                 request = placement_request(fixture)
@@ -318,7 +324,7 @@ class HanaQueueTests(unittest.TestCase):
                         self.assertEqual(fixture.server.host_evidence_key(sized,
                             request.constraints.candidates[0].destination), shared.key)
                         reply = fixture.connect(sized).replies()[-1]
-                        if gib == 1:
+                        if gib == 29:
                             self.assertIsInstance(reply, wire.Assignment)
                         else:
                             self.assertIsInstance(reply, wire.PlacementWait)
@@ -326,6 +332,28 @@ class HanaQueueTests(unittest.TestCase):
                             self.assertEqual(reply.eligibility[0].eligibility, placement.TemporaryExclusion('memory'))
                             self.assertNotIn(sized.episode, fixture.server.current_assignments)
                         self.assertEqual(fixture.server.host_evidence(shared.key), shared)
+
+    def test_hana_excludes_requests_without_recorded_instance_memory(self) -> None:
+        for record in ('missing file', 'legacy record'):
+            with self.subTest(record=record), PlacementFixture() as fixture:
+                target = hana_target(fixture)
+                setup = target_config.ssh_target_state_directory('aws') / 'hana' / 'setup.json'
+                self.assertTrue(setup.is_relative_to(fixture.root))
+                if record == 'missing file':
+                    setup.unlink()
+                else:
+                    _ = setup.write_text(json.dumps({'version': 1}))
+                request = placement_request(fixture)
+                candidate = request.constraints.candidates[0]
+                remote = replace(candidate, destination=replace(candidate.destination, provider='ssh', target=target.name))
+                request = replace(request, constraints=replace(request.constraints, candidates=(remote,)))
+                with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
+                    _ = publish_candidate(fixture, request)
+                    reply = fixture.connect(request).replies()[-1]
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    assert isinstance(reply, wire.PlacementWait)
+                    self.assertEqual(reply.eligibility[0].eligibility, placement.TemporaryExclusion('memory'))
+                    self.assertNotIn(request.episode, fixture.server.current_assignments)
 
     def test_hana_timeout_uses_the_aws_bound_without_ssh_keys(self) -> None:
         with PlacementFixture() as fixture:

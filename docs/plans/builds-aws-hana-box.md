@@ -47,7 +47,8 @@ After loss or watchdog termination, let offload record the attempt lost and fenc
 Do not transfer the remote snapshot to local fallback.
 Keep `scripts/direct/verify.sh` unchanged.
 
-Begin with one active step, limited to 4 vCPUs and 24 GiB RAM.
+Begin with one active step that can use the box's CPUs and memory.
+Use the saved instance type memory less `os_reserve_gib` to check admission.
 The supplied steps use 0.7–2.1 cores; their median peak memory reaches 9.1 GiB.
 Run only one command on each leased slot (D2, D5).
 Release local memory admission and the cargo token through the existing Mac offload release path.
@@ -222,8 +223,8 @@ Keep `start_timeout_seconds=120`, `idle_stop_seconds=600`, and `max_steps=1` as 
 | `idle_stop_seconds` | `600` | Retain short bursts and stop through quiet periods. |
 | `start_timeout_seconds` | `120` | Bound a caller's startup wait. |
 | `max_steps` | `1` | Establish memory and slot behavior before concurrent execution. |
-| `step_cpu_limit` | `4` | Allow the observed work without occupying all host CPUs. |
-| `step_memory_gib` | `24` | Leave 8 GiB for the operating system and control processes. |
+| `guest_service_memory_min_mib` | `128` | Set the memory protection for each guest control service. |
+| `os_reserve_gib` | `2` | Reserve memory for the kernel, page cache, and guest services in admission estimates. |
 | `root_gib` | `40` | Retain the system and Nix store without a smaller untested root. |
 | `data_gib` | `300` | Retain the shared slot pool, Rust tools, and Cargo caches. |
 | `free_floor_gib` | `30` | Prevent disk exhaustion during compilation. |

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 import base64
+from decimal import Decimal
 import fcntl
 from io import StringIO
 import json
@@ -15,7 +16,7 @@ from urllib.parse import urlsplit
 
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import conf
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -31,6 +32,8 @@ class FakeAws:
     lose_response: str = ''
     status: str = 'instance-stopped-by-user'
     ownership: str = IDENTITY.deployment
+    instance_type: str = 'fixture-type'
+    memory_mib: int = 32768
     objects: dict[str, dict[str, object]] = field(default_factory=dict)
     calls: list[tuple[str, str, float]] = field(default_factory=list)
     environments: list[dict[str, str]] = field(default_factory=list)
@@ -48,8 +51,16 @@ class FakeAws:
             return subprocess.CompletedProcess(list(arguments), 1, '', 'private-provider-id signed-secret')
         if operation == 'describe-instances':
             value = {'Reservations': [{'Instances': [{'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request,
-                'State': {'Name': self.state}, 'LaunchTime': 'fixture-launch',
+                'InstanceType': self.instance_type, 'State': {'Name': self.state}, 'LaunchTime': 'fixture-launch',
                 'Tags': [{'Key': 'HanaDeployment', 'Value': self.ownership}, {'Key': 'Workload', 'Value': 'hana'}]}]}]}
+        elif operation == 'describe-instance-types':
+            if tuple(arguments[offset + 2:-2]) != ('--instance-types', self.instance_type):
+                raise AssertionError('The request must use the confirmed instance type')
+            value = {'InstanceTypes': [{'InstanceType': self.instance_type, 'MemoryInfo': {'SizeInMiB': self.memory_mib}}]}
+        elif operation == 'describe-stacks':
+            value = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
+                {'OutputKey': key, 'OutputValue': item} for key, item in (
+                    ('Instance', IDENTITY.instance), ('ControlBucket', 'fixture-bucket'), ('DataVolume', 'fixture-volume'))]}]}
         elif operation == 'describe-spot-instance-requests':
             value = {'SpotInstanceRequests': [{'SpotInstanceRequestId': IDENTITY.spot_request, 'InstanceId': IDENTITY.instance,
                 'Type': 'persistent', 'InstanceInterruptionBehavior': 'stop', 'Status': {'Code': self.status}}]}
@@ -264,3 +275,30 @@ class HanaProviderTests(CostFixture):
         self.assertIn('placement remains disabled', output.getvalue())
         self.assertEqual(self.fake.calls, [])
         self.assertFalse((self.state / 'hana/setup.json').exists())
+
+    def test_approved_setup_saves_confirmed_instance_type_memory(self) -> None:
+        self.text_setting('availability_zone', 'us-east-1a')
+        for name, value in (('ami_id', 'fixture-image'), ('ami_owner_id', 'fixture-owner'),
+                            ('vpc_id', 'fixture-vpc'), ('subnet_id', 'fixture-subnet')):
+            text_setting(self.workload, name, value)
+        self.fake.instance_type = conf.read(self.workload).text('instance_type')
+        self.fake.memory_mib = 32767
+        self.fake.state = 'running'
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(
+            self.clock.now, (ledger.PricedResource('fixture-storage', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'stopped', 'fixture'))
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.fake, clock=self.clock)
+        with (mock.patch.object(deploy.Deployment, '_authorize'),
+              mock.patch.object(deploy.Deployment, '_api', return_value=self.provider.api),
+              mock.patch.object(deploy.Deployment, '_validate_inputs'),
+              mock.patch.object(deploy.Deployment, '_hana_stack_change'),
+              mock.patch.object(provider.AwsHanaProvider, 'from_settings', return_value=self.provider),
+              mock.patch('sys.stdout', new_callable=StringIO)):
+            _ = subject.prepare_hana()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        saved = ledger.mapping(cast(object, json.loads((self.state / 'hana' / 'setup.json').read_text())))
+        self.assertEqual(saved['memory_mib'], self.fake.memory_mib)
+        operations = [op for _, op, _ in self.fake.calls]
+        self.assertEqual(operations.count('describe-instance-types'), 1)
+        self.assertEqual(operations[operations.index('wait') + 1:], ['describe-instances', 'describe-instance-types'])

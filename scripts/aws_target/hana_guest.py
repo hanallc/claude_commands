@@ -35,8 +35,7 @@ class SafetySettings:
     guard_grace_seconds: int
     watchdog_check_seconds: int
     permit_max_seconds: int
-    step_cpu_limit: int
-    step_memory_gib: int
+    guest_service_memory_min_mib: int
     mount_timeout_seconds: int
 
 
@@ -46,8 +45,8 @@ def decode_settings(values: Mapping[str, object]) -> SafetySettings:
     if type(enabled) is not bool:
         raise ValueError('enabled must be a boolean')
     numbers: dict[str, int] = {}
-    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds', 'step_cpu_limit',
-                'step_memory_gib', 'mount_timeout_seconds'):
+    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
+                'guest_service_memory_min_mib', 'mount_timeout_seconds'):
         number = values[key]
         if type(number) is not int or number <= 0:
             raise ValueError(key + ' must be a positive integer')
@@ -61,8 +60,8 @@ def read_settings(configuration: conf.ConfigRead) -> SafetySettings:
     if enabled not in ('on', 'off'):
         raise ValueError('enabled must be on or off')
     values: dict[str, object] = {'enabled': enabled == 'on'}
-    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds', 'step_cpu_limit',
-                'step_memory_gib', 'mount_timeout_seconds'):
+    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
+                'guest_service_memory_min_mib', 'mount_timeout_seconds'):
         values[key] = configuration.whole(key)
     return decode_settings(values)
 
@@ -282,17 +281,14 @@ def stop_work(run: Callable[[list[str]], None]) -> None:
         run(['systemctl', 'poweroff', '--no-block'])
 
 
-def _command_arguments(settings: SafetySettings, generation: str,
-                       command: tuple[str, ...], directory: Path) -> list[str]:
-    """Prepare an unprivileged command in its own bounded slice after admission checks."""
+def _command_arguments(generation: str, command: tuple[str, ...], directory: Path) -> list[str]:
+    """Prepare an unprivileged command in its own slice after admission checks."""
     if not re.fullmatch(r'[A-Za-z0-9_]+', generation):
         raise ValueError('The generation cannot name a command unit')
     if not directory.is_relative_to(DATA) or '..' in directory.parts or not command:
         raise ValueError('The command needs a source directory on the data mount')
     return ['systemd-run', '--wait', '--collect', '--uid=hana-runner',
             '--unit=hana-command-' + generation, '--slice=hana-work-' + generation + '.slice',
-            '--property=CPUQuota=' + str(settings.step_cpu_limit * 100) + '%',
-            '--property=MemoryMax=' + str(settings.step_memory_gib * 1024**3),
             '--property=KillMode=control-group', '--working-directory=' + str(directory), '--', *command]
 
 
@@ -313,7 +309,7 @@ def admit_command[StartedCommand](settings: SafetySettings, command: tuple[str, 
                 or watchdog_action(settings, permit, clock=clock, uptime=uptime) != WatchdogAction.KEEP):
             raise ValueError('The data mount and a fresh permit are required')
         assert isinstance(permit, PermitDeadline)
-        return start(_command_arguments(settings, permit.permit.generation, command, directory))
+        return start(_command_arguments(permit.permit.generation, command, directory))
 
 
 def read_identity(path: Path) -> str:
@@ -419,6 +415,8 @@ FailureAction=poweroff
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+OOMScoreAdjust=-1000
+MemoryMin={settings.guest_service_memory_min_mib}M
 RuntimeDirectory=hana-aws
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
@@ -437,6 +435,8 @@ StartLimitAction=poweroff
 
 [Service]
 Type=simple
+OOMScoreAdjust=-1000
+MemoryMin={settings.guest_service_memory_min_mib}M
 Environment=PATH={SYSTEM_BIN}
 ExecStart={prefix} watchdog
 Restart=always
@@ -470,12 +470,10 @@ Type=oneshot
 ExecStart={tool_setup}
 RemainAfterExit=yes
 '''
-    work_slice = f'''[Unit]
-Description=Hana command resource bounds
+    work_slice = '''[Unit]
+Description=Hana command slice
 
 [Slice]
-CPUQuota={settings.step_cpu_limit * 100}%
-MemoryMax={settings.step_memory_gib * 1024**3}
 '''
     units = {'hana-guard.service': guard, 'hana-watchdog.service': watchdog, 'var-lib-hana.mount': mount}
     if tool_setup is not None:
