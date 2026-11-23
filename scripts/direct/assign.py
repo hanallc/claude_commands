@@ -10,7 +10,9 @@ except FileNotFoundError:
 from scripts.direct import pass_record as pass_recorder
 
 import argparse
+import fcntl
 from collections.abc import Callable
+import hashlib
 from importlib import import_module
 import json
 import os
@@ -25,18 +27,19 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
-from scripts.direct import assign_claude, phase_reservation, progress_history, recorder_state, simplify_daily
+from scripts.direct import assign_claude, phase_reservation, progress_history, recorder_state, remove_run_scratch, simplify_daily
 from scripts.production import staff, worker_admission
 from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
 from scripts.production import worker as staff_worker
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lint import style_review
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 from scripts.whoami import quota_state
@@ -492,9 +495,58 @@ def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_
         return progress_history.record_assignment_launch_exit(run, instance, outcome)
 
 
+def assignment_prompt(args: Arguments, run: Path, phase: str, role: str, slot: str,
+                      launcher: list[str], alias: Path, content: str,
+                      summary: Path) -> tuple[Path, NoStyleAssignment | StyleAssignment]:
+    """Reuse the recorded prompt or publish a new immutable copy."""
+    selected = progress_history.launch_slot(run, slot, launcher)
+    state = read_object(run / unit_runs.STATE_FILE)
+    passed = object_map(object_map(state.get("pass")).get(selected))
+    saved_path = text(passed.get("prompt_file"))
+    if saved_path and role in staff.WORKER_ROLES:
+        saved = Path(saved_path)
+        style_path = progress_history.dispatch_delivery(passed).actions.style_directory
+        style = StyleAssignment(Path(style_path), summary) if style_path else NoStyleAssignment()
+        if bool(style_path) == bool(args.style_since) and saved.is_file():
+            expected = content
+            if isinstance(style, StyleAssignment):
+                addition = (style.directory / "assignment.md").read_text()
+                if addition:
+                    expected += "\n" + addition
+            if saved.read_text() == expected:
+                matched = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=role,
+                    prompt=saved.resolve(), launcher_command=launcher,
+                    work=progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0))
+                if isinstance(matched, progress_history.MatchedDispatch):
+                    return saved, style
+
+    phase_instance = next((text(item.get("instance_id")) for item in recorder_state.open_phases(state)
+                           if item.get("id") == phase), "")
+    digest = hashlib.sha256(json.dumps([phase_instance, launcher, content]).encode("utf-8")).hexdigest()
+    message = alias.parent / "prompts" / f"{digest}.txt"
+    if not message.is_file():
+        _ = create_text_atomic(message, content)
+    if message.read_text() != content:
+        refuse(f"Saved prompt differs from the assignment: {message}")
+    if not alias.exists():
+        _ = create_text_atomic(alias, content)
+    if args.style_since:
+        end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
+        directory = style_review.start(Path(args.cwd), args.style_since, alias.parent, message, slot, end)
+        return directory / "prompt.md", StyleAssignment(directory, summary)
+    return message, NoStyleAssignment()
+
+
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
-    """Send the assignment through the shared worker command."""
+    """Keep generated prompts until the worker command records the dispatch."""
+    with (run / remove_run_scratch.ASSIGNMENT_PROMPT_LOCK).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        return _execute_herdr(args, run, phase, prompt, role, paths, env, lock.fileno())
+
+
+def _execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
+                   role: str, paths: list[str], env: dict[str, str], prompt_lock: int) -> int:
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
     launcher = launcher_command()
@@ -509,13 +561,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
-    if not message.is_file() or message.read_text() != content:
-        write_text_atomic(message, content)
-    end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
-    style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
-    if args.style_since:
-        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
-        message = style.directory / "prompt.md"
+    message, style = assignment_prompt(args, run, phase, role, slot, launcher, message, content, summary)
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
     if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
@@ -546,9 +592,13 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
-    with log.open("a") as output:
+    with log.open("a") as output, TemporaryFile(mode="w+t") as diagnostics:
         offset = output.tell()
-        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=diagnostics,
+                                pass_fds=(prompt_lock,))
+        _ = diagnostics.seek(0)
+        errors = diagnostics.read()
+        _ = output.write(errors)
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
@@ -556,6 +606,10 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                 print(line, end="", file=sys.stderr)
             elif line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
                 print(line, end="")
+    if result.returncode and errors:
+        print(errors, end="", file=sys.stderr)
+    if result.returncode == staff_worker.ExitCode.UNCERTAIN:
+        return result.returncode
     outcome = progress_history.AssignmentLaunchExit.SUBMITTED
     if result.returncode:
         outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)

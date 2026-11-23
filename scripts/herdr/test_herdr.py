@@ -8284,8 +8284,9 @@ class RowTabTests(StaffTestCase):
                 self.assertEqual(sum("p1 tab t0" in line for line in errors.getvalue().splitlines()), 1)
 
     def test_layout_scan_refreshes_the_pane_list_after_pane_not_found(self) -> None:
-        for disappeared in (True, False):
-            with self.subTest(disappeared=disappeared):
+        for closure in ("first scan", "still listed", "second scan"):
+            with self.subTest(closure=closure):
+                disappeared = closure == "first scan"
                 pane = self.client.tabs[0]
                 now = time.time()
                 old = now - herdr.LAYOUT_KEEP_SECONDS - 1
@@ -8309,19 +8310,27 @@ class RowTabTests(StaffTestCase):
                             raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
                     return original(*arguments, deadline=deadline)
 
-                with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+                with (patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors,
+                      herdr.pane_evidence_run()):
                     self.client.record_layout()
-                if disappeared:
-                    self.client.tabs.insert(0, pane)
+                    if disappeared:
+                        self.client.tabs.insert(0, pane)
 
-                self.assertEqual(process_queries, ["p0", "p1", "p2"])
-                self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
-                self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
-                self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
-                if disappeared:
-                    self.assertEqual(errors.getvalue(), "")
-                else:
-                    self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+                    self.assertEqual(process_queries, ["p0", "p1", "p2"])
+                    self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
+                    self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+                    self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
+                    if disappeared:
+                        self.assertEqual(errors.getvalue(), "")
+                    else:
+                        self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+                    if closure == "second scan":
+                        self.client.tabs.remove(pane)
+                        try:
+                            after_close = self.client.scan_row_panes(staff.initial_snapshot(), [dict(pane)])
+                        finally:
+                            self.client.tabs.insert(0, pane)
+                        self.assertEqual(after_close.unknown, [herdr.UnknownPane("p0", "t0", "pane closed during scan")])
 
     def test_layout_scan_refreshes_once_after_several_panes_close(self) -> None:
         queries: list[tuple[str, ...]] = []
@@ -9109,6 +9118,33 @@ class SavedLayoutTests(unittest.TestCase):
             pane_launch.save(pane_launch.record_directory() / "fixture.json", {entry["pane_id"]: entry}, record=staff.StaffSnapshot(()))
             client.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
             self.assertEqual(client.layout(), self.BEFORE)
+
+        with self.subTest(launch="retained shell with a null terminal id"):
+            client = LayoutHerdr("shell-workspace")
+            space = "shell-owner"
+            client.spaces = [("w1", space)]
+            _ = client.add_tab("w1", space)
+            shell = client.tabs[0]
+            session = shell.pop("session_id")
+            owner = staff.initial_snapshot().by_current_session(session)
+            assert owner is not None
+            fake_unit_host.process(os.environ, 42, 1, ["zsh"], {"CLAUDE_CODE_SESSION_ID": session})
+            client.spaces = [("w1", "renamed-shell-workspace")]
+            now = time.time()
+            write_text_atomic(herdr.layout_path(client.session),
+                              json.dumps(herdr.SavedLayout(at=now, workspaces=[
+                                  herdr.SavedSpace(name=space, seen=now, tabs=[
+                                      herdr.SavedMemberTab(staff_id=owner.id, seen=now)])])))
+            original = client.result
+
+            def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                if arguments == ("pane", "list"):
+                    return {"panes": [dict(shell, terminal_id=None)]}
+                return original(*arguments, deadline=deadline)
+
+            with patch.object(client, "result", new=result):
+                client.prepare_restore_workspaces(frozenset({space}))
+            self.assertEqual(client.layout(), [("renamed-shell-workspace", [space])])
 
     def test_placeholder_with_a_running_program_survives_cleanup(self) -> None:
         _ = self.running()
