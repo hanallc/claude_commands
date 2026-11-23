@@ -5,28 +5,30 @@ No source is imported or evaluated. Callers own certification and execution.
 from __future__ import annotations
 
 import ast
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import closing
+import copy
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+import itertools
 import json
+import math
 import os
 import posixpath
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
-from typing import cast
+from typing import cast, override
 
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
-    ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
-    NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
-    RecursiveDirectory, WholeRepository, module_read_record,
+    ListedDirectory, LocalModuleReadsUnavailable, ModuleReadHistory, ModuleReadRecord, NoConfigReadRecord,
+    NoContentReadRecord, NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    RecursiveDirectory, WholeRepository, read_latest_module_reads,
 )
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
@@ -68,8 +70,8 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 2
-EXTRACTOR_VERSION = 11
+CACHE_FORMAT_VERSION = 3
+EXTRACTOR_VERSION = 14
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 
@@ -119,11 +121,22 @@ class ScanPath:
     parts: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, order=True)
+class NameFilter:
+    """The file names that the code which takes the paths of a scan rejects before it reads a file."""
+    excludes: tuple[str, ...] = ()
+    keeps: tuple[str, ...] = ()
+
+    def rejects(self, name: str) -> bool:
+        return name not in self.keeps and any(fnmatchcase(name, pattern) for pattern in self.excludes)
+
+
 @dataclass(frozen=True)
 class ScanPattern:
     directory: ScanPath | UnrootedPath
     pattern: str
     recursive: bool
+    names: NameFilter = NameFilter()
 
 
 @dataclass(frozen=True)
@@ -140,6 +153,7 @@ class ScanScope:
     bindings: tuple[tuple[str, ScanPath | UnrootedPath], ...]
     scans: tuple[ScanPattern, ...]
     calls: tuple[ScanCall, ...]
+    defaults: tuple[tuple[str, ScanPath | UnrootedPath], ...] = ()
 
 
 @dataclass(frozen=True, order=True)
@@ -147,6 +161,7 @@ class RepositoryScan:
     directory: str
     pattern: str
     recursive: bool
+    names: NameFilter = NameFilter()
 
 
 @dataclass(frozen=True)
@@ -169,15 +184,6 @@ class SourceGraph:
 
 def path_tokens(text: str) -> frozenset[str]:
     return frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
-
-
-def scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
-    """Visit one lexical scope without entering a nested scope."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-        return
-    yield node
-    for child in ast.iter_child_nodes(node):
-        yield from scope_nodes(child)
 
 
 def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
@@ -231,12 +237,360 @@ def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
     return UnrootedPath()
 
 
+type Definition = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+type LoopValues = dict[str, tuple[str, ...]]
+
+# A call in a literal loop gets one copy for each combination of the loop values, up to this count.
+# Above the count, the loop names stay unknown and the scan reads the whole repository.
+LOOP_VARIANT_LIMIT = 32
+
+
+def bound_names(node: ast.AST) -> Iterator[str]:
+    """Give each name that one node binds, deletes or declares global or nonlocal."""
+    match node:
+        case ast.Name(id=name, ctx=ast.Store() | ast.Del()) | ast.arg(arg=name):
+            yield name
+        case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
+            yield name
+        case (ast.ExceptHandler(name=str() as name) | ast.MatchAs(name=str() as name)
+              | ast.MatchStar(name=str() as name) | ast.MatchMapping(rest=str() as name)):
+            yield name
+        case ast.Import(names=aliases) | ast.ImportFrom(names=aliases):
+            yield from ((alias.asname or alias.name).split(".")[0] for alias in aliases)
+        case ast.Global(names=names) | ast.Nonlocal(names=names):
+            yield from names
+        case _:
+            pass
+
+
+def literal_strings(node: ast.expr) -> tuple[str, ...] | None:
+    """Give the strings of a literal tuple, list or set that holds only string constants."""
+    if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return None
+    strings = tuple(element.value for element in node.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str))
+    return strings if len(strings) == len(node.elts) else None
+
+
+def scope_children(node: ast.AST) -> Iterator[ast.AST]:
+    """Give the children of a node that run in its scope.
+
+    The body of a nested scope runs later, in its own scope. Its decorators and defaults run now.
+    """
+    if isinstance(node, ast.Lambda):
+        skipped = {id(node.body)}
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        skipped = {id(statement) for statement in node.body}
+    else:
+        return ast.iter_child_nodes(node)
+    return (child for child in ast.iter_child_nodes(node) if id(child) not in skipped)
+
+
+def scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """Visit the nodes of one scope, and the parts of a nested scope that run in it."""
+    yield node
+    for child in scope_children(node):
+        yield from scope_nodes(child)
+
+
+def scope_constants(definition: Definition, declared: frozenset[str]) -> dict[str, tuple[str, ...]]:
+    """Find the names that a scope binds only once, to a literal tuple of strings.
+
+    A tuple cannot change. A nested scope can bind the name only through a name in `declared`,
+    which holds every global or nonlocal declaration in the module.
+    A class body reads a module name until the class binds it, so a class scope has no constants.
+    """
+    if isinstance(definition, ast.ClassDef):
+        return {}
+    counts: Counter[str] = Counter()
+    constants: dict[str, tuple[str, ...]] = {}
+    for statement in definition.body:
+        for node in scope_nodes(statement):
+            counts.update(bound_names(node))
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Tuple) and (strings := literal_strings(node.value)) is not None):
+                constants[node.targets[0].id] = strings
+    # A star import can bind any name.
+    return {name: strings for name, strings in constants.items()
+            if counts[name] == 1 and name not in declared and not counts["*"]}
+
+
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+STAT_TESTS = frozenset({"is_file", "is_dir", "is_symlink", "exists"})
+OPPOSITES: dict[type[ast.cmpop], type[ast.cmpop]] = {
+    ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In}
+
+
+def name_clause(clause: ast.expr, variable: str, constants: dict[str, tuple[str, ...]]) -> NameFilter | None:
+    """Give the names that one clause rejects, or None when the clause is not a known name test.
+
+    A clause is one test, or tests joined with `or`, so it keeps a name when one test keeps it.
+    """
+    prefix: str | None = None
+    suffix: str | None = None
+    keeps: list[str] = []
+    for test in clause.values if isinstance(clause, ast.BoolOp) and isinstance(clause.op, ast.Or) else [clause]:
+        if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Call)
+                and ast.unparse(test.operand.func) == f"{variable}.name.startswith" and len(test.operand.args) == 1
+                and not test.operand.keywords and isinstance(argument := test.operand.args[0], ast.Constant)
+                and isinstance(argument.value, str) and re.fullmatch(r"[^*?\[]*", argument.value) and prefix is None):
+            prefix = argument.value
+        elif (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.NotEq)
+                and ast.unparse(test.left) == f"{variable}.suffix" and isinstance(value := test.comparators[0], ast.Constant)
+                and isinstance(value.value, str) and re.fullmatch(r"\.[^.*?\[/]+", value.value) and suffix is None):
+            suffix = value.value
+        elif (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.In)
+                and ast.unparse(test.left) == f"{variable}.name"):
+            # A named set can change, so only a literal or a tuple constant gives the kept names.
+            comparator = test.comparators[0]
+            names = constants.get(comparator.id) if isinstance(comparator, ast.Name) else literal_strings(comparator)
+            if names is None:
+                return None
+            keeps.extend(names)
+        else:
+            return None
+    # Path.suffix is empty for a name that only starts with a dot, so a suffix needs one character before it.
+    return NameFilter(((prefix or "?") + "*" + (suffix or ""),), tuple(keeps))
+
+
+def pure_test(test: ast.expr, variable: str, constants: dict[str, tuple[str, ...]]) -> bool:
+    """Tell whether a test reads only the name or the file type of the path, and no file."""
+    match test:
+        case ast.BoolOp(values=values):
+            return all(pure_test(value, variable, constants) for value in values)
+        case ast.UnaryOp(op=ast.Not(), operand=operand):
+            return pure_test(operand, variable, constants)
+        case ast.Call(func=ast.Attribute(value=ast.Name(id=name), attr=attribute), args=[], keywords=[]):
+            return name == variable and attribute in STAT_TESTS
+        case ast.Compare(left=ast.Constant(value=str()), ops=[ast.NotIn()],
+                         comparators=[ast.Attribute(value=ast.Name(id=name), attr="parts")]):
+            return name == variable
+        case _:
+            return name_clause(test, variable, constants) is not None
+
+
+def name_filter(tests: list[ast.expr], variable: str, constants: dict[str, tuple[str, ...]]) -> NameFilter:
+    """Keep the name tests that run before the first test that can read a file.
+
+    The tests run in order: each `if` of a comprehension, then each value of an `and`.
+    """
+    if any(isinstance(node, ast.NamedExpr) for test in tests for node in ast.walk(test)):
+        return NameFilter()
+    pending = list(reversed(tests))
+    excludes: set[str] = set()
+    keeps: set[str] = set()
+    while pending:
+        test = pending.pop()
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            pending.extend(reversed(test.values))
+        elif (clause := name_clause(test, variable, constants)) is not None:
+            excludes.update(clause.excludes)
+            keeps.update(clause.keeps)
+        elif not pure_test(test, variable, constants):
+            break
+    return NameFilter(tuple(sorted(excludes)), tuple(sorted(keeps)))
+
+
+def negated(test: ast.expr) -> ast.expr:
+    """Give the opposite test, and keep the order of its parts."""
+    match test:
+        case ast.UnaryOp(op=ast.Not(), operand=operand):
+            return operand
+        case ast.BoolOp(op=ast.And(), values=values):
+            return ast.BoolOp(ast.Or(), [negated(value) for value in values])
+        case ast.BoolOp(op=ast.Or(), values=values):
+            return ast.BoolOp(ast.And(), [negated(value) for value in values])
+        case ast.Compare(left=left, ops=[operator], comparators=comparators) if type(operator) in OPPOSITES:
+            return ast.Compare(left, [OPPOSITES[type(operator)]()], comparators)
+        case _:
+            return ast.UnaryOp(ast.Not(), test)
+
+
+def loop_conditions(body: list[ast.stmt]) -> list[ast.expr]:
+    """Give the test that a loop body applies to each path before any other statement."""
+    first = body[0]
+    if not isinstance(first, ast.If) or first.orelse:
+        return []
+    if len(first.body) == 1 and isinstance(first.body[0], ast.Continue):
+        return [negated(first.test)]
+    return [first.test] if len(body) == 1 else []
+
+
+def consumed_scan(node: ast.expr) -> ast.Call | None:
+    """Give the glob call whose paths a loop takes one by one."""
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"sorted", "list", "tuple"}
+            and len(node.args) == 1 and not node.keywords):
+        node = node.args[0]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+        return node
+    return None
+
+
+def closure_reads(node: ast.AST, name: str) -> bool:
+    """Tell whether a lambda or a nested definition in a node reads a name. It can run after the loop."""
+    return any(isinstance(scope, NESTED_SCOPES) and any(
+        isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, ast.Load) for child in ast.walk(scope))
+        for scope in ast.walk(node))
+
+
+class ScopeLoops:
+    """Visit one scope with the literal loop values around each node, and the name filter of each consumed glob call."""
+
+    def __init__(self, definition: Definition, declared: frozenset[str]) -> None:
+        self.definition: Definition = definition
+        self.declared: frozenset[str] = declared
+        self.known_constants: dict[str, tuple[str, ...]] | None = None
+        self.known_loads: Counter[str] | None = None
+        self.filters: dict[int, NameFilter] = {}
+
+    def constants(self) -> dict[str, tuple[str, ...]]:
+        if self.known_constants is None:
+            self.known_constants = scope_constants(self.definition, self.declared)
+        return self.known_constants
+
+    def loads(self) -> Counter[str]:
+        if self.known_loads is None:
+            self.known_loads = Counter(node.id for statement in self.definition.body for node in ast.walk(statement)
+                                       if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+        return self.known_loads
+
+    def filter(self, node: ast.For | ast.AsyncFor | ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        """Record the name filter that a loop or a comprehension applies to the paths of its glob call."""
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            target = node.target
+            if (not isinstance(target, ast.Name) or target.id in self.declared
+                    or (scan := consumed_scan(node.iter)) is None or node.orelse):
+                return
+            # After the loop, the loop name holds the last path, which the filter can reject.
+            inside = sum(isinstance(child, ast.Name) and child.id == target.id and isinstance(child.ctx, ast.Load)
+                         for child in ast.walk(node))
+            if self.loads()[target.id] == inside and not closure_reads(node, target.id):
+                self.filters[id(scan)] = name_filter(loop_conditions(node.body), target.id, self.constants())
+            return
+        for generator in node.generators:
+            if (isinstance(generator.target, ast.Name) and generator.target.id not in self.declared
+                    and (scan := consumed_scan(generator.iter)) is not None and not closure_reads(node, generator.target.id)):
+                self.filters[id(scan)] = name_filter(generator.ifs, generator.target.id, self.constants())
+
+    def inner(self, target: ast.expr, iterable: ast.expr, bound: LoopValues, body: list[ast.stmt]) -> LoopValues:
+        """Bind the loop name, unless the loop body binds it again or a global or nonlocal statement names it."""
+        targets = {name for node in ast.walk(target) for name in bound_names(node)}
+        result = {name: values for name, values in bound.items() if name not in targets}
+        values = literal_strings(iterable)
+        if values is None and isinstance(iterable, ast.Name):
+            values = self.constants().get(iterable.id)
+        if (values is not None and isinstance(target, ast.Name) and target.id not in self.declared
+                and not any(name == target.id for step in body for node in ast.walk(step) for name in bound_names(node))):
+            result[target.id] = values
+        return result
+
+    def nodes(self, node: ast.AST, bound: LoopValues, hidden: bool = False) -> Iterator[tuple[ast.AST, LoopValues, bool]]:
+        """Visit the nodes of the scope in order. Record the filter of a loop before its glob call.
+
+        The flag is true for a node that cannot read the class body names, such as a later part of a comprehension.
+        """
+        yield node, bound, hidden
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.filter(node)
+            body = self.inner(node.target, node.iter, bound, node.body)
+            for child in (node.target, node.iter):
+                yield from self.nodes(child, bound, hidden)
+            for child in node.body:
+                yield from self.nodes(child, body, hidden)
+            for child in node.orelse:
+                yield from self.nodes(child, bound, hidden)
+        elif isinstance(node, COMPREHENSIONS):
+            self.filter(node)
+            current = bound
+            for index, generator in enumerate(node.generators):
+                yield from self.nodes(generator.iter, current, hidden)
+                if index == 0 and isinstance(self.definition, ast.ClassDef) and not hidden:
+                    # Only the first iterable runs in the class body. The other parts read module names.
+                    current, hidden = {}, True
+                current = self.inner(generator.target, generator.iter, current, [])
+                for condition in generator.ifs:
+                    yield from self.nodes(condition, current, hidden)
+            for part in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
+                yield from self.nodes(part, current, hidden)
+        else:
+            for child in scope_children(node):
+                yield from self.nodes(child, bound, hidden)
+
+
+class LoopValue(ast.NodeTransformer):
+    """Replace each loop name with one of its literal values."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values: dict[str, str] = values
+
+    @override
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        return ast.Constant(self.values[node.id]) if node.id in self.values and isinstance(node.ctx, ast.Load) else node
+
+
+def loop_variants(node: ast.Call, bound: LoopValues) -> list[ast.Call]:
+    """Give one copy of a call for each combination of the literal loop values that it reads."""
+    names = sorted({child.id for child in ast.walk(node) if isinstance(child, ast.Name) and child.id in bound})
+    choices = [bound[name] for name in names]
+    if not names or math.prod(len(values) for values in choices) > LOOP_VARIANT_LIMIT:
+        return [node]
+    variants: list[ast.Call] = []
+    for values in itertools.product(*choices):
+        variant = copy.deepcopy(node)
+        _ = LoopValue(dict(zip(names, values))).generic_visit(variant)
+        variants.append(variant)
+    return variants
+
+
+def call_facts(node: ast.Call, name: str, parent: str, definitions: dict[str, Definition],
+               bindings: dict[str, ScanPath | UnrootedPath], aliases: dict[str, str], names: NameFilter
+               ) -> tuple[ScanCall | None, ScanPattern | None]:
+    """Give the scope call and the folder scan that one call makes."""
+    target = ast.unparse(node.func)
+    head = target.split(".", 1)[0]
+    if target.startswith(("self.", "cls.")):
+        target = parent + "." + target.split(".", 1)[1]
+    for alias, imported_name in aliases.items():
+        if target == alias or target.startswith(alias + "."):
+            target = imported_name + target.removeprefix(alias)
+            break
+    for prefix in (name, parent):
+        if f"{prefix}.{target}".lstrip(".") in definitions:
+            target = f"{prefix}.{target}".lstrip(".")
+            break
+    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
+    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
+                     for keyword in node.keywords if keyword.arg is not None)
+    call = None
+    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
+        call = ScanCall(target, arguments, keywords)
+    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+        directory = scan_path(node.func.value, bindings, aliases)
+        pattern = node.args[0] if node.args else ast.Constant("*")
+        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
+            return call, ScanPattern(directory, pattern.value, node.func.attr == "rglob", names)
+        return call, ScanPattern(directory, "*", True, names)
+    # A walk through the imported ast module visits a syntax tree, not a folder.
+    syntax_walk = target == "ast.walk" and head in aliases and head not in bindings
+    if target.endswith(".walk") and arguments and not syntax_walk:
+        return call, ScanPattern(arguments[0], "*", True)
+    if any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
+        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
+        if directories:
+            return call, ScanPattern(directories[0], "*", True)
+    return call, None
+
+
 def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
     """Keep parameters, paths, and scan calls in their lexical scopes."""
-    definitions: dict[str, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {"": tree}
+    definitions: dict[str, Definition] = {"": tree}
+    declared: set[str] = set()
 
     def definitions_in(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                declared.update(child.names)
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 name = f"{prefix}.{child.name}".lstrip(".")
                 definitions[name] = child
@@ -245,6 +599,7 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                 definitions_in(child, prefix)
 
     definitions_in(tree, "")
+    shared = frozenset(declared)
     scopes: list[ScanScope] = []
     environments: dict[str, tuple[dict[str, ScanPath | UnrootedPath], dict[str, str]]] = {}
     for name, definition in definitions.items():
@@ -253,16 +608,29 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
         bindings = dict(inherited)
         aliases = dict(imported)
         parameters: tuple[str, ...] = ()
+        defaults: list[tuple[str, ScanPath | UnrootedPath]] = []
         if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parameters = tuple(argument.arg for argument in (*definition.args.posonlyargs, *definition.args.args,
-                                                             *definition.args.kwonlyargs))
+            arguments = definition.args
+            positional = (*arguments.posonlyargs, *arguments.args)
+            parameters = tuple(argument.arg for argument in (*positional, *arguments.kwonlyargs))
             if parameters and parameters[0] in {"self", "cls"}:
                 parameters = parameters[1:]
+            for argument, default in (*zip(positional[len(positional) - len(arguments.defaults):], arguments.defaults),
+                                      *zip(arguments.kwonlyargs, arguments.kw_defaults)):
+                # A call without the argument cannot scan a None default.
+                if default is None or isinstance(default, ast.Constant) and default.value is None:
+                    continue
+                value = scan_path(default, inherited, imported)
+                # A default that names a parameter of an outer function has no known root in a call.
+                if isinstance(value, ScanPath) and isinstance(value.root, ParameterRoot):
+                    value = UnrootedPath()
+                defaults.append((argument.arg, value))
             bindings.update((parameter, ScanPath(ParameterRoot(parameter))) for parameter in parameters)
         scans: list[ScanPattern] = []
         calls: list[ScanCall] = []
+        loops = ScopeLoops(definition, shared)
         for statement in definition.body:
-            for node in scope_nodes(statement):
+            for node, bound, hidden in loops.nodes(statement, {}):
                 if isinstance(node, ast.Import):
                     aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
                 elif isinstance(node, ast.ImportFrom):
@@ -275,37 +643,15 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                     bindings.update((ast.unparse(target), value) for target in targets
                                     if isinstance(target, (ast.Name, ast.Attribute)))
                 elif isinstance(node, ast.Call):
-                    target = ast.unparse(node.func)
-                    if target.startswith(("self.", "cls.")):
-                        target = parent + "." + target.split(".", 1)[1]
-                    for alias, imported_name in aliases.items():
-                        if target == alias or target.startswith(alias + "."):
-                            target = imported_name + target.removeprefix(alias)
-                            break
-                    for prefix in (name, parent):
-                        if f"{prefix}.{target}".lstrip(".") in definitions:
-                            target = f"{prefix}.{target}".lstrip(".")
-                            break
-                    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
-                    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
-                                     for keyword in node.keywords if keyword.arg is not None)
-                    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
-                        calls.append(ScanCall(target, arguments, keywords))
-                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
-                        directory = scan_path(node.func.value, bindings, aliases)
-                        pattern = node.args[0] if node.args else ast.Constant("*")
-                        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
-                            scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
-                        else:
-                            scans.append(ScanPattern(directory, "*", True))
-                    elif target.endswith(".walk") and arguments:
-                        scans.append(ScanPattern(arguments[0], "*", True))
-                    elif any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
-                        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
-                        if directories:
-                            scans.append(ScanPattern(directories[0], "*", True))
+                    for variant in loop_variants(node, bound) if bound else [node]:
+                        call, scan = call_facts(variant, name, parent, definitions, inherited if hidden else bindings,
+                                                aliases, loops.filters.get(id(node), NameFilter()))
+                        if call is not None:
+                            calls.append(call)
+                        if scan is not None:
+                            scans.append(scan)
         environments[name] = bindings, aliases
-        scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls)))
+        scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls), tuple(defaults)))
     return tuple(scopes)
 
 
@@ -429,7 +775,7 @@ def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
 
 def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
     result: list[ScanScope] = []
-    for name, parameters, bindings, scans, calls in scan_rows(value, 5):
+    for name, parameters, bindings, scans, calls, defaults in scan_rows(value, 6):
         if not isinstance(name, str):
             raise ValueError("invalid scan scope name")
         paths: list[tuple[str, ScanPath | UnrootedPath]] = []
@@ -438,12 +784,17 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
             if not isinstance(key, str):
                 raise ValueError("invalid scan binding")
             paths.append((key, directory))
+        given: list[tuple[str, ScanPath | UnrootedPath]] = []
+        for key, path in scan_rows(defaults, 2):
+            if not isinstance(key, str):
+                raise ValueError("invalid scan default")
+            given.append((key, decoded_scan_path(path)))
         patterns: list[ScanPattern] = []
-        for path, pattern, recursive in scan_rows(scans, 3):
+        for path, pattern, recursive, excludes, keeps in scan_rows(scans, 5):
             directory = decoded_scan_path(path)
             if not isinstance(pattern, str) or not isinstance(recursive, bool):
                 raise ValueError("invalid scan pattern")
-            patterns.append(ScanPattern(directory, pattern, recursive))
+            patterns.append(ScanPattern(directory, pattern, recursive, NameFilter(scan_strings(excludes), scan_strings(keeps))))
         invocations: list[ScanCall] = []
         for target, arguments, keywords in scan_rows(calls, 3):
             if not isinstance(target, str) or not isinstance(arguments, list):
@@ -454,16 +805,19 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
                     raise ValueError("invalid scan keyword")
                 named.append((key, decoded_scan_path(path)))
             invocations.append(ScanCall(target, tuple(decoded_scan_path(path) for path in cast(list[object], arguments)), tuple(named)))
-        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations)))
+        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations),
+                                tuple(given)))
     return tuple(result)
 
 
 def encoded_scan_scopes(scopes: tuple[ScanScope, ...]) -> list[object]:
     return [[scope.name, scope.parameters,
              [[name, encoded_scan_path(path)] for name, path in scope.bindings],
-             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
+             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive, scan.names.excludes, scan.names.keeps]
+              for scan in scope.scans],
              [[call.target, [encoded_scan_path(path) for path in call.arguments],
-               [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls]] for scope in scopes]
+               [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls],
+             [[name, encoded_scan_path(path)] for name, path in scope.defaults]] for scope in scopes]
 
 
 def decoded_facts(value: object) -> SourceFacts:
@@ -646,13 +1000,15 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         if key in seen:
             return set()
         seen = seen | {key}
+        # A parameter that the call does not give takes its default.
+        parameters = {**{name: directory(source, value, {}, frozenset()) for name, value in scope.defaults}, **parameters}
         result: set[RepositoryScan] = set()
         for scan in scope.scans:
             root = directory(source, scan.directory, parameters, frozenset())
             if isinstance(root, UnrootedPath):
-                result.add(RepositoryScan(".", scan.pattern, True))
+                result.add(RepositoryScan(".", scan.pattern, True, scan.names))
             elif isinstance(root, RepositoryDirectory):
-                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive))
+                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive, scan.names))
         for call in scope.calls:
             arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
             keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
@@ -718,55 +1074,9 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
 
 
-def latest_module_reads() -> dict[str, ModuleReadRecord]:
-    """Read each field from its newest full, non-aborted gate."""
-    from scripts.buildlog import index
-
-    _ = index.update()
-    with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
-            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
-            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
-        ).fetchall())
-    recorded: dict[str, ModuleReadRecord] = {}
-    for suite, module, config_json, folder_json, content_json in rows:
-        path = f"scripts/{suite}/{module}"
-        reads = module_read_record(json.loads(config_json) if config_json is not None else None,
-                                   json.loads(folder_json) if folder_json is not None else None,
-                                   json.loads(content_json) if content_json is not None else None)
-        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
-        configs = previous.config_reads
-        if isinstance(reads.config_reads, RecordedConfigReads):
-            stems = reads.config_reads.stems
-            if isinstance(configs, RecordedConfigReads):
-                stems |= configs.stems
-            configs = RecordedConfigReads(stems)
-        folders = previous.folder_scans
-        if isinstance(reads.folder_scans, RecordedFolderScans):
-            scans = reads.folder_scans.folders
-            if isinstance(folders, RecordedFolderScans):
-                scans |= folders.folders
-            folders = RecordedFolderScans(scans)
-        contents = previous.content_reads
-        if isinstance(reads.content_reads, RecordedContentReads):
-            paths = reads.content_reads.paths
-            if isinstance(contents, RecordedContentReads):
-                paths |= contents.paths
-            contents = RecordedContentReads(paths)
-        recorded[path] = ModuleReadRecord(configs, folders, contents)
-    return recorded
+def latest_module_reads() -> ModuleReadHistory | LocalModuleReadsUnavailable:
+    """Read the latest evidence from all hosts."""
+    return read_latest_module_reads()
 
 
 def changed_path_parents(repo: Path, changed: set[str], base_paths: set[str]) -> set[str]:
@@ -845,8 +1155,49 @@ def names_path(tokens: frozenset[str], source: str, paths: set[str],
                for folder, names in folder_names.items())
 
 
-def fixture_sources(imports: dict[str, set[str]], path: str) -> set[str]:
-    """Include imported test fixtures and their imported test fixtures."""
+def importers_by_file(imports: dict[str, set[str]]) -> defaultdict[str, set[str]]:
+    """Give the files that import each file directly."""
+    importers: defaultdict[str, set[str]] = defaultdict(set)
+    for source, dependencies in imports.items():
+        for dependency in dependencies:
+            importers[dependency].add(source)
+    return importers
+
+
+def reaching_files(imports: dict[str, set[str]], changed: set[str]) -> set[str]:
+    """Give the changed files and each file that imports one, directly or through other files.
+
+    One walk over the reversed graph gives the answer for all tests at once.
+    """
+    importers = importers_by_file(imports)
+    found = set(changed)
+    pending = list(changed)
+    while pending:
+        for importer in importers.get(pending.pop(), set()) - found:
+            found.add(importer)
+            pending.append(importer)
+    return found
+
+
+def test_only_helpers(graph: SourceGraph) -> frozenset[str]:
+    """Return the non-test modules that only test modules and other test-only helpers import.
+
+    A module that nothing imports, or whose text holds the `__main__` token, is production code.
+    A module that production code imports is production code too.
+    A `*_test_support.py` module is always a test-only helper, so no current selection drops.
+    """
+    importers = importers_by_file(graph.imports)
+    supports = {path for path in graph.imports if path.endswith("_test_support.py")}
+    helpers = supports | {path for path in importers
+                          if not is_test_module(path) and "__main__" not in graph.tokens.get(path, frozenset())}
+    while production := {path for path in helpers - supports
+                         if any(not is_test_module(importer) and importer not in helpers for importer in importers[path])}:
+        helpers -= production
+    return frozenset(helpers)
+
+
+def fixture_sources(imports: dict[str, set[str]], helpers: frozenset[str], path: str) -> set[str]:
+    """Include the imported test modules and test-only helpers, and what they import of the same kind."""
     pending = [path]
     seen: set[str] = set()
     while pending:
@@ -855,15 +1206,14 @@ def fixture_sources(imports: dict[str, set[str]], path: str) -> set[str]:
             continue
         seen.add(source)
         pending.extend(dependency for dependency in imports.get(source, set())
-                       if dependency.endswith("_test_support.py") or is_test_module(dependency))
+                       if dependency in helpers or is_test_module(dependency))
     return seen
 
 
 def names_changed_file(graph: SourceGraph, sources: set[str], changed: set[str],
                        folder_names: dict[str, set[str]]) -> bool:
-    """Match a changed fixture, its imports, or its named paths."""
-    return any(source in changed or graph.imports.get(source, set()) & changed
-               or names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names)
+    """Match the paths that a fixture names."""
+    return any(names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names)
                for source in sources)
 
 
@@ -904,7 +1254,7 @@ def scans_repository_changes(graph: SourceGraph, sources: set[str], changed: set
                 except ValueError:
                     continue
                 pattern = "**/" + scan.pattern if scan.recursive else scan.pattern
-                if relative.full_match(pattern):
+                if relative.full_match(pattern) and not scan.names.rejects(relative.name):
                     return True
     return False
 
@@ -971,6 +1321,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             differences.append((candidate, set(changes.split("\0")) - {""}))
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
+        recorded = latest_module_reads()
+        if isinstance(recorded, LocalModuleReadsUnavailable):
+            return FullSuite("local module read snapshot unavailable")
         paths, blobs = worktree_files(repo, dirty)
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
@@ -978,18 +1331,19 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
         config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
         configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
-        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
-        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+        known_configs = recorded.known_modules.get("config_reads", frozenset())
+        known_folders = recorded.known_modules.get("folder_scans", frozenset())
+        known_contents = recorded.known_modules.get("content_reads", frozenset())
         content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
-        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
+        check_folder_history = bool(changed and known_folders)
+        base_blobs = revision_files(repo, base.commit) if check_folder_history else {}
+        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if check_folder_history else set()
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
         old_graph: dict[str, set[str]] = {}
         if removed:
-            old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
+            old_blobs = base_blobs if check_folder_history else revision_files(repo, base.commit)
             old_paths = {path for path in old_blobs if path.endswith(".py")}
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
@@ -1000,22 +1354,27 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 folder_stems[str(Path(source).parent)].add(Path(source).stem)
         named = changed | script_callers(repo, set(blobs) | dirty, changed)
         folder_names = folder_names_of(named)
+        helpers = test_only_helpers(graph)
+        # A removed file has no edges in the current graph, so the base graph gives its importers.
+        reaching = reaching_files(graph.imports, changed) | reaching_files(old_graph, removed)
         selected: list[Path] = []
+        no_reads = ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord())
         for module in modules:
             path = module.relative_to(repo).as_posix()
-            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
-            sources = fixture_sources(graph.imports, path)
+            reads = recorded.positive_reads.get(path, no_reads)
+            sources = fixture_sources(graph.imports, helpers, path)
             static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
             config_reads = reads.config_reads
-            config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
-                or bool(config_reads.stems & configs) or bool(static_configs & configs) or "*" in static_configs
+            config_changed = bool(configs) and (path not in known_configs
+                or isinstance(config_reads, RecordedConfigReads) and bool(config_reads.stems & configs)
+                or bool(static_configs & configs) or "*" in static_configs
                 or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
-            folder_changed = path not in declarations and has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
-                or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
-            content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
-                or bool(reads.content_reads.paths & content_changes))
-            if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
+            folder_changed = check_folder_history and path not in declarations and (path not in known_folders
+                or isinstance(reads.folder_scans, RecordedFolderScans)
+                and scans_changed_paths(reads.folder_scans, changed, scanned_parents))
+            content_changed = bool(content_changes) and bool(known_contents) and (path not in known_contents
+                or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & content_changes))
+            if (path in reaching or names_changed_file(graph, sources, named, folder_names)
                     or scans_repository_changes(graph, sources, changed, path, declarations)
                     or config_changed or folder_changed or content_changed):
                 selected.append(module)
@@ -1026,5 +1385,5 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
-    except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
+    except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")

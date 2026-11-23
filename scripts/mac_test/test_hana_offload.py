@@ -33,7 +33,7 @@ from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload

@@ -9,7 +9,7 @@ import shutil
 from time import perf_counter
 from typing import NamedTuple
 
-from scripts.lib.checkout_test_support import runtime_files
+from scripts.lib.runtime_copy_test_support import runtime_files
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -19,21 +19,6 @@ COPY_HELPERS = (
     "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
-VERIFY_TEST_ENVIRONMENT = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "TZ", "TMPDIR", "TERM",
-    # Keep the test runner's Python process settings in fixture subprocesses.
-    "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
-})
-# Every fixture says who started its queue requests, so the queue never refuses a test run.
-FIXTURE_OWNER = "test fixture"
-
-
-def verify_test_environment() -> dict[str, str]:
-    """Read the allowed caller settings, set the fixture locale, and name the fixture owner."""
-    environment = {name: value for name, value in os.environ.items() if name in VERIFY_TEST_ENVIRONMENT}
-    environment["LANG"] = environment["LC_ALL"] = "C"
-    environment["CLAUDE_SESSION_NAME"] = FIXTURE_OWNER
-    return environment
 
 
 class CopyTime(NamedTuple):

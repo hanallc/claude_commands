@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import (
     PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,

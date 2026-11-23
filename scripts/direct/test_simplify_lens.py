@@ -19,7 +19,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lib import build_folders
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry

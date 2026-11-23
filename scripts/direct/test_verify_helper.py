@@ -12,7 +12,7 @@ import tempfile
 from typing import BinaryIO, cast, override
 import unittest
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.agents.detached_runs import RunRecord
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

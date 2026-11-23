@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from scripts.production.change_review_test_support import registered_fixture_image
 
-from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
+from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records

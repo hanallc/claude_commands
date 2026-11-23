@@ -8,7 +8,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.build_queue import placement
 
 from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture

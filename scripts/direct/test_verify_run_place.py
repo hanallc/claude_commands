@@ -1,9 +1,11 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
-from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
+from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 from dataclasses import replace
 import json

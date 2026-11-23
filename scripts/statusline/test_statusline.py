@@ -1,7 +1,7 @@
 """Tests for statusline.sh and statusline.jq: the role, the usage line, its reset times, and their zone."""
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json

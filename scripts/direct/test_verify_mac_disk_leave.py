@@ -9,7 +9,7 @@ import unittest
 from typing import final
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.build_queue.test_placement import (

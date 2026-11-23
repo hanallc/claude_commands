@@ -27,7 +27,7 @@ from scripts.build_queue import (admission_client, admission_protocol as wire, a
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
-from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lib.fixture_environment_test_support import FIXTURE_OWNER
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit

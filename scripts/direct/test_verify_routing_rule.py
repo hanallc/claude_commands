@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from typing import cast, override
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.build_targets import build_targets, targets
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture

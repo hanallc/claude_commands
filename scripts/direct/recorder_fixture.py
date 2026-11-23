@@ -5,7 +5,7 @@ from __future__ import annotations
 from scripts.direct import pass_record as pass_recorder
 
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 

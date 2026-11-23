@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.build_queue import admission_records
 
 import json

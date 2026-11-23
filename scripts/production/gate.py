@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -67,7 +67,6 @@ import shutil
 import signal
 import stat
 import statistics
-import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -109,7 +108,7 @@ from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
-from scripts.test_times import gate_record
+from scripts.test_times import gate_record, recent_gate_times
 from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_queue import progress_profile
@@ -1080,17 +1079,8 @@ def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
 
 def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
                     targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
-    """Read the report index and rebuild an index without the vCPU column."""
-    from scripts.buildlog import index
-
-    path = index.index_path()
-    if not path.exists() and not any(store.root().glob("*/*.jsonl")):
-        with closing(sqlite3.connect(":memory:")) as connection:
-            index.create_schema(connection)
-            return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
-    _ = index.update()
-    with closing(sqlite3.connect(index.read_only_path_uri(path), uri=True)) as connection:
-        return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+    """Read the saved passing walls for this gate."""
+    return recent_gate_times.read_time_limit(vcpus, modules, jobs, targeted)
 
 
 def failure_log_tail(output: str) -> str:

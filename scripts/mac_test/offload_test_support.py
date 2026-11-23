@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from scripts.build_queue import execution_identity
-from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
+from scripts.lib.checkout_test_support import write_python_tool
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone

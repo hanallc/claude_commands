@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+import io
 import json
 import os
 from pathlib import Path
@@ -13,8 +15,17 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
+from scripts.aws_target import cloud_gate
+from scripts.buildlog import index, store
 from scripts.production import affected_modules as affected
+from scripts.production import gate, mac_gate_process
+from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
+
+
+# A helper that copies a data folder, as a test fixture does.
+COPY_SCAN = ("from pathlib import Path\nROOT = Path(__file__).resolve().parents[2]\n"
+             + "def copy_data():\n    return list((ROOT / 'scripts/data').rglob('*'))\n")
 
 
 class AffectedModulesTests(unittest.TestCase):
@@ -34,8 +45,8 @@ class AffectedModulesTests(unittest.TestCase):
         self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
-        self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.
         for index in range(10):
@@ -65,12 +76,19 @@ class AffectedModulesTests(unittest.TestCase):
         self.base = affected.CertifiedBase(self.commit(), datetime.now(UTC).isoformat())
         self.record_configs({})
 
-    def record_configs(self, reads: dict[str, list[str]]) -> None:
+    def config_gate(self, reads: dict[str, list[str]]) -> dict[str, object]:
         modules = [{"suite": path.parent.name, "module": path.name, "attempt": 1,
                     "config_reads": reads.get(path.name, [])} for path in self.modules]
-        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-full", "host": "mac",
-               "selection": "full", "aborted": False, "modules": modules}
-        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        return {**gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-full", "host": "mac",
+                "selection": "full", "aborted": False, "modules": modules}
+
+    def record_history(self, *runs: dict[str, object], host: str = "natedev") -> None:
+        gate_record.latest_module_reads_path(host).unlink(missing_ok=True)
+        for run in runs:
+            gate_record.update_latest_module_reads(run, cast(list[object], run["modules"]), host=host)
+
+    def record_configs(self, reads: dict[str, list[str]]) -> None:
+        self.record_history(self.config_gate(reads))
 
     def selection(self) -> affected.AffectedSelection:
         result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
@@ -89,9 +107,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_named.py", '# config/limits.conf\n')
         self.add_test("checks/test_missing.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_runtime.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        run = cast(dict[str, object], json.loads(log.read_text()))
+        run = self.config_gate({"test_runtime.py": ["limits"]})
         module_rows = cast(list[dict[str, object]], run["modules"])
         for row in module_rows:
             if row["module"] == "test_missing.py":
@@ -100,37 +116,36 @@ class AffectedModulesTests(unittest.TestCase):
                    "modules": [{**row, "config_reads": ["limits"]} for row in module_rows]}
         aborted = {**earlier, "id": "aborted", "started_at": "2030-01-01T00:00:00Z", "aborted": True}
         affected_run = {**aborted, "id": "affected", "aborted": False, "selection": "affected"}
-        _ = log.write_text("".join(json.dumps(row) + "\n" for row in (earlier, run, aborted, affected_run)))
+        self.record_history(earlier, run, aborted, affected_run)
         self.add_test("checks/test_new.py", "VALUE = 1\n")
         self.write("config/limits.conf", "value=two\n")
-        from scripts.buildlog import index
-        with mock.patch.object(index, "read_only", wraps=index.read_only) as reads:
+        with (mock.patch.object(index, "update", side_effect=AssertionError("updated the index")),
+              mock.patch.object(index, "read_only", side_effect=AssertionError("opened the index")),
+              mock.patch.object(index, "update_lock", side_effect=AssertionError("locked the index")),
+              mock.patch.object(sqlite3, "connect", side_effect=AssertionError("opened SQLite"))):
             selected = self.selection()
-        self.assertEqual(reads.call_count, 1)
         self.assertEqual({path.name for path in selected.modules}, {"test_runtime.py", "test_named.py", "test_new.py", "test_missing.py"})
-        with mock.patch.object(index, "read_only", side_effect=sqlite3.OperationalError("unreadable index")):
+        with mock.patch.object(affected, "latest_module_reads", side_effect=PermissionError("unreadable read history")):
             result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
-        self.assertIn("unreadable index", result.reason)
+        self.assertIn("unreadable read history", result.reason)
         self.write("config/limits.conf", "value=one\n")
         (self.repo / "scripts/checks/test_new.py").unlink()
-        with mock.patch.object(affected, "latest_module_reads", side_effect=AssertionError("No config changed")):
-            _ = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
+        clean = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
+        self.assertEqual(clean, affected.AffectedSelection(self.base, (), ()))
 
     def test_config_selection_skips_a_newer_full_gate_without_config_records(self) -> None:
         self.write("config/limits.conf", "value=one\n")
         self.add_test("checks/test_reader.py", "VALUE = 1\n")
         self.add_test("checks/test_other.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_reader.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        recorded = cast(dict[str, object], json.loads(log.read_text()))
+        recorded = self.config_gate({"test_reader.py": ["limits"]})
         module_rows = cast(list[dict[str, object]], recorded["modules"])
         unrecorded = {**recorded, "id": "newer-unrecorded", "started_at": "2030-01-01T00:00:00Z",
                       "modules": [{key: value for key, value in row.items() if key != "config_reads"}
                                   for row in module_rows]}
-        _ = log.write_text("".join(json.dumps(row) + "\n" for row in (recorded, unrecorded)))
+        self.record_history(recorded, unrecorded)
         self.write("config/limits.conf", "value=two\n")
         self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
 
@@ -158,14 +173,13 @@ class AffectedModulesTests(unittest.TestCase):
                 if removed or label in {"changed file", "changed recursive file", "changed config"}:
                     self.write(path, "base\n")
                 self.certify()
-                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-                run = cast(dict[str, object], json.loads(log.read_text()))
+                run = self.config_gate({})
                 module_rows = cast(list[dict[str, object]], run["modules"])
                 for row in module_rows:
                     row["folder_scans"] = (["scripts/", "commands/", "docs/"]
                                            if row["module"] == "test_staff_accessors.py" and label == "added accessor"
                                            else folders if row["module"] == "test_folder.py" else [])
-                _ = log.write_text(json.dumps(run) + "\n")
+                self.record_history(run)
                 if removed:
                     (self.repo / path).unlink()
                     if label == "removed directory":
@@ -330,8 +344,7 @@ class AffectedModulesTests(unittest.TestCase):
             with self.subTest(case=label):
                 self.write(path, "VALUE = 1\n")
                 self.certify()
-                log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-                run = cast(dict[str, object], json.loads(log.read_text()))
+                run = self.config_gate({})
                 module_rows = cast(list[dict[str, object]], run["modules"])
                 for row in module_rows:
                     row["folder_scans"] = []
@@ -345,7 +358,7 @@ class AffectedModulesTests(unittest.TestCase):
                             "started_at": "2030-01-01T00:00:00Z",
                             "modules": [{**row, "content_reads": []} for row in module_rows]}
                            for selection, aborted in (("full", True), ("affected", False))]
-                _ = log.write_text("".join(json.dumps(record) + "\n" for record in (run, newer, *ignored)))
+                self.record_history(run, newer, *ignored)
                 if removed:
                     (self.repo / path).unlink()
                 else:
@@ -360,9 +373,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_folder.py", "VALUE = 1\n")
         self.add_test("checks/test_unrecorded.py", "VALUE = 1\n")
         self.certify()
-        self.record_configs({"test_config.py": ["limits"]})
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        config_gate = cast(dict[str, object], json.loads(log.read_text()))
+        config_gate = self.config_gate({"test_config.py": ["limits"]})
         config_rows = cast(list[dict[str, object]], config_gate["modules"])
         folder_rows = [{key: value for key, value in row.items() if key != "config_reads"} for row in config_rows]
         for row in folder_rows:
@@ -376,11 +387,166 @@ class AffectedModulesTests(unittest.TestCase):
             ignored = {**folder_gate, "id": "ignored", "started_at": "2032-01-01T00:00:00Z",
                        "selection": selection, "aborted": aborted,
                        "modules": [{**row, "folder_scans": ["/"]} for row in folder_rows]}
-            _ = log.write_text("".join(json.dumps(run) + "\n" for run in (config_gate, folder_gate, empty_gate, ignored)))
+            self.record_history(config_gate, folder_gate, empty_gate, ignored)
             self.write("config/limits.conf", "value=two\n")
             self.write("assets/new.txt", "added\n")
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
+
+    def test_latest_read_file_matches_the_index(self) -> None:
+        template = {"suite": "checks", "module": "test_read.py", "attempt": 1}
+        full = self.config_gate({})
+        config = {**full, "id": "config", "started_at": "1", "modules": [
+            {**template, "config_reads": ["old"]},
+            {**template, "module": "test_old_only.py", "config_reads": ["old"]},
+        ]}
+        folders = {**full, "id": "folders", "started_at": "2", "modules": [
+            {**template, "folder_scans": ["/", "docs/"]},
+            {**template, "module": "test_missing.py"},
+        ]}
+        contents = {**full, "id": "contents", "started_at": "3", "modules": [
+            {**template, "config_reads": ["old"], "content_reads": [], "status": 0},
+        ]}
+        newest_modules: list[dict[str, object]] = [
+            {**template, "config_reads": ["limits"], "status": 143, "restart": "hold"},
+            {**template, "attempt": 2, "config_reads": ["tools", "limits"], "status": 1},
+            {**template, "module": "test_empty.py", "config_reads": []},
+        ]
+        newest = {**full, "id": "newest", "started_at": "3", "status": 1, "modules": newest_modules}
+        aborted = {**config, "id": "aborted", "started_at": "4", "aborted": True}
+        subset = {**config, "id": "subset", "started_at": "5", "selection": "subset"}
+        unrecorded = {**full, "id": "no-reads", "started_at": "6", "modules": [template]}
+        runs = (newest, contents, subset, config, unrecorded, folders, aborted)
+        self.record_history(*runs)
+        published = affected.latest_module_reads()
+        gate_record.latest_module_reads_path("natedev").unlink()
+
+        expected: dict[str, dict[gate_record.ReadField, list[str]]] = {}
+        with closing(sqlite3.connect(":memory:")) as connection:
+            index.create_schema(connection)
+            for run in runs:
+                index.add_gate_run(connection, {**run, "host": "natedev"}, "natedev/2026-11.jsonl")
+            for field in gate_record.READ_FIELDS:
+                newest_id = cast(tuple[str], connection.execute(f"""
+                    SELECT module.run_id FROM gate_modules AS module
+                    JOIN gate_runs AS run ON run.id = module.run_id
+                    WHERE run.selection = 'full' AND run.aborted = 0 AND module.{field} IS NOT NULL
+                    ORDER BY run.started_at DESC, run.id DESC LIMIT 1
+                """).fetchone())[0]
+                rows = cast(list[tuple[str, str, str | None]], connection.execute(
+                    f"SELECT suite, module, {field} FROM gate_modules WHERE run_id = ?", (newest_id,),
+                ).fetchall())
+                for suite, module, values in rows:
+                    fields = expected.setdefault(f"scripts/{suite}/{module}", {})
+                    if values is not None:
+                        fields.setdefault(field, []).extend(cast(list[str], json.loads(values)))
+            gate_record.seed_latest_module_reads(connection)
+        oracle = {name: gate_record.module_read_record(fields.get("config_reads"),
+                  fields.get("folder_scans"), fields.get("content_reads")) for name, fields in expected.items()}
+        history = gate_record.ModuleReadHistory(
+            oracle, {field: frozenset(name for name, fields in expected.items() if field in fields)
+                     for field in gate_record.READ_FIELDS},
+        )
+        self.assertEqual(published, history)
+        self.assertEqual(affected.latest_module_reads(), history)
+
+    def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
+        self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
+        self.certify()
+        self.record_history(self.config_gate({}), host="Mac")
+        self.write("docs/guide.md", "changed\n")
+        local_path = gate_record.latest_module_reads_path("natedev")
+        found = [(path.parent.name, path) for path in self.modules]
+        expected = {path.relative_to(self.repo).as_posix() for path in self.modules}
+        cloud_result = gate.GateRun((), 0.0, 0.0)
+        for label, contents in (("missing", None), ("blank", ""), ("empty", "{}"),
+                                ("invalid JSON", "{"), ("invalid field", '{"config_reads":4}')):
+            with self.subTest(case=label):
+                if contents is None:
+                    local_path.unlink()
+                else:
+                    _ = local_path.write_text(contents)
+                self.assertEqual(affected.select_affected(self.repo, self.base, self.modules, {"docs/guide.md"}),
+                                 affected.FullSuite("local module read snapshot unavailable"))
+                with (mock.patch.object(gate, "discover_test_modules", return_value=found),
+                      mock.patch.object(gate.PassedTreeLedger, "certified_base", return_value=self.base),
+                      mock.patch.object(gate.PassedTreeLedger, "reuse", return_value=False),
+                      mock.patch.object(mac_gate_process, "load_mac_gate_route",
+                                        side_effect=ModuleNotFoundError(name=mac_gate_process.MAC_GATE_MODULE)),
+                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", {"docs/guide.md"})),
+                      mock.patch.object(cloud_gate, "route", return_value=cloud_result) as route,
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED,
+                                                          target=gate.NO_GATE_ASSIGNMENT), cloud_result)
+                selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
+                self.assertEqual(set(selection.paths), expected)
+
+    def test_mac_snapshot_adds_a_module_to_natedev_selection(self) -> None:
+        self.add_test("checks/test_local.py", "VALUE = 1\n")
+        self.add_test("checks/test_mac.py", "VALUE = 1\n")
+        self.certify()
+        self.record_configs({"test_local.py": ["limits"], "test_mac.py": ["tools"]})
+        self.write("config/limits.conf", "value=one\n")
+        self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py"})
+
+        self.record_history(self.config_gate({"test_mac.py": ["limits"]}), host="Mac")
+        self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py", "test_mac.py"})
+        reads = affected.latest_module_reads()
+        assert isinstance(reads, gate_record.ModuleReadHistory)
+        self.assertEqual(reads.positive_reads["scripts/checks/test_mac.py"],
+                         gate_record.module_read_record(["limits", "tools"], None, None))
+
+    def test_newest_host_snapshot_decides_unknown_content_reads(self) -> None:
+        for name in ("dynamic", "null", "older_match", "empty"):
+            self.add_test(f"checks/test_{name}.py", "VALUE = 1\n")
+        self.certify()
+        old = self.config_gate({})
+        rows = cast(list[dict[str, object]], old["modules"])
+        change = "docs/guide.md"
+        self.record_history({**old, "started_at": "2026-11-01", "modules": [
+            {**row, "content_reads": [change] if row["module"] == "test_older_match.py" else []} for row in rows
+        ]})
+        self.record_history({**old, "started_at": "2026-11-02", "modules": [
+            {**row, "content_reads": None if row["module"] == "test_null.py" else []}
+            for row in rows if row["module"] != "test_dynamic.py"
+        ]}, host="Mac")
+
+        self.write(change, "changed\n")
+        self.assertEqual({path.name for path in self.selection().modules},
+                         {"test_dynamic.py", "test_null.py", "test_older_match.py"})
+
+    def test_unknown_folder_scans_require_a_changed_path(self) -> None:
+        self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
+        self.certify()
+        old = self.config_gate({})
+        rows: list[dict[str, object]] = [
+            {**row, "folder_scans": []} for row in cast(list[dict[str, object]], old["modules"])
+        ]
+        self.record_history({**old, "started_at": "2026-11-01", "modules": rows})
+        self.record_history({**old, "started_at": "2026-11-02", "modules": [
+            row for row in rows if row["module"] != "test_dynamic.py"
+        ]}, host="Mac")
+
+        self.assertEqual(self.selection(), affected.AffectedSelection(self.base, (), ()))
+        self.write("docs/guide.md", "changed\n")
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_dynamic.py",))
+
+    def test_corrupt_or_missing_mac_snapshot_is_skipped(self) -> None:
+        self.add_test("checks/test_local.py", "VALUE = 1\n")
+        self.certify()
+        self.record_configs({"test_local.py": ["limits"]})
+        self.write("config/limits.conf", "value=one\n")
+        self.write(".git/buildlog/Mac/2026-11.jsonl", "")
+        peer = gate_record.latest_module_reads_path("Mac")
+        for label, contents in (("missing", None), ("corrupt", "{")):
+            with self.subTest(case=label):
+                if contents is not None:
+                    _ = peer.write_text(contents)
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    self.assertEqual({path.name for path in self.selection().modules}, {"test_local.py"})
+                line, = stderr.getvalue().splitlines()
+                self.assertIn(str(peer), line)
 
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
@@ -559,10 +725,11 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(actual[0]["scripts/component/test_adapter.py"], {"scripts/component/subject.py"})
         self.assertEqual(actual[0]["scripts/component/test_link.py"], {"scripts/component/subject.py"})
 
-    def test_bare_imports_select_each_matching_source_without_transitive_selection(self) -> None:
+    def test_bare_imports_select_each_matching_source_and_imports_select_through_each_step(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/duplicate/subject.py", "VALUE = 1\n")
         self.write("scripts/component/adapter.py", "from scripts.component import subject\n")
+        self.write("scripts/component/adapter_cli.py", "import scripts.component.adapter\n")
         self.add_test("checks/test_qualified.py", "import scripts.component.adapter\n")
         self.add_test("checks/test_bare.py", "from subject import VALUE\n")
         self.add_test("checks/test_mention.py", 'SOURCE = "../component/subject.py"\n')
@@ -571,7 +738,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         result = self.selection()
         self.assertCountEqual([path.name for path in result.modules],
-                              ["test_bare.py"])
+                              ["test_bare.py", "test_qualified.py"])
         self.assertEqual(result.changed_files, ("scripts/component/subject.py",))
         # Bare imports conservatively cover every same-named source.
         self.certify()
@@ -763,9 +930,10 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertIn("graph error:", result.reason)
         self.assertIn("broken.py", result.reason)
 
-    def test_direct_imports_and_same_folder_select_without_a_second_import_step(self) -> None:
+    def test_imports_through_each_step_and_same_folder_select(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/adapters/adapter.py", "import scripts.component.subject\n")
+        self.write("scripts/adapters/adapter_cli.py", "import scripts.adapters.adapter\n")
         self.add_test("checks/test_direct.py", "import scripts.component.subject\n")
         self.add_test("checks/test_indirect.py", "import scripts.adapters.adapter\n")
         self.add_test("component/test_neighbor.py", "VALUE = 1\n")
@@ -784,13 +952,14 @@ class AffectedModulesTests(unittest.TestCase):
                     _ = self.commit()
                 self.assertCountEqual(self.selection().modules,
                                       [self.repo / "scripts" / path for path in
-                                       ("checks/test_direct.py", "component/test_named.py",
+                                       ("checks/test_direct.py", "checks/test_indirect.py", "component/test_named.py",
                                         "component/test_plain.py", "component/test_comment.py")])
 
     def test_complete_path_tokens_select_only_the_test_that_names_the_path(self) -> None:
         self.write("config/custom.json", "{}\n")
         self.write("verify.sh", "true\n")
         self.write("scripts/adapters/adapter.py", "# config/custom.json\n")
+        self.write("scripts/adapters/adapter_cli.py", "import scripts.adapters.adapter\n")
         self.add_test("checks/test_path.py", "# ./config/custom.json\n")
         self.add_test("checks/test_root_path.py", "SCRIPT = 'verify.sh'\n")
         self.add_test("checks/test_fragment.py", "PATHS = 'custom.json old/config/custom.json config/custom.json.bak'\n")
@@ -812,6 +981,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/component/test_fixture.py", "from scripts.component import relay_test_support\n")
         self.write("scripts/adapters/path_adapter.py",
                    "from scripts.component import reader_test_support\n")
+        self.write("scripts/adapters/adapter_cli.py", "from scripts.adapters import path_adapter\n")
         for path, text in (
             ("component/test_support_path.py", "from scripts.component import relay_test_support\n"),
             ("checks/test_folder_path.py", "PARTS = 'component tool.sh'\n"),
@@ -825,6 +995,39 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_support_path.py", "test_folder_path.py", "test_inherited_fixture.py"])
+
+    def test_a_test_only_helper_without_a_support_name_brings_its_scan(self) -> None:
+        self.write("scripts/data/input.txt", "before\n")
+        self.write("scripts/component/copy_fixture.py", COPY_SCAN)
+        self.write("scripts/component/recorder.py", "from scripts.component import copy_fixture\n")
+        self.add_test("checks/test_copy.py", "from scripts.component import recorder\n")
+        self.certify()
+        self.write("scripts/data/input.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_copy.py",))
+
+    def test_a_change_selects_through_a_helper_and_two_production_modules(self) -> None:
+        self.write("scripts/component/second.py", "VALUE = 1\n")
+        self.write("scripts/component/first.py", "from scripts.component import second\n")
+        self.write("scripts/component/cli.py", "from scripts.component import first\nif __name__ == '__main__':\n    pass\n")
+        self.write("scripts/fixtures/first_test_support.py", "from scripts.component import first\n")
+        self.add_test("checks/test_through.py", "from scripts.fixtures import first_test_support\n")
+        self.certify()
+        self.write("scripts/component/second.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_through.py",))
+
+    def test_a_module_that_production_imports_is_not_followed(self) -> None:
+        self.write("scripts/data/input.txt", "before\n")
+        self.write("scripts/component/copy_tool.py", COPY_SCAN)
+        self.write("scripts/component/runner.py", "from scripts.component import copy_tool\n")
+        self.write("scripts/component/copy_main.py", COPY_SCAN + "if __name__ == '__main__':\n    copy_data()\n")
+        self.add_test("checks/test_tool.py", "from scripts.component import copy_tool\n")
+        self.add_test("checks/test_main.py", "from scripts.component import copy_main\n")
+        self.certify()
+        self.write("scripts/data/input.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
 
     def test_a_changed_script_selects_tests_of_every_script_that_calls_it(self) -> None:
         self.write("scripts/component/tool.sh", "# runner.sh calls this file.\ntrue\n")
@@ -931,6 +1134,186 @@ class AffectedModulesTests(unittest.TestCase):
         self.modules.remove(deleted)
         _ = self.commit()
         self.assertEqual(self.selection().modules, ())
+
+
+class RepositoryScanInferenceTests(unittest.TestCase):
+    """Infer repository scans from source text, without a Git fixture."""
+
+    PATH: str = "scripts/checks/test_scan.py"
+    HEADER: str = ("import ast, os, shutil, tempfile, unittest\nfrom dataclasses import dataclass\nfrom pathlib import Path\n"
+                   + "ROOT = Path(__file__).resolve().parents[2]\n")
+
+    def scans(self, body: str) -> frozenset[affected.RepositoryScan]:
+        facts = affected.extract_facts(self.HEADER + body, self.PATH)
+        cached = cast(object, json.loads(json.dumps(affected.encoded_scan_scopes(facts.scan_scopes))))
+        self.assertEqual(affected.decoded_scan_scopes(cached), facts.scan_scopes)
+        return affected.repository_scan_graph(Path("/fixture"), {self.PATH: facts}, {})[self.PATH]
+
+    def selects(self, body: str, changed: str) -> bool:
+        graph = affected.SourceGraph({}, {}, {}, {self.PATH: self.scans(body)})
+        return affected.scans_repository_changes(graph, {self.PATH}, {changed}, self.PATH, {})
+
+    def test_a_literal_loop_gives_one_scan_root_for_each_value(self) -> None:
+        scans = self.scans("def files():\n"
+                           + "    return [path for folder in ('scripts', 'config') for path in (ROOT / folder).rglob('*')]\n"
+                           + "def pages():\n    for folder in ['docs']:\n        yield from (ROOT / folder).glob('*.md')\n"
+                           + "def notes():\n    folders = ('notes', 'plans')\n"
+                           + "    for folder in folders:\n        yield from (ROOT / folder).glob('*.md')\n")
+        self.assertEqual(scans, {affected.RepositoryScan("scripts", "*", True), affected.RepositoryScan("config", "*", True),
+                                 affected.RepositoryScan("docs", "*.md", False),
+                                 affected.RepositoryScan("notes", "*.md", False),
+                                 affected.RepositoryScan("plans", "*.md", False)})
+
+    def test_a_syntax_tree_walk_is_not_a_folder_scan(self) -> None:
+        self.assertEqual(self.scans("NODES = list(ast.walk(ast.parse('VALUE = 1')))\n"), frozenset())
+        whole = {affected.RepositoryScan(".", "*", True)}
+        self.assertEqual(self.scans("FOLDERS = list(os.walk(Path(os.environ['ROOT'])))\n"), whole)
+        self.assertEqual(self.scans("def scan(ast):\n    return list(ast.walk(Path(os.environ['ROOT'])))\n"
+                                    + "FOUND = scan(Path())\n"), whole)
+
+    def test_an_unproven_loop_value_keeps_the_whole_tree_scan(self) -> None:
+        bodies = (
+            "def scan():\n    for folder in ('scripts',):\n        folder = folder + 'x'\n"
+            + "        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ['scripts']\n    folders.append('lib')\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    try:\n        pass\n    except OSError as folders:\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    def change():\n        nonlocal folders\n        folders = ('lib',)\n"
+            + "    change()\n    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folder = 'scripts'\n    def change():\n        nonlocal folder\n        folder = 'lib'\n"
+            + "    for folder in ('scripts',):\n        change()\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "FOLDERS = ('scripts',)\ndef change():\n    global FOLDERS\n    FOLDERS = ('lib',)\n"
+            + "for folder in FOLDERS:\n    FOUND = list((ROOT / folder).rglob('*.py'))\n",
+            "def scan():\n    folders = ('scripts',)\n    def folders():\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    @register(folders := ('lib',))\n    def change():\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    names = ('a', 'b', 'c', 'd', 'e', 'f')\n    for first in names:\n        for second in names:\n"
+            + "            yield from (ROOT / first / second).rglob('*.py')\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(self.scans(body), {affected.RepositoryScan(".", "*.py", True)})
+
+    def test_the_loop_value_limit_allows_a_product_up_to_the_limit(self) -> None:
+        scans = self.scans("def scan():\n    for first in ('a', 'b', 'c', 'd'):\n"
+                           + "        for second in ('e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'):\n"
+                           + "            yield from (ROOT / first / second).glob('*.py')\n")
+        self.assertEqual(len(scans), affected.LOOP_VARIANT_LIMIT)
+        self.assertIn(affected.RepositoryScan("d/l", "*.py", False), scans)
+
+    def test_a_name_filter_rejects_names_only_before_a_file_read(self) -> None:
+        runtime = ("def runtime_files():\n    helpers = ('test_support.py',)\n"
+                   + "    return tuple(path.relative_to(ROOT) for folder in ('scripts', 'config')\n"
+                   + "                 for path in sorted((ROOT / folder).rglob('*'))\n"
+                   + "                 if (path.is_file() or path.is_symlink() and path.is_dir()) and '__pycache__' not in path.parts\n"
+                   + "                 and (path.suffix != '.py' or not path.name.startswith('test_') or path.name in helpers))\n")
+        pages = ("def pages():\n    for path in (ROOT / 'docs').glob('*'):\n"
+                 + "        if not path.is_file() or path.name.startswith('draft_'):\n            continue\n        yield path.read_text()\n")
+        suffix = pages.replace("not path.is_file() or path.name.startswith('draft_')", "path.suffix == '.txt'")
+        named = pages.replace("not path.is_file() or path.name.startswith('draft_')", "path.name not in ('a.md',)")
+        whole_body = ("def pages():\n    for path in (ROOT / 'docs').glob('*'):\n"
+                      + "        if not path.name.startswith('draft_'):\n            print(path.read_text())\n")
+        cases = (
+            (runtime, "scripts/x/test_x.py", False), (runtime, "scripts/a.py", True),
+            (runtime, "scripts/x/test_support.py", True), (runtime, "scripts/x/test_notes.txt", True),
+            (runtime, "config/gate.conf", True),
+            (pages, "docs/draft_a.md", False), (pages, "docs/a.md", True),
+            (suffix, "docs/a.txt", False), (suffix, "docs/a.md", True),
+            (named, "docs/b.md", False), (named, "docs/a.md", True),
+            (whole_body, "docs/draft_a.md", False), (whole_body, "docs/a.md", True),
+            (runtime.replace("('test_support.py',)", "{'test_support.py'}"), "scripts/x/test_x.py", True),
+            (pages.replace("        yield path.read_text()\n", "        yield path.read_text()\n    else:\n        pass\n"),
+             "docs/draft_a.md", True),
+            (pages.replace("        yield path.read_text()\n", "        yield path.read_text()\n    print(path)\n"),
+             "docs/draft_a.md", True),
+            (pages.replace("yield path.read_text()", "yield lambda: path.read_text()"), "docs/draft_a.md", True),
+            ("def f():\n    for p in (ROOT / 'docs').glob('*'):\n        if (q := p).is_file() and not p.name.startswith('draft_'):\n"
+             + "            print(q)\n", "docs/draft_a.md", True),
+        )
+        for body, changed, selected in cases:
+            with self.subTest(body=body, changed=changed):
+                self.assertEqual(self.selects(body, changed), selected)
+
+    def test_a_missing_argument_takes_the_parameter_default(self) -> None:
+        cases = (
+            ("def scan(root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "docs/a.md", True),
+            ("def scan(root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "notes/a.md", False),
+            ("def scan(*, root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "docs/a.md", True),
+            ("def scan(root=Path.cwd()):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "notes/a.md", True),
+            ("def scan(root=None):\n    return list(root.glob('*.md'))\ndef test():\n    return scan(ROOT / 'docs')\n",
+             "notes/a.md", False),
+            ("def scan(root=None):\n    return list(root.glob('*.md'))\ndef test():\n    return scan(ROOT / 'docs')\n",
+             "docs/a.md", True),
+        )
+        for body, changed, selected in cases:
+            with self.subTest(body=body, changed=changed):
+                self.assertEqual(self.selects(body, changed), selected)
+
+    def test_unproven_reads_keep_their_scan(self) -> None:
+        cases = (
+            ("f = 'notes'\nclass Folders:\n    for f in ('docs',):\n"
+             + "        FILES = [q for x in ('a',) for q in (ROOT / f).glob('*')]\n", "notes/a.md"),
+            ("f = 'notes'\nclass Folders:\n    for f in ('docs',):\n"
+             + "        FILES = [list((ROOT / f).glob('*')) for x in ('a',)]\n", "notes/a.md"),
+            ("FOLDER = ROOT / 'notes'\nclass Folders:\n    FOLDER = ROOT / 'docs'\n"
+             + "    FILES = [q for x in ('a',) for q in FOLDER.glob('*')]\n", "notes/a.md"),
+            ("def collect():\n    global p\n    for p in (ROOT / 'docs').glob('*'):\n"
+             + "        if p.name.startswith('draft_'):\n            continue\n"
+             + "def later():\n    return p.read_text()\n", "docs/draft_a.md"),
+            ("def outer():\n    p = None\n    def collect():\n        nonlocal p\n"
+             + "        for p in (ROOT / 'docs').glob('*'):\n            if p.name.startswith('draft_'):\n"
+             + "                continue\n    collect()\n    return p.read_text()\n", "docs/draft_a.md"),
+            ("FOLDERS = ('docs', 'notes')\nclass Folders:\n    FOLDERS = ('docs',)\n"
+             + "    FILES = [p for x in ('a',) for f in FOLDERS for p in (ROOT / f).glob('*.md')]\n", "notes/a.md"),
+            ("FOLDERS = ('docs', 'notes')\nclass Folders:\n    for x in ('a',):\n        for f in FOLDERS:\n"
+             + "            FOUND = list((ROOT / f).glob('*.md'))\n    FOLDERS = ('docs',)\n", "notes/a.md"),
+            ("def f():\n    return [p for p in (ROOT / 'docs').glob('*') if p.read_text() if not p.name.startswith('draft_')]\n",
+             "docs/draft_a.md"),
+            ("def f():\n    for p in (ROOT / 'docs').glob('*'):\n        if 'x' in p.read_text() and not p.name.startswith('draft_'):\n"
+             + "            print(p)\n", "docs/draft_a.md"),
+            ("def f():\n    folders = ['docs']\n    folders.append('notes')\n    for folder in folders:\n"
+             + "        yield from (ROOT / folder).glob('*.md')\n", "notes/a.md"),
+            ("def f():\n    keep = {'a.md'}\n    keep.add('b.md')\n    return [p for p in (ROOT / 'docs').glob('*') if p.name in keep]\n",
+             "docs/b.md"),
+            ("class Other(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "class Case(unittest.TestCase):\n    @property\n    def root(self):\n        return ROOT / 'docs'\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "docs/a.md"),
+            ("class Other(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "@dataclass\nclass Fixture:\n    root: Path\n    def files(self):\n        return list(self.root.glob('*.md'))\n"
+             + "def use():\n    return Fixture(ROOT / 'docs').files()\n", "docs/a.md"),
+            ("from scripts.lib import support\nclass Case(unittest.TestCase):\n    def setUp(self):\n"
+             + "        self.root = Path(tempfile.mkdtemp())\n        support.point_at_repository(self)\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "a.md"),
+            ("def f():\n    tmp = Path(tempfile.mkdtemp())\n    (tmp / 'link').symlink_to(ROOT / 'docs')\n"
+             + "    return list((tmp / 'link').glob('*.md'))\n", "docs/a.md"),
+            ("def f():\n    tmp = Path(tempfile.mkdtemp())\n    shutil.copytree(ROOT / 'docs', tmp / 'docs')\n"
+             + "    return [p.read_text() for p in (tmp / 'docs').glob('*.md')]\n", "docs/a.md"),
+            ("def f():\n    fns = []\n    for p in (ROOT / 'docs').glob('*'):\n        if p.name.startswith('draft_'):\n"
+             + "            continue\n        fns.append(lambda: p.read_text())\n    return fns\n", "docs/draft_a.md"),
+            ("def f():\n    folders = ('docs',)\n    try:\n        pass\n    except Exception as folders:\n        pass\n"
+             + "    for folder in folders:\n        yield from (ROOT / folder).glob('*.md')\n", "docs/a.md"),
+            ("def f():\n    found = [p for p in (ROOT / 'docs').glob('*') if (last := p) and not p.name.startswith('draft_')]\n"
+             + "    return last.read_text()\n", "docs/draft_a.md"),
+            ("def f():\n    with tempfile.TemporaryDirectory() as tmp:\n        for _ in range(2):\n"
+             + "            list(Path(tmp).glob('*.md'))\n            tmp = ROOT / 'docs'\n", "docs/a.md"),
+            ("from unittest import mock\nclass Case(unittest.TestCase):\n    def setUp(self):\n"
+             + "        self.root = Path(tempfile.mkdtemp())\n"
+             + "    @mock.patch('scripts.checks.test_scan.Case.root', ROOT / 'docs', create=True)\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "docs/a.md"),
+            ("class Case(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "        vars(self)['root'] = ROOT / 'docs'\n    def test_scan(self):\n        return list(self.root.glob('*.md'))\n",
+             "docs/a.md"),
+            ("def f():\n    return list(Path(tempfile.mkdtemp(dir=ROOT)).parent.glob('*.md'))\n", "a.md"),
+        )
+        for body, changed in cases:
+            with self.subTest(body=body):
+                self.assertTrue(self.selects(body, changed))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 from typing import cast
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.direct.verify_token_wait_test_support import VERIFY, BOARD
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
