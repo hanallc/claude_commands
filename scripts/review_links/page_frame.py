@@ -618,7 +618,7 @@ function showSendUndo(hold,seconds){
    if(done) return;
    done=true;remove();resolve(undone);
   };
-  // A closed console sends at once. A card frame that goes away leaves the send to the server timer.
+  // A closed console or card frame sends at once.
   const closed=()=>{
    if(done) return;
    done=true;remove();

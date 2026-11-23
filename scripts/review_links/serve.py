@@ -2347,7 +2347,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if action == "send":
             self.json_response(200 if server.send_holds.send_now(hold_id) else 409, {})
             return
-        outcome = server.send_holds.undo(hold_id)
+        try:
+            outcome = server.send_holds.undo(hold_id)
+        except OSError as error:
+            print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The undo failed. The send can still leave."})
+            return
         status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
         self.json_response(status, {"outcome": outcome.value})
 

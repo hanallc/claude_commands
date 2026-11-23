@@ -2071,9 +2071,12 @@ A handler that runs longer than 5 minutes gives the same result, because it can 
 Each saved request is a file, so a server restart sends each request it finds when its time ends.
 A code change restarts the server only when no replay runs and no hold request waits for its answer.
 After that check, no replay starts, and a new held send gets 503: "The console is restarting. Send again."
-A hold file that the server cannot read gets one stderr line, and the sweep deletes it.
+A hold file that the server cannot read gets a stderr line, and the sweep deletes it.
 The sweep also deletes undone marks after 10 minutes, and other files in the folder after 10 minutes.
-If the server cannot write the result of a replay, it keeps the result in memory and deletes the saved request.
+If the server cannot write before a replay, it deletes the saved request and keeps a failed result in memory.
+If the server cannot write the result after a replay, the page reads that result from memory.
+After a restart, that page reads "may have left".
+If the server cannot write the undone mark, the Undo answers 503 and the send still leaves.
 A page can read a result again until the sweep deletes it, 10 minutes after the send.
 A New item that waited through a restart gets the stale token answer. The List page shows it.
 Other pages load a new token and send again, with a new Undo time.

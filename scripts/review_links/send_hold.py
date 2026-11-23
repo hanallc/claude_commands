@@ -125,8 +125,9 @@ def released_file(response: HeldResponse) -> ReleasedFile:
 class Holds:
     """Keep the saved sends of one server and release each one when its time ends.
 
-    The pending ids, their timers and the releases in progress stay in memory, so an undo or a result wait reads
-    no file. Only a release reads the saved request, and only a released result is read back from its file.
+    The pending ids, their timers and the releases in progress stay in memory, so an undo or a result wait for a
+    pending send reads no file. A hold without a timer is read from its file: a result, an undone mark, or a send
+    that the next server releases.
     """
 
     def __init__(self, folder: Path, replay: Replay) -> None:
@@ -199,13 +200,15 @@ class Holds:
         """Cancel a send that the server has not released.
 
         An undone mark replaces the saved words, so a repeated undo, after a lost answer, still says undone.
+        The mark is written before the timer stops, so a failed write raises OSError and the send still leaves.
         """
         with self._lock:
-            timer = self._timers.pop(hold_id, None)
+            timer = self._timers.get(hold_id)
             if timer is not None:
-                timer.cancel()
                 undone: UndoneFile = {"state": "undone", "undone_at": time.time()}
                 self._write(hold_id, undone)
+                del self._timers[hold_id]
+                timer.cancel()
                 return UndoResult.UNDONE
             if hold_id in self._releasing or hold_id in self._failed:
                 return UndoResult.ALREADY_SENT
@@ -294,6 +297,8 @@ class Holds:
         match saved["state"]:
             case "pending":
                 # Only a stopped server keeps a pending file without its timer; the next server sends it.
+                # The wait keeps the page from asking again at once.
+                time.sleep(max(0.0, deadline - time.monotonic()))
                 return HoldState.PENDING
             case "undone":
                 return HoldState.UNDONE

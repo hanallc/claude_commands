@@ -64,6 +64,27 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.undo(hold_id), UndoResult.MISSING)
         self.assertEqual(replays.sent, [])
 
+    def test_a_failed_undo_write_keeps_the_send_and_its_timer(self) -> None:
+        replays = Replays()
+        holds = Holds(self.folder, replays)
+        hold_id = holds.hold("/review", {}, b"words", 0.3)
+        with patch.object(send_hold, "write_text_atomic", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            _ = holds.undo(hold_id)
+        self.assertIs(holds.result(hold_id, wait=0), HoldState.PENDING)
+        self.assertEqual(holds.result(hold_id, wait=5), OK)
+        self.assertEqual(replays.sent, [("/review", {}, b"words")])
+        self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
+
+    def test_a_pending_file_without_a_timer_waits_before_its_answer(self) -> None:
+        holds = Holds(self.folder, Replays())
+        hold_id = holds.hold("/review", {}, b"words", 60)
+        self.assertTrue(holds.stop_if_idle())
+        after = Holds(self.folder, Replays())
+        started = time.monotonic()
+        self.assertIs(after.result(hold_id, wait=0.3), HoldState.PENDING)
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
     def test_a_stop_waits_for_a_hold_request_and_refuses_one_after_it(self) -> None:
         holds = Holds(self.folder, Replays())
         with holds.answering():

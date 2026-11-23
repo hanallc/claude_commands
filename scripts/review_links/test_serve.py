@@ -5,10 +5,12 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.lib.checkout_test_support import python_tool_source
 
+import contextlib
 import fcntl
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import gzip
 import os
@@ -864,6 +866,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             undo = f"{send_hold.HOLD_PATH}/{hold_id}/undo"
             refused = self.held_http("POST", undo, headers={"Origin": "https://elsewhere.invalid"})
             self.assertEqual(refused[0], 403)
+            with patch.object(send_hold, "write_text_atomic", side_effect=OSError("disk full")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.held_http("POST", undo)[::2],
+                                 (503, {"reason": "The undo failed. The send can still leave."}))
+            self.assertEqual(self.hold_states(), ["pending"])
             self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
             # A repeated Undo, after a lost answer, still says undone.
             self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
