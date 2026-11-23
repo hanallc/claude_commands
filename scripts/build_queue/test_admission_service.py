@@ -157,6 +157,30 @@ class PlacementStatusTests(unittest.TestCase):
             assert isinstance(closed, wire.DispatchStatus), type(closed)
             self.assertEqual(closed.state, placement.ClosedAssignment("local execution has ended"))
 
+    def test_placement_poll_with_a_dead_coordinator_reading_drops_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(initial.position, 1)
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            owner = wire.Owner(request.owner.pid, request.owner.start_time)
+            peer = fixture.connect(request)
+            fixture.proc.kill(owner)
+            server.system_reader = FixedSystemReader(replace(evidence,
+                processes={pid: state for pid, state in evidence.processes.items() if pid != owner.pid},
+                read_at=fixture.clock.now(), started_monotonic=fixture.clock.monotonic()))
+            os.eventfd_write(server.reading_events, 1)
+            waiting, = peer.replies()
+            assert isinstance(waiting, wire.PlacementWait)
+            self.assertEqual(waiting.position, 0)
+
     def test_identical_placement_poll_returns_the_grant_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
 
@@ -204,6 +228,8 @@ class PlacementStatusTests(unittest.TestCase):
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
 
         with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=10, min_pass_gap_seconds=0.25)
+            fixture.clock.advance(0.25)
             fixture.free(0)
             fixture.hold_starts()
             request = placement_request(fixture)
@@ -216,11 +242,16 @@ class PlacementStatusTests(unittest.TestCase):
                     self.assertEqual(fixture.server.handle_request(request), [initial])
                     passed.assert_not_called()
                 passed.reset_mock()
-                fixture.server.pending_configuration = gate.read_admission_configuration()
+                fixture.configure(waiting_pass_seconds=2)
+                fixture.clock.advance(0.25)
                 with self.subTest(pending=True):
-                    self.assertEqual(fixture.server.handle_request(request), [initial])
+                    waiting, = fixture.connect(request).replies()
+                    assert isinstance(waiting, wire.PlacementWait)
+                    self.assertEqual(waiting.position, initial.position)
                     passed.assert_called_once()
-                    self.assertIsInstance(fixture.server.pending_configuration, service.NoPass)
+                    configuration = fixture.server.configuration
+                    assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+                    self.assertEqual(configuration.config.waiting_pass_seconds, 2)
 
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
@@ -602,6 +633,7 @@ class PlacementStatusTests(unittest.TestCase):
         cases = (("settled command path", "The Hana attempt already has a settled command path"),
                  ("failed start", "The Hana start deadline expired"),
                  ("fenced start refusal", "The Hana start deadline expired"),
+                 ("cancelled fenced start", "The Hana start deadline expired"),
                  ("command published", ""),
                  ("restored startup refusal", "The Hana start deadline expired"),
                  ("restored claim failure", "The Hana attempt already has a settled command path"))
@@ -674,7 +706,7 @@ class PlacementStatusTests(unittest.TestCase):
                         self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
-                    if case == "fenced start refusal":
+                    if case in ("fenced start refusal", "cancelled fenced start"):
                         def release() -> hana_placement.HanaClaimRelease:
                             return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
 
@@ -687,6 +719,9 @@ class PlacementStatusTests(unittest.TestCase):
                         refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
                         assert isinstance(refusal, wire.DispatchStatus)
                         self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        if case == "cancelled fenced start":
+                            cancel = wire.CancelPlacement("cancel", request.episode, request.owner, "stopped")
+                            self.assertEqual(fixture.server.handle_request(cancel), [wire.Ok()])
                         controller.register(hana_box.DeploymentIdentity("deployment", "instance", "spot", "us-east-2"))
                         retry, = fixture.server.handle_request(request)
                         self.assertEqual(retry, wire.Assignment(assignment))
@@ -697,6 +732,13 @@ class PlacementStatusTests(unittest.TestCase):
                             release_claim=hana_placement.HanaClaimReleased, reason=reason)
                     self.assertIsInstance(settlement, hana_execution.HanaSettled)
                     self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                    if case == "cancelled fenced start":
+                        # Read the journal when a poll arrives in the same turn as the pass timer.
+                        fixture.clock.advance(1)
+                        closed, = fixture.connect(request).replies()
+                        self.assertIsInstance(closed, wire.DispatchStatus)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("cancelled"))
+                        continue
                     if case == "fenced start refusal":
                         _ = fixture.run_pass()
                         self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("state"))
