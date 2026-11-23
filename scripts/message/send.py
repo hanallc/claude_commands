@@ -88,7 +88,8 @@ message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
-                 an emergency push with the key is still live
+                 an emergency push with the key is still live,
+                 or a mac.locked push for a Mac that is off on purpose
   PENDING: why   an earlier send has not confirmed acceptance     exit 5
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
@@ -216,6 +217,9 @@ PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\bcodex_credit_account
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)
+# A Mac that the user turned off is not locked: mac_test.machine_off_on_purpose stops this push.
+# The session that holds the Mac block still pushes.
+MAC_LOCKED_TEXT = "mac.locked"
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
                  + ' --value session=<session> --value machine=<machine> --value "go=<the Go: line to type>"'
@@ -4727,12 +4731,17 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
     return f"auto-mode:{session}:{hashlib.sha256(joined.encode()).hexdigest()[:12]}"
 
 
+def template_values(options: Options) -> dict[str, str]:
+    """The --value key=value pairs of a template push, by key."""
+    return {key: item for key, _, item in (value.partition("=") for value in options.values)}
+
+
 def reviewed_waits(options: Options) -> Options:
     """Review the waits sentence within the configured budget.
 
     Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
     """
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
@@ -4776,7 +4785,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 def refusal_report(options: Options) -> rca.Report:
     """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
                       key=options.key or "")
@@ -5897,6 +5906,16 @@ def main(argv: list[str]) -> int:
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":
                 print("not sent: probe sessions never push to the phone")
                 return 0
+            # The host that delivers the push asks; a --machine forward asks again there with --here.
+            if (options.to == USER and options.text_id == MAC_LOCKED_TEXT
+                    and not isinstance(options.scope, NamedMachine)):
+                from scripts.mac_test import mac_test
+                sender = template_values(options).get("sender")
+                asking = mac_test.AskingSession(sender) if sender else mac_test.NO_ASKING_SESSION
+                mac_use = mac_test.machine_off_on_purpose("mac", asking)
+                if isinstance(mac_use, mac_test.OffOnPurpose):
+                    print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
+                    return EXIT["skipped"]
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
