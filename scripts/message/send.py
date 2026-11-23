@@ -217,6 +217,7 @@ PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with 
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)
 # A Mac that the user turned off is not locked: mac_test.machine_off_on_purpose stops this push.
+# The session that holds the Mac block still pushes.
 MAC_LOCKED_TEXT = "mac.locked"
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
@@ -5899,9 +5900,12 @@ def main(argv: list[str]) -> int:
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":
                 print("not sent: probe sessions never push to the phone")
                 return 0
-            if options.to == USER and options.text_id == MAC_LOCKED_TEXT:
+            # The host that delivers the push asks; a --machine forward asks again there with --here.
+            if (options.to == USER and options.text_id == MAC_LOCKED_TEXT
+                    and not isinstance(options.scope, NamedMachine)):
                 from scripts.mac_test import mac_test
-                machine = mac_test.machine_off_on_purpose(mac_test.state_paths())
+                values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+                machine = mac_test.machine_off_on_purpose("mac", values.get("sender"))
                 if isinstance(machine, mac_test.OffOnPurpose):
                     print(f"not sent: the Mac is off on purpose ({machine.reason})")
                     return 0

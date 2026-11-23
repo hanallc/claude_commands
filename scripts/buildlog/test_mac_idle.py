@@ -1028,6 +1028,18 @@ done
         with mock.patch.object(time, "time", return_value=1481):
             self.assertEqual(mac_idle.main(["cleared", "--since", "999"]), 1)
 
+    def test_cleared_stops_a_sent_push_when_the_user_turns_the_mac_off(self) -> None:
+        self.unreachable()
+        with mock.patch.object(time, "time", return_value=1180):
+            mac_idle.watch_once(self.paths, 1180)
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
+            self.block()
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
+
 
     def test_alert_boundary_validates_fields_and_line_is_fast_without_subprocess(self) -> None:
         self.block("research\u001b\n", "run\u0000")

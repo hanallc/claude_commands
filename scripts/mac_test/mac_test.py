@@ -562,25 +562,34 @@ class MachineInUse:
 MACHINE_IN_USE = MachineInUse()
 
 
-def machine_off_on_purpose(paths: StatePaths) -> OffOnPurpose | MachineInUse:
-    """The one rule for every outage push: a block, offload=off or enabled.<machine>=off turns a machine off.
+def machine_off_on_purpose(target: str, asking_session: str | None = None) -> OffOnPurpose | MachineInUse:
+    """The one rule for every outage push: the user turned the named target off.
 
-    An unreadable record or setting proves nothing, so the machine counts as in use and a real outage still pushes.
+    Each target reads enabled.<target>=off. The Mac also reads its block and offload=off. A block is a lease that
+    a showrunner gives to one session, so it does not count when its holder asks. An unreadable record or setting
+    proves nothing, so the target counts as in use and a real outage still pushes.
     """
+    enabled = f"enabled.{target}"
+    try:
+        # The gate refuses an unknown guest, but a missing key here counts as in use: an alert must not hide an outage.
+        if not conf.read("build_targets").value(enabled, conf.on_off, default=True, recover_invalid=False):
+            return OffOnPurpose(f"{enabled}=off")
+    except ConfigError:
+        pass
+    if target != "mac":
+        return MACHINE_IN_USE
+    paths = state_paths()
     try:
         block = read_block(paths.block)
-    except (OSError, UnicodeError, StateReadError):
-        block = NO_MAC_BLOCK
-    if not isinstance(block, NoMacBlock):
-        return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
+        if not isinstance(block, NoMacBlock) and block.holder != asking_session:
+            return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
+    except StateReadError:
+        pass
     try:
-        settings = conf.read(config_path("" if paths.target == "mac" else paths.target))
-        if not settings.value("offload", conf.on_off, default=True):
+        settings = conf.read(config_path(paths.target if paths.registry_selected else ""))
+        if not settings.value("offload", conf.on_off, default=True, recover_invalid=False):
             return OffOnPurpose("offload=off")
-        enabled = f"enabled.{paths.target}"
-        if not conf.read("build_targets").value(enabled, conf.on_off, default=True):
-            return OffOnPurpose(f"{enabled}=off")
-    except (OSError, ValueError, ConfigError):
+    except ConfigError:
         pass
     return MACHINE_IN_USE
 

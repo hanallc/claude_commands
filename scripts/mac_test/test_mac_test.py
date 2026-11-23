@@ -3627,5 +3627,36 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (0.5, 2))
 
 
+@final
+class MachineOffOnPurposeTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        state = self.root / "mac-state"
+        state.mkdir()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(state)})))
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+        _ = write_config_fixture(self.root / "build_targets.conf")
+        since = datetime.fromtimestamp(1000, timezone.utc)
+        mac_test.write_block(state / "block.json", mac_test.ActiveMacBlock(
+            "hana", "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue("hana"),
+            mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+
+    def test_a_target_other_than_the_mac_reads_only_its_enabled_key(self) -> None:
+        self.assertIsInstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
+        for target in ("natedev", "hana-aws"):
+            with self.subTest(target=target):
+                self.assertIs(mac_test.machine_off_on_purpose(target), mac_test.MACHINE_IN_USE)
+                _ = write_config_fixture(self.root / "build_targets.conf", f"enabled.{target}=off\n")
+                self.assertEqual(mac_test.machine_off_on_purpose(target),
+                                 mac_test.OffOnPurpose(f"enabled.{target}=off"))
+
+
 if __name__ == "__main__":
     _ = unittest.main()

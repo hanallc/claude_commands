@@ -526,8 +526,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
         if (isinstance(reading, MacUnreachable)
                 and now - saved["since"] >= settings.push_seconds and not saved["pushed"]
-                and isinstance(mac_test.machine_off_on_purpose(mac_test.StatePaths(paths.mac_state)),
-                               mac_test.MachineInUse)):
+                and isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.MachineInUse)):
             saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
@@ -563,12 +562,17 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
 def main(args: list[str]) -> int:
     paths = watch_paths()
     if args[:2] == ["cleared", "--since"] and len(args) == 3:
+        from scripts.mac_test import mac_test
+
         try:
             since = float(args[2])
         except ValueError:
             return 1
         if not math.isfinite(since):
             return 1
+        # A push already sent stops its repeats when the user turns the Mac off.
+        if isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose):
+            return 0
         saved = mac_idle_alert.read_alert(paths.state / "alert.json")
         try:
             freshness = mac_idle_alert.read_idle_config().stale_seconds

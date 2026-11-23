@@ -200,9 +200,15 @@ A free Mac, idle claim, block, or disk exclusion sends no phone push.
 These states keep the message to builds.
 The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `push_seconds` while eligible steps wait.
 A Mac that the user turned off sends no phone push: a Mac block, `offload=off` or `enabled.mac=off`.
-`mac_test.machine_off_on_purpose` holds this one rule for every outage push; `mac.locked` in `send.py` asks it too.
+`mac_test.machine_off_on_purpose` holds this one rule for every outage push and takes any target name.
+Each target reads `enabled.<machine>` in `build_targets.conf`; only the Mac also reads its block and `offload`.
+Only an explicit `off` counts. A missing key, an unusable value or an unreadable record counts as in use.
+A block is a lease that a showrunner gives to one session. It does not count when its holder asks.
+`mac.locked` in `send.py` asks with its `sender=` value, so the block holder still reaches the user.
+Only the host that delivers the push asks; a `--machine natedev` forward asks on natedev.
 The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
+When the user turns the Mac off after the push, `mac_idle.py cleared` exits 0 and the push stops its repeats.
 The title is "Mac tests stopped".
 The action is "Wake the Mac or check its network."
 The body gives the elapsed minutes and the number of waiting tests.
