@@ -373,8 +373,8 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(producer, (OTHER.id, f"You are the producer of item {number}: Build plan. "
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
                     + f"Run `{launcher} update --id L{number}` to update it. "
-                    + "Use any of `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, "
-                    + "`--evidence`, `--add-evidence`."))
+                    + "Use any of `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, "
+                    + "`--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
