@@ -4881,12 +4881,16 @@ def role_colors() -> dict[str, str]:
     return conf.read_or_repository("statusline").values(host_only_prefix="model.")
 
 
-def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
-    """Resolve the staff kind through the Accounts role keys and color parser."""
-    group = "units" if member.kind == "unit" else member.kind + "s"
+def role_color(group: str, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
+    """Resolve one role group ("units", "showrunners", ...) through the Accounts role keys and color parser."""
     key = ROLE_COLOR_KEYS[group]
     color = account_color(colors.get(key, ""))
     return StaffRoleColor(key, color.css) if isinstance(color, AccountColor) else NoAccountColor()
+
+
+def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
+    """Resolve the staff kind through the Accounts role keys and color parser."""
+    return role_color("units" if member.kind == "unit" else member.kind + "s", colors)
 
 
 def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
