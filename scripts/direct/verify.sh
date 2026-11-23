@@ -595,11 +595,11 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
-# Run build_folders.py remove for the tool folder $2. That is the one removal for these folders.
-# This function only decides what to print for the status. $1 names the removal in the line.
+# Remove the tool folder $2 with build_folders.py remove. An empty $2 does nothing.
+# $1 names the removal in the line that a failure prints.
 # Status 1 means that another process holds the lock. The folder stays for collection.
-# Status 2 means that build_folders.py printed its error. A higher status prints one line.
-# Return 0, so the step status stays the exit status of the call.
+# Status 2 means that build_folders.py printed its error. Neither status prints a line here.
+# A higher status prints one line. Return 0, so the step status stays the exit status of the call.
 remove_tool_folder() {
     local what=$1 folder=$2 status=0
     [[ -n "$folder" ]] || return 0
