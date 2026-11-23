@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a hand command with a model, run it in a queue place, and record the attempt.
 
-  hand_made.py --why '<why>' --machine natedev [--repo <checkout>] -- <argv...>
+  hand_made.py --why '<why>' --machine <natedev|mac|mac-linux> [--machine ...] [--repo <checkout>] -- <argv...>
 
 Four steps: the model check, the place in the line of a named machine, the run, and one
 row in the build log. A no, a check without an answer, or a checked file that changed
@@ -22,28 +22,33 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field
-import fcntl
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 import os
 from pathlib import Path, PurePath
 import re
-import select
 import subprocess
 import sys
 import time
-from typing import BinaryIO, Literal, Protocol, TextIO, Unpack, cast
+import uuid
+from typing import BinaryIO, Literal, cast
 
 from scripts.accounts.role_map import CLAUDE_GROUPS, ClaudeGroup
-from scripts.build_queue.queue_place import PopenArguments, QueuePlaceRefused
+from scripts.build_hold.owning_session import owning_session
+from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
+from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
+from scripts.build_targets import build_targets
 from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, main_folder
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
-from scripts.production import hand_made_guest
+from scripts.production import hand_made_guest, hand_made_mac
+from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineFailed, MachineRun, Output,
+                                                Placed, Program, ProgramPlace, Refused, discard, in_checkout, note,
+                                                stream)
 
 DESCRIPTION = "Check a hand command with a model, run it in a queue place, and record the attempt."
 SECTION = "cli.hand_made"
@@ -55,18 +60,12 @@ ENV_VALUE_LETTERS = "CSau"
 UV_VALUE_LETTERS = "CPfipw"
 # Long options of env that take the next word as their value. env accepts a unique start of each name.
 ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
-# The only variables that the program gets: no other variable can make it load code that the check does not read.
-PROGRAM_VARIABLES = frozenset({"HOME", "USER", "LOGNAME", "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM",
-                               "TZ", "TMPDIR", "XDG_RUNTIME_DIR", "SHELL", "NIX_PATH", "LOCALE_ARCHIVE",
-                               "SSL_CERT_FILE", "NIX_SSL_CERT_FILE"})
 # Variables that the program also gets when they are set; the model sees each one with its value.
 SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PATH", "BINDGEN_EXTRA_CLANG_ARGS",
                              "SCCACHE_DIR", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE",
                              "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
 PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
-# The most output bytes that one read copies.
-CHUNK_BYTES = 65536
 
 SCHEMA = {
     "type": "object",
@@ -108,10 +107,6 @@ class CheckSettings:
     role: ClaudeGroup
     time_limit_seconds: float
     max_script_bytes: int
-
-
-class Refused(Exception):
-    """The attempt ends before the run; the message names the cause."""
 
 
 def read_settings(text: str) -> CheckSettings:
@@ -168,10 +163,6 @@ def exec_path(name: str, repo: Path) -> Path | None:
     """The file that the run starts for the first word: a name with a slash is a path from the checkout,
     and another name is its first match on PATH."""
     return repo / name if "/" in name else next(iter(path_programs(name)), None)
-
-
-def in_checkout(path: Path, repo: Path) -> bool:
-    return Path(os.path.normpath(path)).is_relative_to(repo)
 
 
 def outside_program(path: Path, any_text: bool) -> bool:
@@ -418,50 +409,6 @@ def check(argv: Sequence[str], files: Sequence[CheckedFile], machines: Sequence[
     return CheckResult(outcome, call.model, account)
 
 
-class ProgramPlace(Protocol):
-    """A held queue place that starts one program in its scope."""
-
-    @property
-    def peak_bytes(self) -> int: ...
-
-    @property
-    def sidecar(self) -> Path:
-        """A file in the folder of the place; the folder ends with the place."""
-        ...
-
-    def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]: ...
-
-
-# A route gets the checkout and the bytes of each program file that the check read.
-Route = Callable[[Path, Mapping[Path, bytes]], AbstractContextManager[ProgramPlace]]
-
-
-@contextmanager
-def natedev_place(repo: Path, _checked: Mapping[Path, bytes]) -> Generator[ProgramPlace]:
-    """Wait for a natedev hold to end and for a place in the natedev line, as a gate job does.
-
-    natedev runs the files in place and reads them again at run start, so it does not use the checked bytes.
-    """
-    from scripts.build_queue.admission_client import AdmissionHoldCheck
-    from scripts.build_queue.queue_place import queue_place
-    from scripts.production.gate import BuildHoldWait
-    from scripts.production.gate_modules import GateRefused
-
-    hold = BuildHoldWait()
-    try:
-        with queue_place(HAND_MADE.step, repo, before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
-            yield place
-    except GateRefused as error:
-        raise QueuePlaceRefused(str(error)) from error
-
-
-# The machine that runs the command with the files that the check read. Another machine runs the
-# command in its own copy of the checkout, and finds the first word in that copy or on its own PATH.
-LOCAL_MACHINE = "natedev"
-# One route for each machine. A later phase adds the Mac.
-ROUTES: Mapping[str, Route] = {LOCAL_MACHINE: natedev_place, hand_made_guest.MACHINE: hand_made_guest.guest_place}
-
-
 @dataclass(frozen=True)
 class Request:
     """One attempt as the caller gave it."""
@@ -469,53 +416,6 @@ class Request:
     machines: tuple[str, ...]
     repo: Path
     argv: tuple[str, ...]
-
-
-def default_output() -> BinaryIO:
-    return sys.stdout.buffer
-
-
-@dataclass(frozen=True)
-class Services:
-    """The outside world of an attempt; tests give their own."""
-    registry_text: Callable[[], str] = models_registry.registry_text
-    runner: review.ProcessRunner = review.run_process
-    routes: Mapping[str, Route] = field(default_factory=lambda: ROUTES)
-    output: Callable[[], BinaryIO] = default_output
-
-
-def new_fields(request: Request) -> record.HandMadeFields:
-    argv = list(request.argv)
-    return record.HandMadeFields(
-        why=request.why, argv=argv, cwd=str(request.repo), machines=list(request.machines), machine=None,
-        files=[], verdict=None, reason=None, refusal=None, status=None, check_model="", check_effort="",
-        check_account=None, check_started_at=None, check_ended_at=None, placed_at=None, sha_checked_at=None,
-        run_started_at=None, run_ended_at=None, queue_wait_s=None, log=None, step=parse.step_name(argv),
-        test_width=parse.test_threads(argv), peak_mem_bytes=None)
-
-
-def now_text() -> str:
-    return store.utc_iso(time.time())
-
-
-def discard(output: BinaryIO | TextIO) -> None:
-    """Point the descriptor of an output that failed at /dev/null; /dev/null takes the bytes it keeps at exit."""
-    try:
-        null = os.open(os.devnull, os.O_WRONLY)
-        try:
-            _ = os.dup2(null, output.fileno())
-        finally:
-            os.close(null)
-    except OSError:
-        pass
-
-
-def note(text: str) -> None:
-    """Write one line to stderr; a closed stderr loses the line and does not end the attempt."""
-    try:
-        print(f"hand made: {text}", file=sys.stderr, flush=True)
-    except OSError:
-        discard(sys.stderr)
 
 
 @dataclass
@@ -537,57 +437,139 @@ class OutputCopy:
             discard(caller)
 
 
-def copy_ready(descriptor: int, output: OutputCopy, limit: int) -> bool:
-    """Copy up to limit bytes that are in the pipe now; False at the end of the output."""
-    while limit > 0:
-        try:
-            chunk = os.read(descriptor, min(limit, CHUNK_BYTES))
-        except BlockingIOError:
-            return True
-        if not chunk:
-            return False
-        output.write(chunk)
-        limit -= len(chunk)
-    return True
-
-
-def exit_descriptor(process: subprocess.Popen[bytes]) -> int | None:
-    """A pidfd that is ready when the program exits, or None when the place reaped the program first."""
-    if process.returncode is not None:
-        return None
-    try:
-        return os.pidfd_open(process.pid)
-    except ProcessLookupError:
-        return None
-
-
-def stream(process: subprocess.Popen[bytes], output: OutputCopy) -> int:
-    """Copy the output as it comes, and return the status when the program exits.
-
-    A child that keeps the pipe open after the program exits does not hold the run: after the exit,
-    only the bytes that are in the pipe then are copied.
-    """
-    pipe = process.stdout
-    assert pipe is not None
-    descriptor = pipe.fileno()
-    os.set_blocking(descriptor, False)
-    exited = exit_descriptor(process)
-    try:
-        while exited is not None:
-            ready, _, _ = select.select([descriptor, exited], [], [])
-            if exited in ready:
-                break
-            if not copy_ready(descriptor, output, CHUNK_BYTES):
-                return process.wait()
-        _ = copy_ready(descriptor, output, fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ))
-        return process.wait()
-    finally:
-        if exited is not None:
-            os.close(exited)
-
-
 def program_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in PROGRAM_VARIABLES | SHOWN_VARIABLES}
+
+
+@dataclass
+class NatedevRun:
+    """The program in its natedev queue place, started from the file that the check found."""
+    place: ProgramPlace
+    program: Program
+    started_at: float | None = None
+
+    @property
+    def peak_bytes(self) -> int | None:
+        return self.place.peak_bytes or None
+
+    def run(self, output: Output) -> int:
+        start, argv = self.program.start, self.program.argv
+        process = self.place.popen([str(start), *argv[1:]] if start is not None else list(argv),
+                                   cwd=self.program.repo, env=program_environment(), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.started_at = time.time()
+        with process:
+            return stream(process, output)
+
+
+@contextmanager
+def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[MachineRun]:
+    """Run the program in the natedev queue place of a local grant; the queue applies the natedev hold."""
+    if not isinstance(placed, wire.LocalPlacementGranted):
+        raise MachineFailed("the queue gave natedev a remote assignment")
+    held = HeldReservation(placed.grant)
+    try:
+        with line.local_place(held) as place:
+            yield NatedevRun(place, program)
+    finally:
+        line.close(placed, held.status, "")
+
+
+# The machine that runs the command with the files that the check read. Another machine runs the
+# command in its own copy of the checkout, and finds the first word in that copy or on its own PATH.
+LOCAL_MACHINE = "natedev"
+# One entry for each machine.
+ROUTES: Mapping[str, Machine] = {
+    LOCAL_MACHINE: Machine(natedev_route),
+    "mac": Machine(hand_made_mac.mac_route, hand_made_mac.mac_refusal),
+    hand_made_guest.MACHINE: Machine(hand_made_guest.guest_route, hand_made_guest.guest_refusal)}
+
+
+@dataclass
+class PlacementLine:
+    """The one placement request of an attempt, with a candidate for each named machine."""
+    request: wire.PlacementRequest
+    setup: queue_place.PlaceSetup
+
+    @property
+    def folder(self) -> Path:
+        return self.setup.folder
+
+    def wait(self) -> Placed:
+        answer = queue_place.wait_for_placement(self.request, "the hand made run left the queue")
+        if isinstance(answer, admission_client.LeftQueue):
+            raise Refused("queue place: the run left the queue")
+        if isinstance(answer, wire.DispatchStatus):
+            raise Refused(f"queue place: {answer.reason or 'the queue ended the run'}")
+        return answer
+
+    def local_place(self, grant: HeldReservation) -> AbstractContextManager[ProgramPlace]:
+        return self.setup.place(grant)
+
+    def close(self, placed: Placed, status: int | None, reason: str) -> None:
+        if isinstance(placed, wire.LocalPlacementGranted):
+            _ = admission_client.finish_local(placed, 1 if status is None else status, "" if status is not None else reason)
+            return
+        assignment = placed.assignment
+        _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assignment.episode, assignment.owner,
+            reason or f"the {assignment.destination.target} run ended with status {status}"))
+
+    def give_back(self, placed: wire.Assignment, reason: str) -> None:
+        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, placed.assignment, reason))
+
+
+def placement_request(request: Request, local: wire.AdmitRequest) -> wire.PlacementRequest:
+    """One placement request with a candidate for each named machine; the first free machine takes the run."""
+    constraints = build_targets.fixed_placement_constraints(request.repo, "", build_targets.HAND_MADE_KIND,
+        request.argv, owning_session(), execution_identity.SourceKeyUnavailable("a hand made run names no commit"))
+    candidates = tuple(item for item in constraints.candidates if item.destination.target in request.machines)
+    missing = [name for name in request.machines if all(item.destination.target != name for item in candidates)]
+    if missing:
+        raise Refused(f"queue place: no line for {', '.join(missing)} in build_targets.conf")
+    owner = placement.SubmittingOwner(store.host_name(), local.owner.pid, local.owner.start_time)
+    return wire.PlacementRequest(local.episode, owner, local.since, local.profile,
+        replace(constraints, candidates=candidates), identity=local.identity, run=local.run,
+        local=queue_place.local_context(local))
+
+
+@contextmanager
+def placement_line(request: Request) -> Generator[Line]:
+    """The placement request of the attempt, with the queue place folder of a natedev run."""
+    try:
+        with queue_place.place_setup(HAND_MADE.step, request.repo) as setup:
+            refresh = setup.request
+            assert refresh is not None, "a named place takes a reservation"
+            yield PlacementLine(placement_request(request, refresh()), setup)
+    except wire.AdmissionUnavailable as error:
+        raise Refused(f"queue place: {error.reason}") from error
+
+
+def default_output() -> BinaryIO:
+    return sys.stdout.buffer
+
+
+@dataclass(frozen=True)
+class Services:
+    """The outside world of an attempt; tests give their own."""
+    registry_text: Callable[[], str] = models_registry.registry_text
+    runner: review.ProcessRunner = review.run_process
+    routes: Mapping[str, Machine] = field(default_factory=lambda: ROUTES)
+    output: Callable[[], BinaryIO] = default_output
+    line: Callable[[Request], AbstractContextManager[Line]] = placement_line
+
+
+def new_fields(request: Request) -> record.HandMadeFields:
+    argv = list(request.argv)
+    return record.HandMadeFields(
+        why=request.why, argv=argv, cwd=str(request.repo), machines=list(request.machines), machine=None,
+        files=[], verdict=None, reason=None, refusal=None, status=None, check_model="", check_effort="",
+        check_account=None, check_started_at=None, check_ended_at=None, placed_at=None, sha_checked_at=None,
+        run_started_at=None, run_ended_at=None, failed_machines=[], queue_wait_s=None, log=None, step=parse.step_name(argv),
+        test_width=parse.test_threads(argv), peak_mem_bytes=None)
+
+
+def now_text() -> str:
+    return store.utc_iso(time.time())
 
 
 def run_start_change(request: Request, files: Sequence[CheckedFile], fields: record.HandMadeFields) -> str:
@@ -606,38 +588,25 @@ def run_start_change(request: Request, files: Sequence[CheckedFile], fields: rec
     return changed
 
 
-def linked_path(path: Path, repo: Path) -> bool:
-    """A path in the checkout with .. or a symbolic link in it, from the checkout down."""
-    relative = path.relative_to(repo)
-    if ".." in relative.parts:
-        return True
-    return any((repo / Path(*relative.parts[:end])).is_symlink() for end in range(1, len(relative.parts) + 1))
-
-
-def guest_refusal(request: Request, files: Sequence[CheckedFile]) -> str:
-    """The reason that the guest takes no run of the command, before the model call; empty for none.
-
-    The guest runs the command in its own copy of one commit of the checkout. Each program file must be a
-    file of the checkout that the copy holds at the same path.
-    """
-    machine = hand_made_guest.MACHINE
-    absolute = [word for word in request.argv if os.path.isabs(word)]
-    if absolute:
-        return (f"{machine} takes no absolute path in the command, because the path names a file of the guest: "
-                + f"{', '.join(absolute)}; give a path in the checkout or a program name")
-    outside = [str(item.path) for item in files if not in_checkout(item.path, request.repo)]
-    if outside:
-        return (f"{machine} runs its own copy of each program file outside the checkout, and the check reads only "
-                + f"the natedev copy: {', '.join(outside)}; use a file in the checkout")
-    linked = [str(item.path) for item in files if linked_path(item.path, request.repo)]
-    if linked:
-        return (f"{machine} takes no program file with a symbolic link or .. in its path in the checkout, because the "
-                + f"guest copy can hold another file there: {', '.join(linked)}; give the real path")
-    try:
-        _ = hand_made_guest.run_owner(request.repo)
-    except QueuePlaceRefused as error:
-        return str(error)
-    return ""
+def run_placed(line: Line, placed: Placed, request: Request, files: Sequence[CheckedFile], program: Program,
+               fields: record.HandMadeFields, services: Services) -> int:
+    """Check the files again on natedev, and run the program on the machine that the queue gave the run."""
+    machine = placed.assignment.destination.target
+    changed = run_start_change(request, files, fields)
+    fields["sha_checked_at"] = now_text()
+    if changed:
+        line.close(placed, None, "a checked file changed after the check")
+        raise Refused(f"{changed}; start a new attempt to check the new text")
+    with services.routes[machine].route(line, placed, program) as run, (line.folder / "output.log").open("ab") as log:
+        try:
+            status = run.run(OutputCopy(log, services.output()))
+        finally:
+            # Only a program that started gives a start time; a machine that failed before the start gives none.
+            fields["run_started_at"] = None if run.started_at is None else store.utc_iso(run.started_at)
+        fields["run_ended_at"] = now_text()
+        fields["status"] = status
+        fields["peak_mem_bytes"] = run.peak_bytes
+    return status
 
 
 def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str, started: float,
@@ -646,17 +615,18 @@ def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str,
     fields["check_model"], fields["check_effort"] = settings.model, settings.effort
     fields["check_started_at"] = now_text()
     files = checked_files(request.argv, request.repo, settings.max_script_bytes)
+    # The run starts this file, so execvp never goes on to a later PATH match that the check did not read.
+    program = Program(request.argv, request.repo, exec_path(request.argv[0], request.repo),
+                      tuple((item.path, item.sha256) for item in files))
     fields["files"] = [record.HandMadeFile(path=str(item.path), sha256_check=item.sha256, sha256_run=None)
                        for item in files]
-    machine = request.machines[0]
-    start: Path | None = None
-    if machine == LOCAL_MACHINE:
-        # The run starts this file, so execvp never goes on to a later PATH match that the check did not read.
-        start = exec_path(request.argv[0], request.repo)
-    elif machine == hand_made_guest.MACHINE:
-        refusal = guest_refusal(request, files)
-        if refusal:
-            raise Refused(refusal)
+    refusals = {name: reason for name in request.machines if (reason := services.routes[name].refusal(program))}
+    if len(refusals) == len(request.machines):
+        raise Refused("; ".join(f"{name} cannot take the run: {reason}" for name, reason in refusals.items()))
+    for name, reason in refusals.items():
+        note(f"{name} cannot take the run: {reason}; the run stands only in the lines of the other machines")
+    # The machines that can take the run; the record keeps each named machine.
+    request = replace(request, machines=tuple(name for name in request.machines if name not in refusals))
     result = check(request.argv, files, request.machines, request.repo, settings, services.runner)
     fields["check_ended_at"] = now_text()
     fields["check_model"], fields["check_account"] = result.model, result.account
@@ -668,32 +638,32 @@ def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str,
         raise Refused("the check said no; change the command or the script and start a new attempt")
     requested = time.time()
     try:
-        with services.routes[machine](request.repo, {item.path: item.text.encode() for item in files}) as place:
-            placed = time.time()
-            fields["machine"], fields["placed_at"] = machine, store.utc_iso(placed)
-            fields["queue_wait_s"] = round(placed - requested, 3)
-            changed = run_start_change(request, files, fields)
-            fields["sha_checked_at"] = now_text()
-            if changed:
-                raise Refused(f"{changed}; start a new attempt to check the new text")
-            log_path = place.sidecar.with_name("output.log")
-            with log_path.open("wb") as log:
-                fields["run_started_at"] = now_text()
-                argv = [str(start), *request.argv[1:]] if start is not None else list(request.argv)
-                process = place.popen(argv, cwd=request.repo, env=program_environment(),
-                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                with process:
-                    status = stream(process, OutputCopy(log, services.output()))
-            fields["run_ended_at"] = now_text()
-            fields["status"] = status
-            try:
-                fields["log"] = record.keep_log(log_path, store.host_name(), started, record_id)
-            except OSError as error:
-                note(f"the log was not kept: {error}")
-        fields["peak_mem_bytes"] = place.peak_bytes or None
+        with services.line(request) as line:
+            while True:
+                placed = line.wait()
+                machine = placed.assignment.destination.target
+                now = time.time()
+                fields["machine"], fields["placed_at"] = machine, store.utc_iso(now)
+                fields["queue_wait_s"] = round(now - requested, 3)
+                try:
+                    status = run_placed(line, placed, request, files, program, fields, services)
+                except MachineFailed as failure:
+                    fields["failed_machines"].append(machine)
+                    if not isinstance(placed, wire.Assignment) or len(request.machines) == 1:
+                        line.close(placed, None, str(failure))
+                        raise Refused(f"{machine} failed: {failure}") from failure
+                    note(f"{machine} failed: {failure}; the run goes back to the lines of the other machines")
+                    line.give_back(placed, failure.queue_reason)
+                    continue
+                try:
+                    fields["log"] = record.keep_log(line.folder / "output.log", store.host_name(), started, record_id)
+                except OSError as error:
+                    note(f"the log was not kept: {error}")
+                return status
     except QueuePlaceRefused as error:
         raise Refused(f"queue place: {error}") from error
-    return status
+    except wire.AdmissionUnavailable as error:
+        raise Refused(f"queue place: {error.reason}") from error
 
 
 def attempt(request: Request, services: Services) -> int:
@@ -763,10 +733,7 @@ def parse_request(argv: Sequence[str]) -> Request:
     machines = tuple(dict.fromkeys(args.machine))
     later = [name for name in machines if name not in ROUTES]
     if later:
-        parser.error(f"machine {', '.join(later)} comes in a later phase; this phase accepts one of: "
-                     + ", ".join(ROUTES))
-    if len(machines) > 1:
-        parser.error("a run that names more than one machine comes in a later phase; name one of "
+        parser.error(f"machine {', '.join(later)} comes in a later phase; this phase accepts only "
                      + ", ".join(ROUTES))
     repo = Path(args.repo or os.getcwd()).resolve()
     if work_tree_top(repo) != repo:

@@ -101,10 +101,14 @@ If AWS refuses that unassigned run, natedev runs the selection.
 
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
 It holds one argv, the work name and the owner unit, in place of the test selection.
+A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
+A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
+After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
 `GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
 Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
 The request also holds the checkout path of each file that natedev read for an argv word.
 After the checkout and clean of the numbered copy, `command_refusal` checks each argv word; a failed word ends the run before the start.
+The guest then prints a refused line with the attempt, and `wait_for_start` raises `GuestRefusedCommand`.
 A later word that names a `main_folder` fails: python runs a `__main__` file of that folder, such as `__main__.py` or `__main__.pyc`. Natedev uses the same `main_folder`.
 A word with a checked file passes. For another word with a slash, the path from the copy must have no `..` and no symbolic link in a part, and its last part must not exist.
 Another later word with no slash must name no entry of the copy other than a plain folder, for example the `.lint-sweep-used` stamp.

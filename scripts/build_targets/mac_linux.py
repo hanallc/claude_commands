@@ -61,6 +61,8 @@ ARM_RECORD_PREFIX = 'mac-linux-armed'
 RUN_START = 'mac-linux run start'
 # The guest prints this line, with the attempt, to stderr when it has taken the run lock.
 RUN_LOCKED = 'mac-linux run locked'
+# The guest prints this line, with the attempt, when it refuses a command word; it starts nothing after it.
+RUN_REFUSED = 'mac-linux run refused'
 # The guest stream exits with this status when the guest took no run lock, so the guest started nothing.
 GUEST_NOT_LOCKED_STATUS = 77
 # Folders of installed tools, on natedev and on the guest. A program found in one of them is a tool, not a program
@@ -79,6 +81,10 @@ class GuestUnavailable(RuntimeError):
 
 class GuestNotLocked(GuestUnavailable):
     """The guest took no run lock, so it started nothing and has no end to prove."""
+
+
+class GuestRefusedCommand(GuestUnavailable):
+    """The guest refused a command word before the start, so it started nothing."""
 
 
 class GuestMissingPrerequisite(GuestUnavailable):
@@ -259,6 +265,10 @@ def run_start_line(attempt: str) -> str:
 
 def run_locked_line(attempt: str) -> str:
     return f'{RUN_LOCKED} {attempt}'
+
+
+def run_refused_line(attempt: str) -> str:
+    return f'{RUN_REFUSED} {attempt}'
 
 
 def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> CandidateSource:
@@ -1013,8 +1023,10 @@ class GuestCommand:
 
         checked holds the bytes of each file of the checkout that the run must find in the commit. A
         failure before the guest starts the argv raises GuestUnavailable with the guest output, and closes
-        the output pipe. After GuestNotLocked, finish proves no end. The process has one output pipe for its
-        standard output and standard error.
+        the output pipe. While process is None, the guest got no command and started nothing; after it is set,
+        only GuestNotLocked and GuestRefusedCommand prove that the guest started nothing (wait_for_start). After
+        GuestNotLocked, finish proves no end. The process has one output pipe for its standard output and
+        standard error.
         """
         source = checkout_source(repo)
         files = {path.relative_to(repo).as_posix(): data for path, data in checked.items()}
@@ -1095,16 +1107,18 @@ class GuestCommand:
 def wait_for_start(process: subprocess.Popen[bytes], attempt: str) -> None:
     """Read the guest output up to the start line of the argv, one byte at a time, so that no argv output is read.
 
-    Output before the start line, other than the lock line, goes to stderr. A stream that ends before the start
-    line raises GuestUnavailable with that output. When it ends before the lock line with GUEST_NOT_LOCKED_STATUS,
-    the error is GuestNotLocked. A stream that ends with another status can come from a lost SSH link after
-    the guest took the lock, so it needs the end proof.
+    Output before the start line, other than the lock and refused lines, goes to stderr. A stream that ends
+    before the start line raises GuestUnavailable with that output. When it ends before the lock line with
+    GUEST_NOT_LOCKED_STATUS, the error is GuestNotLocked. After the refused line, the error is GuestRefusedCommand.
+    Both mean that the guest started nothing. A stream that ends with another status can come from a lost SSH
+    link after the guest took the lock or printed the start line, so the start is unknown and needs the end proof.
     """
     assert process.stdout is not None
     descriptor = process.stdout.fileno()
     start = run_start_line(attempt).encode('utf-8') + b'\n'
     locked_line = run_locked_line(attempt).encode('utf-8') + b'\n'
-    locked = False
+    refused_line = run_refused_line(attempt).encode('utf-8') + b'\n'
+    locked = refused = False
     before = bytearray()
     line = bytearray()
     while True:
@@ -1112,7 +1126,8 @@ def wait_for_start(process: subprocess.Popen[bytes], attempt: str) -> None:
         if not byte:
             status = process.wait()
             text = (before + line).decode('utf-8', errors='replace').strip()
-            error = GuestNotLocked if status == GUEST_NOT_LOCKED_STATUS and not locked else GuestUnavailable
+            error = (GuestNotLocked if status == GUEST_NOT_LOCKED_STATUS and not locked
+                     else GuestRefusedCommand if refused else GuestUnavailable)
             raise error(text or f'the guest stream exited {status} before the argv started')
         line += byte
         if byte == b'\n':
@@ -1120,6 +1135,8 @@ def wait_for_start(process: subprocess.Popen[bytes], attempt: str) -> None:
                 break
             if bytes(line) == locked_line:
                 locked = True
+            elif bytes(line) == refused_line:
+                refused = True
             else:
                 before += line
             line.clear()
@@ -1346,6 +1363,7 @@ def run_guest(request_path: Path) -> int:
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
                     print(refusal, file=sys.stderr, flush=True)
+                    print(run_refused_line(request['attempt']), flush=True)
                     return 1
             else:
                 if request['type_dirs']:

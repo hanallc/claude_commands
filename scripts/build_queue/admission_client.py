@@ -510,11 +510,18 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
 def finish_step(path: Path, status: int, reason: str = "", *,
                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
                 ) -> wire.DispatchStatus:
-    from scripts.build_queue import placement
-
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
+    return finish_local(reply, status, reason, prerequisite=prerequisite)
+
+
+def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "", *,
+                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
+                 ) -> wire.DispatchStatus:
+    """Release a local grant with its status, and close its attempt; a reason closes it as refused before launch."""
+    from scripts.build_queue import placement
+
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))

@@ -1575,7 +1575,7 @@ fi
         self.assertEqual(process.returncode, 0, output)
         # The numbered copy keeps target/, so the guest has the file and natedev has none.
         command = mac_linux.GuestCommand(settings)
-        with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'The guest refuses the command word target/run.sh: '
+        with self.assertRaisesRegex(mac_linux.GuestRefusedCommand, 'The guest refuses the command word target/run.sh: '
                                     + r'the guest has a file at /\S+/target/run\.sh, and natedev read no file there\.'):
             try:
                 _ = command.start(self.repo, ['bash', 'target/run.sh'], work='hand-made', unit='caller',

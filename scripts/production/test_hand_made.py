@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 import gzip
 import hashlib
 import io
@@ -16,16 +17,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import BinaryIO, Unpack, cast, final, override
+from typing import BinaryIO, Literal, Unpack, cast, final, override
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_records, queue_lines
-from scripts.build_queue.queue_place import PopenArguments, QueuePlaceRefused
+from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
+                                 placement, queue_lines, queue_place, step_estimator)
+from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
 from scripts.buildlog import record
 from scripts.lib import build_steps, conf, models_registry, nix_env
 from scripts.notify import review
+from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made
+from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
@@ -41,7 +46,6 @@ def envelope(value: object) -> str:
 @dataclass
 class FakePlace:
     """A held place that starts the program directly."""
-    sidecar: Path = Path("/nonexistent/program.cgroup")
     started: list[list[str]] = field(default_factory=list[list[str]])
     processes: list[subprocess.Popen[bytes]] = field(default_factory=list[subprocess.Popen[bytes]])
     peak_bytes: int = 4096
@@ -52,23 +56,66 @@ class FakePlace:
         return self.processes[-1]
 
 
+PROVIDERS: dict[str, Literal["local", "mac", "ssh"]] = {"natedev": "local", "mac-linux": "ssh"}
+
+
+def assignment(target: str) -> placement.PlacementAssignment:
+    return placement.PlacementAssignment("fixture-episode", f"attempt-{target}",
+        placement.PlacementDestination(PROVIDERS.get(target, "mac"), target, f"{target}-host", WholeMacScope()),
+        execution_identity.SourceKeyUnavailable("a hand made run names no commit"),
+        placement.SubmittingOwner("natedev", os.getpid(), "fixture-start"), NoOwningSession(), 1.0)
+
+
+def local_grant() -> wire.LocalPlacementGranted:
+    return wire.LocalPlacementGranted(assignment("natedev"),
+                                      wire.Admitted("natedev-reservation", 1, "fixture", "/nonexistent/max", "", {}))
+
+
+def remote(target: str = "mac") -> wire.Assignment:
+    return wire.Assignment(assignment(target))
+
+
 @dataclass
-class FakeRoute:
+class FakeLine:
+    """The placement request of an attempt: each wait gives the next answer of the queue."""
+    folder: Path
     place: FakePlace = field(default_factory=FakePlace)
-    entered: list[Path] = field(default_factory=list[Path])
+    answers: list[Placed] = field(default_factory=lambda: [local_grant()])
     refusal: str = ""
     end_error: Exception | None = None
-    checked: list[Mapping[Path, bytes]] = field(default_factory=list[Mapping[Path, bytes]])
+    requests: list[hand_made.Request] = field(default_factory=list[hand_made.Request])
+    entered: list[str] = field(default_factory=list[str])
+    closed: list[tuple[str, int | None, str]] = field(default_factory=list[tuple[str, int | None, str]])
+    given_back: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
 
     @contextmanager
-    def __call__(self, repo: Path, checked: Mapping[Path, bytes]) -> Generator[hand_made.ProgramPlace]:
+    def __call__(self, request: hand_made.Request) -> Generator[Line]:
+        self.requests.append(request)
+        yield self
+
+    def wait(self) -> Placed:
         if self.refusal:
-            raise QueuePlaceRefused(self.refusal)
-        self.entered.append(repo)
-        self.checked.append(checked)
-        yield self.place
+            raise Refused(f"queue place: {self.refusal}")
+        if not self.answers:
+            raise Refused("queue place: no machine is left")
+        return self.answers.pop(0)
+
+    @contextmanager
+    def local_place(self, grant: HeldReservation) -> Generator[ProgramPlace]:
+        self.entered.append(grant.grant.reservation)
+        try:
+            yield self.place
+        finally:
+            # A queue place gives the grant the program status at its end.
+            grant.status = self.place.processes[-1].returncode if self.place.processes else 1
         if self.end_error is not None:
             raise self.end_error
+
+    def close(self, placed: Placed, status: int | None, reason: str) -> None:
+        self.closed.append((placed.assignment.destination.target, status, reason))
+
+    def give_back(self, placed: wire.Assignment, reason: str) -> None:
+        self.given_back.append((placed.assignment.destination.target, reason))
 
 
 Reply = Callable[[list[str]], subprocess.CompletedProcess[str]]
@@ -82,17 +129,19 @@ def same_model(model: str, _env: Mapping[str, str]) -> str:
     return model
 
 
-@final
-class HandMadeTests(unittest.TestCase):
+class AttemptCase(unittest.TestCase):
+    """An attempt in a temporary checkout with an injected model call and placement line."""
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.root = Path()
-        self.repo = Path()
+        self.root: Path = Path()
+        self.repo: Path = Path()
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.reply: Reply = self.answer(YES)
-        self.route = FakeRoute()
-        self.output = io.BytesIO()
+        self.line: FakeLine = FakeLine(Path())
+        self.routes: dict[str, Machine] = dict(hand_made.ROUTES)
+        self.output: io.BytesIO = io.BytesIO()
         self.caller: BinaryIO | None = None
 
     @override
@@ -115,7 +164,8 @@ class HandMadeTests(unittest.TestCase):
         self.calls, self.timeouts = [], []
         self.reply = self.answer(YES)
         (self.root / "place").mkdir()
-        self.route = FakeRoute(FakePlace(self.root / "place" / "program.cgroup"))
+        self.line = FakeLine(self.root / "place")
+        self.routes = dict(hand_made.ROUTES)
         self.output = io.BytesIO()
 
     def answer(self, value: object) -> Reply:
@@ -129,12 +179,13 @@ class HandMadeTests(unittest.TestCase):
 
     def services(self, registry: str = REGISTRY_TEXT) -> hand_made.Services:
         return hand_made.Services(registry_text=lambda: registry, runner=self.runner,
-                                  routes={"natedev": self.route},
+                                  routes=self.routes, line=self.line,
                                   output=lambda: self.output if self.caller is None else self.caller)
 
-    def attempt(self, argv: Sequence[str] = (), registry: str = REGISTRY_TEXT) -> tuple[int, str]:
+    def attempt(self, argv: Sequence[str] = (), registry: str = REGISTRY_TEXT,
+                machines: tuple[str, ...] = ("natedev",)) -> tuple[int, str]:
         command = tuple(argv) or (sys.executable, "check.py")
-        request = hand_made.Request("trial of the hand made job", ("natedev",), self.repo, command)
+        request = hand_made.Request("trial of the hand made job", machines, self.repo, command)
         errors = io.StringIO()
         with redirect_stderr(errors):
             status = hand_made.attempt(request, self.services(registry))
@@ -153,22 +204,25 @@ class HandMadeTests(unittest.TestCase):
 
     def assert_no_run(self, status: int, cause: str) -> dict[str, object]:
         self.assertEqual(status, hand_made.REFUSED_EXIT)
-        self.assertEqual(self.route.entered, [])
-        self.assertEqual(self.route.place.started, [])
+        self.assertEqual(self.line.entered, [])
+        self.assertEqual(self.line.place.started, [])
         row = self.only_row()
         self.assertIn(cause, str(row["refusal"]))
         self.assertIsNone(row["status"])
         self.assertIsNone(row["machine"])
         return row
 
+
+@final
+class HandMadeTests(AttemptCase):
     def test_yes_runs_the_command_in_its_place_and_records_the_attempt(self) -> None:
         status, errors = self.attempt()
         self.assertEqual(status, 0)
         self.assertIn("check yes: The script only prints a line.", errors)
         self.assertEqual(self.output.getvalue(), b"hand made ran\n")
-        self.assertEqual(self.route.entered, [self.repo])
-        self.assertEqual(self.route.checked, [{self.repo / "check.py": SCRIPT.encode()}])
-        self.assertEqual(self.route.place.started, [[sys.executable, "check.py"]])
+        self.assertEqual(self.line.entered, ["natedev-reservation"])
+        self.assertEqual(self.line.place.started, [[sys.executable, "check.py"]])
+        self.assertEqual(self.line.closed, [("natedev", 0, "")])
         command = self.calls[0]
         self.assertEqual(command[:2], [str(self.root / "claude"), "-p"])
         self.assertEqual(command[command.index("--model") + 1:command.index("--model") + 4],
@@ -241,7 +295,7 @@ class HandMadeTests(unittest.TestCase):
                       {"verdict": "yes", "reason": "Fine.", "run": "now"}, ["yes"]):
             with self.subTest(value=value):
                 outcome = hand_made.parse_verdict(value)
-                self.assertIsInstance(outcome, hand_made.Refused)
+                self.assertIsInstance(outcome, Refused)
                 self.assertEqual(str(outcome), "no model answer: schema failure")
 
     def test_unreadable_program_file_is_refused_before_the_model_call(self) -> None:
@@ -274,7 +328,7 @@ class HandMadeTests(unittest.TestCase):
         status, errors = self.attempt((sys.executable, "later.py"))
         self.assertEqual(status, hand_made.REFUSED_EXIT)
         self.assertIn(f"the program files changed after the check: {self.repo / 'later.py'}", errors)
-        self.assertEqual(self.route.place.started, [])
+        self.assertEqual(self.line.place.started, [])
 
     def test_a_child_that_keeps_the_output_open_does_not_hold_the_run(self) -> None:
         child = "import subprocess, sys; print(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']).pid)"
@@ -323,7 +377,7 @@ class HandMadeTests(unittest.TestCase):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
-        self.assertLessEqual(set(program), hand_made.PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES)
+        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES)
         self.assertEqual((program["HOME"], program["PATH"]), (os.environ["HOME"], os.environ["PATH"]))
         self.assertLessEqual(shown.items(), program.items())
         prefix = "Variables that the program gets and that can change the code it runs (JSON): "
@@ -345,7 +399,7 @@ class HandMadeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": f"{first}:{second}:{os.environ['PATH']}"}), \
                 self.assertRaises(FileNotFoundError):
             _ = self.attempt(("helper",))
-        self.assertEqual(self.route.place.started, [[str(first / "helper")]])
+        self.assertEqual(self.line.place.started, [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 
     def test_the_check_runs_no_program_that_the_checkout_names(self) -> None:
@@ -386,7 +440,7 @@ class HandMadeTests(unittest.TestCase):
     def test_a_program_that_the_place_reaped_first_keeps_its_status_and_output(self) -> None:
         def reaped(pid: int, flags: int = 0) -> int:
             del pid, flags
-            _ = self.route.place.processes[-1].wait()
+            _ = self.line.place.processes[-1].wait()
             raise ProcessLookupError
 
         _ = self.enterContext(mock.patch.object(os, "pidfd_open", side_effect=reaped))
@@ -410,7 +464,7 @@ class HandMadeTests(unittest.TestCase):
             with self.subTest(error=error):
                 for path in (self.root / "buildlog").glob("*/*.jsonl"):
                     path.unlink()
-                self.route.end_error = error
+                self.line.end_error, self.line.answers = error, [local_grant()]
                 status, errors = self.attempt((sys.executable, "-c", "import sys; sys.exit(5)"))
                 self.assertEqual(status, 5)
                 self.assertIn(f"hand made: {text}", errors)
@@ -426,8 +480,9 @@ class HandMadeTests(unittest.TestCase):
         status, errors = self.attempt()
         self.assertEqual(status, hand_made.REFUSED_EXIT)
         self.assertIn("check.py changed after the check", errors)
-        self.assertEqual(self.route.entered, [self.repo])
-        self.assertEqual(self.route.place.started, [])
+        self.assertEqual(self.line.entered, [])
+        self.assertEqual(self.line.place.started, [])
+        self.assertEqual(self.line.closed, [("natedev", None, "a checked file changed after the check")])
         row = self.only_row()
         files = cast(list[dict[str, object]], row["files"])
         self.assertNotEqual(files[0]["sha256_check"], files[0]["sha256_run"])
@@ -446,7 +501,7 @@ class HandMadeTests(unittest.TestCase):
         self.assertIsNone(files[0]["sha256_run"])
 
     def test_queue_place_refusal_is_recorded_with_no_run(self) -> None:
-        self.route = FakeRoute(refusal="admission service unavailable")
+        self.line.refusal = "admission service unavailable"
         status, _ = self.attempt()
         self.assertEqual(status, hand_made.REFUSED_EXIT)
         row = self.only_row()
@@ -526,7 +581,7 @@ class ProgramFileTests(unittest.TestCase):
                      ("uv", "--directory=/tmp", "run", "x.py"), ("timeout", "60", "uv", "-q", "--project", "/tmp", "run", "x"),
                      ("uv", "run", "--no-sync", "--directory", "/tmp/x", "evil.py")):
             with self.subTest(argv=argv), self.assertRaisesRegex(
-                    hand_made.Refused, "env -C, --chdir and -S, and uv --directory and --project are refused"):
+                    Refused, "env -C, --chdir and -S, and uv --directory and --project are refused"):
                 _ = self.read(*argv)
         script = self.write(self.repo / "x.sh", "echo x\n")
         self.assertEqual(self.read("env", "-u", "C", "-i", "bash", "x.sh", "-C"), [script])
@@ -536,7 +591,7 @@ class ProgramFileTests(unittest.TestCase):
                      ("timeout", "60", "env", "-i", "--", "FOO=1", "x"), ("nice", "env", "-", "FOO=1", "x"),
                      ("env", "-u", "X", "LD_PRELOAD=/tmp/x.so", "x")):
             with self.subTest(argv=argv), self.assertRaisesRegex(
-                    hand_made.Refused, "set the variable outside the hand made command"):
+                    Refused, "set the variable outside the hand made command"):
                 _ = self.read(*argv)
 
     def test_a_text_program_outside_the_checkout_is_read_and_a_tool_binary_is_not(self) -> None:
@@ -570,7 +625,7 @@ class ProgramFileTests(unittest.TestCase):
                  ({"PATH": f"{self.repo}/tools:/usr/bin"}, f"PATH has the entry '{self.repo}/tools'"))
         for variables, text in cases:
             with self.subTest(variables=variables), mock.patch.dict(os.environ, clean | variables, clear=True), \
-                    self.assertRaisesRegex(hand_made.Refused, re.escape(text)):
+                    self.assertRaisesRegex(Refused, re.escape(text)):
                 _ = self.read(sys.executable, "-c", "1")
         with mock.patch.dict(os.environ, clean | {"PATH": f"{self.bin}:/usr/bin", "LD_LIBRARY_PATH": "/x"}, clear=True):
             self.assertEqual(self.read(sys.executable, "-c", "1"), [])
@@ -585,14 +640,14 @@ class ProgramFileTests(unittest.TestCase):
         package = self.repo / "build"
         package.mkdir()
         _ = self.write(package / "__main__.py", "import os\n")
-        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
+        with self.assertRaisesRegex(Refused, "a word names a folder with a __main__ file"):
             _ = self.read("python3", "build")
 
     def test_a_word_that_names_a_folder_with_a_compiled_main_file_is_refused(self) -> None:
         package = self.repo / "build"
         package.mkdir()
         _ = self.write(package / "__main__.pyc", "compiled\n")
-        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
+        with self.assertRaisesRegex(Refused, "a word names a folder with a __main__ file"):
             _ = self.read("python3", "build")
 
     def test_a_word_that_names_a_plain_folder_is_not_refused(self) -> None:
@@ -609,7 +664,7 @@ class ProgramFileTests(unittest.TestCase):
                      ("uv", "run", "--module", "x"), ("uv", "-q", "run", "--with", "foo", "-qm", "x"),
                      ("timeout", "60", "uv", "run", "-p3.12", "-m", "x"), ("uv", "run", "--frozen", "pytest", "-m", "slow"),
                      ("uv", "run", "--frozen", "-m", "evil"), ("uv", "run", "--isolated", "--module=evil")):
-            with self.subTest(argv=argv), self.assertRaisesRegex(hand_made.Refused, "python -m and uv run -m run a module"):
+            with self.subTest(argv=argv), self.assertRaisesRegex(Refused, "python -m and uv run -m run a module"):
                 _ = self.read(*argv)
         _ = self.write(self.repo / "x.py", "print(1)\n")
         for argv in (("python3", "x.py", "-m", "y"), ("uv", "run", "-p", "3.12", "x.py", "-m", "y"),
@@ -641,9 +696,9 @@ class SettingsTests(unittest.TestCase):
         }
         for old, (new, message) in cases.items():
             with self.subTest(key=new):
-                with self.assertRaisesRegex(hand_made.Refused, message):
+                with self.assertRaisesRegex(Refused, message):
                     _ = hand_made.read_settings(REGISTRY_TEXT.replace(old, new))
-        with self.assertRaisesRegex(hand_made.Refused, r"no \[cli.hand_made\] section"):
+        with self.assertRaisesRegex(Refused, r"no \[cli.hand_made\] section"):
             _ = hand_made.read_settings("[cli.claude]\ninteractive=opus:max\n")
 
 
@@ -656,18 +711,16 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 2)
         return errors.getvalue()
 
-    def test_machine_is_required_and_only_natedev_or_the_guest_is_accepted_in_this_phase(self) -> None:
+    def test_machine_is_required_and_only_natedev_the_mac_and_the_guest_are_accepted_in_this_phase(self) -> None:
         self.assertIn("--machine", self.parse("--why", "trial", "--", "true"))
-        self.assertIn("machine mac comes in a later phase; this phase accepts one of: natedev, mac-linux",
-                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "mac", "--", "true"))
+        self.assertIn("machine hana-aws comes in a later phase; this phase accepts only natedev, mac, mac-linux",
+                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "hana-aws", "--", "true"))
         self.assertIn("give the command after --", self.parse("--why", "trial", "--machine", "natedev"))
 
-    def test_a_run_names_one_machine_in_this_phase(self) -> None:
-        self.assertIn("a run that names more than one machine comes in a later phase; name one of natedev, mac-linux",
-                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "mac-linux", "--", "true"))
-        request = hand_made.parse_request(["--why", "trial", "--machine", "mac-linux", "--repo", str(REPOSITORY),
-                                           "--", "true"])
-        self.assertEqual(request.machines, ("mac-linux",))
+    def test_a_run_can_name_the_guest_with_another_machine(self) -> None:
+        request = hand_made.parse_request(["--why", "trial", "--machine", "natedev", "--machine", "mac-linux",
+                                           "--repo", str(REPOSITORY), "--", "true"])
+        self.assertEqual(request.machines, ("natedev", "mac-linux"))
 
     def test_repo_must_be_the_top_folder_of_a_git_work_tree(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -677,28 +730,69 @@ class ArgumentTests(unittest.TestCase):
                                   self.parse("--why", "trial", "--machine", "natedev", "--repo", str(repo), "--", "true"))
 
     def test_request_keeps_each_named_machine_once(self) -> None:
-        request = hand_made.parse_request(["--why", " trial ", "--machine", "natedev", "--machine", "natedev",
-                                           "--repo", str(REPOSITORY), "--", "cargo", "test"])
-        self.assertEqual(request, hand_made.Request("trial", ("natedev",), REPOSITORY, ("cargo", "test")))
+        request = hand_made.parse_request(["--why", " trial ", "--machine", "natedev", "--machine", "mac",
+                                           "--machine", "natedev", "--repo", str(REPOSITORY), "--", "cargo", "test"])
+        self.assertEqual(request, hand_made.Request("trial", ("natedev", "mac"), REPOSITORY, ("cargo", "test")))
 
 
 @final
 class BuildsPageTests(unittest.TestCase):
-    def test_the_queue_place_carries_the_hand_made_job_name_and_the_hold_check(self) -> None:
-        seen: list[tuple[str, Path, object]] = []
+    def test_one_placement_request_has_a_line_for_each_named_machine_and_the_hand_made_job_name(self) -> None:
+        seen: list[tuple[str | Sequence[str], Path]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            owner = wire.Owner(os.getpid(), "fixture-start")
 
-        @contextmanager
-        def place(program: str, repo: Path, *, before_check: object) -> Generator[FakePlace]:
-            seen.append((program, repo, before_check))
-            yield FakePlace()
+            def request() -> wire.AdmitRequest:
+                return admission_client.step_request(["hand-made"], str(REPOSITORY), owner, 1.0, str(folder / "sidecar"),
+                    "fixture-episode", admission_records.ProgramProfile("hand-made", str(folder), str(REPOSITORY),
+                        admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0.0)))
 
-        from scripts.build_queue import queue_place
-        with mock.patch.object(queue_place, "queue_place", side_effect=place):
-            with hand_made.natedev_place(REPOSITORY, {}) as held:
-                self.assertIsInstance(held, FakePlace)
-        self.assertEqual([(program, repo) for program, repo, _ in seen], [("hand-made", REPOSITORY)])
-        from scripts.build_queue.admission_client import AdmissionHoldCheck
-        self.assertIsInstance(seen[0][2], AdmissionHoldCheck)
+            @contextmanager
+            def setup(program: str | Sequence[str], repo: Path) -> Generator[queue_place.PlaceSetup]:
+                seen.append((program, repo))
+                yield queue_place.PlaceSetup(folder, folder / "sidecar", step_estimator.memory_config(),
+                                             queue_place.ProgramPurpose.BATCH, (), request)
+
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog")}), \
+                    mock.patch.object(queue_place, "place_setup", side_effect=setup):
+                for machines in (("natedev", "mac"), ("mac",), ("natedev", "mac-linux")):
+                    with self.subTest(machines=machines), hand_made.placement_line(
+                            hand_made.Request("trial", machines, REPOSITORY, ("cargo", "test"))) as line:
+                        assert isinstance(line, hand_made.PlacementLine)
+                        constraints = line.request.constraints
+                        self.assertEqual(sorted(item.destination.target for item in constraints.candidates), sorted(machines))
+                        self.assertEqual(constraints.command_kind, "run")
+                        # The guest line takes a hand made run as it takes a gate step.
+                        self.assertNotIn(placement.FixedExclusion("command"),
+                                         [item.eligibility for item in constraints.candidates])
+                        self.assertEqual((line.request.episode, line.folder), ("fixture-episode", folder))
+                        profile = line.request.profile
+                        assert isinstance(profile, admission_records.ProgramProfile)
+                        self.assertEqual(profile.step, "hand-made")
+        self.assertEqual(seen, [("hand-made", REPOSITORY)] * 3)
+
+    def test_a_held_natedev_gives_a_wait_and_no_run(self) -> None:
+        from scripts.build_hold import build_hold
+        from scripts.build_queue.admission_test_support import AdmissionFixture
+        from scripts.build_targets import build_targets
+
+        with AdmissionFixture() as fixture:
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+            fixture.server.host_probe = fixture.server.read_provider_evidence
+            local = fixture.request(episode="hand-made-held")
+            request = hand_made.placement_request(
+                hand_made.Request("trial", ("natedev",), REPOSITORY, ("cargo", "test")), local)
+            holder = build_hold.Holder("fps", datetime.now(UTC), "timing", build_hold.UnknownReleaseEta(), "fps")
+            with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
+                waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait)
+            self.assertIsInstance(waiting.wait, wire.PlacementResourceWait)
+            fixture.allow_next_start()
+            granted, = fixture.server.handle_request(request)
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.release(granted.grant)
 
     def test_the_builds_page_marks_the_row_hand_made(self) -> None:
         names = build_steps.StepNames(conf.read(REPOSITORY / "config/build_steps.conf").values())
