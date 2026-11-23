@@ -2079,11 +2079,11 @@ def _with_run_delivery(item: ListItem, delivery: RunDelivery, moment: datetime, 
     return changed
 
 
-def _settle_current_run(item: ListItem, moment: datetime) -> ListItem:
-    for delivery in reversed(item.run_deliveries):
-        if not isinstance(delivery.confirmation, RunResult):
+def _settle_run_confirmations(item: ListItem, moment: datetime) -> ListItem:
+    for delivery in item.run_deliveries:
+        if isinstance(delivery.confirmation, AwaitingConfirmation):
             settled = replace(delivery, confirmation=RunResult.MANUALLY_SETTLED)
-            return _with_run_delivery(item, settled, moment)
+            item = _with_run_delivery(item, settled, moment)
     return item
 
 
@@ -2191,21 +2191,44 @@ def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNoti
     return (*common, "--to", f"staff:{recipient}", "--text", message)
 
 
+# Adopt and reap children that remain in the sender group after the sender exits.
+_WAIT_FOR_SENDER_GROUP = """import os
+import signal
+import subprocess
+import sys
+
+sys.path.insert(0, sys.argv.pop(1))
+from scripts.lib.descendants import adopt_descendants
+
+if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN or not adopt_descendants():
+    sys.exit("cannot reap the sender group")
+status = subprocess.call(sys.argv[1:])
+while True:
+    try:
+        os.waitpid(0, 0)
+    except ChildProcessError:
+        break
+sys.exit(status if status >= 0 else 128 - status)
+"""
+
+
 def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice) -> None:
     budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
     deadline = monotonic() + budget
     sender = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
     # Kill the group at the deadline even if the sender would exit on TERM.
-    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), *sender]
+    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
+               _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), *sender]
     # Keep the sender's delivery children in the same process group.
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                           errors="replace", start_new_session=True,
                           env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
         try:
             stdout, stderr = child.communicate(timeout=max(0, deadline - monotonic()))
-        finally:
+        except BaseException:
             with suppress(ProcessLookupError):
                 process_group.send_process_group(child.pid, signal.SIGKILL)
+            raise
     if child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL):
         raise ListError("message delivery timed out")
     attempt = send_result.send_outcome(child.returncode, stdout)
@@ -2473,7 +2496,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         if changed.state is ItemState.SCHEDULED:
             changed = replace(changed, parked_until=NoTimestamp.UNSET)
         if changed.state is not item.state:
-            changed = _settle_current_run(changed, moment)
+            changed = _settle_run_confirmations(changed, moment)
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
@@ -2610,7 +2633,7 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
                                  for question in item.questions if question.answer is None)
         changed = replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
                           questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
-        return _settle_current_run(changed, moment)
+        return _settle_run_confirmations(changed, moment)
 
     def close_event(changed: ListItem) -> FieldChange:
         if changed.state is not ItemState.CLOSED:

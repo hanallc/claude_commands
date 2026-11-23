@@ -358,16 +358,25 @@ if "Slow notice" in args[-1] and key.endswith(":owner_start"):
                           start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as child:
         assert child.stdout.readline() == b"ready\n"
         child.wait()
-if "Orphan sender" in args[-1] and key.endswith(":owner_start"):
+if ("Orphan sender" in args[-1] or "Exited sender" in args[-1]) and key.endswith(":owner_start"):
     program = (
-        "import signal, socket, sys\n"
+        "import os, signal, socket, sys\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "with socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=8) as connection:\n"
         "    connection.sendall(b'R')\n"
-        "    connection.recv(1)\n"
+        "    if connection.recv(1) == b'X':\n"
+        "        print('release', flush=True)\n"
+        "        os.close(1)\n"
+        "        connection.recv(1)\n"
     )
-    with subprocess.Popen([sys.executable, "-c", program, os.environ["SCHEDFIRE_TEST_READY_PORT"]]) as child:
-        child.wait()
+    command = [sys.executable, "-c", program, os.environ["SCHEDFIRE_TEST_READY_PORT"]]
+    if "Exited sender" in args[-1]:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        assert child.stdout.readline() == b"release\n"
+        child.stdout.close()
+    else:
+        with subprocess.Popen(command, stdout=subprocess.DEVNULL) as child:
+            child.wait()
 if "Scan resume" in args[-1] and key.endswith("_start"):
     time.sleep(30)
 rows = log.read_text().splitlines() if log.exists() else []
@@ -506,7 +515,8 @@ else:
                     self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
 
             for case in ("interrupted owner", "slow notice", "scan resume", "overlapping runs",
-                         "same check", "state changed", "Mac", "orphan sender"):
+                         "same check", "state changed", "all confirmations", "pending instruction",
+                         "Mac", "orphan sender", "exited sender"):
                 with self.subTest(case=case):
                     for path in (sent, attempted):
                         _ = path.write_text("")
@@ -520,10 +530,12 @@ else:
                             self.check_scheduled_scan_resumes(sent)
                         case "overlapping runs" | "same check" | "state changed":
                             self.check_overlapping_scheduled_runs(sent, attempted, case)
+                        case "all confirmations" | "pending instruction":
+                            self.check_manual_run_settlement(attempted, pending_instruction=case == "pending instruction")
                         case "Mac":
                             self.check_mac_scheduled_run(attempted)
-                        case "orphan sender":
-                            self.check_scheduled_sender_stops_after_upkeep_dies(sender)
+                        case "orphan sender" | "exited sender":
+                            self.check_scheduled_sender_stops_after_upkeep_dies(sender, sender_exits=case == "exited sender")
 
     def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")
@@ -578,9 +590,10 @@ else:
         self.assertEqual(sum(slow.title in args[-1] and args[args.index("--key") + 1].endswith(":owner_start")
                              for args in rows), 1)
 
-    def check_scheduled_sender_stops_after_upkeep_dies(self, sender: Path) -> None:
+    def check_scheduled_sender_stops_after_upkeep_dies(self, sender: Path, *, sender_exits: bool) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")
-        _ = self.add("Orphan sender", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        title = "Exited sender" if sender_exits else "Orphan sender"
+        _ = self.add(title, changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
         program = """import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -607,6 +620,9 @@ the_list.fire_scheduled(timedelta(minutes=2))
                         connection.settimeout(5)
                         self.assertEqual(connection.recv(1), b"R")
                         upkeep.kill()
+                        if sender_exits:
+                            _ = upkeep.wait(timeout=5)
+                            connection.sendall(b"X")
                         self.assertEqual(connection.recv(1), b"")
                 finally:
                     upkeep.kill()
@@ -680,6 +696,55 @@ the_list.fire_scheduled(timedelta(minutes=2))
         for args, due in zip(rows, (second, second, moved, moved), strict=True):
             self.assertIn(due.isoformat(), args[-1])
         self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
+
+    def check_manual_run_settlement(self, attempted: Path, *, pending_instruction: bool) -> None:
+        wait = timedelta(days=3)
+        settings = self.list_config.read_text().replace("confirm_wait_minutes=2", "confirm_wait_minutes=4320")
+        _ = self.list_config.write_text(settings)
+        first = the_list.ScheduledRun(START, "Read the figures.")
+        days = "MO,TU,WE" if pending_instruction else "MO,TU"
+        rule = repeat_rule.parse(f"FREQ=WEEKLY;BYDAY={days};COUNT={4 if pending_instruction else 3}")
+        item = self.add("Manual settlement", changes={"state": the_list.ItemState.SCHEDULED,
+                                                     "schedule": the_list.ScheduledSeries(first, rule)})
+        due = (START, START + timedelta(days=1), START + timedelta(days=2))
+        for tick in due[:2]:
+            with patch.object(the_list, "now", return_value=tick):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+        if pending_instruction:
+            with (patch.object(the_list, "now", return_value=due[2]),
+                  patch.object(the_list, "_deliver_scheduled_notice", side_effect=KeyboardInterrupt),
+                  self.assertRaises(KeyboardInterrupt)):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+
+        active = the_list.load(MORTY.id, item.id)
+        first_run, second_run, *pending = active.run_deliveries
+        for run, tick in zip((first_run, second_run), due[:2], strict=True):
+            self.assertEqual(run.confirmation, the_list.AwaitingConfirmation(tick + wait))
+        if pending_instruction:
+            self.assertEqual([(run.run.start, run.confirmation) for run in pending],
+                             [(due[2], the_list.AwaitingInstruction.OWNER)])
+
+        with patch.object(the_list, "now", return_value=due[2]):
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "nate"),
+                             (0, "", ""))
+            delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
+            self.assertEqual(delivered.schedule, active.schedule)
+            self.assertEqual(delivered.run_deliveries, tuple(pending))
+            for run in (first_run, second_run):
+                self.assertEqual(delivered.log[run.log_index].what,
+                                 f"Scheduled run due {run.run.start.isoformat()}. Settled by a manual state change.")
+            if pending_instruction:
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+                resumed = the_list.load(MORTY.id, item.id)
+                self.assertEqual([(run.key, run.confirmation) for run in resumed.run_deliveries],
+                                 [(pending[0].key, the_list.AwaitingConfirmation(due[2] + wait))])
+
+        sends = attempted.read_text()
+        for tick in due[:2]:
+            with patch.object(the_list, "now", return_value=tick + wait):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sends)
 
     def check_mac_scheduled_run(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")
