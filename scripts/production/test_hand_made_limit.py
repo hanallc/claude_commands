@@ -389,8 +389,8 @@ class NatedevRunTests(unittest.TestCase):
         original = hand_made_limit.held_output
 
         def recorded(argv: Sequence[str], checkout: Path, environment: Mapping[str, str],
-                     held: ExitStack) -> tuple[int, ...]:
-            lock = original(argv, checkout, environment, held)
+                     held: ExitStack, *, note_outside: bool) -> tuple[int, ...]:
+            lock = original(argv, checkout, environment, held, note_outside=note_outside)
             locks.extend((descriptor, os.fstat(descriptor).st_ino) for descriptor in lock)
             return lock
 
@@ -527,6 +527,16 @@ class NatedevRunTests(unittest.TestCase):
         self.assertEqual((result, note.getvalue(), locks), (0, f"cargo: {reason}\n", []), written)
         self.assertTrue((self.program.repo / "ran").exists())
 
+    def test_in_report_mode_the_attempt_start_check_and_the_run_give_the_note_once(self) -> None:
+        reason = f"{self.program.repo}: no build folder. Use worktrees.py make <repo> <unit> <short-name>"
+        _ = self.assigned_cargo(cargo_folder.UnassignedWorkspace(reason), enforce=False)
+        note = io.StringIO()
+        with contextlib.redirect_stderr(note):
+            refusal = hand_made_limit.start_refusal(("cargo", "build"), self.program.repo,
+                                                    hand_made.program_environment())
+            written, result = self.run_script(("cargo", "build"), "touch ran")
+        self.assertEqual((refusal, result, note.getvalue()), ("", 0, f"cargo: {reason}\n"), written)
+
     def test_a_cargo_run_does_the_folder_steps_only_when_the_wrapper_does(self) -> None:
         clear = {"CARGO_FOLDER_CHECKED": "", "BUILDLOG_STEP_SCOPE": ""}
         for argv, variables, due in (
@@ -541,10 +551,12 @@ class NatedevRunTests(unittest.TestCase):
             with (self.subTest(argv=argv, variables=variables), mock.patch.dict(os.environ, variables),
                   mock.patch.object(cargo_folder, "checked_step", return_value=cargo_folder.NoOutputLock()) as step,
                   ExitStack() as held):
-                self.assertEqual(hand_made_limit.held_output(argv, self.program.repo, {"HOME": "/home"}, held), ())
+                self.assertEqual(hand_made_limit.held_output(argv, self.program.repo, {"HOME": "/home"}, held,
+                                                             note_outside=True), ())
                 self.assertEqual(step.called, due)
                 if due:
-                    step.assert_called_once_with(list(argv[1:]), self.program.repo, held, {"HOME": "/home"})
+                    step.assert_called_once_with(list(argv[1:]), self.program.repo, held, {"HOME": "/home"},
+                                                 note_outside=True)
 
     def test_a_cargo_failure_with_an_offline_text_in_colour_is_the_no_network_refusal(self) -> None:
         _ = self.assigned_cargo()

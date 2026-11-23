@@ -4148,7 +4148,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 #### As-built
 
-- `test_run_folder` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+- `start_test_run` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+  This phase put it in `test_run_folder`. The `--affected` gate also holds that folder, so the targeted gate read an empty module read index and lost its gate record. The code moved to `start_test_run`.
 - Every direct test run of every module keeps its build log in its run folder. The gate already sets `BUILDLOG_DIR` for each module (`merge_gate.py:1129`).
 - `scripts/buildlog/test_log_isolation.py` is removed: it re-ran 5 modules under a new HOME and guarded only those 5. `test_testing_folders` checks the two cases and the restore.
 - `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
