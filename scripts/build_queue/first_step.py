@@ -4,12 +4,10 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from importlib import import_module
 import os
 from pathlib import Path
 import subprocess
 import time
-from typing import cast
 from uuid import uuid4
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
@@ -256,12 +254,19 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
-def gate_targets(command: Sequence[str], requested: str = "") -> tuple[str, ...]:
-    """Read the targets for a gate from the caller."""
+def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
+    """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
-    return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    if names:
+        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
+
+    selected = eligible_gate_targets(source, tuple(command))
+    if isinstance(selected, NoEnabledTarget):
+        raise FirstStepRefused(selected.reason)
+    return selected
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
@@ -274,8 +279,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     # Keep the registry order when more than one named target can start.
     configured = target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT)
     ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets), *targets))
-    builder = cast(client.PlacementConstraintBuilder,
-        getattr(import_module('scripts.build_targets.build_targets'), 'fixed_placement_constraints'))
+    builder = client.placement_constraint_builder()
     arguments = tuple(command)
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:

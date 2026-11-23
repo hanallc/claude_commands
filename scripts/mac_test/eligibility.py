@@ -247,7 +247,7 @@ def mac_linux_target(registry: conf.ConfigRead) -> target_config.SshTarget:
 
 
 def mac_linux_enabled(registry: conf.ConfigRead) -> bool:
-    return registry.value(f"enabled.{MAC_LINUX_TARGET}", conf.on_off, recover_invalid=False)
+    return registry.value(f"enabled.{MAC_LINUX_TARGET}", conf.on_off, default=False, recover_invalid=False)
 
 
 def ssh_target_state_directory(target: str) -> Path:

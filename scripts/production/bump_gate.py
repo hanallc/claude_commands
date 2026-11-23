@@ -13,11 +13,10 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 
 from scripts.production.checkpoint_gate import (
-    Stop, complete_gate, read_record, record_lock,
+    Stop, checkpoint_gate_targets, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record, test_steps,
 )
 from scripts.production.production_doc import ProductionDocument
@@ -47,8 +46,8 @@ def run_gate(path: Path) -> int:
             steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
                                tuple(tuple(command) for command in record["merge_tests"]))
             command = steps[0].command if steps else []
-            # The checkpoint caller places each named gate under its own process.
-            if gate_targets(command):
+            # The checkpoint caller places each gate that has targets.
+            if checkpoint_gate_targets(command, source):
                 command = []
             with copies.command_tree(record["owner_id"], source, copies.CommittedSource("HEAD"),
                                      command, step="integrate") as clone:

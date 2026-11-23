@@ -17,9 +17,13 @@ from zoneinfo import ZoneInfo
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.test_placement import PlacementFixture
 from scripts.copies import copies
+from scripts.lib import build_folders
 from scripts.lib.build_steps import gate_job_from_process
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate
 from scripts.production.production_doc import ProductionDocument
@@ -69,10 +73,48 @@ class CheckpointGateTests(unittest.TestCase):
     def test_gate_without_targets_starts_directly(self) -> None:
         folder = Path("/fixture")
         with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+              mock.patch.object(build_folders, "repo_word", return_value="hana"),
               mock.patch.object(subprocess, "run",
                   return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
             _ = checkpoint_gate.run_test_command(list(GATE), folder)
         run.assert_called_once_with(list(GATE), cwd=folder, capture_output=True, text=True, check=False, pass_fds=())
+
+    def test_named_module_gate_keeps_the_parent_reservation(self) -> None:
+        with PlacementFixture() as fixture:
+            start = admission_records.process_start_time(os.getppid())
+            assert start is not None
+            outer = fixture.request(owner=admission_wire.Owner(os.getppid(), start))
+            with fixture.loop_turn():
+                grant = only_admitted(fixture.server.handle_request(outer))
+            fixture.hold_starts()
+            reservation = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            command = [*GATE, "--module", "lib/test_infrastructure.py"]
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "", "BUILDLOG_RESERVED_STEP": reservation}),
+                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
+                  mock.patch.object(subprocess, "run",
+                      return_value=subprocess.CompletedProcess(command, 0, "", "")) as run):
+                self.assertEqual(admission_client.outer_reservation(),
+                                 admission_client.OuterReservation(grant.reservation, outer.owner.pid))
+                result = checkpoint_gate.run_test_command(command, fixture.root)
+            self.assertEqual(result.returncode, 0)
+            run.assert_called_once_with(command, cwd=fixture.root, capture_output=True, text=True, check=False,
+                                        pass_fds=())
+
+    def test_claude_gate_without_enabled_targets_refuses_before_start(self) -> None:
+        with PlacementFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_targets.conf",
+                "targets=mac-linux,natedev\nenabled.mac-linux=off\nenabled.natedev=off\n")
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
+                  mock.patch.object(subprocess, "run",
+                      return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
+                with self.assertRaises(checkpoint_gate.Stop) as refused:
+                    _ = checkpoint_gate.run_test_command(list(GATE), fixture.root)
+            run.assert_not_called()
+            self.assertEqual(refused.exception.state, "blocked")
+            self.assertEqual(refused.exception.detail,
+                             "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf.")
 
 
 COMMAND = ["python3", "gate.py", "--tests-only"]

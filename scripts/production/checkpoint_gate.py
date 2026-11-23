@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
-from scripts.build_queue.first_step import gate_targets
+from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
@@ -116,10 +116,19 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
     return steps
 
 
+def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, ...]:
+    """Report unavailable placement as a blocked checkpoint."""
+    try:
+        return gate_targets(command, folder)
+    except FirstStepRefused as error:
+        reason = str(error)
+        raise Stop("test", "blocked", reason, reason) from error
+
+
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
     submitted = command
-    targets = gate_targets(command)
+    targets = checkpoint_gate_targets(command, folder)
     if targets:
         scripts = Path(__file__).resolve().parents[1]
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",

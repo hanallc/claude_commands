@@ -4,6 +4,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 import os
 from pathlib import Path
+import subprocess
 import unittest
 from unittest import mock
 
@@ -11,16 +12,16 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
 from scripts.build_queue.test_placement import (
-    PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, placement_request,
-    publish_candidate,
+    PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, mac_linux_candidate,
+    placement_request, publish_candidate,
 )
-from scripts.build_targets import build_targets
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 GATE_COMMAND = ("python3", "scripts/production/gate.py", "--tests-only", "--type-dirs", "scripts")
@@ -36,7 +37,68 @@ def forbid_admission_calls() -> AbstractContextManager[object]:
     return mock.patch.object(client, "_call", side_effect=AssertionError("unmocked admission service call"))
 
 
+def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "on") -> Path:
+    """Give the gate a private registry and repository origin."""
+    _ = write_config_fixture(fixture.root / "build_targets.conf",
+        "targets=mac-linux,natedev,mac,hana-aws\n"
+        + f"enabled.mac-linux={enabled}\n")
+    _ = write_config_fixture(fixture.root / "mac_linux.conf",
+        "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n")
+    _ = write_config_fixture(fixture.root / "hana_aws.conf", "enabled=on\n")
+    source = fixture.root / (".claude" if repository == "claude_commands" else repository)
+    source.mkdir()
+    for command in (("init", "-q"), ("remote", "add", "origin", f"https://example.invalid/{repository}.git")):
+        _ = subprocess.run(("git", "-C", str(source), *command), capture_output=True,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
+    return source
+
+
 class FirstStepTests(unittest.TestCase):
+    def test_explicit_gate_targets_override_the_claude_default(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "mac-linux"}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
+
+    def test_hana_gate_has_no_default_targets(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "hana")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ())
+
+    def test_disabled_targets_leave_the_claude_gate_default(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands", enabled="off")
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.natedev=off\n")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                with self.assertRaisesRegex(first_step.FirstStepRefused, "No enabled build target"):
+                    _ = first_step.gate_targets(GATE_COMMAND, source=source)
+
+    def test_disabling_only_mac_linux_keeps_natedev_in_the_claude_gate_default(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands", enabled="off")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
+
+    def test_default_gate_omits_an_unsupported_linux_target(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            _ = write_config_fixture(fixture.root / "build_targets.conf",
+                "targets=linux-extra,natedev\nkind.linux-extra=ssh\nplatform.linux-extra=linux\n"
+                + "settings.linux-extra=linux-extra.conf\n")
+            _ = (fixture.root / "linux-extra.conf").write_text("host=fixture-linux\nkinds=check,test\n")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
+
+    def test_default_gate_omits_mac_linux_when_its_enable_key_is_missing(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            registry = fixture.root / "build_targets.conf"
+            _ = registry.write_text(registry.read_text().replace("enabled.mac-linux=on\n", ""))
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
+
     def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
         position = SlotQueuePosition("episode", 3)
         assignment = placement.PlacementAssignment(position.episode, "attempt",
@@ -66,15 +128,29 @@ class FirstStepTests(unittest.TestCase):
             self.assertIsInstance(admitted.grant, first_step.HandedOff)
 
     def test_named_gate_places_one_request_and_exports_the_assignment(self) -> None:
+        self.check_gate_placement(use_default=False)
+
+    def test_default_claude_gate_places_one_request_and_exports_the_assignment(self) -> None:
+        self.check_gate_placement(use_default=True)
+
+    def check_gate_placement(self, *, use_default: bool) -> None:
         with PlacementFixture() as fixture:
-            _ = (fixture.root / "build_targets.conf").write_text("\n".join((
-                "targets=mac-linux,natedev,mac",
-                "kind.mac-linux=ssh", "platform.mac-linux=linux", "settings.mac-linux=guest.conf",
-                "kind.natedev=local", "platform.natedev=linux",
-                "kind.mac=ssh", "platform.mac=macos", "settings.mac=mac.conf", "",
-            )) + UNREACHABLE_WAIT_FIXTURE)
-            remote = placement.PlacementCandidate(
-                placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", claim_state.WHOLE_MAC, 1))
+            source = gate_source(fixture, "claude_commands")
+            configured = conf.read("build_targets").text("targets").split(",")
+            expected = tuple(name for name in configured if name not in ("mac", "hana-aws"))
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                targets = first_step.gate_targets(GATE_COMMAND, source=source) if use_default else expected[::-1]
+                if use_default:
+                    self.assertEqual(targets, expected)
+                    for option in ("--module=fixture/test_gate.py", "--nightly", "--promote-only"):
+                        local_only = (*GATE_COMMAND, option)
+                        self.assertEqual(first_step.gate_targets(local_only, source=source), ())
+                        self.assertEqual(first_step.gate_targets(local_only, source=source, requested="natedev"),
+                                         ("natedev",))
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev,mac,hana-aws\n")
+                    self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=" + ",".join(configured) + "\n")
+            remote = mac_linux_candidate()
             local = local_candidate(fixture)
             requests: list[wire.PlacementRequest] = []
 
@@ -87,13 +163,12 @@ class FirstStepTests(unittest.TestCase):
                       {"BUILDLOG_PLACEMENT_FILE": "outer-file", "BUILDLOG_PLACEMENT_EPISODE": "outer-episode"}),
                   mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
-                  mock.patch.object(build_targets, "fixed_remote_candidates", return_value=(remote,)) as candidates,
                   mock.patch.object(client, "acquire_placement", side_effect=grant),
                   mock.patch.object(queue_place, "request_place", return_value=PROGRAM_GRANT) as program,
                   mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel,
                   forbid_admission_calls()):
-                with first_step.admitted_run(GATE_COMMAND, fixture.root, targets=("natedev", "mac-linux")) as admitted:
+                with first_step.admitted_run(GATE_COMMAND, source, targets=targets) as admitted:
                     self.assertEqual(len(requests), 1)
                     request = requests[0]
                     self.assertEqual(request.constraints.candidates, (remote, local))
@@ -114,7 +189,6 @@ class FirstStepTests(unittest.TestCase):
                     cancel.assert_not_called()
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], "outer-file")
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], "outer-episode")
-                candidates.assert_called_once()
                 cancel.assert_called_once()
                 program.assert_not_called()
 
