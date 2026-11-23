@@ -23,9 +23,10 @@ under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are ap
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone.
-Style-sync lint uses `copies.standing` in a repository slot under the machine's configured slot root.
-The `roots.slots` settings in `build_folders.conf` select that root.
-Slot trust requires a registered worktree and an `.envrc` that matches `HEAD`.
+Style-sync lint uses `copies.standing`, a numbered copy at `<roots.build>/<repository>/<unit>/<N>`.
+Copy trust requires a copy lease whose source checkout is under a trusted root.
+The copy's `.envrc` must match the `.envrc` of the recorded commit byte for byte.
+A slot under `roots.slots` still needs a registered worktree and an `.envrc` that matches `HEAD`.
 Forged links still require explicit approval.
 
 Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev,

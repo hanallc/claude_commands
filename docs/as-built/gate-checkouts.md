@@ -23,16 +23,17 @@ The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-`config/build_folders.conf` sets the slot root and pool limits.
-The `slots.wait_seconds` setting limits the wait for a slot.
-The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
-The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
-Owners on the same machine share the pool for a repository.
-Each checkout uses `<slot-root>/<repository>-slot<N>`. The lease records the owner.
+`config/build_folders.conf` sets the build root.
+The root uses `roots.build.<machine>`, with `roots.build` as the default.
+Each checkout uses `<roots.build>/<repository>/<unit>/<N>`.
+The lock `<N>.lock` and the lease `<N>.lease.json` are beside the checkout. The lease records the owner.
+The unit is the caller's staff unit name. Without a staff row, the unit is the owner.
+The maker takes the lowest free existing number or makes the smallest missing number. No setting limits the count.
 The repository name comes from the last part of its origin URL, with the `.git` suffix removed.
+A `repo_word.<name>` setting in `build_folders.conf` replaces that name.
 Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
 A cycle of local origins is an error.
-A repository without an origin uses its main checkout's folder name.
+A repository without an origin cannot take a copy.
 Linked worktrees and local clones use the same identity.
 
 The CLI reads the calling session's local staff row.
@@ -40,12 +41,12 @@ A worker uses its parent unit's row id.
 A caller without a staff row receives an error.
 Text owners enter through one boundary as staff row ids or fixed role names.
 
-## Slot preparation
+## Copy preparation
 
-The slot lease covers checkout preparation and caller use. Command children inherit the lease descriptors.
+The copy lease covers checkout preparation and caller use. Command children inherit the lock descriptor.
 Preparation selects the requested commit and applies the source and merge policies.
 The checkout remains after use. A later caller can reuse its build output.
-See [Repository copies](copies.md) for slot cleanup and build output details.
+See [Repository copies](copies.md) for copy cleanup and build output details.
 
 ## Reset and build output
 
@@ -103,8 +104,8 @@ Cache marking does not follow a caller's replacement target symlink.
 
 ## Acquisition and cleanup
 
-Acquisition waits for a free slot when all slots in the configured pool are busy.
-The slot lease releases when preparation fails or the caller ends.
+Acquisition does not wait for a copy. When a copy is busy, the maker tries the next number.
+The copy lease releases when preparation fails or the caller ends.
 
 Each prepared checkout and standing cache has a `.gate.json` record:
 

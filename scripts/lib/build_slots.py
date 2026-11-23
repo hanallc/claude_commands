@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Take reusable repository slots and preserve source before each reset."""
+"""Take numbered copies and preserve source before each reset."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -25,21 +25,10 @@ from uuid import uuid4
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
 from scripts.lib.slot_root import configured_slot_root as configured_slot_root
-from scripts.lib.slot_root import slot_root as slot_root
 
 
-LEASE_SUFFIX = ".lease.json"
 # Python writes these folders beside each imported module; they hold no work.
 _TOOL_OUTPUT_FOLDERS = ("__pycache__",)
-
-
-@dataclass(frozen=True)
-class Slot:
-    path: Path
-    cargo_dir: Path
-    repository: str
-    number: int
-    env: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -51,7 +40,7 @@ class ExactSlotRequest:
 
 @dataclass(frozen=True)
 class LowestFreeSlot:
-    """Acquire the lowest free number within the configured pool."""
+    """Acquire the lowest free copy number."""
 
 
 SlotSelection = ExactSlotRequest | LowestFreeSlot
@@ -117,10 +106,6 @@ def _root(settings: conf.ConfigRead, key: str) -> Path:
 def slot_cargo_root(settings: conf.ConfigRead) -> Path:
     """Read the root for each slot's build output."""
     return _root(settings, "roots.slot_cargo")
-
-
-def lease_path(path: Path) -> Path:
-    return path.with_name(path.name + LEASE_SUFFIX)
 
 
 def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
