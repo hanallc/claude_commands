@@ -1010,6 +1010,7 @@ SCRIPT = r'''(() => {
  let selectedRecipient = '';
  let pageOwner = '';
  let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
+ let restoredRecovery = false;
  let awaitingEarlierSend = false, submittedDraft;
  let draftDatabase;
 
@@ -1029,22 +1030,26 @@ SCRIPT = r'''(() => {
   return form.elements.kind.value === 'scheduled';
  }
 
+ function isRecovering() {
+  return Boolean(pendingItem && (restoredRecovery || pendingItem.kind === 'scheduled'));
+ }
+
  function updateSend() {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
-  const recovering = pendingItem?.kind === 'scheduled';
+  const recovering = isRecovering();
   const locked = recovering || (scheduled && !!savedItem);
-  dialog.classList.toggle('scheduled-locked', locked);
+  dialog.classList.toggle('scheduled-locked', scheduled && locked);
   words.readOnly = locked;
+  includePage.disabled = sending || locked;
+  for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
   for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
   send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
   sentDetails.hidden = scheduled;
   scheduledHelp.hidden = !scheduled || !!savedItem;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
   for (const input of kindInputs) {
-   input.disabled = sending || !!savedItem || (input.value === 'scheduled'
-    ? awaitingEarlierSend || Boolean(pendingItem && pendingItem.kind !== 'scheduled')
-    : pendingItem?.kind === 'scheduled');
+   input.disabled = sending || locked || !!savedItem || (input.value === 'scheduled' && awaitingEarlierSend);
   }
   send.disabled = !!savedItem || sending || !token || (scheduled && awaitingEarlierSend && !recovering) || (!pendingItem &&
     (!recipient || !words.value.trim() || words.value.length > words.maxLength));
@@ -1055,7 +1060,7 @@ SCRIPT = r'''(() => {
   const proposal = form.elements.kind.value === 'proposal';
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
-   if (pendingItem?.kind === 'scheduled' && selectedRecipient === pendingItem.recipient_id) {
+   if (isRecovering() && selectedRecipient === pendingItem.recipient_id) {
     available.push({id: selectedRecipient, name: submittedDraft?.recipientName || selectedRecipient});
    } else {
     selectedRecipient = null;
@@ -1090,7 +1095,7 @@ SCRIPT = r'''(() => {
  }
 
  function editDraft(event) {
-  if (sending || pendingItem?.kind === 'scheduled') return;
+  if (sending || isRecovering()) return;
   if (pendingItem) pendingEdited = true;
   if (event?.target.name === 'kind') {
    showRecipients();
@@ -1121,7 +1126,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
-  if (sending || isScheduled()) return;
+  if (sending || isScheduled() || isRecovering()) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1346,7 +1351,10 @@ SCRIPT = r'''(() => {
   words.rows = bug ? 3 : 4;
   bugStateBox.hidden = !bug;
   fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
-  if (!bug || !pageContext) return;
+  if (!bug || !pageContext) {
+   bugStateBox.querySelector('dl').replaceChildren();
+   return;
+  }
   const {state} = pageContext;
   const rows = [
    ['Page', state.title],
@@ -1366,6 +1374,13 @@ SCRIPT = r'''(() => {
  }
 
  function showSentDetails() {
+  if (restoredRecovery) {
+   slot.hidden = true;
+   fallback.hidden = !includePage.checked;
+   fallback.textContent = pendingItem.capture_key ? 'Retry uses the submitted screenshot.' : 'No screenshot in the submitted item.';
+   updateSend();
+   return;
+  }
   const image = captureSession?.image;
   const include = includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
@@ -1381,7 +1396,7 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if (isScheduled() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  if (isScheduled() || isRecovering() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
   const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
   const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
@@ -1494,7 +1509,7 @@ SCRIPT = r'''(() => {
 
  async function storeSubmittedDraft(payload) {
   const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
-  const draft = {payload, recipientName, selectedKind: form.elements.kind.value};
+  const draft = {payload, recipientName, selectedKind: form.elements.kind.value, includeScreenshot: includePage.checked};
   const earlier = sessionStorage.getItem(submittedKey);
   let pointer;
   try {
@@ -1536,6 +1551,7 @@ SCRIPT = r'''(() => {
   draftId = deferredCapture = pendingItem = undefined;
   awaitingEarlierSend = false;
   pendingEdited = false;
+  restoredRecovery = false;
   if (ownerPage === 'list') {
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
@@ -1587,7 +1603,6 @@ SCRIPT = r'''(() => {
 
  async function open(trigger, page) {
   if (dialog.open || sending) return;
-  if (pendingItem) page = pendingItem.page;
   ownerPage = page;
   pageContext = collectPageContext();
   launcher = trigger;
@@ -1628,21 +1643,24 @@ SCRIPT = r'''(() => {
    const restored = await restoreSubmittedDraft();
    if (controller.signal.aborted) return;
    const original = restored?.payload;
-   if (original) {
-    const changedPage = original.page !== page;
-    if (original.kind === 'scheduled' || (!keepDraft && original.page !== 'list') || original.defer_capture || changedPage) {
-     pendingItem = original;
-    }
+   if (original && (!keepDraft || original.page !== page || original.kind === 'scheduled' || restoredRecovery)) {
+    pendingItem = original;
+    restoredRecovery = true;
+    pendingEdited = false;
     draftId = original.request_id;
     ownerPage = original.page;
     awaitingEarlierSend = true;
-    if (changedPage) pageContext = undefined;
-    if ((!keepDraft && !words.value) || original.kind === 'scheduled') {
-     form.elements.kind.value = restored.selectedKind || original.kind;
-     selectedRecipient = original.recipient_id;
-     words.value = original.words;
+    form.elements.kind.value = restored.selectedKind || original.kind;
+    selectedRecipient = original.recipient_id;
+    words.value = original.words;
+    includePage.checked = restored.includeScreenshot ?? Boolean(original.capture_key);
+    pageContext = original.page_state ? {state: original.page_state} : undefined;
+    if (!images.length && original.images?.length) {
+     addImagePreviews(original.images.map(image => new File([
+      Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
+     ], 'Pasted image', {type: image.media_type})));
     }
-    if (original.kind === 'scheduled') setError('Retry to confirm the Scheduled save.');
+    setError('Retry to confirm the save.');
     showBugPage();
     showSentDetails();
     updateSend();
@@ -1728,11 +1746,17 @@ SCRIPT = r'''(() => {
   } catch (failure) {
    if (failure?.definiteRefusal) {
     if (!failure.staleToken) {
-     const scheduled = pendingItem?.kind === 'scheduled';
+     const recovering = isRecovering();
      clearSubmittedDraft();
      pendingItem = deferredCapture = undefined;
      pendingEdited = false;
-     if (scheduled) showRecipients();
+     if (restoredRecovery) {
+      restoredRecovery = false;
+      pageContext = launcher?.closest('[data-page-owner]')?.dataset.pageOwner === ownerPage ? collectPageContext() : undefined;
+      showBugPage();
+      showSentDetails();
+     }
+     if (recovering) showRecipients();
     }
     awaitingEarlierSend = failure.staleToken && hadEarlierSend;
     storeListDraft();

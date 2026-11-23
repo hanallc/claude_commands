@@ -98,15 +98,27 @@ class SavedScheduledDraft(ScheduledDraftDetails):
 
 
 @dataclass(frozen=True)
-class NativeDraftClaim:
-    saved_id: str
+class SavedNativeDraft:
+    id: str
+
+
+@dataclass(frozen=True)
+class ScheduledItemWithoutReceipt:
+    id: str
+
+
+class NativeDraftClaim(Enum):
+    PENDING = "pending"
+    MOVED = "moved"
+    LIST_ALIAS = "List alias"
 
 
 class NoDraftClaim(Enum):
     UNCLAIMED = "unclaimed"
 
 
-def read_scheduled_draft(folder: Path) -> PendingScheduledDraft | SavedScheduledDraft | NativeDraftClaim | NoDraftClaim:
+def read_scheduled_draft(folder: Path) -> (PendingScheduledDraft | SavedScheduledDraft | SavedNativeDraft
+                                          | NativeDraftClaim | NoDraftClaim):
     """Read the pending claim or the receipt for a New item draft."""
     for filename in ("receipt.json", "pending.json"):
         path = folder / filename
@@ -119,8 +131,11 @@ def read_scheduled_draft(folder: Path) -> PendingScheduledDraft | SavedScheduled
         fields = cast(dict[str, object], data)
         identity = fields.get("id")
         if fields.get("kind") != new_item_dialog.SCHEDULED_KIND:
-            return NativeDraftClaim(identity if filename == "receipt.json" and isinstance(identity, str)
-                                    and re.fullmatch(r"[QPI][1-9][0-9]*", identity) else "")
+            if filename == "pending.json":
+                return NativeDraftClaim.PENDING
+            if isinstance(identity, str) and re.fullmatch(r"[QPI][1-9][0-9]*", identity):
+                return SavedNativeDraft(identity)
+            raise OSError(f"Cannot read the New item receipt at {path}.")
         fingerprint, keeper = fields.get("fingerprint"), fields.get("keeper")
         assignment, readback = fields.get("assignment"), fields.get("readback")
         if (not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
@@ -139,8 +154,10 @@ def read_scheduled_draft(folder: Path) -> PendingScheduledDraft | SavedScheduled
             raise OSError(f"Cannot read the Scheduled receipt at {path}.")
         return SavedScheduledDraft(fingerprint, owner, assignment, (start, repeat), identity,
                                    ScheduledNoticeState(notice), warning)
-    if (folder / "list-receipt-key").exists() or (folder / "moved.json").exists():
-        return NativeDraftClaim("")
+    if (folder / "list-receipt-key").exists():
+        return NativeDraftClaim.LIST_ALIAS
+    if (folder / "moved.json").exists():
+        return NativeDraftClaim.MOVED
     return NoDraftClaim.UNCLAIMED
 
 
@@ -152,7 +169,6 @@ def write_scheduled_draft(folder: Path, draft: PendingScheduledDraft | SavedSche
         fields["notice"] = draft.notice.value
         filename = "receipt.json"
     atomic_file.write_text_atomic(folder / filename, json.dumps(fields), new_file_mode=0o600)
-    atomic_file.sync_folder(folder)
 
 
 def published_console_page(root: Path, path: str) -> str:
@@ -1932,17 +1948,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             with server.list_store_access(), server.staff_read_scope():
                 folder = submission_draft_folder(request.request_id)
+                store_exists = folder.parent.is_dir()
                 folder.mkdir(mode=0o700, parents=True, exist_ok=True)
                 with exclusive(folder / ".lock"):
+                    if not store_exists:
+                        atomic_file.sync_folder(folder.parent.parent)
+                    atomic_file.sync_folder(folder.parent)
                     claim = read_scheduled_draft(folder)
+                    if isinstance(claim, SavedNativeDraft):
+                        self.new_item_saved({"id": claim.id}, claim.id, True)
+                        return
                     if isinstance(claim, NativeDraftClaim):
-                        self.other_kind_draft(claim.saved_id)
+                        self.pending_draft_response()
                         return
                     if isinstance(claim, SavedScheduledDraft) and claim.fingerprint != fingerprint:
                         self.new_item_saved(claim.response(), claim.id, True)
                         return
                     if isinstance(claim, PendingScheduledDraft) and claim.fingerprint != fingerprint:
-                        self.other_kind_draft()
+                        self.pending_draft_response()
                         return
                     saved = self.finish_scheduled_draft(folder, request, fingerprint, claim)
         except new_item.FilingRefused as error:
@@ -1959,17 +1982,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links Scheduled Send: {error}", file=sys.stderr)
             self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
             return
-        self.new_item_saved(saved.response(), saved.id, False)
+        if isinstance(saved, ScheduledItemWithoutReceipt):
+            self.new_item_saved({"id": saved.id}, saved.id, True)
+        else:
+            self.new_item_saved(saved.response(), saved.id, False)
 
     def finish_scheduled_draft(self, folder: Path, request: new_item_dialog.ScheduledSubmission, fingerprint: str,
-                               claim: NoDraftClaim | PendingScheduledDraft | SavedScheduledDraft) -> SavedScheduledDraft:
+                               claim: NoDraftClaim | PendingScheduledDraft | SavedScheduledDraft
+                               ) -> SavedScheduledDraft | ScheduledItemWithoutReceipt:
         if isinstance(claim, SavedScheduledDraft):
             saved = claim
         else:
             identity = new_item.ScheduledDraftIdentity(request.request_id)
-            item = (identity.saved_item(claim.keeper) if isinstance(claim, PendingScheduledDraft)
-                    else new_item.UnfiledScheduledDraft.UNSAVED)
-            if isinstance(item, new_item.UnfiledScheduledDraft):
+            keeper = claim.keeper if isinstance(claim, PendingScheduledDraft) else the_list.producer_id(staff.snapshot(), "morty")
+            item = identity.lookup(keeper)
+            if isinstance(item, the_list.ListItem) and isinstance(claim, NoDraftClaim):
+                return ScheduledItemWithoutReceipt(item.id)
+            if isinstance(item, new_item.ScheduledListAllocation):
                 with investigation.recipient_locks(request.recipient_id):
                     try:
                         members = staff.snapshot()
@@ -1981,7 +2010,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         raise
                     claim = PendingScheduledDraft(fingerprint, filing.keeper, filing.assignment, filing.readback)
                     write_scheduled_draft(folder, claim)
-                    item = filing.save(identity)
+                    while True:
+                        try:
+                            item = filing.save(identity, number=item.number)
+                            break
+                        except the_list.ListError:
+                            # A later allocation can invalidate the number read with the lookup.
+                            current = identity.lookup(filing.keeper)
+                            if current == item:
+                                raise
+                            if isinstance(current, the_list.ListItem):
+                                return ScheduledItemWithoutReceipt(current.id)
+                            item = current
             assert isinstance(claim, PendingScheduledDraft)
             saved = SavedScheduledDraft(claim.fingerprint, claim.keeper, claim.assignment, claim.readback, item.id)
             write_scheduled_draft(folder, saved)
@@ -1996,11 +2036,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             saved = replace(saved, notice_warning="The assignment notice result is unconfirmed. The List item is saved.")
         return saved
 
-    def other_kind_draft(self, saved_id: str = "") -> None:
-        if saved_id:
-            self.new_item_saved({"id": saved_id}, saved_id, True)
-        else:
-            self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
+    def pending_draft_response(self) -> None:
+        self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
 
     def recover_scheduled_kind_conflict(self, draft: object) -> bool:
         if not isinstance(draft, str) or not review_submissions.is_draft_id(draft):
@@ -2017,7 +2054,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.new_item_saved(claim.response(), claim.id, True)
             return True
         if isinstance(claim, PendingScheduledDraft):
-            self.other_kind_draft()
+            self.pending_draft_response()
             return True
         return False
 

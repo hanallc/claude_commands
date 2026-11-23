@@ -3201,19 +3201,19 @@ class ReviewLinksServerTests(unittest.TestCase):
             denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft}).encode(), finished=True)
             self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, json.loads(first.body)["id"]))
             self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+            write = serve.write_scheduled_draft
+
+            def fail_receipt(folder: Path, claim: serve.PendingScheduledDraft | serve.SavedScheduledDraft) -> None:
+                if isinstance(claim, serve.SavedScheduledDraft):
+                    raise OSError("The receipt write failed.")
+                write(folder, claim)
+
             for failure in ("List write", "receipt write"):
                 with self.subTest(failure=failure):
                     draft = "r6-" + uuid4().hex
                     body = json.dumps({**scheduled, "request_id": draft}).encode()
                     before = {item.id for item in the_list.records(morty.id)}
                     notices.clear()
-                    write = serve.write_scheduled_draft
-
-                    def fail_receipt(folder: Path, claim: serve.PendingScheduledDraft | serve.SavedScheduledDraft) -> None:
-                        if isinstance(claim, serve.SavedScheduledDraft):
-                            raise OSError("The receipt write failed.")
-                        write(folder, claim)
-
                     with (patch.object(the_list, "add", side_effect=OSError("The List write failed."))
                           if failure == "List write" else patch.object(serve, "write_scheduled_draft", fail_receipt)):
                         reply = self.new_item_http(body, finished=True)
@@ -3234,6 +3234,47 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(notices, [producer.id, showrunner.id])
                     denied = self.new_item_http(self.new_item_body(native), finished=True)
                     self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, receipt["id"]))
+
+            for words in (scheduled["words"], "Try different words after the draft directory is lost."):
+                with self.subTest(retry_words=words):
+                    draft = "r6-" + uuid4().hex
+                    submitted = {**scheduled, "request_id": draft}
+                    before = {item.id for item in the_list.records(morty.id)}
+                    with patch.object(serve, "write_scheduled_draft", fail_receipt):
+                        failed = self.new_item_http(json.dumps(submitted).encode(), finished=True)
+                    self.assertEqual(failed.status, 503, failed.body)
+                    existing, = {item.id for item in the_list.records(morty.id)} - before
+                    shutil.rmtree(serve.submission_draft_folder(draft))
+                    damaged = the_list.folder(morty.id) / "L9999.md"
+                    _ = damaged.write_bytes(b"\xff")
+                    try:
+                        retry = self.new_item_http(json.dumps({**submitted, "words": words}).encode(), finished=True)
+                    finally:
+                        damaged.unlink()
+                    response = cast(dict[str, object], json.loads(retry.body))
+                    self.assertEqual((retry.status, response["code"], response["id"]), (409, "already_filed", existing))
+                    self.assertEqual({item.id for item in the_list.records(morty.id)}, before | {existing})
+
+            with self.subTest(failure="draft parent sync"):
+                draft = "r6-" + uuid4().hex
+                body = json.dumps({**scheduled, "request_id": draft}).encode()
+                before = {item.id for item in the_list.records(morty.id)}
+                draft_parent = serve.submission_draft_folder(draft).parent
+                sync = atomic_file.sync_folder
+
+                def fail_parent(directory: Path) -> None:
+                    if directory == draft_parent:
+                        raise OSError("The draft parent sync failed.")
+                    sync(directory)
+
+                with patch.object(atomic_file, "sync_folder", fail_parent):
+                    failed = self.new_item_http(body, finished=True)
+                self.assertEqual(failed.status, 503, failed.body)
+                self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+                retry = self.new_item_http(body, finished=True)
+                self.assertEqual(retry.status, 200, retry.body)
+                receipt = cast(dict[str, object], json.loads(retry.body))
+                self.assertEqual({item.id for item in the_list.records(morty.id)} - before, {receipt["id"]})
 
             members = staff.snapshot()
             before = {item.id for item in the_list.records(morty.id)}

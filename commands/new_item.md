@@ -9,7 +9,7 @@ argument-hint: "<type> <assignee> <description> [extra, such as a time]"
 
 The CLI is `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/new_item.py"`. Run it with the sandbox off.
 
-If Send loses the Scheduled reply, reopen New item in the same tab. Select Retry to recover the submitted item.
+If Send loses its reply, reopen New item in the same tab. Select Retry to recover the submitted item.
 
 ## Steps
 

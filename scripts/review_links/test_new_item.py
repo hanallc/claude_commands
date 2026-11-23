@@ -16,6 +16,7 @@ from typing import Literal, NoReturn, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.agents.remote import local_machine
 from scripts.production import producer_map, staff, the_list
 from scripts.lib import main_publish
 from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions
@@ -109,6 +110,12 @@ class NewItemTests(unittest.TestCase):
         with self.config.open("a", encoding="utf-8") as stream:
             _ = stream.write(f"{row.id} = {producer.id}  # {row.name} = {producer.name}\n")
 
+    def scheduled_members(self) -> staff.StaffSnapshot:
+        document = self.config.parent / "natedev.md"
+        _ = document.write_text("> **Status: PRODUCTION — running.**\n", encoding="utf-8")
+        natedev = replace(NATEDEV, doc=staff.LiveDoc(local_machine(), document))
+        return staff.StaffSnapshot(tuple(natedev if row == NATEDEV else row for row in MEMBERS.rows) + (MORTY,))
+
     def run_main(self, *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
@@ -149,7 +156,7 @@ class NewItemTests(unittest.TestCase):
     def test_scheduled_menu_and_custom_rules_save_the_named_owner_and_read_back(self) -> None:
         folder = self.config.parent
         staff_file = folder / "staff.json"
-        members = staff.StaffSnapshot((*MEMBERS.rows, MORTY))
+        members = self.scheduled_members()
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in staff.active(members, "producer")
         ]}))
@@ -276,12 +283,19 @@ class NewItemTests(unittest.TestCase):
                     with self.subTest(start=start, flags=flags):
                         code, output, errors = self.run_main("scheduled", "natedev", f"Check the chart. {start}", *flags)
                         self.assertEqual((code, output, errors), (new_item.Outcome.REFUSED, "", f"new_item: {reason}\n"))
-            exited = replace(BOB, exited=staff.Exited("2026-11-20", "nate", "Test exit"))
-            for members in (replace(MEMBERS, pending_retire=(BOB.id,)), replace(MEMBERS, rows=tuple(
-                    exited if row == BOB else row for row in MEMBERS.rows))):
-                with self.subTest(pending=bool(members.pending_retire)), mock.patch.object(staff, "snapshot", return_value=members):
-                    result = self.run_main("scheduled", "natedev", "Check the chart. Start Fri Nov 27 13:00.")
-                    self.assertEqual(result, (new_item.Outcome.REFUSED, "", "new_item: bob is unavailable. Choose another recipient.\n"))
+            available = self.scheduled_members()
+            for target, owner in ((BOB, NATEDEV), (NATEDEV, NATEDEV), (POSTMASTER, POSTMASTER)):
+                for reason in ("exit", "pending retirement"):
+                    if reason == "exit":
+                        exited = staff.Exited("2026-11-20", "nate", "Test exit")
+                        members = replace(available, rows=tuple(replace(row, exited=exited) if row.id == target.id
+                                                               else row for row in available.rows))
+                    else:
+                        members = replace(available, pending_retire=(target.id,))
+                    with self.subTest(target=target.name, reason=reason), mock.patch.object(staff, "snapshot", return_value=members):
+                        result = self.run_main("scheduled", owner.name, "Check the chart. Start Fri Nov 27 13:00.")
+                        self.assertEqual(result, (new_item.Outcome.REFUSED, "",
+                                                  f"new_item: {target.name} is unavailable. Choose another recipient.\n"))
             self.assertEqual(the_list.records(MORTY.id), [])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 

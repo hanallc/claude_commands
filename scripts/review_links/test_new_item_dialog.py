@@ -755,25 +755,27 @@ OWNER_OPTIONS_PROBE = r"""
 """
 
 
-SCHEDULED_RECOVERY_PROBE = r"""
+RESTORED_SEND_PROBE = r"""
 (async () => {
  const failures = [];
  const check = (value, description) => { if (!value) failures.push(description); };
  const dialog = document.querySelector('#review-new-item');
  const button = document.querySelector('[data-owner-new]');
  const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
- const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
+ const kind = '__KIND__';
+ const selectedKind = dialog.querySelector('[name="kind"][value="' + kind + '"]');
  const recipient = id => dialog.querySelector('[name="recipient_id"][value="' + id + '"]');
- const original = JSON.parse(sessionStorage.getItem('test-scheduled-send') || 'null');
+ const original = JSON.parse(sessionStorage.getItem('test-restored-send') || 'null');
  const http = window.fetch;
  let posted;
  window.fetch = async (path, options) => {
   if (path === '/console/review/new-item' && options?.body) {
    const payload = JSON.parse(options.body);
-   if (payload.kind === 'scheduled') {
+   if (payload.kind === kind) {
     posted = payload;
     if (!original) throw new TypeError('The Send response was lost.');
-    return Response.json({id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.'});
+    return Response.json(kind === 'scheduled'
+     ? {id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.'} : {id:'I1'});
    }
   }
   return http(path, options);
@@ -789,36 +791,51 @@ SCHEDULED_RECOVERY_PROBE = r"""
   button.closest('[data-page-owner]').dataset.pageOwner = original ? 'review' : '__FIRST_PAGE__';
   button.click();
   const include = dialog.querySelector('[name="include_page"]');
-  if (include.checked) include.click();
+  if (!original && include.checked) include.click();
   await ready(() => !!recipient('cargo-liner') && (!original || !send.disabled));
   if (!original) {
-   scheduled.click();
+   selectedKind.click();
    recipient('cargo-liner').click();
    words.value = 'Check the queue. Start Mon Nov 30 09:00.';
    words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   if (kind === 'bug') {
+    const clipboard = new DataTransfer();
+    clipboard.items.add(new File([Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0))], 'queue.png', {type:'image/png'}));
+    const event = new ClipboardEvent('paste', {cancelable:true});
+    Object.defineProperty(event, 'clipboardData', {value: clipboard});
+    words.dispatchEvent(event);
+   }
    send.click();
-   await ready(() => posted && send.textContent === 'Retry' && !send.disabled);
-   check(words.readOnly && recipient('cargo-liner').matches(':disabled'), 'A lost Scheduled Send locks the submitted fields.');
+   await ready(() => posted && send.form.getAttribute('aria-busy') === 'false');
+   if (kind === 'scheduled') {
+    check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
+          recipient('cargo-liner').matches(':disabled'), 'A lost Scheduled Send locks the submitted fields.');
+   }
    if (!failures.length) {
-    sessionStorage.setItem('test-scheduled-send', JSON.stringify(posted));
+    sessionStorage.setItem('test-restored-send', JSON.stringify(posted));
     location.reload();
     return;
    }
   } else {
-   check(scheduled.checked && recipient('cargo-liner').checked && words.value === original.words,
+   check(selectedKind.checked && recipient('cargo-liner').checked && words.value === original.words,
          'New item restores the kind, recipient, and words on another page.');
-   check(words.readOnly && recipient('cargo-liner').matches(':disabled') && send.textContent === 'Retry',
-         'A restored Scheduled draft displays the submitted values and a Retry button.');
+   check(words.readOnly && selectedKind.matches(':disabled') && recipient('cargo-liner').matches(':disabled') &&
+         include.disabled && !include.checked && send.textContent === 'Retry',
+         'The restored draft locks the submitted fields and displays Retry.');
+   if (kind === 'bug') {
+    const attachment = dialog.querySelector('[data-previews] button');
+    check(attachment?.disabled, 'The restored Bug keeps its pasted image and locks its remove button.');
+   }
    recipient('builds-staff').click();
    check(recipient('cargo-liner').checked, 'The submitted recipient cannot change during recovery.');
    const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
    send.click();
    await saved;
-   check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original Scheduled payload.');
+   check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
    check(!sessionStorage.getItem('console.new-item.submitted'), 'The receipt clears the submitted draft.');
   }
  } catch (error) { failures.push(String(error)); }
- sessionStorage.removeItem('test-scheduled-send');
+ sessionStorage.removeItem('test-restored-send');
  await http('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
 })();
@@ -1131,16 +1148,22 @@ function enterWords(value) {
 (async () => {
  try {
   document.querySelector('[data-owner-new]').click();
-  type.click();
-  enterWords(restored ? 'The words after reload.' : 'Keep the first List Send.');
-  const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
-  await waitFor(() => !send.disabled && !evidence.hidden);
+  if (!restored) {
+   type.click();
+   enterWords('Keep the first List Send.');
+   const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
+   await waitFor(() => !send.disabled && !evidence.hidden);
+  } else {
+   await waitFor(() => !send.disabled);
+   check(words.value === restored.words && words.readOnly && type.matches(':disabled') && send.textContent === 'Retry',
+         'Reload locks the submitted List draft and displays Retry.');
+  }
   send.click();
   await waitFor(sendFinished);
-  check(editable(), 'A failed Send leaves the draft editable.');
+  check(editable() && !words.readOnly, 'A failed Send leaves the draft editable after recovery.');
   if (restored) {
-   check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].words !== restored.words,
-         'Reload keeps the draft ID and sends the edited words.');
+   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
+         'Reload keeps the draft ID and sends the original payload.');
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
    check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
@@ -1202,6 +1225,7 @@ if (scenario === 'reload') {
      return Promise.reject(new TypeError('Send did not reach the server.'));
     }
     check(item.request_id === earlier.requestId, 'Send keeps the unfiled draft ID after reload.');
+    if (!earlier.cleared) return Promise.resolve(Response.json({error:'The server refused this Send.'}, {status:409}));
    }
   }
   return fetchHTTP(path, options);
@@ -1244,6 +1268,9 @@ function checkEmpty() {
    }
   } else if (earlier) {
    check(selected() === 'cargo-liner' && !send.disabled, 'Reload restores the selected recipient.');
+   check(words.readOnly && send.textContent === 'Retry', 'Reload requires Retry for the submitted draft.');
+   send.click();
+   await waitFor(() => !words.readOnly && send.form.getAttribute('aria-busy') === 'false');
    selectType('proposal');
    checkEmpty();
    selectType('investigation');
@@ -1549,13 +1576,13 @@ class NewItemDialogTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_owner_button_opens_six_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        probes = {1440: OWNER_OPTIONS_PROBE, 390: OWNER_OPTIONS_PROBE,
-                  1280: SCHEDULED_RECOVERY_PROBE.replace("__FIRST_PAGE__", "builds"),
-                  412: SCHEDULED_RECOVERY_PROBE.replace("__FIRST_PAGE__", "list")}
+        probes = {1440: OWNER_OPTIONS_PROBE, 390: OWNER_OPTIONS_PROBE}
+        for width, kind, page in ((1280, "scheduled", "builds"), (412, "scheduled", "list"), (1152, "bug", "builds")):
+            probes[width] = RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in probes}
         capture_dialogs(temporary / "options.png", fixtures,
                         pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
-        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: []})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: []})
 
     def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()

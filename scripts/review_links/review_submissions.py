@@ -1226,10 +1226,16 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
 def selected_recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
     """Require the selected recipient to be available to receive a new item."""
     row = _recipient(identity, members)
-    if (row.id not in members.rows_by_id or not _page_owner_is_active(row, members)
-            or not _submission_owner_is_active(row, members)):
-        raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
+    require_available_recipient(row, members)
     return row
+
+
+def require_available_recipient(row: staff.StaffRow, members: staff.StaffSnapshot) -> None:
+    """Check availability for a selected recipient or a CLI unit owner."""
+    if (row.id not in members.rows_by_id or not _page_owner_is_active(row, members)
+            or (not (row.kind == "unit" and isinstance(row.doc, staff.DocUnfilled))
+                and not _submission_owner_is_active(row, members))):
+        raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
 
 
 def _active_recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:

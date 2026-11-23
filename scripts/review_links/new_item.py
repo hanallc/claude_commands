@@ -11,16 +11,17 @@ import re
 import secrets
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time
-from enum import Enum, IntEnum, StrEnum
+from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, producer_map, repeat_rule, staff, the_list
+from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list
 from scripts.review_links import for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
@@ -452,6 +453,7 @@ class FilingRefusal(StrEnum):
     INVALID_SCHEDULE = "invalid schedule"
     UNKNOWN_ASSIGNEE = "unknown assignee"
     UNMAPPED_PRODUCER = "unmapped producer"
+    UNAVAILABLE_OWNER = "unavailable owner"
     UNAVAILABLE_PRODUCER = "unavailable producer"
 
 
@@ -507,8 +509,9 @@ class DirectScheduledFiling(StrEnum):
     CLI = "direct CLI filing"
 
 
-class UnfiledScheduledDraft(Enum):
-    UNSAVED = "no saved List item"
+@dataclass(frozen=True)
+class ScheduledListAllocation:
+    number: int
 
 
 @dataclass(frozen=True)
@@ -518,23 +521,24 @@ class ScheduledDraftIdentity:
     def evidence(self) -> str:
         return f"New item draft {self.id}"
 
-    def saved_item(self, keeper: staff.StaffId) -> the_list.ListItem | UnfiledScheduledDraft:
+    def lookup(self, keeper: staff.StaffId) -> the_list.ListItem | ScheduledListAllocation:
+        """Find the saved draft or read the next number under the List lock."""
+        list_store = cast(Callable[[staff.StaffId], record_store.NumberedRecords], getattr(the_list, "_store"))
         evidence = self.evidence()
-        try:
-            records = list(the_list.folder(keeper).iterdir())
-        except FileNotFoundError:
-            return UnfiledScheduledDraft.UNSAVED
-        for path in records:
-            if not re.fullmatch(r"L[1-9][0-9]*\.md", path.name):
-                continue
-            item = the_list.load(keeper, path.stem)
-            if not item.log:
-                continue
-            added = item.log[0].what
-            if (isinstance(added, the_list.FieldChange) and added.action == "Added"
-                    and added.fields.get("evidence") == evidence):
-                return item
-        return UnfiledScheduledDraft.UNSAVED
+        marker = evidence.encode("utf-8")
+        store = list_store(keeper)
+        with store.list_allocation():
+            for path in store.folder().iterdir():
+                if path.suffix != ".md" or not store.valid_id(path.stem):
+                    continue
+                if marker not in path.read_bytes():
+                    continue
+                item = the_list.load(keeper, path.stem)
+                added = item.log[0].what
+                if (isinstance(added, the_list.FieldChange) and added.action == "Added"
+                        and added.fields.get("evidence") == evidence):
+                    return item
+            return ScheduledListAllocation(store.next_number())
 
 
 @dataclass(frozen=True)
@@ -546,7 +550,8 @@ class ScheduledFiling:
     assignment: str
     readback: tuple[str, str]
 
-    def save(self, draft: ScheduledDraftIdentity | DirectScheduledFiling = DirectScheduledFiling.CLI) -> the_list.ListItem:
+    def save(self, draft: ScheduledDraftIdentity | DirectScheduledFiling = DirectScheduledFiling.CLI,
+             *, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE) -> the_list.ListItem:
         run = self.schedule.first if isinstance(self.schedule, the_list.ScheduledSeries) else self.schedule
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
@@ -555,7 +560,8 @@ class ScheduledFiling:
         if isinstance(draft, ScheduledDraftIdentity):
             # The List saves this field in the creation log with the item.
             changes["evidence"] = draft.evidence()
-        return the_list.add(self.keeper, " ".join(run.words.split()), owner=self.member.id, source=SOURCE, changes=changes)
+        return the_list.add(self.keeper, " ".join(run.words.split()), owner=self.member.id, source=SOURCE,
+                            changes=changes, number=number)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot) -> ScheduledFiling:
@@ -563,9 +569,13 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
     schedule = _checked_schedule(words)
     if isinstance(assignee, str):
         member, mapped = _assignment(assignee, members)
+        try:
+            review_submissions.require_available_recipient(member, members)
+        except new_item_dialog.SubmissionConflict as error:
+            raise FilingRefused(FilingRefusal.UNAVAILABLE_OWNER, str(error)) from error
     else:
         member, mapped = assignee, _mapped_producer(assignee, members)
-    if isinstance(assignee, str) or member.id != mapped.producer.id:
+    if member.id != mapped.producer.id:
         try:
             _ = review_submissions.selected_recipient(mapped.producer.id, members)
         except new_item_dialog.SubmissionConflict as error:
@@ -647,7 +657,7 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
     except FilingRefused as error:
-        if error.reason in (FilingRefusal.INVALID_SCHEDULE, FilingRefusal.UNAVAILABLE_PRODUCER):
+        if error.reason in (FilingRefusal.INVALID_SCHEDULE, FilingRefusal.UNAVAILABLE_OWNER, FilingRefusal.UNAVAILABLE_PRODUCER):
             print(f"new_item: {error}", file=sys.stderr)
             return Outcome.REFUSED
         print(error)
