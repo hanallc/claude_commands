@@ -237,7 +237,7 @@ class ReviewSnapshot:
         if view is ReviewBodyView.TABLE:
             return body
         entry = next(entry for entry in self.entries if entry['key'] == key)
-        return render_card(self, entry, body.decode())
+        return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
     def linked_card(self, root: Path, key: str, *, view: ReviewBodyView = ReviewBodyView.CARD) -> bytes:
         """Serve an active or completed card."""
@@ -255,7 +255,7 @@ class ReviewSnapshot:
         if view is ReviewBodyView.TABLE:
             return body
         entry = card_entry(item, self.members, self.names)
-        return render_card(self, entry, body.decode())
+        return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
     def render_body(self, item: ReviewItem, assets: Mapping[str, str]) -> bytes:
         body = CARD_ERROR
@@ -894,7 +894,9 @@ def icon(kind: ReviewType) -> str:
 
 
 def section(heading: str, text: str) -> str:
-    return '<section><h3>'+heading+'</h3>'+change_browser.question_paragraphs(text)+'</section>'
+    paragraphs = change_browser.question_paragraphs(text)
+    empty = '' if paragraphs else ' data-empty-review-section'
+    return '<section'+empty+'><h3>'+heading+'</h3>'+paragraphs+'</section>'
 
 
 def answer_section(text: str) -> str:
@@ -1101,19 +1103,18 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     return build_snapshot(root).render(show=show)
 
 
-def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str) -> bytes:
+def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str, *, waiting_why: str) -> bytes:
     """Serve one expanded Review card with its own document styles."""
-    settings = json.dumps({'entry': entry, 'titleLimit': snapshot.title_limit,
+    if entry['state'] == ReviewState.WAITING and waiting_why:
+        entry = {**entry, 'waitingWhy': waiting_why}
+    settings = json.dumps({'entry': entry, 'titleText': change_page.CODE_SPAN.sub(r"\1", entry['title']),
                            'zone': snapshot.zone.key, 'later': dict(snapshot.later),
                            'requestTimeoutSeconds': snapshot.request_timeout_seconds})
     content = (record_table.STYLE + record_table.DATE_TIME_STYLE + STYLE + CARD_VIEW_STYLE
-               + f'<div data-review-card class="list-table" {snapshot.card_motion.attributes()}>'
+               + f'<div data-review-card {snapshot.card_motion.attributes()}>'
                + '<div class="record-dialog-status" data-review-card-updates>'
                + '<span role="status" data-review-card-notice></span>'
-               + '<button type="button" data-show-record-updates hidden>Show updates</button></div>'
-               + '<table aria-label="Review card">'
-               + CARD_COLUMNS + '</table></div>'
-               + '<template data-card-icon>' + icon(entry['type']) + '</template>'
+               + '<button type="button" data-show-record-updates hidden>Show updates</button></div></div>'
                + '<template data-card-body>' + body + '</template>'
                + '<div data-card-settings hidden>' + html.escape(settings) + '</div>'
                + '<script>' + record_table.DATE_TIME_SCRIPT + page_frame.MOTION_SCRIPT
@@ -1437,7 +1438,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-handoff>:is(span,time){white-space:nowrap}
 .review-handoff>.staff-name{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
-@media(max-width:960px){:is([data-review],[data-review-card]) .list-row td:last-child::before{content:'Age: '}
+@media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 @media(max-width:800px){[data-review]>:is(.page-status,.record-filter-words){flex-basis:100%}
 [data-review]>.record-filter-words{margin-top:8px}
@@ -1446,11 +1447,37 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 </style>'''
 
 CARD_VIEW_STYLE = '''<style>
-:root{scrollbar-gutter:stable}
+:root:has([data-review-card]){overflow:hidden;scrollbar-gutter:auto}
+:root:not(.layout-measuring) main:has(>[data-review-card]){max-width:none;padding:0}
+.review-box{position:relative;box-sizing:border-box;display:flex;flex-direction:column;max-height:100dvh;padding:24px;background:var(--card)}
+.review-box-header{flex:none}
+.review-box-header h1{margin:0 0 8px;padding-right:84px;font-size:24px;white-space:pre-line;overflow-wrap:anywhere}
+.review-box-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;color:var(--ink-3);font-size:13px}
+.review-box-scroll{min-height:var(--review-body-min,0px);overflow:auto;scrollbar-gutter:stable}
+:is(.review-box,.review-box-scroll){scrollbar-width:thin;
+scrollbar-color:color-mix(in srgb,var(--ink-3) 45%,var(--card)) transparent}
+.review-box[data-whole-scroll]{overflow:auto}
+.review-box[data-whole-scroll] .review-box-scroll{flex:none;overflow:visible}
+.review-box .review-panel{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+column-gap:24px;row-gap:0;border:0;padding:0}
+.review-box .review-panel>div{min-width:0}
+.review-box :is([data-title-fallback],[data-empty-review-section],section:has(>.list-log:empty)){display:none}
+.review-box .review-panel:not(:has(.review-handoff,[data-review-body]>:not([data-empty-review-section])))
+>div:nth-child(2){grid-column:1/-1}
+.review-box .review-source{margin:12px 0 0!important}
+.review-box-footer{position:relative;flex:none;margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}
+.review-box-footer form{margin:0}
+.review-box-footer textarea{margin:0;max-height:9rem}
+.review-box .later-menu{position:static}
+.review-box [data-later-menu]{bottom:calc(100% + 6px)}
+@media(max-width:799px){.review-box .review-panel{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:560px){
+.review-box .review-actions{flex-direction:row;flex-wrap:wrap;gap:8px}
+.review-box .review-action-group>div>button{font-size:14px;min-height:36px;padding-inline:10px}
+.review-box-footer textarea{max-height:4rem}
+}
+.review-box [data-review-card-updates]{padding-inline:0}
 [data-review-card-notice]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-main{max-width:1060px;padding:0}
-[data-review-card] .list-row{cursor:default}
-@media(max-width:560px){:root:not(.layout-measuring) main{padding:0 12px 12px}}
 </style>'''
 
 REVIEW_CARD_SCRIPT = r'''
@@ -1470,6 +1497,9 @@ function updateHandoffAges(root=document){
   if(stamp.textContent!==label) stamp.textContent=label;
  }
 }
+const reviewUrgency=entry=>({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'})[entry.urgency] || '';
+const reviewWaiting=entry=>entry.state==='Waiting' && entry.waitingWhy
+ ? '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
 function reviewCardSummary(entry,titleLimit,icon){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
@@ -1484,22 +1514,21 @@ function reviewCardSummary(entry,titleLimit,icon){
  const age=handoff ? ' · Validating for <time data-validating-age datetime="'+escapeText(handoff)+'">'
   +reviewAge(Date.parse(handoff),true)+'</time>' : '';
  const handoffLine=validating && entry.owner ? '<span class="review-handoff">With '+colored(entry.ownerName,entry.ownerHtml)+age+'</span>' : '';
- const waitingLine=entry.state==='Waiting' && entry.waitingWhy ?
-  '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
+ const urgency=reviewUrgency(entry);
  const cells=['<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
   +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
   icon+typeLabel,colored(entry.ownerName,entry.ownerHtml)
   +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
-  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+waitingLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
+  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+reviewWaiting(entry)+(urgency ? '<small>'+escapeText(urgency)+'</small>' : ''),
   '<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+stateLabel+'</span>',stamp];
  node.innerHTML='<tr class="list-row">'+cells.map((cell,at)=>'<td'+(at===0 ? ' class="record-id"' : '')+' data-label="'+['Id','Type','Owner','Item','State','Age'][at]+'">'+cell+'</td>').join('')
   +'</tr><tr data-detail id="'+panel+'" hidden><td colspan="6"><p data-record-loading role="status">Loading the item…</p></td></tr>';
  return node;
 }
-function updateTitleFallback(panel){
- const fallback=panel.querySelector('[data-title-fallback]');
- if(!fallback) return;
- const body=panel.querySelector('[data-review-body]').cloneNode(true);
+const plainReviewText=text=>text.replace(/\s+/g,' ').trim();
+function reviewBodyText(element,omitHeading=false){
+ const body=element.cloneNode(true);
+ if(omitHeading) body.querySelector(':scope > h3')?.remove();
  body.querySelectorAll('[data-title-fallback],[data-title-ignore],.list-log,form,button,input,select,textarea,label,script,style')
   .forEach(node=>node.remove());
  const blocks=new Set('ADDRESS ARTICLE ASIDE BLOCKQUOTE BR DD DETAILS DIALOG DIV DL DT FIELDSET FIGCAPTION FIGURE FOOTER H1 H2 H3 H4 H5 H6 HEADER HGROUP HR LI MAIN MENU NAV OL P PRE SECTION SUMMARY TABLE TBODY TD TFOOT TH THEAD TR UL'.split(' '));
@@ -1508,8 +1537,13 @@ function updateTitleFallback(panel){
   const text=[...node.childNodes].map(bodyText).join('');
   return blocks.has(node.nodeName) ? ' '+text+' ' : text;
  };
- const plain=text=>text.replace(/\s+/g,' ').trim();
- fallback.hidden=plain(bodyText(body)).includes(plain(fallback.querySelector('p').textContent));
+ return plainReviewText(bodyText(body));
+}
+function updateTitleFallback(panel){
+ const fallback=panel.querySelector('[data-title-fallback]');
+ if(!fallback) return;
+ fallback.hidden=reviewBodyText(panel.querySelector('[data-review-body]'))
+  .includes(plainReviewText(fallback.querySelector('p').textContent));
 }
 function laterTimes(now,zone,settings){
  const today=zoneParts(zone,now);
@@ -1627,7 +1661,8 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
    const latest=reviewDrafts.get(key);
    const unchanged=latest?.stamp===atConflict?.stamp;
    const draft=unchanged ? atConflict?.draft : latest?.draft;
-   const fresh=recordDetails(row)?.querySelector('[data-review-form]');
+   const fresh=recordDetails(row)?.querySelector('[data-review-form]')
+    ?? row?.querySelector('.review-box-footer [data-review-form]');
    if(fresh?.elements.feedback){
     if(atConflict && unchanged){
      restoreReviewDraft(fresh,atConflict.draft);
@@ -1675,32 +1710,73 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,r
 
 CARD_VIEW_SCRIPT = r'''(() => {
 const frame=window.frameElement;
-const card=document.querySelector('[data-review-card]'),table=card.querySelector('table');
-const notice=card.querySelector('[data-review-card-notice]'),showUpdates=card.querySelector('[data-show-record-updates]');
+const card=document.querySelector('[data-review-card]'),updates=card.querySelector('[data-review-card-updates]');
+const notice=updates.querySelector('[data-review-card-notice]'),showUpdates=updates.querySelector('[data-show-record-updates]');
 function report(text){
  notice.textContent=text;
  notice.title=text;
 }
 const motion=createCardMotion(()=>card);
+const boxFrame=frame?.closest('[data-list-review-dialog]') ? frame : null;
+function fitReviewBox(){
+ const box=card.firstElementChild;
+ const header=box.querySelector('.review-box-header'),footer=box.querySelector('.review-box-footer');
+ const detail=box.querySelector('[data-review-detail]'),menu=footer?.querySelector('[data-later-menu]');
+ const style=getComputedStyle(box),oldMin=box.style.getPropertyValue('--review-body-min');
+ const minBody=footer ? Math.max(96,menu?.offsetHeight || 0) : 0;
+ const fixedHeight=parseFloat(style.paddingTop)+header.getBoundingClientRect().height+parseFloat(style.paddingBottom)
+  +(footer ? parseFloat(getComputedStyle(footer).marginTop)+footer.getBoundingClientRect().height : 0);
+ const min=minBody+'px';
+ box.style.setProperty('--review-body-min',min);
+ const height=Math.ceil(fixedHeight+Math.max(minBody,detail.getBoundingClientRect().height));
+ boxFrame?.style.setProperty('--review-card-height',height+'px');
+ const whole=fixedHeight+minBody>document.documentElement.clientHeight;
+ box.toggleAttribute('data-whole-scroll',whole);
+ if(whole && min!==oldMin && menu?.contains(document.activeElement))
+  document.activeElement.scrollIntoView({block:'nearest'});
+}
+const resizeBox=new ResizeObserver(fitReviewBox);
+window.addEventListener('resize',fitReviewBox);
+function showCard(row){
+ row.querySelector('.review-box-header').append(updates);
+ card.replaceChildren(row);
+ resizeBox.disconnect();
+ for(const element of row.querySelectorAll('.review-box-header,[data-review-detail],.review-box-footer,[data-later-menu]'))
+  resizeBox.observe(element,{box:'border-box'});
+ fitReviewBox();
+}
 function mountCard(page,replaceCard=false){
- const {entry,titleLimit,zone,later:settings,requestTimeoutSeconds}=JSON.parse(page.querySelector('[data-card-settings]').textContent);
- const row=reviewCardSummary({...entry,order:0},titleLimit,page.querySelector('[data-card-icon]').innerHTML);
- const id=document.createElement('span');
- id.className='list-toggle';id.textContent=entry.id;
- row.querySelector('.list-toggle').replaceWith(id);
- row.querySelector('.list-row').classList.add('open');
- row.querySelector('[data-detail]').hidden=false;
+ const {entry,titleText,zone,later:settings,requestTimeoutSeconds}=JSON.parse(page.querySelector('[data-card-settings]').textContent);
+ const row=document.createElement('article');
+ row.className='review-box';
+ Object.assign(row.dataset,{listItem:'',key:entry.key,state:entry.state,type:entry.type});
+ const type=entry.type==='for-you' ? 'For you' : entry.type[0].toUpperCase()+entry.type.slice(1);
+ const state=entry.actionStatus==='withdrawn' ? 'Withdrawn' : entry.state,urgency=reviewUrgency(entry);
+ row.innerHTML='<header class="review-box-header"><h1>'+escapeText(entry.title)+'</h1><div class="review-box-meta">'
+  +'<span>'+escapeText(entry.id)+'</span><span>'+type+'</span><span>'+colored(entry.ownerName,entry.ownerHtml)+'</span>'
+  +'<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+state+'</span>'
+  +(entry.filed ? '<time datetime="'+new Date(entry.filed*1000).toISOString()+'">'+reviewAge(entry.filed*1000)+'</time>' : '')
+  +reviewWaiting(entry)+(urgency ? '<span>'+escapeText(urgency)+'</span>' : '')+'</div></header>'
+  +'<div class="review-box-scroll" role="region" aria-label="Review details" tabindex="0"><div data-review-detail></div></div>';
+ row.openDetails=row.querySelector('[data-review-detail]');
  installReviewBody(row,page.querySelector('[data-card-body]').innerHTML);
- const previous=table.tBodies[0];
+ const title=plainReviewText(titleText);
+ for(const section of row.querySelectorAll('[data-review-body] > section,[data-review-body] > .change-text > section')){
+  if(!section.querySelector('a[href]') && reviewBodyText(section,true)===title) section.dataset.emptyReviewSection='';
+ }
+ const form=row.querySelector('[data-review-form]');
+ if(form?.elements.feedback){
+  const footer=document.createElement('footer');
+  footer.className='review-box-footer';footer.append(form);row.append(footer);
+ }else form?.remove();
  if(replaceCard){
-  const form=row.querySelector('[data-review-form]');
-  if(form) setCardSubmitting(form,true);
-  return motion.switchCard(previous,row,()=>previous.replaceWith(row)).then(()=>{
-   if(form) setCardSubmitting(form,false);
+  if(form?.elements.feedback) setCardSubmitting(form,true);
+  return motion.switchCard(card.firstElementChild,row,()=>showCard(row)).then(()=>{
+   if(form?.elements.feedback) setCardSubmitting(form,false);
    return bindCard(row,zone,settings,requestTimeoutSeconds);
   });
  }
- table.append(row);
+ showCard(row);
  return bindCard(row,zone,settings,requestTimeoutSeconds);
 }
 function bindCard(row,zone,settings,requestTimeoutSeconds){
@@ -1720,7 +1796,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   const focus=document.activeElement;
   showUpdates.hidden=true;
   if(hadFocus && (focus===showUpdates || focus===document.body))
-   table.querySelector('[name="feedback"]')?.focus({preventScroll:true});
+   card.querySelector('[name="feedback"]')?.focus({preventScroll:true});
  };
  const busy=active=>{
   setCardSubmitting(form,active);
