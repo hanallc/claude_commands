@@ -11,12 +11,12 @@ class VerifyTokenCheckTests(VerifyTokenWaitFixture):
     def test_check_keep_going_reaches_cargo_in_either_order_with_features(self) -> None:
         # A migration phase that fixes only some crates reads every crate's result (hana, 2026-10-26).
         environment = self.build_stub([{"name": "sample", "kind": ["lib"]}])
-        for words, expected in ((("--keep-going",), "check --workspace --lib --bins --keep-going\n"),
+        for words, expected in ((("--keep-going",), "check --workspace --all-targets --keep-going\n"),
                                 (("--features", "fast", "--keep-going"),
-                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
+                                 "check --workspace --all-targets --keep-going --features sample/fast\n"),
                                 (("--keep-going", "--features", "fast"),
-                                 "check --workspace --lib --bins --keep-going --features sample/fast\n"),
-                                ((), "check --workspace --lib --bins\n")):
+                                 "check --workspace --all-targets --keep-going --features sample/fast\n"),
+                                ((), "check --workspace --all-targets\n")):
             with self.subTest(words=words):
                 (self.root / "cargo-calls").unlink(missing_ok=True)
                 result = subprocess.run(["bash", str(VERIFY), "check", "sample", *words], cwd=self.root,

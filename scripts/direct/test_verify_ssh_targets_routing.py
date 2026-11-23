@@ -405,7 +405,7 @@ raise SystemExit(75)
         self.assertEqual(check.returncode, 2, check.stdout + check.stderr)
         request, check_request = requests
         self.assertEqual(check_request.constraints.command, (
-            "cargo", "check", "--workspace", "--lib", "--bins", "--features", "hana/dynamic_linking"))
+            "cargo", "check", "--workspace", "--all-targets", "--features", "hana/dynamic_linking"))
         self.assertEqual(request.constraints.command, (
             "cargo", "nextest", "run", "--no-fail-fast", "--workspace", "--test", "shader_variants",
             "-E", "package(sample)"))
