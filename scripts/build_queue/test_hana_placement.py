@@ -872,7 +872,7 @@ class HanaGpuQueueTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             settings = fixture.root / 'cloud_gate.conf'
             repository = 'https://github.com/fixture/hana'
-            _ = settings.write_text('execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            _ = settings.write_text('enabled=on\nexecution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
                 + f'hana_gpu_repository={repository}\nhana_gpu_instance_types=g6.2xlarge\n'
                 + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
             _ = (fixture.root / 'build_targets.conf').write_text(

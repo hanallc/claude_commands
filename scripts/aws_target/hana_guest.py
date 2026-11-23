@@ -38,9 +38,16 @@ class PermitWindow:
 
 
 def read_permit_window(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> PermitWindow:
+    """Read the Hana switch through aws_switch: an unattended reader counts an invalid value as off.
+
+    The image build passes recover_invalid=False and refuses an invalid value, so no image holds a stale switch."""
+    from scripts.aws_target.config import AwsOn, AwsSwitchUnusable, aws_switch
     from scripts.lib import conf
 
-    return PermitWindow(configuration.value('enabled', conf.on_off, recover_invalid=recover_invalid),
+    switch = aws_switch(configuration)
+    if isinstance(switch, AwsSwitchUnusable) and not recover_invalid:
+        raise conf.Unusable(switch.reason)
+    return PermitWindow(isinstance(switch, AwsOn),
                         configuration.value('permit_max_seconds', conf.positive_whole, recover_invalid=recover_invalid))
 
 
