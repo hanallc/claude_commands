@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from contextlib import redirect_stdout
 import io
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
@@ -216,7 +216,44 @@ class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
     def test_pinned_linux_doc_keeps_the_staged_tree_and_skips_local_admission(self) -> None:
         self.linux_doc_case(pinned=True)
 
+    def test_a_linux_run_that_a_clear_ended_stops_its_caller_and_leaves_the_mac_fields_empty(self) -> None:
+        reason = 'ended: mac-linux cleared by bob — "guest image". A Mac run cannot go back to its lines yet.'
+        self.prepare_linux_doc(pinned=False, refused=reason)
+        self.environment["BUILDLOG_OFF"] = "0"
+        result = self.verify()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"verify.sh: {reason}\n", result.stderr)
+        self.assertFalse(self.events.exists() and self.cargo_calls())
+        # The decline belongs to the linux target; the Mac fields stay empty.
+        calls = [record for path in (self.root / "buildlog").glob("*/*.jsonl")
+                 for line in path.read_text(encoding="utf-8").splitlines()
+                 if (record := cast(dict[str, object], json.loads(line))).get("kind") == "call"]
+        self.assertEqual([(call["target"], call["mac"], call["mac_reason"], call["status"]) for call in calls],
+                         [("linux", "", "", 2)])
+
     def linux_doc_case(self, *, pinned: bool) -> None:
+        self.prepare_linux_doc(pinned=pinned)
+        staged = self.repo / "alpha/src/lib.rs"
+        _ = staged.write_text("pub fn staged() {}\n")
+        _ = self.git("add", "alpha/src/lib.rs")
+        _ = staged.write_text("pub fn unstaged() {}\n")
+        _ = (self.repo / "notes.md").write_text("private fixture")
+        original_index = (self.repo / ".git/index").read_bytes()
+
+        result = self.verify("--target", "linux") if pinned else self.verify()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(Path(self.environment["TEST_LINUX_DOC_RUN"]).exists())
+        call, = self.cargo_calls()
+        self.assertEqual(call["sources"]["alpha/src/lib.rs"], "pub fn staged() {}\n")
+        self.assertFalse(call["notes_present"])
+        self.assertNotEqual(call["cwd"], str(self.repo))
+        self.assertEqual((self.repo / ".git/index").read_bytes(), original_index)
+        self.assertEqual(staged.read_text(), "pub fn unstaged() {}\n")
+        self.assertEqual(len(self.pass_records()), 1)
+
+    def prepare_linux_doc(self, *, pinned: bool, refused: str = "") -> None:
+        """Route doc to the linux SSH target. With refused, the runner settles itself after a clear with that reason."""
         self.enable_held_mac_doc()
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
@@ -256,25 +293,17 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
         runner_source = runner_source.replace('words = sys.argv[1:]', '''words = sys.argv[1:]
 assert words[words.index("--target") + 1] == "linux"
 Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
+        if refused:
+            # The runner releases its claim, reports the clear's reason and writes the refused result.
+            self.environment["TEST_DOC_REFUSED"] = refused
+            runner_source = runner_source.replace('assert words[words.index("--verb") + 1] == "doc"', '''
+if "--assignment-file" in words:
+    fixture_outcome = placement.AttemptDeclined(os.environ["TEST_DOC_REFUSED"])
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("a clear ended the run", time.time())
+    fixture_cleanup_confirmed = True
+result.write_text("outcome=refused\\ntarget=linux\\nreason=" + os.environ["TEST_DOC_REFUSED"] + "\\nseconds=0\\n")
+raise SystemExit(143)''', 1)
         self.executable(runner, runner_source)
-        staged = self.repo / "alpha/src/lib.rs"
-        _ = staged.write_text("pub fn staged() {}\n")
-        _ = self.git("add", "alpha/src/lib.rs")
-        _ = staged.write_text("pub fn unstaged() {}\n")
-        _ = (self.repo / "notes.md").write_text("private fixture")
-        original_index = (self.repo / ".git/index").read_bytes()
-
-        result = self.verify("--target", "linux") if pinned else self.verify()
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(Path(self.environment["TEST_LINUX_DOC_RUN"]).exists())
-        call, = self.cargo_calls()
-        self.assertEqual(call["sources"]["alpha/src/lib.rs"], "pub fn staged() {}\n")
-        self.assertFalse(call["notes_present"])
-        self.assertNotEqual(call["cwd"], str(self.repo))
-        self.assertEqual((self.repo / ".git/index").read_bytes(), original_index)
-        self.assertEqual(staged.read_text(), "pub fn unstaged() {}\n")
-        self.assertEqual(len(self.pass_records()), 1)
 
 
 if __name__ == "__main__":

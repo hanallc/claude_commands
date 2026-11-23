@@ -325,36 +325,87 @@ class StopTests(unittest.TestCase):
                     _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     watch.copy = copy_watch.RunningCopy(process, result, time.monotonic(), root / "copy.assignment.json")
                     watch.copy_count = 1
-                    report = watch.stop()
+                    # The fixture writes no assignment, so the settle of an ended copy names the missing file.
+                    with redirect_stderr(io.StringIO()):
+                        report = watch.stop()
                     self.assertEqual((report.outcome, report.copy_count), (outcome, 1))
                     self.assertIsInstance(report.win, copy_watch.NoWin)
                     self.assertIsInstance(watch.copy, copy_watch.NoCopy)
 
 
 class StoppedCopyReleaseTests(unittest.TestCase):
-    def test_a_stopped_copy_releases_its_kept_claim_and_settles_its_assignment(self) -> None:
+    def assigned_copy(self, root: Path) -> tuple[copy_watch.WatchRequest, placement.PlacementAssignment, Path]:
+        """A copy request and its written assignment."""
         from scripts.build_queue import admission_client
 
+        request = copy_watch.WatchRequest(
+            info=root / "info", result=root / "result", runner=root / "runner.py",
+            settings=root / "mac.conf", repo_root=root, package="sample", call_id="v-call",
+            call_started=1.0, filter_run=False, nextest_words=(),
+        )
+        destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+        assignment = placement.PlacementAssignment("v-call-copy-1", "attempt-1", destination,
+            execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+            NoOwningSession(), 1.0)
+        assignment_file = root / "copy.assignment.json"
+        admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
+        return request, assignment, assignment_file
+
+    def test_a_copy_that_a_clear_ended_gets_its_kept_claim_settled(self) -> None:
+        from scripts.build_queue import admission_client
+
+        reason = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+            root = Path(directory)
+            request, assignment, assignment_file = self.assigned_copy(root)
+            watch = copy_watch.Watch(request, eligibility.KnownRepository("repo"), root)
+            # The TERM came before the remote start settled: the runner exits 143 and keeps its claim.
+            process = subprocess.Popen([sys.executable, "-c", "raise SystemExit(143)"])
+            _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            copy = copy_watch.RunningCopy(process, root / "copy.result", time.monotonic(), assignment_file)
+            released = mac_test.ClaimsReleased(1, (), claim_state.EndedByHold(reason))
+            with mock.patch.object(mac_test, "release_exact_claims", return_value=released) as release, \
+                 mock.patch.object(admission_client, "report_execution") as report:
+                self.assertIsNone(watch.finish_copy(copy))
+            self.assertEqual(cast(int, release.call_args.args[1]), process.pid)
+            sent = cast(wire.ExecutionReport, report.call_args.args[0])
+            self.assertEqual((sent.assignment, sent.outcome, sent.path),
+                             (assignment, placement.AttemptDeclined(reason), placement.DispatchPathSettled()))
+            self.assertEqual(watch.outcome, "gave_way")
+
+    def test_a_report_failure_after_the_release_names_it_and_keeps_no_claim(self) -> None:
+        from scripts.build_queue import admission_client
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+            root = Path(directory)
+            request, _assignment, assignment_file = self.assigned_copy(root)
+            process = subprocess.Popen([sys.executable, "-c", "raise SystemExit(143)"])
+            _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            copy = copy_watch.RunningCopy(process, root / "copy.result", time.monotonic(), assignment_file)
+            with mock.patch.object(mac_test, "release_exact_claims", return_value=mac_test.ClaimsReleased(1, ())), \
+                 mock.patch.object(admission_client, "report_execution",
+                                   side_effect=wire.AdmissionUnavailable("queue down")) as report, \
+                 redirect_stderr(io.StringIO()) as errors:
+                copy_watch.release_stopped_copy(copy, request, eligibility.KnownRepository("repo"))
+            self.assertEqual(report.call_count, 1)
+            self.assertEqual(errors.getvalue(), "copy_watch: the stopped copy released its Mac claim, "
+                             + "and the report of the attempt end failed: queue down\n")
+
+    def test_a_stopped_copy_releases_its_kept_claim_and_settles_its_assignment(self) -> None:
         cases = {
             "kept claim released": (mac_test.ClaimsReleased(1, ()), 1),
             "claim already released": (mac_test.ClaimsReleased(0, ()), 0),
             "remote work remains": (mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"), 0),
         }
+        from scripts.build_queue import admission_client
+
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
             root = Path(directory)
-            request = copy_watch.WatchRequest(
-                info=root / "info", result=root / "result", runner=root / "runner.py",
-                settings=root / "mac.conf", repo_root=root, package="sample", call_id="v-call",
-                call_started=1.0, filter_run=False, nextest_words=(),
-            )
+            request, assignment, assignment_file = self.assigned_copy(root)
             repository = eligibility.KnownRepository("repo")
-            destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
-            assignment = placement.PlacementAssignment("v-call-copy-1", "attempt-1", destination,
-                execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
-                NoOwningSession(), 1.0)
-            assignment_file = root / "copy.assignment.json"
-            admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
             for name, (released, reports) in cases.items():
                 with self.subTest(name):
                     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

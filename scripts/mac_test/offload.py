@@ -223,6 +223,11 @@ class HanaGuestEndedRun(LostMacRun):
 
 
 @dataclass(frozen=True)
+class RefusedByClear(LostMacRun):
+    """A clear ended the run. The detail is the clear's row reason, and the caller stops with it."""
+
+
+@dataclass(frozen=True)
 class HanaCommandAdmissionRefused:
     """The Hana admission check refused the command."""
     reason: str
@@ -988,6 +993,8 @@ class ProcessController:
         self.claim_settings: Path | DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
+        # A clear that ended this run, as the release of its claim reports it.
+        self.ended: claim_state.EndedByHold | claim_state.NotEnded = claim_state.NOT_ENDED
 
     def stop(self) -> None:
         active = self.active
@@ -1370,6 +1377,10 @@ def write_result(
 
             if reason != placement.HANA_IMAGE_STALE or first_hana_image_notice():
                 print(f"mac_test: The Hana command did not start on {label}. {reason}")
+    elif isinstance(result, RefusedByClear):
+        mac = "refused"
+        reason = result.detail
+        status = 75
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = result.detail if target else ""
@@ -1601,11 +1612,22 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
             if line.startswith("copy_bytes="):
                 transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
+            elif line.startswith("ended="):
+                controller.ended = ended_by_hold(line.removeprefix("ended="))
 
     if isinstance(result, CommandOutput) and result.status == 0:
         pending_start_path(target, identity).unlink(missing_ok=True)
         return ClaimReleaseConfirmed()
     return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
+
+
+def ended_by_hold(value: str) -> claim_state.EndedByHold | claim_state.NotEnded:
+    """Read the `ended=` value of a release. A value that is not a JSON string with text is no clear reason."""
+    try:
+        reason = cast(object, json.loads(value))
+    except ValueError:
+        return claim_state.NOT_ENDED
+    return claim_state.EndedByHold(reason) if isinstance(reason, str) and reason else claim_state.NOT_ENDED
 
 
 def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
@@ -3654,9 +3676,10 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         outcome = placement.AttemptDeclined("no_tests")
     elif (isinstance(result, LostMacRun) and evidence.cleanup == "confirmed"
           and isinstance(controller.pending, SettledDispatchOperations)):
-        outcome = (placement.PrelaunchRefused("lost")
+        reason = claim_state.lost_reason(controller.ended)
+        outcome = (placement.PrelaunchRefused(reason)
                    if not evidence.launch_authorized and isinstance(evidence.execution, execution_identity.ExecutionNotStarted)
-                   else placement.AttemptDeclined("lost"))
+                   else placement.AttemptDeclined(reason))
     elif (isinstance(result, (DeclinedMacRun, BusyMacDecline))
           and isinstance(evidence.execution, execution_identity.ExecutionNotStarted)):
         outcome = placement.PrelaunchRefused(result.reason)
@@ -3791,6 +3814,11 @@ def main() -> int:
     except OffloadInterrupted as interrupted:
         result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
         status = 128 + interrupted.signal_number
+        if isinstance(controller.ended, claim_state.EndedByHold):
+            # The runner settled its own claim after a clear. The result gives the clear's reason to the caller.
+            result = RefusedByClear(result.seconds, controller.ended.reason)
+            with suppress(OSError):
+                _ = write_result(result, request.result, target=request.target, evidence=controller.attempt_evidence)
     except Exception:
         if sys.stderr is not None:
             traceback.print_exc()

@@ -1860,6 +1860,8 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
+    # The new owner did not end by a clear; the old run's reason does not pass to it.
+    _ = kept.pop("ended", None)
     worktree = kept["worktree"]
     if Path(worktree).is_absolute():
         kept["worktree"] = str(claim_worktree_path(worktree))
@@ -2181,6 +2183,7 @@ class ClaimsReleased:
 
     count: int
     transfers: tuple[transfer_bytes.TransferBytes, ...]
+    ended: claim_state.EndedByHold | claim_state.NotEnded = claim_state.NOT_ENDED
 
 
 @dataclass(frozen=True)
@@ -2208,6 +2211,7 @@ def release_exact_claims(
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
+    ended: claim_state.EndedByHold | claim_state.NotEnded = claim_state.NOT_ENDED
     for path, record in owned:
         pending = offload.pending_start_path(paths.target, identity)
         if "remote_host" in record and pending.exists():
@@ -2228,13 +2232,15 @@ def release_exact_claims(
             if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
             transfers.extend(current.get("transfers", []))
+            if "ended" in current:
+                ended = claim_state.EndedByHold(current["ended"])
             pending.unlink(missing_ok=True)
             path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
         start_watcher(paths)
-    return ClaimsReleased(len(owned), tuple(transfers))
+    return ClaimsReleased(len(owned), tuple(transfers), ended)
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
@@ -2245,7 +2251,98 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
         return 12
     if released.transfers:
         print("copy_bytes=" + json.dumps(list(released.transfers)))
+    if isinstance(released.ended, claim_state.EndedByHold):
+        print("ended=" + json.dumps(released.ended.reason))
     return 0
+
+
+def mark_claim_ended(paths: StatePaths, claim: HeldClaim, reason: str) -> bool:
+    """Record why a hold ends this claim's run, before the stop. The settle of the run reports the reason."""
+    with locked(paths.lock):
+        current = read_run(claim.path)
+        if isinstance(current, NoRun) or claim_owner(current) != claim_owner(claim.record):
+            return False
+        current["ended"] = reason
+        write_json(claim.path, current)
+    return True
+
+
+@dataclass(frozen=True)
+class StoppedRunSettled:
+    """The remote work ended, the claim is gone, and the queue has the end of the attempt."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class StoppedRunKept:
+    """The claim stays because its cleanup failed; the reason names the failed step."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class StoppedRunUnreported:
+    """The remote work ended and the claim is gone, but the report of the attempt end failed."""
+
+    reason: str
+    failure: str
+
+
+@dataclass(frozen=True)
+class NoStoppedRun:
+    """The runner left no claim of the attempt, so nothing remains to settle."""
+
+
+def settle_stopped_runner(
+    paths: StatePaths, runner_pid: int, assignment: placement.PlacementAssignment, settings: str,
+    repository: eligibility.KnownRepository,
+) -> StoppedRunSettled | StoppedRunKept | StoppedRunUnreported | NoStoppedRun:
+    """Settle the attempt of a runner that exited before its own report.
+
+    The runner keeps its claim when a signal comes before its remote start settles, or when it dies
+    with no chance to act (SIGKILL, out of memory). No later claim of that attempt comes to take the
+    claim over, so the caller that waited for the runner settles it here: end the remote work, settle
+    the start fence, release the claim, and report the attempt as declined. The reason is the row
+    reason of the clear that ended the run, else "lost". Call this only after the runner has exited.
+    StoppedRunKept means only that the release refused; a report that fails after the release is StoppedRunUnreported.
+    """
+    from scripts.build_queue import admission_protocol as wire, placement
+
+    released = release_exact_claims(paths, runner_pid, assigned_identity(assignment), settings,
+                                    remote_work=EndStoppedWork(repository))
+    if isinstance(released, ClaimReleaseRefused):
+        return StoppedRunKept(released.reason)
+    if released.count == 0:
+        return NO_STOPPED_RUN
+    outcome = placement.AttemptDeclined(claim_state.lost_reason(released.ended))
+    try:
+        report_stopped_attempt(assignment, outcome, placement.DispatchPathSettled())
+    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+        return StoppedRunUnreported(outcome.reason, str(error))
+    return StoppedRunSettled(outcome.reason)
+
+
+def assigned_identity(assignment: placement.PlacementAssignment) -> claim_state.ClaimIdentity:
+    return claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                     assignment.episode, assignment.attempt)
+
+
+def report_stopped_attempt(assignment: placement.PlacementAssignment, outcome: placement.AttemptDeclined,
+                           dispatch: placement.DispatchPathState) -> None:
+    """Report the end of the attempt of a runner that exited before its own report."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+
+    identity = assigned_identity(assignment)
+    destination = assignment.destination
+    reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 identity.claim_id, identity.episode, identity.attempt)
+    _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+        execution_identity.ExecutionEvidenceUnavailable("the runner exited before its final status", time.time()),
+        outcome, dispatch))
+
+
+NO_STOPPED_RUN = NoStoppedRun()
 
 
 def free_now(

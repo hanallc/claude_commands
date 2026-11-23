@@ -496,6 +496,15 @@ class AuditedBuild:
     children: tuple[ProcessIdentity, ...]
 
 
+def process_argv(proc_root: Path, pid: int) -> tuple[str, ...]:
+    """Read one process's arguments. A process that is gone has none."""
+    try:
+        return tuple(part.decode("utf-8", "replace") for part in
+                     (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0") if part)
+    except OSError:
+        return ()
+
+
 def read_audit_processes(
     proc_root: Path, selection: FullBuildAudit | DrainBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
     cgroup_root: Path = SYSTEM_CGROUP_ROOT,
@@ -552,11 +561,7 @@ def read_audit_processes(
     for pid in details:
         process = processes[pid]
         directory = proc_root / str(pid)
-        try:
-            argv = tuple(part.decode("utf-8", "replace") for part in
-                         (directory / "cmdline").read_bytes().split(b"\0") if part)
-        except OSError:
-            argv = ()
+        argv = process_argv(proc_root, pid)
         try:
             environment = dict(part.decode("utf-8", "replace").split("=", 1) for part in
                                (directory / "environ").read_bytes().split(b"\0") if b"=" in part)

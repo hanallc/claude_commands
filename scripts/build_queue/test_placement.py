@@ -1355,6 +1355,41 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(reply.permission, placement.PermissionConsumed)
                 self.assertEqual(len(fixture.server.assignments), 1)
 
+    def test_a_run_end_settle_of_a_dead_runner_closes_the_attempt_while_its_caller_lives(self) -> None:
+        # mac_test.settle_stopped_runner: the runner died with its claim kept; the live caller settles it.
+        cleared = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        for reason in ("lost", cleared):
+            with self.subTest(reason=reason), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                destination = assignment.destination
+                claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                         f"claim-{assignment.attempt}", assignment.episode, assignment.attempt)
+                runner = fixture.proc.spawn(used=0)
+                write_process(fixture.proc.path, runner.pid, parent=request.owner.pid, start=runner.start_time)
+                holder = placement.ClaimHolderIdentity(fixture.server.host, runner.pid, runner.start_time)
+                kept = placement.AdoptedProviderClaim(claim, holder, assignment.session, destination.host, "host-generation-a")
+                _ = publish_candidate(fixture, request, claims=(kept,))
+                authorized, = fixture.connect(wire.ConsumePermission("consume-runner", assignment, claim,
+                                                                     holder=holder)).replies()
+                self.assertIsInstance(authorized, wire.FirstAuthorization)
+                fixture.proc.kill(runner)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                # The kept claim alone holds the attempt current while the caller lives.
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=(kept,))
+                _ = fixture.run_pass()
+                self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                _ = fixture.connect(wire.ExecutionReport("run-end-settle", assignment, claim,
+                    execution_identity.ExecutionEvidenceUnavailable("the runner exited before its final status", 1.0),
+                    placement.AttemptDeclined(reason), placement.DispatchPathSettled())).replies()
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
+                self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment(reason))
+                self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
     def test_a_released_claim_waits_for_its_settlement_instead_of_a_final_status(self) -> None:
         with PlacementFixture() as fixture:
             request = placement_request(fixture)

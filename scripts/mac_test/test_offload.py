@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -363,6 +364,51 @@ class RunnerCompletionTests(unittest.TestCase):
         }])
 
 
+class ClearedRunReportTests(unittest.TestCase):
+    def test_a_run_that_settles_itself_after_a_clear_reports_the_clear_reason(self) -> None:
+        # The claim release gives back the clear's row reason; the runner's own "lost" report uses it.
+        reason = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        for launched, expected in ((True, placement.AttemptDeclined(reason)), (False, placement.PrelaunchRefused(reason))):
+            with self.subTest(launched=launched):
+                ended, sent = self.release_and_report("ended=" + json.dumps(reason) + "\n", launched)
+                self.assertEqual(ended, claim_state.EndedByHold(reason))
+                self.assertEqual((sent.outcome, sent.path), (expected, placement.DispatchPathSettled()))
+
+    def test_a_bad_ended_line_leaves_the_interrupt_result(self) -> None:
+        # The claim is already gone, so a bad value must not raise; the run reports as the interrupt left it.
+        for line in ("ended=not json", 'ended=""', "ended=42", "ended="):
+            with self.subTest(line=line):
+                ended, sent = self.release_and_report(line + "\n", True)
+                self.assertEqual(ended, claim_state.NOT_ENDED)
+                self.assertEqual((sent.outcome, sent.path), (placement.AttemptDeclined("lost"), placement.DispatchPathSettled()))
+
+    def release_and_report(self, release_output: str, launched: bool
+                           ) -> tuple[claim_state.EndedByHold | claim_state.NotEnded, wire.ExecutionReport]:
+        """Release the claim with this output, then send the report of an interrupted run."""
+        destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+        assignment = placement.PlacementAssignment("episode", "attempt", destination,
+            execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+            NoOwningSession(), 1.0)
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id("episode", "attempt"), "episode", "attempt")
+        with tempfile.TemporaryDirectory() as directory:
+            request = offload.OffloadRequest(Path(directory), "hana", "call", offload.NO_RESULT_FILE, (), owner="verify",
+                                             holder_session="fixture", placement=offload.AssignedOffloadRequest(assignment))
+            controller = offload.ProcessController()
+            controller.claim_identity = identity
+            with mock.patch.object(controller, "capture", return_value=offload.CommandOutput(0, release_output, "")), \
+                 mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+                self.assertIsInstance(offload.release_claim(controller), offload.ClaimReleaseConfirmed)
+            evidence = controller.attempt_evidence
+            evidence.cleanup, evidence.launch_authorized = "confirmed", launched
+            if launched:
+                evidence.execution = execution_identity.ExecutionEvidenceUnavailable("ended", 1.0)
+            evidence.provider = placement.ProviderClaimReference(
+                "mac", "mac", claim_state.RepositoryScope("repo"), identity.claim_id, "episode", "attempt")
+            with mock.patch.object(admission_client, "report_execution") as report:
+                offload.report_placement_result(controller, request, offload.LostMacRun(1.0, "interrupted by signal 15"))
+        return controller.ended, cast(wire.ExecutionReport, report.call_args.args[0])
+
+
 class CompletedRunSyncTests(unittest.TestCase):
     def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
         for target in ("linux", "mac"):
@@ -579,6 +625,34 @@ class OffloadSettingsTests(unittest.TestCase):
                 self.assertIn(field, result.splitlines())
                 placement_report.assert_called_once()
                 attempt_record.assert_called_once()
+
+    def test_a_runner_that_a_clear_interrupts_writes_the_refused_result(self) -> None:
+        reason = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        path = self.root / "refused.result"
+
+        def place(request: offload.OffloadRequest, *_arguments: object) -> offload.OffloadRequest:
+            return request
+
+        def cleared(controller: offload.ProcessController, *_arguments: object) -> offload.MacOffloadResult:
+            # The release of the claim in the interrupted run gives back the clear's reason.
+            controller.ended = claim_state.EndedByHold(reason)
+            raise offload.OffloadInterrupted(signal.SIGTERM)
+
+        argv = ["offload", "run", "--repo-root", str(self.root), "--call-id", "call", "--result", str(path)]
+        with (mock.patch.object(sys, "argv", argv),
+              redirect_stdout(io.StringIO()) as output,
+              mock.patch.object(override_guard, "refuse_overrides"),
+              mock.patch.object(copies, "source_owner", return_value="fixture"),
+              mock.patch.object(offload, "holder_session", return_value="fixture"),
+              mock.patch.object(offload, "restore_ignored_interrupt_default"),
+              mock.patch.object(offload, "submit_direct_placement", side_effect=place),
+              mock.patch.object(offload, "run_offload", side_effect=cleared),
+              mock.patch.object(offload, "report_placement_result") as placement_report,
+              mock.patch.object(offload, "persist_attempt")):
+            self.assertEqual(offload.main(), 128 + signal.SIGTERM)
+        self.assertEqual(path.read_text().splitlines()[:2], ["mac=refused", f"reason={reason}"])
+        self.assertEqual(output.getvalue(), "")
+        self.assertIsInstance(cast(object, placement_report.call_args.args[2]), offload.RefusedByClear)
 
     def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
         config = eligibility.read_config(self.settings)

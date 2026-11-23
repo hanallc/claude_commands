@@ -38,9 +38,9 @@ The caller must submit a new run to retry.
 
 ## Mac queue runs
 
-`mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
-The run uses the holding unit's session for the block check and the placement request.
-Workers of that unit can start a run during its block.
+`mac_queue_run.py` checks the Mac block for every `--kind` before placement, before remote preparation, and before the remote command.
+The run uses the holding unit's session (`owning_session()`) for the block check and the placement request.
+Workers of that unit can start a run of any kind during its block.
 A run that waits for another session's block prints one line with the holder and reason.
 The run returns any placement before it waits for the block to clear.
 The wait can lift an expired block through the Mac block expiry procedure.
@@ -89,6 +89,7 @@ If `bwrap` is missing, the route declines before it sends the source.
 - **Claim files and scopes.** `claims/<repo>.json` holds one repository's claim; `run.json` holds a claim whose worktree is in no repository. `claim_scope(worktree)` names the repository through `offload.repository_identity` (`sweep.repo_name`, the folder holding the shared repository directory), else `WHOLE_MAC`: `ClaimScope = RepositoryScope(name) | WholeMacScope`, and `claim_path(paths, scope)` maps it to its file. `scopes_overlap` is true when either side is the whole Mac or both name the same repository. `read_claims(paths) -> tuple[HeldClaim(scope, path, record), ...]` reads every file, oldest `since` first; a `claims/<repo>.json` scope comes from its file name, a `run.json` scope from its worktree, so a machine-wide `run.json` from an older install covers the repository its worktree is in, or every repository when that worktree is in none. A file it cannot read raises `ClaimStateUnreadable(path)`, a `StateReadError`. `live_claims` removes each claim whose owner ended and returns the rest. A cleanup releases a claim only through `claim_state.cleanup_scope_matches`: a `run.json` claim with a relative worktree and no `repo_name` keeps its whole-Mac scope for admission but matches no cleanup. When the owner of such a kept claim ends, no tool releases it; a person releases it with `mac_test.py release --pid <pid> --claim-id <id> --episode <episode> --attempt <attempt>`, with the values from `run.json`.
 Each claim records `claim_id`, `episode`, `attempt`, `submitting_session`, `pid`, `proc_start`, job details, worktree, and queue time.
 A remote-bound claim also records `remote_host` and its applicable host generation.
+A claim whose run a clear ended records `ended`, the 6.1 row reason. The release of the claim gives the reason back (`ended=` on `release` output), and the settle of the attempt reports it as the decline reason. A takeover drops it. An `ended=` value that is not a JSON string with text gives no reason, and the run reports as the interrupt left it. A runner that a clear interrupted writes the result word `refused` with that reason, and its `verify.sh` caller stops.
 A process-bound claim ends when its checked owner ends.
 A remote-bound claim remains held until provider cleanup confirms departure.
 Adoption preserves exact claim identity under the target lock.
@@ -497,6 +498,7 @@ The offload adapter claims, adopts, and consumes that attempt through the normal
 The watcher preserves first-result handling, loser stopping, logs, fetch behavior, and source locks.
 An uncertain loser retains its exact provider claim until departure is confirmed.
 A retained cleanup claim cannot yield overlapping capacity.
+After each copy runner exits, the watcher settles a claim that the runner kept (`release_stopped_copy`), for example after a clear's `SIGTERM` before the remote start settled. When the runner left no claim, this does nothing.
 Changed source content receives receiver write time through `copies.remote_rsync` and `RSYNC_RECEIVER_WRITE_TIME_FLAGS`.
 Unchanged content retains its earlier time.
 
@@ -560,6 +562,7 @@ Both values use the existing configuration reader.
   Changed files get the receiver write time, so Cargo detects changed source even when its source modification time is old.
   A change to the source modification time alone causes no transfer.
 - GitHub lists hana's macOS job only after `macOS: Runner Availability` completes, and lists it at once as completed/skipped while the switch is off. A pending block therefore also waits on queued runs that have not reached that job.
+- A runner that exits before its own report (a signal while its remote start is pending, `SIGKILL`, out of memory) keeps its claim. At run end, the `verify.sh` caller settles that claim through `release-wait --assignment-file`: it ends the remote work, settles the fence, removes the claim and reports the attempt as declined (`lost`, or the clear's reason). For a cleared run it also writes the `refused` result (`release-wait --result-file`); a failed cleanup reports the attempt with a pending dispatch path that names the failure. When the release works and only the report fails, the claim is gone, no second report goes out, and stderr says `the report of the attempt end failed: <error>`.
 - A lost run whose cleanup cannot confirm the end keeps its claim. A remote claimant takes it over with exit 13 and checks the stored host. Remaining work declines `busy`; an unreadable host or failed check declines `unreachable` and starts the unreachable backoff. Both keep the claim. Stderr says `mac_test: <N> leftover processes of a lost run are still on the Mac; it stays busy until they end`, or `mac_test: could not confirm that a lost run's leftovers ended: <reason>; the Mac stays busy`.
 - A non-interactive bash starts an `&` child with `SIGINT` ignored, so a forwarded INT is lost until `offload.py run` installs its own handlers. `verify.sh` therefore forwards INT as TERM. A terminal interrupt reaches the runner twice: INT from the process group and TERM from the forward.
 - The message and session lookup run outside `state.lock`; send.py can take 40 s.

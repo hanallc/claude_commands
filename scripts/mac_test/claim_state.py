@@ -37,6 +37,26 @@ class NoMacBlock:
 
 
 @dataclass(frozen=True)
+class EndedByHold:
+    """A clear ended the claim's run. The reason is the row reason of contract section 6.1."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class NotEnded:
+    """No hold ended the claim's run."""
+
+
+NOT_ENDED = NotEnded()
+
+
+def lost_reason(ended: EndedByHold | NotEnded) -> str:
+    """The decline reason of a run that ended before its result: the clear's row reason, else "lost"."""
+    return ended.reason if isinstance(ended, EndedByHold) else "lost"
+
+
+@dataclass(frozen=True)
 class RecordedSession:
     """The session recorded when a block was requested."""
 
@@ -240,6 +260,8 @@ class ClaimOwnerRecord(TypedDict):
     repo_name: NotRequired[str]
     slot: NotRequired[int]
     transfers: NotRequired[list[TransferBytes]]
+    # The row reason of a clear that ended this run (contract section 6.1). The settle of the run reports it.
+    ended: NotRequired[str]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -405,6 +427,11 @@ def read_run(path: Path) -> RunState:
         if type(slot) is not int or slot < 1:
             raise StateReadError(f"{path} has an invalid slot")
         record["slot"] = slot
+    if "ended" in values:
+        ended = required_string(values, "ended", path)
+        if not ended.strip():
+            raise StateReadError(f"{path} has an invalid ended")
+        record["ended"] = ended
     if "remote_host" not in values:
         return record
     host = values["remote_host"]

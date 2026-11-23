@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, nullcontext, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -134,6 +134,8 @@ def parser() -> argparse.ArgumentParser:
         return OwningSession(value) if value else NoOwningSession()
 
     _ = release.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
+    _ = release.add_argument("--assignment-file", default="")
+    _ = release.add_argument("--result-file", default="")
     _ = commands.add_parser("submitting-session")
     source = commands.add_parser("source-key")
     _ = source.add_argument("--repo-root", required=True)
@@ -1180,6 +1182,83 @@ def command_release_wait(pid: int, *,
     return 0
 
 
+def settle_ended_runner(assignment_file: Path, identity: claim_state.ClaimIdentity,
+                        session: SubmittingSession | claim_state.CallingSession, result_file: str) -> None:
+    """Settle the attempt of the runner that exited before its own report, for the caller that waited for it.
+
+    When nothing remains or the run ended as lost, do nothing more. A failed cleanup of a lost run keeps the
+    claim kept, and the next claim of its scope takes it over as before. When a clear ended the run, write
+    its refused result to result_file, as the runner writes it after a clear. The reason is the clear's row
+    reason, or the named cleanup failure. A cleanup failure also reports the attempt end with that failure.
+    """
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.build_targets import target_config
+    from scripts.mac_test import mac_test
+
+    session = claim_state.submitting_session(session)
+    try:
+        reply = admission_client.read_assignment(assignment_file)
+    except (OSError, ValueError, wire.AdmissionUnavailable):
+        return
+    if not isinstance(reply, wire.Assignment) or reply.assignment.destination.provider == "local":
+        return
+    assignment = reply.assignment
+    try:
+        target = target_config.configured_ssh_target(assignment.destination.target)
+        if not target_config.ssh_target_state_directory(target.name).exists():
+            return
+        paths = mac_test.state_paths(target.name)
+        # A claim that a later claim took over has a live new owner, so it is not kept and this settle does nothing.
+        with mac_test.locked(paths.lock):
+            stopped = [held.record for held in mac_test.read_claims(paths)
+                       if claim_state.claim_identity(held.record) == identity
+                       and held.record["submitting_session"] == claim_state.session_id(session)
+                       and mac_test.run_is_kept(held.record)]
+    except (OSError, ValueError, ConfigError):
+        return
+    if not stopped:
+        return
+    record = stopped[0]
+    settled = settle_kept_run(paths, record, assignment, str(target.settings))
+    if isinstance(settled, mac_test.StoppedRunUnreported):
+        print(f"release-wait: the Mac claim is released, and the report of the attempt end failed: {settled.failure}",
+              file=sys.stderr)
+    if "ended" not in record:
+        return
+    if isinstance(settled, mac_test.StoppedRunKept):
+        with suppress(OSError, ValueError, wire.AdmissionUnavailable):
+            mac_test.report_stopped_attempt(assignment, placement.AttemptDeclined(record["ended"]),
+                                            placement.DispatchPathPending(settled.reason))
+        write_refused_result(result_file, target.name, f"the Mac run ended, and its cleanup failed: {settled.reason}")
+    elif isinstance(settled, (mac_test.StoppedRunSettled, mac_test.StoppedRunUnreported)):
+        write_refused_result(result_file, target.name, settled.reason)
+
+
+def settle_kept_run(paths: claim_state.StatePaths, record: claim_state.ClaimOwnerRecord,
+                    assignment: placement.PlacementAssignment, settings: str,
+                    ) -> mac_test.StoppedRunSettled | mac_test.StoppedRunKept | mac_test.StoppedRunUnreported | mac_test.NoStoppedRun:
+    """Settle the kept claim. An error comes only from the release, so the claim stays kept."""
+    from scripts.mac_test import eligibility, mac_test
+
+    if "repo_name" not in record:
+        return mac_test.StoppedRunKept("the claim names no repository")
+    try:
+        return mac_test.settle_stopped_runner(paths, record["pid"], assignment, settings,
+                                              eligibility.KnownRepository(record["repo_name"], record.get("repo_key", "")))
+    except (OSError, ValueError, ConfigError) as error:
+        return mac_test.StoppedRunKept(str(error))
+
+
+def write_refused_result(result_file: str, target: str, reason: str) -> None:
+    """Give the clear's reason to the caller in the runner's result file. An empty path names no file."""
+    if not result_file:
+        return
+    from scripts.mac_test import offload
+
+    with suppress(OSError, ConfigError):
+        _ = offload.write_result(offload.RefusedByClear(0.0, reason), offload.ResultFile(Path(result_file)), target=target)
+
+
 def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing: Routing,
                           *, mac_only: bool = False, new_step: bool = False) -> int:
     decision = step_routing_rule(kind, routing, Pinned("mac") if mac_only else ROUTED)
@@ -1630,8 +1709,11 @@ def main() -> int:
 
             with target_config.command_configuration():
                 if args.command == "release-wait":
-                    return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
-                        args.claim_id, args.episode, args.attempt), session=args.session)
+                    identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+                    released = command_release_wait(args.pid, identity=identity, session=args.session)
+                    if not released and args.assignment_file:
+                        settle_ended_runner(Path(args.assignment_file), identity, args.session, args.result_file)
+                    return released
                 return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
         if args.command == "register-local":
             return command_register_local(args.call_id, pid=args.pid, session=args.session)

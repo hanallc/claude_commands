@@ -8,6 +8,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2505,6 +2506,30 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(self.enforce((self.machine_hold("mac", "drain"),), machine, signals), ())
         self.assertEqual(signals, [])
 
+    def test_mac_clear_leaves_a_wait_reservation_that_no_runner_has_adopted(self) -> None:
+        # Section 4: a waiter stays in its lines. Its holder is verify.sh until a runner adopts the reservation.
+        _ = self.process(45, "bash", argv=("bash", "/fixture/scripts/direct/verify.sh", "test"))
+        _ = self.process(46, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 45)
+        self.write_claim("mac", 46)
+        signals: list[tuple[int, int]] = []
+        lines = self.enforce((self.machine_hold("mac", "clear"),), "mac", signals)
+        self.assertEqual(signals, [(46, signal.SIGTERM)])
+        self.assertEqual(len(lines), 1)
+        claims = hold_enforcer.machine_state_paths("mac").claims
+        self.assertNotIn("ended", cast(dict[str, object], json.loads((claims / "repo-45.json").read_text())))
+        self.assertEqual((self.proc / "45/fd/2").read_text(), "")
+
+    def test_mac_clear_leaves_a_wait_reservation_whose_verify_shell_has_an_option_value(self) -> None:
+        verify = "/fixture/scripts/direct/verify.sh"
+        _ = self.process(45, "bash", argv=("bash", "-o", "pipefail", verify, "test"))
+        self.write_claim("mac", 45)
+        signals: list[tuple[int, int]] = []
+        self.assertEqual(self.enforce((self.machine_hold("mac", "clear"),), "mac", signals), ())
+        self.assertEqual(signals, [])
+        for options in (("-eo", "pipefail"), ("-O", "extglob"), ("+o", "posix")):
+            self.assertEqual(hold_enforcer.verify_arguments(("bash", *options, verify, "test")), (verify, "test"))
+
     def test_mac_clear_covers_mac_linux_and_a_mac_linux_clear_does_not_cover_mac(self) -> None:
         _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
         _ = self.process(50, "python3", argv=("python3", "mac_linux.py"))
@@ -2698,6 +2723,232 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(signals, [(41, signal.SIGTERM)])
         self.assertEqual(sorted(line.split(" (")[0] for line in lines), ["mac: pid 40", "mac: pid 41"])
         self.assertIn("mac: pid 40 (tests 40) could not be ended: [Errno 1] Operation not permitted", lines)
+
+    # Defect B: a clear, or any other runner death, leaves no Mac attempt that is not settled.
+
+    def start_runner(self) -> tuple[subprocess.Popen[bytes], str]:
+        """Start a stand-in offload runner that this test owns, and give its real start time."""
+        from scripts.lib import process_start
+
+        runner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(runner.wait)
+        self.addCleanup(runner.kill)
+        started = process_start.proc_table_start(runner.pid, Path("/proc"))
+        assert isinstance(started, process_start.Started)
+        _ = self.process(runner.pid, "python3", start=int(started.start), argv=("python3", "offload.py"))
+        return runner, started.start
+
+    def runner_exits(self, runner: subprocess.Popen[bytes]) -> int:
+        """Reap the runner, and remove its entry from the test process table as the kernel does."""
+        status = runner.wait(timeout=10)
+        shutil.rmtree(self.proc / str(runner.pid))
+        return status
+
+    def started_offload_run(self, pid: int, start: str) -> tuple[Path, Path, Path]:
+        """Write the assignment, the remote claim and the pending start of an offload run on the Mac."""
+        from scripts.build_queue import admission_client
+        from scripts.mac_test import offload
+
+        _ = write_config_fixture(self.root / "config/build_targets.conf",
+                                 "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+        assignment = placement.PlacementAssignment("verify-call", "attempt-1", destination,
+            execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+            NoOwningSession(), 1.0)
+        assignment_file = self.root / "step.assignment.json"
+        admission_client.write_assignment(assignment_file, admission_protocol.Assignment(assignment))
+        claim = hold_enforcer.machine_state_paths("mac").claims / "repo.json"
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": self.run_identity().claim_id, "episode": "verify-call", "attempt": "attempt-1",
+            "submitting_session": "", "pid": pid, "proc_start": start, "what": "tests sample", "worktree": "repo",
+            "since": "2026-11-22T12:00:00+00:00", "repo_name": "repo", "repo_key": "", "remote_host": "mac.test"}
+        _ = claim.write_text(json.dumps(record))
+        pending = offload.pending_start_path("mac", self.run_identity())
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.touch()
+        return assignment_file, claim, pending
+
+    def run_identity(self) -> claim_state.ClaimIdentity:
+        return claim_state.ClaimIdentity(execution_identity.assigned_claim_id("verify-call", "attempt-1"),
+                                         "verify-call", "attempt-1")
+
+    def settle_run(self, assignment_file: Path, *, work_remains: bool = False, report_fails: bool = False
+                   ) -> tuple[str, list[admission_protocol.ExecutionReport], list[str]]:
+        """Run the caller's run-end settle with the Mac cleanup and the queue as stand-ins.
+
+        Return the runner result file that the settle wrote ("" when it wrote none), the reports and the cleanup scripts.
+        """
+        from scripts.build_queue import admission_client
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import eligibility, offload
+
+        result = assignment_file.with_name("runner-result")
+        reports: list[admission_protocol.ExecutionReport] = []
+        scripts: list[str] = []
+
+        def read_leftovers(_config: object, host: str, script: str, target: str) -> offload.LeftoverObservation:
+            self.assertEqual((host, target), ("mac.test", "mac"))
+            scripts.append(script)
+            if work_remains:
+                return offload.LeftoverObservation(offload.LeftoversRemain(1), "leftovers=1\nrc=0\n")
+            settled = "dispatch_start_settled=" + offload.pending_start_key(self.run_identity())
+            return offload.LeftoverObservation(offload.LeftoversEnded(), f"leftovers=0\n{settled}\nrc=0\n")
+
+        def report_execution(request: admission_protocol.ExecutionReport) -> admission_protocol.DispatchStatus:
+            reports.append(request)
+            if report_fails:
+                raise admission_protocol.AdmissionUnavailable("queue down")
+            return cast(admission_protocol.DispatchStatus, mock.sentinel.status)
+
+        with mock.patch.object(eligibility, "read_connection_settings"), \
+             mock.patch.object(offload, "read_leftovers", side_effect=read_leftovers), \
+             mock.patch.object(admission_client, "report_execution", side_effect=report_execution), \
+             redirect_stdout(io.StringIO()) as output:
+            build_targets.settle_ended_runner(assignment_file, self.run_identity(), NoOwningSession(), str(result))
+        self.assertEqual(output.getvalue(), "")
+        return (result.read_text() if result.exists() else ""), reports, scripts
+
+    def test_clear_mac_settles_the_started_offload_run_as_refused_and_its_caller_stops(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, pending = self.started_offload_run(runner.pid, start)
+        hold = self.machine_hold("mac", "clear")
+        reason = machine_hold.refused_reason(hold)
+        lines = hold_enforcer.enforce_machine(machine_hold.ActiveHolds((hold,)), "mac", self.proc)
+        self.assertEqual(lines, (f"mac: pid {runner.pid} (tests sample) {reason}",))
+        self.assertEqual(self.runner_exits(runner), -signal.SIGTERM)
+        self.assertEqual(cast(dict[str, object], json.loads(claim.read_text()))["ended"], reason)
+        result, reports, scripts = self.settle_run(assignment_file)
+        # The refused result gives the 6.1 reason to the caller, and verify.sh stops on it.
+        self.assertEqual(result, f"mac=refused\nreason={reason}\nseconds=0.000000\n")
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("leftovers", scripts[0])
+        self.assertEqual([(report.outcome, report.path) for report in reports],
+                         [(placement.AttemptDeclined(reason), placement.DispatchPathSettled())])
+        self.assertFalse(claim.exists())
+        self.assertFalse(pending.exists())
+
+    def test_a_cleared_run_whose_cleanup_fails_names_the_failure_and_its_caller_stops(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, _pending = self.started_offload_run(runner.pid, start)
+        hold = self.machine_hold("mac", "clear")
+        _ = hold_enforcer.enforce_machine(machine_hold.ActiveHolds((hold,)), "mac", self.proc)
+        _ = self.runner_exits(runner)
+        result, reports, _scripts = self.settle_run(assignment_file, work_remains=True)
+        failure = "the remote work of the claim has not ended"
+        self.assertEqual(result, f"mac=refused\nreason=the Mac run ended, and its cleanup failed: {failure}\n"
+                                 + "seconds=0.000000\n")
+        # The queue gets the attempt end with the named failure; the dispatch stays pending while the claim stays.
+        self.assertEqual([(report.outcome, report.path) for report in reports],
+                         [(placement.AttemptDeclined(machine_hold.refused_reason(hold)), placement.DispatchPathPending(failure))])
+        self.assertTrue(claim.exists())
+
+    def test_a_report_failure_after_a_good_release_names_it_and_sends_no_pending_report(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, pending = self.started_offload_run(runner.pid, start)
+        hold = self.machine_hold("mac", "clear")
+        reason = machine_hold.refused_reason(hold)
+        _ = hold_enforcer.enforce_machine(machine_hold.ActiveHolds((hold,)), "mac", self.proc)
+        _ = self.runner_exits(runner)
+        with redirect_stderr(io.StringIO()) as errors:
+            result, reports, _scripts = self.settle_run(assignment_file, report_fails=True)
+        # The cleanup worked and the claim is gone: one report, no pending path, and no "cleanup failed".
+        self.assertEqual([(report.outcome, report.path) for report in reports],
+                         [(placement.AttemptDeclined(reason), placement.DispatchPathSettled())])
+        self.assertEqual(result, f"mac=refused\nreason={reason}\nseconds=0.000000\n")
+        self.assertEqual(errors.getvalue(),
+                         "release-wait: the Mac claim is released, and the report of the attempt end failed: queue down\n")
+        self.assertFalse(claim.exists())
+        self.assertFalse(pending.exists())
+
+    def test_a_runner_that_dies_without_a_clear_settles_its_attempt_as_lost(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, pending = self.started_offload_run(runner.pid, start)
+        # Out of memory, or a SIGKILL by hand: the runner runs no code of its own.
+        runner.kill()
+        _ = self.runner_exits(runner)
+        result, reports, scripts = self.settle_run(assignment_file)
+        # The caller goes on with its "lost" result; the queue closes the attempt, so the next placement can assign.
+        self.assertEqual(result, "")
+        self.assertEqual(len(scripts), 1)
+        self.assertEqual([(report.outcome, report.path) for report in reports],
+                         [(placement.AttemptDeclined("lost"), placement.DispatchPathSettled())])
+        self.assertFalse(claim.exists())
+        self.assertFalse(pending.exists())
+
+    def test_a_lost_run_whose_cleanup_fails_keeps_its_claim_for_the_next_claim(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, pending = self.started_offload_run(runner.pid, start)
+        runner.kill()
+        _ = self.runner_exits(runner)
+        # No clear ended the run: its caller goes on, and the next claim of the scope takes the claim over.
+        result, reports, _scripts = self.settle_run(assignment_file, work_remains=True)
+        self.assertEqual((result, reports), ("", []))
+        self.assertTrue(claim.exists())
+        self.assertTrue(pending.exists())
+
+    def cleared_kept_claim(self) -> tuple[Path, Path, claim_state.HeldClaim]:
+        """A started offload run that a clear marked, whose runner is gone."""
+        from scripts.mac_test import mac_test
+
+        runner, start = self.start_runner()
+        assignment_file, claim, _pending = self.started_offload_run(runner.pid, start)
+        runner.kill()
+        _ = self.runner_exits(runner)
+        paths = hold_enforcer.machine_state_paths("mac")
+        held = claim_state.read_claims(paths)[0]
+        self.assertTrue(mac_test.mark_claim_ended(paths, held, "ended: fixture clear"))
+        return assignment_file, claim, claim_state.read_claims(paths)[0]
+
+    def test_a_takeover_drops_the_ended_reason_of_the_kept_claim(self) -> None:
+        from scripts.mac_test import mac_test
+
+        _assignment_file, claim, held = self.cleared_kept_claim()
+        assert "remote_host" in held.record
+        _ = self.process(777, "python3", start=12_000, argv=("python3", "offload.py"))
+        arguments = mac_test.CliArguments()
+        arguments.pid = 777
+        with redirect_stdout(io.StringIO()):
+            _ = mac_test.take_over_kept_claim(arguments, held, held.record, session=NoOwningSession())
+        record = cast(dict[str, object], json.loads(claim.read_text()))
+        self.assertEqual((record["pid"], record.get("cleanup_pending")), (777, True))
+        self.assertNotIn("ended", record)
+
+    def test_the_release_of_a_cleared_claim_prints_the_clear_reason(self) -> None:
+        from scripts.mac_test import mac_test, offload
+
+        _assignment_file, claim, held = self.cleared_kept_claim()
+        offload.pending_start_path("mac", self.run_identity()).unlink()
+        arguments = mac_test.CliArguments()
+        arguments.pid = held.record["pid"]
+        arguments.claim_id, arguments.episode, arguments.attempt = (
+            held.record["claim_id"], held.record["episode"], held.record["attempt"])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(mac_test.command_release(arguments, hold_enforcer.machine_state_paths("mac")), 0)
+        self.assertEqual(output.getvalue(), 'ended="ended: fixture clear"\n')
+        self.assertFalse(claim.exists())
+
+    def test_a_run_end_settle_without_a_target_state_folder_makes_no_folder(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, _claim, _pending = self.started_offload_run(runner.pid, start)
+        state = hold_enforcer.machine_state_paths("mac").directory
+        shutil.rmtree(state)
+        self.assertEqual(self.settle_run(assignment_file), ("", [], []))
+        self.assertFalse(state.exists())
+
+    def test_a_drain_leaves_a_kept_run_between_two_steps_unsettled(self) -> None:
+        runner, start = self.start_runner()
+        assignment_file, claim, pending = self.started_offload_run(runner.pid, start)
+        signals: list[tuple[int, int]] = []
+        for machine in machine_hold.covered_machines("mac"):
+            self.assertEqual(self.enforce((self.machine_hold("mac", "drain"),), machine, signals), ())
+        self.assertEqual(signals, [])
+        self.assertNotIn("ended", cast(dict[str, object], json.loads(claim.read_text())))
+        # The run still lives, so a run-end settle finds nothing to settle.
+        self.assertEqual(self.settle_run(assignment_file), ("", [], []))
+        self.assertTrue(claim.exists())
+        self.assertTrue(pending.exists())
+        self.assertIsNone(runner.poll())
 
     def test_mac_clear_never_signals_the_caller_or_its_ancestors(self) -> None:
         _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))

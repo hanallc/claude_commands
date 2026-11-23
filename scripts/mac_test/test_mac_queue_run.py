@@ -202,6 +202,55 @@ class QueueRunTests(unittest.TestCase):
             self.assertTrue(block.is_file())
             self.assertTrue((root / "remote").is_file())
 
+    def test_install_never_streams_under_another_sessions_block(self) -> None:
+        # Seen 2026-11-22 16:51 PST: an install waiter started after the Mac block of another session.
+        expected = {True: (78, "Mac blocked held by fixture-holder: fixture work needs the Mac"),
+                    False: (0, "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac")}
+        for no_wait, (status, line) in expected.items():
+            with self.subTest(no_wait=no_wait), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                # The block arrives after the waiter is placed, so only the check before the stream can stop it.
+                self.write_block(root / "block-on-placement.json")
+
+                def release_block() -> None:
+                    self.assertFalse((root / "remote").exists())
+                    block.unlink()
+
+                stream = mac_queue_run.stream_remote
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_block) as wait,
+                      mock.patch.object(mac_queue_run, "stream_remote", side_effect=stream) as streamed,
+                      redirect_stdout(io.StringIO()) as output):
+                    words = ["--no-wait"] if no_wait else []
+                    self.assertEqual(mac_queue_run.main([*words, *self.command(root, "install")[3:]]), status)
+                self.assertEqual(output.getvalue().splitlines()[0], line)
+                self.assertEqual([event[0] for event in self.events(root)][:2], ["place-step", "cancel-placement"])
+                if no_wait:
+                    streamed.assert_not_called()
+                    wait.assert_not_called()
+                    self.assertFalse((root / "remote").exists())
+                else:
+                    wait.assert_called_once()
+                    streamed.assert_called_once()
+
+    def test_install_streams_under_the_block_of_its_own_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "CLAUDE_CODE_SESSION_ID": "holder-session"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(root / "block-on-placement.json")
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=AssertionError("no wait")),
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "install")[3:]]), 0)
+            self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+            self.assertTrue((root / "remote").is_file())
+
     def test_run_uses_the_block_holding_units_session_for_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -226,6 +275,34 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(placed[placed.index("--session-id") + 1], holder)
             self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
             self.assertTrue(block.is_file())
+
+    def test_install_resolves_the_block_owner_from_the_workers_unit(self) -> None:
+        # A Codex worker's thread id is not the block session; its unit's session is.
+        holder = fixture_runtime_id("install-holder")
+        other = fixture_runtime_id("install-other")
+        for unit_session, status in ((holder, 0), (other, 78)):
+            with self.subTest(unit_session=unit_session), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                named_run = root / "unit-run"
+                environment = {**queue_fixture(root), "UNIT_RUN_DIR": str(named_run), "CODEX_THREAD_ID": "worker-thread"}
+                director = staff.StaffId(fixture_runtime_id("install-director"))
+                parent = staff.StaffRow(director, "showrunner", "fixture-director", staff.StaffRoot(),
+                                        current_session=director)
+                row = staff.StaffRow(staff.StaffId(fixture_runtime_id("install-unit")), "unit", "fixture-unit",
+                                     staff.ReportsTo(director), current_session=staff.StaffId(unit_session),
+                                     run=staff.OpenRun(named_run), unit_type=staff.UnitDetails("direct"))
+                _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot((parent, row)).encode())
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                self.write_block(block, session=holder)
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=AssertionError("no wait")),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "install")[3:]]), status)
+                self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"] if status == 0 else
+                                 ["Mac blocked held by fixture-holder: fixture work needs the Mac"])
+                self.assertEqual((root / "remote").is_file(), status == 0)
+                self.assertTrue(block.is_file())
 
     def test_block_during_recovery_prevents_prepare_and_removes_retry_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

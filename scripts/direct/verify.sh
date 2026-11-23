@@ -2438,7 +2438,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
-    release_wait_claim
+    release_wait_claim "$MAC_RESULT_FILE"
 
     if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
         "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
@@ -2464,6 +2464,18 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         rm -f "$MAC_RESULT_FILE"
     fi
     MAC_RESULT_FILE=""
+    # A clear ended the run: it is refused, and it does not go back to its lines.
+    if [[ "$result_usable" == 1 && "$result_word" == refused ]]; then
+        LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=blocked
+        BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
+        if [[ "$selected_is_mac" == 1 ]]; then BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=blocked; fi
+        exec 9>&-
+        rm -f "$MAC_LOG_FILE"
+        MAC_LOG_FILE=""
+        printf 'verify.sh: %s\n' "$result_reason" >&2
+        note_event failed "$SECONDS" 0 "" 0 2
+        exit 2
+    fi
 
     if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
@@ -2756,13 +2768,16 @@ target_for_settings() {
     printf '%s\n' "${STEP_ASSIGNED_TARGET:-mac}"
 }
 
+# Release this caller's wait claim, and settle the attempt of a runner that exited before its own report.
+# The optional argument is the runner's result file. A clear that ended the run writes its refused result there.
 release_wait_claim() {
     [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
     local claim_id="" episode="" attempt="" claim_session=""
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
         IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
         verify_helper "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
-            --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
+            --episode "$episode" --attempt "$attempt" --session "$claim_session" \
+            --assignment-file "${PLACEMENT_ASSIGNMENT_FILE:-}" --result-file "${1:-}" >/dev/null 2>&1 || true
     fi
     rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
 }

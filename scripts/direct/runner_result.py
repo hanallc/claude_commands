@@ -8,7 +8,7 @@ import sys
 from typing import Literal, cast, get_args
 
 
-ResultWord = Literal["passed", "failed", "lost", "declined", "prelaunch_failed", "hana_command_admission_refused"]
+ResultWord = Literal["passed", "failed", "lost", "declined", "refused", "prelaunch_failed", "hana_command_admission_refused"]
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,9 @@ def read_result(path: Path, status: int, selected_is_mac: bool) -> UsableRunnerR
     if word == "passed" and status != 0 or word == "failed" and status == 0:
         return UnusableRunnerResult()
     if word == "prelaunch_failed" and (selected_is_mac or status in (0, 75)):
+        return UnusableRunnerResult()
+    # A clear ended the run. The reason is the clear's row reason, and the caller stops with it.
+    if word == "refused" and not fields.get("reason"):
         return UnusableRunnerResult()
     if word == "hana_command_admission_refused" and (selected_is_mac or status != 75 or not fields.get("reason")):
         return UnusableRunnerResult()

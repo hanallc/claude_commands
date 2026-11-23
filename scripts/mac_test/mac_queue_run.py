@@ -330,8 +330,6 @@ class Arguments(argparse.Namespace):
 def blocking_run(
     args: Arguments, owner: OwningSession | NoOwningSession,
 ) -> claim_state.MacBlockState | mac_test.ClaimFinished:
-    if args.kind != "run":
-        return mac_test.NO_MAC_BLOCK
     paths = claim_state.state_paths()
     try:
         block = mac_test.blocking_claim_block(paths, owner)
@@ -356,7 +354,7 @@ def wait_to_retry() -> None:
 
 def run(args: Arguments) -> int:
     since = time.time()
-    owner = owning_session() if args.kind == "run" else NoOwningSession()
+    owner = owning_session()
     if isinstance(owner, NoOwningSession):
         session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         if session:

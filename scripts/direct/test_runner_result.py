@@ -54,6 +54,16 @@ class RunnerResultTests(unittest.TestCase):
                 self.write(text)
                 self.assertEqual(read_result(self.path, 75, True), expected)
 
+    def test_a_refused_result_needs_the_clear_reason(self) -> None:
+        reason = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        for prefix, selected_is_mac in (("mac=refused", True), ("outcome=refused\ntarget=mac-linux", False)):
+            with self.subTest(prefix=prefix):
+                self.write(f"{prefix}\nreason={reason}\nseconds=0.000000\n")
+                self.assertEqual(read_result(self.path, 143, selected_is_mac),
+                                 UsableRunnerResult("refused", reason=reason, seconds="0.000000"))
+                self.write(f"{prefix}\nreason=\nseconds=0.000000\n")
+                self.assertIsInstance(read_result(self.path, 143, selected_is_mac), UnusableRunnerResult)
+
     def test_invalid_text_is_unusable(self) -> None:
         self.write("invalid\n")
         self.assertIsInstance(read_result(self.path, 75, True), UnusableRunnerResult)

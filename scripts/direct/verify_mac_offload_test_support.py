@@ -754,8 +754,9 @@ if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
         fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
-    elif mode == "lost":
-        fixture_outcome = placement.AttemptDeclined("lost")
+    elif mode in ("lost", "refused"):
+        # A runner that a clear ended settles its own claim and reports the clear's reason.
+        fixture_outcome = placement.AttemptDeclined("lost" if mode == "lost" else reason)
         fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
 if mode in ("passed", "failed", "lost"):
     print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
@@ -826,6 +827,13 @@ def main() -> object:
             output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
         write_text_atomic(root / "local-wait-added", "added\n")
     status = real_targets()
+    # TEST_RUNNER_ENDED_BY: the run-end release finds a kept claim that a clear ended, and settle_ended_runner
+    # writes the refused result with the clear's reason to the runner's result file.
+    ended = os.environ.get("TEST_RUNNER_ENDED_BY", "")
+    if (command == "release-wait" and ended and "--result-file" in sys.argv
+            and sys.argv[sys.argv.index("--result-file") + 1]):
+        Path(sys.argv[sys.argv.index("--result-file") + 1]).write_text(
+            "mac=refused\nreason=" + ended + "\nseconds=0.000000\n", encoding="utf-8")
     event = {"command": command, "status": status, "at": time.monotonic(),
              "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
     with (root / "routing-events.jsonl").open("a") as output:

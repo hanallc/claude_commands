@@ -699,11 +699,17 @@ def end_claim_runs(
 ) -> tuple[str, ...]:
     """End each run whose live claim is on the machine. The run ends as refused; it does not go back to its lines.
 
-    The run's stderr gets the reason before the stop. The caller and its ancestors never get a signal.
+    The claim and the run's stderr get the reason before the stop. The caller and its ancestors never get a signal.
+    The caller that waited for the run settles its attempt with that reason (mac_test.settle_stopped_runner).
+    A wait reservation that no runner has adopted (its holder is verify.sh) is a waiter: it stays in its lines
+    (contract section 4), and the block refuses its adoption.
     """
+    from scripts.mac_test import mac_test
+
     reason = machine_hold.refused_reason(hold)
+    paths = machine_state_paths(machine)
     try:
-        claims = claim_state.read_claims(machine_state_paths(machine))
+        claims = claim_state.read_claims(paths)
     except (OSError, ValueError) as error:
         return (f"{machine}: claims unreadable; the clear ended no run there: {error}",)
     caller = build_hold.caller_processes(proc_root, os.getpid())
@@ -715,6 +721,15 @@ def end_claim_runs(
             continue
         identity = build_hold.ProcessIdentity(pid, start)
         if identity in caller or build_hold.process_start_time(pid, proc_root) != start:
+            continue
+        if "remote_host" not in claim.record and verify_arguments(build_hold.process_argv(proc_root, pid)):
+            continue
+        try:
+            marked = mac_test.mark_claim_ended(paths, claim, reason)
+        except (OSError, ValueError) as error:
+            lines.append(f"{machine}: pid {pid} ({what}) could not be ended: its claim is unreadable: {error}")
+            continue
+        if not marked:
             continue
         write_run_line(proc_root, pid, reason + "\n")
         try:
@@ -951,11 +966,18 @@ def verify_arguments(argv: tuple[str, ...]) -> tuple[str, ...]:
     if program == "verify.sh":
         return argv
     if program in SHELLS:
+        option_value = False
         for index, argument in enumerate(argv[1:], 1):
+            if option_value:
+                option_value = False
+                continue
             if argument in {"-c", "-lc", "-ic"}:
                 break
-            if not argument.startswith("-"):
-                return argv[index:] if Path(argument).name == "verify.sh" else ()
+            if argument.startswith(("-", "+")):
+                # A short option group that ends in o or O (-o pipefail, -eo pipefail, -O extglob) takes the next argument.
+                option_value = not argument.startswith("--") and argument[-1] in "oO"
+                continue
+            return argv[index:] if Path(argument).name == "verify.sh" else ()
     return ()
 
 

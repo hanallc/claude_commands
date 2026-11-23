@@ -270,7 +270,7 @@ def read_mac_words(path: Path) -> MacWords | None:
 def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
     """What a copy that ended without the watcher stopping it means for the call."""
     if status == STOPPED_BY_TERM:
-        # Only a new test's claim stops a copy this watcher did not stop.
+        # A new test's claim or a Mac clear stopped a copy that this watcher did not stop.
         return CopyEnded("gave_way", final=False)
     if words is None or (words.mac == "passed" and status != 0) or (words.mac == "failed" and status == 0):
         return CopyEnded("lost", final=False)
@@ -315,11 +315,7 @@ def stop_copy(copy: RunningCopy, request: WatchRequest, repository: eligibility.
 
 
 def release_stopped_copy(copy: RunningCopy, request: WatchRequest, repository: eligibility.KnownRepository) -> None:
-    """End the remote work of a stopped copy, release the claim it kept, and settle its assignment.
-
-    The copy keeps its claim when TERM comes before its remote start settles. Its process
-    has exited, so no later claim of that copy can come to take the claim over.
-    """
+    """End the remote work of a stopped copy, release the claim it kept, and settle its assignment."""
     from scripts.build_queue import admission_client
     from scripts.mac_test import mac_test
 
@@ -330,29 +326,17 @@ def release_stopped_copy(copy: RunningCopy, request: WatchRequest, repository: e
         return
     if not isinstance(reply, wire.Assignment):
         return
-    assignment = reply.assignment
-    identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-                                         assignment.episode, assignment.attempt)
     try:
-        released = mac_test.release_exact_claims(claim_state.state_paths(), copy.process.pid, identity,
-                                                 str(request.settings), remote_work=mac_test.EndStoppedWork(repository))
-    except (OSError, ValueError) as error:
-        print(f"copy_watch: the stopped copy keeps its Mac claim: {error}", file=sys.stderr)
-        return
-    if isinstance(released, mac_test.ClaimReleaseRefused):
-        print(f"copy_watch: the stopped copy keeps its Mac claim: {released.reason}", file=sys.stderr)
-        return
-    if released.count == 0:
-        return
-    destination = assignment.destination
-    reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
-                                                 identity.claim_id, identity.episode, identity.attempt)
-    try:
-        _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), assignment, reference,
-            execution_identity.ExecutionEvidenceUnavailable("the copy was stopped before its final status", time.time()),
-            placement.AttemptDeclined("lost"), placement.DispatchPathSettled()))
+        settled = mac_test.settle_stopped_runner(claim_state.state_paths(), copy.process.pid, reply.assignment,
+                                                 str(request.settings), repository)
     except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
-        print(f"copy_watch: cannot report the stopped copy: {error}", file=sys.stderr)
+        print(f"copy_watch: cannot settle the stopped copy: {error}", file=sys.stderr)
+        return
+    if isinstance(settled, mac_test.StoppedRunKept):
+        print(f"copy_watch: the stopped copy keeps its Mac claim: {settled.reason}", file=sys.stderr)
+    elif isinstance(settled, mac_test.StoppedRunUnreported):
+        print(f"copy_watch: the stopped copy released its Mac claim, and the report of the attempt end failed: {settled.failure}",
+              file=sys.stderr)
 
 
 def result_text(report: WatchReport) -> str:
@@ -497,6 +481,8 @@ class Watch:
             return None
         self.copy_seconds += time.monotonic() - copy.started
         self.copy = NO_COPY
+        # A copy that a signal ended before its remote start settled keeps its claim. When no claim is left, this does nothing.
+        release_stopped_copy(copy, self.request, self.repository)
         words = read_mac_words(copy.result)
         result = copy_result(words, status)
         if words is not None and words.reason == "source_changed" and isinstance(self.placement, QueuedCopyPlacement):
