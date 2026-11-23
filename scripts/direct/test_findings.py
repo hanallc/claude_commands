@@ -276,6 +276,41 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
 
+    def closed_phase_beside_an_open_one(self) -> str:
+        """Phase 62 started and closed with no ledger; phase 63 is open and owns the live ledger."""
+        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.history_file.write_text(json.dumps(
+            {"event_type": "phase_started", "phase_id": "62", "phase_instance_id": "phase-sixty-two"}) + "\n")
+        self.write_progress_state("phase-sixty-three", "63")
+        return self.open_finding("blocker", "sixty-three's finding")
+
+    def test_a_late_finding_goes_into_a_closed_phase_and_its_trial_ledger(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        live = self.ledger()
+        late = ("open", "--phase", "62", "--caught-by", "main", "--severity")
+        self.assertEqual(self.run_command(*late, "nit", "--title", "late nit", at=2_000), "F001")
+        self.assertEqual(self.run_command(*late, "minor", "--title", "late fix", "--accepted", at=2_010), "F002")
+        self.assertEqual(self.ledger(), live)
+        ledger = findings.read_phase_ledger(self.session_dir, "phase-sixty-two", "62", 2_020)
+        rows = cast(dict[str, dict[str, object]], ledger["findings"])
+        self.assertEqual([(row["title"], row["state"]) for row in rows.values()],
+                         [("late nit", "open"), ("late fix", "accepted")])
+        event = self.events()[-1]
+        self.assertEqual((event["event_type"], event["phase_instance_id"], event["state"]),
+                         ("finding_opened", "phase-sixty-two", "accepted"))
+
+    def test_accepted_is_refused_outside_a_closed_phase(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        for phase in (("--phase", "63"), ()):
+            with self.subTest(phase=phase):
+                self.assert_refused("--accepted records a late finding in a closed phase", "open", *phase,
+                                    "--severity", "nit", "--title", "fixed", "--caught-by", "main", "--accepted")
+
+    def test_a_finding_for_a_phase_the_run_never_started_is_refused(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        self.assert_refused("Phase 14 is not open (open phases: 63)", "open", "--phase", "14",
+                            "--severity", "nit", "--title", "typo", "--caught-by", "main")
+
     def test_an_unnamed_finding_ignores_the_last_finished_phase(self) -> None:
         state: dict[str, object] = {
             "history_file": str(self.history_file), "open_phases": [],

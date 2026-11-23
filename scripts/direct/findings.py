@@ -213,8 +213,11 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     live = _state_path(session_dir)
     instance_id = _string(state.get("phase_instance_id"))
     displaced = _ledger_instance(live) if live.exists() else ""
-    newest = _newest_open_instance(session_dir)
-    if live.exists() and displaced != instance_id and instance_id and newest and newest != instance_id:
+    open_instances = _open_instances(session_dir)
+    newest = open_instances[-1] if open_instances else ""
+    # A closed phase never takes the live file from another phase.
+    closed = bool(instance_id) and instance_id not in open_instances and displaced != instance_id
+    if closed or (live.exists() and displaced != instance_id and instance_id and newest and newest != instance_id):
         target = _parked_path(session_dir, instance_id)
     else:
         target = live
@@ -240,10 +243,25 @@ def _progress_state(session_dir: Path) -> dict[str, object] | None:
         return None
 
 
-def _newest_open_instance(session_dir: Path) -> str:
+def _open_instances(session_dir: Path) -> list[str]:
     progress = _progress_state(session_dir)
     phases = recorder_state.open_phases(progress) if progress is not None else []
-    return _string(phases[-1].get("instance_id")) if phases else ""
+    return [_string(phase.get("instance_id")) for phase in phases]
+
+
+def _started_instance(session_dir: Path, phase_id: str) -> str:
+    """Return the newest instance the run started for the named phase."""
+    history_file = _history_file(session_dir)
+    try:
+        lines = history_file.read_text(encoding="utf-8").splitlines() if history_file is not None else []
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        event = _json_object(line)
+        if (event is not None and _string(event.get("event_type")) == "phase_started"
+                and _string(event.get("phase_id")) == phase_id):
+            return _string(event.get("phase_instance_id"))
+    return ""
 
 
 def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
@@ -278,7 +296,7 @@ def _phase_identity(
             if _string(phase.get("id")) == phase_id:
                 return _string(phase.get("instance_id")), phase_id
         if closed_phase_ok:
-            instance_id = _newest_ledger_instance(session_dir, phase_id)
+            instance_id = _newest_ledger_instance(session_dir, phase_id) or _started_instance(session_dir, phase_id)
             if instance_id:
                 return instance_id, phase_id
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
@@ -726,9 +744,15 @@ def _advisory_reason(
 def _open(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    phase = _arg_string(args, "phase")
+    state = _read_state(session_dir, now, phase, closed_phase_ok=bool(phase))
     severity = _arg_string(args, "severity")
     held = bool(getattr(args, "held_for_decision", False))
+    accepted = bool(getattr(args, "accepted", False))
+    if accepted and (not phase or _string(state.get("phase_instance_id")) in _open_instances(session_dir)):
+        raise SystemExit("--accepted records a late finding in a closed phase; an open phase accepts a finding after review")
+    if accepted and held:
+        raise SystemExit("--accepted and --held-for-decision exclude each other")
     lenses = _arg_string(args, "lens").split(",")
     if held and "simplify" not in lenses:
         raise SystemExit("--held-for-decision requires --lens simplify")
@@ -745,7 +769,7 @@ def _open(args: argparse.Namespace) -> None:
         "detail": _arg_string(args, "detail"),
         "caught_by": _caught_by(args),
         "lens": _arg_string(args, "lens"),
-        "state": STATE_HELD if held else STATE_OPEN,
+        "state": STATE_HELD if held else STATE_ACCEPTED if accepted else STATE_OPEN,
         "opened_at": now,
         "opened_round": len(_rounds(state)),
         "fix_attempts": 0,
@@ -1275,7 +1299,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     opened = subparsers.add_parser("open", help="record a confirmed finding and print its id")
     _ = opened.add_argument("--session-dir", required=True)
-    _ = opened.add_argument("--phase", default="", help=PHASE_HELP)
+    _ = opened.add_argument("--phase", default="", help=PHASE_HELP + "; a closed phase takes a late finding")
     _ = opened.add_argument("--severity", choices=SEVERITIES, required=True)
     _ = opened.add_argument("--title", required=True)
     _ = opened.add_argument("--file", default="")
@@ -1291,6 +1315,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # review or the main review alone.
     _ = opened.add_argument("--lens", type=_lens_list, default="")
     _ = opened.add_argument("--held-for-decision", action="store_true")
+    _ = opened.add_argument("--accepted", action="store_true",
+                            help="record a late finding in a closed phase as already fixed")
     opened.set_defaults(handler=_open)
 
     decision = subparsers.add_parser("decision", help="record the user's answer to a held or decided finding")
