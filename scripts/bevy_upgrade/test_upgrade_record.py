@@ -22,6 +22,7 @@ from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_staff_file,
 )
 from scripts.lib import test_hang_guard
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 NOW = datetime(2026, 10, 12, 19, 8, 41, tzinfo=timezone.utc)
 LATER = datetime(2026, 10, 13, 1, 2, 3, tzinfo=timezone.utc)
@@ -66,7 +67,7 @@ class RecordTests(unittest.TestCase):
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(
             os.environ, {"BEVY_UPGRADE_STATE_DIR": str(self.root / "state"),
-                         "HERDR_BIN": "/nonexistent/herdr", "HOME": str(self.root)},
+                         "HERDR_BIN": MISSING_HERDR_BIN, "HOME": str(self.root)},
         )))
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

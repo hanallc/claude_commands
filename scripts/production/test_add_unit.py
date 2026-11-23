@@ -54,6 +54,7 @@ def setUpModule() -> None:
 
 from scripts.production import staff, unit_config
 from scripts.production.production_doc import Production, read_production
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 class NativeClaudeUnitTests(StaffTestCase):
     @override
@@ -87,7 +88,7 @@ class NativeClaudeUnitTests(StaffTestCase):
     def test_pending_unit_with_empty_composer_reports_manual_recovery(self) -> None:
         request, marked, pending, _native, _text = self.pending_opening_fixture()
         saved = pending.read_bytes()
-        with (patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+        with (patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}),
               patch.object(add_unit, "ensure_staff_unit"),
               patch.object(herdr.Herdr, "panes", return_value=[]),
               patch.object(herdr.Herdr, "run", return_value="────────\n❯ \n────────"),
@@ -110,7 +111,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         request, marked, pending, native, text = self.pending_opening_fixture()
         place = marked.unit.place
         screen = f"────────\n❯ {text}\n────────"
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             client = herdr.Herdr("agents")
 
         def enter(_pane: str, *_keys: str) -> None:
@@ -145,7 +146,7 @@ class NativeClaudeUnitTests(StaffTestCase):
         request, marked, pending, native, text = self.pending_opening_fixture()
         place = marked.unit.place
         transcript = herdr.SessionTranscript(self.root, native)
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             client = herdr.Herdr(place.session)
         screen = "────────\n❯ \n────────"
         now = time.monotonic()
@@ -226,7 +227,7 @@ class NativeClaudeUnitTests(StaffTestCase):
             ("fixture", "claude-fable-saved-fixture", "claude-fable-saved-fixture"),
         ):
             with (self.subTest(director=director_model, saved=saved_model),
-                  patch.dict(os.environ, {**caller, "HERDR_BIN": "/nonexistent/herdr"}),
+                  patch.dict(os.environ, {**caller, "HERDR_BIN": MISSING_HERDR_BIN}),
                   patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="w1:p1"),
                   patch.object(herdr.Herdr, "run_in_pane"),
                   patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
