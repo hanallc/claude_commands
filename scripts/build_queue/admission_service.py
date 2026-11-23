@@ -3879,14 +3879,17 @@ class AdmissionServer:
         paths = claim_state.state_paths(destination.target)
         with claim_state.locked(paths.lock):
             held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
-        # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
-        # or each pass makes a new attempt that the Mac refuses as busy.
+        # Routing keeps a busy or blocked Mac eligible so a step can wait for it. Placement must
+        # wait too, or each pass makes a new attempt that the Mac refuses. A Mac run skips the
+        # repository policy, so this check is the only one that sees a block from another session.
+        # An unreadable block or claim record also waits: it can hide a block.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration,
-                                      mac_scope=destination.scope) == "busy"):
-            eligibility = placement.TemporaryExclusion("busy")
+                and target.platform == "macos"):
+            mac_answer = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                           session=key.session, configuration=configuration,
+                                           mac_scope=destination.scope)
+            if mac_answer in ("blocked", "busy", "state"):
+                eligibility = placement.TemporaryExclusion(mac_answer)
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
