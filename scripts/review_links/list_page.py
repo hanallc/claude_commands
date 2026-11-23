@@ -466,9 +466,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
                              ("next_step", item.next_step), ("done_when", item.done_when)))
     return ('<div class="list-panel"><div><div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
-            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
-            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
-            + '<ol class="list-log">' + log + '</ol></div></section></div>')
+            + '</div>' + record_table.log_panel(log_id, log) + '</div>')
 
 
 class LinkedReviewRead(StrEnum):
@@ -1048,7 +1046,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
-    log_max_height = settings.whole("list_log_max_height_rem")
+    log_max_height = record_table.log_max_height_rem(settings)
     counts = ''
     if include_counts:
         if defer_counts:
@@ -1170,10 +1168,6 @@ background:var(--ink-2);border-radius:50%}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
 .list-panel [data-waiting-note]{margin-top:16px}
-[data-record-inline-view] .record-dialog-status{border-inline-start:3px solid var(--accent);text-align:left}
-[data-record-inline-view] .record-dialog-status:not(:has(> :not([hidden]))){display:none}
-[data-record-inline-view] [data-record-error]{padding-inline:24px;text-align:left}
-[data-record-inline-view] [data-record-link-notice]{padding:0;border:0}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 .list-eta{display:block;position:relative;min-width:0}
@@ -1236,26 +1230,6 @@ const unparkMessages={
  expired:'Parking time already expired',
  no_active_parking:'No active parking time to clear',
 };
-/** @typedef {{key: string, index: string, offset: number}} LogPosition */
-const openLog=()=>recordDetails(tableView.openItem)?.querySelector('.list-log-scroll');
-/** @type {LogPosition | null} */
-let heldLog=null;
-// Moving or replacing the open row resets its log scroll, so hold the first visible entry for this task.
-function holdLog(){
- const log=openLog();
- if(heldLog || !log?.clientHeight || !log.scrollTop) return;
- const top=log.getBoundingClientRect().top;
- const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
- if(!entry) return;
- heldLog={key:tableView.openItem.dataset.key,index:entry.dataset.logIndex,offset:entry.getBoundingClientRect().top-top};
- queueMicrotask(()=>{heldLog=null;});
-}
-function restoreLog(){
- const log=openLog();
- if(!heldLog || tableView.openItem?.dataset.key!==heldLog.key) return;
- const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
- if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
-}
 function restoreEvidenceDetails(fresh){
  const opened=new Map();
  for(const details of content.querySelectorAll('.log-evidence[open]')){
@@ -1313,12 +1287,10 @@ function installListDetail(item){
 function renderListDetail(revision,text,{retainLinks=false}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
-  if(row===tableView.openItem) holdLog();
   row.dataset.detailRevision=revision;
   detail.innerHTML=text;
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
   installListDetail(row);
-  restoreLog();
  };
 }
 function installSavedListDetail(request,revision,text,options){
@@ -1356,8 +1328,6 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- beforeApply:holdLog,
- applied:restoreLog,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -1879,7 +1849,7 @@ function applyListSnapshot(fresh){
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
- holdLog();
+ tableView.holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter && !nextFooter.childNodes.length)
   nextFooter.replaceChildren(...footer.childNodes);
@@ -1894,7 +1864,7 @@ function applyListSnapshot(fresh){
  bindListControls();tableView.replace();
  const openItem=tableView.openItem;
  if(links && openItem?.dataset.key===key) presentReviewLinks(openItem,links);
- restoreLog();
+ tableView.restoreLog();
  if(field?.isConnected) field.focus({preventScroll:true});
  else if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
