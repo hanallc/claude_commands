@@ -3611,24 +3611,20 @@ class PaneRunDeliveryTests(unittest.TestCase):
         agent = test_worker.DispatchAgent(self.fixture)
         done_before_reap = ("done-before-reap", "done-before-reap-no-link", "done-before-reap-unavailable-link",
                             "done-before-reap-saved-finish", "native_done_before_reap")
+        result_after_done = ("result-after-done", "result-after-done-fallback")
         for case in ("earlier-pass", "current-pass", "current-done", "failed-with-done-message",
-                     "result-after-done", *done_before_reap):
+                     *result_after_done, *done_before_reap):
             with self.subTest(case=case):
                 self.inputs.clear()
                 row = self.fixture.worker(case, family="codex")
                 pane = "w1:p1"
                 self.fixture.world.add(row, pane, family="codex")
+                if case in result_after_done:
+                    self.check_result_after_done(agent, row, pane, fallback=case == "result-after-done-fallback")
+                    continue
                 original, reply = self.begin_pane_pass(row)
-                if case == "result-after-done":
-                    stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
-                    stage = replace(stage, completion_id=worker_panes.stage_two_completion_id(original))
-                    progress_history.save_dispatch_delivery(self.run_dir, original, stage)
-                    agent.append(pane, "user", stage.line)
-                    agent.append(pane, "assistant", f"DONE {stage.completion_id}")
                 record = self.record(row, case)
                 record.update(pid=DEAD_PID, exit_code=0)
-                if case == "result-after-done":
-                    record["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
                 if case == "done-before-reap-saved-finish":
                     # A saved pass link remains valid after a clock adjustment.
                     record["started_at"] = 0
@@ -3650,12 +3646,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     current, reply = self.begin_pane_pass(row)
                     self.assertNotEqual(current, original)
                 delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
-                if case != "result-after-done":
-                    agent.append(pane, "user", delivery.line)
-                done = f"DONE {delivery.completion_id}"
-                final = done
+                agent.append(pane, "user", delivery.line)
+                done = f"DONE {current}"
                 self.fixture.world.locations[pane]["agent_status"] = "idle"
-                if case not in ("current-pass", "result-after-done"):
+                if case != "current-pass":
                     supervisor = (patch.object(detached_run_process, "supervises", return_value=True)
                                   if case in done_before_reap else contextlib.nullcontext())
                     with supervisor:
@@ -3720,29 +3714,18 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 else:
                     self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
                     self.assertEqual(len(self.inputs), 1)
-                    text = self.inputs[0][1]
-                    self.assertIn(f"Detached run: {record['run_id']}", text)
+                    self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
                     self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
-                    if case in ("result-after-done", "done-before-reap-no-link"):
-                        result_body = text.removesuffix("\n</system-reminder>")
+                    if case == "done-before-reap-no-link":
+                        result_body = self.inputs[0][1].removesuffix("\n</system-reminder>")
                         self.assertEqual(result_body.splitlines()[-1], f"End your final reply with this line alone: {done}")
                     else:
-                        self.assertNotIn("End your final reply with this line alone:", text)
-                    if case == "result-after-done":
-                        ordinary = "I read the run result."
-                        agent.append(pane, "assistant", ordinary)
-                        self.fixture.world.locations[pane]["agent_status"] = "done"
-                        self.assertEqual(self.native_stop(row, ordinary), 0)
-                        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
-                        final = f"The verification passed.\n{done}"
-                    agent.append(pane, "assistant", final)
+                        self.assertNotIn("End your final reply with this line alone:", self.inputs[0][1])
+                    agent.append(pane, "assistant", done)
                     self.fixture.world.locations[pane]["agent_status"] = "done"
-                    if case == "result-after-done":
-                        self.assertEqual(self.native_stop(row, final), 0)
-                    else:
-                        event = turn_end.WorkerEvent(str(row.current_session), reply=final)
-                        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.DONE)
-                self.assertEqual(reply.read_text().rstrip(), final)
+                    event = turn_end.WorkerEvent(str(row.current_session), reply=done)
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.DONE)
+                self.assertEqual(reply.read_text().rstrip(), done)
                 self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
 
         for order in ("delayed_stop_after_unlinked_result", "same_reply_with_later_time"):
@@ -3765,6 +3748,51 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.check_acknowledgement_reads_evidence_once(
                     agent, fallback=case == "acknowledge_prompt_fallback_once",
                     check_record_retention=case == "acknowledge_releases_unrelated_records")
+
+    def check_result_after_done(
+            self, agent: test_worker.DispatchAgent, row: staff.StaffRow, pane: str, *, fallback: bool) -> None:
+        dispatch, reply = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        completion_id = worker_panes.stage_two_completion_id(dispatch)
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch, replace(stage, completion_id=completion_id))
+        done = f"DONE {completion_id}"
+        instruction = f"End your final reply with this line alone: {done}"
+        prompt = (f"Read the unchanged prompt file {json.dumps(stage.line)}. {instruction}\n"
+                  "A reply that waits on a detached run is not final.") if fallback else stage.line
+        agent.append(pane, "user", prompt)
+        agent.append(pane, "assistant", done)
+        record = self.record(row, row.name)
+        record.update(pid=DEAD_PID, exit_code=0, pane_dispatch_id=dispatch,
+                      finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        with patch.object(detached_run_process, "supervises", return_value=False):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+        self.assertEqual(len(self.inputs), 1)
+        text = self.inputs[0][1]
+        self.assertIn(f"Detached run: {record['run_id']}", text)
+        result_body = text.removesuffix("\n</system-reminder>")
+        self.assertEqual(result_body.splitlines()[-1], instruction)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+
+        ordinary = "I read the run result."
+        agent.append(pane, "assistant", ordinary)
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+        if fallback:
+            active = progress_history.active_dispatch(row.id, self.run_dir)
+            assert isinstance(active, progress_history.ActiveDispatch)
+            self.assertIsInstance(worker.resume_receipt(row, active), worker.DispatchAwaitingReply)
+        self.assertEqual(self.native_stop(row, ordinary), 0)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+
+        final = f"The verification passed.\n{done}"
+        agent.append(pane, "assistant", final)
+        self.assertEqual(self.native_stop(row, final), 0)
+        self.assertEqual(reply.read_text().rstrip(), final)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
 
     def check_stop_after_unlinked_result(self, agent: test_worker.DispatchAgent, *, repeat_reply: bool) -> None:
         row = self.fixture.worker("same-reply" if repeat_reply else "delayed-stop", family="codex")

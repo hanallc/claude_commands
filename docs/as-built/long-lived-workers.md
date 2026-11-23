@@ -189,6 +189,7 @@ The selected occurrence covers explicit result receipts that precede it.
 The transcript timestamp can prove additional run coverage.
 Acknowledgement selects the evidence once for all pending results.
 The exact prompt and pass marker checks use separate receipt states and consume the same transcript stream.
+Both checks identify a detached run delivery by its first line before they check for a dispatch prompt.
 The parser discards each decoded record after both states read it.
 The evidence file preserves outstanding results when the transcript becomes unavailable.
 A later reply updates an unfinished completion without repeating its actions or notice.
