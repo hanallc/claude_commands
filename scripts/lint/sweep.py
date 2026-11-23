@@ -168,8 +168,8 @@ class CargoOutputIndex:
     known_trees: dict[str, list[str]] = field(default_factory=dict)
 
     @cached_property
-    def linked_roots(self) -> dict[str, tuple[str, ...]]:
-        """Connected output roots, shared by all lookups in this index."""
+    def connected_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with every root that a chain of saved mappings connects to it."""
         connected: dict[str, set[str]] = {}
         for mapping in self.workspaces:
             target, build = str(mapping.target_directory), str(mapping.build_directory)
@@ -178,8 +178,23 @@ class CargoOutputIndex:
                 connected[root] = linked
         return {root: tuple(sorted(linked)) for root, linked in connected.items()}
 
-    def roots_for(self, root: str) -> tuple[str, ...]:
-        return tuple(path for path in self.linked_roots.get(root, (root,)) if os.path.isdir(path))
+    @cached_property
+    def pair_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with the target and build folders of the saved mappings that name it."""
+        pairs: dict[str, set[str]] = {}
+        for mapping in self.workspaces:
+            pair = {str(mapping.target_directory), str(mapping.build_directory)}
+            for root in pair:
+                pairs.setdefault(root, set()).update(pair)
+        return {root: tuple(sorted(pair)) for root, pair in pairs.items()}
+
+    def connected_roots_for(self, root: str) -> tuple[str, ...]:
+        """The closure of root's mappings, for scan clusters and order. Busy state never uses it."""
+        return tuple(path for path in self.connected_roots.get(root, (root,)) if os.path.isdir(path))
+
+    def pair_roots_for(self, root: str) -> tuple[str, ...]:
+        """One hop: the roots of root's own mappings. Busy state spreads this far only."""
+        return tuple(path for path in self.pair_roots.get(root, (root,)) if os.path.isdir(path))
 
     @cached_property
     def output_owners(self) -> dict[Path, tuple[int, ...]]:
@@ -200,6 +215,17 @@ class CargoOutputIndex:
 
 
 OUTPUT_ROOTS: ContextVar[CargoOutputIndex] = ContextVar("cargo_output_roots", default=CargoOutputIndex())
+
+
+def spread_over_pairs[Use](found: Mapping[str, Use], roots: Collection[str]) -> dict[str, Use]:
+    """A use of one output root also holds the other roots of its own mappings, in roots.
+
+    A root keeps its own use. The spread is one hop; a held root never spreads again.
+    """
+    pairs = OUTPUT_ROOTS.get().pair_roots_for
+    spread = {paired: use for root, use in found.items() for paired in pairs(root) if paired in roots}
+    spread.update(found)
+    return spread
 
 
 @dataclass(frozen=True)
@@ -2141,7 +2167,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         whole_targets = [whole for whole in scan.whole_targets
                          if cause == "floor take" and whole.target == target]
         take = TrimTake(target, cause, len(groups) + len(whole_targets),
-                        output_roots=OUTPUT_ROOTS.get().roots_for(target))
+                        output_roots=OUTPUT_ROOTS.get().pair_roots_for(target))
         recovered = True
         if path.exists():
             unfinished = load_trim_for_recovery(path)
@@ -2707,12 +2733,12 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
             scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
 
-    paired_roots = output_index.roots_for
+    connected_roots = output_index.connected_roots_for
     clusters: list[tuple[str, ...]] = []
     assigned: set[str] = set()
     for root in roots:
         if root not in assigned:
-            cluster = tuple(path for path in paired_roots(root) if path in roots)
+            cluster = tuple(path for path in connected_roots(root) if path in roots)
             clusters.append(cluster)
             assigned.update(cluster)
     if not clusters:
@@ -2956,8 +2982,12 @@ def shrink_floor(
 *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     policy: MacFloor | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    pair_held: Collection[str] = (),
 ) -> tuple[int, int, list[tuple[FloorTake, int]]]:
-    """Lock one target at a time to verify the proposed entries."""
+    """Lock one target at a time to verify the proposed entries.
+
+    pair_held names the busy roots that are held only because a pair root is in use; they hold no other root.
+    """
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     orphan_batches: dict[str, list[FloorTake]] = {}
@@ -2975,9 +3005,10 @@ def shrink_floor(
         target_batches.items(),
         key=lambda batch: (max(target_last_use(root, [
             group for group in batch[1] if isinstance(group, Group)
-        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().roots_for(batch[0])), batch[0]),
+        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().connected_roots_for(batch[0])), batch[0]),
     )
     remaining = dict(scan.links)
+    held_only = set(pair_held)
     taken: list[tuple[FloorTake, int]] = []
     attempted: list[FloorTake] = []
     failures = 0
@@ -2986,8 +3017,8 @@ def shrink_floor(
     for root, candidates in batches:
         if left <= budget:
             break
-        paired_roots = OUTPUT_ROOTS.get().roots_for(root)
-        if any(paired in busy for paired in paired_roots):
+        paired_roots = OUTPUT_ROOTS.get().pair_roots_for(root)
+        if any(paired in busy and paired not in held_only for paired in paired_roots):
             continue
         current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings, proc=PROC_DIR)
                          if not isinstance(policy, MacFloor) else {})
@@ -3000,8 +3031,9 @@ def shrink_floor(
         current_holds = {path: use for path, use in current_holds.items() if path in paired_roots}
         current_uses = {path: use for path, use in current_uses.items() if path in paired_roots}
         if current_holds or current_uses:
-            busy.update(current_holds)
-            busy.update(current_uses)
+            found = spread_over_pairs({**current_holds, **current_uses}, scan.discovered_targets)
+            busy.update(found)
+            held_only.difference_update(found)
             continue
         with ExitStack() as guards:
             lock = scratch.judgment_lock
@@ -4377,7 +4409,7 @@ def _hold_floor(floor: int, dry_run: bool, *,
             if any(root.is_relative_to(ci) for root in pair for ci in ci_roots):
                 excluded_roots.update(pair)
                 for root in pair:
-                    excluded_roots.update(Path(paired) for paired in mappings.roots_for(str(root)))
+                    excluded_roots.update(Path(paired) for paired in mappings.connected_roots_for(str(root)))
         targets = [root for root in targets if not any(Path(root).is_relative_to(excluded)
                                                       for excluded in excluded_roots)]
         filesystems = filesystem_floors(floor, targets, lint_settings=lint_settings)
@@ -4649,6 +4681,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: set[str] = set()
     busy: dict[str, FloorProtection] = {}
+    pair_held: set[str] = set()
     detail = ""
     mirror_leases = ExitStack()
     try:
@@ -4689,9 +4722,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
-        paired_roots = OUTPUT_ROOTS.get().roots_for
         known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
-        targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
+        targets = (sorted({paired for root in filesystem.targets
+                           for paired in OUTPUT_ROOTS.get().connected_roots_for(root)})
                    if isinstance(filesystem, FilesystemFloor) else
                    target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
         all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
@@ -4711,14 +4744,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             for root in targets:
                 if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
                     uses[root] = LockHeld("remote mirror lease is busy")
-        for root in tuple(hold_targets):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    hold_targets[paired] = hold_targets[root]
-        for root in tuple(uses):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    uses[paired] = uses[root]
+        hold_targets = spread_over_pairs(hold_targets, targets)
+        uses = spread_over_pairs(uses, targets)
         locked_files = held_cargo_lock_files(lint_settings=lint_settings)
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
@@ -4780,15 +4807,17 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 continue
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
+        pair_roots = OUTPUT_ROOTS.get().pair_roots_for
+        in_use = dict(busy)
         for root in tuple(idle):
-            pair = paired_roots(root)
-            blocked_pair = next((paired for paired in pair if paired in busy), "")
+            blocked_pair = next((paired for paired in pair_roots(root) if paired in in_use), "")
             if blocked_pair:
-                busy[root] = busy[blocked_pair]
+                busy[root] = in_use[blocked_pair]
+                pair_held.add(root)
                 idle.remove(root)
         scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
-        grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
+        grouped_roots = {root: OUTPUT_ROOTS.get().connected_roots_for(root) for root in set(tree_targets.values())}
         for group in scan.groups:
             for root in grouped_roots[tree_targets[group.build_tree]]:
                 if root in target_groups:
@@ -4850,7 +4879,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     *unit_age(group, planned_at),
                 ),
                 planned_at, owners,
-             lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT)
+             lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT,
+             pair_held=pair_held)
         else:
             print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
                   + " nothing taken")
@@ -4934,8 +4964,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         try:
             if not dry_run:
                 held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
-                for root in tuple(held_targets):
-                    held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
+                for root in tuple(held_targets - pair_held):
+                    held_targets.update(OUTPUT_ROOTS.get().pair_roots_for(root))
                 notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets)),
                                              targets=target_search),
                                      lint_settings=lint_settings, detail=detail,
