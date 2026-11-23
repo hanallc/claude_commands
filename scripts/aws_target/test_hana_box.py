@@ -5,6 +5,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 import fcntl
 from io import StringIO
 import json
@@ -15,7 +16,7 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
+from scripts.aws_target import admin_secrets, aws_target, config as aws_config, deploy, hana_box, hana_placement, hana_placement_adapter, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
@@ -985,10 +986,16 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
 
-    def test_automatic_restart_is_counted_without_caller_while_disabled(self) -> None:
+    def test_box_that_may_run_is_observed_and_stopped_while_disabled(self) -> None:
         text_setting(self.workload_path, 'enabled', 'off')
         self.provider.state = 'running'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls, [])
+        record = self.record()
+        record['state'] = hana_box.Lifecycle.INTERRUPTED.value
+        _ = (self.state / 'hana/lifecycle.json').write_text(json.dumps(record))
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.provider.calls[0].action, hana_box.Action.OBSERVE)
         exposure = self.book.read_snapshot().hana_compute[-1]
         self.assertIsInstance(exposure.state, ledger.HanaExposureOpen)
         self.assertEqual(self.record()['claims'], [])
@@ -996,6 +1003,56 @@ class HanaBoxTests(CostFixture):
         _ = self.tick()
         _ = self.tick()
         self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+
+    def test_each_term_that_shows_a_box_may_run_still_gets_a_call_while_disabled(self) -> None:
+        self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
+        claims = self.record()['claims']
+        row = self.record()
+        row['claims'] = []
+        _ = self.controller.path.write_text(json.dumps(row))
+        text_setting(self.workload_path, 'enabled', 'off')
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls, [])
+        at_rest, book = self.controller.path.read_bytes(), self.book.path.read_bytes()
+        for term, action in (('claim', hana_box.Action.OBSERVE), ('stop duty', hana_box.Action.OBSERVE),
+                             ('open compute', hana_box.Action.OBSERVE), ('operation', hana_box.Action.STOP)):
+            with self.subTest(term=term):
+                _ = self.controller.path.write_bytes(at_rest)
+                _ = self.book.path.write_bytes(book)
+                hana_replacement_record.record_path(self.state).unlink(missing_ok=True)
+                self.provider.calls.clear()
+                row = self.record()
+                if term == 'claim':
+                    row['claims'] = claims
+                elif term == 'stop duty':
+                    hana_replacement_record.save(self.state, hana_replacement_record.ReplacementAttempt(
+                        'fixture-image', 'fixture-attachment', 'fixture-token', 1, 'fixture-digest'))
+                elif term == 'open compute':
+                    with self.book.transaction() as state:
+                        state.hana_compute.append(ledger.HanaComputeExposure(
+                            self.clock.now, self.clock.now + 600, 1, Decimal('0.1'), region='us-east-2'))
+                else:
+                    row['operation'] = {'action': action.value, 'token': 'operation-token', 'at': self.clock.now,
+                        'generation': 0, 'permit': None, 'expected_generation': 0, 'execution': ''}
+                _ = self.controller.path.write_text(json.dumps(row))
+                _ = self.tick()
+                self.assertEqual([call.action for call in self.provider.calls], [action])
+
+    def test_invalid_live_switch_gives_no_claim_and_no_start_over_a_committed_on(self) -> None:
+        for arguments in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid'),
+                          ('add', self.workload_path.name), ('commit', '-qm', 'Record Hana on')):
+            _ = subprocess.run(['git', '-C', str(self.root), *arguments], check=True)
+        text_setting(self.workload_path, 'enabled', 'of')
+        workload = conf.read(self.workload_path)
+        # A reader that recovers the committed value would see on.
+        with redirect_stderr(StringIO()):
+            self.assertTrue(workload.value('enabled', conf.on_off))
+        self.assertIsInstance(aws_config.aws_switch(workload), aws_config.AwsSwitchUnusable)
+        self.assertEqual(hana_placement_adapter.read_settings(workload), hana_placement.DisabledHanaRoute())
+        self.assertEqual(self.controller.request('execution-one'), hana_box.ClaimRefused('Hana is disabled'))
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
 
     def test_renewal_preserves_execution_and_uses_expected_generation(self) -> None:
         self.ready()
