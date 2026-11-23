@@ -94,7 +94,7 @@ Requests and cleanup continue when this logging setting is unusable.
 ### Build filesystem space
 
 The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
-The service measures available space at the configured `roots.slot_cargo` path once per pass.
+The service measures available space at the build root (`build_folders.conf` `roots.build`, `/build` on natedev) once per pass.
 If space is below the floor or the reading fails, new local steps wait in order.
 Running steps continue.
 Eligible remote steps can start on a remote target.
@@ -1761,8 +1761,7 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 The folder stays with its hold marked ended.
 
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
-The scratch root is `build_folders.conf` `roots.scratch`: `/build/claude/scratch` on natedev and `/tmp/claude/scratch` on the Mac.
-On natedev, cargo builds a scratch workspace in `/build/cargo/scratch/<folder>`.
+The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.

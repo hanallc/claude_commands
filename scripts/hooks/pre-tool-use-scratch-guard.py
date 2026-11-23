@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refuse a Bash command or file write that makes a new loose folder in ~, /tmp, $TMPDIR, /tmp/claude,
 ~/rust, ~/rust/scratch, the session root (/session on natedev) or the folder that holds the scratch and
-copies roots (/build/claude on natedev).
+copies roots (/tmp/claude).
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
