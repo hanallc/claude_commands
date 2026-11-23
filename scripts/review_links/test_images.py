@@ -1640,6 +1640,12 @@ class ImagePairTests(ImagesFixture):
         page = images.render(self.status).decode()
         self.assertEqual(page.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(page.count(page_frame.ZOOM_SCRIPT), 1)
+        # Hover or keyboard focus shows an arrow button's tip; a turned-off button shows none.
+        focus_tip = "[data-image-zoom-step]:not([disabled]):focus-visible [data-image-zoom-tip]{visibility:visible}"
+        hover_tip = ("@media (hover:hover){[data-image-zoom-step]:not([disabled]):hover [data-image-zoom-tip]"
+                     "{visibility:visible}}")
+        self.assertIn(focus_tip, page_frame.ZOOM_STYLE)
+        self.assertIn(hover_tip, page_frame.ZOOM_STYLE)
         self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
         # A narrow card stacks the pair, before on top.
         self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
@@ -1654,7 +1660,7 @@ class ImagePairTests(ImagesFixture):
         self.assertIn("The counts now match.", page)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_the_arrow_keys_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
+    def test_the_arrow_keys_and_buttons_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
         _ = self.register_pair()
         _ = self.register()
         probe = """<script>
@@ -1669,8 +1675,27 @@ class ImagePairTests(ImagesFixture):
   check(!label.hidden && label.textContent === text, step + ' badges the picture ' + text);
   check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, step + ' names the zoom ' + text);
  };
+ const [left, right] = zoom.querySelectorAll('[data-image-zoom-step]');
+ const tip = button => button.querySelector('[data-image-zoom-tip]');
+ const tipShown = button => getComputedStyle(tip(button)).visibility === 'visible';
  after.click();
  shows(after, 'After', 'A click on After');
+ check(!left.hidden && !left.disabled && left.getAttribute('aria-label') === 'Show Before', 'The left button shows Before');
+ check(!right.hidden && right.disabled, 'The right button is off on the last picture');
+ check(getComputedStyle(right).opacity === '0.3', 'An off button is dim');
+ check(left.getAttribute('aria-keyshortcuts') === 'ArrowLeft' && right.getAttribute('aria-keyshortcuts') === 'ArrowRight',
+       'Each button names its key for a screen reader');
+ check(tip(left).textContent === 'Press ← to show Before' && tip(left).querySelector('kbd').textContent === '←',
+       'The left tip names the key and the picture');
+ check(!tipShown(left), 'The tip is hidden until hover or focus');
+ left.focus();
+ left.click();
+ shows(before, 'Before', 'A click on the left button');
+ check(left.disabled && !right.disabled && tip(right).textContent === 'Press → to show After',
+       'On the first picture the left button is off and the right tip names After');
+ check(document.activeElement === zoom, 'A button that turns off returns focus to the large view');
+ right.click();
+ shows(after, 'After', 'A click on the right button');
  press('ArrowRight');
  shows(after, 'After', 'The right arrow on the last picture');
  press('ArrowLeft');
@@ -1691,13 +1716,25 @@ class ImagePairTests(ImagesFixture):
  const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
  single.click();
  check(zoom.open && label.hidden && label.textContent === '', 'A single image has no badge');
+ check(left.hidden && right.hidden, 'A single image has no arrow buttons');
  press('ArrowLeft');
  check(zoom.querySelector('img').src === single.href, 'The arrows keep a single image');
  press('Escape');
+ const frame = document.createElement('iframe');
+ frame.src = '/mac';
+ await new Promise(done => { frame.onload = done; document.body.append(frame); });
+ const mac = frame.contentDocument;
+ mac.querySelector('[data-image-zoom-group] a[data-image-zoom]').click();
+ const macTip = mac.querySelector('[data-image-zoom-step="1"] [data-image-zoom-tip]');
+ check(macTip.textContent === 'Press ▶ to show After', 'On a Mac the tip names the ▶ key');
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
 })().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
 </script><img src="/probe-complete" alt="" hidden>"""
-        page = images.render(self.status).decode().replace("</body>", probe + "</body>").encode()
+        rendered = images.render(self.status).decode()
+        page = rendered.replace("</body>", probe + "</body>").encode()
+        # Firefox has no userAgentData, so navigator.platform alone selects the Mac keys.
+        mac_platform = "<script>Object.defineProperty(Navigator.prototype,'platform',{get:()=>'MacIntel'})</script>"
+        mac_page = rendered.replace("<head>", "<head>" + mac_platform, 1).encode()
         results: list[list[str]] = []
         complete = threading.Event()
 
@@ -1711,7 +1748,8 @@ class ImagePairTests(ImagesFixture):
                     self.send_response(204)
                     self.end_headers()
                     return
-                body, kind = (page, "text/html; charset=utf-8") if self.path == "/" else (PNG, "image/png")
+                pages = {"/": page, "/mac": mac_page}
+                body, kind = (pages[self.path], "text/html; charset=utf-8") if self.path in pages else (PNG, "image/png")
                 self.send_response(200)
                 self.send_header("Content-Type", kind)
                 self.end_headers()
