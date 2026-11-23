@@ -2352,7 +2352,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                   mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
                   mock.patch.object(gate, 'run_suites') as local):
-                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full), remote)
+                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full, target=gate.NO_GATE_ASSIGNMENT),
+                                 remote)
                 local.assert_not_called()
                 run.assert_called_once()
                 self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
@@ -2361,7 +2362,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         repo = self.gate_checkout()
         with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED)
+            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(local.call_args.kwargs['full'])
         self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED)
 
@@ -2995,7 +2996,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                   mock.patch.object(gate, 'run_suites', return_value=passed) as local,
                   redirect_stdout(StringIO()) as output):
                 before = len(self.fallback_rows())
-                outcome = gate.run_gate_suites(self.repo, full=True, mode=mode)
+                outcome = gate.run_gate_suites(self.repo, full=True, mode=mode, target=gate.NO_GATE_ASSIGNMENT)
                 self.assertTrue(outcome.passed)
                 local.assert_called_once_with(self.repo, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
                                               source='tests-only', full=True, mode=mode)
@@ -3724,7 +3725,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
         with (mock.patch.object(cloud_gate, 'route', side_effect=route_changed_tree),
               mock.patch.object(gate, 'run_suites', return_value=local), redirect_stdout(StringIO())):
-            run = gate.run_gate_suites(self.repo)
+            run = gate.run_gate_suites(self.repo, target=gate.NO_GATE_ASSIGNMENT)
 
         self.assertIs(run, local)
         self.assertFalse((folder / 'imported.json').exists())
@@ -3734,7 +3735,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         with (mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('The result is saved')),
               mock.patch.object(gate, 'run_suites', side_effect=AssertionError('The saved result matches')),
               redirect_stdout(StringIO())):
-            run = gate.run_gate_suites(self.repo)
+            run = gate.run_gate_suites(self.repo, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(run.passed)
         self.assertTrue((folder / 'imported.json').is_file())
 
@@ -3753,7 +3754,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                   mock.patch.object(gate, 'run_suites', return_value=typed) as local,
                   mock.patch.object(gate, 'finalize_gate', create=True,
                                     wraps=cast(object, getattr(gate, 'finalize_gate', None))) as finalize):
-                run = gate.run_gate_suites(self.repo, types)
+                run = gate.run_gate_suites(self.repo, types, target=gate.NO_GATE_ASSIGNMENT)
                 self.assertTrue(run.passed)
                 self.assertTrue((folder / 'imported.json').is_file())
                 self.assertEqual(finish.call_count, int(route in ('fresh', 'cloud and types')))
@@ -4470,7 +4471,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             return gate.GateRun((), 0, 0)
         with (mock.patch.object(cloud_gate, 'run', side_effect=route),
               mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED)
+            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(self.admission.callers_released())
 
     def test_cloud_service_error_releases_its_slot(self) -> None:

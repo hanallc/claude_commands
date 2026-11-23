@@ -198,10 +198,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
                             (gate.GateJobResult("hooks", "test_first.py", int(outcome == "red"), 0, "fixture"),),
                             0, 0, tests_reused=True)
 
-                    def merge(arguments: gate.GateArguments) -> int:
+                    def merge(arguments: gate.GateArguments, target: str | gate.NoGateAssignment) -> int:
                         self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
-                            return checkpoint(arguments)
+                            return checkpoint(arguments, target)
                         finally:
                             restored.append(os.environ.get(admission_records.BUILDLOG_UNIT))
 
