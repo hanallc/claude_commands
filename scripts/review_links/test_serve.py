@@ -912,7 +912,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         words = "The frame time graph has a gap."
         output, errors = StringIO(), StringIO()
-        self.new_item_post_done.clear()
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
@@ -920,7 +919,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
             code = new_item.main(["bug", unit.name, words, "--session", "another-session"])
             # The server replies before it delivers the item.
-            self.assertTrue(self.new_item_post_done.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(self.new_item_posts.wait_until_none_run())
         # The server's request log shares stderr with the command.
         self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
         self.assertNotIn("new_item:", errors.getvalue())
