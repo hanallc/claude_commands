@@ -43,7 +43,7 @@ from scripts.production import change_review, change_routing, delivery_state, in
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page
+from scripts.review_links import review_items, review_page, review_submissions
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -2134,12 +2134,13 @@ document.body.append(result);
             "eta": the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))})
 
     def fixture_items(self) -> list[the_list.ListItem]:
-        items = [self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58),
-                 self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10)),
-                 self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1)),
-                 self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41),
-                 self.add("Read the delivered page", the_list.ItemState.DONE, number=63),
-                 self.add("Removed task", number=54)]
+        paused = self.add("Shared documentation structure", the_list.ItemState.PAUSED, number=41)
+        removed = self.add("Removed task", number=54)
+        waiting = self.add("Remove the mesh code", the_list.ItemState.WAITING_FOR_NATE, number=58)
+        done = self.add("Read the delivered page", the_list.ItemState.DONE, number=63)
+        status = self.add("Console status", number=105, owner=OTHER.id, next_check=NOW - timedelta(minutes=10))
+        latest = self.add("The List in the console Straße", number=106, next_check=NOW + timedelta(hours=1))
+        items = [waiting, status, latest, paused, done, removed]
         _ = the_list.mark_read(MORTY.id, items[0].id, source="nate")
         _ = the_list.update(MORTY.id, items[1].id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, items[3].id, {"producer": DWIGHT.id}, source="morty")
@@ -2186,11 +2187,11 @@ document.body.append(result);
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
-        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE, number=59)
+        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE)
         _ = the_list.park(MORTY.id, parked.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
         parked_markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(re.findall(r'<tbody data-list-item [^>]*data-number="(\d+)"', parked_markup),
-                         ["58", "105", "106", "63", "59", "41"])
+                         ["58", "105", "106", "63", "107", "41"])
         self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
         self.assertNotIn('<h3>Closing words</h3>', body)
         _ = the_list.reopen(MORTY.id, "L54", source="nate")
@@ -3078,6 +3079,32 @@ window.fetch=(url,options)=>{
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
+    def test_page_adds_to_the_same_sequence_after_remove(self) -> None:
+        first = self.add("Keep the first item", number=206)
+        removed = self.add("Remove the highest item", number=207)
+        root = self.root / "reviews"
+        _ = list_page.submit(root, urlencode(self.fields(removed, "remove")))
+        saved = the_list.load(MORTY.id, removed.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.log[:-2], removed.log)
+        self.assertEqual([entry.item.id for entry in list_page.records()], [first.id])
+
+        for number, recipient in enumerate((DWIGHT, MORTY), start=208):
+            native = investigation.Investigation("I1", recipient.id, "Read the result",
+                investigation.InvestigationState.OPEN, "", "", "", "Read the result.", "")
+            key = f"{recipient.id}/I1"
+            path = self.root / f"{recipient.name}-I1.md"
+            saved_submission = review_submissions.SavedSubmission(
+                "I1", new_item_dialog.SubmissionKind.INVESTIGATION, recipient.id, str(number), "",
+                path, path, recipient.id, native)
+            published = review_page.PublishedSubmission(saved_submission, key, "fixture-version")
+            entry = list_page.add_submission(published)
+            self.assertEqual((entry.key, entry.item.producer, entry.item.reviews),
+                             (f"{MORTY.id}/L{number}", recipient.id, (key,)))
+            self.assertEqual(list_page.add_submission(published), entry)
+        self.assertFalse(the_list.folder(DWIGHT.id).exists())
+        self.assertEqual(the_list.load(MORTY.id, removed.id), saved)
+
     def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Park this item now")
         fields = self.fields(item, "park", until="2026-12-03")
@@ -3354,6 +3381,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Check the other item", number=2)
         self.browser_action_sequence(r"""
  const toggle=form.querySelector('[data-later-toggle]');
@@ -3388,7 +3416,7 @@ window.fetch=async(_path,options={})=>{
  check(!row.hidden,'Unpark returns the item to Working');
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
         self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3946,15 +3974,16 @@ window.fetch=async(_path,options={})=>{
     def test_browser_list_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
         root = self.root / 'reviews'
         for number in range(7, 28):
-            if number != 13:
-                _ = self.add(f'List item {number}', number=number)
+            title = 'A row that returns above the open item' if number == 13 else f'List item {number}'
+            _ = self.add(title, number=number)
+        _ = the_list.close(MORTY.id, 'L13', 'The row returns later.', source='nate')
 
         def page() -> str:
             return list_page.render(root, include_counts=False).decode().replace(
                 '</head>', '<style>.list-row td { line-height: 22px; }</style></head>')
 
         initial = page()
-        _ = self.add('An added row above the open item', number=13)
+        _ = the_list.reopen(MORTY.id, 'L13', source='nate')
         added = page()
         _ = the_list.close(MORTY.id, 'L12', 'The work has finished.', source='nate')
         removed_above = page()
@@ -4293,10 +4322,10 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
         root = self.root / "reviews"
-        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         for number in range(1, 17):
             state = the_list.ItemState.DELIVERED if number == 5 else the_list.ItemState.WORKING
             _ = self.add(f"List item {number}", state, number=number)
+        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         before = list_page.render(root, include_counts=False).decode()
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
         _ = the_list.update(MORTY.id, parked.id, {"state": the_list.ItemState.WORKING}, source="morty")
@@ -4512,6 +4541,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_switching_rows_moves_a_lost_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4529,10 +4559,11 @@ observer.observe(original.parentElement,{childList:true});
  check(aboveOnly(),'Opening another row moves the notice above the table.');
  row.querySelector('.list-toggle').click();
  check(inlineOnly(),'Opening the first row returns the notice to its details.');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4555,7 +4586,7 @@ observer.observe(original.parentElement,{childList:true});
  check(!shows(1) && shows(2),'Closing row one does not restore the older notice.');
  second.querySelector('.list-toggle').click();
  check(status.hidden,'opening the latest failed row hides the notice above the table');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_clears_the_list_save_notice(self) -> None:
@@ -5327,6 +5358,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence("""
@@ -5343,10 +5375,11 @@ observer.observe(original.parentElement,{childList:true});
  submit('remove');
  finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
  check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence(r"""
@@ -5368,7 +5401,7 @@ observer.observe(original.parentElement,{childList:true});
  check(updateKey()===original && first()==='1','the restored Update key puts the row first');
  restore?.finish();await flush();
  check(!animation() && first()==='1','the correct order remains after the animation');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_closed_response_clears_unread_when_the_server_reports_read(self) -> None:
@@ -5442,6 +5475,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
  document.querySelector('[data-sort="0"]').click();
@@ -5479,7 +5513,7 @@ observer.observe(original.parentElement,{childList:true});
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_respects_reduced_motion(self) -> None:
