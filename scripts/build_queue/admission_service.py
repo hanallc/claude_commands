@@ -925,7 +925,10 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
     def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
-        return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
+        # A scope with no recorded caller gets its owner from the family of its oldest process.
+        name = evidence.session_name or ("" if evidence.session_id or not evidence.members
+                                         else records.family_owner_name(evidence.members[0].pid, proc.path))
+        return records.queue_caller(evidence.session_id, "", name, "", evidence.folder,
                                     members=staff_members, unit=unit)
 
     unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))

@@ -1076,8 +1076,10 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
     def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
+        # A terminal family gives no name, so the worktree folder names the caller.
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}):
+                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}), \
+                mock.patch.object(records, "family_owner_name", return_value=""):
             identity = client.step_identity("nextest", "/work/queue-fixture")
         self.assertEqual(identity.name, "terminal · queue-fixture")
 
@@ -1100,7 +1102,7 @@ class ClientTests(unittest.TestCase):
                 with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
                     **environment, "CLAUDE_CODE_SESSION_ID": session,
                     "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
-                }):
+                }), mock.patch.object(records, "family_owner_name", return_value=""):
                     identity = client.step_identity("nextest", "")
                     self.assertEqual((identity.name, identity.unit), (name, owner_unit))
                     self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
