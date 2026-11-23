@@ -510,7 +510,8 @@ try {
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === '—');
+          // bob, 2026-11-23: a Mac build with no unit starts with who started it, here a terminal.
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
@@ -571,7 +572,7 @@ try {
               await assertRowCenters(evaluate);
               assert.deepEqual(rows.headers, runningHeaders);
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest','natedev'],
-                ['queue','builds','','gate','mac-linux'],[mac.name,'','','',mac.machine || '—'],['hana CI','','','','natedev'],
+                ['queue','builds','','gate','mac-linux'],['terminal','hana','','build','mac'],['hana CI','','','','natedev'],
                 ['admin-console','builds','','test affected','natedev or hana-aws']]);
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
               assert.equal(rows.tight, width === 900, `The walk at ${width} px has the wrong tight state.`);
@@ -1887,13 +1888,13 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            assert.deepEqual(macProof.map(row=>row.name),['hana: build','trunk','cargo-liner: nextest']);
+            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner: nextest']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
-            assert.deepEqual(macProof.map(row=>row.step),['','nextest','']);
+            assert.deepEqual(macProof.map(row=>row.step),['build','nextest','']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -2694,6 +2695,7 @@ try {
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
           Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
             progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
+          delete mac.started_by;
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,

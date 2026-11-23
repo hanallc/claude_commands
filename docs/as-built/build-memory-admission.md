@@ -410,11 +410,12 @@ Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
 On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit, so the row name text shows only in rows without a unit.
+A Mac row with no unit has a `started_by` field instead, so it shows in the same form as a unit row. Its owner starts the row (a staff owner, then the launcher). Its repository is the small text, and its step is in Step.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
 1. The recorded unit, then the staff unit.
 2. The staff showrunner, or the session name for a session with no production.
-3. The stored caller name, then the repository or package.
+3. The stored caller name, then the Mac launcher, then the repository or package.
 A CI row uses `hana CI` as the owner.
 A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
 So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
@@ -2354,7 +2355,17 @@ The recorded project directory identifies the run; a compiler's crate directory 
 The step name uses the command's package, then the repository when the command has no package.
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
-A Mac row without a unit shows only its name, which starts with the repository. A Mac row with a unit starts with the unit, with the showrunner under it.
+A Mac row with a unit starts with the unit, with the showrunner under it.
+The Mac reader records the launcher of each cargo run. It walks the parent process chain of the run and takes the first program that `queue_view.MAC_LAUNCHER_PROGRAMS` names:
+1. `claude` is a Claude session. The session id comes from the run's `CLAUDE_CODE_SESSION_ID`, then from the session marker in the copy record.
+2. `Runner.Worker` or `Runner.Listener` is hana CI. The CI origin uses the same walk.
+3. `rust-analyzer` is rust-analyzer.
+A program name can have a version suffix, such as `rust-analyzer-2026-11-02`.
+A session marker with no launcher program is a Claude session. A run with no launcher program and no marker is `terminal`.
+`memory_feed.mac_launcher_name` gives the shown launcher: the staff name of a known Claude session, `Claude session` for an unknown one, `hana CI`, `rust-analyzer` or `terminal`.
+A Mac row with no unit starts with its owner, from `owner_name`. A known staff owner comes first, then the launcher. The repository is the small text, and the step is in Step.
+The staff name shows in its staff color; the other launcher names show in plain text. The row hover names the owner in a `Started by` field.
+A reading from before the launcher field has no launcher, so its row keeps the old name that starts with the repository.
 A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
 A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.

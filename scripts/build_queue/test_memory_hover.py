@@ -145,6 +145,54 @@ class MemoryHoverTests(unittest.TestCase):
         lines = self.page_expression("data.walk.map(row => queueRowLabels(row).owner)", {"walk": walk})
         self.assertEqual(lines, ["aws", "", "", "", ""])
 
+    def test_a_mac_build_with_no_unit_starts_with_who_started_it(self) -> None:
+        # bob, 2026-11-23: the launcher starts the row, the repository is the small text and the verb fills Step.
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+        mac = {"kind": "mac-build", "unit": "—", "showrunner": "—", "repository": "hana", "machine": "mac",
+               "started_at": 100, "read_at": 190, "used": 1.5, "stage": {"kind": "MacBuilding"}}
+        walk = [{**mac, "name": "terminal: build", "started_by": {"name": "terminal", "step": "build"}},
+                {**mac, "name": "builds: test", "started_by": {"name": "builds", "step": "test"}}]
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": walk, "waiters": []}
+        rendered = cast(list[str], self.page_expression("(()=>{" + setup + "renderWalk(data);"
+            + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
+        root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
+        for index, (start, color, step) in enumerate((("terminal", None, "build"), ("builds", "role.showrunner", "test"))):
+            with self.subTest(start=start):
+                chart = root.find(f".//div[@data-run='fixture-run-{index}']")
+                table = root.find(f".//tr[@data-tip='row:fixture-run-{index}']")
+                assert chart is not None and table is not None
+                name = chart.find(".//span[@class='name']")
+                assert name is not None
+                self.assertEqual("".join(name.itertext()), start)
+                colored = name.find("span[@data-color-text]")
+                self.assertEqual(colored.get("data-color-text") if colored is not None else None, color)
+                self.assertEqual(chart.findtext(".//span[@class='owner']"), "hana")
+                self.assertEqual(table.findtext("th[@class='step']/span"), step)
+                self.assertIn("<dt>Started by</dt>", rendered[index + 1])
+                self.assertIn(start, rendered[index + 1].split("<dt>Started by</dt>", 1)[1].split("</dd>", 1)[0])
+
+    def mac_starter_hover(self, extra: dict[str, object]) -> list[tuple[object, object]]:
+        """Give the hover rows of one Mac build that a staff owner named "builds" started."""
+        row = {"kind": "mac-build", "machine": "mac", "name": "builds: build", "unit": "—", "repository": "hana",
+               "used": 1.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacBuilding"},
+               "started_by": {"name": "builds", "step": "build"}, **extra}
+        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('row:fixture-run-0', data)",
+                                                                   {"read_at": 200, "walk": [row]}))
+        return [(row["label"], row["value"]) for row in rows]
+
+    def test_a_caller_that_started_a_mac_build_shows_once(self) -> None:
+        rows = self.mac_starter_hover({"caller": "builds", "showrunner": "—"})
+        self.assertEqual([row for row in rows if row[0] == "Started by"], [("Started by", "builds")])
+        self.assertEqual([row for row in rows if row[1] == "builds"], [("Started by", "builds")])
+
+    def test_a_showrunner_that_started_a_mac_build_shows_once(self) -> None:
+        rows = self.mac_starter_hover({"showrunner": "builds"})
+        self.assertEqual([row for row in rows if row[0] == "Started by"], [("Started by", "builds")])
+        self.assertEqual([row for row in rows if row[1] == "builds"], [("Started by", "builds")])
+
     def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
         # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,
         # Step comes after Verify, no Unit or Slot column, and a running row's Target is only its machine.

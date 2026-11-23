@@ -3292,6 +3292,39 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
 
+    def test_a_mac_build_with_no_unit_starts_with_its_launcher(self) -> None:
+        # bob, 2026-11-23: a Mac build with no owner names who started it; a row with a unit does not change.
+        worker = staff.StaffRow(staff.StaffId("impl2"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-a"))
+        members = memory_feed.FeedStaff(staff.StaffSnapshot((worker,)))
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo build -p hana", "hana")
+        owned = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                        unit_labels.UnderDirector("research", "research", ""))
+        for case, launched, identity, expected in (
+            ("known session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-a"),
+             unit_labels.UnitLabels(""), "impl2"),
+            ("unknown session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-x"),
+             unit_labels.UnitLabels(""), "Claude session"),
+            ("CI", replace(build, launcher=queue_view.MacLauncher.CI, origin=queue_view.MacBuildOrigin.CI),
+             unit_labels.UnitLabels(""), "hana CI"),
+            ("rust-analyzer", replace(build, launcher=queue_view.MacLauncher.RUST_ANALYZER),
+             unit_labels.UnitLabels(""), "rust-analyzer"),
+            ("terminal", replace(build, launcher=queue_view.MacLauncher.TERMINAL), unit_labels.UnitLabels(""), "terminal"),
+            ("old reading", build, unit_labels.UnitLabels(""), ""),
+            ("unit", replace(build, launcher=queue_view.MacLauncher.TERMINAL), owned, ""),
+        ):
+            with self.subTest(case=case):
+                row = memory_feed.mac_work_row(launched, queue_view.MacBuildReading(1, (launched,)), identity,
+                    names=read_step_names(), slot_roots={}, slot_machine="private-mac-host",
+                    launcher=memory_feed.mac_launcher_name(launched, members))
+                if expected:
+                    self.assertEqual(row.get("started_by"), {"name": expected, "step": "build"})
+                    self.assertEqual(row["name"], f"{expected}: build")
+                    self.assertEqual(row["repository"], "hana")
+                else:
+                    self.assertNotIn("started_by", row)
+                    self.assertEqual(row["name"], "research: build" if case == "unit" else "hana: build")
+
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
         self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["unknown: nextest"])
@@ -4625,13 +4658,18 @@ def write_browser_fixture(folder: Path) -> None:
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
                 reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        # The first build has no unit: a terminal started it. The last one is from a reading with no launcher.
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
-            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
-            for index, (pid, path, command, repository, used, done, unit) in enumerate((
-                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk"),
-                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify"),
-                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler"))))
+            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit,
+            launcher=launcher)
+            for index, (pid, path, command, repository, used, done, unit, launcher) in enumerate((
+                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk",
+                 queue_view.MacLauncher.TERMINAL),
+                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify",
+                 queue_view.MacLauncher.CLAUDE),
+                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler",
+                 queue_view.MacLauncher.UNKNOWN))))
         mac_reading = queue_view.MacBuildReading(base.explanation.now - 5, mac_builds)
         from scripts.mac_test import claim_state
         from scripts.copies import copies

@@ -877,10 +877,13 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
+// A Showrunner or Caller name that already shows as Started by is left out, so no name shows twice.
 function ownerFields(row) {
-  const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
+  const starter = row.started_by?.name || '';
+  const showrunner = ownerText(row.showrunner);
+  const fields = [staffField('Started by', [starter]), staffField('Showrunner', [showrunner === starter ? '' : showrunner])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
-  if (row.caller) fields.push(field('Caller', row.caller));
+  if (row.caller && row.caller !== starter) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
 function olderStepTitle(row) {
@@ -1103,16 +1106,19 @@ function publicParts(parts) {
   return shown;
 }
 // One function gives the row start, its small text and the Step and Verify cells, so any console page can use them.
-// A row with a unit starts with the unit; its showrunner is the small text. Other rows show their own name only.
+// A row with a unit starts with the unit; its showrunner is the small text. A Mac build with no unit starts with who
+// started it, in the same form: its repository is the small text and its step fills Step. Other rows show their own name only.
 function queueRowLabels(row) {
+  if (row.started_by) return {name: row.started_by.name, unit: "", owner: "", starter: row.started_by.name,
+    repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const showrunner = unit ? ownerText(row.showrunner) : "";
   return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
     step: unit && row.title?.unit ? row.title.step : "", verify: row.verify?.verb || ""};
 }
-function rowLabel({name, unit = "", owner = ""}, note = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? staffName(unit) : esc(name)}</span></span>` +
-    `<span class="owner">${staffName(owner)}</span>` +
+function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
+  return `<span class="row-label"><span class="row-heading"><span class="name">${unit || starter ? staffName(unit || starter) : esc(name)}</span></span>` +
+    `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, bars = "") {
