@@ -408,6 +408,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 (b'{', '', {}, 400),
                 (encoded({**payload, 'images': 'invalid'}), '', {}, 400),
                 (encoded(payload), '', {'Content-Length': str(serve.MAX_NEW_ITEM_BODY+1)}, 400),
+                (encoded({"token": token, "kind": "scheduled", "page": [], "page_recipient": "selected"}), '', {}, 400),
+                (encoded({"token": token, "kind": "scheduled", "page": "list", "page_recipient": "selected",
+                          "recipient_id": owner.id, "request_id": "r6-" + uuid4().hex,
+                          "words": "Check the queue. Start 2099-11-30T09:00Z.", "capture_key": "x"}), '', {}, 400),
             )
             for body, query, headers, status in cases:
                 with self.subTest(code=status, query=query, headers=headers):
@@ -3111,12 +3115,21 @@ class ReviewLinksServerTests(unittest.TestCase):
         producer = fixture_member("producer", name="producer", doc=staff.LiveDoc(local_machine(), document))
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={showrunner.id}\n")
+        _ = write_config_fixture(conf.path("producer_map"), f"{showrunner.id}={producer.id}\n")
+        _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         # The dialog sends Feedback as an Investigation.
-        kinds = [new_item_dialog.SubmissionKind(kind if kind != "feedback" else "investigation")
+        kinds = [kind if kind != "feedback" else new_item_dialog.SubmissionKind.INVESTIGATION
                  for kind, _, _ in new_item_dialog.KINDS]
+        notices: list[staff.StaffId] = []
+
+        def send_notice(recipient: staff.StaffRow, message: str) -> None:
+            self.assertIn("Check the Scheduled item.", message)
+            notices.append(recipient.id)
+
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
+              patch.object(the_list, "_send_assignment_notice", side_effect=send_notice),
               capture_sender("send_message")):
             for page in sorted(page_frame.OWNER_PAGES):
                 options = self.new_item_http(query=f"?page={page}")
@@ -3133,7 +3146,41 @@ class ReviewLinksServerTests(unittest.TestCase):
                         if kind == new_item_dialog.SubmissionKind.PROPOSAL and row["name"] not in proposal_names:
                             continue
                         with self.subTest(page=page, kind=kind, name=row["name"]):
-                            request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
+                            owner = staff.StaffId(str(row["id"]))
+                            if kind == new_item_dialog.SCHEDULED_KIND:
+                                notices.clear()
+                                scheduled = {"token": self.server.new_item_token, "kind": kind, "page": page,
+                                             "page_recipient": "selected", "request_id": "r6-" + uuid4().hex,
+                                             "recipient_id": owner,
+                                             "words": "Check the Scheduled item. Start 2099-11-30T09:00Z. Repeat Daily."}
+                                encoded = json.dumps(scheduled).encode()
+                                response = self.new_item_http(encoded, finished=True)
+                                self.assertEqual(response.status, 200, response.body)
+                                result = cast(dict[str, object], json.loads(response.body))
+                                item = the_list.load(morty.id, str(result["id"]))
+                                self.assertEqual((item.owner, item.producer, item.state, item.log[0].source),
+                                                 (owner, morty.id if owner == morty.id else producer.id,
+                                                  the_list.ItemState.SCHEDULED, "nate via /new_item"))
+                                series = item.schedule
+                                assert isinstance(series, the_list.ScheduledSeries)
+                                self.assertEqual((series.first.words, series.rule.rrule),
+                                                 ("Check the Scheduled item.", "FREQ=DAILY"))
+                                self.assertEqual(result["readback"], [
+                                    "Starts: Mon Nov 30 2099 09:00 UTC (04:00 EST)", "Repeats: Daily"])
+                                count = len(the_list.records(morty.id))
+                                repeat = self.new_item_http(encoded, finished=True)
+                                self.assertEqual((repeat.status, json.loads(repeat.body)), (200, result))
+                                changed = self.new_item_http(json.dumps({**scheduled, "words": "Changed words"}).encode(),
+                                                             finished=True)
+                                recovered = cast(dict[str, object], json.loads(changed.body))
+                                self.assertEqual((changed.status, recovered["id"], recovered["code"]),
+                                                 (409, item.id, "already_filed"))
+                                self.assertEqual(len(the_list.records(morty.id)), count)
+                                expected = ([producer.id, showrunner.id] if owner == showrunner.id
+                                            else [producer.id] if owner == producer.id else [])
+                                self.assertEqual(notices, expected)
+                                continue
+                            request = replace(case.submission_request(new_item_dialog.SubmissionKind(kind), owner), page=page,
                                               page_recipient=new_item_dialog.PageRecipient.SELECTED,
                                               request_id="r6-" + uuid4().hex)
                             response = self.new_item_http(self.new_item_body(request), finished=True)

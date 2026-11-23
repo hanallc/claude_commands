@@ -755,13 +755,35 @@ def read_words(value: object, label: str) -> str:
     return _text(value, label, MAX_WORDS_LENGTH)
 
 
+SCHEDULED_KIND = "scheduled"
+
+
+@dataclass(frozen=True)
+class ScheduledSubmission:
+    request_id: str
+    recipient_id: staff.StaffId
+    words: str
+
+
+def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
+    """Read the Scheduled Send fields."""
+    page = fields.get("page")
+    if not isinstance(page, str) or page not in page_frame.OWNER_PAGES or fields.get("page_recipient") != PageRecipient.SELECTED:
+        raise SubmissionError("Select a recipient from the New item dialog.")
+    if set(fields) - {"kind", "page", "page_recipient", "request_id", "recipient_id", "token", "words"}:
+        raise SubmissionError("Send the instruction, start, and repeat for a Scheduled item.")
+    recipient = staff.StaffId(_text(fields.get("recipient_id"), "Recipient ID", 128))
+    check_recipient_id(recipient)
+    return ScheduledSubmission(read_request_id(fields.get("request_id")), recipient,
+                               read_words(fields.get("words"), "Your words"))
+
 
 KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          (SubmissionKind.QUESTION, "Question", "circle-help"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
          (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
-         ("scheduled", "Scheduled", "clock-alert"))
+         (SCHEDULED_KIND, "Scheduled", "clock-alert"))
 
 
 def render() -> str:
@@ -785,10 +807,8 @@ def render() -> str:
    </fieldset>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
-   <section data-scheduled-help hidden>
-    <p>Run this command in a session to save the item. Add a start time and an optional repeat.</p>
-    <code data-scheduled-command></code>
-   </section>
+   <p data-scheduled-help hidden>Enter the instruction. Then add <code>Start Mon Nov 30 09:00.</code>
+    You can add <code>Repeat every 2 weeks on Monday and Thursday.</code></p>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
     <div data-bug-page-state hidden>
@@ -877,7 +897,8 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 #review-new-item .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
-#review-new-item [data-scheduled-command] { overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
+#review-new-item [data-scheduled-help] { margin: 0; color: var(--ink-2); }
+#review-new-item .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item [data-recipient-group] { display: flow-root; }
@@ -942,7 +963,7 @@ STYLE = '''
 }
 #review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
-#review-new-item #new-item-saved { margin: 0 0 12px; }
+#review-new-item #new-item-saved { margin: 0 0 12px; white-space: pre-line; }
 @media (max-width: 480px) {
  #review-new-item footer { padding-bottom: 14px; }
  #review-new-item .new-item-body { gap: 14px; }
@@ -973,7 +994,7 @@ SCRIPT = r'''(() => {
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
- const scheduledCommand = scheduledHelp.querySelector('[data-scheduled-command]');
+ const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
  const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
@@ -987,6 +1008,7 @@ SCRIPT = r'''(() => {
  let selectedRecipient = '';
  let pageOwner = '';
  let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
+ let awaitingEarlierSend = false;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -1001,21 +1023,21 @@ SCRIPT = r'''(() => {
  }
 
  function isScheduled() {
-  return !pendingItem && form.elements.kind.value === 'scheduled';
+  return form.elements.kind.value === 'scheduled';
  }
 
  function updateSend() {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
-  send.hidden = sentDetails.hidden = scheduled;
-  scheduledHelp.hidden = !scheduled;
+  sentDetails.hidden = scheduled;
+  scheduledHelp.hidden = !scheduled || !!savedItem;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
-  if (scheduled) {
-   const owner = recipient?.value || '<assignee>';
-   const instruction = words.value.trim() || 'Enter the instruction. Start YYYY-MM-DD HH:MM.';
-   scheduledCommand.textContent = '/new_item scheduled ' + owner + ' ' + instruction;
+  for (const input of kindInputs) {
+   input.disabled = sending || !!savedItem || (input.value === 'scheduled'
+    ? awaitingEarlierSend || Boolean(pendingItem && pendingItem.kind !== 'scheduled')
+    : pendingItem?.kind === 'scheduled');
   }
-  send.disabled = scheduled || !!savedItem || sending || !token || (!pendingItem &&
+  send.disabled = !!savedItem || sending || !token || (scheduled && awaitingEarlierSend) || (!pendingItem &&
     (!recipient || !words.value.trim() || words.value.length > words.maxLength));
  }
 
@@ -1139,7 +1161,7 @@ SCRIPT = r'''(() => {
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
-       typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
+       typeof data.id === 'string' && /^[QPIL][1-9][0-9]*$/.test(data.id)) {
     failure.filedId = data.id;
    }
    throw failure;
@@ -1425,23 +1447,26 @@ SCRIPT = r'''(() => {
   try {
    const stored = sessionStorage.getItem(listSendKey);
    if (!stored) return null;
-   if (listDraftId.test(stored)) return {id: stored, recipient: null};
+   if (listDraftId.test(stored)) return {id: stored, recipient: null, awaitingSend: false};
    const draft = JSON.parse(stored);
    if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
    const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient};
+   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend === true};
   } catch (_) { return null; }
  }
 
  function storeListDraft() {
   if (ownerPage !== 'list' || !draftId) return;
   try {
-   sessionStorage.setItem(listSendKey, JSON.stringify({id: draftId, recipient: selectedRecipient}));
+   sessionStorage.setItem(listSendKey, JSON.stringify({
+    id: draftId, recipient: selectedRecipient, awaitingSend: awaitingEarlierSend
+   }));
   } catch (_) {}
  }
 
  function finishDraft() {
   draftId = deferredCapture = pendingItem = undefined;
+  awaitingEarlierSend = false;
   pendingEdited = false;
   if (ownerPage === 'list') {
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
@@ -1451,9 +1476,15 @@ SCRIPT = r'''(() => {
  function showConfirmation(item) {
   savedItem = item;
   const saved = Boolean(item);
-  confirmation.textContent = saved ? 'Saved ' + item.id + '.' : '';
+  const scheduled = saved && item.id.startsWith('L');
+  confirmation.textContent = scheduled
+   ? ['Saved List item ' + item.id.slice(1) + '.', ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
+   : saved ? 'Saved ' + item.id + '.' : '';
   confirmation.hidden = savedControls.hidden = !saved;
-  body.hidden = sendControls.hidden = saved;
+  body.hidden = saved && !scheduled;
+  sendControls.hidden = saved;
+  words.readOnly = scheduled;
+  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = scheduled;
   updateSend();
   if (saved) done.focus();
  }
@@ -1464,7 +1495,7 @@ SCRIPT = r'''(() => {
   discardCapture();
   opening.abort();
   dialog.close();
-  keepDraft = !sent && !result && Boolean(pendingItem || words.value || images.length);
+  keepDraft = !sent && !result && Boolean(pendingItem || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
    if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
    for (const image of images) URL.revokeObjectURL(image.url);
@@ -1500,6 +1531,7 @@ SCRIPT = r'''(() => {
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    awaitingEarlierSend = stored.awaitingSend;
    }
   }
   const newDraft = !keepDraft && !draftId;
@@ -1555,6 +1587,10 @@ SCRIPT = r'''(() => {
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
                    page: ownerPage, page_recipient: 'selected'};
   storeListDraft();
+  if (kind === 'scheduled') {
+   pendingItem = payload;
+   return payload;
+  }
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
@@ -1577,11 +1613,16 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
+  const hadEarlierSend = awaitingEarlierSend;
   let saved, usedPreview = false;
   setError('');
   setSending(true);
   try {
    const item = await submissionPayload();
+   if (item.kind !== 'scheduled') {
+    awaitingEarlierSend = true;
+    storeListDraft();
+   }
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
    const sendItem = () => post({...item, token});
    let result;
@@ -1594,14 +1635,19 @@ SCRIPT = r'''(() => {
     if (!pendingItem && selectedRecipient !== item.recipient_id) return;
     result = await sendItem();
    }
-   if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
+   const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
+   if (typeof result.id !== 'string' || !expectedId.test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
    saved = result;
   } catch (failure) {
-   if (failure?.definiteRefusal && !failure.staleToken) {
-    pendingItem = deferredCapture = undefined;
-    pendingEdited = false;
+   if (failure?.definiteRefusal) {
+    if (!failure.staleToken) {
+     pendingItem = deferredCapture = undefined;
+     pendingEdited = false;
+    }
+    awaitingEarlierSend = failure.staleToken && hadEarlierSend;
+    storeListDraft();
    }
    if (failure?.filedId) {
     discardCapture();
@@ -1637,7 +1683,7 @@ SCRIPT = r'''(() => {
     startCapture();
     updateSend();
     send.focus();
-   } else if (onList) {
+   } else if (onList && !saved.id.startsWith('L')) {
     close({sent: true});
     dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
    } else {

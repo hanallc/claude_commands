@@ -41,11 +41,11 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
-from scripts.lib import atomic_file, conf, scratch
+from scripts.lib import atomic_file, conf, file_lock, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -1603,6 +1603,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields = cast(dict[str, object], payload)
             token = fields.get("token")
             valid_token = self.valid_request_token(token)
+            if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
+                if not valid_token:
+                    self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                    return
+                scheduled = new_item_dialog.read_scheduled_request(fields)
+                if not review_submissions.is_draft_id(scheduled.request_id):
+                    raise new_item_dialog.SubmissionError("Invalid Scheduled request ID.")
+                self.scheduled_item_post(server, scheduled)
+                return
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
@@ -1821,6 +1830,47 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
                                                  attached=review_submissions.PAGE_SCREENSHOT in details.images)
+
+    def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
+        """File one Scheduled item for each browser draft."""
+        fingerprint = hashlib.sha256(json.dumps([request.recipient_id, request.words]).encode()).hexdigest()
+        folder = server.store_folder / ".scheduled-drafts"
+        path = folder / f"{request.request_id}.json"
+        try:
+            with server.list_store_access(), server.staff_read_scope():
+                folder.mkdir(mode=0o700, exist_ok=True)
+                with file_lock.exclusive(folder / ".lock"):
+                    if path.exists():
+                        record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+                        response = record.get("response")
+                        if not isinstance(response, dict):
+                            self.json_response(409, {"error": "The save is unconfirmed. Check the List before sending again."})
+                            return
+                        result = cast(dict[str, object], response)
+                        if record.get("fingerprint") != fingerprint:
+                            self.new_item_saved(result, str(result["id"]), True)
+                            return
+                    else:
+                        # Keep the claim if a file error leaves the save result unknown.
+                        atomic_file.write_text_atomic(path, json.dumps({"fingerprint": fingerprint}), new_file_mode=0o600)
+                        try:
+                            saved = new_item.create_scheduled(request.recipient_id, request.words)
+                        except new_item.FilingRefused:
+                            path.unlink()
+                            raise
+                        result = {"id": saved.id, "list_key": saved.list_key,
+                                  "readback": saved.readback, "notice_warning": saved.notice_warning}
+                        atomic_file.write_text_atomic(path, json.dumps({"fingerprint": fingerprint, "response": result}),
+                                                      new_file_mode=0o600)
+        except new_item.FilingRefused as error:
+            status = 400 if error.outcome is new_item.Outcome.REFUSED else 409
+            self.json_response(status, {"error": str(error)})
+            return
+        except (OSError, ValueError, KeyError, TypeError, staff.StaffRefused) as error:
+            print(f"review-links Scheduled Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": f"Could not confirm the Scheduled save. {new_item.MAY_BE_FILED}"})
+            return
+        self.new_item_saved(result, str(result["id"]), False)
 
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
         if edited:

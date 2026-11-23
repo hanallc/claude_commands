@@ -11,11 +11,12 @@ import re
 import secrets
 import subprocess
 import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time
 from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf, main_publish
@@ -36,7 +37,6 @@ class ItemType(StrEnum):
     PROPOSAL = "proposal"
     EFFICIENCY = "efficiency"
     FEEDBACK = "feedback"
-    SCHEDULED = "scheduled"
 
 
 # The console server takes four kinds. Feedback and efficiency file as an investigation.
@@ -90,35 +90,44 @@ class Refusal:
     reason: str
 
 
-_UTC_OFFSET = r"Z|[+-][0-9]{2}:[0-5][0-9]"
+_UTC_OFFSET = r"Z\b|[+-][0-9]{2}:[0-5][0-9]"
 _ZONE_NAME = r"[a-z0-9_+/-]+"
 _START_TIME = re.compile(
     r"(?:(?P<iso>[0-9]{4}-[0-9]{2}-[0-9]{2})[T ]|"
     + r"(?P<weekday>[a-z]{3})\s+(?P<day>[a-z]{3}\s+[0-9]{1,2})(?:\s+(?P<year>[0-9]{4}))?\s+)"
-    + rf"(?P<clock>[0-9]{{2}}:[0-5][0-9])\s*(?P<zone>{_UTC_OFFSET}|\[{_ZONE_NAME}\]|{_ZONE_NAME})?",
+    + rf"(?P<clock>[0-9]{{2}}:[0-5][0-9])\s*(?P<offset>{_UTC_OFFSET})?\s*(?P<zone>\[{_ZONE_NAME}\]|{_ZONE_NAME})?",
     re.IGNORECASE,
 )
 _WEEKDAYS = {day.name.lower(): day for day in repeat_rule.Weekday}
 _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "last": -1}
-_MENU_FREQUENCIES = {"daily": "DAILY", "weekly": "WEEKLY", "monthly": "MONTHLY", "annually": "YEARLY"}
-_CUSTOM_FREQUENCIES = {"day": "DAILY", "week": "WEEKLY", "month": "MONTHLY", "year": "YEARLY"}
+_MENU_FREQUENCIES = {
+    "daily": repeat_rule.Frequency.DAILY, "weekly": repeat_rule.Frequency.WEEKLY,
+    "monthly": repeat_rule.Frequency.MONTHLY, "annually": repeat_rule.Frequency.YEARLY,
+}
+_CUSTOM_FREQUENCIES = {
+    "day": repeat_rule.Frequency.DAILY, "week": repeat_rule.Frequency.WEEKLY,
+    "month": repeat_rule.Frequency.MONTHLY, "year": repeat_rule.Frequency.YEARLY,
+}
 _REPEAT_MENU_ERROR = "Use a repeat from the List menu or a Custom repeat."
+_EASTERN = ZoneInfo("America/New_York")
+Scheduled = the_list.ScheduledRun | the_list.ScheduledSeries
+
+
+class NoRepeat(StrEnum):
+    ONCE = "one scheduled run"
 
 
 def _start_time(text: str, *, now: datetime, zone: ZoneInfo) -> datetime:
     match = _START_TIME.fullmatch(text)
     if match is None:
         raise ValueError("Use a start time such as Fri Nov 27 2026 13:00 or 2026-11-27T13:00.")
-    name = match["zone"]
-    if not name:
-        start_zone = zone
-    elif re.fullmatch(_UTC_OFFSET, name, re.IGNORECASE):
-        start_zone = time.fromisoformat("00:00" + name.upper()).tzinfo
-    else:
-        try:
-            start_zone = ZoneInfo(name.removeprefix("[").removesuffix("]"))
-        except ZoneInfoNotFoundError:
-            raise ValueError("Use an IANA time zone such as America/Los_Angeles or a UTC offset.") from None
+    name, offset = match["zone"], match["offset"]
+    try:
+        named_zone = ZoneInfo(name.removeprefix("[").removesuffix("]")) if name else zone
+    except ZoneInfoNotFoundError:
+        raise ValueError("Use an IANA time zone such as America/Los_Angeles or a UTC offset.") from None
+    fixed_zone = time.fromisoformat("00:00" + offset.upper()).tzinfo if offset else named_zone
+    start_zone = named_zone if name else fixed_zone
     if match["iso"]:
         day = match["iso"]
     else:
@@ -127,26 +136,32 @@ def _start_time(text: str, *, now: datetime, zone: ZoneInfo) -> datetime:
         if dated.strftime("%a").lower() != match["weekday"].lower():
             raise ValueError(f"The start date falls on {dated:%A}.")
         day = dated.date().isoformat()
-    start = datetime.fromisoformat(f"{day}T{match['clock']}").replace(tzinfo=start_zone)
+    wall = datetime.fromisoformat(f"{day}T{match['clock']}")
+    start = wall.replace(tzinfo=fixed_zone).astimezone(start_zone) if offset else wall.replace(tzinfo=named_zone)
     instant = start.astimezone(UTC)
-    if instant.astimezone(start.tzinfo).replace(tzinfo=None) != start.replace(tzinfo=None):
+    if instant.astimezone(start.tzinfo).replace(tzinfo=None) != wall:
+        if offset:
+            raise ValueError("The start offset does not match its time zone.")
         raise ValueError("The start time does not exist in its time zone.")
+    if not offset and start.utcoffset() != start.replace(fold=1).utcoffset():
+        raise ValueError("This start time occurs twice. Give its UTC offset and time zone.")
     if instant <= now.astimezone(UTC):
         raise ValueError("The start must be in the future.")
     return start
 
 
-def _repeat_end(text: str, start: datetime) -> tuple[str, str]:
+def _repeat_end(text: str, start: datetime) -> tuple[
+        str, repeat_rule.RepeatUntilLimit | repeat_rule.RunCount | repeat_rule.RunUntil]:
     rule, _, end = re.sub(r"[.,;]?\s+ends\s+", " ends ", text).partition(" ends ")
     if not end:
         match = re.fullmatch(r"(.+?)\s+(never|until .+|after .+|for .+)", rule)
         if match is not None:
             rule, end = match[1], match[2]
     if not end or end == "never":
-        return rule, ""
+        return rule, repeat_rule.RepeatUntilLimit.REACHED
     count = re.fullmatch(r"(?:after|for) ([0-9]+) (?:occurrences?|runs?)", end)
     if count is not None:
-        return rule, f";COUNT={count[1]}"
+        return rule, repeat_rule.RunCount(int(count[1]))
     until = re.fullmatch(r"(?:on|until) (.+)", end)
     if until is not None:
         for form in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
@@ -155,68 +170,76 @@ def _repeat_end(text: str, start: datetime) -> tuple[str, str]:
             except ValueError:
                 continue
             last = datetime.combine(day, time(23, 59, 59), start.tzinfo).astimezone(UTC)
-            return rule, f";UNTIL={last:%Y%m%dT%H%M%SZ}"
+            return rule, repeat_rule.RunUntil(last)
         raise ValueError("Use an end date such as Mar 1, 2027 or 2027-03-01.")
     raise ValueError("End a repeat with Never, On a date, or After a number of occurrences.")
 
 
-def _monthly_days(selector: str, start: datetime) -> str:
+def _monthly_days(selector: str, start: datetime) -> repeat_rule.MonthDay | repeat_rule.MonthWeekday:
     if selector in ("same day number", "the same day number"):
-        return f";BYMONTHDAY={start.day}"
+        return repeat_rule.MonthDay(start.day)
     day = re.fullmatch(r"day ([0-9]{1,2})", selector)
     if day is not None:
-        return f";BYMONTHDAY={day[1]}"
+        return repeat_rule.MonthDay(int(day[1]))
     if selector.removesuffix(" of the month") in ("same weekday", "the same weekday"):
         weekday = tuple(repeat_rule.Weekday)[start.weekday()]
         last_day = calendar.monthrange(start.year, start.month)[1]
-        ordinal = -1 if start.day + 7 > last_day else (start.day - 1) // 7 + 1
-        return f";BYDAY={ordinal}{weekday}"
+        ordinal = (start.day - 1) // 7 + 1
+        is_last = start.day + 7 > last_day
+        if ordinal == 4 and is_last:
+            name = weekday.name.title()
+            raise ValueError(f"Choose the fourth {name} or the last {name}.")
+        return repeat_rule.MonthWeekday(-1 if is_last else ordinal, weekday)
     weekday_of_month = re.fullmatch(r"the (first|second|third|fourth|last) ([a-z]+)", selector)
     if weekday_of_month is not None and (weekday := _WEEKDAYS.get(weekday_of_month[2])) is not None:
-        return f";BYDAY={_ORDINALS[weekday_of_month[1]]}{weekday}"
+        return repeat_rule.MonthWeekday(_ORDINALS[weekday_of_month[1]], weekday)
     raise ValueError(_REPEAT_MENU_ERROR)
 
 
-def _repeat_days(frequency: str, selector: str, start: datetime) -> str:
+def _repeat_days(frequency: repeat_rule.Frequency, selector: str, start: datetime
+                 ) -> repeat_rule.StartDay | repeat_rule.WeeklyDays | repeat_rule.MonthDay | repeat_rule.MonthWeekday:
     if not selector:
-        return ""
-    if frequency == "WEEKLY":
+        return repeat_rule.StartDay.SAME
+    if frequency is repeat_rule.Frequency.WEEKLY:
         names = re.split(r",\s*(?:and )?|\s+and\s+", selector)
         if all(name in _WEEKDAYS for name in names):
-            return ";BYDAY=" + ",".join(_WEEKDAYS[name] for name in names)
-    if frequency == "MONTHLY":
+            days = sorted((_WEEKDAYS[name] for name in names), key=lambda day: day.day_number)
+            return repeat_rule.WeeklyDays(tuple(days))
+    if frequency is repeat_rule.Frequency.MONTHLY:
         return _monthly_days(selector, start)
-    if frequency == "YEARLY" and selector in (start.strftime("%B %-d").lower(), start.strftime("%b %-d").lower()):
-        return ""
+    if frequency is repeat_rule.Frequency.YEARLY and selector in (
+            start.strftime("%B %-d").lower(), start.strftime("%b %-d").lower()):
+        return repeat_rule.StartDay.SAME
     raise ValueError(_REPEAT_MENU_ERROR)
 
 
-def _repeat(text: str, start: datetime) -> repeat_rule.RepeatRule | the_list.NoSchedule:
+def _repeat(text: str, start: datetime) -> repeat_rule.RepeatRule | NoRepeat:
     text = " ".join(text.lower().split()).removeprefix("repeat ")
     if text in ("", "does not repeat"):
-        return the_list.NoSchedule.UNSET
+        return NoRepeat.ONCE
     rule, end = _repeat_end(text, start)
     if rule in ("every weekday", "every weekday (monday to friday)"):
-        fields = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+        result = repeat_rule.RepeatRule(repeat_rule.Frequency.WEEKLY, 1,
+                                        repeat_rule.WeeklyDays(tuple(repeat_rule.Weekday)[:5]), end)
     else:
         cadence, _, selector = rule.partition(" on ")
         frequency = _MENU_FREQUENCIES.get(cadence)
-        interval = ""
+        interval = 1
         if frequency is None:
             custom = re.fullmatch(r"every (?:([0-9]+) )?(day|week|month|year)s?", cadence)
             if custom is None:
                 raise ValueError(_REPEAT_MENU_ERROR)
             frequency = _CUSTOM_FREQUENCIES[custom[2]]
             if custom[1]:
-                interval = f";INTERVAL={custom[1]}"
-        fields = f"FREQ={frequency}{interval}{_repeat_days(frequency, selector, start)}"
-    result = repeat_rule.parse(fields + end)
+                interval = int(custom[1])
+        result = repeat_rule.RepeatRule(frequency, interval, _repeat_days(frequency, selector, start), end)
+    result = repeat_rule.parse(result.rrule)
     result.validate_start(start)
     return result
 
 
-def read_schedule(text: str, *, now: datetime, zone: ZoneInfo) -> the_list.ScheduledRun | the_list.ScheduledSeries:
-    """Read the instruction, start and repeat from the user's words."""
+def read_schedule(text: str, *, now: datetime, zone: ZoneInfo) -> Scheduled:
+    """Read the instruction, start, and repeat from the user's words."""
     parts = re.fullmatch(r"(.+)\s+Start\s+(.+)", text.strip(), re.IGNORECASE | re.DOTALL)
     if parts is None or not parts[1].strip():
         raise ValueError("Give the instruction followed by Start and a date and time.")
@@ -224,22 +247,39 @@ def read_schedule(text: str, *, now: datetime, zone: ZoneInfo) -> the_list.Sched
     start = _start_time(start_words.strip(), now=now, zone=zone)
     run = the_list.ScheduledRun(start, parts[1].strip())
     rule = _repeat(repeat_words.strip().removesuffix(".").rstrip(), start)
-    return the_list.ScheduledSeries(run, rule) if isinstance(rule, repeat_rule.RepeatRule) else run
+    if isinstance(rule, NoRepeat):
+        return run
+    limit = the_list.series_run_limit()
+    if isinstance(rule.end, repeat_rule.RunCount) and rule.end.count > limit:
+        raise ValueError(f"The repeat exceeds the series limit of {limit} runs.")
+    return the_list.ScheduledSeries(run, rule)
 
 
-def _say_schedule(schedule: the_list.ScheduledRun | the_list.ScheduledSeries) -> None:
+def schedule_lines(schedule: Scheduled) -> tuple[str, str]:
     start = schedule.first.start if isinstance(schedule, the_list.ScheduledSeries) else schedule.start
-    print(f"Starts: {start:%a %b %-d %Y %H:%M %Z}", flush=True)
-    if isinstance(schedule, the_list.ScheduledSeries):
-        print(f"Repeats: {schedule.rule.describe(start)}", flush=True)
-    else:
-        print("Does not repeat", flush=True)
+    eastern = start.astimezone(_EASTERN)
+    starts = f"Starts: {start:%a %b %-d %Y %H:%M %Z}"
+    if start.utcoffset() != eastern.utcoffset():
+        equivalent = "%H:%M %Z" if start.date() == eastern.date() else "%a %b %-d %Y %H:%M %Z"
+        starts += f" ({eastern:{equivalent}})"
+    if isinstance(schedule, the_list.ScheduledRun):
+        return starts, "Does not repeat"
+    rule = schedule.rule
+    if isinstance(rule.end, repeat_rule.RunUntil):
+        calendar_date = rule.end.utc.astimezone(start.tzinfo).date()
+        cadence = replace(rule, end=repeat_rule.RepeatUntilLimit.REACHED).describe(start)
+        return starts, f"Repeats: {cadence} until {calendar_date:%b %-d, %Y}"
+    return starts, f"Repeats: {rule.describe(start)}"
+
+
+def _say_schedule(lines: tuple[str, str]) -> None:
+    print(*lines, sep="\n", flush=True)
 
 
 def usage() -> str:
     return "\n".join((
         FORM,
-        f"Types: {', '.join(ItemType)}",
+        f"Types: {', '.join((*ItemType, new_item_dialog.SCHEDULED_KIND))}",
         "Assignee: a producer, a showrunner or a unit",
         "/new_item scheduled natedev Set the time zone back to Eastern time. Start Fri Nov 27 13:00.",
     ))
@@ -283,7 +323,7 @@ def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, 
     return f"{question}\n{producers}"
 
 
-def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_map.MappedProducer,
+def result_line(item_type: ItemType | Literal["scheduled"], member: staff.StaffRow, mapped: producer_map.MappedProducer,
                 members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
     """Say who does the work, who tracks it and why, and the List item number."""
     to = unit_of(member, members) + (", this session" if this_session else "")
@@ -292,7 +332,7 @@ def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_ma
         why = "set for" if mapped.set_by == member else "from"
         producer = f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
     number = list_key.partition("/")[2].removeprefix("L")
-    return f"{item_type.value.capitalize()} → {to}.{producer} List item {number}."
+    return f"{item_type.capitalize()} → {to}.{producer} List item {number}."
 
 
 def console_address() -> for_you.ConsoleAddress:
@@ -400,6 +440,81 @@ def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.Map
         _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
 
 
+class FilingRefused(ValueError):
+    """The filing checks failed before the item was saved."""
+
+    def __init__(self, outcome: Outcome, reason: str) -> None:
+        super().__init__(reason)
+        self.outcome: Outcome = outcome
+
+
+def _assignment(assignee: str, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, producer_map.MappedProducer]:
+    member = producer_map.find_member(assignee, members, producer_map.ASSIGNEE_KINDS)
+    if isinstance(member, producer_map.UnknownMember):
+        raise FilingRefused(Outcome.UNKNOWN_NAME, unknown_name(member, members))
+    mapped = producer_map.producer_for(member.id, members)
+    if isinstance(mapped, producer_map.NoProducer):
+        raise FilingRefused(Outcome.NO_PRODUCER, producer_question(member, mapped, members))
+    return member, mapped
+
+
+def _checked_schedule(words: str) -> Scheduled:
+    try:
+        return read_schedule(words, now=the_list.now(), zone=user_zone())
+    except (ValueError, OverflowError) as error:
+        raise FilingRefused(Outcome.REFUSED, str(error)) from error
+
+
+class ListAssignmentNotice(Protocol):
+    def __call__(self, item: the_list.ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId, *,
+                 caller: staff.StaffId) -> int: ...
+
+
+def _assignment_warning(item: the_list.ListItem, keeper: staff.StaffId, member: staff.StaffRow,
+                        members: staff.StaffSnapshot) -> str:
+    # Use the List CLI sender until the List exports its assignment notice function.
+    send = cast(ListAssignmentNotice, getattr(the_list, "_notify_producer_assignment"))
+    showrunner = producer_map.showrunner_of(member, members)
+    notice_item = replace(item, owner=showrunner.id) if showrunner.id != item.owner else item
+    try:
+        if send(notice_item, keeper, keeper, caller=keeper) == 0:
+            return ""
+    except (ValueError, OSError, staff.StaffRefused) as error:
+        print(f"new_item: {error}", file=sys.stderr)
+    return "At least one assignment notice failed. The List item is saved."
+
+
+@dataclass(frozen=True)
+class SavedScheduledItem:
+    id: str
+    list_key: str
+    receipt: str
+    readback: tuple[str, str]
+    notice_warning: str
+
+
+def create_scheduled(assignee: str, words: str, *,
+                     show_schedule: Callable[[tuple[str, str]], None] | None = None) -> SavedScheduledItem:
+    """File Nate's Scheduled item with the selected owner and its mapped producer."""
+    schedule = _checked_schedule(words)
+    members = staff.snapshot()
+    member, mapped = _assignment(assignee, members)
+    keeper = the_list.producer_id(members, "morty")
+    run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
+    if run.start.astimezone(UTC) <= the_list.now():
+        raise FilingRefused(Outcome.REFUSED, "The start must be in the future.")
+    readback = schedule_lines(schedule)
+    if show_schedule is not None:
+        show_schedule(readback)
+    item = the_list.add(keeper, " ".join(run.words.split()), owner=member.id, source=SOURCE, changes={
+        "state": the_list.ItemState.SCHEDULED, "schedule": schedule, "producer": mapped.producer.id,
+        "unit": member.name if member.kind == "unit" else "",
+    })
+    key = f"{keeper}/{item.id}"
+    receipt = result_line(new_item_dialog.SCHEDULED_KIND, member, mapped, members, this_session=False, list_key=key)
+    return SavedScheduledItem(item.id, key, receipt, readback, _assignment_warning(item, keeper, member, members))
+
+
 class Arguments(argparse.Namespace):
     item_type: str = ""
     assignee: str = ""
@@ -419,7 +534,7 @@ def main(arguments: list[str] | None = None) -> int:
         return main_publish.forward("review_links/new_item.py", [*argv, "--session", staff.caller_identity()],
                                     label="new_item", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
     parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__)
-    _ = parser.add_argument("item_type", type=str.lower, choices=[kind.value for kind in ItemType])
+    _ = parser.add_argument("item_type", type=str.lower, choices=(*ItemType, new_item_dialog.SCHEDULED_KIND))
     _ = parser.add_argument("assignee")
     _ = parser.add_argument("description")
     _ = parser.add_argument("extra", nargs="?", default="")
@@ -428,42 +543,22 @@ def main(arguments: list[str] | None = None) -> int:
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.description.strip():
         parser.error("the description is empty")
-    item_type = ItemType(args.item_type)
-    schedule: the_list.Schedule = the_list.NoSchedule.UNSET
-    if item_type is ItemType.SCHEDULED:
-        try:
-            schedule = read_schedule(f"{args.description} {args.extra}", now=the_list.now(), zone=user_zone())
-        except (OSError, ValueError, OverflowError) as error:
-            print(f"new_item: {error}", file=sys.stderr)
-            return Outcome.REFUSED
-        if args.preview:
-            _say_schedule(schedule)
-            return 0
-    elif args.preview:
+    if args.preview and args.item_type != new_item_dialog.SCHEDULED_KIND:
         parser.error("--preview requires the scheduled type")
     try:
-        members = staff.snapshot()
-        member = producer_map.find_member(args.assignee, members, producer_map.ASSIGNEE_KINDS)
-        if isinstance(member, producer_map.UnknownMember):
-            print(unknown_name(member, members))
-            return Outcome.UNKNOWN_NAME
-        mapped = producer_map.producer_for(member.id, members)
-        if isinstance(mapped, producer_map.NoProducer):
-            print(producer_question(member, mapped, members))
-            return Outcome.NO_PRODUCER
-        if not isinstance(schedule, the_list.NoSchedule):
-            keeper = the_list.producer_id(members, "morty")
-            run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
-            if run.start.astimezone(UTC) <= the_list.now():
-                print("new_item: The start must be in the future.", file=sys.stderr)
-                return Outcome.REFUSED
-            _say_schedule(schedule)
-            item = the_list.add(keeper, " ".join(run.words.split()), owner=member.id, source=SOURCE, changes={
-                "state": the_list.ItemState.SCHEDULED, "schedule": schedule, "producer": mapped.producer.id,
-                "unit": member.name if member.kind == "unit" else "",
-            })
-            print(result_line(item_type, member, mapped, members, this_session=False, list_key=f"{keeper}/{item.id}"))
+        if args.item_type == new_item_dialog.SCHEDULED_KIND:
+            words = f"{args.description} {args.extra}"
+            if args.preview:
+                _say_schedule(schedule_lines(_checked_schedule(words)))
+            else:
+                saved = create_scheduled(args.assignee, words, show_schedule=_say_schedule)
+                print(saved.receipt)
+                if saved.notice_warning:
+                    print(saved.notice_warning)
             return Outcome.FILED
+        item_type = ItemType(args.item_type)
+        members = staff.snapshot()
+        member, mapped = _assignment(args.assignee, members)
         address = console_address()
         options = read_options(address)
         recipient = recipient_for(member, options, members)
@@ -476,6 +571,12 @@ def main(arguments: list[str] | None = None) -> int:
         if reply.status != 200 or not isinstance(list_key, str):
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
+    except FilingRefused as error:
+        if error.outcome is Outcome.REFUSED:
+            print(f"new_item: {error}", file=sys.stderr)
+        else:
+            print(error)
+        return error.outcome
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED

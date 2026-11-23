@@ -700,17 +700,13 @@ OWNER_OPTIONS_PROBE = r"""
   words.value = 'Check a proposal for this recipient.';
   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
   check(!send.disabled, 'The alternate recipient enables Send.');
-  dialog.querySelector('[data-kind="scheduled"] input').click();
+  const scheduledInput = dialog.querySelector('[data-kind="scheduled"] input');
+  scheduledInput.click();
   const scheduled = dialog.querySelector('[data-scheduled-help]');
-  const command = scheduled.querySelector('code');
-  words.value = 'Check the queue. Start 2027-01-15T13:00.';
-  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
-  check(!scheduled.hidden && command.textContent === '/new_item scheduled cargo-liner ' + words.value,
-        'Scheduled displays a command with the selected recipient and instruction.');
   const hidden = element => getComputedStyle(element).display === 'none';
-  check(hidden(send) && send.disabled && hidden(dialog.querySelector('[data-sent-details]')) &&
+  check(!hidden(send) && !send.disabled && !hidden(scheduled) && hidden(dialog.querySelector('[data-sent-details]')) &&
         hidden(dialog.querySelector('[data-saved-controls]')),
-        'Scheduled uses the command to file the item.');
+        'Scheduled keeps Send and shows the schedule fields.');
   dialog.querySelector('[data-kind="proposal"] input').click();
   check(scheduled.hidden && !send.hidden && !dialog.querySelector('[data-sent-details]').hidden,
         'The other types can send from the dialog.');
@@ -723,6 +719,33 @@ OWNER_OPTIONS_PROBE = r"""
   inputs().find(input => input.value === alternate.value).click();
   check(selected() === alternate.value && !send.disabled && status.hidden,
         'An explicit selection enables Send and hides the notice.');
+  scheduledInput.click();
+  words.value = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  const sendResponse = window.fetch;
+  let posted;
+  window.fetch = (path, options) => {
+   if (path === '/console/review/new-item' && options?.body) {
+    const payload = JSON.parse(options.body);
+    if (payload.kind === 'scheduled') {
+     posted = payload;
+     return Promise.resolve(Response.json({id:'L12', readback:[
+      'Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)', 'Repeats: Daily'
+     ]}));
+    }
+   }
+   return sendResponse(path, options);
+  };
+  const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+  send.click();
+  await saved;
+  check(posted?.recipient_id === alternate.value && posted.words === words.value &&
+        posted.page_recipient === 'selected' && !('capture_key' in posted),
+        'Scheduled sends the selected owner and words without capture fields.');
+  check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
+        dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
+        dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
+        'The confirmation shows the saved List number, repeat, and selected type.');
  } catch (error) { failures.push(String(error)); }
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
@@ -896,6 +919,11 @@ const send = async () => {
    dialog.querySelector('[type="submit"]').click();
    await whenVisible(dialog.querySelector('.new-item-error'));
    const first = wire.at(-1);
+   const scheduled = dialog.querySelector('[data-kind="scheduled"] input');
+   scheduled.click();
+   check(scheduled.disabled && !scheduled.checked &&
+         dialog.querySelector('[name="kind"]:checked').value === 'bug',
+         'A pending Bug prevents a change to Scheduled.');
    const beforePreview = previewRequests;
    previewPending = true;
    releaseCapture();
@@ -908,6 +936,7 @@ const send = async () => {
 
    trigger.closest('[data-page-owner]').dataset.pageOwner = 'list';
    await open();
+   check(!scheduled.disabled, 'Recovering the earlier Bug enables Scheduled.');
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep the pending screenshot after a lost List response.');
    loseSend = true;
