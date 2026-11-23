@@ -195,7 +195,7 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
         # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,
-        # Step comes after Verify, no Unit or Slot column, and a running row's Target is only its machine.
+        # Step comes after Verify, no Unit or Slot column, and a running row's Machine cell is one icon.
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
@@ -223,9 +223,9 @@ class MemoryHoverTests(unittest.TestCase):
             + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
         root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
         self.assertEqual([cell.text for cell in root.findall(".//thead/tr/th")],
-                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Target", "vCPU", "Tokens"])
+                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"])
         self.assertEqual([cell.text for cell in root.findall(".//tr[@class='queue-head']/th")],
-                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Target", "vCPU"])
+                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"])
         self.assertEqual(root.findall(".//*[@class='unit']") + root.findall(".//*[@class='slot']"), [])
         for key, verify, step in (("row:fixture-run-0", "test", "nextest hana"), ("row:fixture-run-2", "", "gate"),
                                   ("wait:fixture-wait-0", "", "test affected")):
@@ -242,10 +242,12 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(key=key):
                 cell = root.find(f".//tr[@data-tip='{key}']/td[@class='machine']")
                 assert cell is not None
-                self.assertEqual((cell.get("data-machine"), "".join(cell.itertext()), list(cell)), (machine, machine, []))
+                self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in cell],
+                                 [("machine machine-icon run", machine)])
         waiting_target = root.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
         assert waiting_target is not None
-        self.assertEqual("".join(waiting_target.itertext()), "natedev or mac-linux or hana-aws")
+        self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in waiting_target],
+                         [("machine machine-icon dim", name) for name in ("natedev", "mac-linux", "hana-aws")])
         # Each machine name in the hover shows in its machine color.
         def machines(*names: str) -> str:
             return " or ".join(f'<span class="machine" data-machine="{name}">{name}</span>' for name in names)
@@ -774,7 +776,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Target", "vCPU", "Tokens"])
+                                 ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
@@ -789,7 +791,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Target", "vCPU"])
+                                     ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")

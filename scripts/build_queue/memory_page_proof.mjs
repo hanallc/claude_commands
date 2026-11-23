@@ -57,8 +57,8 @@ const queueRowsProof = previousPage === '--queue-rows';
 const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
-const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Target','vCPU','Tokens'];
-const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Target','vCPU'];
+const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
+const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU'];
 
 async function assertRowCenters(evaluate) {
   const rows = await evaluate(`(() => {
@@ -502,8 +502,9 @@ try {
           break browserProof;
         }
         if (queueRowsProof || !focusedProof) {
-          // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it, and a running row's
-          // Target shows only its machine. The gate checks these rows too; only --queue-rows takes the shot.
+          // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it. The Machine column
+          // shows icons: one bright icon where a step runs, and one dim icon for each machine that can take a waiting step.
+          // The gate checks these rows too; only --queue-rows takes the shot.
           // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
           const shootBefore = queueRowsProof && beforePage;
@@ -528,9 +529,9 @@ try {
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          // At 900 px the walk is tight: waiting cells wrap, but no word and no machine name is cut or split.
+          // At 800 px the walk is tight: a waiting step wraps, but no word is cut. No icon row wraps at any width.
           let rows;
-          for (const width of shootBefore ? [1440] : [1440, 900]) {
+          for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
             await navigate(shootBefore ? 'before.html' : 'memory_live.html');
             rows = await evaluate(`(() => {
@@ -545,50 +546,49 @@ try {
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
-                  table(key).querySelector('.step').textContent,table(key).querySelector('td.machine').textContent]),
+                  table(key).querySelector('.step').textContent]),
+                icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
+                  [icon.getAttribute('aria-label'), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
+                wrappedIcons:[...walk.querySelectorAll('tbody td.machine')].filter(cell =>
+                  new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
+                  .map(cell => cell.closest('tr').dataset.tip),
+                legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
+                  [key.textContent, key.querySelector('.machine-icon')?.dataset.machine]),
                 colors:[chart(keys[0]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(chart(keys[4]).querySelector('.name')),
-                waitingTargetLines:(() => {
-                  const list = table(keys[4]).querySelector('.wait-target');
-                  return list ? lines(list) : 0;
-                })(),
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
                 })(),
                 cutSteps:[...walk.querySelectorAll('tbody .step .cell-text')]
                   .filter(text => text.scrollWidth > text.clientWidth).map(text => text.textContent),
-                splitMachines:[...walk.querySelectorAll('tr.wait .wait-target .machine')]
-                  .filter(machine => machine.getClientRects().length > 1).map(machine => machine.textContent),
-                // A machine name is a Target cell with no list in it, or one name in a waiting list.
-                machineColors:[...walk.querySelectorAll('tbody td.machine:not(:has(.machine)), tbody td.machine .machine')]
-                  .filter(name => !['', '—'].includes(name.textContent)).map(name => [name.textContent, getComputedStyle(name).color,
-                    getComputedStyle(name.closest('tr')).color]),
+                machineColors:[...walk.querySelectorAll('tbody td.machine .machine')].map(icon => [icon.dataset.machine,
+                  getComputedStyle(icon).color, getComputedStyle(icon.closest('tr')).color]),
                 clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
             })()`);
             if (!shootBefore) {
               await assertRowCenters(evaluate);
               assert.deepEqual(rows.headers, runningHeaders);
-              assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest','natedev'],
-                ['queue','builds','','gate','mac-linux'],['terminal','hana','','build','mac'],['hana CI','','','','natedev'],
-                ['admin-console','builds','','test affected','natedev or hana-aws']]);
+              assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
+                ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
+                ['admin-console','builds','','test affected']]);
+              assert.deepEqual(rows.icons, [[['natedev','img','run']],[['mac-linux','img','run']],[['mac','img','run']],
+                [['natedev','img','run']],[['natedev','img','dim'],['hana-aws','img','dim']]]);
+              assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
+              assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-              assert.equal(rows.tight, width === 900, `The walk at ${width} px has the wrong tight state.`);
+              assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
               assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
               assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
-              assert.deepEqual(rows.splitMachines, [], `A waiting machine name breaks at ${width} px.`);
               assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
-                'A Target machine name has no machine color.');
+                'A Machine icon has no machine color.');
               const macColor = 'rgb(' + reading.colors.dark.machines.mac.slice(1).match(/../g)
                 .map(part => parseInt(part, 16)).join(', ') + ')';
               assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
-                'The mac-linux Target has no mac color.');
-              if (width === 1440) {
-                assert.equal(rows.waitingTargetLines, 1, 'The waiting Target list wraps.');
-                assert.equal(rows.headingCut, false, 'The queued heading is cut.');
-              }
+                'The mac-linux icon has no mac color.');
+              if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
             }
             if (queueRowsProof) {
               const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
@@ -799,7 +799,7 @@ try {
         await waitForLine('typesafe · test affected moved from 2 to 1');
         assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
-        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] td.machine .machine').dataset.machine`), 'mac');
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
@@ -1472,11 +1472,12 @@ try {
                 element.childElementCount===0 && element.textContent.includes('no update for'));
               return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
                 running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
-                machine:running?.querySelector('.machine')?.textContent,
+                machine:running?.querySelector('td.machine .machine')?.dataset.machine,
                 place:waiting?.querySelector('.place')?.textContent,
-                waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                waitingMachine:waiting?.querySelector('td.machine .machine')?.dataset.machine,
                 localWaiting:(() => {const index=latest.waiters.findIndex(row=>row.kind!=='cloud');
-                  return index<0?null:{shown:table.querySelector('tr[data-tip="'+proofTip('wait',index)+'"] .machine')?.textContent,
+                  return index<0?null:{shown:[...table.querySelectorAll('tr[data-tip="'+proofTip('wait',index)+'"] td.machine .machine')]
+                    .map(icon=>icon.dataset.machine).join(' or '),
                     targets:(latest.waiters[index].targets||[]).join(' or ')};})(),
                 beside:document.querySelector('#walk').classList.contains('beside'),
                 statusHeight:runningDetails?.querySelector('.amounts')?.getBoundingClientRect().height,
@@ -1520,7 +1521,7 @@ try {
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
             assert.equal(cloudProof.waitingMachine,'aws');
-            // The user, 11-15: a queued row names the machines that can take it in the Target column.
+            // The user, 11-15: a queued row shows the machines that can take it in the Machine column.
             assert.ok(cloudProof.localWaiting && cloudProof.localWaiting.targets,'The fixture has no local waiting row with targets.');
             assert.equal(cloudProof.localWaiting.shown,cloudProof.localWaiting.targets);
             // The user, 11-15: a cloud status wraps one letter to a line when its room before the cap is narrow.
@@ -2188,7 +2189,7 @@ try {
               return {name:chart.querySelector('.name').textContent,
                 small:chart.querySelector('.owner').textContent,
                 step:table.querySelector('.step').textContent,
-                machine:table.querySelector('.machine').textContent};
+                machine:table.querySelector('td.machine .machine')?.dataset.machine};
             })()`);
             assert.equal(row.machine,'aws');
             assert.equal(row.name,version==='before'?'nextest':'research');
@@ -2198,9 +2199,9 @@ try {
             await evaluate(`showTip(proofTip('row', 0),180,160)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             if(version==='after') {
-              assert.match(tooltip,/showrunner\s*:?\s*hana/);
-              assert.match(tooltip,/unit\s*:?\s*research/);
-            } else assert.match(tooltip,/owner not recorded/);
+              assert.match(tooltip,/^research · nextest\n/);
+              assert.match(tooltip,/\nShowrunner\nhana\n/);
+            } else assert.doesNotMatch(tooltip,/not recorded/,'The hover shows an owner that is not recorded.');
             await capture(version+'-aws-tooltip','#tip');
             if (comparisonImages) comparisons.push({version,...row,tooltip});
           }
@@ -2728,7 +2729,7 @@ try {
                   remoteColor:getComputedStyle(macBar).backgroundColor,
                   awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
                   localColor:getComputedStyle(document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .seg-used')).backgroundColor,
-                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
+                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] td.machine .machine')].map(icon=>getComputedStyle(icon).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
                   waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .step')?.textContent,
                   waitingOwner:document.querySelector('.wrow[data-tip="' + proofTip('wait', 0) + '"] .owner')?.textContent,

@@ -2288,22 +2288,31 @@ This includes Build tools, unowned Mac builds, compiler cache, unowned processes
 The small text is empty when the showrunner is the same name as the unit.
 `Step` shows the step only when the feed's `title.unit` names a unit. When the step text is the unit, the feed sends an empty `title.unit`, so `Step` stays empty and the unit does not show twice.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
-For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Target`, `vCPU`, and `Tokens`.
+For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Machine`, `vCPU`, and `Tokens`.
 The waiting table uses `#` and `Waiting`, and omits `Tokens`.
 The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
 On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
-A running row's `Target` cell shows only the machine that runs the step, such as `natedev`, `mac`, `mac-linux`, or `aws`, in the machine's color.
+On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): the `Machine` column shows icons, not names.
+`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon: lucide `server` for `natedev`, lucide `laptop` for `mac`, and lucide `cloud` for `aws`.
+`mac-linux` is the laptop with a 🐧 badge. `hana-aws` is the cloud with a 🌸 badge. `hana-gpu` is the cloud with a ⚡ badge.
+One hidden `<svg>` at the top of the page defines each symbol once, and each icon uses it with `<use href>`.
+The badge is CSS text from the icon's `data-badge`, so it is not page text.
+Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
+A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
-The row hover lists the other machines that the step named, under `Named targets`.
-A waiting row's `Target` cell lists each machine that can take the step, joined by `or`.
-Waiting rows size the `Step` and `Target` columns too, so each step and each list shows on one line; a new waiting row can move the columns to their right.
-In a tight pane a waiting step breaks between words, and a waiting list breaks between machines, never inside a machine name.
-There, a waiting cell sizes its column by its widest word or widest machine name, so no word is cut.
-Each machine name on the page shows in its machine color: in the `Target` cells, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
+The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
+A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
+A machine with no icon shows its name as text in its machine color.
+An icon keeps the 20 px text line, so it does not make a row taller, and a row of icons never wraps.
+Waiting rows size the `Step` column, so each step shows on one line; a new waiting row can move the columns to its right.
+In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
+A legend under the table shows `Legend:`, then each of the six icons with its name.
+Each machine on the page shows in its machine color: the `Machine` icons, the legend, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
 The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
-`mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` is the AWS box, so it uses the `aws` color.
+`mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` and `hana-gpu` are AWS boxes, so they use the `aws` color.
 Every match in the map ignores case, so the hover words `Mac` and `AWS` match their machines.
 The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. The `--queue-heading-gap` CSS property holds the gap between the heading and the table, and `fitWalkDetails` reads it. With no room, the heading ends in an ellipsis and its hover gives the full text.
 `Verify` shows the Rust verify verb when the feed records a Verify call.
@@ -2336,8 +2345,10 @@ A longer queued name wraps at a space inside that width, so a one-word unit name
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
-It also fails when a `Target` machine name has no machine color, or a `mac-linux` cell does not show the `mac` color.
-It checks the queued rows at 1440 px and in a tight pane at 900 px. It fails when a waiting unit name takes two lines, a Step cell is cut, or a waiting machine name breaks.
+It also fails when a `Machine` icon has no machine color, or the `mac-linux` icon does not show the `mac` color.
+It checks the queued rows at 1440 px, at 900 px, and in a tight pane at 800 px.
+It fails when a running row does not show one bright icon with its machine name, or a waiting row does not show one dim icon for each machine that can take it.
+It also fails when a row of icons wraps, the legend does not show the six machines, a waiting unit name takes two lines, or a Step cell is cut.
 The other checks hide scrollbars. One more load at 1440 px shows them, and the proof fails when the Running and Queued scroll box shows a scrollbar or can scroll.
 `--queue-rows` also saves that card's right edge as `after-edge.png`, or `before-edge.png` for a before page.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.

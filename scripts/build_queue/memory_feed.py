@@ -519,7 +519,7 @@ class PageOwnerLabels(TypedDict):
     worker: str
 
 
-# The machine names that rows show in the Target column, and the words for them in "can run on" text.
+# The machine names that rows show in the Machine column, and the words for them in "can run on" text.
 LOCAL_TARGET = "natedev"
 MAC_TARGET = "mac"
 TARGET_WORDS = {MAC_TARGET: "Mac"}

@@ -182,10 +182,18 @@ __PAGE_FRAME_STYLE__
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 /* The one machine color map. Each name matches without case, so the hover words "Mac" and "AWS" match too.
-   mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws is the AWS box, so it takes the aws color. */
+   mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws and hana-gpu are AWS boxes, so they take the aws color. */
 .machine[data-machine="natedev" i] { color: var(--machine-natedev); }
 .machine:is([data-machine="mac" i], [data-machine="mac-linux" i]) { color: var(--machine-mac); }
-.machine:is([data-machine="aws" i], [data-machine="hana-aws" i]) { color: var(--machine-aws); }
+.machine:is([data-machine="aws" i], [data-machine="hana-aws" i], [data-machine="hana-gpu" i]) { color: var(--machine-aws); }
+/* A machine icon keeps the 20px text line, so it never makes a row taller. Its badge is CSS text, not page text. */
+.machine-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 24px;
+  margin-block: -2px; vertical-align: top; border-radius: 6px; }
+.machine-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.machine-icon[data-badge]::after { content: attr(data-badge); position: absolute; right: -7px; bottom: -5px;
+  font: 14px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
+.machine-icon.run { background: color-mix(in srgb, var(--ink) 7%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 16%, transparent); }
+.machine-icon.dim { opacity: 0.5; }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
@@ -342,18 +350,15 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .step { width: var(--step); min-width: var(--step); }
-.walk-table .machine { width: var(--machine); min-width: var(--machine); }
+.walk-table td.machine > * + * { margin-left: 10px; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
-/* A waiting step and its targets size the Step and Target columns (fitWalkDetails). In a tight pane they wrap
-   inside them. A step breaks between words, and a target list breaks only between machines, never inside hana-aws.
-   The column is never narrower than the widest word or machine name. */
+/* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
+   The column is never narrower than the widest word. */
 .walk-table .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; }
 .walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; white-space: normal; }
-.walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
-.walk-table .wait-target .machine { white-space: nowrap; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - var(--queue-heading-gap)); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -414,8 +419,12 @@ body.queue-unavailable .card { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
-.walk-key { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 0.85rem; }
-.walk-key .key { display: inline-flex; align-items: center; gap: 6px; cursor: help; }
+.walk-key, .machine-key { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; color: var(--ink-2); font-size: 0.85rem; }
+.walk-key { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.machine-key { margin-top: 8px; }
+.walk-key .key, .machine-key .key { display: inline-flex; align-items: center; gap: 6px; }
+.walk-key .key { cursor: help; }
+.machine-key .key { gap: 12px; color: var(--ink); }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -426,6 +435,11 @@ body.queue-unavailable .card { display: none; }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+  <symbol id="machine-server" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></symbol>
+  <symbol id="machine-laptop" viewBox="0 0 24 24"><path d="M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z"/><path d="M20.054 15.987H3.946"/></symbol>
+  <symbol id="machine-cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></symbol>
+</svg>
 <main class="page-wide">
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   __PAGE_TITLE__
@@ -525,6 +539,7 @@ body.queue-unavailable .card { display: none; }
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
       <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
     </div>
+    <div class="machine-key" id="machine-key" aria-hidden="true"></div>
   </section>
 
   <details class="card legend-box" id="build-limits" hidden>
@@ -584,6 +599,19 @@ function nameParts(parts) {
 // A machine name shows in its machine color (the .machine rules).
 function machineName(name) {
   return `<span class="machine" data-machine="${esc(name)}">${esc(name)}</span>`;
+}
+// The icon of each known machine: a lucide symbol, and a badge for the Mac Linux guest and the hana AWS boxes.
+const MACHINE_ICONS = new Map([["natedev", {symbol: "server"}], ["mac", {symbol: "laptop"}],
+  ["mac-linux", {symbol: "laptop", badge: "🐧"}], ["aws", {symbol: "cloud"}],
+  ["hana-aws", {symbol: "cloud", badge: "🌸"}], ["hana-gpu", {symbol: "cloud", badge: "⚡"}]]);
+// A known machine shows as its icon in its machine color, with its name as the accessible name.
+// An unknown machine shows its name. The state is "run", "dim" or "".
+function machineIcon(name, state = "") {
+  const icon = MACHINE_ICONS.get(name.toLowerCase());
+  if (!icon) return machineName(name);
+  return `<span class="machine machine-icon${state && " " + state}" data-machine="${esc(name)}"` +
+    `${icon.badge ? ` data-badge="${icon.badge}"` : ""} role="img" aria-label="${esc(name)}">` +
+    `<svg aria-hidden="true"><use href="#machine-${icon.symbol}"></use></svg></span>`;
 }
 // "natedev or Mac" and "natedev only" give each machine name its color.
 function machineParts(text) {
@@ -859,7 +887,7 @@ function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
 }
 function ciRow(row) { return row.ci || !!row.ci_label; }
-const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
+const STEP_TABLE_HEADERS = {machine: "Machine", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
   return /not recorded/.test(shown) || /^(?:session:)?[a-f0-9]{8}(?:-?[a-f0-9]{4}){3}-?[a-f0-9]{12}$/i.test(shown)
@@ -1185,6 +1213,8 @@ function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 __PAGE_REFRESH_SCRIPT__
 const $ = (id) => document.getElementById(id);
+$("machine-key").innerHTML = "<span>Legend:</span>" + [...MACHINE_ICONS.keys()]
+  .map(name => `<span class="key">${machineIcon(name)}${name}</span>`).join("");
 function setSeg(id, value, total) {
   $(id).style.flex = `0 1 ${value / total * 100}%`;
 }
@@ -1844,13 +1874,13 @@ function renderWalk(d) {
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
   };
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
-  // A step that runs shows only its machine; the row tooltip names the other targets. A step that waits lists them all.
+  // A step that runs shows the bright icon of its machine; the row tooltip names the other targets.
+  // A step that waits shows a dim icon for each machine that can take it.
   const targetCell = (machine, named) => {
-    if (machine || !named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
-    const labels = named.map(machineName).join(" or ");
-    return `<td class="machine" data-machine="${esc(named.join(" or "))}"><span class="wait-target">${labels || "—"}</span></td>`;
+    const icons = machine ? machineIcon(machine, "run") : (named || []).map(name => machineIcon(name, "dim")).join("");
+    return `<td class="machine">${icons || "—"}</td>`;
   };
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
@@ -1979,14 +2009,12 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    // Waiting steps and targets size their columns, so each stays on one line. In a tight pane they wrap,
-    // so only the widest word of a waiting step or the widest machine name of a waiting list counts.
-    const tight = name !== "duration" && walk.classList.contains("tight");
+    // Waiting steps size the Step column, so each stays on one line. In a tight pane a waiting step wraps,
+    // so only its widest word counts.
+    const tight = name === "step" && walk.classList.contains("tight");
     const widths = [...table.querySelectorAll(`tr > .${name}`)].map(cell => {
       context.font = canvasFont(cell);
-      const machines = [...cell.querySelectorAll(".machine")].map(machine => machine.textContent);
-      const parts = !tight || !cell.closest("tr.wait") ? [cell.textContent]
-        : machines.length ? machines : cell.textContent.split(/\s+/);
+      const parts = tight && cell.closest("tr.wait") ? cell.textContent.split(/\s+/) : [cell.textContent];
       return Math.max(...parts.map(part => context.measureText(part).width)) + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
@@ -1998,7 +2026,6 @@ function fitWalkDetails() {
   }
   measureColumn("duration");
   measureColumn("step");
-  measureColumn("machine");
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
@@ -2034,7 +2061,6 @@ function fitWalkDetails() {
   if (fit.remainingWidth < minimumTrackWidth) {
     walk.classList.add("tight");
     measureColumn("step");
-    measureColumn("machine");
     fit = measure(labelWidth);
   }
   root.classList.remove("layout-measuring");
@@ -2055,7 +2081,6 @@ function fitWalkDetails() {
   walk.classList.remove("measuring");
   measureColumn("duration");
   measureColumn("step");
-  measureColumn("machine");
   // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
   const range = track.getBoundingClientRect();
   const tableRight = walk.getBoundingClientRect().right - naturalWidth;

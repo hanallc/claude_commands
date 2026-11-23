@@ -571,7 +571,8 @@ class MemoryFeedTests(unittest.TestCase):
         text = "\n".join(tips["walk"][page["walk"].index(row)])
         self.assertIn("mac-linux: not enabled", text)
         self.assertIn("Named targets  Mac or natedev or mac-linux or hana-aws", text)
-        self.assertIn('<td class="machine" data-machine="mac">mac</td>', table)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("run", "mac")])
 
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
@@ -614,15 +615,14 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
 
     def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
-        # The user, 11-23: a running row shows where it runs; the named targets go in the tooltip.
+        # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
         page = self.guest_gate_page()
         row = next(row for row in page["walk"] if row["pid"] == 8200)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         cells = dict(cast(list[tuple[str, str]],
             re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
-        self.assertEqual(re.findall(r'<td class="machine"[^>]*>.*?</td>', cells[str(row.get("key"))], flags=re.S),
-                         ['<td class="machine" data-machine="mac-linux">mac-linux</td>'])
+        self.assertEqual(machine_icons(cells[str(row.get("key"))]), [("run", "mac-linux")])
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", "\n".join(tips["walk"][page["walk"].index(row)]))
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
@@ -694,17 +694,14 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
-                        # A queued row names the machines that can take it, in a span that wraps in the column.
+                        # A queued row shows a dim icon for each machine that can take it.
                         self.assertEqual(machine, "")
-                        targets = " or ".join(cast(list[str], row["targets"]))
+                        targets = cast(list[str], row["targets"])
                         self.assertTrue(targets)
-                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
-                                            for target in cast(list[str], row["targets"]))
-                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
-                                      cell)
+                        self.assertEqual(machine_icons(cell), [("dim", target) for target in targets])
                     else:
                         self.assertTrue(machine)
-                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
+                        self.assertEqual([name for _, name in machine_icons(cell)], [machine])
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
@@ -4485,6 +4482,20 @@ class BuildsPageProofTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).glob("*.png")), [])
             for report in ("proof.json", "steady-refresh.json"):
                 self.assertFalse((Path(directory) / report).exists())
+
+
+def machine_icons(row: str) -> list[tuple[str, str]]:
+    """Return the state and name of each machine in the Machine cell of one rendered table row.
+
+    An icon has the state "run" or "dim" and its name as its accessible name. An unknown machine is text, with no state.
+    """
+    cell = re.search(r'<td class="machine">(.*?)</td>', row, flags=re.S)
+    assert cell is not None
+    machines = cast(list[tuple[str, str, str]], re.findall(
+        r'<span class="machine(?: machine-icon (run|dim))?" data-machine="([^"]+)"(?:[^>]* role="img" aria-label="([^"]+)")?>',
+        cell.group(1)))
+    assert all(label == (name if state else "") for state, name, label in machines), machines
+    return [(state, name) for state, name, _ in machines]
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
