@@ -690,7 +690,7 @@ def page() -> bytes:
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"">' + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
+            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
             + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()

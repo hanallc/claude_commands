@@ -758,7 +758,7 @@ window.fetch=()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE});
   const view=document.querySelector('[data-accounts]');
   await refresh();
   check(document.querySelector('[data-accounts]')===view,'a draft keeps the old tables');
-  check(line().dataset.state==='Paused' && status().includes('A newer page loads when the open edit ends.'),
+  check(line().dataset.state==='Paused' && status().includes('A newer page loads at the next refresh after the open edit ends.'),
    'a draft defers the reload: '+status());
   draft.value='';
   sessionStorage.setItem('reload-probe',String(scrollY));

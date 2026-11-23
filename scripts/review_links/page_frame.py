@@ -174,16 +174,7 @@ CONSOLE_READY_SCRIPT = """(() => {
 })();"""
 
 
-REFRESH_SCRIPT = r'''function restoreScrollAfterReload(){
- try{
-  const key='page-reload-scroll:'+location.href,top=sessionStorage.getItem(key);
-  if(top===null) return;
-  sessionStorage.removeItem(key);
-  const restore=()=>scrollTo({top:Number(top),behavior:'instant'});
-  if(document.readyState==='complete') restore();else addEventListener('load',restore,{once:true});
- }catch{}
-}
-function pageHoldsInput(){
+REFRESH_SCRIPT = r'''function pageHoldsInput(){
  const shown=node=>node.checkVisibility ? node.checkVisibility() : node.getClientRects().length>0;
  if([...document.querySelectorAll('dialog[open],[role=dialog],[role=menu]')].some(shown)) return true;
  if(getSelection()?.isCollapsed===false) return true;
@@ -196,10 +187,10 @@ function reloadForNewScript(page){
  const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
  const fresh=version(page),own=version(document);
  if(!fresh || !own || fresh===own) return null;
- if(pageHoldsInput()) return {...pageRefreshFacts(page),busy:'A newer page loads when the open edit ends.'};
- try{sessionStorage.setItem('page-reload-scroll:'+location.href,String(scrollY));}catch{}
+ // The open page keeps showing its own data, so the status keeps its own data time.
+ if(pageHoldsInput()) return {...pageRefreshFacts(),busy:'A newer page loads at the next refresh after the open edit ends.'};
  location.reload();
- return pageRefreshFacts(page);
+ return pageRefreshFacts();
 }
 function pageRefreshFacts(page=document){
  const line=page.querySelector('[data-page-status]');
@@ -219,7 +210,6 @@ function restoreFocusAfterRefresh(){
  };
 }
 function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
- restoreScrollAfterReload();
  const line=document.querySelector('[data-page-status]');
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
