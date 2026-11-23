@@ -26,7 +26,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, parse
+from scripts.buildlog import charts, cost_actions, costs, machine_facts, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -386,6 +386,7 @@ class MemoryFeedTests(unittest.TestCase):
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "MACHINE_FACTS_FILE": str(self.root / "machine-facts.json"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
@@ -2728,6 +2729,29 @@ process.stdout.write(JSON.stringify({
                     "until": "until released"}])
                 self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
                 self.assertEqual({tuple(waiter.get("targets", ())) for waiter in page["waiters"]}, {("natedev", "mac")})
+
+    def test_feed_carries_saved_machine_facts_into_build_limits(self) -> None:
+        reading = queued_reading(captured_reading(), ())
+        now = reading.explanation.now
+        background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None, "USD"))
+        saved: machine_facts.SavedFacts = {"version": machine_facts.VERSION, "written": now, "machines": {
+            "natedev": machine_facts.facts("read", load=8.04, cpus=32),
+            "mac": machine_facts.facts("read", link_ms=3.2, load=1.5, cpus=12, battery={"percent": 85, "mains": True}),
+            "aws": machine_facts.facts("no_box")}}
+
+        def limits() -> limits_view.BuildLimits:
+            with mock.patch.object(admission_client, "view", return_value=reading), \
+                 mock.patch.object(time, "time", return_value=now):
+                page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: None)
+            shown = page.get("build_limits")
+            assert shown is not None
+            return shown
+
+        self.assertEqual(limits().mac.facts, "facts not sampled")
+        _ = (self.root / "machine-facts.json").write_text(json.dumps(saved))
+        shown = limits()
+        self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
+                         ("load 8.0/32", "link 3 ms · load 1.5/12 · battery 85% · not in use", "no box running"))
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())

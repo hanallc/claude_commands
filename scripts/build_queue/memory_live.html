@@ -102,7 +102,7 @@ __PAGE_FRAME_STYLE__
 .build-limit-gpu:not(:first-child) { border-inline-start: 1px solid var(--line); padding-inline-start: 8px; }
 .build-limit-metric .build-limit-marks { gap: 2px; }
 .build-limit-metric .build-limit-mark:not(.line) { width: 8px; height: 8px; }
-.build-limit-note { color: var(--ink-2); font-size: .8rem; font-weight: 400; overflow-wrap: anywhere; }
+.build-limit-note, .build-limit-facts { color: var(--ink-2); font-size: .8rem; font-weight: 400; overflow-wrap: anywhere; }
 .build-limit-cell .build-limit-marks { gap: 3px; }
 .build-limit-cell .build-limit-mark.free { width: 9px; height: 9px; }
 .build-limit-wait { margin-top: 5px; }
@@ -1435,6 +1435,7 @@ function renderBuildLimits(limits) {
     const data = limits[key];
     return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}>${esc(name)}
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
+    ${data.facts ? `<div class="build-limit-facts">${esc(data.facts)}</div>` : ""}
     ${!data.unattributed ? "" : key === "mac"
       ? `<div class="build-limit-count"><span class="build-limit-marks">${limitMarks("run", data.unattributed)}</span>
         <span>${esc(limitWords(words, "occupied", {count: data.unattributed}))}</span></div>`

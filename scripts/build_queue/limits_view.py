@@ -20,7 +20,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.slot_wait import public_queue_text
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
-from scripts.buildlog import charts, repository, store
+from scripts.buildlog import charts, machine_facts, repository, store
 from scripts.lib import conf, git_files
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -72,6 +72,19 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "legend_free": "A free place",
     "legend_line": "The limit",
     "legend_wait": "A run that waits",
+    "facts_link": "link {ms} ms",
+    "facts_load": "load {load}/{cpus}",
+    "facts_load_unreadable": "load unreadable",
+    "facts_battery_full": "battery 100% charged · not in use",
+    "facts_battery_mains": "battery {percent}% · not in use",
+    "facts_battery_in_use": "battery {percent}% · in use",
+    "facts_battery_unreadable": "battery unreadable",
+    "facts_unreachable": "link unreachable",
+    "facts_no_box": "no box running",
+    "facts_box_running": "box running · no link or load reading",
+    "facts_failed": "facts unreadable",
+    "facts_missing": "facts not sampled",
+    "facts_stale": "facts not sampled since {time}",
     records.TokenWaitingWaiter: WaitWords("1 run waits for permission to continue its Cargo work.",
         "{count} runs wait for permission to continue their Cargo work."),
     records.EstimateExpired: WaitWords("1 run waits because the queue needs a new memory estimate before it can start.",
@@ -181,6 +194,7 @@ class MachineLimits:
     waits: WaitGroups
     unattributed: int = 0
     unattributed_note: str = ""
+    facts: str = ""
 
 
 @dataclass(frozen=True)
@@ -827,10 +841,40 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
     return unattributed, "A Mac claim has no repository name that this page can show." if missing_scope else ""
 
 
+def facts_line(saved: machine_facts.SavedFacts | machine_facts.FactsUnread, machine: machine_facts.Machine, now: float,
+               zone: tzinfo) -> str:
+    """One line of link delay, load and battery under a machine heading."""
+    if isinstance(saved, machine_facts.FactsUnread) or machine not in saved["machines"]:
+        return PAGE_WORDS["facts_missing"]
+    if now - saved["written"] > machine_facts.STALE_SECONDS:
+        return PAGE_WORDS["facts_stale"].format(time=datetime.fromtimestamp(saved["written"], zone).strftime("%H:%M"))
+    facts = saved["machines"][machine]
+    state = facts["state"]
+    if state != "read" and state != "load_unreadable":
+        return PAGE_WORDS["facts_" + state]
+    parts: list[str] = []
+    link_ms = facts["link_ms"]
+    if link_ms is not None:
+        parts.append(PAGE_WORDS["facts_link"].format(ms="<1" if link_ms < 1 else f"{link_ms:.0f}"))
+    load, cpus = facts["load"], facts["cpus"]
+    parts.append(PAGE_WORDS["facts_load"].format(load=f"{load:.1f}", cpus=cpus)
+                 if state == "read" and load is not None and cpus is not None else PAGE_WORDS["facts_load_unreadable"])
+    battery = facts["battery"]
+    if battery == "unreadable":
+        parts.append(PAGE_WORDS["facts_battery_unreadable"])
+    elif battery != "no_battery":
+        # On mains the machine does not use its battery; a full charge says so.
+        word = ("facts_battery_in_use" if not battery["mains"]
+                else "facts_battery_full" if battery["percent"] >= 100 else "facts_battery_mains")
+        parts.append(PAGE_WORDS[word].format(percent=battery["percent"]))
+    return " · ".join(parts)
+
+
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
                  waits: Sequence[VisibleWait], cloud_names: Mapping[wire.Owner, str],
                  names: Mapping[str, str], saved: Background, zone: tzinfo, *,
-                 mac: MacReading | None = None) -> BuildLimits:
+                 mac: MacReading | None = None,
+                 facts: machine_facts.SavedFacts | machine_facts.FactsUnread = machine_facts.FactsUnread.VALUE) -> BuildLimits:
     explanation = reading.explanation
     occupancy = explanation.local_occupancy
     inputs = replace(explanation.decided_from,
@@ -1119,10 +1163,15 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                    cloud_slots if isinstance(cloud_slots, int) else None, waits=metric_waits.get("cloud", {}),
                    unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
     first_rows = {"claude_commands": 0, "hana": 1}
+
+    def facts_text(machine: machine_facts.Machine) -> str:
+        return facts_line(facts, machine, explanation.now, zone)
+
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
-                                    (*limits, *shared), local_waits, unattributed, local_note),
-                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed, mac_note),
-                       MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits),
+                                    (*limits, *shared), local_waits, unattributed, local_note, facts_text("natedev")),
+                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed, mac_note,
+                                     facts_text("mac")),
+                       MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, facts=facts_text("aws")),
                        tuple(sorted(rows.values(), key=lambda item: (first_rows.get(item.name, len(first_rows)),
                                                                      item.name.casefold(), item.name))),
                        saved.history is ReadingState.UNAVAILABLE, unplaced)
