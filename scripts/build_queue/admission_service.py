@@ -316,10 +316,10 @@ class SystemReadings:
         return gate.read_pressure(host, policy=policy)
 
     def build_space(self, floor: int) -> records.BuildSpaceHold | records.NoBuildSpaceHold:
-        from scripts.lib.build_slots import slot_cargo_root
+        from scripts.lib.build_folders import build_root
 
         try:
-            root = slot_cargo_root(conf.read("build_folders"))
+            root = build_root(settings=conf.read("build_folders"))
             reading = os.statvfs(root)
         except (OSError, conf.Unusable) as error:
             hold = records.BuildSpaceUnreadable(str(error))
@@ -1771,6 +1771,8 @@ class AdmissionServer:
             host_probe if host_probe is not None else self._read_host_evidence)
         self.host_readers: dict[placement.HostEvidenceKey, HostEvidenceReader] = {}
         self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
+        self.mac_recovery_lock: threading.Lock = threading.Lock()
+        self.mac_recovery_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
@@ -3811,6 +3813,18 @@ class AdmissionServer:
             except conf.Unusable as error:
                 return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
 
+    def _begin_mac_backoff_probe(self, target: str) -> bool:
+        """Allow one recovery probe per target in each waiting pass interval."""
+        from scripts.mac_test import eligibility
+
+        if not isinstance(eligibility.read_backoff(time.time(), target), eligibility.ActiveBackoff):
+            return False
+        with self.mac_recovery_lock:
+            if self.clock.monotonic() < self.mac_recovery_retry_at.get(target, 0):
+                return False
+            self.mac_recovery_retry_at[target] = float("inf")
+            return True
+
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets
@@ -3867,9 +3881,16 @@ class AdmissionServer:
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         else:
             if isinstance(target, target_config.SshTarget):
-                answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session, configuration=configuration, mac_scope=destination.scope)
+                recover = target.platform == "macos" and self._begin_mac_backoff_probe(target.name)
+                try:
+                    answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
+                        request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, new_step=True,
+                        session=key.session, configuration=configuration, mac_scope=destination.scope,
+                        recover_mac_backoff=recover)
+                finally:
+                    if recover:
+                        with self.mac_recovery_lock:
+                            self.mac_recovery_retry_at[target.name] = self.clock.monotonic() + self._waiting_pass_interval()
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
@@ -3879,14 +3900,17 @@ class AdmissionServer:
         paths = claim_state.state_paths(destination.target)
         with claim_state.locked(paths.lock):
             held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
-        # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
-        # or each pass makes a new attempt that the Mac refuses as busy.
+        # Routing keeps a busy or blocked Mac eligible so a step can wait for it. Placement must
+        # wait too, or each pass makes a new attempt that the Mac refuses. A Mac run skips the
+        # repository policy, so this check is the only one that sees a block from another session.
+        # An unreadable block or claim record also waits: it can hide a block.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration,
-                                      mac_scope=destination.scope) == "busy"):
-            eligibility = placement.TemporaryExclusion("busy")
+                and target.platform == "macos"):
+            mac_answer = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                           session=key.session, configuration=configuration,
+                                           mac_scope=destination.scope)
+            if mac_answer in ("blocked", "busy", "state"):
+                eligibility = placement.TemporaryExclusion(mac_answer)
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
@@ -3978,13 +4002,14 @@ for placement_pid in $placement_pids; do
     printf '%s\t%s\n' "$placement_pid" "$placement_start"
 done
 '''
-        probe = eligibility.SshProbeSettings(config)
-        options, timeout = offload.ssh_options(probe), probe.probe_timeout_s
         host = record["remote_host"]
         try:
+            # A build target registry without a usable unreachable wait raises conf.Unusable, a ValueError.
+            probe = eligibility.probe_settings(config, _provider_configuration().read("build_targets"))
+            options = offload.ssh_options(probe)
             result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                check=False, timeout=timeout)
+                check=False, timeout=probe.probe_timeout_s)
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")
@@ -5331,8 +5356,14 @@ done
             return [wire.Refused(refusal)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
-            status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
-                status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
+            if isinstance(saved, status_wire.UnknownPlacementStatus):
+                return [status_wire.PlacementStatusReply(saved)]
+            if request.include_permission:
+                permission, report = saved.permission, saved.terminal_report
+            else:
+                permission, report = status_wire.LAUNCH_PERMISSION_NOT_REPORTED, placement.NoTerminalReport()
+            status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider,
+                                                      permission, report)
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
             return [wire.Refused("Repository copy capacity no longer requires admission")]

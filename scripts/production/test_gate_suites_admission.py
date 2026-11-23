@@ -562,7 +562,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
 
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
-            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:

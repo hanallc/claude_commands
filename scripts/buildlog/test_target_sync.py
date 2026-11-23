@@ -21,6 +21,7 @@ from scripts.buildlog import store
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
 from scripts.buildlog.test_index import point_root_at
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 class TargetSyncTests(unittest.TestCase):
@@ -48,6 +49,7 @@ class TargetSyncTests(unittest.TestCase):
             + "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023\nsync.hosts.spare=spare-build\n"
             + "sync.hosts.natedev=natedev\n"
             + "# whole: 0..10\nvault.lock_retries=5\n"
+            + UNREACHABLE_WAIT_FIXTURE
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
         )
         point_root_at(self, self.root)
