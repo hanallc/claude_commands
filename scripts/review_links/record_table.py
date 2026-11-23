@@ -532,6 +532,8 @@ const detailMissing=inlineView?.querySelector('[data-record-missing]');
 const detailError=inlineView?.querySelector('[data-record-error]');
 const detailLinkNotice=inlineView?.querySelector('[data-record-link-notice]');
 let openItem=null,openNeedsRecord=false;
+// Changes when a row opens or closes; never on a remount, a snapshot or a link to the open row.
+let openSession=0;
 let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
 const measured=new Map(),mounted=new Map(),windowGaps=[];
@@ -914,9 +916,8 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');
  const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
-  opened.clear();
   const key=saved.opened.includes(item) ? item : saved.opened[0];
-  if(key) openCard(key);
+  if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
@@ -1299,6 +1300,8 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
+ // A link to a missing item closes the open row, so the page shows the missing item notice.
+ if(!target && !keepItemOnMissing) opened.clear();
  if(options.mount && target) revealKey=key;
  apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
@@ -1323,12 +1326,14 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
 }
 function openCard(key){
+ if(!opened.has(key)) openSession++;
  opened.clear();
  opened.add(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
 function closeCard(key,write=true){
  const wasOpen=opened.delete(key);
+ if(wasOpen) openSession++;
  if(!wasOpen && linkedItem!==key) return;
  linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
@@ -1399,7 +1404,7 @@ function bind(){
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
  preserveRecordRowTop,holdLog,restoreLog,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return openItem && !openItem.hidden && location.hash===placeHash && openItem.dataset.key===key &&
    opened.has(key) && detailMissing.hidden && viewDetail.contains(form);

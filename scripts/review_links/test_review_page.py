@@ -2537,6 +2537,184 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
         self.assertEqual(firefox_probe_results(markup), [[]])
 
+    def assert_own_save_keeps_the_open_row(self, opener: str) -> None:
+        """Open change-15 with the opener, save feedback, and check the row stays open at the same pixel."""
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 31)]
+        waiting = [replace(record, state=review_items.ReviewState.WAITING) if record.key == 'change-15' else record
+                   for record in records]
+        (page, initial), (_, fresh) = self.browser_snapshot(records), self.browser_snapshot(waiting)
+        steps = r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  const pageFetch=window.fetch;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
+   saved.content.querySelector('form').remove();
+   saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
+   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+    detail_html:saved.innerHTML});
+  };
+  OPENER
+  await until(()=>row(15) && recordIsOpen(row(15)),'the open row');
+  const form=await readyReviewCard(row(15));
+  form.elements.feedback.value='Check the header.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  const top=row(15).getBoundingClientRect().top;
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  const shows=()=>row(15) && recordDetails(row(15))?.textContent.includes('The saved words.');
+  await until(()=>shows() || !row(15),'the saved detail or a removed row');
+  for(let count=0;count<5;count++) await frame();
+  check(Boolean(row(15)) && recordIsOpen(row(15)),'After the save, the open row is still on the page.');
+  check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the save, the open row stays at the same pixel.');
+""".replace('OPENER', opener)
+        markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_keeps_a_row_opened_by_an_item_link(self) -> None:
+        self.assert_own_save_keeps_the_open_row("location.hash=new URLSearchParams({item:'change-15'});")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_keeps_a_row_opened_by_a_click(self) -> None:
+        self.assert_own_save_keeps_the_open_row("row(15).querySelector('.list-toggle').click();")
+
+    def handed_change_page(self, *, stale: bool = False) -> bytes:
+        """Return a probe page whose change-15 feedback save waits for finishSave().
+
+        With stale, the page also serves a 'stale' snapshot: a new version that still shows change-15 Open.
+        """
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 31)]
+        waiting = [replace(record, state=review_items.ReviewState.WAITING) if record.key == 'change-15' else record
+                   for record in records]
+        (page, initial), (_, fresh) = self.browser_snapshot(records), self.browser_snapshot(waiting)
+        snapshots = {'initial': initial, 'fresh': fresh}
+        if stale:
+            renamed = [replace(record, title='Renamed change 3') if record.key == 'change-3' else record
+                       for record in records]
+            snapshots['stale'] = self.browser_snapshot(renamed)[1]
+        return snapshot_probe_page(page, snapshots, r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  const pageFetch=window.fetch;
+  let finishSave;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
+   saved.content.querySelector('form').remove();
+   saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
+   const reply=Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+    detail_html:saved.innerHTML});
+   return new Promise(resolve=>{finishSave=()=>resolve(reply);});
+  };
+  const follow=async key=>{
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   location.hash=new URLSearchParams({item:key});
+   await changed;
+   for(let count=0;count<10;count++) await frame();
+  };
+  const open15=()=>Boolean(row(15)) && recordIsOpen(row(15));
+  await follow('change-15');
+  await until(open15,'the open row');
+  const form=await readyReviewCard(row(15));
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.elements.feedback.value='Check the header.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  AFTER_SUBMIT
+""")
+
+    def assert_relink_after_own_save_hides_the_row(self, leave: str) -> None:
+        """Save feedback on a linked change, leave its row, then link to it again before the next snapshot."""
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  LEAVE
+  for(let count=0;count<10;count++) await frame();
+  check(!row(15),'The handed change leaves the page after its row closes.');
+  await follow('change-15');
+  check(!row(15),'A new link to the handed change shows no row before the next snapshot.');
+""".replace('LEAVE', leave)
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_relink_after_closing_an_own_save_row_hides_the_handed_change(self) -> None:
+        self.assert_relink_after_own_save_hides_the_row("row(15).querySelector('.list-toggle').click();")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_relink_after_following_another_item_hides_the_handed_change(self) -> None:
+        self.assert_relink_after_own_save_hides_the_row("await follow('change-3');")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_row_stays_open_through_a_stale_snapshot(self) -> None:
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  const top=row(15).getBoundingClientRect().top;
+  const content=document.querySelector('[data-review]');
+  const shownMessage=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  const stays=label=>{
+   check(open15(),'After '+label+', the own row is still open.');
+   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After '+label+', the own row stays at the same pixel.');
+  };
+  shown='stale';shownMessage();
+  await until(()=>content.dataset.version===snapshots.stale.version,'the stale refresh');
+  for(let count=0;count<10;count++) await frame();
+  stays('a snapshot that still shows the old change');
+  shownMessage();
+  for(let count=0;count<30;count++) await frame();
+  stays('a second refresh of the same snapshot');
+  // The All chip keeps the Waiting row listed; a chip that hides the row closes it by the filter rule.
+  document.getElementById('review-show-all').click();
+  for(let count=0;count<10;count++) await frame();
+  stays('a chip click');
+"""
+        markup = self.handed_change_page(stale=True).decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_row_stays_open_after_a_link_to_the_same_item(self) -> None:
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  const top=row(15).getBoundingClientRect().top;
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({item:'change-15',show:'all'});
+  await changed;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'After a link to the same open item, the own row is still open.');
+  check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the same-item link, the own row stays at the same pixel.');
+"""
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_deferred_link_after_change_feedback_waits_for_the_snapshot(self) -> None:
+        steps = r"""
+  await follow('change-3');
+  await follow('change-15');
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(!row(15),'The deferred link keeps the handed change hidden until the next snapshot.');
+  const content=document.querySelector('[data-review]');
+  await until(()=>{refresh();return content.dataset.version===snapshots.fresh.version;},'the refresh');
+  await until(()=>Boolean(row(15)),'the handed change after the snapshot');
+  check(row(15).dataset.state==='Waiting','The snapshot shows the handed change as Waiting.');
+"""
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
         change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)

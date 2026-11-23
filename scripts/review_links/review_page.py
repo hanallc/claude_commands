@@ -1853,10 +1853,16 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || (entry.state===(show==='open' ? 'Open' : show) && entry.actionStatus!=='withdrawn'));
 }
+// A linked item that a save handed off waits for the snapshot that confirms it,
+// unless its own save kept the row open with the result and the row has stayed open since.
+function awaitsHandoff(key){
+ const departure=saved.get(key);
+ const ownRowOpen=departure?.ownSession===view.openSession && view.opened.has(key);
+ return Boolean(departure?.handed && departure.awaitingSnapshot && !ownRowOpen && view.linkedItem===key);
+}
 function isListed(entry,filters){
  const key=entry.key,departure=saved.get(key);
- if(pendingSaves.get(key)?.departing) return false;
- if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
+ if(pendingSaves.get(key)?.departing || awaitsHandoff(key)) return false;
  return (!departure || entry.type==='for-you' || departure.handed && entry.state!=='Open') && matches(entry,filters);
 }
 function matching(filters){return allEntries().filter(entry=>isListed(entry,filters));}
@@ -1892,7 +1898,7 @@ const view=createRecordTable({content:()=>content,
  focusKey:()=>focusAfterLoad?.key,
  pinOpenRow:key=>{
   const pending=pendingSaves.get(key);
-  return !pending || pending.keepOpen;
+  return (!pending || pending.keepOpen) && !awaitsHandoff(key);
  },
  unmount:rememberItem,
  rememberItem,
@@ -2103,7 +2109,7 @@ function bindForm(row){
    const keepOpen=['question','feedback'].includes(outcome) && ['change','proposal'].includes(row.dataset.type);
    const pending={notice:'Saving…',saved:false,departing:!validationQuestion,keepOpen,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
-   const request=view.startItemRequest(key);
+   const request=view.startItemRequest(key),session=view.openSession;
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);
    const submission=view.preserveRecordRowTop(()=>view.startAction(row));
    const reopened=()=>view.openItem?.dataset.key===key && view.opened.has(key) &&
@@ -2166,7 +2172,7 @@ function bindForm(row){
      type:result.type,
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:outcome==='question',
-     retained:showOwnDetail && result.state==='Done' ? index.get(key) : null,
+     retained:showOwnDetail && result.state==='Done' ? index.get(key) : null,ownSession:showOwnDetail ? session : undefined,
      closes:result.detail_closed ?? (!handed && !['question','later'].includes(outcome)),awaitingSnapshot:true};
     const applySaved=()=>view.preserveRecordRowTop(()=>{
      if(!reopened() && !showOwnDetail && (outcome==='later' || !isDeferredLink(key))) view.closeCard(key);

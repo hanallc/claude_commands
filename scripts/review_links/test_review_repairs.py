@@ -814,9 +814,11 @@ window.fetch=async(url,options={})=>{
     !page.querySelector('[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
    if(entry.item){
-    const summary=page.querySelector('[data-key="'+entry.item+'"] .list-toggle');
-    const dialog=page.getElementById(summary?.getAttribute('aria-controls'));
-    check(summary?.getAttribute('aria-expanded')==='true' && dialog?.open,'F012: the legacy row opens its dialog.');
+    const item=page.querySelector('[data-list-item][data-key="'+entry.item+'"]');
+    const summary=item?.querySelector('.list-toggle'),detail=item?.querySelector('[data-detail]');
+    const owner=page.querySelector('[data-owner-chip][aria-pressed="true"]');
+    check(summary?.getAttribute('aria-expanded')==='true' && detail && !detail.hidden &&
+     owner?.dataset.ownerChip===item.dataset.owner,'F012: the legacy row opens in its row with the review owner kept.');
    }
    legacy.remove();
   }

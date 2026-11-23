@@ -435,6 +435,13 @@ The old form cannot submit while the update waits.
 The card keeps edits when the user selects **Show updates**.
 The open row shows a refresh error below the detail and keeps the shown detail and draft.
 If a refresh removes the open item, its row leaves the table.
+An item link in the address to an item that is not on the Review page closes the open row and shows the missing item notice.
+A `data-record-jump` link inside a card to a missing item keeps the row open and shows the link notice in the row.
+A linked item that a save handed off stays hidden until a snapshot shows it in its new state.
+The exception is a row that its own save kept open with the result.
+That row stays open and listed until the user closes it or opens another item.
+A refresh, a chip that keeps the row listed, Back or Forward to the same open item, or a link to that item never ends it.
+After that, a new link to the item shows no row until the snapshot arrives.
 Closing the row returns focus to its toggle when focus was in the open row.
 The open row's log scrolls in its own area, like the List log, with the same `list_log_max_height_rem` limit.
 A refresh, a detail load, or a save result keeps the log's first visible entry at the same place.
