@@ -289,7 +289,7 @@ class GuestRouteTests(unittest.TestCase):
     def test_a_refused_mac_claim_takes_no_run(self) -> None:
         with mock.patch.object(mac_run, "held", side_effect=mac_run.MacRunRefused("mac is busy with fixture")):
             status, errors = self.attempt()
-        self.assert_failed(status, errors, "not started: mac is busy with fixture")
+        self.assert_failed(status, errors, "mac-linux: mac is busy with fixture")
         self.assertEqual(self.guest.events, [])
 
     def test_a_failed_guest_start_takes_no_run_and_names_the_cause(self) -> None:
