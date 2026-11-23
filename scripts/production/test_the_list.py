@@ -309,6 +309,7 @@ class TheListTests(unittest.TestCase):
                 assert isinstance(series, the_list.ScheduledSeries)
                 self.assertEqual((series.finished_runs, series.skipped_runs, series.runs_used),
                                  (expected_finished, frozenset({2}), 2))
+                self.assertEqual(series.run_number_offset, offset)
                 event = saved.log[-1].what
                 assert isinstance(event, the_list.FieldChange)
                 self.assertEqual(event.fields.get("schedule"), series)
@@ -342,6 +343,16 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual((refused, message), (1, ""))
                 self.assertIn(f"COUNT exceeds the series limit of {limit} runs", errors)
 
+                for numbers, unissued in (((1, 999), 999), ((1,), 0)):
+                    with self.subTest(finish=numbers):
+                        if unissued:
+                            with self.assertRaisesRegex(the_list.ListError, f"the series did not issue run {unissued}"):
+                                _ = series.finish_runs(numbers)
+                        else:
+                            completed = series.finish_runs(numbers)
+                            self.assertEqual((completed.finished_runs, completed.runs_used), (frozenset({1}), 1))
+                            self.assertIs(completed.finish_runs(numbers), completed)
+
                 for progress in ("exhausted", "skipped"):
                     with self.subTest(progress=progress):
                         if progress == "skipped":
@@ -374,7 +385,7 @@ class TheListTests(unittest.TestCase):
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
         second = start + timedelta(days=1)
         moved = second + timedelta(hours=1)
-        for scope, now_at, first, runs_before, next_words in (
+        for scope, now_at, first, run_number_offset, next_words in (
             ("this", second, start, 0, "Read the figures.\nSend the total."),
             ("following", second, moved, 1, "Read new figures."),
             ("all", START, moved, 0, "Read new figures."),
@@ -394,7 +405,7 @@ class TheListTests(unittest.TestCase):
                 item = the_list.load(MORTY.id, identity)
                 series = item.schedule
                 assert isinstance(series, the_list.ScheduledSeries)
-                self.assertEqual((series.first.start, series.runs_before), (first, runs_before))
+                self.assertEqual((series.first.start, series.run_number_offset), (first, run_number_offset))
                 next_run = series.next_run(the_list.series_run_limit())
                 assert isinstance(next_run, the_list.SeriesRun)
                 self.assertEqual(next_run.run, the_list.ScheduledRun(moved, "Read new figures."))
@@ -451,6 +462,35 @@ class TheListTests(unittest.TestCase):
                     pending = item.schedule.next_run(the_list.series_run_limit())
                     assert isinstance(pending, the_list.SeriesRun)
                     self.assertEqual((pending.number, pending.run), (number, expected))
+
+        for rule, moved_at, end, expected in (
+            ("FREQ=DAILY", "2026-12-01T10:00+00:00", "COUNT=3",
+             ("2026-12-01T10:00+00:00", "2026-12-02T09:00+00:00", "2026-12-03T09:00+00:00")),
+            ("FREQ=WEEKLY;BYDAY=MO", "2026-12-08T09:00+00:00", "COUNT=3",
+             ("2026-12-08T09:00+00:00", "2026-12-14T09:00+00:00", "2026-12-21T09:00+00:00")),
+            ("FREQ=DAILY", "2026-12-01T10:00+00:00", "UNTIL=20261203T090000Z",
+             ("2026-12-01T10:00+00:00", "2026-12-02T09:00+00:00", "2026-12-03T09:00+00:00")),
+        ):
+            with self.subTest(rule=rule, moved_at=moved_at, end=end):
+                anchor = "2026-11-30T09:00+00:00"
+                code, output, errors = self.add_scheduled(anchor, "--repeat", rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                code, _, errors = self.command("update", "--id", identity, "--source", "nate",
+                                               "--scope", "this", "--start", moved_at)
+                self.assertEqual((code, errors), (0, ""))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                code, _, errors = self.command("update", "--id", identity, "--source", "nate",
+                                               "--scope", "following", "--repeat", f"{rule};{end}")
+                self.assertEqual((code, errors), (0, ""))
+                changed = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(changed, the_list.ScheduledSeries)
+                self.assertEqual(changed.first.start, datetime.fromisoformat(anchor))
+                self.assertEqual(changed.exceptions, before.exceptions)
+                self.assertEqual(tuple(run.run.start.isoformat(timespec="minutes")
+                                       for run in changed.runs(the_list.series_run_limit())), expected)
 
     def test_repeated_item_removals_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)

@@ -249,7 +249,7 @@ class ScheduledSeries:
 
     first: ScheduledRun
     rule: repeat_rule.RepeatRule
-    runs_before: int = 0
+    run_number_offset: int = 0
     exceptions: tuple[RunException, ...] = ()
     runs_used: int = 0
     finished_runs: frozenset[int] = frozenset()
@@ -260,12 +260,24 @@ class ScheduledSeries:
 
     def finish_runs(self, numbers: Iterable[int]) -> ScheduledSeries:
         """Record finished runs after delivery or recovery."""
-        finished = self.finished_runs | (frozenset(numbers) - self.skipped_runs)
-        return replace(self, finished_runs=finished, runs_used=self.runs_used + len(finished - self.finished_runs))
+        requested = tuple(numbers)
+        if any(type(number) is not int for number in requested):
+            raise ListError("a run number must be an integer")
+        new = frozenset(requested) - self.finished_runs - self.skipped_runs
+        if not new:
+            return self
+        unissued = set(new)
+        for slot in self._slots(series_run_limit()):
+            unissued.discard(slot.number)
+            if not unissued:
+                break
+        if unissued:
+            raise ListError(f"the series did not issue run {min(unissued)}")
+        return replace(self, finished_runs=self.finished_runs | new, runs_used=self.runs_used + len(new))
 
     def pending_count(self, end: repeat_rule.RunCount) -> int:
         settled = self.finished_runs | self.skipped_runs
-        used = sum(self.runs_before < number <= self.runs_before + end.count for number in settled)
+        used = sum(self.run_number_offset < number <= self.run_number_offset + end.count for number in settled)
         return end.count - used
 
     def validate_run_times(self, limit: int) -> None:
@@ -280,8 +292,8 @@ class ScheduledSeries:
         exceptions = {entry.number: entry.run for entry in self.exceptions}
         settled = self.finished_runs | self.skipped_runs
         remaining = max(0, limit - self.runs_used)
-        slot_limit = remaining + sum(number > self.runs_before for number in settled)
-        for number, original in enumerate(self.rule.runs(self.first.start, slot_limit), self.runs_before + 1):
+        slot_limit = remaining + sum(number > self.run_number_offset for number in settled)
+        for number, original in enumerate(self.rule.runs(self.first.start, slot_limit), self.run_number_offset + 1):
             if number not in settled:
                 if remaining == 0:
                     break
@@ -603,7 +615,7 @@ def _schedule_fields(schedule: Schedule) -> dict[str, object] | None:
     first = schedule.first if isinstance(schedule, ScheduledSeries) else schedule
     fields: dict[str, object] = {"start": _schedule_time_text(first.start), "do": first.words}
     if isinstance(schedule, ScheduledSeries):
-        fields.update(repeat=schedule.rule.rrule, runs_before=schedule.runs_before, runs_used=schedule.runs_used,
+        fields.update(repeat=schedule.rule.rrule, runs_before=schedule.run_number_offset, runs_used=schedule.runs_used,
                       finished_runs=sorted(schedule.finished_runs))
         fields["exceptions"] = [
             {"number": entry.number, "removed": True, "words": entry.run.words} if isinstance(entry.run, SkippedRun)
@@ -623,11 +635,11 @@ def _read_schedule(raw: object) -> Schedule:
         required = {"start", "do", "repeat", "runs_before", "exceptions"}
         if fields.keys() not in (required, required | {"runs_used"}, required | {"runs_used", "finished_runs"}):
             raise ListError("invalid schedule fields")
-        runs_before = fields["runs_before"]
-        runs_used = fields.get("runs_used", runs_before)
+        run_number_offset = fields["runs_before"]
+        runs_used = fields.get("runs_used", run_number_offset)
         rows = fields["exceptions"]
-        if (type(runs_before) is not int or type(runs_used) is not int or runs_used < 0
-                or runs_before < 0 or not isinstance(rows, list)):
+        if (type(run_number_offset) is not int or type(runs_used) is not int or runs_used < 0
+                or run_number_offset < 0 or not isinstance(rows, list)):
             raise ListError("invalid schedule run history")
         exceptions: list[RunException] = []
         for raw_row in cast(list[object], rows):
@@ -654,11 +666,11 @@ def _read_schedule(raw: object) -> Schedule:
             if len(finished) != len(numbers):
                 raise ListError("invalid finished run numbers")
         else:
-            if runs_before > runs_used:
+            if run_number_offset > runs_used:
                 raise ListError("invalid schedule run history")
             finished = frozenset(range(1, runs_used + 1)) - skipped
             runs_used = len(finished | skipped)
-        schedule = ScheduledSeries(first, repeat_rule.parse(_field_text(fields["repeat"], "repeat")), runs_before,
+        schedule = ScheduledSeries(first, repeat_rule.parse(_field_text(fields["repeat"], "repeat")), run_number_offset,
                                    tuple(exceptions), runs_used, finished)
     _validate_schedule(schedule)
     return schedule
@@ -680,7 +692,7 @@ def _validate_schedule(schedule: object) -> None:
         raise ListError("invalid List field: schedule")
     _validate_scheduled_run(schedule.first)
     skipped = schedule.skipped_runs
-    if (type(schedule.runs_before) is not int or schedule.runs_before < 0 or type(schedule.runs_used) is not int
+    if (type(schedule.run_number_offset) is not int or schedule.run_number_offset < 0 or type(schedule.runs_used) is not int
             or any(type(number) is not int or number < 1 for number in schedule.finished_runs)
             or schedule.finished_runs & skipped or schedule.runs_used != len(schedule.finished_runs | skipped)):
         raise ListError("invalid schedule run progress")
@@ -693,7 +705,7 @@ def _validate_schedule(schedule: object) -> None:
             raise ListError("a schedule exception must name a distinct run number")
         seen.add(entry.number)
         if isinstance(entry.run, ScheduledRun):
-            if entry.number <= schedule.runs_before:
+            if entry.number <= schedule.run_number_offset:
                 raise ListError("an override must name a run in the current series")
             _validate_scheduled_run(entry.run)
         else:
@@ -1743,29 +1755,37 @@ def _split_series(series: ScheduledSeries, selected: SeriesRun, edits: ScheduleC
     if _validate_schedule_time(pending.start) < moment.astimezone(UTC):
         raise ListError("choose a time on or after now for this and following runs")
     settled = series.finished_runs | series.skipped_runs
-    reanchors = "start" in edits or "repeat" in edits
-    if not reanchors and any(number not in settled for number in range(series.runs_before + 1, selected.number)):
+    reanchors = "start" in edits or replace(rule, end=series.rule.end) != series.rule
+    if not reanchors and "repeat" in edits:
+        if isinstance(rule.end, repeat_rule.RunCount):
+            count = rule.end.count
+            for number in sorted(settled):
+                if series.run_number_offset < number <= series.run_number_offset + count:
+                    count += 1
+            rule = replace(rule, end=repeat_rule.RunCount(count))
         return _edit_all_runs(series, edits, rule)
-    runs_before = selected.number - 1
+    if not reanchors and any(number not in settled for number in range(series.run_number_offset + 1, selected.number)):
+        return _edit_all_runs(series, edits, rule)
+    run_number_offset = selected.number - 1
     exceptions = tuple(entry for entry in series.exceptions if isinstance(entry.run, SkippedRun))
     if reanchors:
         first = ScheduledRun(pending.start, edits.get("words", series.first.words))
-        runs_before = max(runs_before, max(settled, default=0))
+        run_number_offset = max(run_number_offset, max(settled, default=0))
         if "repeat" not in edits and isinstance(rule.end, repeat_rule.RunCount):
             rule = replace(rule, end=repeat_rule.RunCount(series.pending_count(rule.end)))
     else:
         first = ScheduledRun(selected.original, edits.get("words", series.first.words))
         if isinstance(rule.end, repeat_rule.RunCount):
-            rule = replace(rule, end=repeat_rule.RunCount(rule.end.count - (runs_before - series.runs_before)))
+            rule = replace(rule, end=repeat_rule.RunCount(rule.end.count - (run_number_offset - series.run_number_offset)))
         exceptions = tuple(
             replace(entry, run=replace(entry.run, words=first.words))
             if isinstance(entry.run, ScheduledRun) and entry.number not in series.finished_runs else entry
             for entry in series.exceptions
-            if isinstance(entry.run, SkippedRun) or entry.number > runs_before
+            if isinstance(entry.run, SkippedRun) or entry.number > run_number_offset
         )
-    following = replace(series, first=first, rule=rule, runs_before=runs_before, exceptions=exceptions)
+    following = replace(series, first=first, rule=rule, run_number_offset=run_number_offset, exceptions=exceptions)
     if _schedule_fields(pending) != _schedule_fields(first):
-        following = _replace_series_run(following, runs_before + 1, pending)
+        following = _replace_series_run(following, run_number_offset + 1, pending)
     return following
 
 
