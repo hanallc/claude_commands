@@ -22,11 +22,10 @@ from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
 from scripts.build_queue.queue_place import PopenArguments
 from scripts.build_targets import mac_linux
-from scripts.buildlog import store
 from scripts.lib import build_folder_lock, build_folders
 from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import Program, Refused
-from scripts.production.test_hand_made import FakePlace, clear_build_variables, namespace_members
+from scripts.production.test_hand_made import FakePlace, clear_build_variables
 from scripts.worktree import worktrees
 
 BWRAP = shutil.which("bwrap")
@@ -182,27 +181,25 @@ class LimitTests(unittest.TestCase):
         status, output, _ = self.limited(["sh", "-c", "echo ${SSH_AUTH_SOCK:-none}"])
         self.assertEqual((status, output), (0, "none\n"))
 
-    # The natedev route is the only one that starts the private sccache server, so natedev must run this test.
-    # Another host without sccache, such as the Mac Linux guest, skips it.
-    @unittest.skipIf(store.host_name() != hand_made.LOCAL_MACHINE
-                     and shutil.which("sccache", path=program_path()) is None,
-                     "sccache is not on PATH, and this host is not natedev")
-    def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
-        # A C compile: the merge gate fails a module that starts cargo or rustc.
+    def test_a_compile_passes_without_sccache_and_the_cargo_wrapper_is_off(self) -> None:
+        # Use a C compile because the merge gate rejects tests that start Cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
-        cache = self.root / "sccache"
+        cargo_home, cache = self.root / "cargo", self.root / "sccache"
+        cargo_home.mkdir()
         cache.mkdir()
-        script = ("sccache cc -c tiny.c -o tiny.o && sccache --show-stats && readlink /proc/self/ns/pid "
-                  + "&& cat /proc/[0-9]*/comm")
-        status, output, ran = self.limited(["sh", "-c", script], self.environment(SCCACHE_DIR=str(cache)))
+        config = '[build]\nrustc-wrapper = "sccache"\n'
+        _ = (cargo_home / "config.toml").write_text(config)
+        environment = self.environment(CARGO_HOME=str(cargo_home), SCCACHE_DIR=str(cache),
+            RUSTC_WRAPPER="sccache", CARGO_BUILD_RUSTC_WRAPPER="sccache")
+        script = ("""test "$RUSTC_WRAPPER" = "" && test "$CARGO_BUILD_RUSTC_WRAPPER" = "" """
+                  + """&& test ! -e "$1" && cat "$CARGO_HOME/config.toml" """
+                  + "&& cc -c tiny.c -o tiny.o && cat /proc/[0-9]*/comm")
+        status, output, ran = self.limited(["sh", "-eu", "-c", script, "compile", str(cache)], environment)
         self.assertEqual((status, ran), (0, True), output)
         self.assertTrue((self.checkout / "tiny.o").exists())
-        requests = next(line for line in output.splitlines() if line.startswith("Compile requests "))
-        self.assertGreater(int(requests.split()[-1]), 0, output)
-        # The private server ran in the limit, with its socket in the attempt temp folder.
-        self.assertIn("sccache", output.split("pid:[", 1)[1].splitlines()[1:])
-        self.assertTrue((self.temp / "sccache.sock").exists())
-        self.assertEqual(namespace_members("pid:[" + output.split("pid:[", 1)[1].split("]", 1)[0] + "]"), [])
+        self.assertTrue(output.startswith(config), output)
+        self.assertNotIn("sccache", output.removeprefix(config).splitlines())
+        self.assertFalse((self.temp / "sccache.sock").exists())
 
     def test_a_tiny_python_test_folder_passes(self) -> None:
         (self.checkout / "tests").mkdir()
@@ -255,7 +252,7 @@ class LimitTests(unittest.TestCase):
         for folder in (self.root / "link", Path("/"), home.parent):
             with self.subTest(folder=folder):
                 words = hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
-                                                   {"HOME": str(home), "SCCACHE_DIR": str(folder)}, 3)
+                                                   {"HOME": str(home), "CARGO_TARGET_DIR": str(folder)}, 3)
                 self.assertNotIn(str(folder), [words[index + 1] for index, word in enumerate(words) if word == "--bind"])
         # A read only bind can have a link into /nix/store, as ~/.cargo/config.toml has.
         self.assertTrue(mac_linux.bindable(Path("/run/current-system/sw/bin/sh"), home, read=True))
@@ -671,18 +668,17 @@ class OutputFolderTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config")}):
             self.assertEqual(hand_made_limit.tools_refusal(root / "worktree", {"PATH": str(root / "bin")}), "")
 
-    def test_an_output_or_sccache_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
+    def test_an_output_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout = root / "worktree"
         for folder in (checkout, root / "config", root / "cache"):
             folder.mkdir()
         scripts = Path(hand_made_limit.__file__).resolve().parents[1]
-        cases = (({"CARGO_TARGET_DIR": str(scripts)}, scripts), ({"SCCACHE_DIR": str(root / "config")}, root / "config"),
-                 ({"SCCACHE_DIR": str(root / "cache")}, root / "cache"))
         with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config"), "XDG_CACHE_HOME": str(root / "cache")}):
-            for values, bind in cases:
-                with self.subTest(values=values):
-                    self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root), **values}),
+            for bind in (scripts, root / "config", root / "cache"):
+                with self.subTest(bind=bind):
+                    self.assertEqual(hand_made_limit.tools_refusal(checkout,
+                                                                  {"HOME": str(root), "CARGO_TARGET_DIR": str(bind)}),
                                      hand_made_limit.TOOLS_REFUSAL.format(bind=bind))
             self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root)}), "")
 

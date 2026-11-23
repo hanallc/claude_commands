@@ -488,6 +488,23 @@ class GuestLimitTests(unittest.TestCase):
                          (1, f'{mac_linux.run_refused_line("fixture")}\n', mac_linux.BWRAP_MISSING + '\n'))
         self.assertFalse(mark.exists())
 
+    def test_a_hand_made_guest_drops_sccache_and_disables_the_cargo_wrapper(self) -> None:
+        cache = self.root / 'cache'
+        cache.mkdir()
+        inherited = {'SCCACHE_DIR': str(cache), 'SCCACHE_CACHE_SIZE': '77G',
+                     'SCCACHE_SERVER_UDS': str(cache / 'server.sock'),
+                     'RUSTC_WRAPPER': 'sccache', 'CARGO_BUILD_RUSTC_WRAPPER': 'sccache'}
+        probe = ("import os, sys\n"
+                 "print(repr(os.environ['RUSTC_WRAPPER']), repr(os.environ['CARGO_BUILD_RUSTC_WRAPPER']))\n"
+                 "print(any(name in os.environ for name in sys.argv[2:]),"
+                 " os.path.exists(sys.argv[1]))")
+        with patch.dict(os.environ, inherited):
+            status, output, errors = self.run_limited([
+                os.path.realpath(sys.executable), '-I', '-c', probe, str(cache),
+                'SCCACHE_DIR', 'SCCACHE_CACHE_SIZE', 'SCCACHE_SERVER_UDS'])
+        self.assertEqual(status, 0, output + errors)
+        self.assertEqual(output, f"{mac_linux.run_start_line('fixture')}\n'' ''\nFalse False\n")
+
 
 class GuestCommandParityTests(unittest.TestCase):
     """The guest starts only a file that natedev read, or a tool: command_refusal checks each argv word."""
