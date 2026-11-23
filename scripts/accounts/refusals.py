@@ -6,13 +6,14 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 
-from scripts.lib import conf
+from scripts.lib import conf, models_registry, registry_rows
 from scripts.whoami import usage_store  # noqa: E402
 
 @dataclass(frozen=True)
@@ -99,12 +100,60 @@ class UnknownWindow:
 
 
 @dataclass(frozen=True)
+class ModelFamily:
+    """One Claude model family, such as fable or opus, in lower case."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class AllModels:
+    """The refusal blocks every model on the account."""
+
+
+@dataclass(frozen=True)
+class UnknownFamily:
+    """The caller does not know the model family of its work."""
+
+
+UNKNOWN_FAMILY = UnknownFamily()
+ALL_MODELS = AllModels()
+# The provider resets a model family's allowance at most one week after a refusal.
+FAMILY_WINDOW = timedelta(days=7)
+
+
+def claude_families() -> frozenset[str]:
+    """Read the family names in [claude.families] of the model registry; an unreadable registry names none."""
+    try:
+        # Resolve the registry from this call's HOME, as a launch does.
+        sections = registry_rows.parse_registry(models_registry.registry_text(models_registry.registry_path(os.environ)))
+    except (OSError, ValueError):
+        return frozenset()
+    return registry_families(sections)
+
+
+def registry_families(sections: Mapping[str, Mapping[str, str]]) -> frozenset[str]:
+    """Take the family names from the keys of [claude.families] in parsed registry sections."""
+    return frozenset(name.casefold() for name in sections.get("claude.families", {}))
+
+
+def model_family(model: str, families: frozenset[str]) -> ModelFamily | UnknownFamily:
+    """Name the family of a Claude model ID or alias, such as claude-fable-5-2 or opus.
+
+    Only a name in `families` is a family; any other model, such as opusplan or default, has an unknown family.
+    """
+    words = model.casefold().partition("[")[0].split("-")
+    return next((ModelFamily(word) for word in words if word in families), UNKNOWN_FAMILY)
+
+
+@dataclass(frozen=True)
 class AccountRefusal:
     tool: Literal["claude", "codex"]
     login: str
     window: KnownWindow | UnknownWindow
     reset: KnownReset | NoResetKnown
     at: datetime
+    family: ModelFamily | AllModels = ALL_MODELS
 
 
 class RefusalWire(TypedDict):
@@ -113,6 +162,7 @@ class RefusalWire(TypedDict):
     window: str
     reset: str
     at: str
+    family: NotRequired[str]
 
 
 class RefusalsError(ValueError):
@@ -124,7 +174,14 @@ def store_file() -> Path:
 
 
 def key(tool: str, login: str) -> str:
+    """The store key of an all-model refusal."""
     return f"{tool.casefold()}:{login.casefold()}"
+
+
+def refusal_key(refusal: AccountRefusal) -> str:
+    """A family refusal has its own key, so it never replaces the all-model record."""
+    identity = key(refusal.tool, refusal.login)
+    return identity + ":" + refusal.family.name if isinstance(refusal.family, ModelFamily) else identity
 
 
 def _time(text: str) -> datetime:
@@ -159,9 +216,22 @@ def load() -> dict[str, AccountRefusal]:
             raise RefusalsError("invalid account refusal identity or window")
         window = (UnknownWindow() if wire["window"] == "unknown" else KnownWindow(cast(Literal["weekly", "five_hour"], wire["window"])))
         reset = KnownReset(_time(wire["reset"])) if wire["reset"] else NoResetKnown()
-        refusal = AccountRefusal(cast(Literal["claude", "codex"], wire["tool"]), wire["login"], window, reset, _time(wire["at"]))
-        result[key(refusal.tool, refusal.login)] = refusal
+        family = held.get("family", "")
+        if not isinstance(family, str) or family and not family.isalpha():
+            raise RefusalsError("invalid account refusal family")
+        refusal = AccountRefusal(cast(Literal["claude", "codex"], wire["tool"]), wire["login"], window, reset, _time(wire["at"]),
+                                 ModelFamily(family.casefold()) if family else ALL_MODELS)
+        result[refusal_key(refusal)] = refusal
     return result
+
+
+def _wire(refusal: AccountRefusal) -> RefusalWire:
+    wire = RefusalWire(tool=refusal.tool, login=refusal.login,
+        window=refusal.window.name if isinstance(refusal.window, KnownWindow) else "unknown",
+        reset=refusal.reset.at.isoformat() if isinstance(refusal.reset, KnownReset) else "", at=refusal.at.isoformat())
+    if isinstance(refusal.family, ModelFamily):
+        wire["family"] = refusal.family.name
+    return wire
 
 
 def write_refusal(refusal: AccountRefusal) -> None:
@@ -171,17 +241,12 @@ def write_refusal(refusal: AccountRefusal) -> None:
     with path.with_suffix(".lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         held = load()
-        identity = key(refusal.tool, refusal.login)
+        identity = refusal_key(refusal)
         previous = held.get(identity)
         if previous is not None and previous.at > refusal.at:
             return
         held[identity] = refusal
-        wire: dict[str, RefusalWire] = {
-            identity: RefusalWire(tool=item.tool, login=item.login,
-                window=item.window.name if isinstance(item.window, KnownWindow) else "unknown",
-                reset=item.reset.at.isoformat() if isinstance(item.reset, KnownReset) else "", at=item.at.isoformat())
-            for identity, item in held.items()
-        }
+        wire = {identity: _wire(item) for identity, item in held.items()}
         descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".refusals-")
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
@@ -192,6 +257,9 @@ def write_refusal(refusal: AccountRefusal) -> None:
 
 
 def resolved(refusal: AccountRefusal, reading: FreshReading | StaleReading | NoReading, now: datetime) -> bool:
+    if isinstance(refusal.family, ModelFamily):
+        # Saved readings hold no family window, so only time resolves a family refusal.
+        return now >= (refusal.reset.at if isinstance(refusal.reset, KnownReset) else refusal.at + FAMILY_WINDOW)
     if isinstance(refusal.window, KnownWindow) and isinstance(refusal.reset, KnownReset) and refusal.reset.at <= now:
         return True
     if not isinstance(reading, FreshReading):
@@ -205,3 +273,18 @@ def resolved(refusal: AccountRefusal, reading: FreshReading | StaleReading | NoR
     windows = ((reading.weekly,) if isinstance(reading.five_hour, NoWindow)
                else (reading.weekly, reading.five_hour))
     return all(window.at > refusal.at and window.left > 0 for window in windows)
+
+
+def applicable(held: Mapping[str, AccountRefusal], tool: str, login: str,
+               family: ModelFamily | UnknownFamily) -> tuple[AccountRefusal, ...]:
+    """The account's refusals that apply to work of this family; an unknown family takes every refusal."""
+    return tuple(refusal for refusal in held.values()
+                 if key(refusal.tool, refusal.login) == key(tool, login)
+                 and (isinstance(refusal.family, AllModels) or isinstance(family, UnknownFamily) or refusal.family == family))
+
+
+def blocking(held: Mapping[str, AccountRefusal], tool: str, login: str, family: ModelFamily | UnknownFamily,
+             reading: FreshReading | StaleReading | NoReading, now: datetime) -> AccountRefusal | None:
+    """The first unresolved refusal that keeps work of this family off the account."""
+    return next((refusal for refusal in applicable(held, tool, login, family)
+                 if not resolved(refusal, reading, now)), None)
