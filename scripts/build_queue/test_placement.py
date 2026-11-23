@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
@@ -29,7 +30,8 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
-from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
+from scripts.lint import memory_test_support
+from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
@@ -44,6 +46,16 @@ ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
 
 
+# The settings these tests depend on. A tune of the repository settings must not change a test.
+MAC_TEST_PINS = "offload=on\n"
+
+
+def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
+    """Write a fixture setting file with the module's pins under the test's own overrides."""
+    pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" else ""
+    return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
+
+
 class PlacementFixture(AdmissionFixture):
     """Supply private provider evidence across each service restart."""
 
@@ -52,6 +64,11 @@ class PlacementFixture(AdmissionFixture):
     def __init__(self) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         super().__init__()
+        settings = conf.path("mac_test")
+        if settings.parent != self.root:
+            self.close()
+            raise AssertionError(f"a placement test must not read the live settings: {settings}")
+        _ = write_config_fixture(settings)
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -535,6 +552,29 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_a_tune_of_the_repository_settings_reaches_no_placement_fixture(self) -> None:
+        original = cast(Callable[[str], Path], getattr(memory_test_support, "_template"))
+        repository = original("mac_test.conf").read_text().splitlines()
+        with TemporaryDirectory() as folder:
+            for offload in ("on", "off"):
+                tuned = Path(folder) / offload / "mac_test.conf"
+                tuned.parent.mkdir()
+                _ = tuned.write_text("".join(f"offload={offload}\n" if line.startswith("offload=") else line + "\n"
+                                             for line in repository))
+
+                def template(name: str, tuned: Path = tuned) -> Path:
+                    return tuned if name == tuned.name else original(name)
+
+                with self.subTest(offload=offload), mock.patch.object(memory_test_support, "_template", template):
+                    with PlacementFixture() as fixture:
+                        self.assertEqual(conf.read("mac_test").text("offload"), "on")
+                        settings, _, _ = self.target_settings_fixture(fixture)
+                        self.assertEqual(conf.read(settings).text("offload"), "on")
+        with mock.patch.object(conf, "directory", return_value=Path.home() / ".claude" / "config"):
+            with self.assertRaisesRegex(AssertionError, "must not read the live settings"):
+                with PlacementFixture():
+                    pass
+
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
             with self.subTest(operation=operation), PlacementFixture() as fixture:
