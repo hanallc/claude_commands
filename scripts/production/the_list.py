@@ -2073,8 +2073,7 @@ def producer_id(members: staff.StaffSnapshot, reference: str) -> staff.StaffId:
 
 def _check_cli_text_limits(changes: ItemChanges, add_evidence: str | None) -> None:
     lengths: list[tuple[str, str, int]] = []
-    for field, value in (("latest_status", changes.get("latest_status")), ("next_step", changes.get("next_step")),
-                         ("done_when", changes.get("done_when"))):
+    for field, value in (("latest_status", changes.get("latest_status")), ("next_step", changes.get("next_step"))):
         if value is not None:
             lengths.append((f"{field}_max_chars", "--" + field.replace("_", "-"), len(value)))
     if "evidence" in changes:

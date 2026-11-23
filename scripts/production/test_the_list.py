@@ -34,7 +34,6 @@ START = datetime(2026, 11, 16, 18, tzinfo=UTC)
 LIST_TEXT_LIMITS = {
     "latest_status_max_chars": 80,
     "next_step_max_chars": 72,
-    "done_when_max_chars": 72,
     "evidence_line_max_chars": 90,
 }
 
@@ -214,7 +213,6 @@ class TheListTests(unittest.TestCase):
         cases = (
             ("latest-status", "latest_status", "latest_status_max_chars"),
             ("next-step", "next_step", "next_step_max_chars"),
-            ("done-when", "done_when", "done_when_max_chars"),
             ("add-evidence", "evidence", "evidence_line_max_chars"),
             ("evidence", "evidence", "evidence_line_max_chars"),
         )
@@ -244,10 +242,24 @@ class TheListTests(unittest.TestCase):
                     saved = the_list.load(MORTY.id, identity)
                     self.assertEqual(getattr(saved, field), at_limit)
 
+    def test_done_when_saves_every_result_on_add_and_update(self) -> None:
+        done = ("The operator can open the List, find the correct item, and see who owns the next step. "
+                "The producer can update that step and confirm that the List shows the new text after a reload.")
+        code, output, error = self.command("add", "--source", "nate", "--title", "Deliver the List",
+                                           "--owner", RUNNER.id, "--done-when", done)
+        self.assertEqual((code, error), (0, ""))
+        identity = output.strip()
+        self.assertEqual(the_list.load(MORTY.id, identity).done_when, done)
+        updated = done + " The change record includes the review result."
+        self.assertEqual(self.command("update", "--source", "nate", "--id", identity, "--done-when", updated),
+                         (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, identity).done_when, updated)
+
     def test_old_long_text_remains_readable_and_survives_other_updates(self) -> None:
         status = "s" * (LIST_TEXT_LIMITS["latest_status_max_chars"] + 1)
         step = "n" * (LIST_TEXT_LIMITS["next_step_max_chars"] + 1)
-        done = "d" * (LIST_TEXT_LIMITS["done_when_max_chars"] + 1)
+        done = ("The producer can find the release checklist in the List and confirm that the review, "
+                "the browser check, and the final approval are complete before closing the item.")
         evidence = "e" * (LIST_TEXT_LIMITS["evidence_line_max_chars"] + 1)
         item = self.add(changes={"latest_status": status, "next_step": step, "done_when": done, "evidence": evidence})
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
@@ -258,8 +270,9 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("update", "--id", item.id, "--source", "nate", "--title", "New title",
                                       "--add-evidence", "New fact."), (0, "", ""))
         saved = the_list.load(MORTY.id, item.id)
-        self.assertEqual((saved.latest_status, saved.next_step, saved.done_when, saved.evidence),
-                         (status, step, done, evidence + "\nNew fact."))
+        self.assertEqual((saved.latest_status, saved.next_step, saved.evidence),
+                         (status, step, evidence + "\nNew fact."))
+        self.assertEqual(saved.done_when, done)
 
     def test_text_limit_uses_the_current_config_and_refuses_bad_settings(self) -> None:
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.list_config.parent)}))

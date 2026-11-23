@@ -640,6 +640,7 @@ An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+Use `--done-when` to name every result the item needs before it can close.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
 
@@ -647,7 +648,6 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 | --- | --- |
 | `latest_status_max_chars` | 200 characters for the latest status |
 | `next_step_max_chars` | 160 characters for the next step |
-| `done_when_max_chars` | 160 characters for done-when |
 | `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
 
 The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
