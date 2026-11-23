@@ -569,6 +569,12 @@ class ProgramFileTests(unittest.TestCase):
         with mock.patch.dict(os.environ, clean | {"PATH": f"{self.bin}:/usr/bin", "LD_LIBRARY_PATH": "/x"}, clear=True):
             self.assertEqual(self.read(sys.executable, "-c", "1"), [])
 
+    def test_a_later_word_reads_a_path_script_with_no_execute_bit(self) -> None:
+        helper = self.bin / "helper"
+        _ = helper.write_text("rm -rf ~/work\n")
+        helper.chmod(0o644)
+        self.assertEqual(self.read("bash", "helper"), [helper])
+
     def test_a_word_that_names_a_folder_with_a_main_file_is_refused(self) -> None:
         package = self.repo / "build"
         package.mkdir()

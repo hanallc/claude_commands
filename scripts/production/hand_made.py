@@ -154,13 +154,14 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def path_programs(name: str) -> list[Path]:
-    """Each file on PATH that execvp can start for a name with no slash, in PATH order.
+def path_programs(name: str, *, executable: bool = True) -> list[Path]:
+    """Each file on PATH for a name with no slash, in PATH order: with executable, each file that execvp can
+    start; else each file that a program can read, because bash finds a script name on PATH with no execute bit.
 
     checked_files refuses a PATH entry that is empty, relative or in the checkout.
     """
     return [path for path in (Path(folder) / name for folder in os.get_exec_path())
-            if path.is_file() and os.access(path, os.X_OK)]
+            if path.is_file() and os.access(path, os.X_OK if executable else os.R_OK)]
 
 
 def exec_path(name: str, repo: Path) -> Path | None:
@@ -203,7 +204,7 @@ def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     """
     found: list[Path] = []
     for index, word in enumerate(argv):
-        programs = [repo / word] if "/" in word else path_programs(word)
+        programs = [repo / word] if "/" in word else path_programs(word, executable=not index)
         for program in programs if index else programs[:1]:
             if os.path.isfile(program) and (
                     in_checkout(program, repo) or outside_program(program, any_text=bool(index))):
