@@ -25,7 +25,7 @@ import stat
 import subprocess
 import tempfile
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from functools import cached_property
@@ -303,16 +303,24 @@ def _saved_target_prefix(checkout: Path) -> str:
     return f".saved-target-{checkout.name}-"
 
 
-def _report_saved_targets(checkout: Path) -> None:
+# Older migrations named no checkout, so such a folder can belong to any checkout beside it.
+_UNNAMED_SAVED_TARGET = re.compile(r"\.saved-target-[a-z0-9_]{8}")
+
+
+def _report_saved_targets(checkout: Path, reported: set[Path]) -> None:
+    """Report each saved-target folder beside the checkout once in a run."""
     for saved in _saved_targets(checkout):
-        report_retained_folder(saved, _EARLIER_CARGO_TARGET)
+        if saved not in reported:
+            reported.add(saved)
+            report_retained_folder(saved, _EARLIER_CARGO_TARGET)
 
 
 def _saved_targets(checkout: Path) -> tuple[Path, ...]:
-    """Find the folders that hold an earlier target of this checkout, beside the checkout."""
+    """Find the folders beside the checkout that can hold its earlier target."""
     name = re.compile(re.escape(_saved_target_prefix(checkout)) + r"[a-z0-9_]{8}")
     with suppress(FileNotFoundError):
-        return tuple(sorted(entry for entry in checkout.parent.iterdir() if name.fullmatch(entry.name)))
+        return tuple(sorted(entry for entry in checkout.parent.iterdir()
+                            if name.fullmatch(entry.name) or _UNNAMED_SAVED_TARGET.fullmatch(entry.name)))
     return ()
 
 
@@ -3064,6 +3072,7 @@ class MigrationProgress:
     in_use: dict[Path, str]
     kernel_hidden: dict[int, str]
     moved: int = 0
+    reported_saved_targets: set[Path] = field(default_factory=set[Path])
 
     def record_process_scan(self, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> None:
         from scripts.lint import tmp_sweep
@@ -3298,7 +3307,7 @@ def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *,
     if reason := _migration_target_lock(checkout, common, output):
         progress.kept[checkout] = reason
         return False
-    _report_saved_targets(checkout)
+    _report_saved_targets(checkout, progress.reported_saved_targets)
     target = checkout / "target"
     real = _is_real_target(target)
     with ExitStack() as held:
@@ -3478,7 +3487,7 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
             _ = progress.kept.pop(checkout, None)
             print(f"output {checkout} -> {recorded}")
     for checkout in plan.saved:
-        _report_saved_targets(checkout)
+        _report_saved_targets(checkout, progress.reported_saved_targets)
     progress.print_keeps(dry_run=dry_run)
     if not dry_run and any(selection.includes(path)
                            and progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)

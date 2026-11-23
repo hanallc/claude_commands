@@ -1340,6 +1340,17 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(status, 0, text.getvalue())
         self.assertIn(f"keep {new}: already moved; defer output: archive the old build root first", text.getvalue())
 
+    def test_migration_reports_an_unnamed_saved_target_once_per_run(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        _ = self.other_main()
+        unnamed = main.parent / ".saved-target-ab_d1234"
+        (unnamed / "target").mkdir(parents=True)
+        result = self.command(self.root, self.migration_command("--all"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = f"kept for a manual removal list: {unnamed} (worktrees, the checkout's earlier Cargo target)"
+        self.assertEqual(result.stderr.count(line), 1, result.stderr)
+
     def test_migration_reports_the_saved_target_of_a_linked_moved_worktree(self) -> None:
         self.layout_fixture()
         new, output, _lock = self.moved_worktree_with_real_target()
