@@ -390,7 +390,10 @@ class SavedQuestionDelivery:
 
     @property
     def message_body(self) -> str:
-        return f"{self.source.words}\nAnswer with this command: {self.answer_command}"
+        return self._body(self.answer_command)
+
+    def _body(self, command: str) -> str:
+        return f"{self.source.words}\nAnswer with this command: {command}"
 
     @property
     def message(self) -> str:
@@ -411,7 +414,10 @@ class SavedQuestionDelivery:
         if len(parts) != 3:
             return False
         heading, title, body = parts
-        return heading == self.heading and bool(title.strip()) and title.splitlines() == [title] and body == self.message_body
+        # Attempts saved before the keeper flag carry the List answer command without --keeper.
+        before_keeper = self._body(re.sub(r" --keeper \S+", "", self.answer_command, count=1))
+        return (heading == self.heading and bool(title.strip()) and title.splitlines() == [title]
+                and body in (self.message_body, before_keeper))
 
 
 @dataclass(frozen=True)

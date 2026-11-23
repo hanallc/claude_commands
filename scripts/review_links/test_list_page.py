@@ -5340,6 +5340,50 @@ observer.observe(original.parentElement,{childList:true});
                     send.assert_not_called()
                 self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
 
+    def save_attempt_before_the_keeper_flag(self, status: change_page.DeliveryStatus,
+                                            saved_state: delivery_state.QuestionSendState,
+                                            receipt: delivery_state.NoQuestionSendReceipt | delivery_state.QuestionSendReceipt
+                                            ) -> tuple[Path, delivery_state.QuestionAttempt, change_page.SavedQuestionDelivery]:
+        item = self.add("The question from before the keeper flag")
+        asked = list_page.submit(status.root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        claimed = delivery.job.record
+        current = the_list.load(MORTY.id, item.id)
+        saved = change_page.list_question_target(Path(claimed.source.path), current.id, current.number, current.title,
+                                                 MORTY.id, keeper=MORTY.id).saved(current.questions[0])
+        before_keeper = saved.message.replace(f" --keeper {shlex.quote(MORTY.id)}", "")
+        self.assertNotEqual(before_keeper, saved.message)
+        path = status.path(delivery.page, delivery.row)
+        with status.locked():
+            change_page.advance_question_attempt(path, claimed, replace(
+                claimed, state=saved_state, message=before_keeper,
+                owner=delivery_state.NoQuestionSendOwner(), receipt=receipt))
+        _ = delivery.job.release()
+        return path, change_page.read_question_attempt(path), saved
+
+    def test_a_sent_question_from_before_the_keeper_flag_waits_for_an_answer(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        sent = delivery_state.QuestionSendState.SENT
+        _, attempt, saved = self.save_attempt_before_the_keeper_flag(
+            status, sent, delivery_state.QuestionSendReceipt("sent", ""))
+        with status.locked():
+            self.assertEqual(change_page.question_delivery_view(status, saved).state, sent)
+        state = list_page.saved_action_state(MORTY.id, attempt.source.item_id, status=status)
+        self.assertEqual(state["waiting_for_answer"], "true")
+
+    def test_restart_resends_a_ready_question_from_before_the_keeper_flag(self) -> None:
+        root = self.root / "reviews"
+        path, attempt, _ = self.save_attempt_before_the_keeper_flag(
+            change_page.DeliveryStatus(root), delivery_state.QuestionSendState.READY,
+            delivery_state.NoQuestionSendReceipt())
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            change_page.recover_review_messages(change_page.DeliveryStatus(root))
+        send.assert_called_once_with(MORTY.id, attempt.message, attempt.message_id)
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
     def test_mixed_question_results_keep_counts_and_unread_in_agreement(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)

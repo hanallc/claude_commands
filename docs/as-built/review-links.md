@@ -1419,6 +1419,7 @@ An unconfirmed send keeps its saved message ID for the next attempt.
 The server retries unresolved attempts during recovery.
 If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
 The question reader checks the saved question words and answer command.
+An attempt saved before the `--keeper` flag also matches the same command without the flag.
 A List title edit preserves the delivery state.
 Recovery sends the prepared message with its original title.
 If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
@@ -1439,7 +1440,7 @@ The List address preserves a linked item outside the filters when the console re
 It counts in its current status chip.
 Close the linked item or change a filter to dismiss the section.
 An open question adds a Producer answering note below the saved state.
-The recipient runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
+The recipient runs the command in the message to save an answer: `the_list.py answer L<N> --keeper <keeper> --question <id> --text "<answer>"`.
 Morty can answer any List question.
 Without `--keeper`, the command uses the caller's List folder if it holds the item, and morty's folder if not.
 Only morty can name a keeper other than itself or the caller.
