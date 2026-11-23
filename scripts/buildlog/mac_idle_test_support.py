@@ -7,10 +7,11 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Generator, Sequence
-from typing import ParamSpec, TypeVar, cast, override
+from typing import Literal, ParamSpec, TypeVar, cast, override
 from unittest import mock
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.lint.memory_test_support import write_config_fixture
@@ -34,6 +35,43 @@ def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> 
     }))
     return path
 
+
+LiveClaim = Literal["none", "idle", "working"]
+
+
+def write_live_mac_state(directory: Path, *, block: bool = False, claim: LiveClaim = "none",
+                         unreachable_until: float = 0) -> Path:
+    """Write the local Mac state that the alert line checks before it shows a saved condition.
+
+    Set MAC_TEST_STATE_DIR to the returned folder. A call removes the state that it does not write.
+    """
+    from scripts.lib import process_start
+    from scripts.mac_test import mac_test
+
+    claims = directory / "claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    for path in (directory / "block.json", claims / "live.json", directory / "unreachable_until"):
+        path.unlink(missing_ok=True)
+    if block:
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        mac_test.write_block(directory / "block.json", mac_test.ActiveMacBlock(
+            "research", "P15 F11 L0 run", since, since + timedelta(hours=4),
+            mac_test.RecordedSession("research", "research"), mac_test.NO_SHOWRUNNER,
+            "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+    if claim != "none":
+        start = process_start.process_start(os.getpid())
+        if not isinstance(start, process_start.Started):
+            raise AssertionError("the test process has no start identity")
+        row: dict[str, object] = {"claim_id": "claim-live", "episode": "episode-live", "attempt": "attempt-live",
+            "submitting_session": "research", "holder_session": "research", "pid": os.getpid(),
+            "proc_start": start.start, "what": "nextest hana", "worktree": str(directory / "worktree"),
+            "since": "2026-01-01T00:00:00+00:00"}
+        if claim == "idle":
+            row["work_idle_since"] = "2026-01-01T00:00:00+00:00"
+        _ = (claims / "live.json").write_text(json.dumps(row))
+    if unreachable_until:
+        _ = (directory / "unreachable_until").write_text(str(unreachable_until))
+    return directory
 
 
 class NotificationTransportBlocked(AssertionError):
