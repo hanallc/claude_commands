@@ -8,7 +8,7 @@ from scripts.build_queue.admission_test_support import (
 from scripts.build_queue import placement
 from scripts.mac_test import claim_state
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 import json
 import os
@@ -338,7 +338,8 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
-                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n"
+                               + UNREACHABLE_WAIT_FIXTURE)
         state = self.root / "mac-state"
         self.environment.update({"MAC_TEST_STATE_DIR": str(state), "CONF_DIR": str(settings.parent),
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),

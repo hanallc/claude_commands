@@ -32,7 +32,7 @@ from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, off
 from scripts.build_hold import owning_session as session_owner
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 
 class SshEligibilityTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class SshEligibilityTests(unittest.TestCase):
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=linux-part\n")
         _ = write_config_fixture(self.root / "linux.conf",
                               "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\nslots.hana=2\n", template="mac_test")
