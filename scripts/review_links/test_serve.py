@@ -92,8 +92,8 @@ find_executable = shutil.which
 FIXTURE_CAPTURE = new_item_dialog.PageCaptureRequest("/console/review.html?show=all", 876, 640, True)
 
 
-def setUpModule() -> None:
-    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+def write_server_config(configuration: Path) -> dict[str, str]:
+    """Write the configuration fixtures that the server tests read; return the environment that selects them."""
     _ = write_config_fixture(configuration / "change_review.conf")
     _ = write_config_fixture(configuration / "review_links.conf",
         "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
@@ -104,8 +104,34 @@ def setUpModule() -> None:
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
-    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
-        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
+    return {"CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"}
+
+
+def setUpModule() -> None:
+    configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, write_server_config(configuration))))
+
+
+class ServerConfigFolderTests(unittest.TestCase):
+    def test_a_subclass_without_conf_dir_writes_the_go_fixture_into_its_own_folder(self) -> None:
+        written: list[Path] = []
+
+        class Elsewhere(ReviewLinksServerTests):
+            def runTest(self) -> None:
+                _ = self.go_fixture()
+                path = conf.path("review_links").resolve()
+                self.assertTrue(path.is_file())
+                self.assertTrue(path.is_relative_to(self.root.parent.resolve()), path)
+                written.append(path)
+        home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-home-")))
+        result = unittest.TestResult()
+        # A home folder of the test's own keeps "~/.claude/config" away from the live folder.
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            _ = os.environ.pop("CONF_DIR", None)
+            _ = Elsewhere().run(result)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        self.assertEqual(len(written), 1)
+        self.assertFalse((home / ".claude").exists())
 
 
 @contextmanager
@@ -145,7 +171,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=temporary / "usage.json"))
         staff_file = temporary / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
+        # The class owns its configuration folder, so a subclass in another module writes no live configuration.
+        configuration = temporary / "config"
+        configuration.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **write_server_config(configuration),
             "SHOWRUNNER_STATE_DIR": str(temporary / "investigations-state"),
             "CHANGE_REVIEW_DIR": str(temporary / "change-reviews"),
             "NEXT_STATE_DIR": str(temporary / "next"),
