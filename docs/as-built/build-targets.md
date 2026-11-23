@@ -43,14 +43,19 @@ A held target admits only work that its hold rules permit.
 
 ### Gate placement
 
-A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
-The caller checks the targets in `targets` in the order the file lists them.
-It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and mac-linux for a full gate.
-Named module tests, nightly gates, and promotion without tests use natedev.
+A Claude gate requests placement on every eligible target in `build_targets.conf`.
+The caller reads the targets in registry order and applies the fixed placement rules.
+It omits any target whose `enabled.<target>` switch is off.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
+Standalone named module tests and nightly suites can request the same targets.
+A nested named module can use its parent reservation. Promotion without tests uses natedev.
 Hana gates have no repository default.
-The Builds page shows both candidates while a gate with both targets waits or runs.
+
+The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
+To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.
+Set `settings.<name>=cloud_gate.conf`. The scaler also requires `enabled=on` in that settings file.
+The queue checks whether the scaler is available on each placement pass.
+A scaler assignment uses a cloud slot until the queue confirms settlement.
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
