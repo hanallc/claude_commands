@@ -1029,23 +1029,25 @@ class GateWorker:
 def time_limit_result(request: dict[str, object], text: str, elapsed: float,
                       limit: float, vcpus: int) -> dict[str, object]:
     """Keep a red result when the box does not return its own result."""
-    completed = {match[1]: (int(match[2]), float(match[3])) for match in re.finditer(
-        r"(?m)^(\S+) exit=(-?\d+) seconds=(\d+\.\d+)(?: stopped)?$", text)}
+    completed = {match[1]: (int(match[2]), float(match[3]), bool(match[4])) for match in re.finditer(
+        r"(?m)^(\S+) exit=(-?\d+) seconds=(\d+\.\d+)( stopped)?$", text)}
+    module_stops = dict(re.findall(r"(?m)^(\S+) (killed: [^\n]+)$", text))
     started = set(re.findall(r"(?m)^Starting module: (\S+)$", text))
     running = sorted(started - completed.keys())
     report = (f"time limit: limit {limit:g} s; elapsed {elapsed:.3f} s; "
               f"running modules: {', '.join(running) or '(none)'}")
     jobs: list[gate.GateJobResult] = []
+    details: list[str] = []
     for path in cast(list[str], request['modules']):
         name = path.removeprefix('scripts/')
         suite, module = name.split('/', 1)
-        status, seconds = completed.get(name, (124, elapsed if name in started else 0.0))
+        status, seconds, stopped = completed.get(name, (124, elapsed if name in started else 0.0, False))
+        killed_for = report if name not in completed else module_stops.get(name, report) if stopped else ''
         failure = re.search(r'(?ms)^--- ' + re.escape(name) + r' exit=-?\d+ ---\n(.*?)\n--- end module failure ---', text)
         output = gate.failure_log_tail(failure[1]) if failure else report if status else ''
-        jobs.append(gate.GateJobResult(suite, module, status, seconds, output,
-                                      killed_for=report if name not in completed else ''))
-    details = [f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}"
-               for job in jobs if job.returncode and not job.killed_for]
+        jobs.append(gate.GateJobResult(suite, module, status, seconds, output, killed_for=killed_for))
+        if status and name in completed:
+            details.append(f"--- {name} exit={status} ---\n{output}")
     report = '\n'.join([report, *details])
     run = gate.GateRun(tuple(jobs), elapsed, 0, executions=tuple(jobs), time_limit_report=report)
     now = time.time()

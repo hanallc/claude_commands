@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import unittest
 import json
 import contextlib
@@ -15,10 +16,12 @@ import subprocess
 import select
 from types import SimpleNamespace
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.aws_target import cloud_gate, gate_box
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
@@ -26,6 +29,7 @@ from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
+from scripts.production.gate import selection_miss_command as run_selection_miss_command
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
@@ -36,6 +40,339 @@ from scripts.production.gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    def selection_miss_checkpoint(self) -> str:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
+        passing = self.run_gate("--tests-only", "--full")
+        self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+        record, = self.pass_records()
+        self.assertEqual(record["commit"], self.base)
+        # Both fixture modules name this file. Keep it outside the merge diff.
+        (self.unit / "unit.txt").unlink()
+        module = self.unit / "scripts/hooks/test_first.py"
+        self.write(module, module.read_text() + "\n# Select this module.\n")
+        for index in range(51):
+            self.write(self.unit / "notes" / f"note-{index:02d}.txt", "Fixture note.\n")
+        return self.checkpoint_commit("checkpoint(fixture): selection fixture\n\n"
+                                      + "Change-Review: none — internal check")
+
+    def selection_miss_notices(self) -> list[list[str]]:
+        return [call["args"] for call in self.calls()
+                if call["tool"] == "send.py" and call["args"][:2] == ["--to", "natest"]]
+
+    def run_audit_in_process(self, *arguments: str, timeout: float) -> str:
+        if not arguments:
+            return run_selection_miss_command(timeout=timeout)
+        source, folder = arguments
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        return json.dumps(gate.write_selection_misses(Path(source), Path(folder)))
+
+    @gate_suites("hooks", "message")
+    def test_red_merge_records_and_reports_a_skipped_module(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        selections: list[affected_modules.AffectedSelection | affected_modules.FullSuite] = []
+
+        def select(repo: Path, base: affected_modules.CertifiedBase | affected_modules.NoCertifiedBase,
+                   modules: list[Path], dirty: set[str], *,
+                   state_dir: Path, recorded: dict[str, gate_record.ModuleReadRecord]
+                   ) -> affected_modules.AffectedSelection | affected_modules.FullSuite:
+            self.assertNotEqual(repo, self.checkout)
+            self.assertIsInstance(base, affected_modules.CertifiedBase)
+            self.assertEqual(dirty, set())
+            self.assertEqual(state_dir, Path(self.environment["GATE_STATE_DIR"]))
+            self.assertEqual([path.relative_to(repo).as_posix() for path in modules],
+                             ["scripts/hooks/test_first.py", "scripts/message/test_first.py"])
+            selection = affected_modules.select_affected(repo, base, modules, dirty, state_dir=state_dir,
+                                                        recorded=recorded)
+            selections.append(selection)
+            return selection
+
+        with (mock.patch.object(gate, "select_affected", side_effect=select),
+              mock.patch.object(gate, "selection_miss_command", side_effect=self.run_audit_in_process)):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("message: RED", result.stdout)
+        self.assert_not_pushed()
+        self.assertEqual(len(selections), 1, result.stdout + result.stderr)
+        self.assertIsInstance(selections[0], affected_modules.AffectedSelection, repr(selections[0]))
+        selection = selections[0]
+        assert isinstance(selection, affected_modules.AffectedSelection)
+        selected, = selection.modules
+        self.assertEqual(selected.parts[-3:], ("scripts", "hooks", "test_first.py"), result.stdout)
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.assertTrue(path.is_file(), result.stdout + result.stderr)
+        line, = path.read_text().splitlines()
+        record = cast(gate.SelectionMiss, json.loads(line))
+        at = datetime.fromisoformat(record["at"])
+        self.assertEqual(at.utcoffset(), timedelta())
+        self.assertLessEqual(at, datetime.now(UTC))
+        self.assertEqual(self.git(self.checkout, "show", "-s", "--format=%P", record["tree"]),
+                         f"{self.base} {checkpoint}")
+        self.assertEqual(record["base"], self.base)
+        self.assertEqual(record["module"], "scripts/message/test_first.py")
+        self.assertEqual(record["changed"], [f"notes/note-{index:02d}.txt" for index in range(50)])
+        self.assertEqual(record["changed_count"], 53)
+        self.assertEqual(record["selected_count"], 1)
+        self.assertEqual(record["module_count"], 2)
+        notice, = self.selection_miss_notices()
+        detail = notice[notice.index("--text") + 1]
+        for value in (record["tree"], self.base, record["module"], str(path)):
+            self.assertIn(value, detail)
+
+    @gate_suites("hooks", "message")
+    def test_red_merge_does_not_record_a_selected_module(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-hooks", "red")
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("hooks: RED", result.stdout)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+
+    @gate_suites("hooks", "message")
+    def test_red_merge_does_not_record_a_miss_when_selection_requires_the_full_suite(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        with (mock.patch.object(gate, "select_affected",
+                                return_value=affected_modules.FullSuite("fixture full suite")) as select,
+              mock.patch.object(gate, "selection_miss_command", side_effect=self.run_audit_in_process)):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Cannot check for targeted selection misses", result.stderr)
+        select.assert_called_once()
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+
+    @gate_suites("hooks", "message")
+    def test_red_merge_keeps_its_status_when_selection_raises(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        with (mock.patch.object(gate, "select_affected", side_effect=RuntimeError("fixture selection failed\nsecond line")),
+              mock.patch.object(gate, "selection_miss_command", side_effect=self.run_audit_in_process)):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("RED:", result.stderr)
+        self.assertIn("Cannot check for targeted selection misses. fixture selection failed second line",
+                      result.stderr.splitlines())
+        self.assert_not_pushed()
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+
+    @gate_suites("hooks", "message")
+    def test_red_merge_keeps_the_miss_when_notice_delivery_fails(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        self.write(self.state / "send-fails", "fail")
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("RED:", result.stderr)
+        notices = [line for line in result.stderr.splitlines() if line.startswith("Cannot send the targeted")]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("fixture message failed", notices[0])
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+        self.assertEqual(len(self.selection_miss_notices()), 1)
+
+    @gate_suites("hooks", "message")
+    def test_selection_misses_use_reads_from_before_the_red_gate(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        changed = "notes/note-00.txt"
+        self.write(self.state / "red-message", "red")
+        self.write(self.state / "red-read-message", changed)
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        module = "scripts/message/test_first.py"
+        with mock.patch.dict(os.environ, self.environment):
+            latest = affected_modules.latest_module_reads()[module].content_reads
+        assert isinstance(latest, gate_record.RecordedContentReads)
+        self.assertIn(changed, latest.paths)
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.assertTrue(path.is_file(), result.stdout + result.stderr)
+        row, = path.read_text().splitlines()
+        self.assertEqual(cast(gate.SelectionMiss, json.loads(row))["module"], module)
+        self.assertEqual(len(self.selection_miss_notices()), 1)
+
+    @gate_suites("hooks", "message", "notify", "direct")
+    def test_selection_misses_count_only_the_individual_module_timeout(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        limit = "time limit: limit 20 s; elapsed 20.000 s; running modules: notify/test_first.py"
+        jobs = (
+            gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),
+            gate.GateJobResult("message", "test_first.py", 124, 0, "did not start", limit),
+            gate.GateJobResult("notify", "test_first.py", -9, 20, "stopped", limit),
+            gate.GateJobResult("direct", "test_first.py", -9, 5, "stopped",
+                               "killed: still running after 5 s, the module time limit"),
+        )
+        run = gate.GateRun(jobs, 20, 0, time_limit_report=limit)
+        with (mock.patch.object(gate, "run_suites", return_value=run),
+              mock.patch.object(gate, "tell_time_limit")):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.assertTrue(path.is_file(), result.stdout + result.stderr)
+        row, = path.read_text().splitlines()
+        self.assertEqual(cast(gate.SelectionMiss, json.loads(row))["module"], "scripts/direct/test_first.py")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message", "notify")
+    def test_selection_misses_exclude_recovered_aws_deadline(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        modules = ["scripts/hooks/test_first.py", "scripts/message/test_first.py", "scripts/notify/test_first.py"]
+        request: dict[str, object] = {"attempt": "fixture", "commit": "fixture", "tree": "fixture",
+                                      "mode": "gate", "modules": modules}
+        log = ("hooks/test_first.py exit=0 seconds=0.50\n"
+               + "message/test_first.py exit=1 seconds=1.00\n"
+               + "Starting module: notify/test_first.py\n"
+               + "notify/test_first.py exit=-15 seconds=20.00 stopped\n")
+        recovered = cloud_gate.time_limit_result(request, log, 20, 20, 4)
+        run = gate_box.decode_run(recovered["gate"])
+        self.assertIn("running modules: (none)", run.jobs[2].killed_for)
+        self.assertTrue(run.jobs[2].killed_for.startswith("time limit:"))
+        with (mock.patch.object(gate, "run_suites", return_value=run),
+              mock.patch.object(gate, "tell_time_limit")):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        journal = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        row, = journal.read_text().splitlines()
+        self.assertEqual(cast(gate.SelectionMiss, json.loads(row))["module"], modules[1])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_misses_use_the_tested_tree_identity(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        path = "scripts/message/test_first.py"
+        _ = self.git(self.checkout, "update-index", "--assume-unchanged", "--", path)
+        module = self.checkout / path
+        self.write(module, module.read_text() + "\n# Test a different tree.\n")
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.write(self.state / "red-message", "red")
+
+        with mock.patch.object(gate, "selection_miss_command", side_effect=self.run_audit_in_process):
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("message: RED", result.stdout)
+        self.assertEqual(result.stderr.splitlines().count(
+            "Cannot check for targeted selection misses. The tested checkout differs from the merge commit"), 1)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_miss_diagnostic_does_not_send_a_notice(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        ledger = Path(self.environment["GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        self.write(ledger, "broken pass record\n")
+        self.write(self.state / "red-hooks", "red")
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        diagnostic = "Test pass ledger unavailable; tests cannot be reused or recorded"
+        self.assertIn(diagnostic, result.stderr)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_misses_refuse_ignored_python(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        path = "scripts/message/test_ignored.py"
+        exclude = Path(self.git(self.checkout, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+        with exclude.open("a", encoding="utf-8") as rules:
+            _ = rules.write(f"\n/{path}\n")
+        self.write(self.checkout / path, SUITE_MODULE)
+        self.assertEqual(self.git(self.checkout, "check-ignore", "--", path), path)
+        self.write(self.state / "red-message", "red")
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fixture failure in message/test_ignored.py", result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines().count(
+            "Cannot check for targeted selection misses. The tested checkout differs from the merge commit"), 1)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_misses_refuse_untracked_python(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.checkout / "scripts/message/untracked_helper.py", "VALUE = 1\n")
+        self.write(self.state / "red-message", "red")
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("message: RED", result.stdout)
+        self.assertEqual(result.stderr.splitlines().count(
+            "Cannot check for targeted selection misses. The tested checkout differs from the merge commit"), 1)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_misses_report_graph_errors(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.unit / "scripts/hooks/test_invalid.py", "def (\n")
+        invalid = self.checkpoint_commit("checkpoint(fixture): invalid source\n\n"
+                                         + "Change-Review: none — internal check")
+        self.write(self.state / "red-message", "red")
+        result = self.run_gate(checkpoint=invalid, previous=checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        errors = [line for line in result.stderr.splitlines() if line.startswith("Cannot check for targeted")]
+        diagnostic, = errors
+        self.assertIn("graph error:", diagnostic)
+        self.assertIn("scripts/hooks/test_invalid.py", diagnostic)
+        self.assertFalse((Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl").exists())
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
+    @gate_suites("hooks", "message")
+    def test_selection_miss_append_repairs_a_partial_tail(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.write(path, '{"fixture":true}\n{"partial"')
+        result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        previous, current = path.read_text().splitlines()
+        self.assertEqual(previous, '{"fixture":true}')
+        self.assertEqual(cast(gate.SelectionMiss, json.loads(current))["module"], "scripts/message/test_first.py")
+
+    @gate_suites("hooks", "message")
+    def test_selection_miss_audit_times_out_after_restoration(self) -> None:
+        checkpoint = self.selection_miss_checkpoint()
+        self.write(self.state / "red-message", "red")
+        path = Path(self.environment["GATE_STATE_DIR"]) / "selection-misses.jsonl"
+        self.write(path, "")
+
+        def audit(*arguments: str, timeout: float) -> str:
+            if arguments:
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(timeout, 1)
+            return run_selection_miss_command(*arguments, timeout=timeout)
+
+        with (path.open("r+b") as journal,
+              mock.patch.object(gate, "SELECTION_MISS_AUDIT_SECONDS", 1),
+              mock.patch.object(gate, "selection_miss_command", side_effect=audit)):
+            fcntl.flock(journal, fcntl.LOCK_EX)
+            result = self.run_gate(checkpoint=checkpoint, previous=self.checkpoint)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        diagnostic, = [line for line in result.stderr.splitlines() if line.startswith("Cannot check for targeted")]
+        self.assertIn("timed out after 1 seconds", diagnostic)
+        self.assertEqual(path.read_text(), "")
+        self.assertEqual(self.selection_miss_notices(), [])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.

@@ -252,6 +252,9 @@ class FixtureTest(unittest.TestCase):
                     self.fail("module processes never overlapped")
                 time.sleep(0.01)
         if (state / ("red-" + suite)).exists():
+            source = state / ("red-read-" + suite)
+            if source.is_file():
+                Path(source.read_text()).read_text()
             self.fail("fixture failure in " + suite + "/" + module.name)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "finish", "tmpdir": str(tmp)})

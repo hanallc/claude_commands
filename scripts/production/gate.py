@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -72,7 +72,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import BinaryIO, Literal, Protocol, TextIO, cast
+from typing import BinaryIO, Literal, Protocol, TextIO, TypedDict, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -131,6 +131,10 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
+# The audit is optional. Limit the history refresh, the audit, and the notice.
+SELECTION_MISS_HISTORY_SECONDS = 5
+SELECTION_MISS_AUDIT_SECONDS = 45
+SELECTION_MISS_NOTICE_SECONDS = 5
 # basedpyright resolves bpy with these Blender stubs.
 # Later versions report diagnostics in bake_textures.py.
 TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
@@ -516,7 +520,7 @@ def fetch_branches(repo: Path, *branches: str) -> None:
     _ = checked_git(repo, "fetch", "origin", *(f"+refs/heads/{branch}:refs/remotes/origin/{branch}" for branch in dict.fromkeys(branches)))
 
 
-def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
+def command(arguments: Sequence[str], repo: Path, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     with ExitStack() as cleanup:
         recovery = ACTIVE_GATE_RECOVERY.get()
         process: subprocess.Popen[str] | None = None
@@ -528,7 +532,7 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
                     text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
                 if isinstance(recovery, GateRecovery):
                     recovery.add_group(process.pid)
-            output, errors = process.communicate()
+            output, errors = process.communicate(timeout=timeout)
             return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
         except BaseException:
             if process is not None:
@@ -1552,17 +1556,181 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
 
 def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | UnrecordableTestTree,
                             modules: Sequence[tuple[str, Path]], *,
-                            source: Literal["tests-only", "checkpoint"] = "tests-only"
+                            source: Literal["tests-only", "checkpoint"] = "tests-only",
+                            report: bool = True,
+                            recorded: Mapping[str, gate_record.ModuleReadRecord] | None = None,
                             ) -> tuple[AffectedSelection | FullSuite, PassedTreeLedger]:
     """Select affected tests against the tree that the caller will test."""
     if not modules:
         raise GateRefused("the test list is empty")
     ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
     dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
-    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                state_dir=gate_state_dir())
-    report_selection(selection, len(modules))
+    inputs = repo, ledger.certified_base(), [path for _, path in modules], dirty
+    selection = (select_affected(*inputs, state_dir=gate_state_dir()) if recorded is None else
+                 select_affected(*inputs, state_dir=gate_state_dir(), recorded=recorded))
+    if report:
+        report_selection(selection, len(modules))
     return selection, ledger
+
+
+class SelectionMiss(TypedDict):
+    """Record a failed module outside the targeted selection."""
+
+    at: str
+    tree: str
+    base: str
+    module: str
+    changed: list[str]
+    changed_count: int
+    selected_count: int
+    module_count: int
+
+
+type SelectionReadFields = tuple[list[str] | None, list[str] | None, list[str] | None]
+
+
+class SelectionMissRequest(TypedDict):
+    """Inputs for the audit process."""
+
+    commit: str
+    tested_tree: str
+    failed: list[str]
+    reads: dict[str, SelectionReadFields]
+
+
+class SelectionMissResult(TypedDict):
+    """Return the number of records written and the notice text."""
+
+    miss_count: int
+    notice: str
+
+
+@dataclass(frozen=True)
+class RedMerge:
+    """Keep the red result and audit inputs until after restoration."""
+
+    run: GateRun
+    commit: str
+    tested_tree: str
+    failed: list[str]
+    reads: dict[str, SelectionReadFields] | Exception
+
+
+def selection_read_fields(reads: gate_record.ModuleReadRecord) -> SelectionReadFields:
+    configs, folders, contents = reads.config_reads, reads.folder_scans, reads.content_reads
+    return (sorted(configs.stems) if isinstance(configs, gate_record.RecordedConfigReads) else None,
+            gate_record.folder_scan_strings(folders) if isinstance(folders, gate_record.RecordedFolderScans) else None,
+            sorted(contents.paths) if isinstance(contents, gate_record.RecordedContentReads) else None)
+
+
+def selection_miss_worker(arguments: Sequence[str]) -> int:
+    """Capture history or run an audit without holding the merge checkout."""
+    try:
+        with redirect_stdout(sys.stderr):
+            if not arguments:
+                payload = json.dumps({path: selection_read_fields(reads)
+                                      for path, reads in affected_modules.latest_module_reads().items()})
+            else:
+                source, folder = arguments
+                payload = json.dumps(write_selection_misses(Path(source), Path(folder)))
+        print(payload)
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+def write_selection_misses(source: Path, folder: Path) -> SelectionMissResult:
+    """Audit the tested commit in a private checkout that shares the Git objects."""
+    request = cast(SelectionMissRequest, json.loads((folder / "request.json").read_text(encoding="utf-8")))
+    # Include ignored files. This Git process shares the audit deadline.
+    extra = subprocess.run(["git", "ls-files", "--others", "-z", "--", "*.py"], cwd=source,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", check=False)
+    if extra.returncode:
+        raise GateRefused(failure_detail(extra))
+    if extra.stdout:
+        raise GateRefused("The tested checkout differs from the merge commit")
+    mirror = folder / "objects.git"
+    repo = folder / "checkout"
+    commit = request["commit"]
+    for arguments in (("clone", "--mirror", "--shared", "--quiet", "--", str(source), str(mirror)),
+                      ("-C", str(mirror), "-c", "core.hooksPath=/dev/null",
+                       "worktree", "add", "--detach", "--quiet", str(repo), commit)):
+        result = subprocess.run(["git", *arguments], stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, check=False)
+        if result.returncode:
+            raise GateRefused(failure_detail(result))
+    committed = head_test_tree(repo)
+    if request["tested_tree"] != committed.tree:
+        raise GateRefused("The tested checkout differs from the merge commit")
+    modules = discover_test_modules(repo)
+    history = {path: gate_record.module_read_record(*fields) for path, fields in request["reads"].items()}
+    selection, _ledger = select_targeted_modules(repo, committed, modules, source="checkpoint",
+                                                report=False, recorded=history)
+    if isinstance(selection, FullSuite):
+        if selection.reason.startswith("graph error:"):
+            raise GateRefused(selection.reason)
+        return SelectionMissResult(miss_count=0, notice="")
+    selected = {path.relative_to(repo).as_posix() for path in selection.modules}
+    misses = sorted(set(request["failed"]) - selected)
+    if not misses:
+        return SelectionMissResult(miss_count=0, notice="")
+    path = gate_state_dir() / "selection-misses.jsonl"
+    at = datetime.now(UTC).isoformat()
+    changed = sorted(selection.changed_files)[:50]
+    with store.locked_append(path) as output:
+        for module in misses:
+            record = SelectionMiss(at=at, tree=commit, base=selection.base.commit, module=module,
+                                   changed=changed, changed_count=len(selection.changed_files),
+                                   selected_count=len(selected), module_count=len(modules))
+            store.append_locked(output, record)
+    notice = (f"The targeted selection skipped {len(misses)} of the failed test modules at {commit} "
+              + f"(base {selection.base.commit}).\n" + ", ".join(misses) + f"\nRecord at {path}.")
+    return SelectionMissResult(miss_count=len(misses), notice=notice)
+
+
+def selection_miss_command(*arguments: str, timeout: float) -> str:
+    result = command([sys.executable, "-B", str(Path(__file__).resolve()), "--selection-miss-worker", *arguments],
+                     Path.cwd(), timeout=timeout)
+    if result.returncode:
+        raise GateRefused(result.stderr.strip() or f"Audit process exit {result.returncode}")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+    return result.stdout.strip()
+
+
+def capture_selection_reads() -> dict[str, SelectionReadFields] | Exception:
+    """Capture the recorded reads available before the full gate starts."""
+    try:
+        return cast(dict[str, SelectionReadFields], json.loads(selection_miss_command(
+            timeout=SELECTION_MISS_HISTORY_SECONDS)))
+    except Exception as error:
+        return error
+
+
+def record_selection_misses(repo: Path, commit: str, tested_tree: str, failed: list[str],
+                            reads: dict[str, SelectionReadFields] | Exception) -> None:
+    """Run the bounded audit after restoration and send one notice."""
+    try:
+        if isinstance(reads, Exception):
+            raise reads
+        with tempfile.TemporaryDirectory(prefix="selection-miss-") as temporary:
+            request = SelectionMissRequest(commit=commit, tested_tree=tested_tree, failed=failed, reads=reads)
+            _ = (Path(temporary) / "request.json").write_text(json.dumps(request), encoding="utf-8")
+            result = cast(SelectionMissResult, json.loads(selection_miss_command(
+                str(repo), temporary, timeout=SELECTION_MISS_AUDIT_SECONDS)))
+    except Exception as error:
+        print("Cannot check for targeted selection misses. " + " ".join(str(error).split()), file=sys.stderr, flush=True)
+        return
+    if not result["miss_count"]:
+        return
+    try:
+        sent = command(session_send.send_argv("--to", "natest", "--from", "gate", "--text", result["notice"]),
+                       Path.cwd(), timeout=SELECTION_MISS_NOTICE_SECONDS)
+        if sent.returncode:
+            raise ValueError(failure_detail(sent))
+    except Exception as error:
+        print("Cannot send the targeted selection notice. " + " ".join(str(error).split()), file=sys.stderr, flush=True)
 
 
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
@@ -2404,8 +2572,16 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         recovery.rollback_head = baseline
         recovery.rollback_source = checkpoint
         recovery.save()
+    red: RedMerge | None = None
+    tested_tree = ""
+
+    def report_tested_tree(tree: str) -> None:
+        nonlocal tested_tree
+        tested_tree = tree
+
     try:
         hold.wait_until_free()
+        reads = capture_selection_reads()
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
         if result.returncode:
             conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
@@ -2426,15 +2602,19 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         try:
             with admission_records.default_owner(args.unit):
                 suites = run_gate_suites(repo, module_time_limit_s=float(args.module_time_limit_s),
-                                         source="checkpoint", full=args.full, gate_job=args.gate_job, target=target)
+                                         source="checkpoint", full=args.full, gate_job=args.gate_job, target=target,
+                                         report_tested_tree=report_tested_tree)
         finally:
             if previous_unit is None:
                 _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
             else:
                 os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
-            if suites.time_limit_report:
-                tell_time_limit(args.unit, repo, suites)
+            failed = [] if suites.tests_reused else sorted({
+                f"scripts/{job.suite}/{job.module}" for job in suites.jobs
+                if job.kind is GateJobKind.TEST_MODULE and job.returncode
+                and not job.killed_for.startswith("time limit:")})
+            red = RedMerge(suites, merged, tested_tree, failed, reads)
             raise GateRefused("RED: " + (suites.time_limit_report or "types or suites failed"))
         fetch_branches(repo, "main")
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
@@ -2447,6 +2627,11 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
+        if red is not None:
+            if red.failed:
+                record_selection_misses(repo, red.commit, red.tested_tree, red.failed, red.reads)
+            if red.run.time_limit_report:
+                tell_time_limit(args.unit, repo, red.run)
         refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
         raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
@@ -3262,7 +3447,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
-                    target: GateTarget) -> GateRun:
+                    target: GateTarget, report_tested_tree: Callable[[str], None] | None = None) -> GateRun:
     """Route the whole test selection to the target that gate_start_target checked: the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
@@ -3316,7 +3501,10 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         token = ACTIVE_ROUTED_GATE_TREE.set(routed)
         try:
             run = select(routed, dirty)
-            return finalize_gate(cloud, routed, run)
+            result = finalize_gate(cloud, routed, run)
+            if report_tested_tree is not None:
+                report_tested_tree(routed.tree)
+            return result
         except affected_modules.GraphError as error:
             raise GateRefused(str(error)) from error
         finally:
@@ -3651,4 +3839,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--selection-miss-worker"]:
+        raise SystemExit(selection_miss_worker(sys.argv[2:]))
     raise SystemExit(main())

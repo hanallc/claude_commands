@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
@@ -948,7 +948,8 @@ def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[s
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
-                    state_dir: Path | None = None) -> AffectedSelection | FullSuite:
+                    state_dir: Path | None = None,
+                    recorded: Mapping[str, ModuleReadRecord] | None = None) -> AffectedSelection | FullSuite:
     try:
         settings = conf.read("gate")
         declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
@@ -978,9 +979,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
         config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
         configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
-        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
-        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+        reads_by_module = (latest_module_reads() if recorded is None else recorded) if changed else {}
+        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in reads_by_module.values())
+        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in reads_by_module.values())
         content_changes = {path for path in changed if not path.startswith("config/")}
         base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
         scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
@@ -1003,7 +1004,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         selected: list[Path] = []
         for module in modules:
             path = module.relative_to(repo).as_posix()
-            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
+            reads = reads_by_module.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
             sources = fixture_sources(graph.imports, path)
             static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
             config_reads = reads.config_reads

@@ -564,6 +564,24 @@ A selection of zero modules passes.
 Affected passes record `kind: affected` and never replace the full base.
 Types, admission, isolated reruns, and later merge checks keep their existing behavior.
 
+**Targeted selection misses**
+
+The merge gate captures recorded reads before it tests the merge candidate.
+After a full merge gate fails, the gate restores the checkout and audits the tested commit in a temporary checkout.
+The audit uses the captured reads.
+Like `--affected`, it uses the eligible base that gives the fewest changed paths.
+The audit requires the tested checkout to match the commit.
+If the selector requires the full suite, the gate records zero misses.
+An individual module timeout counts as a failure.
+Modules that the whole gate deadline prevents from finishing do not count.
+The gate appends one line for each failed module outside the selection to `selection-misses.jsonl` in the gate state folder.
+Each line contains the UTC time, the tested commit, the base commit, and the module path.
+Each line lists up to 50 changed paths in sorted order.
+It gives the counts for changed paths, selected modules, and total modules.
+The gate sends one message to natest if it records any misses.
+The audit and the notice have time limits.
+The gate prints one diagnostic if the audit or notice fails.
+
 **Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.

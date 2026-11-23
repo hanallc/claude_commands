@@ -466,6 +466,34 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(run.jobs[1].returncode, 124)
                 self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
 
+    def test_deadline_recovery_keeps_stop_reasons(self) -> None:
+        names = ("fixture/test_module_limit.py", "fixture/test_deadline.py", "fixture/test_red.py")
+        request = {**self.request, "modules": [f"scripts/{name}" for name in names]}
+        module_limit = "killed: still running after 4 s, the module time limit"
+        log = (f"{names[0]} {module_limit}\n"
+               + f"{names[0]} exit=-15 seconds=4.00 stopped\n"
+               + f"Starting module: {names[1]}\n"
+               + f"--- {names[1]} exit=-15 ---\n"
+               + "Output from the stopped module.\n"
+               + "--- end module failure ---\n"
+               + f"{names[1]} exit=-15 seconds=10.00 stopped\n"
+               + f"{names[2]} exit=1 seconds=1.00\n")
+
+        recovered = cloud_gate.time_limit_result(request, log, 10, 10, 4)
+        run = gate_box.decode_run(recovered["gate"])
+
+        deadline = "time limit: limit 10 s; elapsed 10.000 s; running modules: (none)"
+        self.assertEqual([job.killed_for for job in run.jobs], [module_limit, deadline, ""])
+        self.assertEqual([job.returncode for job in run.jobs], [-15, -15, 1])
+        self.assertIn(f"--- {names[1]} exit=-15 ---\nOutput from the stopped module.", run.time_limit_report)
+        self.assertIn(f"--- {names[2]} exit=1 ---", run.time_limit_report)
+        self.assertEqual(run.time_limit_report, "\n".join((
+            deadline,
+            f"--- {names[0]} exit=-15 ---", deadline,
+            f"--- {names[1]} exit=-15 ---", "Output from the stopped module.",
+            f"--- {names[2]} exit=1 ---", deadline,
+        )))
+
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
         import sqlite3
         _ = index.update()
