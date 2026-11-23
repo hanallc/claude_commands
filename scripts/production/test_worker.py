@@ -48,6 +48,7 @@ from scripts.message import send, sessions
 from scripts.usage import agents_log
 
 from scripts.herdr import herdr
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 DETACHED_FIXTURE_DEAD_PID = 2 ** 22 + 12345
@@ -237,7 +238,7 @@ class DispatchAgent:
         _ = case.enterContext(patch.object(os, "kill", side_effect=self.fixture.world.signal))
 
     def run(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if args[0] != "/nonexistent/herdr":
+        if args[0] != MISSING_HERDR_BIN:
             return self.run_process(args, **kwargs)
         action, pane = args[4:6]
         if not (action == "prompt" and args[6] == "/compact"):
@@ -357,7 +358,7 @@ class WorkerCommandTests(unittest.TestCase):
         _ = self.enterContext(detached_fixture_processes())
         _ = (self.fixture.root / "conf/build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n" + UNREACHABLE_WAIT_FIXTURE)
-        self.fixture.world.binary = "/nonexistent/herdr"
+        self.fixture.world.binary = MISSING_HERDR_BIN
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
@@ -2194,7 +2195,7 @@ class WorkerCommandTests(unittest.TestCase):
                     atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
                     opened = case.opened()
                     def queued_without_delivery(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-                        if arguments[0] == "/nonexistent/herdr" and arguments[4:6] == ["prompt", opened.pane]:
+                        if arguments[0] == MISSING_HERDR_BIN and arguments[4:6] == ["prompt", opened.pane]:
                             if exited:
                                 pid, _, _ = case.fixture.world.foreground.pop(opened.pane)
                                 del case.fixture.world.processes[pid]
@@ -2765,7 +2766,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.agent.finish_after = 1
                 def exit_after_prompt(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                     result = self.agent.run(args, **kwargs)
-                    if args[0] == "/nonexistent/herdr" and args[4] == "prompt":
+                    if args[0] == MISSING_HERDR_BIN and args[4] == "prompt":
                         del self.fixture.world.foreground[opened.pane]
                         self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
                         if closed:

@@ -25,6 +25,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
@@ -294,7 +295,7 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(self.notifier_root),
             "SHOWRUNNER_STATE_DIR": str(self.showrunner_root),

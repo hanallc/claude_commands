@@ -28,6 +28,7 @@ from scripts.style import style_rules
 from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 if TYPE_CHECKING:
     from scripts.style import declarations
@@ -99,7 +100,7 @@ def legacy_overlapping_tickets() -> Generator[None]:
 def style_staff_fixture(root: Path, repo: Path,
                         assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> Generator[None]:
     """Create private ticket owners for the copied repository."""
-    with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+    with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
         owner = fixture_member("showrunner", name="sample-style")
         members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
             staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
@@ -251,7 +252,7 @@ class LedgerTestCase(unittest.TestCase):
         _ = (self.root / "staff.json").write_text(json.dumps(record), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
