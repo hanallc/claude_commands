@@ -27,6 +27,7 @@ from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
+    from scripts.buildlog.repository import MacSourceRepository
     from scripts.buildlog.transfer_bytes import TransferBytes
 
 
@@ -944,12 +945,31 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
         return WHOLE_MAC
     if isinstance(source, repository.UnrecordedSourceCheckout):
         return WHOLE_MAC
-    mirror = Path(source.git_dir).parent.name
+    mirror = _mac_mirror_name(source)
     if not valid_mac_path_component(mirror):
         return WHOLE_MAC
     key = mac_claim_key(source.key)
     fence = mac_claim_stem(key, 0)
     return ResolvedMacMirror(key, mirror, f"{fence}.json", fence, worktree)
+
+
+def _mac_mirror_name(source: "MacSourceRepository") -> str:
+    """Name the mirror after the checkout that lends its objects when it has the same origin.
+
+    A prepared or merged copy is a shared clone in a folder named for the copy.
+    Its own folder name is not the repository name; the lending checkout's name is.
+    """
+    from scripts.buildlog import repository
+
+    lender = repository.borrowed_git_dir(source.git_dir)
+    if lender is not None:
+        try:
+            lent = repository.mac_source_repository(str(Path(lender).parent), lender)
+        except (OSError, SubprocessError, ValueError):
+            lent = None
+        if isinstance(lent, repository.MacSourceRepository) and lent.key == source.key:
+            return Path(lent.git_dir).parent.name
+    return Path(source.git_dir).parent.name
 
 
 def has_mac_worktree(worktree: str) -> bool:

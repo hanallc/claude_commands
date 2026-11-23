@@ -740,6 +740,20 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         return cast(str, values["variable"])
 
 
+    def test_shared_copy_folder_takes_the_mirror_name_of_its_source_checkout(self) -> None:
+        # copies.py puts a prepared or merged copy at <tool folder>/copies-source/source as a shared clone.
+        origin = "https://fixture.invalid/hana"
+        source = self.repository("hana")
+        copy = self.root / "tmp" / "copies-source" / "source"
+        _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", origin], env=self.environment, check=True)
+        _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(copy)],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(copy), "remote", "set-url", "origin", origin], env=self.environment, check=True)
+        expected = claim_state.mac_repository_identity(str(source))
+        mirror = claim_state.mac_repository_identity(str(copy))
+        assert isinstance(expected, claim_state.MacMirrorIdentity) and isinstance(mirror, claim_state.MacMirrorIdentity)
+        self.assertEqual((mirror.mirror_name, mirror.key), ("hana", expected.key))
+
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)
         self.assert_command(on, 0, "free\nno block\nCI's Mac switch: on\n")

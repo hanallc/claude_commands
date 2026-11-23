@@ -53,6 +53,7 @@ REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
 REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
+REAL_MAC_REPOSITORY_IDENTITY = claim_state.mac_repository_identity
 REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
 WAITING_SESSION = OwningSession("waiting-session")
 
@@ -957,6 +958,32 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                     repo, "", kind, command, NoOwningSession(), "fixed-source", selection=Pinned("mac"))
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, expected)
+
+    def test_copy_folder_names_keep_the_repository_linux_only_policy(self) -> None:
+        # A prepared or merged copy is a shared clone in a folder that is not named for the repository.
+        # setUp sets linux_only.hana=linux-part; the copy must read that policy, not one for its folder name.
+        origin = "https://fixture.invalid/hana"
+        source = self.root / "repositories" / "hana"
+        _ = self.enterContext(mock.patch("subprocess.run", REAL_SUBPROCESS_RUN))
+        _ = self.enterContext(mock.patch("subprocess.Popen", REAL_SUBPROCESS_POPEN))
+        _ = self.enterContext(mock.patch.object(claim_state, "mac_repository_identity", REAL_MAC_REPOSITORY_IDENTITY))
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture", "--no-gpg-sign", "--allow-empty"],
+                           check=True)
+        _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", origin], check=True)
+        for step, folder in (("prepared", "copies-source/source"), ("merged", "copies-merge/merged")):
+            copy = self.root / "tmp" / folder
+            _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(copy)], check=True)
+            _ = subprocess.run(["git", "-C", str(copy), "remote", "set-url", "origin", origin], check=True)
+            for package, expected in (("portable", placement.AllowedHost()),
+                                      ("linux-part", placement.FixedExclusion("linux_only"))):
+                with self.subTest(step=step, package=package):
+                    constraints = build_targets.fixed_placement_constraints(
+                        copy, package, "test", ("cargo", "test"), NoOwningSession(), "fixed-source",
+                        selection=Pinned("mac"))
+                    mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+                    self.assertEqual(mac.eligibility, expected)
 
     def test_claude_doc_exclusion_applies_only_to_the_default_route(self) -> None:
         cases: tuple[tuple[str, build_targets.StepKind, TargetSelection, placement.HostEligibility], ...] = (
