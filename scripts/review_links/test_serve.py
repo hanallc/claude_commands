@@ -1009,7 +1009,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
         form = case.card_body(cache.get(), key, "works", "The held answer.")
         marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
-        self.review_post_done.clear()
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
@@ -1021,7 +1020,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
             self.assertEqual((status, hold), (200, ""), answer)
             self.assertTrue({"answer", "version", "delivery_pending"} <= answer.keys(), answer)
-            self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(self.review_posts.wait_until_none_run())
             save.assert_called_once()
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "works: The held answer.")
