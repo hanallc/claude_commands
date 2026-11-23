@@ -6642,6 +6642,127 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertFalse((self.root / "log.jsonl").exists())
         self.assertEqual(self.relayed, [])
 
+    def mac_locked_main(self, sender: str = "hana", *extra: str) -> tuple[int, str, mock.MagicMock]:
+        arguments = ["--to", "user", "--text-id", "mac.locked", "--value", f"sender={sender}",
+                     "--value", "waiting=One unit's phase waits for 2 shots", "--clears-when", "true", *extra]
+        with (mock.patch.object(send, "send", return_value=send.Result("sent", "to the user")) as sent,
+              redirect_stdout(output := io.StringIO()), redirect_stderr(io.StringIO())):
+            code = send.main(arguments)
+        return code, output.getvalue(), sent
+
+    def mac_in_use(self) -> tuple[Path, Path, Path]:
+        """Give the Mac state folder, mac_test.conf and build_targets.conf of a Mac in use."""
+        state = self.root / "mac-state"
+        state.mkdir(exist_ok=True)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(state)})))
+        mac_test_conf, build_targets_conf = self.root / "config/mac_test.conf", self.root / "config/build_targets.conf"
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
+        _ = write_config_fixture(build_targets_conf, "enabled.mac=on\n")
+        (state / "block.json").unlink(missing_ok=True)
+        return state, mac_test_conf, build_targets_conf
+
+    def write_mac_block(self, state: Path, holder: str) -> None:
+        from scripts.mac_test import mac_test
+
+        since = datetime.fromtimestamp(1000, timezone.utc)
+        block = mac_test.block_record(mac_test.ActiveMacBlock(
+            holder, "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue(holder),
+            mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+        _ = (state / "block.json").write_text(json.dumps(block))
+
+    def assert_mac_locked_sent(self, sender: str = "hana", *extra: str) -> None:
+        code, output, sent = self.mac_locked_main(sender, *extra)
+        self.assertEqual(code, 0)
+        self.assertIn("SENT: to the user", output)
+        sent.assert_called_once()
+
+    def assert_mac_locked_not_sent(self, sender: str = "hana") -> None:
+        code, output, sent = self.mac_locked_main(sender)
+        self.assertEqual(code, 0)
+        self.assertIn("SKIPPED: the Mac is off on purpose", output)
+        sent.assert_not_called()
+
+    def test_mac_locked_push_waits_for_a_mac_in_use(self) -> None:
+        for name, offload, enabled, blocked in (("block", "on", "on", True), ("offload", "off", "on", False),
+                                                ("enabled", "on", "off", False)):
+            state, mac_test_conf, build_targets_conf = self.mac_in_use()
+            _ = write_config_fixture(mac_test_conf, f"offload={offload}\n")
+            _ = write_config_fixture(build_targets_conf, f"enabled.mac={enabled}\n")
+            if blocked:
+                self.write_mac_block(state, "nate")
+            with self.subTest(signal=name):
+                self.assert_mac_locked_not_sent()
+        _ = self.mac_in_use()
+        self.assert_mac_locked_sent()
+
+    def test_mac_locked_push_goes_when_a_record_or_setting_is_unusable(self) -> None:
+        def corrupt_block(state: Path, _mac_test_conf: Path, _build_targets_conf: Path) -> None:
+            _ = (state / "block.json").write_text("{not json")
+
+        def unusable_offload(_state: Path, mac_test_conf: Path, _build_targets_conf: Path) -> None:
+            _ = write_config_fixture(mac_test_conf, "offload=maybe\n")
+
+        def unusable_enabled(_state: Path, _mac_test_conf: Path, build_targets_conf: Path) -> None:
+            _ = write_config_fixture(build_targets_conf, "enabled.mac=maybe\n")
+
+        def missing_settings_with_no_committed_copy(_state: Path, mac_test_conf: Path,
+                                                    _build_targets_conf: Path) -> None:
+            # CONF_DIR is not a Git checkout, so conf finds no committed copy.
+            # The offload read fails, so the Mac counts as in use.
+            mac_test_conf.unlink()
+
+        for fault in (corrupt_block, unusable_offload, unusable_enabled, missing_settings_with_no_committed_copy):
+            fault(*self.mac_in_use())
+            with self.subTest(fault=fault.__name__):
+                self.assert_mac_locked_sent()
+
+    def test_mac_locked_push_reads_the_committed_offload_when_the_live_value_is_missing(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        # CONF_DIR is a Git checkout here, so conf reads the committed copy.
+        for arguments in (("init", "-q"), ("add", mac_test_conf.name), ("commit", "-qm", "committed settings")):
+            _ = subprocess.run(["git", "-C", str(mac_test_conf.parent), "-c", "user.name=Send test",
+                                "-c", "user.email=send@example.invalid", "-c", "commit.gpgsign=false", *arguments],
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                               env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def missing_key() -> None:
+            _ = mac_test_conf.write_text("# The live file has no offload key.\n")
+
+        for fault in (missing_key, mac_test_conf.unlink):
+            fault()
+            with self.subTest(fault=fault.__name__):
+                code, output, sent = self.mac_locked_main()
+                self.assertEqual(code, 0)
+                self.assertIn("SKIPPED: the Mac is off on purpose (offload=off)", output)
+                sent.assert_not_called()
+
+    def test_mac_locked_block_holder_still_pushes_and_another_sender_does_not(self) -> None:
+        state, _, _ = self.mac_in_use()
+        self.write_mac_block(state, "hana")
+        self.assert_mac_locked_sent("hana")
+        self.assert_mac_locked_not_sent("nate")
+
+    def test_mac_locked_forward_to_natedev_asks_only_on_the_delivering_host(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        self.assert_mac_locked_sent("hana", "--machine", "natedev")
+        self.assert_mac_locked_not_sent()
+
+    def test_mac_locked_skip_on_natedev_is_a_confirmed_skip_on_the_mac(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        code, output, _ = self.mac_locked_main()
+        options = send.parse(["--machine", "natedev", "--to", "user", "--text-id", "mac.locked",
+                              "--value", "sender=hana", "--value", "waiting=One unit's phase waits for 2 shots",
+                              "--clears-when", "true"])
+        message = send.Message("user", "hana", "Mac locked", "Details", options.key)
+        with mock.patch.object(send, "run", return_value=(code, output, "")):
+            result = send.remote(message, "natedev", options)
+        self.assertEqual(result.outcome, "skipped")
+        self.assertIsInstance(result.failure, send.NoFailedPush)
+        self.assertIn("the Mac is off on purpose (offload=off)", result.detail)
+
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
                      "--action", "Choose retry.", "--text", "The build stopped."]
