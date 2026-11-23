@@ -491,7 +491,9 @@ class MacLinuxRouteTests(unittest.TestCase):
             + 'run.time_limit_seconds=7\n',
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
-        _ = (config / 'machines.conf').write_text('mac.hosts=fixture-mac\n', encoding='utf-8')
+        _ = (config / 'machines.conf').write_text(
+            'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
+            + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
@@ -518,8 +520,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = self.git('remote', 'add', 'origin', 'https://example.test/claude_commands.git')
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
             (self.repo / folder).mkdir(parents=True)
-        model = Path(__file__).resolve().parents[2] / 'config/build_folders.conf'
-        _ = (self.repo / 'config/build_folders.conf').write_bytes(model.read_bytes())
+        _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()
