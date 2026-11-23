@@ -254,13 +254,13 @@ def state_directory(target: str = "mac") -> Path:
     return ssh_target_state_directory(target)
 
 
-def read_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> conf.ConfigRead:
+def read_target_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> conf.ConfigRead:
     """Read only the target settings file. A policy check uses this read; it needs no registry and no wait."""
     return conf.read(config_path() if isinstance(path, DefaultMacSettings) else path.expanduser())
 
 
 def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
-    return connection_settings(read_settings(path))
+    return connection_settings(read_target_settings(path))
 
 
 def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
@@ -269,8 +269,7 @@ def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
 
 
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    config = conf.read(settings)
+    config = read_target_settings(path)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
@@ -282,7 +281,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
         free_floor_gib=config.number("free_floor_gib"),
         default_target_budget_gib=config.text("target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
         values=values,
-        source=settings,
+        source=config.source,
         settings=config,
     )
 

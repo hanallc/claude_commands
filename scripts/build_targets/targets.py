@@ -181,7 +181,7 @@ def mac_policy_eligibility(
         elif isinstance(repository, eligibility.UnknownRepository):
             results.append(ExcludedTarget(target, "repo"))
         else:
-            config = eligibility.read_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_settings()
+            config = eligibility.read_target_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_target_settings()
             policy = eligibility.linux_only_policy(config, repository, repo_root, package, kind="")
             results.append(ExcludedTarget(target, policy.reason) if isinstance(policy, eligibility.IneligibleMacStep)
                            else EligibleTarget(target))

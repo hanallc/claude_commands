@@ -2390,7 +2390,7 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
     """Reserve a slot for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
     settings = Path(args.settings) if args.settings else config_path(args.target)
-    config = eligibility.read_config(settings)
+    config = eligibility.read_target_settings(settings)
     worktree = claim_worktree_path(args.repo_root)
     mac_repository = (claim_state.mac_repository_identity(str(worktree))
                       if paths.platform == "macos" else WHOLE_MAC)
