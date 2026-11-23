@@ -1371,10 +1371,19 @@ Status derives `draining (N runs left)` or `held` from matching live keep entrie
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
-Legacy CI cargo requests use the same hold and lineage check before memory admission.
-CI requests outside the keep list remain queued until release.
-A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
-Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+On natedev, each admission pass applies the same hold and lineage check to every local step waiter (`AdmitRequest`), CI requests included.
+App launches (`LaunchRequest`) are not held; the enforcer does not stop them either.
+The check uses the waiter's process lineage and the session that owns its run, so the holder's own steps and kept runs still start.
+The client sends that owning session (`owning_session()`) in `AdmitRequest.session`; a worker in the holder's run is not held.
+A request from an older client has `SessionNotSent` and falls back to the session in its queue row.
+The service finds the own hold key once for each session in a pass.
+An unreadable staff record gives no own hold key for that pass, so the step waits.
+A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
+A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
+A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.
+View and explain replies between passes show the holds of the last pass.
+Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
+Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.

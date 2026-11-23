@@ -2562,10 +2562,18 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         return directory
 
     def admission(self, pid: int, start: str) -> None:
-        fixture = self.admission_fixture
-        with fixture.loop_turn():
-            owner = fixture.fixture_owner(pid, start)
-            _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
+        """Admit a build as the service did before the hold started: a natedev hold holds a new local waiter."""
+        held = {path: path.read_bytes() for path in self.holders.iterdir()}
+        for path in held:
+            path.unlink()
+        try:
+            fixture = self.admission_fixture
+            with fixture.loop_turn():
+                owner = fixture.fixture_owner(pid, start)
+                _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
+        finally:
+            for path, data in held.items():
+                _ = path.write_bytes(data)
 
     def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
         return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force)

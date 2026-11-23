@@ -43,6 +43,7 @@ from scripts.accounts import outage_alerts
 from scripts.buildlog import store
 from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
+from scripts.build_hold.owning_session import OwningSession
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
@@ -2630,38 +2631,167 @@ class RunnerAuthorizationTests(unittest.TestCase):
 
     def test_a_ci_step_waits_during_a_natedev_hold_and_starts_after_the_release(self) -> None:
         # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
-        from scripts.build_hold import build_hold
-        from scripts.build_targets import build_targets
-
-        holder = build_hold.Holder("fps", datetime.now(user_zone()), "Phase 3 timing", build_hold.UnknownReleaseEta(), "fps")
         held = records.NatedevHeld("fps", "Phase 3 timing")
         for priority_source in ("existing", "request"):
-            with self.subTest(priority_source=priority_source), AdmissionFixture() as fixture, fixture.loop_turn():
+            with self.subTest(priority_source=priority_source), mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
+                directory = fixture.root / "holders"
+                directory.mkdir()
+                _ = (directory / "fps").write_text(json.dumps({"holder": "fps", "since": "2026-11-15T12:00:00+00:00",
+                    "for": "Phase 3 timing", "release_eta": "unknown", "keep": []}))
                 request = fixture.service_request()
                 priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
                     "set_at": fixture.clock.now(), "set_by": "fixture"},))
                 if priority_source == "existing":
                     fixture.server.priority = priority
-                with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
-                    waiting, = fixture.server.handle_request(request)
-                    assert isinstance(waiting, wire.Wait)
-                    self.assertEqual(waiting.reason, held)
-                    self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
-                    if priority_source == "request":
-                        with mock.patch.object(gate, "priority_labels", return_value={}):
-                            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
-                                "bump-ci-runner", request.runner, "fixture", "fixture")), [wire.Ok()])
-                    view, = fixture.server.handle_request(wire.ViewRequest())
-                    assert isinstance(view, wire.ViewReply)
-                    step, = view.reading.view.waiting
-                    self.assertEqual(step.reason, held)
-                    snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
-                    assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
-                    self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
-                    self.assertEqual(snapshot.inputs.priority, priority)
-                    self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.Wait)
+                self.assertEqual(waiting.reason, held)
+                self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
+                if priority_source == "request":
+                    with mock.patch.object(gate, "priority_labels", return_value={}):
+                        self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                            "bump-ci-runner", request.runner, "fixture", "fixture")), [wire.Ok()])
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                step, = view.reading.view.waiting
+                self.assertEqual(step.reason, held)
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
+                self.assertEqual(snapshot.inputs.priority, priority)
+                self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
+                (directory / "fps").unlink()
                 fixture.allow_next_start()
                 fixture.release(only_admitted(fixture.server.handle_request(request)))
+
+    def test_a_waiter_that_joined_before_a_drain_waits_in_the_hold_and_starts_first_at_the_release(self) -> None:
+        # fps drain 2026-11-22 17:33: a smoke step that joined at 14:12 started in the hold, and the enforcer ended it.
+        from scripts.build_hold import build_hold
+
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            fixture.hold_starts()
+            older = fixture.request(since=fixture.clock.now() - 20)
+            newer = fixture.request(since=fixture.clock.now() - 10)
+            for request in (older, newer):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            kept = fixture.request(owner=fixture.fixture_owner(4100, "41000"))
+            write_process(fixture.proc.path, 4100, start="41000")
+            _ = (directory / "fps").write_text(json.dumps({
+                "holder": "fps", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": [{"pid": 4100, "start_time": "41000"}]}))
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.free(9 * GIB)
+            with mock.patch.object(build_hold, "PROC_ROOT", fixture.proc.path):
+                fixture.allow_next_start()
+                kept_grant = only_admitted(fixture.server.handle_request(kept))
+                fixture.allow_next_start()
+                _ = fixture.server.run_pass()
+                self.assertEqual(set(fixture.server.reservations), {kept.episode})
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                held = records.NatedevHeld("fps", "a traced timeline")
+                self.assertEqual([(step.pid, step.reason) for step in view.reading.view.waiting],
+                                 [(older.owner.pid, held), (newer.owner.pid, held)])
+                fixture.release(kept_grant)
+                (directory / "fps").unlink()
+                fixture.allow_next_start()
+                _ = fixture.server.run_pass()
+            self.assertIn(older.episode, fixture.server.reservations)
+            self.assertIn(newer.episode, fixture.server.waiters)
+
+    def test_a_step_of_the_holders_own_run_starts_in_the_hold(self) -> None:
+        # A worker in the run has its own session; the run's owning session holds natedev.
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture, fixture.loop_turn():
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            fixture.hold_starts()
+            worker = replace(fixture.request(), session=OwningSession("fps-run"))
+            self.assertIsInstance(fixture.server.handle_request(worker)[0], wire.Wait)
+            self.assertNotEqual(fixture.server.waiters[worker.episode].row.get("session_id"), "fps-run")
+            _ = (directory / "fps-run").write_text(json.dumps({
+                "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            self.assertIn(worker.episode, fixture.server.reservations)
+
+    def test_a_held_step_gives_back_its_runs_slot_between_steps(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture:
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            run = fixture.run_owner()
+            first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+            fixture.allow_next_start()
+            other = only_admitted(fixture.server.handle_request(fixture.request(run=fixture.run_owner(), need=GIB)))
+            fixture.release(first)
+            fixture.release(other)
+            fixture.free(11 * GIB)
+            head = fixture.request(run=run, need=16 * GIB)
+            self.assertIsInstance(fixture.server.handle_request(head)[0], wire.Wait)
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.ContinuationSlot)
+            _ = (directory / "fps").write_text(json.dumps({
+                "holder": "fps", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[head.episode].continuation_claim, service.NoContinuationClaim)
+
+    def test_a_plain_step_starts_while_the_hold_state_is_unreadable(self) -> None:
+        # The enforcer stays the guard; a ReadingUnavailable wait would end the step at the client.
+        for host in ("natedev", "mac"):
+            with (self.subTest(host=host), mock.patch.object(store, "host_name", return_value=host),
+                  AdmissionFixture() as fixture, fixture.loop_turn()):
+                _ = (fixture.root / "holders").write_text("not a folder")
+                fixture.free(9 * GIB)
+                fixture.allow_next_start()
+                _ = only_admitted(fixture.server.handle_request(fixture.request()))
+
+    def test_a_mac_service_does_not_hold_for_a_natedev_hold(self) -> None:
+        with mock.patch.object(store, "host_name", return_value="mac"), AdmissionFixture() as fixture, fixture.loop_turn():
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            _ = (directory / "fps").write_text(json.dumps({
+                "holder": "fps", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = only_admitted(fixture.server.handle_request(fixture.request()))
+
+    def test_an_unreadable_staff_record_holds_the_step_and_the_pass_goes_on(self) -> None:
+        from scripts.build_targets import build_targets
+
+        with (mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture,
+              fixture.loop_turn(), mock.patch.object(build_targets, "own_hold_key", side_effect=OSError("staff record"))):
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            _ = (directory / "fps-run").write_text(json.dumps({
+                "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "a traced timeline",
+                "release_eta": "unknown", "keep": []}))
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            step = replace(fixture.request(), session=OwningSession("fps-run"))
+            reply, = fixture.server.handle_request(step)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertEqual(fixture.server.local_holds[step.episode], records.NatedevHeld("fps-run", "a traced timeline"))
+
+    def test_no_hold_in_force_reads_no_process_lineage(self) -> None:
+        from scripts.build_targets import build_targets
+
+        with (mock.patch.object(store, "host_name", return_value="natedev"), AdmissionFixture() as fixture,
+              fixture.loop_turn(), mock.patch.object(build_targets, "read_caller_lineage",
+                                                     side_effect=AssertionError("lineage read with no hold"))):
+            (fixture.root / "holders").mkdir()
+            fixture.hold_starts()
+            self.assertIsInstance(fixture.server.handle_request(fixture.request())[0], wire.Wait)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.free(9 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            self.assertTrue(fixture.server.reservations)
 
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
