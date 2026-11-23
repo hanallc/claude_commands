@@ -1042,10 +1042,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(owned, 'text/html; charset=utf-8', prepared)
             return None
         if route.path == list_page.PAGE_PATH:
-            self.list_document(route.query, list_page.render)
+            self.list_document(route.query, list_page.LIST_VIEW)
             return None
         if route.path == studio_page.PAGE_PATH:
-            self.list_document(route.query, studio_page.render)
+            self.list_document(route.query, studio_page.STUDIO_VIEW)
             return None
         if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
             return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
@@ -1874,7 +1874,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         return self.attachment_response(content, media)
 
-    def list_document(self, query: str, render: list_page.ListRender) -> None:
+    def list_document(self, query: str, view: list_page.ListView) -> None:
         """Answer a List view: the page, or the List counts and item state it reads."""
         server = cast(ReviewLinksServer, self.server)
         if query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
@@ -1889,15 +1889,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access(), server.staff_read_scope():
                 live = server.mode is ServerMode.LIVE
                 reviews = server.list_review_records()
-                content = render(server.root, include_counts=live, defer_counts=True,
-                                 status=server.delivery_status,
-                                 review_records=(list_page.LinkedReviewRead.AFTER_RENDER
-                                                 if live and reviews is list_page.LinkedReviewRead.FROM_DISK
-                                                 else reviews))
+                content = list_page.render(server.root, include_counts=live, defer_counts=True,
+                                           status=server.delivery_status,
+                                           review_records=(list_page.LinkedReviewRead.AFTER_RENDER
+                                                           if live and reviews is list_page.LinkedReviewRead.FROM_DISK
+                                                           else reviews),
+                                           view=view)
                 content = owned_document(content, "list")
         except (OSError, ValueError) as error:
-            print(f"review-links list: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
+            print(f"review-links {view.page}: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)
 
@@ -1911,7 +1912,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError):
             self.send_error(404)
             return None
-        return self.attachment_response(content, "image/webp", cache="max-age=86400, immutable")
+        return self.attachment_response(content, "image/webp", cache="max-age=86400")
 
     def attachment_response(self, content: bytes, media: str, *, cache: str = "no-store") -> BinaryIO:
         self.send_response(200)

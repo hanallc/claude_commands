@@ -7,7 +7,6 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from random import choice
-from typing import Literal
 
 from scripts.lib import conf
 from scripts.production import staff, the_list
@@ -95,16 +94,7 @@ font-size:20px;font-weight:600}
 .studio-tabs b{right:6px}
 </style>'''
 
-STUDIO_VIEW = list_page.ListView("The Studio", STYLE, tabs, list_page.no_producer_control)
-
-
-def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
-           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: list_page.ReviewRecords | list_page.LinkedReviewRead = list_page.LinkedReviewRead.FROM_DISK
-           ) -> bytes:
-    """Render the List rows in the Studio view."""
-    return list_page.render(root, include_counts=include_counts, defer_counts=defer_counts, status=status,
-                            review_records=review_records, view=STUDIO_VIEW)
+STUDIO_VIEW = list_page.ListView("The Studio", "studio", STYLE, tabs, list_page.ProducerPlacement.ABOVE_FILTERS)
 
 
 def avatar(relative: str) -> bytes:

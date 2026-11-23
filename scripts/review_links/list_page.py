@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
@@ -971,14 +971,10 @@ def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) ->
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def staff_label(members: staff.StaffSnapshot, identity: the_list.ItemOwner) -> str:
-    """Name a staff ID for a chip, without a unit suffix."""
-    return re.sub(r"(?:-unit)+\Z", "", owner_name(members, identity)) or str(identity)
-
-
 def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner]) -> list[record_table.Chip]:
     """Build a counted chip for each staff ID, in name order."""
-    choices = [(staff_label(members, identity), identity, count) for identity, count in counts.items()]
+    choices = [(re.sub(r"(?:-unit)+\Z", "", owner_name(members, identity)) or str(identity), identity, count)
+               for identity, count in counts.items()]
     choices.sort(key=lambda choice: (choice[0].casefold(), choice[1]))
     return [record_table.Chip("all", "All", counts.total()),
             *(record_table.Chip(f"staff:{identity}", html.escape(label), count)
@@ -988,34 +984,31 @@ def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner
 type ProducerControl = Callable[[staff.StaffSnapshot, Counter[the_list.ItemOwner]], str]
 
 
-def no_producer_control(_members: staff.StaffSnapshot, _producers: Counter[the_list.ItemOwner]) -> str:
-    return ''
-
-
 def producer_chip_row(members: staff.StaffSnapshot, producers: Counter[the_list.ItemOwner]) -> str:
-    """Render the Producer chips beside the words box."""
+    """Render the Producer chips."""
     return record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+
+
+class ProducerPlacement(Enum):
+    """Where a List view puts its Producer control."""
+
+    ABOVE_FILTERS = "above the filters"
+    BESIDE_WORDS = "beside the words box"
 
 
 @dataclass(frozen=True)
 class ListView:
-    """The page around the List rows: its title, its style and where the Producer control goes."""
+    """The page around the List rows: its names, its style and its Producer control."""
 
     title: str
+    # The name in the server log line.
+    page: str
     style: str
-    tabs: ProducerControl
-    producer_row: ProducerControl
+    producer: ProducerControl
+    placement: ProducerPlacement
 
 
-LIST_VIEW = ListView("The List", '', no_producer_control, producer_chip_row)
-
-
-class ListRender(Protocol):
-    """Render the List rows in one view."""
-
-    def __call__(self, root: Path, *, include_counts: bool = True, defer_counts: bool = False,
-                 status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-                 review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes: ...
+LIST_VIEW = ListView("The List", "list", '', producer_chip_row, ProducerPlacement.BESIDE_WORDS)
 
 
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
@@ -1092,6 +1085,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
+    producer_control = view.producer(members, producers)
     content = (STYLE + view.style + page_frame.title(view.title, "list")
                + f'<div data-list data-list-path="{PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
@@ -1099,11 +1093,11 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
-               + view.tabs(members, producers)
+               + (producer_control if view.placement is ProducerPlacement.ABOVE_FILTERS else '')
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
                + '<div class="list-producer-filter">'
-               + view.producer_row(members, producers)
+               + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')

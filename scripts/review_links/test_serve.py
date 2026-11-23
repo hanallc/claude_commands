@@ -4971,8 +4971,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(item.title.encode(), response.body)
         self.assertEqual(response.body.count(b'data-filter-row="producer"'), 1)
         self.assertIn(f'data-list-path="{list_page.PAGE_PATH}"'.encode(), response.body)
-        with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
-            self.assertEqual(self.request(studio_page.PAGE_PATH).status, 503)
+        with (patch.object(list_page, "render", side_effect=OSError("fixture read failed")),
+              redirect_stderr(StringIO()) as log):
+            failed = self.request(studio_page.PAGE_PATH)
+        self.assertEqual(failed.status, 503)
+        self.assertIn(b"The Studio page is not available.", failed.body)
+        self.assertIn("review-links studio: fixture read failed", log.getvalue())
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"
@@ -4987,7 +4991,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
         served = self.request(f"{studio_page.AVATAR_PATH}/all/01-64.webp")
         self.assertEqual((served.status, served.content_type, served.body), (200, "image/webp", picture))
-        self.assertEqual(served.headers["cache-control"], "max-age=86400, immutable")
+        self.assertEqual(served.headers["cache-control"], "max-age=86400")
         self.assertEqual(served.headers["x-content-type-options"], "nosniff")
         for name in ("all/01-32.webp", "all/1-64.webp", "all/04-64.webp", "all/02-64.webp", "all/03-64.webp",
                      "a898cb38-dbac-4751-b72b-d0b14ab9c38d/01-64.webp", "outside/01-64.webp",

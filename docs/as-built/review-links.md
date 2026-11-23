@@ -171,7 +171,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Studio, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`, except the Placement disk POC page.
 That page is a standalone document with its own layout and styles, and it has no status line.
@@ -266,6 +266,7 @@ Review retains typed text across refresh and holds replacement during an active 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
 Accounts, AWS, Builds, Disks, Images, List and Review put the title and status line in the same place.
+The Studio renders through the List code with `page_frame.title(..., "list")`, so its title and status line are where the List puts them.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -1638,6 +1639,8 @@ Its `config/console.conf` block follows the List block.
 `studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
 `list_page.LIST_VIEW` keeps the List output unchanged.
 The Studio has no Producer chip row. The Owner and Show rows and the words box stay.
+`ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
+A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
 
 The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
 They use the same `staff:<id>` values and the same `#producer=<id>` fragment as the List.
@@ -1659,7 +1662,7 @@ So a picture changes only when the page loads.
 The folder is `all` or a 36-character staff ID. The size is 64, 128 or 256.
 The request gets the Tailscale, host and origin checks of a Review attachment request, and a failure gets 403.
 Any other name, a link below the root, a missing file, or a file over 64 KB gets 404.
-A picture goes out as `image/webp` with `Cache-Control: max-age=86400, immutable`.
+A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
 
 `data-list-path` on `[data-list]` names `/console/list.html`.
 Row actions post to that path, and item-state reads use it, so the server needs no Studio POST route.

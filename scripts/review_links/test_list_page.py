@@ -1077,7 +1077,7 @@ if(example.filterOn){
         _ = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
         listing = list_page.render(self.root / "reviews").decode()
-        studio = studio_page.render(self.root / "reviews").decode()
+        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
         self.assertIn('<div class="list-producer-filter">' + row, listing)
         self.assertIn('<h1 class="page-title">The List</h1>', listing)
@@ -1107,10 +1107,55 @@ if(example.filterOn){
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'The fragment names the producer.');
  chip('producer','all').click();
  check(others.length && others.every(row=>!row.hidden),'All shows the other producer rows again.');
-'''.replace('DWIGHT', json.dumps(DWIGHT.id)), studio_page.render)
+ const initial=chip('producer','staff:'+MORTY);
+ check(initial.querySelector('.studio-initial[aria-hidden="true"]'),'A producer without a picture shows the initial.');
+ initial.click();
+ check(JSON.stringify(activeChipLabels(document,'[data-filter-row="producer"] [aria-pressed="true"]'))
+  ==='["Producer: morty"]','The filter label omits the initial.');
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)), studio_page.STUDIO_VIEW)
 
-    def browser_row_expansion(self, steps: str, render: list_page.ListRender = list_page.render) -> None:
-        markup = render(self.root / "reviews", include_counts=False).decode()
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_refresh_keeps_the_pictures_and_updates_the_tab_counts(self) -> None:
+        _ = self.add("Test List action retries", number=1)
+        avatars = self.studio_avatars(DWIGHT.id)
+        for folder in ("all", DWIGHT.id):
+            for size in studio_page.SIZES:
+                _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
+
+        def page() -> str:
+            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+
+        with patch.object(studio_page, "choice", side_effect=min):
+            initial = page()
+        added = self.add("A new item for dwight", number=2)
+        _ = the_list.update(MORTY.id, added.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(studio_page, "choice", side_effect=max):
+            fresh = page()
+        self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/02-128.webp"', fresh)
+        steps = r'''
+ const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
+ const values=['all','staff:'+DWIGHT];
+ const pictures=()=>JSON.stringify(values.map(value=>{
+  const picture=tab(value).querySelector('img');
+  return [picture.getAttribute('src'),picture.getAttribute('srcset')];
+ }));
+ const shown=pictures();
+ check(shown.includes('/01-128.webp') && !shown.includes('/02-'),'The first render shows picture 01.');
+ check(tab('staff:'+DWIGHT).dataset.filterCount==='0' && tab('all').dataset.filterCount==='1',
+  'The first render counts one item.');
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ check(document.querySelector('[data-number="2"]'),'The refresh shows the new row.');
+ check(pictures()===shown,'The refresh keeps each picture src and srcset on screen.');
+ check(tab('staff:'+DWIGHT).dataset.filterCount==='1' && tab('staff:'+DWIGHT).querySelector('b').textContent==='1'
+  && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, add_item=False, markup=initial)
+
+    def browser_row_expansion(self, steps: str, view: list_page.ListView = list_page.LIST_VIEW) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False, view=view).decode()
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
