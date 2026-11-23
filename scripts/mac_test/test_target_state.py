@@ -231,9 +231,10 @@ class TargetStateTests(IsolatedTargetState):
         _ = write_config_fixture(legacy, "offload=on\nci_repo=", template="mac_test")
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"), encoding="utf-8")
+        arguments = ["free-now", "--repo-root", str(self.root)]
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
-            selected = self.invoke_mac(["free-now", "--target", "mac"])
-            default = self.invoke_mac(["free-now"])
+            selected = self.invoke_mac([*arguments, "--target", "mac"])
+            default = self.invoke_mac(arguments)
         self.assertEqual((selected.returncode, selected.stdout.strip()), (1, "off"))
         self.assertEqual((default.returncode, default.stdout.strip()), (0, "free"))
 
