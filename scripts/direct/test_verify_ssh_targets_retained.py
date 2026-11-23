@@ -22,7 +22,7 @@ from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixtu
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state, offload
+from scripts.mac_test import claim_state
 
 from scripts.lib import process_start as process_identity
 
@@ -90,7 +90,8 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         else:
             self.assertIn("cleanup timed out after 1 s", output)
             self.assertNotIn("the Mac does not answer; stop and submit again", errors)
-        self.assertEqual(slots_during_authorization, [process.pid])
+        # A Mac run takes no natedev run slot (036f97c797: the slot comes with the first local memory grant).
+        self.assertEqual(slots_during_authorization, [])
         self.assertEqual(self.local_runs(), [])
         if command == "check":
             self.assertFalse(any(event["args"][:1] == ["check"] for event in self.cargo_events()))
@@ -109,7 +110,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         controls = caller_provider_controls(self, self.admission)
         claim, = controls.claims("mac")
         identity = claim_state.claim_identity(claim.record)
-        journal = controls.claim_paths("mac").directory / "pending-starts" / offload.pending_start_key(identity)
+        journal = claim_state.claim_pending_start(controls.claim_paths("mac"), claim.path, claim.record)
         self.assertEqual(journal.is_file(), mode != "post-fetch-cleanup-timeout")
 
         _ = self.admission.run_pass()
