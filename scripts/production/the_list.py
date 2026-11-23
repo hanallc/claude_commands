@@ -16,12 +16,13 @@ import shlex
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
-from itertools import islice, takewhile
+from heapq import merge
+from itertools import chain, dropwhile, islice, takewhile
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -244,8 +245,8 @@ class RunException:
     run: ScheduledRun | SkippedRun
 
 
-class RuleSelectsRuns(StrEnum):
-    ALL = "use the repeat rule"
+class UseRuleEnd(StrEnum):
+    RULE = "use the repeat rule"
 
 
 @dataclass(frozen=True)
@@ -263,7 +264,7 @@ class ScheduledSeries:
     exceptions: tuple[RunException, ...] = ()
     runs_used: int = 0
     finished_runs: frozenset[int] = frozenset()
-    following_runs: RetainedFollowingRuns | RuleSelectsRuns = RuleSelectsRuns.ALL
+    following_runs: RetainedFollowingRuns | UseRuleEnd = UseRuleEnd.RULE
 
     @property
     def skipped_runs(self) -> frozenset[int]:
@@ -326,9 +327,22 @@ class ScheduledSeries:
 
     def runs(self, limit: int) -> Generator[SeriesRun]:
         """Yield pending runs in effective time order."""
-        pending: Iterable[SeriesRun] = (run for run in self._slots(limit) if run.number not in self.finished_runs)
-        if any(isinstance(entry.run, ScheduledRun) for entry in self.exceptions):
-            pending = sorted(pending, key=lambda run: run.run.start.astimezone(UTC))
+        pending: Iterator[SeriesRun] = (run for run in self._slots(limit) if run.number not in self.finished_runs)
+        last_override = max((entry.number for entry in self.exceptions if isinstance(entry.run, ScheduledRun)),
+                            default=self.run_number_offset)
+        if last_override > self.run_number_offset:
+            prefix: list[SeriesRun] = []
+            for run in pending:
+                if run.number > last_override:
+                    pending = chain((run,), pending)
+                    break
+                prefix.append(run)
+
+            def effective_start(run: SeriesRun) -> datetime:
+                return run.run.start.astimezone(UTC)
+
+            prefix.sort(key=effective_start)
+            pending = merge(prefix, pending, key=effective_start)
         yield from islice(pending, max(0, limit - self.runs_used))
 
     def describe(self, limit: int) -> str:
@@ -703,7 +717,7 @@ def _read_schedule(raw: object) -> Schedule:
             finished = frozenset(range(1, runs_used + 1)) - skipped
             runs_used = len(finished | skipped)
         following_runs = (RetainedFollowingRuns(_read_run_numbers(fields["following_runs"], "following"))
-                          if "following_runs" in fields else RuleSelectsRuns.ALL)
+                          if "following_runs" in fields else UseRuleEnd.RULE)
         schedule = ScheduledSeries(first, repeat_rule.parse(_field_text(fields["repeat"], "repeat")), run_number_offset,
                                    tuple(exceptions), runs_used, finished, following_runs)
     _validate_schedule(schedule)
@@ -735,7 +749,7 @@ def _validate_schedule(schedule: object) -> None:
     rule = schedule.rule
     retained = schedule.following_runs
     if isinstance(retained, RetainedFollowingRuns):
-        if (isinstance(rule.end, repeat_rule.RepeatUntilLimit) or not retained.numbers
+        if (not retained.numbers
                 or any(type(number) is not int or not 0 < number - schedule.run_number_offset <= date.max.toordinal()
                        for number in retained.numbers)):
             raise ListError("invalid following run selection")
@@ -1788,35 +1802,40 @@ def _edit_all_runs(series: ScheduledSeries, edits: ScheduleChanges,
         for entry in series.exceptions
         if isinstance(entry.run, SkippedRun) or (same_pattern and same_start)
     )
-    following_runs = RuleSelectsRuns.ALL if "repeat" in edits else series.following_runs
+    following_runs = UseRuleEnd.RULE if "repeat" in edits else series.following_runs
     return replace(series, first=run, rule=rule, exceptions=exceptions, following_runs=following_runs)
 
 
 def _edit_following_end(series: ScheduledSeries, selected: SeriesRun, edits: ScheduleChanges,
                         rule: repeat_rule.RepeatRule, limit: int) -> ScheduledSeries:
-    changed = _edit_all_runs(series, edits, rule)
     end = rule.end
-    if isinstance(end, repeat_rule.RepeatUntilLimit):
-        return changed
     start = selected.run.start.astimezone(UTC)
-    candidates = replace(changed, rule=replace(rule, end=repeat_rule.RepeatUntilLimit.REACHED))
-    retained = series.following_runs
-    search_limit = limit
-    if isinstance(retained, RetainedFollowingRuns):
-        search_limit += max(retained.numbers) - series.run_number_offset
     remaining = limit - series.runs_used
-    pending = islice((run for run in candidates.runs(search_limit) if run.run.start.astimezone(UTC) >= start), remaining)
-    if isinstance(end, repeat_rule.RunCount):
-        if end.count > remaining:
-            raise ListError(f"COUNT exceeds the series limit of {limit} runs")
-        numbers = frozenset(run.number for run in islice(pending, end.count))
-        if len(numbers) < end.count:
-            raise ListError("COUNT exceeds the available following runs")
-    else:
-        if end.utc < start:
-            raise ListError("UNTIL must be on or after the selected run")
-        numbers = frozenset(run.number for run in takewhile(lambda run: run.run.start.astimezone(UTC) <= end.utc, pending))
-    return replace(changed, following_runs=RetainedFollowingRuns(numbers))
+    count = end.count if isinstance(end, repeat_rule.RunCount) else remaining
+    if count > remaining:
+        raise ListError(f"COUNT exceeds the series limit of {limit} runs")
+    if isinstance(end, repeat_rule.RunUntil) and end.utc < start:
+        raise ListError("UNTIL must be on or after the selected run")
+
+    def in_scope(runs: Iterable[SeriesRun]) -> Iterator[int]:
+        pending = dropwhile(lambda run: run.run.start.astimezone(UTC) < start, runs)
+        if isinstance(end, repeat_rule.RunUntil):
+            pending = takewhile(lambda run, cutoff=end.utc: run.run.start.astimezone(UTC) <= cutoff, pending)
+        return (run.number for run in pending)
+
+    open_rule = replace(rule, end=repeat_rule.RepeatUntilLimit.REACHED)
+    open_series = replace(series, rule=open_rule, following_runs=UseRuleEnd.RULE)
+    search_limit = series.runs_used + date.max.toordinal()
+    # Keep pending runs first. Use the open rule to fill the remaining places.
+    numbers: set[int] = set()
+    for number in chain(in_scope(series.runs(limit)), in_scope(open_series.runs(search_limit))):
+        numbers.add(number)
+        if len(numbers) == count:
+            break
+    if isinstance(end, repeat_rule.RunCount) and len(numbers) < count:
+        raise ListError("COUNT exceeds the available following runs")
+    changed = _edit_all_runs(series, edits, rule)
+    return replace(changed, following_runs=RetainedFollowingRuns(frozenset(numbers)))
 
 
 def _split_series(series: ScheduledSeries, selected: SeriesRun, edits: ScheduleChanges,
@@ -1850,7 +1869,7 @@ def _split_series(series: ScheduledSeries, selected: SeriesRun, edits: ScheduleC
             if isinstance(entry.run, SkippedRun) or entry.number > run_number_offset
         )
     following = replace(series, first=first, rule=rule, run_number_offset=run_number_offset, exceptions=exceptions,
-                        following_runs=RuleSelectsRuns.ALL)
+                        following_runs=UseRuleEnd.RULE)
     if _schedule_fields(pending) != _schedule_fields(first):
         following = _replace_series_run(following, run_number_offset + 1, pending)
     return following
