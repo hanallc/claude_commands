@@ -495,7 +495,7 @@ def _scope_stop_lock(path: Path, *, blocking: bool) -> Generator[bool]:
 
 def _scope_stop_graces() -> tuple[float, float]:
     settings = conf.read("shutdown")
-    return float(settings.text("STOP_GRACE_SECONDS")), float(settings.text("KILL_GRACE_SECONDS"))
+    return float(settings.text("stop_grace_seconds")), float(settings.text("kill_grace_seconds"))
 
 
 def _finish_slice_stop(
