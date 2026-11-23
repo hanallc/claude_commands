@@ -1190,6 +1190,31 @@ if(example.filterOn){
                       bands)
         self.assertIn(f':not([data-filter-value="all"],[data-filter-value="staff:{DWIGHT.id}"])) '
                       + '[data-top-band="none"]{display:flex}', bands)
+        # A retired producer has no top item.
+        _ = staff.set_producer_retirement(DWIGHT.id, staff.RetiredProducer("claude:sonnet:high"))
+        retired = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        self.assertNotIn('class="list-top-mark"', retired)
+
+    def test_studio_waiting_item_has_the_make_top_priority_button(self) -> None:
+        _ = self.studio_avatars(MORTY.id)
+        item = self.add("Wait for an answer", number=1)
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(list_page.submit(root, urlencode(
+                self.fields(item, "question", words="Which check passed?")), status))
+
+        def waiting_row() -> str:
+            studio = list_page.render(root, include_counts=False, status=status, view=studio_page.STUDIO_VIEW).decode()
+            return studio.split(f'data-number="{item.number}"', 1)[1].split('</tbody>', 1)[0]
+
+        self.assertIn('<form method="post" data-feedback-form data-waiting-actions>', waiting_row())
+        self.assertIn('<div class="list-actions"><button name="action" value="top">Make top priority</button>'
+                      + '<div class="list-parking-actions">', waiting_row())
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(item.number))
+        top = waiting_row()
+        self.assertIn('class="list-top-mark"', top)
+        self.assertNotIn('value="top"', top)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_studio_band_follows_the_tab_and_make_top_priority_moves_the_flag(self) -> None:

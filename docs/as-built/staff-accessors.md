@@ -62,9 +62,10 @@ It refuses a row that is not a producer and a session that another row holds.
 The hidden `transfer-producer` CLI verb sends the write to the owner machine.
 `StaffRow.top_item` is `TopItem(number)` or `NoTopItem()`: one List item number, the producer's top priority item.
 JSON stores it as the integer `top_item` on a producer row only.
-`staff.set_producer_top_item(identity, top_item)` writes it for an active producer, and the hidden `set-producer-top-item` CLI verb sends the write to the owner machine.
+`staff.set_producer_top_item(identity, top_item)` takes a `TopItem` and writes it for an active producer.
+The hidden `set-producer-top-item` CLI verb requires `--number` and sends the write to the owner machine.
 `the_list.make_top_priority` is its one caller. It checks that the item is open and, for a producer, that the item is its own.
-The field is not cleared when the item closes: a reader treats a Closed or missing item as no top item.
+No call clears the field: a reader treats a Closed or missing item as no top item.
 
 ## Backend and hold evidence
 

@@ -4999,7 +4999,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _, closed = self.list_keeper_item("A closed item")
         record = [staff.StaffSnapshot((morty,))]
 
-        def name_top_item(identity: staff.StaffId, top_item: staff.TopItem | staff.NoTopItem) -> staff.StaffRow:
+        def name_top_item(identity: staff.StaffId, top_item: staff.TopItem) -> staff.StaffRow:
             named = replace(morty, top_item=top_item)
             self.assertEqual(identity, morty.id)
             record[0] = staff.StaffSnapshot((named,))

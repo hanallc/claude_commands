@@ -2355,13 +2355,12 @@ def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) 
     return _transaction(edit)
 
 
-def set_producer_top_item(identity: StaffId, top_item: TopItem | NoTopItem) -> StaffRow:
-    """Name a producer's top priority List item, or clear it. The caller checks the item."""
-    if isinstance(top_item, TopItem) and top_item.number < 1:
+def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
+    """Name a producer's top priority List item. The caller checks the item."""
+    if top_item.number < 1:
         raise StaffRefused("a top item is a List item number from 1")
     if not is_owner():
-        number = str(top_item.number) if isinstance(top_item, TopItem) else ""
-        return _remote_row(["set-producer-top-item", identity, f"--number={number}"])
+        return _remote_row(["set-producer-top-item", identity, f"--number={top_item.number}"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
@@ -2717,7 +2716,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("--json", action="store_true")
     producer_top_item = verbs.add_parser("set-producer-top-item", help=argparse.SUPPRESS)
     _ = producer_top_item.add_argument("target")
-    _ = producer_top_item.add_argument("--number", required=True, help="a List item number, or empty to clear")
+    _ = producer_top_item.add_argument("--number", required=True, help="a List item number")
     _ = producer_top_item.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
     _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
@@ -2806,10 +2805,9 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         state = RetiredProducer(arguments.profile) if arguments.profile else Active()
         return set_producer_retirement(StaffId(arguments.target), state)
     if arguments.verb == "set-producer-top-item":
-        if arguments.number and not (arguments.number.isascii() and arguments.number.isdecimal()):
-            raise StaffRefused("--number takes a List item number, or nothing to clear the top item")
-        top_item = TopItem(int(arguments.number)) if arguments.number else NoTopItem()
-        return set_producer_top_item(StaffId(arguments.target), top_item)
+        if not (arguments.number.isascii() and arguments.number.isdecimal()):
+            raise StaffRefused("--number takes a List item number")
+        return set_producer_top_item(StaffId(arguments.target), TopItem(int(arguments.number)))
     if arguments.verb == "transfer-producer":
         return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
                                  SessionHome(Path(arguments.home).absolute()),

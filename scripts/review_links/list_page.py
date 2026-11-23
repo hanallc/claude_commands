@@ -99,7 +99,7 @@ class TopPriority(Enum):
 class TopPriorityMark(Enum):
     """The top priority mark of one open item in a List view."""
 
-    HIDDEN = "the view shows no top priority marks"
+    HIDDEN = "no mark: the view shows none, or the item has no active producer"
     TOP_ITEM = "the flag: the item is the top priority item of its producer"
     MAKE_TOP = "the Make top priority button"
 
@@ -116,10 +116,11 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     if shown is TopPriority.HIDDEN:
         return TopPriorityMark.HIDDEN
     producer = members.by_id(item.producer)
-    if (item.state != the_list.ItemState.CLOSED and producer is not None and producer.kind == "producer"
-            and producer.top_item == staff.TopItem(item.number)):
-        return TopPriorityMark.TOP_ITEM
-    return TopPriorityMark.MAKE_TOP
+    # Only an active producer has a top item, so the item of any other row shows neither the flag nor the button.
+    if (item.state == the_list.ItemState.CLOSED or producer is None or producer.kind != "producer"
+            or isinstance(producer.retirement, staff.RetiredProducer)):
+        return TopPriorityMark.HIDDEN
+    return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
 def page_url() -> str:
@@ -402,11 +403,16 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
+def top_button(mark: TopPriorityMark) -> str:
+    """Render the Make top priority button of an item panel."""
+    return '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
+
+
 def feedback_form(entry: ListRecord, secret: str, *, keeper_name: str, parking_label: str = "",
                   mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
-    top = '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
+    top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     keeper_label = html.escape(keeper_name, quote=True)
     words_label = f"Your words for {keeper_label} about this item"
@@ -558,8 +564,10 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool) -> str:
-    if not parking_label and not unread:
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool,
+                          mark: TopPriorityMark) -> str:
+    top = top_button(mark)
+    if not parking_label and not unread and not top:
         return ""
     parked = '' if parking_label else ' hidden'
     unpark = parked if entry.item.state != the_list.ItemState.CLOSED else ' hidden'
@@ -569,7 +577,7 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
     return ('<form method="post" data-feedback-form data-waiting-actions>' + signed_form_fields(entry, secret)
             + '<input type="hidden" name="words"><input type="hidden" name="until">'
             + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions">' + read
+            + '<div class="list-actions">' + read + top
             + '<div class="list-parking-actions">'
             + f'<button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button></div></div>'
             + '<span role="status" data-send-status></span></form>')
@@ -577,11 +585,12 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str) -> str:
+                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
-                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
+                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
+                    mark=mark))
     return detail_panel(entry, sections, today, names, unread_answers)
 
 
@@ -590,7 +599,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
             unread_answers: frozenset[str], *, parking_label: str, mark: TopPriorityMark) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark)
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'

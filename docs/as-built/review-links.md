@@ -1675,7 +1675,8 @@ Each producer has one top priority item: the `top_item` List number in its staff
 An item is the top item when it is open, its producer is an active producer row, and that row names its number.
 A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
 A flag before the title marks the top item in its row, also on the All tab.
-Each other open item has the button **Make top priority** beside Remove in its panel.
+Each other open item of an active producer has the button **Make top priority** in its panel. An item of a retired or unknown producer shows neither the flag nor the button.
+`list_page.top_button` gives the button to both panel forms: beside Remove, or beside Mark read and Unpark when the item waits for an answer.
 The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
 The List path refuses `top`. The refresh after the save moves the flag and the band.
 

@@ -810,7 +810,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(restored, producer)
         self.assertEqual(staff.snapshot().by_path(producer.name), restored)
 
-    def test_producer_top_item_round_trips_and_the_setter_replaces_or_clears_it(self) -> None:
+    def test_producer_top_item_round_trips_and_the_setter_replaces_it(self) -> None:
         producer = fixture_member("producer", name="planner")
         runner = fixture_member("showrunner", name="another-production")
         initial = cast(dict[str, object], self.assert_rerun("set-producer-top-item", producer.id, "--number=233"))
@@ -824,10 +824,9 @@ class StaffTests(StaffCommandTestCase):
                 _ = staff.StaffRow.from_json({**row.to_json(), "top_item": value})
         self.assert_refused(lambda: staff.set_producer_top_item(runner.id, staff.TopItem(1)))
         self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(0)))
-        _ = self.cli("set-producer-top-item", producer.id, "--number=L1", code=2)
-        cleared = staff.set_producer_top_item(producer.id, staff.NoTopItem())
-        self.assertEqual(cleared, producer)
-        self.assertNotIn("top_item", cleared.to_json())
+        for number in ("L1", ""):
+            with self.subTest(number=number):
+                _ = self.cli("set-producer-top-item", producer.id, f"--number={number}", code=2)
         _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
         self.assert_refused(lambda: staff.set_producer_top_item(producer.id, staff.TopItem(1)))
 
