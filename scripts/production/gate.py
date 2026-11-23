@@ -3145,7 +3145,7 @@ def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded)
             mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
         raise GateAssignmentRefused("The placement owner's command does not match this gate job")
     try:
-        status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
+        status = admission_client.placement_status(saved.episode, saved.attempt).status
     except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
         raise GateAssignmentRefused(f"Cannot query the gate placement status: {error}") from error
     if isinstance(status, admission_wire.UnknownPlacementStatus):
