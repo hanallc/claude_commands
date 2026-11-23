@@ -255,6 +255,7 @@ def source_hash(data: bytes | None) -> str:
 def copy_snapshot(vault: Path, folder: Path, blobs: dict[str, tuple[str, str]],
                   env: dict[str, str]) -> tuple[ReviewedPath, ...]:
     entries: list[ReviewedPath] = []
+    filtered: dict[str, str] = {}
     folder.mkdir()
     for name, (mode, blob) in sorted(blobs.items()):
         file = read_source(vault, name)
@@ -269,13 +270,32 @@ def copy_snapshot(vault: Path, folder: Path, blobs: dict[str, tuple[str, str]],
             raw_blob = f"blob {len(data)}\0".encode() + data
             algorithm = "sha256" if len(blob) == 64 else "sha1"
             if hashlib.new(algorithm, raw_blob).hexdigest() != blob:
-                staged = folder / "blobs" / name
-                staged.parent.mkdir(parents=True, exist_ok=True)
-                _ = staged.write_bytes(checked_bytes(vault, "cat-file", "blob", blob, env=env))
+                filtered[name] = blob
         else:
             raise SaveError(f"{name!r} changed type during the scan. Scan again.")
         entries.append(ReviewedPath(name, mode, blob, source_hash(data)))
+    for name, data in zip(filtered, read_blobs(vault, list(filtered.values()), env), strict=True):
+        staged = folder / "blobs" / name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        _ = staged.write_bytes(data)
     return tuple(entries)
+
+
+def read_blobs(vault: Path, blobs: list[str], env: dict[str, str]) -> list[bytes]:
+    """Read the blobs in one Git process, in the given order."""
+    if not blobs:
+        return []
+    output = checked_bytes(vault, "cat-file", "--batch", input_data="".join(f"{blob}\n" for blob in blobs).encode(),
+                           env=env)
+    contents: list[bytes] = []
+    for blob in blobs:
+        header, output = output.split(b"\n", 1)
+        name, kind, size = header.decode("ascii").split()
+        if name != blob or kind != "blob":
+            raise SaveError(f"Git did not return the blob {blob}.")
+        contents.append(output[:int(size)])
+        output = output[int(size) + 1:]
+    return contents
 
 
 def ancestor(vault: Path, older: str, newer: str) -> bool:
@@ -345,17 +365,9 @@ def index_modes(vault: Path, env: dict[str, str]) -> dict[str, str]:
     return modes
 
 
-def check_blob(vault: Path, entry: ReviewedPath, data: bytes, env: dict[str, str], *, write: bool = False) -> None:
-    options = ("-w",) if write else ()
-    blob = checked_bytes(vault, "hash-object", *options, "--stdin", f"--path={entry.name}", input_data=data, env=env)
-    if blob.strip().decode("ascii") != entry.blob:
-        raise SaveError(f"The filtered blob for {entry.name!r} differs from the manifest. Scan again.")
-
-
-def verify_sources(vault: Path, review: Review, env: dict[str, str]) -> list[tuple[ReviewedPath, bytes]]:
+def verify_sources(vault: Path, review: Review, env: dict[str, str]) -> None:
     trust_mode = checked(vault, "config", "--type=bool", "--default=true", "--get", "core.filemode").strip() == "true"
     modes = {} if trust_mode else index_modes(vault, env)
-    sources: list[tuple[ReviewedPath, bytes]] = []
     for entry in review.files:
         file = read_source(vault, entry.name)
         if source_hash(file.data if file is not None else None) != entry.source_hash:
@@ -368,10 +380,6 @@ def verify_sources(vault: Path, review: Review, env: dict[str, str]) -> list[tup
                 mode = modes.get(entry.name, "100644")
         if mode != entry.mode or (file is None and entry.blob != "0" * len(review.head)):
             raise SaveError(f"The mode or deletion for {entry.name!r} differs from the manifest. Scan again.")
-        if file is not None:
-            check_blob(vault, entry, file.data, env)
-            sources.append((entry, file.data))
-    return sources
 
 
 def update_index(vault: Path, review: Review, *, env: dict[str, str] | None = None) -> None:
@@ -386,19 +394,21 @@ def create_reviewed_commit(vault: Path, review: Review) -> str:
     with first_save_folder(vault) as folder:
         env = temporary_git_environment(vault, folder)
         _ = checked(vault, "read-tree", review.head, env=env)
-        sources = verify_sources(vault, review, env)
-        for entry, data in sources:
-            check_blob(vault, entry, data, env, write=True)
-        if sources:
-            # Import only the verified blobs. Filters can change between the two passes.
-            hashes = "".join(f"{blob}\n" for blob in sorted({entry.blob for entry, _ in sources}))
+        verify_sources(vault, review, env)
+        # One add filters every path in one Git process. The blob check proves it staged the reviewed bytes.
+        with_paths(vault, [entry.name for entry in review.files], "add", "-A", env=env)
+        staged = diff_blobs(vault, "--cached", review.head, env=env)
+        reviewed = review.staged_blobs()
+        for name in sorted(staged.keys() | reviewed.keys()):
+            if staged.get(name) != reviewed.get(name):
+                raise SaveError(f"The filtered blob for {name!r} differs from the manifest. Scan again.")
+        present = sorted({blob for mode, blob in reviewed.values() if mode != "000000"})
+        if present:
+            # Import only the checked blobs.
+            hashes = "".join(f"{blob}\n" for blob in present)
             pack = checked_bytes(vault, "pack-objects", "--stdout", input_data=hashes.encode("ascii"), env=env)
             _ = checked_bytes(vault, "unpack-objects", input_data=pack)
-        index_env = {"GIT_INDEX_FILE": env["GIT_INDEX_FILE"]}
-        update_index(vault, review, env=index_env)
-        if diff_blobs(vault, "--cached", review.head, env=index_env) != review.staged_blobs():
-            raise SaveError("The temporary index differs from the manifest. Scan again.")
-        tree = checked(vault, "write-tree", env=index_env).strip()
+        tree = checked(vault, "write-tree", env={"GIT_INDEX_FILE": env["GIT_INDEX_FILE"]}).strip()
     return checked(vault, "commit-tree", tree, "-p", review.head, "-m", SUBJECT).strip()
 
 

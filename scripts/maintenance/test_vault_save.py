@@ -260,7 +260,7 @@ class VaultSaveTests(unittest.TestCase):
     def test_vault_save_checks_first_push(self) -> None:
         origin = self.git("rev-parse", "origin/main")
         _ = self.git("config", "filter.fixture.clean", "sed '/^derived=/d'")
-        self.write(".gitattributes", "bob/note.md filter=fixture\n")
+        self.write(".gitattributes", "bob/*.md filter=fixture\n")
         self.write("older.md", "A local older commit.\n")
         _ = self.git("add", ".gitattributes", "older.md")
         _ = self.git("commit", "-m", "Fixture outgoing commit")
@@ -273,6 +273,7 @@ class VaultSaveTests(unittest.TestCase):
         _ = stale.write_text("An old copy.\n", encoding="utf-8")
         original = index.read_bytes()
         self.write("bob/note.md", "derived=old\nReviewed content.\n")
+        self.write("bob/second.md", "derived=2\nSecond note.\n")
         (self.vault / "remove.md").unlink()
         calls: list[tuple[Path, tuple[str, ...]]] = []
 
@@ -281,6 +282,7 @@ class VaultSaveTests(unittest.TestCase):
             if args[0] == "dir":
                 self.assertEqual((folder / "files/bob/note.md").read_bytes(), b"derived=old\nReviewed content.\n")
                 self.assertEqual((folder / "blobs/bob/note.md").read_bytes(), b"Reviewed content.\n")
+                self.assertEqual((folder / "blobs/bob/second.md").read_bytes(), b"Second note.\n")
                 self.assertEqual(folder.parent.parent, work)
                 self.assertFalse(stale.exists())
             self.assertEqual(index.read_bytes(), original)
@@ -295,7 +297,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(calls[1], (self.vault, ("git", f"--log-opts=--diff-merges=first-parent {origin}..{head}", ".")))
         self.assertEqual(index.read_bytes(), original)
         digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
-        self.assertIn("Scanned 3 paths.", output)
+        self.assertIn("Scanned 4 paths.", output)
         self.assertIn(f"Manifest {manifest}", output)
         self.assertIn(f"Manifest hash {digest}", output)
         self.assertEqual(self.command("first-save", "commit", "0" * 64)[0], 1)
@@ -329,6 +331,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "main", repo=self.origin))
         self.assertEqual(self.git("show", "HEAD:bob/note.md"), "Reviewed content.")
+        self.assertEqual(self.git("show", "HEAD:bob/second.md"), "Second note.")
         self.assertEqual(self.git("ls-tree", "HEAD", "remove.md"), "")
         self.assertEqual(self.git("diff", "--name-only", "HEAD"), "")
         self.assertEqual(self.git("ls-files", "--others", "--exclude-standard"), "")
