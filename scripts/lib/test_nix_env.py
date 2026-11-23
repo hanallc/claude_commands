@@ -641,6 +641,72 @@ class RegisteredCloneTests(GitNixFixture):
         self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
 
 
+class RunSnapshotTests(GitNixFixture):
+    """A `copies.py run` snapshot proves its envrc by the source commit its binding names."""
+
+    @contextmanager
+    def snapshot(self, repository: Path) -> Generator[Path]:
+        with (patch.object(tempfile, "tempdir", str(self.root)),
+              copies.requested_source(repository, copies.CommittedSource("HEAD"), copies.NO_MERGE) as tree):
+            yield tree
+
+    def assert_snapshot_refused(self, tree: Path) -> None:
+        self.assertFalse(nix_env.trusted_envrc(tree / ".envrc"))
+        self.assert_explicit_approval_required(tree)
+
+    def test_snapshot_of_a_trusted_repository_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        with self.snapshot(repository) as tree:
+            self.assertEqual(copy_record.source_of(tree),
+                             copy_record.RecordedCopySource(repository, self.git(repository, "rev-parse", "HEAD")))
+            self.assertTrue(nix_env.trusted_envrc(tree / ".envrc"))
+            self.assertIsInstance(nix_env.ensure(tree, {**self.env, "DIRENV_DENY": "1"}), nix_env.Loaded)
+            self.assertEqual(self.direnv_calls(), [
+                {"args": ["allow", str(tree / ".envrc")], "cwd": str(tree)},
+                {"args": ["export", "json"], "cwd": str(tree)}])
+
+    def test_snapshot_with_edited_envrc_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            _ = (tree / ".envrc").write_text("use another flake\n", encoding="utf-8")
+            self.assert_snapshot_refused(tree)
+
+    def test_snapshot_of_an_untrusted_repository_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.root / "outside/repo")) as tree:
+            self.assert_snapshot_refused(tree)
+
+    def test_binding_for_another_checkout_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            self.rewrite_binding(tree, checkout=str(tree.parent / "other"))
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+            self.assert_snapshot_refused(tree)
+
+    def rewrite_binding(self, tree: Path, **changes: str) -> None:
+        binding = tree.parent / copy_record.SNAPSHOT_ORIGIN
+        fields = cast(dict[str, object], json.loads(binding.read_text()))
+        _ = binding.write_text(json.dumps({**fields, **changes}), encoding="utf-8")
+
+    def test_binding_with_a_revision_name_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            self.rewrite_binding(tree, source_commit="HEAD")
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+            self.assert_snapshot_refused(tree)
+
+    def test_binding_in_a_shared_folder_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            mode = tree.parent.stat().st_mode
+            tree.parent.chmod(mode | 0o020)
+            try:
+                self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+                self.assert_snapshot_refused(tree)
+            finally:
+                tree.parent.chmod(mode)
+
+    def test_deeply_nested_binding_reads_as_no_source(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            _ = (tree.parent / copy_record.SNAPSHOT_ORIGIN).write_text("[" * 100000, encoding="utf-8")
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+
+
 class NixConfigTests(NixFixture):
     def test_direnv_commands_read_the_timeout_setting_at_use(self) -> None:
         _ = self.envrc(self.work)
