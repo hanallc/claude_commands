@@ -3,17 +3,14 @@ from __future__ import annotations
 
 import html
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from string import Formatter
 from typing import Literal, TypedDict
 
 from scripts.accounts import accounts
-from scripts.build_queue.snapshot_codec import format_queue_name, public_queue_text, UNKNOWN_CALLER
+from scripts.build_queue.snapshot_codec import public_queue_text, row_text, select_queue_name
 from scripts.production import staff
-from scripts.lib.build_steps import StepNames
-from scripts.message.owner_role import OwnerRole
 
 
 @dataclass(frozen=True)
@@ -57,38 +54,12 @@ def parts_text(parts: Sequence[NamePart]) -> str:
     return "".join(part["text"] for part in parts)
 
 
-def template_parts(template: str, fields: Mapping[str, str | int | StaffReference]) -> list[NamePart]:
-    """Mark template fields at their source without reading names from the result."""
-    values: list[str | StaffReference] = []
-    for literal, field, spec, conversion in Formatter().parse(template):
-        values.append(literal)
-        if field is not None:
-            value = fields[field]
-            text = value.name if isinstance(value, StaffReference) else value
-            pattern = "{value" + ("!" + conversion if conversion else "") + (":" + spec if spec else "") + "}"
-            shown = pattern.format(value=text)
-            values.append(StaffReference(shown) if isinstance(value, StaffReference) else shown)
-    return text_parts(*values)
-
-
-def owned_step_parts(names: StepNames, step: str, unit: str, role: OwnerRole, *,
-                     ci: bool = False, current: Sequence[NamePart] = ()) -> list[NamePart]:
-    """Keep staff fields separate in the configured step name."""
-    unit = public_queue_text(unit)
-    shown = public_queue_text(names.shown(step))
-    template = names.owner_template(step, unit, role, ci=ci)
-    label = format_queue_name(template, unit=unit, step=shown)
-    if label:
-        try:
-            parts = template_parts(template, {"unit": unit if ci else StaffReference(unit), "step": shown})
-        except (KeyError, ValueError):
-            return text_parts(label)
-        return parts if parts_text(parts) == label else text_parts(label)
-    if public_queue_text(parts_text(current)):
-        return list(current)
-    if template and role is OwnerRole.UNIT and not ci:
-        return text_parts(StaffReference(unit), " " if unit and shown else "", shown)
-    return text_parts(shown or UNKNOWN_CALLER)
+def row_parts(owner: str, what: str, unit: str) -> list[NamePart]:
+    """The parts of `<owner>: <what>`; an owner that is the staff unit is a staff reference."""
+    text = row_text(owner, what)
+    shown_owner = select_queue_name(owner)
+    owner_part = StaffReference(shown_owner) if shown_owner == public_queue_text(unit) else shown_owner
+    return text_parts(owner_part, text.removeprefix(shown_owner))
 
 
 class NameReading(Enum):

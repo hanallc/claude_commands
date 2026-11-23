@@ -3,7 +3,8 @@
 Wait for proof that the guest run ended.
 If the wait expires, fail the route. The guest keeps its run lock until the run ends.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
-Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
+Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death.
+When this process ends by any signal, the link to the guest ends, and the guest ends the run. The guest timeout still ends the run.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import tarfile
 from time import monotonic, sleep, time
-from typing import Literal, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -35,13 +36,18 @@ from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
-from scripts.mac_test import eligibility
+from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
+if TYPE_CHECKING:
+    from scripts.build_queue.placement import PlacementAssignment
+
 
 TARGET = eligibility.MAC_LINUX_TARGET
+# The guest route holds a repository claim on this Mac target while its run lasts.
+GUEST_CLAIM_TARGET = 'mac'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -140,11 +146,37 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
 
 
 def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
-                          gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
+                          gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[claim_state.ClaimIdentity]:
     """Take the Mac repository claim for the guest route."""
     from scripts.build_queue import mac_run
 
-    return mac_run.held(repo, 'mac', work, gate_job)
+    return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
+
+
+def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
+    """Consume the launch permission of the gate assignment before the guest run starts.
+
+    The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
+    A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
+    """
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.buildlog import store
+    from scripts.lib import process_start
+
+    start = process_start.process_start(os.getpid())
+    if not isinstance(start, process_start.Started):
+        raise GuestTookNoRun('the gate process has no start time to hold the launch permission')
+    destination = assignment.destination
+    reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 claim.claim_id, assignment.episode, assignment.attempt)
+    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+    try:
+        permission = admission_client.consume_permission(
+            wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
+    except wire.AdmissionUnavailable as error:
+        raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
+    if isinstance(permission, wire.DispatchStatus):
+        raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
 
 
 class GuestRunRequest(TypedDict):
@@ -582,6 +614,15 @@ def guest_attempt_command(mode: Literal['lock', 'start', 'cancel'], armed: Armed
                        armed.attempt, armed.boot_id, str(armed.deadline_ns), Path(RUN_LOCK_PATH).name, str(descriptor)))
 
 
+def guest_group_signal_command() -> str:
+    """The guest command that sends SIGNAL to process group GROUP through the shared check in process_group.py.
+
+    Append the GROUP and SIGNAL arguments. The guest can run it before its checkout has scripts, so the command
+    carries the source of the module.
+    """
+    return shlex.join(('python3', '-I', '-S', '-c', Path(process_group.__file__).read_text(encoding='utf-8')))
+
+
 def run_shell(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
     checkout = f'''set -euo pipefail
@@ -618,6 +659,14 @@ if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
     fi
     exit 1
 fi
+# natedev holds the link open for the run. If the link ends first, end the run group, which frees the run lock.
+# The watcher is in the run group, so a group kill ends it too; the EXIT trap ends it after a normal end.
+# At the link end it moves to a new session, because the shared check refuses the caller's own group.
+read -r group _ < "/proc/$$/fd/{RUN_LOCK_FD}"
+{{ while read -r _; do :; done; exec setsid {guest_group_signal_command()} "$group" KILL; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
+watcher=$!
+trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
+exec </dev/null
 commit={shlex.quote(source.commit)}
 origin_main={shlex.quote(source.origin_main)}
 tree=$(git rev-parse --verify "$commit^{{tree}}")
@@ -644,9 +693,7 @@ exec timeout --signal=KILL {settings.guest_timeout_seconds} {start} "$BASHPID" {
 
 def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
     cancel = guest_attempt_command('cancel', armed, 8)
-    # Cleanup can run before the guest has a checkout with scripts.
-    group_helper = Path(process_group.__file__).read_text(encoding='utf-8')
-    send_group = shlex.join(('python3', '-I', '-S', '-c', group_helper))
+    send_group = guest_group_signal_command()
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
 prove_end() {{
@@ -859,12 +906,15 @@ def empty_delta_header(repo: Path, source: CheckoutSource, basis: DeltaBundle, p
 
 # Without a count argument, the SSH output is the stream output. With one, send the SSH result to
 # descriptor 3, use descriptor 4 to collect the byte count, and print the count last.
+# After the bundle, the SSH input stays open while natedev holds the link (guest_link). The guest ends the run
+# when its input ends first.
 STREAM_SOURCE = '''
 prefix=$1
 base=$2
 header=$3
 count=$4
-shift 4
+exec {link}<&"$5"
+shift 5
 bundle() {
     if [ -n "$header" ]; then
         printf '%s' "$header" && git pack-objects --stdout </dev/null
@@ -876,23 +926,55 @@ bundle() {
         git bundle create - "${refs[@]}"
     fi
 }
+send() {
+    if [ -n "$count" ]; then
+        { cat && bundle; } | tee >(wc -c >&4) || exit
+    else
+        { cat && bundle; } || exit
+    fi
+    exec cat <&"$link"
+}
+linked_ssh() {
+    exec {input}< <(send)
+    sender=$!
+    "$@" <&"$input" {input}<&- 3>&- 4>&-
+    status=$?
+    exec {input}<&-
+    kill "$sender" 2>/dev/null
+    return "$status"
+}
 if [ -z "$count" ]; then
-    { cat && bundle; } | "$@"
+    linked_ssh "$@"
     exit
 fi
 exec 3>&1
 size=$(
     exec 4>&1
-    { cat && bundle; } | tee >(wc -c >&4) | "$@" >&3 3>&- 4>&-
+    linked_ssh "$@" >&3
 ) || exit "$?"
 printf '\\n%s\\n' "$size"
 '''
 
 
-def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes,
-                        timeout: int) -> subprocess.CompletedProcess[bytes]:
+@contextmanager
+def guest_link() -> Generator[int]:
+    """Hold the link to the guest run for the block, and yield the descriptor that the stream reads.
+
+    The link ends when the block ends, or when this process ends by any signal. The guest then ends a run that
+    is still active, and so frees the run lock with no cleanup from natedev.
+    """
+    link, hold = os.pipe()
+    try:
+        yield link
+    finally:
+        os.close(hold)
+        os.close(link)
+
+
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int) -> subprocess.CompletedProcess[bytes]:
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True) as stream:
+                          stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
         try:
             output, errors = stream.communicate(bootstrap, timeout=timeout)
         except BaseException as error:
@@ -910,11 +992,11 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
 
 
 def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt,
-                     prefix: str, send: BundleSend, *, count: bool) -> list[str]:
-    """The local command that sends the bootstrap and the bundle to the armed guest run."""
+                     prefix: str, send: BundleSend, *, count: bool, link: int) -> list[str]:
+    """The local command that sends the bootstrap and the bundle to the armed guest run, then holds the link."""
     command = settings.command(run_shell(settings, source, bootstrap_bytes, armed))
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
-            'count' if count else '', *command]
+            'count' if count else '', str(link), *command]
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
@@ -939,8 +1021,11 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
-                        arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send, count=True)
-                        stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
+                        with guest_link() as link:
+                            arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
+                                                         count=True, link=link)
+                            stream = stream_guest_bundle(repo, arguments, bootstrap,
+                                                         settings.transfer_timeout_seconds, link)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1072,10 +1157,12 @@ class GuestCommand:
         prefix = self.refs.enter_context(bundle_refs(repo, source, request['attempt']))
         send = bundle_send(repo, source, bundle, prefix)
         self.armed = arm_guest(self.settings, request['attempt'])
-        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False)
+        link = self.refs.enter_context(guest_link())
+        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False,
+                                     link=link)
         with bootstrap.open('rb') as stdin:
             self.process = subprocess.Popen(arguments, cwd=repo, stdin=stdin, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, start_new_session=True)
+                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,))
         try:
             wait_for_start(self.process, request['attempt'])
         except BaseException as error:
@@ -1087,7 +1174,7 @@ class GuestCommand:
         return self.process
 
     def finish(self, failure: BaseException | None = None) -> None:
-        """Prove the end of an armed run, then remove the bundle refs.
+        """Prove the end of an armed run, then end the guest link and remove the bundle refs.
 
         failure is the error that ended the run early, if any. A stream that still runs is stopped, and the
         guest kills a run that still holds the lock. An interrupt does not stop the proof; the first one is
@@ -1218,8 +1305,11 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
-          type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
-    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed."""
+          assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
+    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed.
+
+    The assignment is the one the gate checked at its start. The route consumes its launch permission.
+    """
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run
     from scripts.build_queue.admission_client import step_identity
@@ -1246,7 +1336,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         try:
-            with mac_linux_reservation(repo, mode, gate_job):
+            with mac_linux_reservation(repo, mode, gate_job) as claim:
+                consume_launch_permission(claim, assignment)
                 reply = transfer_source(repo, settings, source, request)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
