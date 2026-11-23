@@ -46,6 +46,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "running": "{count} running",
     "occupied": "{count} in use",
     "kept": "{count} kept (leftover of a stopped run)",
+    "kept_many": "{count} kept (leftovers of stopped runs)",
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
     "policy_key": "{name} run limit",
@@ -70,6 +71,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "held_until": "Held until {time}",
     "unreachable": "Unreachable",
     "legend_run": "A run that is in progress",
+    "legend_kept": "A place kept by a stopped run",
     "legend_free": "A free place",
     "legend_line": "The limit",
     "legend_wait": "A run that waits",
@@ -602,7 +604,10 @@ class MacClaim:
 
 @dataclass(frozen=True)
 class MacHeading:
-    """The Mac claims without a repository row: each counts in the limit, and kept ones are a part."""
+    """The Mac claims without a repository row.
+
+    Each one counts in the limit. `kept` counts the kept claims in `unattributed`.
+    """
     unattributed: int = 0
     kept: int = 0
     note: str = ""
@@ -660,9 +665,10 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
         if isinstance(scope, claim_state.RepositoryScope):
             # The Mac admits a checkout under a scope that uses only its name.
             scope = claim_state.RepositoryScope(scope.name)
-        session = (record["submitting_session"]
-                   if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
-        use = MacClaimUse.KEPT if mac_test.run_is_kept(record) else MacClaimUse.WORKING
+        # Each claim here is live, so a claim that is not kept holds work.
+        kept = mac_test.run_is_kept(record)
+        session = record["submitting_session"] if not record.get("cleanup_pending") and not kept else ""
+        use = MacClaimUse.KEPT if kept else MacClaimUse.WORKING
         claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), session, use))
     configured: dict[str, int] = {}
     if origins.source_names:

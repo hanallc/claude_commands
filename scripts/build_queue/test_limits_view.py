@@ -283,30 +283,54 @@ class BuildLimitsTests(unittest.TestCase):
             return shown, ElementTree.tostring(mac_heading, encoding="unicode")
 
         background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None))
+        kept_mark = 'class="build-limit-mark kept"'
         alone, alone_html = heading(kept)
         self.assertEqual((alone.mac.unattributed, alone.mac.unattributed_kept), (1, 1))
         self.assertIn("1 kept (leftover of a stopped run)", alone_html)
         self.assertNotIn("in use", alone_html)
         self.assertNotIn("lucide-loader-circle", alone_html)
+        self.assertEqual(alone_html.count(kept_mark), 1)
         both, both_html = heading(working, kept)
         self.assertEqual((both.mac.unattributed, both.mac.unattributed_kept), (2, 1))
         self.assertIn("1 in use · 1 kept (leftover of a stopped run)", both_html)
-        self.assertEqual(both_html.count("lucide-loader-circle"), 1)
+        self.assertEqual((both_html.count("lucide-loader-circle"), both_html.count(kept_mark)), (1, 1))
+        two, two_html = heading(kept, {**kept, "claim_id": "kept-2"})
+        self.assertEqual((two.mac.unattributed, two.mac.unattributed_kept), (2, 2))
+        self.assertIn("2 kept (leftovers of stopped runs)", two_html)
+        self.assertEqual(two_html.count(kept_mark), 2)
+
+        def hana_row(limit: int, *uses: limits_view.MacClaimUse) -> tuple[limits_view.Cell, str, str]:
+            claims = tuple(limits_view.MacClaim(claim_state.RepositoryScope("hana"), limit, "", use) for use in uses)
+            mac = limits_view.MacReading(claims, {"hana": limit}, claims_readable=True)
+            shown = limits_view.build_limits(head_reading(), (), (), {}, {}, background, UTC, mac=mac)
+            cell = next(row.mac for row in shown.repositories if row.name == "hana")
+            rendered, tooltip = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => [
+                limitCell(data.build_limits.repositories.find(row => row.name === 'hana').mac, data.build_limits.words, 'mac'),
+                pageTooltipHtml('limit:cell:mac:hana', data)])()""",
+                {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True))
+            return cell, rendered, tooltip
 
         # A kept claim in a repository row still fills its place in the limit.
-        claim = limits_view.MacClaim(claim_state.RepositoryScope("hana"), 1, "", limits_view.MacClaimUse.KEPT)
-        mac = limits_view.MacReading((claim,), {"hana": 1}, claims_readable=True)
-        shown = limits_view.build_limits(head_reading(), (), (), {}, {}, background, UTC, mac=mac)
-        cell = next(row.mac for row in shown.repositories if row.name == "hana")
+        cell, rendered, tooltip = hana_row(1, limits_view.MacClaimUse.KEPT)
         self.assertEqual((cell.used, cell.limit, cell.kept, cell.runs), (1, 1, 1, []))
-        rendered, tooltip = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => [
-            limitCell(data.build_limits.repositories.find(row => row.name === 'hana').mac, data.build_limits.words, 'mac'),
-            pageTooltipHtml('limit:cell:mac:hana', data)])()""",
-            {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True))
         self.assertIn("1 of 1", rendered)
         self.assertNotIn("lucide-loader-circle", rendered)
+        self.assertEqual(rendered.count(kept_mark), 1)
+        self.assertIn("<dt>Places</dt>", tooltip)
         self.assertIn("1 kept (leftover of a stopped run)", tooltip)
         self.assertNotIn("in use", tooltip)
+
+        # Two claims above a limit of 1 leave the row with no limit; the hover still names each kind.
+        cell, rendered, tooltip = hana_row(1, limits_view.MacClaimUse.KEPT, limits_view.MacClaimUse.KEPT)
+        self.assertEqual((cell.used, cell.limit, cell.kept), (2, None, 2))
+        self.assertEqual(rendered.count(kept_mark), 2)
+        self.assertIn("2 kept (leftovers of stopped runs)", tooltip)
+
+        cell, rendered, tooltip = hana_row(2, limits_view.MacClaimUse.WORKING, limits_view.MacClaimUse.KEPT)
+        self.assertEqual((cell.used, cell.limit, cell.kept), (2, 2, 1))
+        self.assertIn("2 of 2", rendered)
+        self.assertEqual((rendered.count("lucide-loader-circle"), rendered.count(kept_mark)), (1, 1))
+        self.assertIn("1 in use · 1 kept (leftover of a stopped run)", tooltip)
 
     def test_claude_mac_scope_uses_the_claude_commands_row(self) -> None:
         base = head_reading()
