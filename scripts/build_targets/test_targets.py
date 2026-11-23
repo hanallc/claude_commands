@@ -16,7 +16,7 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
@@ -715,7 +715,7 @@ class TargetStateTests(IsolatedTargetTest):
 class ReservationTests(IsolatedTargetTest):
     def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
         _ = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
         args = build_targets.CliArguments()
         args.target, args.kind, args.package = "mac", "test", "sample"

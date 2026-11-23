@@ -57,6 +57,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.agents import pane_record
 from scripts.production import session_staff, unit_lookup
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -2505,7 +2506,7 @@ runpy.run_path(str(script), run_name='__main__')
     def test_holding_statuses_log_each_pass_without_any_delivery(self) -> None:
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\npinned_targets=hana-gpu\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         (self.root / "mac_test.conf").touch()
         mac_state = self.root / "mac-state"
         self.environment["MAC_TEST_STATE_DIR"] = str(mac_state)

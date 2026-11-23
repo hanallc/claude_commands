@@ -145,7 +145,7 @@ class Probes:
     loadavg: Path = Path("/proc/loadavg")
     cpus: Callable[[], int | None] = os.cpu_count
     mac_settings: Callable[[], eligibility.SshProbeSettings] = (
-        lambda: eligibility.SshProbeSettings(conf.read("mac_test")))
+        lambda: eligibility.probe_settings(conf.read("mac_test")))
     aws_box: Callable[[float], str] = running_gate_box
 
 

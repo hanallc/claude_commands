@@ -81,7 +81,13 @@ def copy_helpers(home: Path, *folders: str) -> Path:
             target = Path(os.readlink(source)) if source.is_symlink() else None
             resolved = source.resolve()
             inside = resolved.is_relative_to(SOURCE) and resolved.relative_to(SOURCE) in selected_files
-            if target is not None and not target.is_absolute() and inside:
+            if target is not None and resolved.is_dir():
+                if (target.is_absolute() or not resolved.is_relative_to(SOURCE)
+                        or not any(member.is_relative_to(resolved.relative_to(SOURCE)) for member in files)):
+                    raise ValueError(f"The fixture helper directory has no private copy: {source}")
+                copied_directory = installed / resolved.relative_to(SOURCE)
+                destination.symlink_to(os.path.relpath(copied_directory, destination.parent), target_is_directory=True)
+            elif target is not None and not target.is_absolute() and inside:
                 destination.symlink_to(target)
             else:
                 _ = shutil.copy2(source, destination)
