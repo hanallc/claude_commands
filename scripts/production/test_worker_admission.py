@@ -18,6 +18,7 @@ from unittest import mock
 from scripts.agents import worker_lifecycle
 from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import claude_worker
@@ -51,8 +52,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         self.assertEqual(str(missing_caller.exception), "the caller has no staff row and names no unit or production")
 
     def test_parent_prints_a_state_read_anomaly_once(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        start_new_command(self)
         _, unit, _ = self.tree()
         run = self.root / "bad-state"
         run.mkdir()

@@ -33,7 +33,8 @@ from scripts.buildlog import machine_facts, repository, store
 from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[str]]:
@@ -252,6 +253,87 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(wait_names(rows["hana"].waits), {words.one: ["Mac step"]})
         self.assertEqual(rows["other"], limits_view.Cell())
         self.assertEqual(shown.mac.waits, {})
+
+    def test_kept_mac_claim_counts_in_the_limit_but_is_not_in_use(self) -> None:
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
+        working: claim_state.RemoteJobClaim = {"claim_id": "working", "episode": "episode", "attempt": "attempt",
+            "submitting_session": "build", "pid": os.getpid(), "proc_start": started.start, "what": "test",
+            "worktree": "relative", "since": "2026-11-22T12:00:00+00:00", "remote_host": "fixture-host"}
+        # The saved owner process is gone, so mac_test keeps the claim for the leftovers of its run.
+        kept: claim_state.RemoteJobClaim = {**working, "claim_id": "kept", "proc_start": started.start + "0"}
+        self.assertTrue(mac_test.run_is_kept(kept))
+        self.assertFalse(mac_test.run_is_kept(working))
+
+        def heading(*records: claim_state.RemoteJobClaim) -> tuple[limits_view.BuildLimits, str]:
+            held = tuple(claim_state.HeldClaim(claim_state.WHOLE_MAC, Path(f"/{record['claim_id']}.json"), record)
+                         for record in records)
+            snapshot = targets.TargetSnapshot(target_config.SshTarget("mac", "macos", Path("mac.conf")),
+                                              (targets.Free(),), held, eligibility.NO_BACKOFF)
+            with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": "/nonexistent"}):
+                mac = limits_view.read_mac(snapshot, limits_view.Origins())
+            # A kept claim has no working session, so it never shows under Running.
+            self.assertEqual([claim.working_session for claim in mac.claims],
+                             ["" if claim.use is limits_view.MacClaimUse.KEPT else "build" for claim in mac.claims])
+            shown = limits_view.build_limits(head_reading(), (), (), {}, {}, background, UTC, mac=mac)
+            rendered = test_memory_hover.MemoryHoverTests().page_expression("""(() => {
+                renderBuildLimits(data.build_limits);
+                return $('build-limits-content').innerHTML;
+            })()""", {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True)
+            assert isinstance(rendered, str)
+            mac_heading = ElementTree.fromstring(f"<root>{rendered}</root>").find(".//th[3]")
+            assert mac_heading is not None
+            return shown, ElementTree.tostring(mac_heading, encoding="unicode")
+
+        background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None))
+        kept_mark = 'class="build-limit-mark kept"'
+        alone, alone_html = heading(kept)
+        self.assertEqual((alone.mac.unattributed, alone.mac.unattributed_kept), (1, 1))
+        self.assertIn("1 kept (leftover of a stopped run)", alone_html)
+        self.assertNotIn("in use", alone_html)
+        self.assertNotIn("lucide-loader-circle", alone_html)
+        self.assertEqual(alone_html.count(kept_mark), 1)
+        both, both_html = heading(working, kept)
+        self.assertEqual((both.mac.unattributed, both.mac.unattributed_kept), (2, 1))
+        self.assertIn("1 in use · 1 kept (leftover of a stopped run)", both_html)
+        self.assertEqual((both_html.count("lucide-loader-circle"), both_html.count(kept_mark)), (1, 1))
+        two, two_html = heading(kept, {**kept, "claim_id": "kept-2"})
+        self.assertEqual((two.mac.unattributed, two.mac.unattributed_kept), (2, 2))
+        self.assertIn("2 kept (leftovers of stopped runs)", two_html)
+        self.assertEqual(two_html.count(kept_mark), 2)
+
+        def hana_row(limit: int, *uses: limits_view.MacClaimUse) -> tuple[limits_view.Cell, str, str]:
+            claims = tuple(limits_view.MacClaim(claim_state.RepositoryScope("hana"), limit, "", use) for use in uses)
+            mac = limits_view.MacReading(claims, {"hana": limit}, claims_readable=True)
+            shown = limits_view.build_limits(head_reading(), (), (), {}, {}, background, UTC, mac=mac)
+            cell = next(row.mac for row in shown.repositories if row.name == "hana")
+            rendered, tooltip = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => [
+                limitCell(data.build_limits.repositories.find(row => row.name === 'hana').mac, data.build_limits.words, 'mac'),
+                pageTooltipHtml('limit:cell:mac:hana', data)])()""",
+                {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True))
+            return cell, rendered, tooltip
+
+        # A kept claim in a repository row still fills its place in the limit.
+        cell, rendered, tooltip = hana_row(1, limits_view.MacClaimUse.KEPT)
+        self.assertEqual((cell.used, cell.limit, cell.kept, cell.runs), (1, 1, 1, []))
+        self.assertIn("1 of 1", rendered)
+        self.assertNotIn("lucide-loader-circle", rendered)
+        self.assertEqual(rendered.count(kept_mark), 1)
+        self.assertIn("<dt>Places</dt>", tooltip)
+        self.assertIn("1 kept (leftover of a stopped run)", tooltip)
+        self.assertNotIn("in use", tooltip)
+
+        # Two claims above a limit of 1 leave the row with no limit; the hover still names each kind.
+        cell, rendered, tooltip = hana_row(1, limits_view.MacClaimUse.KEPT, limits_view.MacClaimUse.KEPT)
+        self.assertEqual((cell.used, cell.limit, cell.kept), (2, None, 2))
+        self.assertEqual(rendered.count(kept_mark), 2)
+        self.assertIn("2 kept (leftovers of stopped runs)", tooltip)
+
+        cell, rendered, tooltip = hana_row(2, limits_view.MacClaimUse.WORKING, limits_view.MacClaimUse.KEPT)
+        self.assertEqual((cell.used, cell.limit, cell.kept), (2, 2, 1))
+        self.assertIn("2 of 2", rendered)
+        self.assertEqual((rendered.count("lucide-loader-circle"), rendered.count(kept_mark)), (1, 1))
+        self.assertIn("1 in use · 1 kept (leftover of a stopped run)", tooltip)
 
     def test_claude_mac_scope_uses_the_claude_commands_row(self) -> None:
         base = head_reading()
@@ -519,7 +601,8 @@ class BuildLimitsTests(unittest.TestCase):
             settings = root / "mac.conf"
             _ = settings.write_text("linux_only.project=linux_package\nlinux_only.quiet=\n", encoding="utf-8")
             _ = (root / "build_targets.conf").write_text(
-                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n", encoding="utf-8")
+                "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE,
+                encoding="utf-8")
             claims = root / "claims"
             claims.mkdir()
             since = datetime(2026, 11, 22, 12, tzinfo=UTC)
@@ -584,14 +667,11 @@ class BuildLimitsTests(unittest.TestCase):
                          (1, "", normal.mac.waits))
         keyless_cells = {row.name: row.mac for row in keyless.repositories}
         self.assertEqual((keyless_cells["project"].used, keyless_cells["cleanup"].used), (None, 1))
-        for shown, project_count in ((unresolved, 2),):
-            with self.subTest(mac_claims=project_count):
-                self.assertEqual(shown.mac.unattributed, 0)
-                self.assertEqual(shown.mac.waits, normal.mac.waits)
-                mac_cells = {row.name: row.mac for row in shown.repositories}
-                self.assertEqual(mac_cells["project"].used, project_count)
-                self.assertEqual(mac_cells["cleanup"].used, 1)
-                self.assertNotIn("other", mac_cells)
+        self.assertEqual(unresolved.mac.unattributed, 0)
+        self.assertEqual(unresolved.mac.waits, normal.mac.waits)
+        unresolved_cells = {row.name: row.mac for row in unresolved.repositories}
+        self.assertEqual((unresolved_cells["project"].used, unresolved_cells["cleanup"].used), (2, 1))
+        self.assertNotIn("other", unresolved_cells)
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
         self.assertEqual(full_mac.mac.unattributed_note, "")

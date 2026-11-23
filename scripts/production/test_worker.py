@@ -44,12 +44,13 @@ from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, conf, file_lock, process_start, unit_runs
 from scripts.lib.fork_test_support import ForkChildren
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.message import send, sessions
 from scripts.usage import agents_log
 
@@ -457,7 +458,8 @@ class WorkerCommandTests(unittest.TestCase):
         _ = write_config_fixture(self.fixture.root / "conf/shutdown.conf")
         _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
         _ = self.enterContext(detached_fixture_processes())
-        _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
+        _ = (self.fixture.root / "conf/build_targets.conf").write_text(
+            "targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n" + UNREACHABLE_WAIT_FIXTURE)
         self.fixture.world.binary = "/nonexistent/herdr"
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
@@ -6776,8 +6778,7 @@ class WorkerCommandTests(unittest.TestCase):
         resolve.assert_not_called()
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        start_new_command(self)
         rows = [self.fixture.worker(name) for name in ("impl", "review", "test")]
         for index, row in enumerate(rows, 1):
             self.fixture.world.add(row, f"w1:p{index}")

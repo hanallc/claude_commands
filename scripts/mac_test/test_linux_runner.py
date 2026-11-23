@@ -30,7 +30,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -214,7 +214,7 @@ class LinuxShellTests(unittest.TestCase):
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=linux,mac\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
         _ = (self.root / "lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
@@ -1430,7 +1430,7 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
             _ = selector_runner.write_text(
-                "#!/bin/bash\nprintf '%s' " + shlex.quote(selector.stdout)
+                "#!/usr/bin/env bash\nprintf '%s' " + shlex.quote(selector.stdout)
                 + "; printf '%s' " + shlex.quote(selector.stderr)
                 + " >&2; exit " + str(selector.returncode) + "\n"
             )
@@ -1442,7 +1442,7 @@ class LinuxProcessTests(unittest.TestCase):
             with mock.patch.object(subprocess, "Popen", open_process):
                 result = run_command(["bash", "-c", stubs + argv[-1]], text=True,
                                      capture_output=True, check=False, timeout=5,
-                                     env={"HOME": str(dispatch.fixture.root), "PATH": "/usr/bin:/bin"})
+                                     env={"HOME": str(dispatch.fixture.root), "PATH": os.environ["PATH"]})
             cleanups.append(result)
             return result
 
@@ -1759,7 +1759,8 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
         registry = self.root / "build_targets.conf"
-        _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+        _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+                                + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

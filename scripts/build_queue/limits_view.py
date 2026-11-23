@@ -45,6 +45,8 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "no_limit": "No limit",
     "running": "{count} running",
     "occupied": "{count} in use",
+    "kept": "{count} kept (leftover of a stopped run)",
+    "kept_many": "{count} kept (leftovers of stopped runs)",
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
     "policy_key": "{name} run limit",
@@ -69,6 +71,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "held_until": "Held until {time}",
     "unreachable": "Unreachable",
     "legend_run": "A run that is in progress",
+    "legend_kept": "A place kept by a stopped run",
     "legend_free": "A free place",
     "legend_line": "The limit",
     "legend_wait": "A run that waits",
@@ -167,6 +170,7 @@ class Cell:
     limit: int | None = None
     used: int | None = None
     other_used: int = 0
+    kept: int = 0
     policy: CellPolicy = CellPolicy.UNRESOLVED
     runs: list[str] = field(default_factory=list[str])
     merge_above: list[str] = field(default_factory=list[str])
@@ -195,6 +199,7 @@ class MachineLimits:
     unattributed: int = 0
     unattributed_note: str = ""
     facts: str = ""
+    unattributed_kept: int = 0
 
 
 @dataclass(frozen=True)
@@ -583,11 +588,29 @@ class LimitsRefresh:
             self.origins.current(now, self.token_interval, read_origins, key=checkouts))
 
 
+class MacClaimUse(Enum):
+    """A working claim holds a live run; a kept claim holds the leftovers of a stopped run."""
+    WORKING = "working"
+    KEPT = "kept"
+
+
 @dataclass(frozen=True)
 class MacClaim:
     scope: claim_state.ClaimScope
     limit: int
     working_session: str
+    use: MacClaimUse = MacClaimUse.WORKING
+
+
+@dataclass(frozen=True)
+class MacHeading:
+    """The Mac claims without a repository row.
+
+    Each one counts in the limit. `kept` counts the kept claims in `unattributed`.
+    """
+    unattributed: int = 0
+    kept: int = 0
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -642,9 +665,11 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
         if isinstance(scope, claim_state.RepositoryScope):
             # The Mac admits a checkout under a scope that uses only its name.
             scope = claim_state.RepositoryScope(scope.name)
-        session = (record["submitting_session"]
-                   if not record.get("cleanup_pending") and mac_test.run_holds_work(record) else "")
-        claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), session))
+        # Each claim here is live, so a claim that is not kept holds work.
+        kept = mac_test.run_is_kept(record)
+        session = record["submitting_session"] if not record.get("cleanup_pending") and not kept else ""
+        use = MacClaimUse.KEPT if kept else MacClaimUse.WORKING
+        claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), session, use))
     configured: dict[str, int] = {}
     if origins.source_names:
         settings = conf.read(target.settings)
@@ -793,23 +818,27 @@ def mac_row_name(scope: str) -> str:
     return "claude_commands" if scope == ".claude" else clean_label(scope)
 
 
-def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Mapping[str, str]) -> tuple[int, str]:
+def kept_count(claims: Sequence[MacClaim]) -> int:
+    return sum(1 for claim in claims if claim.use is MacClaimUse.KEPT)
+
+
+def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Mapping[str, str]) -> MacHeading:
     """Put each confirmed claim in its repository row or in the heading."""
     by_row: dict[str, list[MacClaim]] = {}
-    unattributed = 0
+    unattributed: list[MacClaim] = []
     show_free = mac.claims_readable
     missing_scope = False
     for claim in mac.claims:
         if isinstance(claim.scope, claim_state.RepositoryScope):
             name = mac_row_name(claim.scope.name)
             if not name:
-                unattributed += 1
+                unattributed.append(claim)
                 show_free = False
                 missing_scope = True
                 continue
             by_row.setdefault(name, []).append(claim)
         else:
-            unattributed += 1
+            unattributed.append(claim)
             show_free = False
 
     limits_by_row: dict[str, dict[str, int]] = {}
@@ -823,6 +852,7 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
         row = rows[name]
         row.quiet = False
         row.mac.used = len(claims)
+        row.mac.kept = kept_count(claims)
         row.mac.runs.extend(label for claim in claims
                             if claim.working_session and (label := clean_label(names.get(claim.working_session, ""))))
         first = claims[0]
@@ -838,7 +868,8 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
                 limit = next(iter(scopes.values()))
                 cell = rows[name].mac
                 cell.used, cell.limit, cell.policy = 0, limit, CellPolicy.CONFIGURED
-    return unattributed, "A Mac claim has no repository name that this page can show." if missing_scope else ""
+    return MacHeading(len(unattributed), kept_count(unattributed),
+                      "A Mac claim has no repository name that this page can show." if missing_scope else "")
 
 
 def facts_line(saved: machine_facts.SavedFacts | machine_facts.FactsUnread, machine: machine_facts.Machine, now: float,
@@ -1144,7 +1175,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             item.aws.other.clear()
             item.aws.show_marks = item.aws.limit is None
 
-    mac_unattributed, mac_note = place_mac_counts(mac, rows, names) if mac is not None else (0, "")
+    mac_heading = place_mac_counts(mac, rows, names) if mac is not None else MacHeading()
     room = explanation.room
     memory_used = room.cap_use / records.GIB if isinstance(room, records.MemoryRoom) else None
     memory_cap = room.cap / records.GIB if isinstance(room, records.MemoryRoom) and isinstance(room.cap, int) else None
@@ -1169,8 +1200,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
                                     (*limits, *shared), local_waits, unattributed, local_note, facts_text("natedev")),
-                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed, mac_note,
-                                     facts_text("mac")),
+                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_heading.unattributed,
+                                     mac_heading.note, facts_text("mac"), unattributed_kept=mac_heading.kept),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, facts=facts_text("aws")),
                        tuple(sorted(rows.values(), key=lambda item: (first_rows.get(item.name, len(first_rows)),
                                                                      item.name.casefold(), item.name))),

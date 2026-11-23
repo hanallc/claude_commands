@@ -44,13 +44,14 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 import fcntl
+from functools import cache
 import hashlib
 import inspect
 from importlib import import_module
@@ -71,7 +72,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Literal, Protocol, TextIO, cast
+from typing import BinaryIO, Literal, Protocol, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -81,7 +82,7 @@ from scripts.lib import build_folders, cancellation, conf, land_main, main_push_
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
                                      gate_job_for_command, gate_job_from_process, read_step_names)
-from scripts.lint import sweep
+from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
@@ -102,6 +103,7 @@ from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
+from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
 from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
@@ -111,11 +113,11 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import (  # noqa: E402
-    AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation,
+    AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation, step_identity,
 )
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
+    QueuePlace, QueuePlaceRefused, no_hold_wait, queue_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -198,6 +200,11 @@ class NightlyRunState(Enum):
 @dataclass(frozen=True)
 class SharedMachine:
     """Share the machine through admission, holds, memory limits, and CPU slots."""
+
+
+@dataclass(frozen=True)
+class HoldExemptNamedModuleMachine:
+    """Share resources for a named run that the build hold exempts."""
 
 
 @dataclass(frozen=True)
@@ -448,16 +455,21 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
         print("Memory stop message could not be sent: " + " ".join(str(error).split()), flush=True)
 
 
+class NoBuildHoldCheck:
+    """Request admission while a build hold can be active."""
+
+
 @contextmanager
-def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
+def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildHoldCheck, *,
                      type_dirs: Sequence[str] = (),
                      mode: SuiteMode = SuiteMode.GATE) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-        with queue_place(program, repo,
-                         before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
+        before_check = (no_hold_wait if isinstance(hold, NoBuildHoldCheck)
+                        else AdmissionHoldCheck(hold.wait_until_free, hold.admits))
+        with queue_place(program, repo, before_check=before_check) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -1126,6 +1138,30 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
                                              -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
 
 
+@cache
+def _gate_program_source() -> BinaryIO:
+    """Keep the gate source open while this process launches test modules."""
+    return Path(__file__).resolve().open("rb")
+
+
+def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
+    """Filter descriptor variables with names that end in _FD or _FDS, or contain _FD_."""
+    passed_leases = {str(lease) for lease in leases}
+    job_environment: dict[str, str] = {}
+    for name, value in environment.items():
+        if name in ("LISTEN_FDS", GATE_PARENT_SOURCE_FD):
+            continue
+        if name.endswith("_FDS"):
+            value = ",".join(number for number in value.split(",") if number in passed_leases)
+            if not value:
+                continue
+        elif (name.endswith("_FD") or "_FD_" in name) and value not in passed_leases:
+            continue
+        job_environment[name] = value
+    job_environment["GATE_PARENT_PID"] = str(os.getpid())
+    return job_environment
+
+
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
@@ -1135,10 +1171,16 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
+            descriptors = copies.COMMAND_LOCKS.get()
+            job_environment = _gate_job_environment(environment, descriptors)
+            if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
+                descriptor = _gate_program_source().fileno()
+                job_environment[GATE_PARENT_SOURCE_FD] = str(descriptor)
+                descriptors = (*descriptors, descriptor)
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                       cwd=repo, env={**environment, "GATE_PARENT_PID": str(os.getpid())},
+                                       cwd=repo, env=job_environment,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+                                       start_new_session=True, pass_fds=descriptors)
             job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
@@ -1212,6 +1254,11 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         except ValueError:
             detail = f"(unreadable record): {line}"
         captured += f"\n{job.module}: a test read live memory {detail}\n"
+    config_marker = job.log.parent / "live-config-writes"
+    config_violation = config_marker.is_file()
+    if config_violation:
+        path = config_marker.read_text(encoding="utf-8", errors="replace").partition("\n")[0]
+        captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     try:
@@ -1227,7 +1274,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     if (job.memory_stopped or job.killed_for.startswith("time limit")) and status == 0:
         status = 1
-    tripwire_tripped = bool(calls or readings)
+    tripwire_tripped = bool(calls or readings or config_violation)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
@@ -1240,12 +1287,51 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
 class CleanTestTree:
     tree: str
     commit: str
+    branch: str
 
 
 @dataclass(frozen=True)
 class UnrecordableTestTree:
     reason: str
     dirty_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NoPendingTestPass:
+    """The routed gate has no local pass to publish."""
+
+
+@dataclass
+class RoutedGateTree:
+    repo: Path
+    tree: str
+    pending_pass: PendingTestPass | NoPendingTestPass = NoPendingTestPass()
+
+
+@dataclass(frozen=True)
+class NoRoutedGateTree:
+    """The caller did not bind the gate to a tree."""
+
+
+ACTIVE_ROUTED_GATE_TREE: ContextVar[RoutedGateTree | NoRoutedGateTree] = ContextVar(
+    "routed_gate_tree", default=NoRoutedGateTree())
+
+
+def routed_gate_tree(repo: Path) -> RoutedGateTree | NoRoutedGateTree:
+    routed = ACTIVE_ROUTED_GATE_TREE.get()
+    return routed if isinstance(routed, RoutedGateTree) and routed.repo == repo else NoRoutedGateTree()
+
+
+def matches_routed_gate_tree(repo: Path, tree: str) -> bool:
+    routed = routed_gate_tree(repo)
+    return isinstance(routed, NoRoutedGateTree) or routed.tree == tree
+
+
+def read_gate_checkout(cloud: CloudGateRoute, repo: Path) -> tuple[str, set[str]]:
+    try:
+        return cloud.working_tree(repo)
+    except (affected_modules.GraphError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise GateRefused(str(error)) from error
 
 
 def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
@@ -1255,7 +1341,28 @@ def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
         raise GateRefused(str(error)) from error
     if paths:
         return UnrecordableTestTree("checkout is dirty", tuple(paths))
-    return CleanTestTree(checked_git(repo, "rev-parse", "HEAD^{tree}"), checked_git(repo, "rev-parse", "HEAD"))
+    return head_test_tree(repo)
+
+
+def head_test_tree(repo: Path) -> CleanTestTree:
+    ref = checked_git(repo, "rev-parse", "--symbolic-full-name", "HEAD")
+    commit, tree = checked_git(repo, "show", "-s", "--no-show-signature", "--format=%H%n%T", ref).splitlines()
+    return CleanTestTree(tree, commit, ref.removeprefix("refs/heads/"))
+
+
+@dataclass(frozen=True)
+class NoFullRunRequired:
+    pass
+
+
+NO_FULL_RUN_REQUIRED = NoFullRunRequired()
+
+
+@dataclass(frozen=True)
+class ValidatedTestPass:
+    tree: CleanTestTree
+    selection: AffectedSelection | FullSuite
+    required: FullSuite | NoFullRunRequired
 
 
 @dataclass
@@ -1305,7 +1412,7 @@ class PassedTreeLedger:
         return records
 
     def reuse(self, *, report: bool = True) -> bool:
-        if isinstance(self.tree, UnrecordableTestTree):
+        if isinstance(self.tree, UnrecordableTestTree) or not matches_routed_gate_tree(self.repo, self.tree.tree):
             return False
         try:
             for record in reversed(self.records()):
@@ -1335,33 +1442,88 @@ class PassedTreeLedger:
             self.report_error(error)
         return NoCertifiedBase()
 
-    def record_pass(self, selection: AffectedSelection | FullSuite) -> None:
-        if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
+    def record_pass(self, selection: AffectedSelection | FullSuite, *,
+                    discovered: Sequence[tuple[str, Path]] = (),
+                    required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED) -> None:
+        PendingTestPass(self, selection, discovered, required).publish_local()
+
+    def append_pass(self, passed: ValidatedTestPass) -> None:
+        if self.unavailable:
             return
         try:
-            # A changed HEAD or a test that leaves edits must not certify a
-            # tree that differs from the clean tree at the start of the run.
-            ending = clean_test_tree(self.repo)
-            if not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree:
-                return
-            record = {"tree": self.tree.tree, "commit": self.tree.commit,
+            record = {"tree": passed.tree.tree, "commit": passed.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
                       "checkout": str(self.repo.resolve()), "suites": self.suites, "source": self.source,
-                      "kind": "full" if isinstance(selection, FullSuite) else "affected"}
-            if isinstance(selection, FullSuite):
-                record["reason"] = selection.reason
+                      "kind": "full" if isinstance(passed.selection, FullSuite) else "affected"}
+            if isinstance(passed.selection, FullSuite):
+                record["reason"] = passed.selection.reason
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
                 if os.write(ledger.fileno(), line) != len(line):
                     raise OSError("incomplete test pass write")
-        except (GateRefused, OSError, ValueError) as error:
+        except (OSError, ValueError) as error:
             self.report_error(error)
+        else:
+            if isinstance(passed.required, FullSuite):
+                (gate_state_dir() / "full-required").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
-class NoFullRunRequired:
-    pass
+class PendingTestPass:
+    ledger: PassedTreeLedger
+    selection: AffectedSelection | FullSuite
+    discovered: Sequence[tuple[str, Path]]
+    required: FullSuite | NoFullRunRequired
+
+    def coverage_matches(self) -> bool:
+        return not self.discovered or list(self.discovered) == discover_test_modules(self.ledger.repo)
+
+    def publish_if_eligible(self, clean_tree: str, modules_match: bool) -> None:
+        tested = self.ledger.tree
+        if modules_match and isinstance(tested, CleanTestTree) and tested.tree == clean_tree:
+            self.ledger.append_pass(ValidatedTestPass(tested, self.selection, self.required))
+
+    def publish_local(self) -> None:
+        if self.ledger.unavailable or isinstance(self.ledger.tree, UnrecordableTestTree):
+            return
+        try:
+            modules_match = self.coverage_matches()
+            ending = clean_test_tree(self.ledger.repo)
+        except (GateRefused, OSError, ValueError) as error:
+            self.ledger.report_error(error)
+            return
+        if isinstance(ending, CleanTestTree):
+            self.publish_if_eligible(ending.tree, modules_match)
+
+
+@dataclass(frozen=True)
+class PendingEmptyAffectedPass(PendingTestPass):
+    started_at: float
+
+
+def finalize_gate(cloud: CloudGateRoute, routed: RoutedGateTree, run: GateRun) -> GateRun:
+    """Validate the checkout and publish an eligible pass."""
+    pending = routed.pending_pass
+    modules_match = False
+    tested_tree_matches = True
+    if isinstance(pending, PendingTestPass):
+        tested = pending.ledger.tree
+        try:
+            modules_match = pending.coverage_matches()
+        except (OSError, ValueError) as error:
+            raise GateRefused(str(error)) from error
+        tested_tree_matches = isinstance(tested, UnrecordableTestTree) or tested.tree == routed.tree
+    tree, dirty = read_gate_checkout(cloud, routed.repo)
+    if tree != routed.tree or not tested_tree_matches:
+        raise GateRefused("The checkout changed during the gate")
+    if run.passed and not dirty and isinstance(pending, PendingTestPass):
+        pending.publish_if_eligible(tree, modules_match)
+    if isinstance(pending, PendingEmptyAffectedPass):
+        record_gate_run(pending.ledger, (), (), {}, {}, started_at=pending.started_at, wall_s=0.0,
+                        hold_wait_s=0.0, selection=pending.selection, reused=False, reason="", status=0,
+                        max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=SuiteMode.TARGETED)
+    return run
 
 
 def full_required() -> FullSuite | NoFullRunRequired:
@@ -1370,7 +1532,7 @@ def full_required() -> FullSuite | NoFullRunRequired:
         value = cast(dict[str, object], json.loads(marker.read_text()))
         return FullSuite(f"last nightly run was red ({value['tree']}, {value['at']})")
     except FileNotFoundError:
-        return NoFullRunRequired()
+        return NO_FULL_RUN_REQUIRED
     except (OSError, ValueError, KeyError, TypeError) as error:
         return FullSuite(f"last nightly run was red (unreadable marker: {error})")
 
@@ -1423,7 +1585,11 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                                if job.kind is GateJobKind.TEST_MODULE and job.suite == suite))}
             for suite, began in suite_started.items()
         ]
-        sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
+        tested = ledger.tree
+        if isinstance(tested, CleanTestTree):
+            sha, branch = tested.commit, tested.branch
+        else:
+            sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
         run: gate_record.GateRun = {
             "started_at": store.utc_iso(started_at), "ended_at": store.utc_iso(datetime.now(UTC).timestamp()),
             "wall_s": wall_s, "hold_wait_s": hold_wait_s,
@@ -1433,11 +1599,11 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "vcpus": os.cpu_count() or 1,
             "status": status, "max_jobs": max_jobs, "peak_mib": peak_mib, "cap_mib": cap_mib,
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
-            "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
+            "tree": tested.tree if isinstance(tested, CleanTestTree) else "",
             "source": ledger.source, "step": mode.value, "aborted": aborted,
-            "dirty": isinstance(ledger.tree, UnrecordableTestTree),
-            "dirty_paths": list(ledger.tree.dirty_paths[:50]) if isinstance(ledger.tree, UnrecordableTestTree) else [],
-            "dirty_path_count": len(ledger.tree.dirty_paths) if isinstance(ledger.tree, UnrecordableTestTree) else 0,
+            "dirty": isinstance(tested, UnrecordableTestTree),
+            "dirty_paths": list(tested.dirty_paths[:50]) if isinstance(tested, UnrecordableTestTree) else [],
+            "dirty_path_count": len(tested.dirty_paths) if isinstance(tested, UnrecordableTestTree) else 0,
             "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
     except Exception as error:
@@ -1487,7 +1653,7 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
-def gate_work_parent(machine: SharedMachine | WholeMachine) -> Path:
+def gate_work_parent(machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine) -> Path:
     """Select the folder for gate recovery, state, and tests."""
     if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
         return machine.gate_parent.path
@@ -1499,10 +1665,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
-               machine: SharedMachine | WholeMachine = SHARED_MACHINE,
+               machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
-    shared = isinstance(machine, SharedMachine)
+    shared = not isinstance(machine, WholeMachine)
     named = isinstance(selected, NamedModules)
     under_parent = shared and named and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
     owns_place = shared and not under_parent
@@ -1526,30 +1692,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    modules = discover_test_modules(repo)
-    if not modules:
-        raise GateRefused("the test list is empty")
-    module_count = len(modules)
-    if isinstance(selected, (SelectedModules, NamedModules)):
-        paths = set(selected.paths)
-        discovered = {str(path.relative_to(repo)) for _, path in modules}
-        if not paths <= discovered:
-            raise GateRefused('selected modules are absent from the tested tree')
-        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
     gate_parent = gate_work_parent(machine)
     if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
     report_retained_gate_test_folders(gate_parent)
-    hold = BuildHoldWait() if owns_place else None
+    hold = BuildHoldWait() if owns_place and isinstance(machine, SharedMachine) else None
+    tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
     if hold is not None:
         hold.wait_until_free()
-    suites = sorted({suite for suite, _ in modules})
-    ledger: PassedTreeLedger | None = None
-    required: FullSuite | NoFullRunRequired = NoFullRunRequired()
-    reused = False
-    selection: AffectedSelection | FullSuite | SelectedModules | NamedModules = (
-        selected if isinstance(selected, (SelectedModules, NamedModules)) else FullSuite("whole machine"))
     if shared and not named:
         try:
             tested_tree = clean_test_tree(repo)
@@ -1558,9 +1709,25 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
         if isinstance(tested_tree, UnrecordableTestTree) and tested_tree.dirty_paths:
             print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
+    discovered = modules = discover_test_modules(repo)
+    if not modules:
+        raise GateRefused("the test list is empty")
+    module_count = len(modules)
+    if isinstance(selected, (SelectedModules, NamedModules)):
+        paths = set(selected.paths)
+        if not paths <= {str(path.relative_to(repo)) for _, path in modules}:
+            raise GateRefused('selected modules are absent from the tested tree')
+        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
+    suites = sorted({suite for suite, _ in modules})
+    ledger: PassedTreeLedger | None = None
+    required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED
+    reused = False
+    selection: AffectedSelection | FullSuite | SelectedModules | NamedModules = (
+        selected if isinstance(selected, (SelectedModules, NamedModules)) else FullSuite("whole machine"))
+    if shared and not named:
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
         if isinstance(selected, AllModules):
-            required = full_required() if mode is SuiteMode.GATE else NoFullRunRequired()
+            required = full_required() if mode is SuiteMode.GATE else NO_FULL_RUN_REQUIRED
             reused = not full and isinstance(required, NoFullRunRequired) and ledger.reuse()
             selection = FullSuite("passed tree reused")
             if not reused:
@@ -1593,7 +1760,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     scope_prefix = suite_scope_prefix() if owns_place else []
     state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
-    timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
+    timings = machine.module_seconds.copy() if isinstance(machine, WholeMachine) else read_measures(timings_path)
     cpu_path = state_directory / "module_cpu_seconds.json"
     cpu_measures = read_measures(cpu_path) if shared else {}
     run_cpu: dict[str, float] = {}
@@ -1632,9 +1799,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or hold is None or admission is None or isinstance(selection, NamedModules):
+        if ledger is None or admission is None or isinstance(selection, NamedModules):
             return
-        waited = hold.waited_s()
+        waited = hold.waited_s() if hold is not None else 0.0
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
@@ -1652,10 +1819,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
+    hold_check = hold if hold is not None else NoBuildHoldCheck()
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
+          (gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if owns_place else nullcontext(None)) as reservation,
           (shared_cpu_pool() if owns_place else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
@@ -1925,9 +2093,12 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if run.passed and not reused and ledger is not None and isinstance(selection, (AffectedSelection, FullSuite)):
-        ledger.record_pass(selection)
-        if isinstance(required, FullSuite):
-            (gate_state_dir() / "full-required").unlink(missing_ok=True)
+        pending_pass = PendingTestPass(ledger, selection, discovered, required)
+        routed = routed_gate_tree(repo)
+        if isinstance(routed, RoutedGateTree):
+            routed.pending_pass = pending_pass
+        else:
+            pending_pass.publish_local()
     return run
 
 
@@ -3040,6 +3211,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
+
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
@@ -3078,10 +3251,26 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                           file=sys.stderr, flush=True)
         return outcome
 
+    def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
+        absent = [name for name in type_dirs if not (repo / name).exists()]
+        if absent:
+            raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
+        tree, dirty = read_gate_checkout(cloud, repo)
+        routed = RoutedGateTree(repo, tree)
+        token = ACTIVE_ROUTED_GATE_TREE.set(routed)
+        try:
+            run = select(routed, dirty)
+            return finalize_gate(cloud, routed, run)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        finally:
+            ACTIVE_ROUTED_GATE_TREE.reset(token)
+
     target = current_gate_target(mode, gate_job)
     match target:
         case "natedev":
-            return run_local(type_dirs)
+            # A gate assigned to natedev checks its checkout at the end, like every other gate.
+            return run_routed(lambda _routed, _dirty: run_local(type_dirs))
         case "mac-linux":
             key = "enabled.mac-linux"
             try:
@@ -3100,62 +3289,53 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         case _:
             raise GateRefused(f"The gate does not support the assigned target {target}")
 
-    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-    absent = [name for name in type_dirs if not (repo / name).exists()]
-    if absent:
-        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    if mode is SuiteMode.GATE:
-        return run_selected(ALL_MODULES)
+    def select_and_run(routed: RoutedGateTree, dirty: set[str]) -> GateRun:
+        if mode is SuiteMode.GATE:
+            return run_selected(ALL_MODULES)
 
-    selected: AllModules | TreeSelection = ALL_MODULES
-    whole_suite = full
-    if not full:
+        selected: AllModules | TreeSelection = ALL_MODULES
+        whole_suite = full
+        if not full:
+            tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                           else head_test_tree(repo))
+            if isinstance(tested_tree, CleanTestTree) and tested_tree.tree != routed.tree:
+                raise GateRefused("The checkout changed before test selection")
+            modules = discover_test_modules(repo)
+            selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+            unassigned = isinstance(target, NoGateAssignment)
+            if ledger.reuse(report=not unassigned and not type_dirs):
+                if unassigned:
+                    return run_local(type_dirs)
+                if type_dirs:
+                    return run_selected(TreeSelection((), routed.tree))
+                return GateRun((), 0.0, 0.0, tests_reused=True)
+            whole_suite = isinstance(selection, FullSuite)
+            paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+            selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), routed.tree)
+            if isinstance(selection, AffectedSelection) and not selection.modules:
+                if type_dirs:
+                    return run_local(type_dirs) if unassigned else run_selected(selected)
+                routed.pending_pass = PendingEmptyAffectedPass(ledger, selection, modules, NO_FULL_RUN_REQUIRED,
+                                                              started_at=time.time())
+                return GateRun((), 0.0, 0.0, selection_certified=True)
+
+        # Nate ordered the Mac split off on 2026-11-21.
+        return run_selected(selected)
+
+        mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
         try:
-            tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        unassigned = isinstance(target, NoGateAssignment)
-        if ledger.reuse(report=not unassigned and not type_dirs):
-            if unassigned:
-                return run_local(type_dirs)
-            if type_dirs:
-                return run_selected(TreeSelection((), tree))
-            return GateRun((), 0.0, 0.0, tests_reused=True)
-        whole_suite = isinstance(selection, FullSuite)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
-                return run_local(type_dirs) if unassigned else run_selected(selected)
-            ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
-
-    # Nate ordered the Mac split off on 2026-11-21.
-    return run_selected(selected)
-
-    mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
-    try:
-        mac = mac_gate_process.load_mac_gate_route(mac_module)
-    except ModuleNotFoundError as error:
-        if error.name != mac_module:
-            raise
-        return run_cloud(selected)
-    try:
+            mac = mac_gate_process.load_mac_gate_route(mac_module)
+        except ModuleNotFoundError as error:
+            if error.name != mac_module:
+                raise
+            return run_cloud(selected)
         exclusions = mac.read_modules(repo)
         if isinstance(exclusions, MacGateExcludeFileMissing):
             return run_cloud(selected)
         excluded = set(exclusions.paths)
         if isinstance(selected, AllModules):
-            tree, _dirty = cloud.working_tree(repo)
             modules = discover_test_modules(repo)
-            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
+            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), routed.tree)
         else:
             assignment = selected
         mac_paths = tuple(path for path in assignment.paths if path not in excluded)
@@ -3200,11 +3380,9 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             run = run_local(type_dirs)
         else:
             run = run_local_subset(linux_paths, type_dirs)
-        if cloud.working_tree(repo)[0] != assignment.tree:
-            raise GateRefused("The checkout changed during the split gate")
         return run
-    except affected_modules.GraphError as error:
-        raise GateRefused(str(error)) from error
+
+    return run_routed(select_and_run)
 
 
 def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
@@ -3224,8 +3402,24 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
 
 
 def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode) -> GateRun:
-    """Run the named modules through shared admission for a diagnostic check."""
-    return run_suites(repo, mode=mode, machine=SHARED_MACHINE,
+    """Run the named modules through shared admission, with the hold exemption for the configured unit.
+
+    The unit identity is not proof against a session that claims to be that unit.
+    It is the same trust that the run limit exemption uses, and builds accepts it.
+    """
+    try:
+        exempt_unit = admission_records.read_memory_config().policy.repository_runs.exempt_unit
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
+    machine: SharedMachine | HoldExemptNamedModuleMachine = SHARED_MACHINE
+    if exempt_unit:
+        caller = step_identity(mode.value, str(repo))
+        labels: Mapping[str, memory_admit.UnitMembership] = {}
+        if caller.session_id and not caller.unit:
+            labels = memory_admit.priority_labels([caller.session_id])
+        if memory_admit.queue_unit(caller.unit, caller.session_id, labels) == exempt_unit:
+            machine = HoldExemptNamedModuleMachine()
+    return run_suites(repo, mode=mode, machine=machine,
                       selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 

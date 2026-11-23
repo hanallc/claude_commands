@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from typing import cast
 
-from scripts.aws_target import hana_guest, hana_payload, hana_receiver
+from scripts.aws_target import hana_guest, hana_payload, hana_protocol, hana_receiver
 from scripts.lib import conf
 
 
@@ -231,13 +231,24 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     )
 
 
+def image_source_sha256(checkout: Path) -> str:
+    """Hash the image file list and each listed path and its bytes, in list order."""
+    entries = [(IMAGE_FILE_LIST.as_posix(), sha256((checkout / IMAGE_FILE_LIST).read_bytes()).hexdigest()),
+               *((file.path.as_posix(), sha256(file.content).hexdigest())
+                 for file in _listed_files(checkout, IMAGE_FILE_LIST))]
+    return sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest()
+
+
 def digest_files(files: tuple[RenderedGuestFile, ...]) -> GuestDigest:
-    """Hash the rendered paths, modes, and bytes before adding the digest."""
-    entries = sorted((file.path.as_posix(), file.mode, sha256(file.content).hexdigest()) for file in files)
-    return GuestDigest(sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
+    """Hash the rendered controls and the runtime ABI, without the image Python source."""
+    entries = sorted((file.path.as_posix(), file.mode, sha256(file.content).hexdigest()) for file in files
+                     if not (file.path.parts[0] == 'runtime' and file.path.suffix == '.py'))
+    document = {'files': entries, 'runtime_abi': hana_protocol.RUNTIME_ABI}
+    return GuestDigest(sha256(json.dumps(document, separators=(',', ':')).encode()).hexdigest())
 
 
 def guest_digest(configuration: Path | conf.ConfigRead, *, checkout: Path = CHECKOUT) -> GuestDigest:
+    """Hash what makes the image compatible: the rendered controls and the runtime ABI."""
     return digest_files(guest_files(checkout, configuration, DATA_DEVICE))
 
 

@@ -3822,5 +3822,58 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (0.5, 2))
 
 
+@final
+class MachineOffOnPurposeTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        state = self.root / "mac-state"
+        state.mkdir()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(state)})))
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+        _ = write_config_fixture(self.root / "build_targets.conf")
+        since = datetime.fromtimestamp(1000, timezone.utc)
+        mac_test.write_block(state / "block.json", mac_test.ActiveMacBlock(
+            "hana", "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue("hana"),
+            mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+
+    def test_a_target_other_than_the_mac_reads_only_its_enabled_key(self) -> None:
+        self.assertIsInstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
+        for target in ("natedev", "hana-aws"):
+            with self.subTest(target=target):
+                self.assertIs(mac_test.machine_off_on_purpose(target), mac_test.MACHINE_IN_USE)
+                _ = write_config_fixture(self.root / "build_targets.conf", f"enabled.{target}=off\n")
+                self.assertEqual(mac_test.machine_off_on_purpose(target),
+                                 mac_test.OffOnPurpose(f"enabled.{target}=off"))
+
+    def off_on_purpose(self, *arguments: str) -> int:
+        with mock.patch.object(sys, "argv", ["mac_test.py", "off-on-purpose", *arguments]):
+            return mac_test.main()
+
+    def test_off_on_purpose_exits_0_for_each_off_signal_and_1_in_use(self) -> None:
+        mac_test_conf, build_targets_conf = self.root / "mac_test.conf", self.root / "build_targets.conf"
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
+        # The block alone: it counts for every session but its holder.
+        self.assertEqual(self.off_on_purpose(), 0)
+        self.assertEqual(self.off_on_purpose("--asking", "nate"), 0)
+        self.assertEqual(self.off_on_purpose("--asking", "hana"), 1)
+        (self.root / "mac-state/block.json").unlink()
+        self.assertEqual(self.off_on_purpose(), 1)
+        for name, settings, path in (("offload", "offload=off\n", mac_test_conf),
+                                     ("enabled", "enabled.mac=off\n", build_targets_conf)):
+            _ = write_config_fixture(path, settings)
+            with self.subTest(signal=name):
+                self.assertEqual(self.off_on_purpose("--asking", "hana"), 0)
+            _ = write_config_fixture(path, settings.replace("=off", "=on"))
+            with self.subTest(signal=name, state="in use"):
+                self.assertEqual(self.off_on_purpose("--asking", "hana"), 1)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
