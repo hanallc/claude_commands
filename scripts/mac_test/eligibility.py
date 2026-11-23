@@ -15,7 +15,7 @@ from urllib.parse import quote
 from scripts.build_targets import target_config
 from scripts.buildlog import repository, store
 from scripts.lib import conf
-from scripts.mac_test import cargo_manifest
+from scripts.mac_test import cargo_manifest, claim_state
 
 
 MAC_LINUX_TARGET = "mac-linux"
@@ -32,6 +32,7 @@ def step_kind(verb: str) -> str:
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
+    "history_key_unavailable",
     "linux_only",
     "backoff",
     "blocked",
@@ -465,15 +466,23 @@ def recorded_step_kind(step: str) -> str:
 
 def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
-                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF,
+                         mac_repository: claim_state.MacMirrorIdentity | claim_state.WholeMacScope
+                         | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
+                         ) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
     if not enabled:
         return IneligibleMacStep("off")
-    repository = repository_identity(repo_root)
-    if isinstance(repository, UnknownRepository):
-        return IneligibleMacStep("repo")
     platform = configured_ssh_target(target).platform if target else "macos"
+    if platform == "macos":
+        if isinstance(mac_repository, claim_state.ResolveMacRepository):
+            mac_repository = claim_state.mac_repository_identity(str(repo_root))
+        if isinstance(mac_repository, claim_state.WholeMacScope):
+            return IneligibleMacStep("repo")
+        repository = KnownRepository(mac_repository.mirror_name, mac_repository.key)
+    else:
+        repository = repository_identity(repo_root)
     policy = configured_step_policy(config, platform, repository, repo_root, package, kind or verb_kind(verb))
     if isinstance(policy, IneligibleMacStep):
         return policy

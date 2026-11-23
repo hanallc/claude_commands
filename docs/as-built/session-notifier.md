@@ -317,7 +317,7 @@ The dry run uses `would move` in that line.
 Both modes keep folders with a running session or an active process when they check candidates.
 The real run checks again after it writes the session index and just before it saves the journal.
 If that check finds a live source, the next run can reuse its index entry.
-Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
+Both modes continue with other candidates and return status 0 if they only skip live entries or folders with no destination before copying.
 Both modes check the source, its parent, the destination, and the session index before they print each move.
 The source check reads file contents, symbolic link targets, and metadata.
 It checks write and search permission on the parent of each source entry, including the source folder.
@@ -353,4 +353,6 @@ If source data changes before publication, the command saves a copy-in-progress 
 The command keeps the source and can rebuild the stage on retry.
 The command reports unrecognized entries and preserves them.
 Entries outside Claude projects do not affect the refusal count or the exit status.
-It refuses an existing destination unless the journal identifies it as the result of the pending move.
+A session with no working folder in any transcript has no destination.
+Both modes keep its folder and report it, but it does not affect the refusal count or the exit status.
+The command refuses an existing destination unless the journal identifies it as the result of the pending move.

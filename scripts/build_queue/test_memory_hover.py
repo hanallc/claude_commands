@@ -11,7 +11,7 @@ import unittest
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import limits_view, memory_feed, progress_profile as progress, snapshot_codec
 from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
@@ -39,6 +39,59 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_build_limits_move_names_and_wait_reasons_to_hover(self) -> None:
+        wait = limits_view.WaitGroup(limits_view.WaitWords("1 run waits for space.", "{count} runs wait for space."),
+                                     ["Test <one>", "Test two"])
+        waits = {"disk": wait}
+        cell = limits_view.Cell(limit=2, used=1, runs=["Build <one>"], waits=waits)
+        disk = limits_view.Metric("disk", 20, 31, "GiB", "minimum", waits)
+        machine = limits_view.MachineLimits("In use", (disk,), waits)
+        empty = limits_view.MachineLimits("", (), {})
+        mac = limits_view.MachineLimits("On", (), {}, 1, "A Mac claim has no repository name that this page can show.")
+        hana = limits_view.Cell(limit=2, used=2, gpu=limits_view.Metric("gpu", 0, 2), verify_used=2)
+        section = limits_view.BuildLimits(machine, mac, empty,
+            (limits_view.RepositoryRow("repo:example", natedev=cell),
+             limits_view.RepositoryRow("hana", natedev=hana, mac=limits_view.Cell(waits=waits))), False, {})
+        keys = ("limit:cell:natedev:repo:example", "limit:machine:natedev", "limit:metric:natedev:disk",
+                "limit:cell:natedev:hana", "limit:machine:mac", "limit:cell:mac:hana")
+        rendered, tooltip, heading, metric, hana_tip, mac_tip, mac_wait_tip = cast(list[str], self.page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return [$('build-limits-content').innerHTML, ...data.keys.map(key => pageTooltipHtml(key, data))];
+        })()""", {"build_limits": snapshot_codec.snapshot_value(section), "keys": keys}, limits=True))
+        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        detail = table.find(f".//td[@data-tip='{keys[0]}']/span")
+        assert detail is not None
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-loader-circle", "lucide lucide-hourglass"])
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/span")],
+                         ["build-limit-mark free", "build-limit-mark line", None])
+        self.assertEqual(detail.findtext("span[2]"), "1 of 2")
+        self.assertNotIn("Test two", rendered)
+        self.assertNotIn("wait for space", rendered)
+        pending = table.find(f".//td[@data-tip='{keys[5]}']/span/span[@data-wait-count='2']")
+        assert pending is not None
+        self.assertEqual(pending.findtext("span"), "2")
+        self.assertEqual([icon.get("class") for icon in pending.findall("{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-hourglass"])
+        gpu = table.find(f".//td[@data-tip='{keys[3]}']/span/span[@class='build-limit-chip build-limit-gpu']")
+        assert gpu is not None
+        self.assertEqual(gpu.findtext("span"), "0 of 2")
+        self.assertEqual(len(table.findall(".//tbody//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']")), 1)
+        self.assertIsNone(table.find(".//thead//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']"))
+        self.assertIsNotNone(table.find(".//th[@data-tip='limit:machine:mac']"))
+        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, mac_wait_tip)]
+        for column in columns:
+            assert column is not None
+            self.assertIn("Waiting", [row.text for row in column.findall("dt")])
+            self.assertIn("Because", [row.text for row in column.findall("dt")])
+            self.assertIn("Test <one>, Test two", [row.text for row in column.findall("dd")])
+            self.assertIn("2 runs wait for space.", [row.text for row in column.findall("dd")])
+        self.assertIn("Build &lt;one&gt;", tooltip)
+        self.assertNotIn("Build &lt;one&gt;", rendered)
+        self.assertIn("Verify runs", hana_tip)
+        self.assertIn("The GPU limit applies to tests for this repository on natedev.", hana_tip)
+        self.assertIn("A Mac claim has no repository name that this page can show.", mac_tip)
+
     def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
@@ -957,17 +1010,22 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
-    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
+    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
+                        limits: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
+        if limits:
+            functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
+            constants += f"const buildLimitIcons = {json.dumps(memory_feed.build_limit_icons())};\n"
+        if walk or limits:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
 const $ = id => {
-  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}});
+  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}, open: true, querySelector: () => ({})});
   return elements.get(id);
 };
 function fitLabels() {}

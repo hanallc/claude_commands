@@ -160,6 +160,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
+    *"rev-list --max-parents=0"*) printf "fixture-root-commit\n" ;;
     *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac

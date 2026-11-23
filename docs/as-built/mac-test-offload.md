@@ -70,6 +70,14 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 ## Mac Linux guest folders
 
+The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
+A Mac block or a busy repository slot can refuse the claim.
+The route reports `not started` with the refusal reason before any upload or retry backoff.
+The route releases the claim when the guest proves the run ended.
+The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
+The guest run lock still refuses another guest run until the first run ends.
+Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
+
 The Mac Linux route runs the suite in a numbered copy.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
@@ -136,7 +144,14 @@ Its default interval is 60 seconds.
 The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
-They make no SSH or recipient lookup calls.
+Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work` (`mac_idle.view_alert_line`).
+That read uses only the local block, claim and `unreachable_until` files, and `/proc` for the claim holder's process.
+It does not look for a CI job on the Mac, so a saved `free` line can show for one sample beside a CI job that just started.
+It compares the cause, not the holder, so a block or idle claim that replaces another one of the same cause shows the old holder until the next sample.
+The view shows the saved line only when the live state and cause agree with the saved reading.
+A saved line that disagrees is stale, and the view shows no Mac condition until the next sample.
+The watch message formats the reading that the watch just wrote, so it does not read the live state again.
+The views make no SSH or recipient lookup calls.
 
 The check counts live steps that can use a Mac.
 It accepts `AnyTarget` records with Mac targets.

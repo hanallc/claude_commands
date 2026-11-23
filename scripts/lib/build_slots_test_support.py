@@ -92,6 +92,9 @@ slots.wait_seconds=30"""
     fixed_lines = fixed.splitlines()
     if host != "natedev":
         fixed_lines.append(f"roots.build.{host}={root / 'build'}")
+    mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
+    if mac_hosts and mac_hosts[0] != machine:
+        fixed_lines.extend(("# whole: 1..", f"slots.{conf.host_key_name(mac_hosts[0])}.default_max=1"))
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
     lines = [line for line in settings.read_text().splitlines()

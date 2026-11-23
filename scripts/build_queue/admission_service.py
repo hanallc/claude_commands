@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from types import MappingProxyType
-from typing import Callable, Protocol, cast, override
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -57,6 +57,7 @@ from scripts.production import staff
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
@@ -66,6 +67,9 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
+
+if TYPE_CHECKING:
+    from scripts.mac_test.claim_state import RemoteJobClaim
 
 
 
@@ -147,6 +151,77 @@ CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
 READING_ALERT_KEY = "build-admission-reading"
 
 PlacementEvidenceKeys = dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey | placement.EvidenceNeeded]
+
+
+PLACEMENT_REASON_TEXT = {
+    "mac_linux_off": "the guest is off",
+    "mac_linux_unregistered": "the guest has no queue registration",
+    "mac_linux_settings_unreadable": "the guest settings are unreadable or invalid",
+    "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
+    "mac_linux_backoff": "the guest is in retry backoff",
+    "mac_linux_reading_required": "the queue needs a newer guest reading",
+    MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    "busy": "the target is busy",
+    "off": "the target is off",
+    "disk": "the target needs more disk space",
+    "command": "the target does not support this command",
+    "repo": "the target does not support this repository",
+    "linux_only": "this step runs only on Linux",
+    "offload_exclude": "the target excludes this step",
+}
+
+
+def confirmed_guest_run(assignment: placement.PlacementAssignment,
+                        evidence: execution_identity.ExecutionEvidence) -> records.ConfirmedGuestRun | None:
+    """Use execution evidence that matches the assigned guest and attempt."""
+    destination = assignment.destination
+    if (destination.target != "mac-linux" or destination.provider != "ssh"
+            or not assignment.attempt or not isinstance(evidence, execution_identity.ObservedExecution)):
+        return None
+    identity = evidence.identity
+    matches = (identity.host == destination.host and identity.pid > 0 and bool(identity.start_time)
+               if isinstance(identity, execution_identity.ProcessExecution)
+               else (identity.target, identity.attempt) == (destination.target, assignment.attempt))
+    return {"target": "mac-linux", "attempt": assignment.attempt} if matches else None
+
+
+@dataclass(frozen=True)
+class MacLinuxReadyForProbe:
+    """The guest is enabled and its backoff permits a reading."""
+
+    registry: conf.ConfigRead
+    failed_at: float
+
+
+def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | placement.TemporaryExclusion:
+    from scripts.mac_test import eligibility
+
+    try:
+        registry = _provider_configuration().read("build_targets")
+        target = records.effective_target(eligibility.MAC_LINUX_TARGET,
+            placement.ConfiguredProviderSettings(), configuration=registry)
+        if not isinstance(target, target_config.SshTarget):
+            return placement.TemporaryExclusion("mac_linux_unregistered")
+        if target.platform != "linux":
+            return placement.TemporaryExclusion("mac_linux_settings_unreadable")
+        if not eligibility.mac_linux_enabled(registry):
+            return placement.TemporaryExclusion("mac_linux_off")
+    except (OSError, ValueError):
+        return placement.TemporaryExclusion("mac_linux_settings_unreadable")
+    try:
+        backoff = eligibility.read_backoff(now, eligibility.MAC_LINUX_TARGET, strict=True)
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return placement.TemporaryExclusion("mac_linux_backoff")
+        if isinstance(backoff, eligibility.UnreadableBackoff):
+            return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
+        failed_at = eligibility.backoff_path(eligibility.MAC_LINUX_TARGET).stat().st_mtime
+    except target_config.ConfigError:
+        return placement.TemporaryExclusion("mac_linux_unregistered")
+    except FileNotFoundError:
+        failed_at = float("-inf")
+    except OSError:
+        return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
+    return MacLinuxReadyForProbe(registry, failed_at)
 
 
 @dataclass(frozen=True)
@@ -811,7 +886,7 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc)
+            return gate.scope_memory(lifetime.directory, gate.ScopeMembershipPass())
         except FileNotFoundError:
             identity = processes.get(row["pid"])
             if identity is None or identity.start != row["start_time"]:
@@ -889,6 +964,21 @@ class SystemEvidence:
         return self.activity.run(pid)
 
 
+def local_reservation_row(record: ReservationRecord, evidence: SystemEvidence) -> records.Reservation:
+    row = reservation_row(record)
+    if "build_run" not in row:
+        row["build_run"] = evidence.build_run(record.owner.pid)
+        row["run_origin"] = records.FoundRun(row["build_run"])
+    return row
+
+
+def resolve_reservation_repository(row: records.Reservation, record: ReservationRecord) -> None:
+    repository_name = record.queue_waiter.get("repository_name", record.repo)
+    resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
+    if resolved_name != repository_name:
+        row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
+
+
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
                 reservation_reader: Callable[[ReservationRecord, records.Reservation, gate.StepLifetime,
                     dict[int, gate.ProcessIdentity], Path], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
@@ -919,13 +1009,17 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             sample_file(Path(record.path).with_suffix(".max")),
             sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
     # Capture every scope before the loop applies current reservation ownership.
+    membership = gate.ScopeMembershipPass()
     unowned = gate.unowned_slice_memory([], processes, proc.path,
-        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice, membership=membership)
     has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
     staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
     def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
-        return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
+        # A scope with no recorded caller gets its owner from the family of its oldest process.
+        name = evidence.session_name or ("" if evidence.session_id or not evidence.members
+                                         else records.family_owner_name(evidence.members[0].pid, proc.path))
+        return records.queue_caller(evidence.session_id, "", name, "", evidence.folder,
                                     members=staff_members, unit=unit)
 
     unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))
@@ -933,12 +1027,9 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
-        if not reading.cgroup:
+        if not reading.cgroup or reading.diagnostic:
             continue
-        try:
-            members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
-        except (OSError, ValueError):
-            members[reading.cgroup] = frozenset()
+        members[reading.cgroup] = membership.read(Path(reading.cgroup))
         if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
@@ -960,11 +1051,13 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         if not isinstance(evidence, ScopeProcesses):
             continue
         live_run = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
-        measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
-        if isinstance(measured, records.GoneMemory):
-            continue
+        tree = gate.process_tree({run.pid: run.start_time}, processes)
+        measured = gate.process_memory(tree - scope_process_memory.keys(), proc.path)
+        cached = [scope_process_memory[pid] for pid in tree & scope_process_memory.keys()]
+        used = measured.bytes + sum(item.bytes for item in cached)
+        swap = measured.swap_bytes + sum(item.swap_bytes for item in cached)
         caller = scope_caller(evidence, place.unit)
-        memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
+        memory = records.UnownedSliceMemory(used, swap_bytes=swap,
             pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
         between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
             evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=caller.unit))
@@ -1233,7 +1326,7 @@ def same_remote_resource(first: placement.PlacementDestination, second: placemen
     from scripts.mac_test.mac_test import scopes_overlap
 
     return (first.provider == second.provider and first.target == second.target
-            and scopes_overlap(first.scope, second.scope))
+            and scopes_overlap(first.scope, second.scope, mac=first.provider == "mac"))
 
 
 @dataclass(frozen=True)
@@ -1445,6 +1538,13 @@ class WaitingAdmission:
     last_reply: wire.Wait | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
+
+
+def without_owners(inputs: records.QueueInputs, owners: set[str]) -> records.QueueInputs:
+    """Remove held waiters from the order that the admission pass may start."""
+    if not owners:
+        return inputs
+    return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered if records.waiter_owner(row) not in owners])
 
 
 @dataclass(frozen=True)
@@ -1683,6 +1783,8 @@ class AdmissionServer:
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
         self.last_policy: records.AdmissionPolicy | NoPass = NoPass()
+        # The natedev hold of each held local waiter at the last pass.
+        self.local_holds: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
         self.reading_alert_delivery: ReadingAlertDelivery | NoReadingAlertDelivery = NoReadingAlertDelivery()
         self.reading_alert_needs_clear: bool = True
@@ -1990,10 +2092,12 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ci_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
-        """Apply the existing hold policy to legacy CI admission requests."""
+    def _local_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
+        """Hold each local waiter that a natedev hold applies to, at each pass."""
+        if self.host != "natedev":
+            return {}
         waiting = {episode: item for episode, item in self.waiters.items()
-                   if isinstance(item.request, ServiceEstimatedAdmission)}
+                   if isinstance(item.request, wire.AdmitRequest) and isinstance(item.request.place, wire.LocalPlace)}
         if not waiting:
             return {}
         from scripts.build_hold import build_hold
@@ -2003,12 +2107,31 @@ class AdmissionServer:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
-            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}") for episode in waiting}
+            # The enforcer stays the guard for other local steps while the hold state is unreadable.
+            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}")
+                    for episode, item in waiting.items() if isinstance(item.request, ServiceEstimatedAdmission)}
+        if not holds.in_force:
+            return {}
         reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
+        own_keys: dict[OwningSession | NoOwningSession, str] = {}
         for episode, item in waiting.items():
-            owner = item.request.owner
+            request = item.request
+            if not isinstance(request, wire.AdmitRequest):
+                continue
+            session = request.session
+            if isinstance(session, wire.SessionNotSent):
+                # An older client names only its own session, in its queue row.
+                session_id = item.row.get("session_id", "")
+                session = OwningSession(session_id) if session_id else NoOwningSession()
+            if session not in own_keys:
+                try:
+                    own_keys[session] = build_targets.own_hold_key(session, directory)
+                except OSError:
+                    # The staff record is unreadable: no hold is the step's own, so the step waits.
+                    own_keys[session] = ""
+            owner = request.owner
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
-            blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
+            blocking = build_targets.blocking_hold(holds, own_keys[session], lineage)
             if isinstance(blocking, build_hold.Holder):
                 reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
@@ -2224,12 +2347,18 @@ class AdmissionServer:
         return slots
 
     def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
+        held = self._held_owners()
+        for waiting in self.waiters.values():
+            # A held waiter gives back its slot, so the slot can expire during the hold.
+            if records.waiter_owner(waiting.row) in held and isinstance(waiting.continuation_claim, records.ContinuationSlot):
+                self._free_claim(records.waiter_owner(waiting.row))
+                waiting.continuation_claim = NoContinuationClaim()
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
         waiters = {records.waiter_owner(item.row): item for item in self.waiters.values()}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             waiting = waiters.get(owner)
-            if waiting is None or not gate.can_use_natedev(row):
+            if waiting is None or owner in held or not gate.can_use_natedev(row):
                 continue
             request = waiting.request
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
@@ -2253,6 +2382,9 @@ class AdmissionServer:
             self.slots[key] = claim
             waiting.continuation_claim = claim
             claimed.add(owner)
+
+    def _held_owners(self) -> set[str]:
+        return {records.waiter_owner(self.waiters[episode].row) for episode in self.local_holds if episode in self.waiters}
 
     def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> None:
         if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
@@ -2427,11 +2559,8 @@ class AdmissionServer:
                     self._end(episode, record.ending)
                 if episode not in self.reservations:
                     continue
-            row = reservation_row(record)
-            if "build_run" not in row:
-                row["build_run"] = evidence.build_run(record.owner.pid)
-                row["run_origin"] = records.FoundRun(row["build_run"])
-            elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
+            row = local_reservation_row(record, evidence)
+            if isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = records.CallerRun(NoLiveBuildRun())
             captured = evidence.reservations.get(episode)
             memory = (reservation_charge(captured, row, now, config.policy) if captured is not None
@@ -2440,10 +2569,7 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
-            repository_name = record.queue_waiter.get("repository_name", record.repo)
-            resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
-            if resolved_name != repository_name:
-                row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
+            resolve_reservation_repository(row, record)
             lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
             unscoped_direct = (not record.sidecar and episode not in self.placement_requests
                                and episode in evidence.lifetimes)
@@ -2786,19 +2912,19 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
+        self.local_holds = local_holds = self._local_hold_reasons()
+        held_owners = self._held_owners()
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
         inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
-        ci_holds = self._ci_hold_reasons()
-        held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
-        if held_owners:
-            inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
-                                             if records.waiter_owner(row) not in held_owners])
+        inputs = without_owners(inputs, held_owners)
         verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
         inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
-        inputs = self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds)
+        # The placement pass rebuilds the local order from the queue order, so remove held waiters again.
+        inputs = without_owners(self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds),
+                                held_owners)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
@@ -2834,7 +2960,7 @@ class AdmissionServer:
                         cargo_folder=cargo_folder, verify_slots=verify_slots)
         self.persist()
         visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
-        self._publish_replies(visible_order, ci_holds=ci_holds)
+        self._publish_replies(visible_order)
         assert isinstance(self.published, PublishedReplies)
         waiting_steps = self.published.view.reading.view.waiting
         positions = self.published.wait_positions
@@ -2847,8 +2973,8 @@ class AdmissionServer:
             if (entry := decisions.get(owner)) is not None:
                 reason, decision, holder = entry.reason, entry.decision, entry.holder
                 label = head_label
-            elif (ci_reason := ci_holds.get(episode)) is not None:
-                reason, holder = ci_reason, records.NoHolder()
+            elif (held_reason := local_holds.get(episode)) is not None:
+                reason, holder = held_reason, records.NoHolder()
                 decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
                 label = ""
             else:
@@ -3038,7 +3164,63 @@ class AdmissionServer:
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
+    def _placement_wait_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        candidates = dict(reading.explanation.decided_from.placement_candidates)
+        if not candidates:
+            return reading
+        published = {(step.pid, step.since): named
+                     for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True)
+                     if (named := candidates.get(records.waiter_owner(row), ()))}
+
+        def with_candidates(step: records.WaitingStep) -> records.WaitingStep:
+            named = published.get((step.pid, step.since), ())
+            return replace(step, placement_candidates=named) if named else step
+
+        waiting = [with_candidates(step) for step in reading.view.waiting]
+        ordered = list(reading.ordered)
+        represented = {records.waiter_owner(row) for _, row in ordered}
+        for path, row in self._queue_order():
+            owner = records.waiter_owner(row)
+            if owner in represented or not any(candidate.destination.target == "mac-linux"
+                                               for candidate in candidates.get(owner, ())):
+                continue
+            represented.add(owner)
+            waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
+                records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
+                project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
+                route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
+                job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner]))
+            ordered.append((path, row))
+        head, line = reading.explanation.head, reading.explanation.line
+        if isinstance(head, records.HeadExplanation):
+            head = replace(head, waiter=with_candidates(head.waiter))
+        line = replace(line, steps=tuple(replace(entry, waiter=with_candidates(entry.waiter)) for entry in line.steps))
+        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered,
+                       explanation=replace(reading.explanation, head=head, line=line))
+
+    def _local_placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
+        for episode, record in self.reservations.items():
+            request = self.placement_requests.get(episode)
+            assignment = self.assignments.get(self.current_assignments.get(episode, ""))
+            if (request is not None and assignment is not None
+                    and assignment.assignment.destination.provider == "local"):
+                candidates[record.reservation_id] = assignment.placement_candidates or self._placement_candidate_reading(request)
+        if not candidates:
+            return reading
+        reservations = iter(reading.explanation.decided_from.reservations)
+        running: list[records.RunningStep] = []
+        explained: list[records.ExplainedRunningStep] = []
+        for step, entry in zip(reading.view.running, reading.explanation.running, strict=True):
+            named = candidates.get(next(reservations).get("reservation_id", ""), ()) if gate.running_has_reservation(step) else ()
+            running.append(replace(step, placement_candidates=named) if named else step)
+            explained.append(replace(entry, step=replace(entry.step, placement_candidates=named)) if named else entry)
+        return replace(reading, view=replace(reading.view, running=tuple(running)),
+                       explanation=replace(reading.explanation, running=tuple(explained)))
+
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
+        reading = self._local_placement_reading(self._placement_wait_reading(reading))
         remote: list[records.RunningStep] = []
         for key, saved in self.assignments.items():
             assignment = saved.assignment
@@ -3061,6 +3243,11 @@ class AdmissionServer:
             if not isinstance(saved.state, placement.CurrentAssignment) and not retained:
                 continue
             identity = request.identity
+            guest = assignment.destination.target == "mac-linux"
+            confirmed = (confirmed_guest_run(assignment, evidence)
+                         if isinstance(saved.permission, placement.PermissionConsumed)
+                         and self.current_assignments.get(assignment.episode) == key
+                         and isinstance(saved.state, placement.CurrentAssignment) else None)
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -3069,8 +3256,12 @@ class AdmissionServer:
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
+                assignment_target=assignment.destination.target if guest else "",
+                placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
+                confirmed_guest_run=confirmed,
+                route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
-                    if assignment.destination.provider == "mac" else ""))
+                    if assignment.destination.provider == "mac" or confirmed is not None else ""))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -3078,8 +3269,24 @@ class AdmissionServer:
         return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote)),
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
-    def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]], *,
-                         ci_holds: Mapping[str, records.WaitReason] | None = None) -> None:
+    def _local_occupancy(self, inputs: records.QueueInputs) -> records.LocalAdmissionOccupancy:
+        captured = {row.get("reservation_id"): row for row in inputs.reservations}
+        reservations: list[records.Reservation] = []
+        for record in self.reservations.values():
+            if isinstance(record.place, wire.CloudPlace):
+                continue
+            row = captured.get(record.reservation_id)
+            if row is None:
+                row = reservation_row(record)
+                # Admission used the waiter owner when it granted this reservation.
+                build_run = record.queue_waiter.get("build_run")
+                if build_run is not None:
+                    row["build_run"] = build_run
+                resolve_reservation_repository(row, record)
+            reservations.append(row)
+        return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_owners())
+
+    def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
                 or not isinstance(self.last_inputs, records.QueueInputs)
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
@@ -3090,9 +3297,8 @@ class AdmissionServer:
                           diagnostics=self.last_diagnostics)
         local = {path: replace(step, verify=row.get("verify", step.verify))
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
-        holds = self._ci_hold_reasons() if ci_holds is None else ci_holds
-        ci_reasons = {records.waiter_owner(self.waiters[episode].row): reason
-                      for episode, reason in holds.items() if episode in self.waiters}
+        held_reasons = {records.waiter_owner(self.waiters[episode].row): reason
+                        for episode, reason in self.local_holds.items() if episode in self.waiters}
         routed = {place.move_id: request for request in self.placement_requests.values()
                   if (place := self.places.get(_place_key(request.owner, request.since))) is not None
                   and place.episode == request.episode}
@@ -3108,7 +3314,7 @@ class AdmissionServer:
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
             targets = tuple(dict.fromkeys(item.destination.target for item in candidates
                 if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
-            reason = ci_reasons.get(owner, records.ReadyForAdmission())
+            reason = held_reasons.get(owner, records.ReadyForAdmission())
             if request is not None and self._local_placement_eligibility(request) == placement.TemporaryExclusion("blocked"):
                 holder = self.local_hold_holders.get(request.episode)
                 reason = records.NatedevHeld(holder.unit if isinstance(holder, placement.ResourceHolderUnit) else "", "")
@@ -3122,8 +3328,9 @@ class AdmissionServer:
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
-        view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
+        occupancy = self._local_occupancy(self.last_inputs)
+        view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         self.published = PublishedReplies(view, explain, positions)
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
@@ -3425,6 +3632,10 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
+        if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
+            from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
+
+            return GUEST_REF_TIMEOUT_SECONDS
         from scripts.aws_target import hana_placement
 
         with conf.report_key_changes():
@@ -3509,6 +3720,8 @@ class AdmissionServer:
                                  key: placement.HostEvidenceKey) -> placement.HostEvidence:
         destination = key.destination
         self.placement_host_keys[(request.episode, destination)] = key
+        if destination.provider == "ssh" and destination.target == "mac-linux":
+            return self._request_mac_linux_evidence(request, key)
         if destination.provider == 'ssh':
             from scripts.aws_target import hana_placement
 
@@ -3532,6 +3745,27 @@ class AdmissionServer:
         if isinstance(self.last_usable_configuration, records.MemoryConfig):
             _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
         return self.host_evidence(key)
+
+    def _request_mac_linux_evidence(self, request: wire.PlacementRequest,
+                                    key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+        now = self.clock.now()
+        backoff = mac_linux_backoff(now)
+        if isinstance(backoff, placement.TemporaryExclusion):
+            return placement.FreshHostEvidence(key, now, "", backoff)
+        self.host_requests[key] = request
+        current = self.host_evidence(key)
+        if (isinstance(current, placement.FreshHostEvidence) and current.observed_at > backoff.failed_at
+                and isinstance(current.eligibility, placement.AllowedHost)):
+            if any(saved.assignment.destination.target == "mac-linux" and saved.assignment.episode != request.episode
+                   for attempt in self.current_assignments.values() if (saved := self.assignments.get(attempt)) is not None):
+                return replace(current, eligibility=placement.TemporaryExclusion("busy"))
+            return current
+        if isinstance(self.last_usable_configuration, records.MemoryConfig):
+            _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+        reason = (MAC_LINUX_NO_ANSWER if isinstance(current, placement.FreshHostEvidence)
+                  and current.eligibility == placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
+                  else "mac_linux_reading_required")
+        return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion(reason))
 
     def _placement_evidence_key(self, request: wire.PlacementRequest,
                                 destination: placement.PlacementDestination, keys: PlacementEvidenceKeys | None = None
@@ -3606,6 +3840,8 @@ class AdmissionServer:
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
+        if destination.provider == "ssh" and destination.target == "mac-linux":
+            return self._read_mac_linux_guest(key)
         target = records.effective_target(destination.target, key.settings)
         if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
@@ -3633,32 +3869,41 @@ class AdmissionServer:
             if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session, configuration=configuration)
+                    new_step=True, session=key.session, configuration=configuration, mac_scope=destination.scope)
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration)
+                    configuration=configuration, mac_scope=destination.scope)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
+        with claim_state.locked(paths.lock):
+            held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
+                                      session=key.session, configuration=configuration,
+                                      mac_scope=destination.scope) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
-        with claim_state.locked(paths.lock):
-            held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
-        scope = claim_state.target_claim_scope(paths, request.constraints.repository)
+        scope = destination.scope
+        if paths.platform == "linux":
+            scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
-            if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_holds_work(claim.record)):
+            if not mac_test.claim_blocks_scope(paths, claim, scope):
+                continue
+            if paths.platform == "macos" and (mac_test.run_is_kept(claim.record) or claim.record.get("cleanup_pending")):
+                if isinstance(diagnostic, placement.NoProviderDiagnostic):
+                    diagnostic = placement.BusyProviderDiagnostic(
+                        destination.target, claim.record["what"] + " (kept for cleanup)", claim.record["since"])
+                continue
+            if mac_test.run_holds_work(claim.record):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):
@@ -3667,9 +3912,17 @@ class AdmissionServer:
         generation = ""
         for claim in held:
             record = claim.record
-            if "remote_host" not in record:
+            if "remote_host" not in record or "replaced_reservation" in record:
                 continue
-            reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
+            reference_scope = claim.scope
+            if paths.platform == "macos":
+                saved = self.assignments.get(execution_identity.attempt_key(record["episode"], record["attempt"]))
+                if saved is not None:
+                    assigned = saved.assignment.destination
+                    if (assigned.provider == destination.provider and assigned.target == destination.target
+                            and claim.matches_mac_assignment_scope(assigned.scope)):
+                        reference_scope = assigned.scope
+            reference = placement.ProviderClaimReference(destination.provider, destination.target, reference_scope,
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
@@ -3681,20 +3934,40 @@ class AdmissionServer:
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
-                record["remote_host"], record.get("instance_generation", ""), configuration)))
+                record, paths.platform, configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
+    def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+        from scripts.build_targets import mac_linux
+
+        started_at = self.clock.now()
+        backoff = mac_linux_backoff(started_at)
+        if isinstance(backoff, placement.TemporaryExclusion):
+            return placement.FreshHostEvidence(key, started_at, "", backoff)
+        try:
+            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
+        except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
+            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
+        return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
+
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                                    reference: placement.ProviderClaimReference, host: str, generation: str,
+                                    reference: placement.ProviderClaimReference, record: RemoteJobClaim,
+                                    platform: Literal["linux", "macos"],
                                     config: conf.ConfigRead) -> execution_identity.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
         from scripts.mac_test import eligibility, offload, claim_state
 
         if isinstance(eligibility.read_backoff(time.time(), destination.target), eligibility.ActiveBackoff):
             return execution_identity.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
-        repository = eligibility.repository_identity(Path(request.constraints.repository))
-        if not isinstance(repository, eligibility.KnownRepository):
-            return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
+        if platform == "macos":
+            saved = claim_state.saved_mac_repository(record)
+            if not isinstance(saved, claim_state.MacMirrorIdentity):
+                return execution_identity.ExecutionEvidenceUnavailable("the claim has no saved Mac mirror", self.clock.now())
+            repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
+        else:
+            repository = eligibility.repository_identity(Path(request.constraints.repository))
+            if not isinstance(repository, eligibility.KnownRepository):
+                return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
         scope = reference.scope
         slot = scope.slot if isinstance(scope, claim_state.RepositoryScope) and scope.slot else destination.slot or 1
         script = offload.mirror_selector_script(repository, destination.target, slot) + r'''
@@ -3707,6 +3980,7 @@ done
 '''
         probe = eligibility.SshProbeSettings(config)
         options, timeout = offload.ssh_options(probe), probe.probe_timeout_s
+        host = record["remote_host"]
         try:
             result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -3715,7 +3989,8 @@ done
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")
                     if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
-                        return execution_identity.ObservedExecution(execution_identity.ProcessExecution(host, generation, int(pid), start.strip()))
+                        return execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                            host, record.get("instance_generation", ""), int(pid), start.strip()))
                 return execution_identity.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
@@ -3812,7 +4087,8 @@ done
 
         The Mac can keep the claim after its holder ends. The next claim for the scope takes it
         over and checks for leftovers, so the old assignment holds nothing. A live owner can still
-        send a terminal report, and a pending start can still launch, so both keep it current.
+        send a terminal report, and a pending start can still launch, so both keep it current until
+        the owner asks again (`_close_abandoned_attempt`).
         """
         return (self._ended_claim_holder(saved)
             and not self._placement_owner_live(saved.assignment.owner)
@@ -3837,8 +4113,57 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
 
+    def _close_abandoned_attempt(self, episode: str) -> None:
+        """Close the current attempt as lost when its owner asks again after the claim holder ended.
+
+        The owner asks for a placement again only after its attempt ends, so no report comes for that
+        attempt. The episode goes back to its lines. Only a mac_test claim closes this way: the provider
+        keeps the claim and any pending start, and the next claim for the scope takes it over and settles
+        the start before it runs.
+        """
+        saved = self.assignments.get(self.current_assignments.get(episode, ""))
+        if (saved is None or not isinstance(saved.state, placement.CurrentAssignment)
+                or not isinstance(saved.terminal_report, placement.NoTerminalReport)
+                or not self._ended_claim_holder(saved) or not self._next_claim_takes_over(saved)):
+            return
+        report = self._lost_report()
+        self._close_for_report(replace(saved, terminal_report=report), report)
+
+    def _next_claim_takes_over(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A mac_test claim gives its kept claim and pending start to the next claim for its scope.
+
+        A Hana claim does not: only recovery of the current attempt settles its started command.
+        An unreadable target counts as no takeover, so the attempt stays current.
+        """
+        from scripts.aws_target import hana_placement
+
+        destination = saved.assignment.destination
+        if destination.provider != "ssh":
+            return destination.provider != "local"
+        transport = self._ssh_transport(saved)
+        return transport is not None and not isinstance(
+            transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
+
+    def _ssh_transport(self, saved: records.SavedPlacementAssignment) -> ExecutionTransport | None:
+        """The transport of an ssh assignment's target; None when the target is not ssh or cannot be read."""
+        destination = saved.assignment.destination
+        submitted = self.placement_requests.get(saved.assignment.episode)
+        settings = (placement.ConfiguredProviderSettings() if submitted is None
+                    else self._placement_settings(submitted, destination))
+        try:
+            with conf.report_key_changes():
+                configuration = _provider_configuration()
+                target = configuration.target(destination.target, settings)
+                return configuration.transport(target) if isinstance(target, target_config.SshTarget) else None
+        except (OSError, ValueError):
+            return None
+
+    def _lost_report(self) -> placement.TerminalAttemptReport:
+        return placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
+                                               self.clock.now())
+
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state
 
         provider = saved.provider
         from scripts.aws_target import hana_placement
@@ -3846,14 +4171,9 @@ done
             try:
                 destination = saved.assignment.destination
                 submitted = self.placement_requests.get(saved.assignment.episode)
-                settings = (placement.ConfiguredProviderSettings() if submitted is None
-                            else self._placement_settings(submitted, destination))
-                with conf.report_key_changes():
-                    configuration = _provider_configuration()
-                    target = configuration.target(destination.target, settings)
-                    if not isinstance(target, target_config.SshTarget):
-                        return True
-                    transport = configuration.transport(target)
+                transport = self._ssh_transport(saved)
+                if transport is None:
+                    return True
                 if isinstance(transport, HanaGpuNextestTransport):
                     from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
 
@@ -3902,8 +4222,9 @@ done
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
         with conf.report_key_changes():
             try:
-                return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
-            except conf.Unusable:
+                return claim_state.pending_start_exists(
+                    claim_state.state_paths(saved.assignment.destination.target), identity)
+            except (OSError, conf.Unusable):
                 return True
 
     def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
@@ -3946,7 +4267,8 @@ done
         if isinstance(local, wire.LocalAdmissionUnavailable):
             return wire.LaunchRequest(request.episode, owner, request.since, identity, request.profile)
         return wire.AdmitRequest(request.episode, owner, local.argv, local.cwd, request.since, local.sidecar,
-            identity, local.call, local.test_width, request.profile, local.fresh_test, local.token_back_at, request.run)
+            identity, local.call, local.test_width, request.profile, local.fresh_test, local.token_back_at, request.run,
+            session=request.constraints.session)
 
     def _placement_row(self, request: wire.PlacementRequest) -> records.Waiter:
         admission = self._placement_admission(request)
@@ -3972,6 +4294,9 @@ done
             and isinstance(saved.state, placement.ClosedAssignment)]
         if not previous:
             return placement.RetryAt(0)
+        # A guest that took no run twice in one run has a cause that does not clear; the next named machine takes it.
+        if sum(closed.state == placement.ClosedAssignment(MAC_LINUX_NO_ANSWER) for closed in previous) > 1:
+            return placement.DoNotRetry(MAC_LINUX_NO_ANSWER)
         saved = previous[-1]
         retry = saved.retry
         if (isinstance(retry, placement.DoNotRetry) and retry.reason in placement.SETTINGS_REFUSAL_REASONS
@@ -4021,8 +4346,8 @@ done
                         and isinstance(report.outcome, BeforeLaunchRefusal)
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope))
-                    if any(scopes_overlap(claim.reference.scope, destination.scope)
+                        and scopes_overlap(attempt.provider.scope, destination.scope, mac=destination.provider == "mac"))
+                    if any(scopes_overlap(claim.reference.scope, destination.scope, mac=destination.provider == "mac")
                             and (isinstance(claim, placement.RetainedCleanupClaim)
                                  or any(claim.reference == item[0] for item in retained))
                             for claim in (*evidence.cleanup_claims, *evidence.claims)):
@@ -4178,7 +4503,7 @@ done
                 else records.RemoteStartHoldUnrecorded())
         self.assignments[key] = records.SavedPlacementAssignment(assignment,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
-            remote_start_hold=hold)
+            remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
         return assignment
 
@@ -4331,6 +4656,19 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
+    def _placement_candidate_reading(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
+        """Keep the named destinations in order and give their plain reasons."""
+        candidates = self.placement_eligibility.get(request.episode)
+        if candidates is None:
+            candidates = tuple(placement.CandidateEligibility(candidate.destination,
+                placement.EvidenceNeeded("the target reading is unavailable")
+                    if isinstance(candidate.eligibility, placement.AllowedHost) else candidate.eligibility)
+                for candidate in request.constraints.candidates)
+        return tuple(replace(candidate, eligibility=replace(state, reason=reason))
+                     if not isinstance(state := candidate.eligibility, placement.AllowedHost)
+                     and (reason := PLACEMENT_REASON_TEXT.get(state.reason)) is not None else candidate
+                     for candidate in candidates)
+
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
                         policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
@@ -4438,9 +4776,11 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
+        named = {owner: candidates for owner, request in owners.items()
+                 if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
-            pending_remote_starts=frozenset(pending_remote_starts))
+            pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -4680,8 +5020,7 @@ done
                 if not self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
                     continue
             if isinstance(report, placement.NoTerminalReport):
-                report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
-                    placement.DispatchPathSettled(), self.clock.now())
+                report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
 
@@ -4771,6 +5110,7 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                self._close_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:
@@ -4816,7 +5156,7 @@ done
 
                     destination = assignment.destination
                     if (request.claim.provider != destination.provider or request.claim.target != destination.target
-                            or not scopes_overlap(request.claim.scope, destination.scope)):
+                            or not scopes_overlap(request.claim.scope, destination.scope, mac=destination.provider == "mac")):
                         return [self._placement_status(assignment, "retained claim does not match the assigned provider scope",
                             check_lifetime=False)]
                 terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
@@ -4843,7 +5183,9 @@ done
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
-            self.execution_evidence[key] = request.evidence
+            if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
+                    or not isinstance(request.evidence, execution_identity.ObservedExecution)):
+                self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)

@@ -31,6 +31,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, pl
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_hold import override_guard
+from scripts.buildlog import repository as buildlog_repository
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -48,7 +49,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
-    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+    CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -479,10 +480,14 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                                                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                                                      retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
+                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                                                  mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                                                  retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
             scripts_copy.assert_not_called()
             tree_copy.assert_not_called()
@@ -527,11 +532,16 @@ class OffloadSettingsTests(unittest.TestCase):
               mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
               mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), False, {1: lease})
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, {1: lease})
+            assert isinstance(result, offload.DeclinedMacRun)
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
-        self.assertEqual(claim.call_args_list, [mock.call(controller, config, request, HANA, (1,)),
-            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,))])
+        self.assertEqual(claim.call_args_list, [
+            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+                      retire_wait=False),
+            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
+                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
+        ])
         release.assert_called_once_with(controller, request.target)
         self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (state)\n")
         self.assertEqual(errors.getvalue(), fresh_error)
@@ -585,7 +595,7 @@ class OffloadSettingsTests(unittest.TestCase):
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
                 words = shlex.split(offload.remote_test_command(
-                    config, request, eligibility.KnownRepository("hana", key),
+                    config, request, eligibility.KnownRepository("hana"), history_key=key,
                 ))
                 assignments = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
                 self.assertEqual(assignments, [f"BUILDLOG_REPO_IDENTITY={key}"] if key else [])
@@ -834,11 +844,12 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         from scripts.build_queue import admission_protocol as wire, placement
         from scripts.build_queue.admission_test_support import AdmissionFixture
-        from scripts.build_queue import admission_records as records
+        from scripts.build_queue import admission_records as records, admission_service
         from scripts.build_hold.owning_session import NoOwningSession
 
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
-        fixture = self.enterContext(AdmissionFixture(root=self.root))
+        with mock.patch.object(admission_service, "loaded_git_revision", return_value="fixture"):
+            fixture = self.enterContext(AdmissionFixture(root=self.root))
         start = records.process_start_time(os.getpid())
         assert start is not None
         local = fixture.request(owner=wire.Owner(os.getpid(), start))
@@ -858,6 +869,9 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(fixture.serving())
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
+        mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", str(self.root))
+        history_key = "https://fixture.invalid/hana"
+        saved = mirror.claim_repository(history_key=claim_state.KnownMacHistoryKey(history_key))
 
         def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
                            attempt: offload.LocalClaimAttempt) -> None:
@@ -865,12 +879,14 @@ class OffloadSettingsTests(unittest.TestCase):
                 arguments[arguments.index("--claim-id") + 1], arguments[arguments.index("--episode") + 1],
                 arguments[arguments.index("--attempt") + 1])
             controller.claim_identity = claim
+            controller.mac_repository = saved
             attempt.answer = offload.FreshMacClaim()
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination),
                                              "--assignment-file", str(assignment_file)]), \
-             mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+             mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror), \
+             mock.patch.object(buildlog_repository, "repository_key", return_value=history_key), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -891,8 +907,11 @@ class OffloadSettingsTests(unittest.TestCase):
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
-                with mock.patch.object(eligibility, "repository_identity",
-                                       return_value=eligibility.KnownRepository("cargo-liner")):
+                mirror = claim_state.ResolvedMacMirror(
+                    "fixture-cargo-liner", "cargo-liner", "cargo-liner.json", "cargo-liner", str(self.root))
+                with mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror), \
+                        mock.patch.object(buildlog_repository, "repository_key",
+                                          return_value="https://fixture.invalid/cargo-liner"):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 
@@ -996,8 +1015,31 @@ class BusyHolderTests(unittest.TestCase):
 
 @final
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_unreadable_history_ends_verify_without_a_retry(self) -> None:
+        git = self.bin_directory / "git"
+        source = git.read_text().replace("#!/bin/bash\n",
+            '#!/bin/bash\nif [[ " $* " == *" rev-list "* ]]; then exit 1; fi\n', 1)
+        self.write_executable(git, source)
+        result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
+                             extra={"VERIFY_MAC_RUNNER": str(offload.__file__)})
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 15, output)
+        self.assertEqual(output.count("history_key_unavailable"), 1, output)
+        self.assertEqual(self.local_runs(), [])
+
     def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
         _ = self.routing_fixture()
+        git = self.bin_directory / "git"
+        origin = """if [[ "$*" == *' config --includes --null --show-scope --get-regexp '* ]]; then
+    printf 'local\\0%s\\n%s\\0' remote.origin.url 'https://fixture.invalid/case.git'
+    exit 0
+fi
+"""
+        script = git.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + origin, 1)
+        self.write_executable(git, script)
+        mac_host = conf.read(self.root / "machines.conf").words("mac.hosts")[0]
+        with (self.root / "build_folders.conf").open("a", encoding="utf-8") as settings:
+            _ = settings.write(f"\n# whole: 1..\nslots.{mac_host}.{self.root.name}.max=1\n")
         holder = "last recorded mirror session reader (mirror process check)"
         self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
         process = self.start_routing()
@@ -1014,8 +1056,9 @@ class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixt
 class OffloadCommandTests(OffloadCommandFixture):
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
-        retained = self.write_kept_claim()
-        _ = self.claim_file.write_text(json.dumps({**retained, "worktree": "."}))
+        retained = self.write_kept_claim(legacy=True)
+        claim_file = self.claim_file.rename(self.claim_file.with_name("saved-legacy.json"))
+        _ = claim_file.write_text(json.dumps({**retained, "worktree": ".", "repo_name": "hana"}))
         reservation = self.root / "reservation"
         identity = self.root / "reservation.identity"
         waiter = str(os.getpid())
@@ -1029,14 +1072,23 @@ class OffloadCommandTests(OffloadCommandFixture):
         target, settings = reservation.read_text().rstrip("\n").split("\t")
         claim_id, episode, attempt, session = identity.read_text().rstrip("\n").split("\t")
 
-        result = self.command(subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
+        missing = self.repository
+        _ = missing.rename(self.root / "former-checkout")
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        self.write_executable(selectors / "pgrep", "raise SystemExit(1)\n")
+        self.write_executable(selectors / "lsof", f"print('p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/old-mirror')\n")
+        self.write_executable(selectors / "sleep", "raise SystemExit(0)\n")
+        self.fixture["selector_shell"] = "sh"
+        self.sync_fixture()
+        result = self.command(repository=missing, subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
             *assignment, "--target", target, "--claim-owner-pid", waiter, "--claim-id", claim_id,
             "--episode", episode, "--attempt", attempt, "--claim-session", session,
         ))
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertTrue(result.stdout.endswith(f"mac_test: not running on the {target} (busy)\n"), result.stdout)
         self.assert_wire("declined", "busy")
-        self.assertFalse(self.claim_file.exists())
+        self.assertTrue(claim_file.exists())
         cleanup, = self.leftover_events()
         self.assertEqual(self.events(), [cleanup])
         adopted = cleanup.get("claim")
@@ -1045,6 +1097,25 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotEqual(adopted["pid"], int(waiter))
         self.assertEqual(adopted["claim_id"], retained["claim_id"])
         self.assertEqual(adopted["worktree"], ".")
+        self.assertEqual(adopted["remote_host"], retained["remote_host"])
+        script = cleanup["args"][-1]
+        self.assertNotIn("kill ", script)
+        self.assertEqual((self.stub_directory / "selector-answer").read_text().splitlines(), ["leftovers=1", "rc=0"])
+
+    def test_claim_stub_preserves_the_host_and_worktree_during_cleanup_handoff(self) -> None:
+        kept = self.write_kept_claim(legacy=True)
+        _ = self.claim_file.write_text(json.dumps({**kept, "worktree": "older-path", "cleanup_pending": True}))
+        (self.stub_directory / "finish-claim").touch()
+        result = subprocess.run([sys.executable, "-c", CLAIM_STUB, "claim", "--from-pid", str(kept["pid"]),
+            "--pid", str(os.getpid()), "--what", "new check", "--worktree", str(self.repository),
+            "--remote", "new-mac", "--claim-id", kept["claim_id"], "--episode", kept["episode"],
+            "--attempt", kept["attempt"], "--session", kept["submitting_session"]],
+            cwd=Path(offload.__file__).parents[2], env=self.environment, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 13, result.stderr)
+        self.assertIn(f"leftovers: {kept['remote_host']}\n", result.stdout)
+        saved = self.remote_claim()
+        self.assertEqual((saved["remote_host"], saved["worktree"], saved["pid"]),
+                         (kept["remote_host"], "older-path", os.getpid()))
 
     def test_wait_claim_decline_prints_the_child_status_and_failed_check(self) -> None:
         result = self.command(runner_options=(
@@ -1728,7 +1799,16 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = (snapshot / "Cargo.toml").write_text('[package]\nname="staged"\nversion="0.1.0"\n')
         _ = (self.repository / ".gitignore").write_text("staged-file.rs\n")
         _ = (snapshot / "staged-file.rs").write_text("staged source")
-        result = self.command("--workspace", verb="doc", source=offload.StagedDocSnapshot(snapshot))
+        git_environment = {name: value for name, value in self.environment.items() if not name.startswith("GIT_")}
+        git_environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        git = ["git", "-C", str(snapshot), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+               "-c", "core.hooksPath=/dev/null"]
+        _ = subprocess.run([*git, "init", "-q"], check=True, env=git_environment)
+        _ = subprocess.run([*git, "add", "--", "Cargo.toml", "staged-file.rs"], check=True, env=git_environment)
+        _ = subprocess.run([*git, "commit", "-qm", "Staged doc source", "--no-gpg-sign"],
+                           check=True, env=git_environment)
+        snapshot_source = offload.StagedDocSnapshot(snapshot)
+        result = self.command("--workspace", verb="doc", source=snapshot_source)
         self.assertEqual(result.returncode, 0, result.stdout)
         copied, = self.events_for("rsync")
         self.assertIn(str(snapshot) + "/", copied["args"])
@@ -1736,7 +1816,6 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotIn("/staged-file.rs", copied.get("exclude", ""))
         self.config["linux_only.hana"] = "staged"
         self.sync_config()
-        snapshot_source = offload.StagedDocSnapshot(snapshot)
         result = self.command("--workspace", verb="doc", package="", source=snapshot_source)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(len(self.events_for("rsync")), 2)
@@ -2015,17 +2094,19 @@ class BackoffReadTests(unittest.TestCase):
     def test_a_passed_backoff_decides_eligibility_without_a_read(self) -> None:
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
                                        {"linux_only.hana": ""})
+        root = Path("/fixture/hana")
+        key = "https://fixture.invalid/hana"
+        mirror = claim_state.ResolvedMacMirror(key, "hana", "hana.json", "hana", str(root))
         cases: tuple[tuple[eligibility.BackoffState, eligibility.KnownRepository | eligibility.IneligibleMacStep], ...] = (
             (eligibility.UnreadableBackoff("bad"), eligibility.IneligibleMacStep("state")),
             (eligibility.ACTIVE_BACKOFF, eligibility.IneligibleMacStep("backoff")),
-            (eligibility.NO_BACKOFF, HANA),
+            (eligibility.NO_BACKOFF, eligibility.KnownRepository("hana", key)),
         )
-        with mock.patch.object(eligibility, "repository_identity", return_value=HANA), \
-             mock.patch.object(eligibility, "read_backoff", side_effect=AssertionError("backoff was passed")):
+        with mock.patch.object(eligibility, "read_backoff", side_effect=AssertionError("backoff was passed")):
             for backoff, expected in cases:
                 with self.subTest(backoff=type(backoff).__name__):
-                    self.assertEqual(eligibility.mac_step_eligibility(config, Path("/fixture/hana"), "hana", "nextest",
-                                                                  backoff=backoff), expected)
+                    self.assertEqual(eligibility.mac_step_eligibility(config, root, "hana", "nextest",
+                                                                  backoff=backoff, mac_repository=mirror), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()
