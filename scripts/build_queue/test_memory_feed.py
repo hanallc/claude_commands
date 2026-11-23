@@ -1248,12 +1248,12 @@ process.stdout.write(JSON.stringify({
                 _ = memory_feed.page_url()
 
     def test_served_page_allows_same_origin_framing(self) -> None:
-        for name in ("review_links", "change_review"):
-            _ = write_config_fixture(self.root / f'{name}.conf')
+        # Read the feed configuration first: the server fixture then points CONF_DIR at its own folder.
+        configuration = memory_feed.read_configuration()
         server_fixture = test_serve.ReviewLinksServerTests()
         self.addCleanup(server_fixture.doCleanups)
         server_fixture.setUp()
-        memory_feed.publish_page(replace(memory_feed.read_configuration(), output_folder=server_fixture.root))
+        memory_feed.publish_page(replace(configuration, output_folder=server_fixture.root))
         connection = HTTPConnection("127.0.0.1", server_fixture.port, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.addCleanup(connection.close)
         connection.request("GET", "/memory_live.html")

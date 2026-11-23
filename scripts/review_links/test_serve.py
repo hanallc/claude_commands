@@ -6371,14 +6371,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
 
     def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
-        configuration = self.root.parent / "config"
-        configuration.mkdir()
-        _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
         tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
         body = "key=role.worker&value=%23af875f"
         host = f"other.invalid:{self.port}"
         with (patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
-              patch.dict(os.environ, {"CONF_DIR": str(configuration), "REVIEW_LINKS_HOST": ""}),
+              patch.dict(os.environ, {"REVIEW_LINKS_HOST": ""}),
               patch.object(accounts_page, "subprocess", Mock(wraps=subprocess, run=tune))):
             status, _ = self.post(accounts_page.PAGE_PATH, body, headers={"Host": host, "Origin": f"http://{host}"})
             self.assertEqual(status, 403)
