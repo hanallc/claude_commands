@@ -16,6 +16,7 @@ import time
 import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,7 +55,7 @@ def upkeep() -> None:
         _ = detection_rules.refresh(running, herdr.reload_agent_rules)
         try:
             with operation_deadline.within(time.monotonic() + operation_deadline.remaining() / 4):
-                the_list.fire_scheduled()
+                the_list.fire_scheduled(timedelta(seconds=cadence.interval_seconds))
         except (OSError, ValueError, staff.StaffRefused, subprocess.SubprocessError) as error:
             print(f"herdr-upkeep: scheduled List items: {error}", file=sys.stderr)
         producers = accounts.producer_upkeep_members()

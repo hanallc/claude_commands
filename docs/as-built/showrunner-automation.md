@@ -616,23 +616,25 @@ Use `following` after a run occurs to apply the change from the next run.
 Use `all` to change or remove the series.
 Use `--repeat ''` to remove the repeat and keep the pending run.
 Supply a new start if the pending start is in the past.
-Use `update --state Working`, `park`, or `close` to remove the schedule.
+Use scoped `update --state Working`, `park`, or `close` to remove a repeat schedule.
+A state update without a scope applies to the current run while it is active.
 The record keeps its earlier log entries when the schedule changes or ends.
 A producer can change its own schedules. Morty can change all schedules.
 Herdr upkeep checks the List on natedev after it restores the shared server.
 The job uses its existing lock and interval.
 It reads the next check time from each item header.
 It loads the item when a run, notice, or confirmation deadline is due.
+If the scan reaches its time limit, the next check starts after the last item it inspected.
 Delivery has separate time limits for a notice, an item, and the whole check.
 
 On the first check at or after the start, the List saves the run and sets the item to Working.
 The owner receives the instruction. The producer receives a copy.
 The List saves each notice as sending before it calls the sender.
 If the List cannot confirm acceptance, it records one uncertainty entry.
-Each notice has at most one send attempt.
-If several runs are overdue, the List sends the latest one with its due time.
-The same save records each earlier run as missed.
-If an edit moves a run after a later run, the List starts both at their saved times.
+The List calls `send.py` at most once per notice.
+The List starts runs due within two upkeep intervals in order of their saved start times.
+It keeps the latest due run even after an outage.
+The same save records the other runs older than two intervals as missed.
 
 Use `the_list.py confirm --id L<n>` to confirm the latest active run.
 The start message includes `--run` to select that exact run.

@@ -1,6 +1,7 @@
 """Test The List against private staff records and state folders."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -33,6 +34,7 @@ MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "p
 BOB = staff.StaffRow(staff.StaffId("a02a55c8-a2c4-47d9-bf99-fd30ffe75247"), "producer", "bob", staff.StaffRoot(),
                      current_session=staff.StaffId("32c954ea-25b3-44e7-9eed-3218ce9df1d6"))
 START = datetime(2026, 11, 16, 18, tzinfo=UTC)
+UPKEEP_INTERVAL = timedelta(minutes=2)
 LIST_TEXT_LIMITS = {
     "latest_status_max_chars": 80,
     "next_step_max_chars": 72,
@@ -330,6 +332,8 @@ class TheListTests(unittest.TestCase):
         attempted = self.root / "attempted.jsonl"
         _ = sender.write_text(r"""from pathlib import Path
 import json
+import os
+import subprocess
 import sys
 import time
 
@@ -341,6 +345,19 @@ to = args[args.index("--to") + 1]
 with attempted.open("a") as stream:
     stream.write(json.dumps(args) + "\n")
 if "Slow notice" in args[-1] and key.endswith(":owner_start"):
+    lock = log.with_name("sender-child.lock")
+    program = (
+        "import fcntl, sys, time\n"
+        "with open(sys.argv[1], 'w') as lock:\n"
+        "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "    print('ready', flush=True)\n"
+        "    time.sleep(10)\n"
+    )
+    with subprocess.Popen([sys.executable, "-c", program, str(lock)], stdout=subprocess.PIPE,
+                          start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as child:
+        assert child.stdout.readline() == b"ready\n"
+        child.wait()
+if "Scan resume" in args[-1] and key.endswith("_start"):
     time.sleep(30)
 rows = log.read_text().splitlines() if log.exists() else []
 if any(key in json.loads(row) for row in rows):
@@ -389,11 +406,11 @@ else:
                                                     if not line.startswith("scheduled_check:")))
                     with (patch.object(the_list, "now", return_value=START - timedelta(seconds=1)),
                           patch.object(the_list, "load", side_effect=AssertionError("the future record was loaded"))):
-                        the_list.fire_scheduled()
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
                     self.assertEqual(sent.read_text(), "")
                     extra_logs = missed_days + int(case == "Lose receipt")
                     with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
-                        the_list.fire_scheduled()
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
                         working = the_list.load(MORTY.id, item.id)
                         self.assertIs(working.state, the_list.ItemState.WORKING)
                         self.assertEqual(len(working.log), len(item.log) + 1 + extra_logs)
@@ -413,7 +430,7 @@ else:
                         self.assertEqual(len(working.run_deliveries), 1)
                         run_key = working.run_deliveries[0].key
                         if case == "Lose receipt":
-                            the_list.fire_scheduled()
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
                             sends = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
                             self.assertEqual(sends, starts)
                             self.assertIn("Delivery uncertain for producer start", str(working.log[-1].what))
@@ -434,15 +451,15 @@ else:
                                 result = self.command("confirm", "--id", item.id, "--run", run_key)
                             self.assertEqual(result, (0, f"confirmed {item.id}\n", ""))
                     with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2, seconds=-1)):
-                        the_list.fire_scheduled()
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
                     self.assertEqual(len(sent.read_text().splitlines()), 2)
                     with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2)):
                         if case == "timeout":
                             code, _, error = self.command("confirm", "--id", item.id)
                             self.assertEqual(code, 1)
                             self.assertIn("the confirmation time has passed", error)
-                        the_list.fire_scheduled()
-                        the_list.fire_scheduled()
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
                     changed = the_list.load(MORTY.id, item.id)
                     self.assertEqual(len(changed.log), len(item.log) + 1 + extra_logs)
                     result_entry = changed.log[len(item.log) + missed_days]
@@ -461,7 +478,7 @@ else:
                         next_time = due + timedelta(days=1)
                         self.assertIn(f"next {next_time.isoformat()}", the_list.table(MORTY.id))
                         with patch.object(the_list, "now", return_value=next_time):
-                            the_list.fire_scheduled()
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
                             code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
                             self.assertEqual(code, 1)
                             self.assertIn("no matching scheduled run", error)
@@ -472,12 +489,13 @@ else:
                         self.assertIn(next_time.isoformat(), str(changed.log[-1].what))
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
                         with patch.object(the_list, "now", return_value=next_time + timedelta(days=1)):
-                            the_list.fire_scheduled()
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
                         self.assertEqual(len(sent.read_text().splitlines()), 4)
                     self.assertIs(changed.state, the_list.ItemState.WORKING)
                     self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
 
-            for case in ("interrupted owner", "slow notice", "overlapping runs", "Mac"):
+            for case in ("interrupted owner", "slow notice", "scan resume", "overlapping runs",
+                         "same check", "state changed", "Mac"):
                 with self.subTest(case=case):
                     for path in (sent, attempted):
                         _ = path.write_text("")
@@ -487,8 +505,10 @@ else:
                             self.check_scheduled_instruction_interrupt(attempted)
                         case "slow notice":
                             self.check_slow_scheduled_notice(sent, attempted)
-                        case "overlapping runs":
-                            self.check_overlapping_scheduled_runs(sent)
+                        case "scan resume":
+                            self.check_scheduled_scan_resumes(sent)
+                        case "overlapping runs" | "same check" | "state changed":
+                            self.check_overlapping_scheduled_runs(sent, case)
                         case "Mac":
                             self.check_mac_scheduled_run(attempted)
 
@@ -497,7 +517,7 @@ else:
         item = self.add("Interrupted", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
         with (patch.object(the_list, "_send_scheduled_notice", side_effect=KeyboardInterrupt),
               self.assertRaises(KeyboardInterrupt)):
-            the_list.fire_scheduled()
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
         interrupted = the_list.load(MORTY.id, item.id)
         active = interrupted.run_deliveries[0]
         self.assertEqual(active.notices[0], the_list.ScheduledNotice(the_list.RunNotice.OWNER_START,
@@ -507,8 +527,8 @@ else:
         self.assertIn("waiting for its owner instruction", error)
         recovered_at = START + timedelta(minutes=3)
         with patch.object(the_list, "now", return_value=recovered_at):
-            the_list.fire_scheduled()
-            the_list.fire_scheduled()
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
         recovered = the_list.load(MORTY.id, item.id)
         self.assertEqual(recovered.run_deliveries[0].confirmation,
                          the_list.AwaitingConfirmation(recovered_at + timedelta(minutes=2)))
@@ -518,8 +538,8 @@ else:
         rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
         self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows], ["producer_start"])
         with patch.object(the_list, "now", return_value=recovered_at + timedelta(minutes=2)):
-            the_list.fire_scheduled()
-            the_list.fire_scheduled()
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
         rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
         self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows],
                          ["producer_start", "user_timeout", "producer_timeout"])
@@ -530,41 +550,71 @@ else:
         slow = self.add("Slow notice", changes=changes)
         later = self.add("Later item", changes=changes)
         with redirect_stderr(io.StringIO()) as errors:
-            the_list.fire_scheduled()
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
         self.assertIn("timed out", errors.getvalue())
+        with (self.root / "sender-child.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
         self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
         done = the_list.load(MORTY.id, slow.id)
         self.assertIn("Delivery uncertain for owner start", str(done.log[-1].what))
         for item in (slow, later):
             self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
-        the_list.fire_scheduled()
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
         rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
         self.assertEqual(sum(slow.title in args[-1] and args[args.index("--key") + 1].endswith(":owner_start")
                              for args in rows), 1)
 
-    def check_overlapping_scheduled_runs(self, sent: Path) -> None:
-        first = the_list.ScheduledRun(START, "First words.")
+    def check_scheduled_scan_resumes(self, sent: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
+        slow = self.add("Scan resume", changes=changes)
+        later = self.add("Later scan item", changes=changes)
+        with patch.object(the_list, "_SCHEDULED_CHECK_SECONDS", 1.5), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            first_check = the_list.load(MORTY.id, slow.id)
+            self.assertIn("Delivery uncertain for owner start", str(first_check.log[-1].what))
+            self.assertEqual(the_list.load(MORTY.id, later.id), later)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
+        for item in (slow, later):
+            self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
+
+    def check_overlapping_scheduled_runs(self, sent: Path, case: str) -> None:
+        first = the_list.ScheduledRun(START.replace(hour=17), "First words.")
         schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"))
         item = self.add("Lose receipt in moved run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
-        second = START + timedelta(days=1)
+        second = first.start + timedelta(days=1)
         moved = second + timedelta(minutes=1)
         self.assertEqual(self.command("update", "--id", item.id, "--scope", "this", "--start", moved.isoformat(),
                                       "--source", "nate"), (0, "Repeats: Daily for 2 runs\n", ""))
-        with patch.object(the_list, "now", return_value=second), redirect_stderr(io.StringIO()):
-            the_list.fire_scheduled()
-            after_second = the_list.load(MORTY.id, item.id)
-            active = after_second.run_deliveries[0]
-            self.assertEqual(active.run.start, second)
-            self.assertIn("Delivery uncertain for producer start", str(after_second.log[-1].what))
-            remaining = after_second.schedule
-            assert isinstance(remaining, the_list.ScheduledSeries)
-            self.assertEqual(remaining.finished_runs, frozenset({2}))
-            self.assertEqual(remaining.runs_used, 1)
-            self.assertEqual([(run.number, run.run.start) for run in remaining.runs(730)], [(1, moved)])
-        with patch.object(the_list, "now", return_value=moved), redirect_stderr(io.StringIO()):
-            the_list.fire_scheduled()
-            the_list.fire_scheduled()
+        if case != "same check":
+            with patch.object(the_list, "now", return_value=second), redirect_stderr(io.StringIO()):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+                after_second = the_list.load(MORTY.id, item.id)
+                active = after_second.run_deliveries[0]
+                self.assertEqual(active.run.start, second)
+                self.assertIn("Delivery uncertain for producer start", str(after_second.log[-1].what))
+                remaining = after_second.schedule
+                assert isinstance(remaining, the_list.ScheduledSeries)
+                self.assertEqual(remaining.finished_runs, frozenset({2}))
+                self.assertEqual(remaining.runs_used, 1)
+                self.assertEqual([(run.number, run.run.start) for run in remaining.runs(730)], [(1, moved)])
+                if case == "state changed":
+                    self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered",
+                                                  "--source", "nate"), (0, "", ""))
+                    delivered = the_list.load(MORTY.id, item.id)
+                    self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
+                    self.assertEqual(delivered.schedule, remaining)
+        tick = moved + timedelta(seconds=30) if case == "same check" else moved
+        with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            if case == "same check":
+                first_check = the_list.load(MORTY.id, item.id)
+                self.assertEqual([run.run.start for run in first_check.run_deliveries], [second, moved])
+                self.assertNotIn("Missed.", "\n".join(str(entry.what) for entry in first_check.log))
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
             started = the_list.load(MORTY.id, item.id)
             self.assertEqual([run.run.start for run in started.run_deliveries], [second, moved])
             for run in started.run_deliveries:
@@ -588,7 +638,7 @@ else:
         with (patch.object(remote, "local_machine", return_value="mac"),
               patch.object(sys, "platform", "darwin"),
               patch.object(main_publish, "ssh", return_value=receipt) as ssh):
-            the_list.fire_scheduled()
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
             self.assertEqual(attempted.read_text(), "")
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(self.command("confirm", "--id", item.id, "--run", run_key),
@@ -1065,7 +1115,8 @@ else:
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
                     + f"Run `{launcher} update --id L{number}` to update it. "
                     + "Use any of `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, "
-                    + "`--evidence`, `--add-evidence`, `--title`, `--done-when`."))
+                    + "`--evidence`, `--add-evidence`, `--title`, `--done-when`, "
+                    + "`--start`, `--do`, `--repeat`, `--scope`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
@@ -1076,6 +1127,16 @@ else:
         self.assertIn("| Latest status |", output)
         self.assertIn("| 1 | show | dwight | Build plan | New; parked until", output)
         self.assertIn("| The build is complete. · 13:00 EST |", output)
+        with self.subTest(owner="producer"):
+            owned = the_list.add(MORTY.id, "Producer's plan", owner=BOB.id, source="nate",
+                                 changes={"producer": OTHER.id})
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                result = the_list.notify_producer_assignment(owned, MORTY.id, MORTY.id, caller=MORTY.id)
+            self.assertEqual((result, errors.getvalue()), (0, ""))
+            (notice,) = self.notices[4:]
+            self.assertEqual(notice[0], OTHER.id)
+            self.assertIn("You are the producer of item 3: Producer's plan.", notice[1])
 
     def test_assignment_sends_no_notice_for_same_producer_or_morty(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
