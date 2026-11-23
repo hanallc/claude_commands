@@ -430,7 +430,11 @@ class _ModelWorktreePath(NamedTuple):
 def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
     """Return the model path and its names, or the error that explains the mismatch."""
     try:
-        repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
+        worktree_root = copy_record.worktree_root()
+        parts = root.relative_to(worktree_root).parts if root.is_relative_to(worktree_root) else ()
+        if len(parts) != 3:
+            return ValueError(f"the checkout is not at {worktree_root / '<repo>/<unit>/<short name>'}")
+        repo, unit, short_name = parts
         model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
         if root != model_path.resolve():
             return ValueError("the checkout is outside the worktree model")
