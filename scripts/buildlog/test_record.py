@@ -207,7 +207,7 @@ class RecordTests(unittest.TestCase):
             return self.record_process(*args, cwd=cwd, extra=extra, input=input)
         module = step_context if args and args[0] == "step-context" else recorder
         arguments = list(args)
-        with mock.patch.object(recorder, "detach"), mock.patch.object(sys, "stdin", io.StringIO(input)):
+        with mock.patch.object(sys, "stdin", io.StringIO(input)):
             return invoke_cli(module, lambda: module.main(arguments), arguments,
                               self.environment(**(extra or {})), cwd or self.repo)
 
@@ -1172,6 +1172,16 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         detached = self.step(0, "0", "", "", SWEEP)
         self.assertEqual(detached["branch"], "detached")
         self.assertEqual(detached["sha"], self.git("rev-parse", "--short", "HEAD", cwd=self.repo))
+
+    def test_step_in_another_process_leaves_that_process_attached(self) -> None:
+        # verify_helper.py runs main in its long-lived process. A detach there would leave the
+        # verify.sh session and close the helper's request pipe.
+        arguments = ["step", "0", str(START), "", "0", "", "", *SWEEP]
+        with mock.patch.object(recorder, "detach") as detach, mock.patch.object(sys, "stdin", io.StringIO("")):
+            result = invoke_cli(recorder, lambda: recorder.main(arguments), arguments, self.environment(), self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detach.assert_not_called()
+        self.assertEqual(self.records()[-1]["kind"], "step")
 
     def test_manifest_path_names_the_repo(self) -> None:
         elsewhere = self.base / "elsewhere"

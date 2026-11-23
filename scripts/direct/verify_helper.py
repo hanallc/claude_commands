@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import ExitStack
+import contextvars
 from dataclasses import dataclass
 import hashlib
 import importlib.util
@@ -241,7 +242,9 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             program = programs[call.program]
             if isinstance(program, LoadedProgram):
                 try:
-                    value = program.invoke()
+                    # A ContextVar value lives for one command, as in its own process: each call
+                    # runs in a copy of the helper's context, and the copy ends with the call.
+                    value = contextvars.copy_context().run(program.invoke)
                     status = str(value if isinstance(value, int) else 0)
                 except SystemExit as exit_request:
                     value = exit_request.code
@@ -251,8 +254,9 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 except Exception:
                     traceback.print_exc()
                     status = "1"
-        except Exception:
-            # An import or protocol failure uses the original process path.
+        except (Exception, SystemExit):
+            # An import or protocol failure uses the original process path. A module that
+            # exits at import time ends only its call, so the caller runs it in its own process.
             status = "fallback"
         finally:
             stdout.flush()
