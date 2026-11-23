@@ -305,6 +305,7 @@ Other Linux callers keep the local admission and hold checks.
 `scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
 
 1. `UniqueBuildFolder(prefix, parent)` creates a private folder atomically with mode `0700`.
+   When another run holds the name, it takes a new name at once and does not wait for the lock.
 2. `StableOwnerFolder(name, parent, mode)` retains the owner's folder, contents, and existing permissions.
 
 `FOLDER_PREFIXES` defines each build kind's prefix.
