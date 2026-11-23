@@ -564,10 +564,14 @@ States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`,
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
-The List hides an item with unanswered questions while each send is pending or successful.
+The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
-The producer uses `the_list.py answer` to save an answer and mark the item unread.
+The saved recipient uses `the_list.py answer` to save an answer and mark the item unread.
+Morty can answer any List question.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
+Only morty can name a keeper other than itself or the caller.
+Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -606,27 +610,44 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+They can update their own items with `--title`, `--done-when`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
+Only morty can change the owner or producer of an existing item.
 Their updates use the caller's staff name as the log source.
+Their add can set `--producer` to their own name or staff ID; without it, the item goes to the caller.
+The CLI refuses another producer and `--number` on their add.
+The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
+Producers can park and close their own items. The CLI uses the caller's staff name as the log source.
+The writer checks the assigned producer under the same lock as the save.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-Morty's new items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+New items that morty adds without `--producer` default to morty.
+An assignment that morty makes to another producer sends two notices after the save.
+When another producer adds their own item, the CLI sends only the showrunner notice after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
 If the recipient is offline, the notice fails and stays unsent.
-If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+If a producer that morty assigned retires before the staff refresh, the CLI reports the failed producer notice.
 The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
-When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+When the staff refresh fails, the CLI reports the saved item ID and the notices it could not send.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
+The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
+
+| Config key | Limit |
+| --- | --- |
+| `latest_status_max_chars` | 200 characters for the latest status |
+| `next_step_max_chars` | 160 characters for the next step |
+| `done_when_max_chars` | 160 characters for done-when |
+| `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
+
+The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
+The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
 References use numbers in morty's List folder.
