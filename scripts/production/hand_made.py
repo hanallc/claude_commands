@@ -23,12 +23,15 @@ import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path, PurePath
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -40,12 +43,12 @@ from scripts.build_hold.owning_session import owning_session
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
 from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
 from scripts.build_targets import build_targets
-from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, main_folder
+from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, entry_kind, main_folder
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
-from scripts.production import hand_made_guest, hand_made_mac
+from scripts.production import hand_made_guest, hand_made_limit, hand_made_mac
 from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineFailed, MachineRun, Output,
                                                 Placed, Program, ProgramPlace, Refused, discard, in_checkout, note,
                                                 stream)
@@ -66,6 +69,17 @@ SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PAT
                              "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
 PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
+# The characters that split a word into values, as in --config build.target-dir="/tmp/x".
+VALUE_SEPARATORS = re.compile(r"""[\s=,:;"']""")
+# Each file under this folder is fixed, so a tool can run a file from a folder under it.
+STORE = "/nix/store/"
+MAIN_FOLDER_REFUSAL = ("a word names a folder with a __main__ file, such as __main__.py or __main__.pyc: python runs "
+                       + "that file, and the check cannot read it; run the program file by its path")
+RESPONSE_REFUSAL = ("the word {word} names the response file {path}; it gives the tool words that the check does not "
+                    + "read. Put the words in the command line")
+FOLDER_REFUSAL = ("the word {word} names {entry} {folder}, which {reason}; a tool can run a file from it that the "
+                  + "check does not read. Name a checkout file, a tracked folder, a folder in /nix/store or a new "
+                  + "entry in a tracked folder, or leave out the option so the tool uses its default")
 
 SCHEMA = {
     "type": "object",
@@ -182,6 +196,22 @@ def outside_program(path: Path, any_text: bool) -> bool:
     return start != COMPILED_START if any_text else start[:2] == b"#!"
 
 
+def word_values(word: str) -> list[str]:
+    """The values of a later word that can name a file or a folder: the word, each part of it between
+    VALUE_SEPARATORS, for a word with one -, each part after its first two characters that follows only option
+    letters, and for each value that starts with @, the rest of it.
+
+    A word with one - can join a value to a short option letter, as in -Ctarget, and the check does not know
+    which letters take a value. Option letters are letters and digits, so in -I/nix/store/x/bin the value
+    starts only after I, and /bin is not a value. A value that starts with @ can name a response file.
+    """
+    values = [word, *VALUE_SEPARATORS.split(word)]
+    if word.startswith("-") and not word.startswith("--"):
+        values += [word[start:] for start in range(2, len(word)) if word[1:start].isalnum()]
+    values += [value[1:] for value in values if value.startswith("@")]
+    return [value for value in dict.fromkeys(values) if value]
+
+
 def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     """Each file that the command can run. A wrapper such as timeout or env starts a later word with execvp,
     and an interpreter opens a later word as a path, so each later word gives both files.
@@ -191,7 +221,9 @@ def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     checkout. The execvp of a wrapper also goes on to a later PATH match when a start fails, for example
     for a #! line with a missing interpreter, so a later word reads each match. The run
     starts the first word by its exec_path, with no PATH search and no /bin/sh, so the first word reads only
-    that file and only a #! script; the model sees a word with a slash in the command.
+    that file and only a #! script; the model sees a word with a slash in the command. A tool can also open a
+    value of a later word, as in make -f/x/evil.mk or --file=/x/evil.mk, so each value that names a checkout
+    file, or a file outside the checkout that is not compiled, is read too.
     """
     found: list[Path] = []
     for index, word in enumerate(argv):
@@ -200,8 +232,10 @@ def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
             if os.path.isfile(program) and (
                     in_checkout(program, repo) or outside_program(program, any_text=bool(index))):
                 found.append(program)
-        if index and in_checkout(repo / word, repo) and os.path.isfile(repo / word):
-            found.append(repo / word)
+        for value in word_values(word) if index else ():
+            path = repo / value
+            if os.path.isfile(path) and (in_checkout(path, repo) or outside_program(path, any_text=True)):
+                found.append(path)
     return tuple(dict.fromkeys(found))
 
 
@@ -293,6 +327,133 @@ def sets_variable(argv: Sequence[str]) -> bool:
     return False
 
 
+def value_path(repo: Path, value: str) -> str:
+    """The path that a value names from the checkout. A value with no .. part is normalized, so a long run of
+    ./ parts does not exceed the path limit. A value with a .. part keeps its form, because a link before the
+    .. changes where it goes; folder_refusal refuses it."""
+    joined = os.path.join(repo, value)
+    return joined if ".." in PurePath(value).parts else os.path.normpath(joined)
+
+
+def root_only(path: str) -> bool:
+    """Tell if only root can change the folder at the absolute path, or a part of the path as written.
+
+    Each part must be owned by root, must not be a link, and must not be writable by group or other. A folder
+    above the last part can be writable with the sticky bit, as /nix/store is: then only root can replace its
+    root-owned entries. A missing part tells True, because the path then names nothing; each other lstat error
+    tells False.
+    """
+    parts = PurePath(path).parts
+    prefix = Path(parts[0])
+    for index, part in enumerate(parts):
+        prefix = prefix / part
+        try:
+            info = os.lstat(prefix)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if info.st_uid != 0 or stat.S_ISLNK(info.st_mode) or (
+                writable and (index == len(parts) - 1 or not info.st_mode & stat.S_ISVTX)):
+            return False
+    return True
+
+
+def unchecked_refusal(word: str, path: str, error: OSError) -> str:
+    name = errno.errorcode.get(error.errno, type(error).__name__) if error.errno is not None else type(error).__name__
+    return FOLDER_REFUSAL.format(word=word, entry="the entry", folder=path, reason=f"cannot be checked ({name})")
+
+
+def value_refusal(word: str, value: str, named: str, repo: Path, checkout: dict[str, tuple[str, str]]) -> str | None:
+    """The refusal for one value of a word, or None. A checkout folder that git must check goes into checkout
+    with its word and entry text. An OSError other than a missing entry is raised.
+
+    A value that names a FIFO, a socket or a device is refused, because program_files reads only regular
+    files and another process can write into a FIFO. /dev/null passes, as in cc -o /dev/null. An @ with no
+    rest, as in git log @, is no response file.
+    """
+    if value.startswith("@") and value[1:]:
+        response = value_path(repo, value[1:])
+        if entry_kind(response, follow=False) != "missing":
+            return RESPONSE_REFUSAL.format(word=word, path=response)
+    kind = entry_kind(named)
+    if kind == "other" and named != os.devnull:
+        return FOLDER_REFUSAL.format(word=word, entry="the entry", folder=named,
+                                     reason="is not a regular file or a folder, so the check cannot read it")
+    if kind == "folder":
+        folder, entry = named, "the folder"
+    elif (kind != "missing" or entry_kind(named, follow=False) != "missing"
+          or entry_kind(os.path.dirname(named)) != "folder"):
+        return None
+    else:
+        folder, entry = os.path.dirname(named), "a new entry in the folder"
+    folder = os.path.normpath(folder)
+    parts = Path(folder).relative_to(repo).parts if in_checkout(Path(folder), repo) else None
+    prefixes = [repo.joinpath(*parts[:end]) for end in range(1, len(parts) + 1)] if parts is not None else []
+    if ".." in PurePath(value).parts:
+        reason = "is named with a .. part"
+    elif parts is None:
+        if os.path.realpath(folder).startswith(STORE) or (entry != "the folder" and root_only(folder)):
+            return None
+        reason = "is outside the checkout and not in /nix/store"
+    elif any(entry_kind(str(prefix), follow=False) == "link" for prefix in prefixes):
+        reason = "is reached through a link"
+    elif ".git" in parts:
+        reason = "is in .git"
+    elif any(entry_kind(str(prefix / ".git"), follow=False) != "missing" for prefix in prefixes):
+        reason = "is in another git repository"
+    else:
+        if parts:
+            _ = checkout.setdefault(os.path.join(*parts), (word, entry))
+        return None
+    return FOLDER_REFUSAL.format(word=word, entry=entry, folder=folder, reason=reason)
+
+
+def folder_refusal(argv: Sequence[str], repo: Path) -> str | None:
+    """The refusal for the first later word from which a tool can run a file that the check does not read.
+
+    The main_folder refusal comes first. A value that starts with @ and names an entry with the rest is a
+    response file, and is refused; a FIFO can get words from another process. A value that names an entry
+    that is not a regular file or a folder, such as a FIFO, a socket or a device, is refused; /dev/null
+    passes. Then each value of each word that names an existing folder is a folder word, and a value that
+    names no entry is a new entry in its parent folder, because a tool can take it as a prefix and run an
+    entry of the parent. A value that names a file keeps the file rules, and a value with a missing parent
+    passes.
+
+    Each value with a .. part is refused. A folder in the checkout gets the trust of the checkout top: git
+    does not ignore it, it is not in .git, its path from the checkout has no link, and no folder on that path
+    has a .git entry of another repository. Like the top, it can hold ignored files. A folder outside the
+    checkout passes when its real path is under /nix/store/, because a recursive tool walks each folder under
+    it. A parent outside the checkout also passes when it is root_only, because a prefix names only its direct
+    entries. A path that cannot be checked, for example one over the path limit, is refused.
+    """
+    for word in argv[1:]:
+        path = value_path(repo, word)
+        try:
+            # entry_kind names a stat error first; main_folder alone takes it as a __main__ folder.
+            if entry_kind(path) == "folder" and main_folder(path):
+                return MAIN_FOLDER_REFUSAL
+        except OSError as error:
+            return unchecked_refusal(word, path, error)
+    checkout: dict[str, tuple[str, str]] = {}
+    for word in argv[1:]:
+        for value in word_values(word):
+            named = value_path(repo, value)
+            try:
+                refusal = value_refusal(word, value, named, repo, checkout)
+            except OSError as error:
+                return unchecked_refusal(word, named, error)
+            if refusal is not None:
+                return refusal
+    ignored = treekey.ignored_paths(str(repo), list(checkout)) if checkout else set[str]()
+    for relative, (word, entry) in checkout.items():
+        if ignored is None or relative in ignored:
+            reason = "is in a submodule, or git cannot check it" if ignored is None else "git ignores"
+            return FOLDER_REFUSAL.format(word=word, entry=entry, folder=repo / relative, reason=reason)
+    return None
+
+
 def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[CheckedFile, ...]:
     """Read each program file of the command; max_bytes limits the sum of all files."""
     if runs_module(argv):
@@ -304,9 +465,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
     if sets_variable(argv):
         raise Refused("env NAME=VALUE is refused: a variable can make the program load code that the check does not "
                       + "read; set the variable outside the hand made command")
-    if any(main_folder(os.path.join(repo, word)) for word in argv[1:]):
-        raise Refused("a word names a folder with a __main__ file, such as __main__.py or __main__.pyc: python runs "
-                      + "that file, and the check cannot read it; run the program file by its path")
+    refusal = folder_refusal(argv, repo)
+    if refusal is not None:
+        raise Refused(refusal)
     for name in PATH_LIST_VARIABLES:
         for entry in os.environ[name].split(os.pathsep) if name in os.environ else ():
             if not entry or not os.path.isabs(entry) or in_checkout(Path(entry).resolve(), repo):
@@ -441,11 +602,21 @@ def program_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in PROGRAM_VARIABLES | SHOWN_VARIABLES}
 
 
+def natedev_refusal(program: Program) -> str:
+    """Why natedev cannot take the program: a checkout that holds the tools that check the run, or an output
+    folder that the limit cannot bind."""
+    return hand_made_limit.limit_refusal(program.argv, program.repo, program_environment())
+
+
 @dataclass
 class NatedevRun:
-    """The program in its natedev queue place, started from the file that the check found."""
+    """The program in its natedev queue place, started from the file that the check found, under the read limit.
+
+    temp is the attempt temp folder in the queue place folder; the end of the place removes it.
+    """
     place: ProgramPlace
     program: Program
+    temp: Path
     started_at: float | None = None
 
     @property
@@ -453,13 +624,40 @@ class NatedevRun:
         return self.place.peak_bytes or None
 
     def run(self, output: Output) -> int:
-        start, argv = self.program.start, self.program.argv
-        process = self.place.popen([str(start), *argv[1:]] if start is not None else list(argv),
-                                   cwd=self.program.repo, env=program_environment(), stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.started_at = time.time()
-        with process:
-            return stream(process, output)
+        """Run the program under bwrap.
+
+        A checkout that holds the tools that check the run, a limit that bwrap does not set up, an output folder
+        that the limit cannot bind (the program can change the target link after the check), or a cargo failure
+        from offline mode ends the attempt as a refusal.
+        """
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise Refused(hand_made_limit.BWRAP_MISSING)
+        environment = program_environment()
+        refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
+        if refusal:
+            raise Refused(refusal)
+        self.temp.mkdir(exist_ok=True)
+        status_read, status_write = os.pipe()
+        try:
+            try:
+                command = hand_made_limit.limit_argv(bwrap, self.program, self.temp, environment, status_write)
+                process = self.place.popen(command, cwd=self.program.repo, env=environment, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(status_write,))
+            finally:
+                os.close(status_write)
+            self.started_at = time.time()
+            tail = hand_made_limit.OutputTail(output)
+            with process:
+                status = stream(process, tail)
+            if hand_made_limit.setup_failed(status, status_read):
+                self.started_at = None
+                raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
+            if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
+                raise Refused(hand_made_limit.NO_NETWORK)
+            return status
+        finally:
+            os.close(status_read)
 
 
 @contextmanager
@@ -470,7 +668,7 @@ def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[Mac
     held = HeldReservation(placed.grant)
     try:
         with line.local_place(held) as place:
-            yield NatedevRun(place, program)
+            yield NatedevRun(place, program, line.folder / "tmp")
     finally:
         line.close(placed, held.status, "")
 
@@ -480,7 +678,7 @@ def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[Mac
 LOCAL_MACHINE = "natedev"
 # One entry for each machine.
 ROUTES: Mapping[str, Machine] = {
-    LOCAL_MACHINE: Machine(natedev_route),
+    LOCAL_MACHINE: Machine(natedev_route, natedev_refusal),
     "mac": Machine(hand_made_mac.mac_route, hand_made_mac.mac_refusal),
     hand_made_guest.MACHINE: Machine(hand_made_guest.guest_route, hand_made_guest.guest_refusal)}
 
@@ -573,7 +771,8 @@ def now_text() -> str:
 
 
 def run_start_change(request: Request, files: Sequence[CheckedFile], fields: record.HandMadeFields) -> str:
-    """Read each checked file again and find the program files again; name the first change."""
+    """Read each checked file again, find the program files again and check the folder words again; name the
+    first change."""
     changed = ""
     for item, row in zip(files, fields["files"]):
         try:
@@ -585,7 +784,8 @@ def run_start_change(request: Request, files: Sequence[CheckedFile], fields: rec
     found = program_files(request.argv, request.repo)
     if not changed and found != tuple(item.path for item in files):
         changed = "the program files changed after the check: " + (", ".join(map(str, found)) or "none")
-    return changed
+    refusal = None if changed else folder_refusal(request.argv, request.repo)
+    return f"a folder changed after the check: {refusal}" if refusal is not None else changed
 
 
 def run_placed(line: Line, placed: Placed, request: Request, files: Sequence[CheckedFile], program: Program,

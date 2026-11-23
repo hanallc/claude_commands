@@ -8,7 +8,7 @@ On the Mac add `--machine natedev`; never read `~/.config/pushover/env`.
 
 Mac locked, screenshots black (replace `<clear-command>` with a command that exits 0 when unlocked):
 `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id mac.locked --value "sender=<your session>" --value "waiting=One unit's phase waits for 2 shots" --clears-when "<clear-command>"`
-When the user turned the Mac off (a Mac block held by another session, `offload=off` in `mac_test.conf` or `enabled.mac=off` in `build_targets.conf`), send.py prints `SKIPPED: the Mac is off on purpose (<reason>)`, exits 0 and sends no push. The session that holds the block still sends it.
+When the user turned the Mac off (a Mac block held by another session, `offload=off` in `mac_test.conf` or `enabled.mac=off` in `build_targets.conf`), send.py prints `SKIPPED: the Mac is off on purpose (<reason>)`, exits 0 and sends no push. The session that holds the block still sends it. A sent push also stops when the user turns the Mac off later. A `--machine natedev` forward does not get this stop.
 
 GitHub keys cold (one push per machine until `github-warm-status` passes; the template sets its key and clear check):
 `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id github.keys_cold --value "sender=<your session>" --value "machine=<machine with cold keys>"`

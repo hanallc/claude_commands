@@ -1252,19 +1252,48 @@ def guest_tool(real: Path, copy: Path) -> bool:
         return False
 
 
+EntryKind = Literal['folder', 'file', 'link', 'other', 'missing']
+
+
+def entry_kind(path: str, *, follow: bool = True) -> EntryKind:
+    """The kind of the entry at the path: os.stat follows a link, and os.lstat does not. A file is a regular
+    file; other is a FIFO, a socket or a device.
+
+    ENOENT and ENOTDIR mean missing. Each other OSError, such as ENAMETOOLONG or ELOOP, is raised, so that
+    the caller refuses the word and does not take the entry as missing.
+    """
+    try:
+        mode = (os.stat if follow else os.lstat)(path).st_mode
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return 'missing'
+        raise
+    if stat.S_ISDIR(mode):
+        return 'folder'
+    if stat.S_ISREG(mode):
+        return 'file'
+    return 'link' if stat.S_ISLNK(mode) else 'other'
+
+
 def main_folder(path: str) -> bool:
     """Tell if python runs a file of the folder when it gets the folder as its script.
 
     Python imports __main__ from the folder, so each entry with that name and any suffix counts, for example
     __main__.py or __main__.pyc. A folder that cannot be listed counts too, because python can still open a
-    file in it by its name.
+    file in it by its name. A stat error other than a missing entry, such as ELOOP or ENAMETOOLONG, counts
+    too, because the check cannot tell what the path names.
     """
-    if not os.path.isdir(path):
-        return False
     try:
+        if entry_kind(path) != 'folder':
+            return False
         return any(name.startswith('__main__') for name in os.listdir(path))
     except OSError:
         return True
+
+
+def unchecked_entry(path: Path, error: OSError) -> str:
+    """The reason for a path that the guest cannot stat: the check cannot tell what the path names."""
+    return f'{path} cannot be checked ({error.strerror or type(error).__name__})'
 
 
 def unread_entry(copy: Path, word: str) -> str:
@@ -1288,7 +1317,7 @@ def unread_entry(copy: Path, word: str) -> str:
         except OSError as error:
             if error.errno in (errno.ENOENT, errno.ENOTDIR):
                 return ''
-            return f'the guest cannot read {path}: {error.strerror}'
+            return unchecked_entry(path, error)
         if stat.S_ISLNK(mode):
             return f'{path} is a symbolic link'
     if not slash and stat.S_ISDIR(mode):
@@ -1312,9 +1341,16 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
     """
     copy = copy.resolve()
     for index, word in enumerate(argv):
-        if index and main_folder(str(copy / word)):
-            return (f'The guest refuses the command word {word}: python runs a __main__ file of the folder '
-                    + f'{copy / word}, and natedev read no file there.')
+        if index:
+            try:
+                # entry_kind names a stat error first; main_folder alone takes it as a __main__ folder.
+                folder = entry_kind(str(copy / word)) == 'folder'
+            except OSError as error:
+                return (f'The guest refuses the command word {word}: {unchecked_entry(copy / word, error)}, '
+                        + 'and natedev read no file there.')
+            if folder and main_folder(str(copy / word)):
+                return (f'The guest refuses the command word {word}: python runs a __main__ file of the folder '
+                        + f'{copy / word}, and natedev read no file there.')
         if (index or '/' in word) and Path(word).as_posix() not in checked:
             reason = unread_entry(copy, word)
             if reason:

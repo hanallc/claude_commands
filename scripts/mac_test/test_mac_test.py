@@ -3851,6 +3851,28 @@ class MachineOffOnPurposeTests(unittest.TestCase):
                 self.assertEqual(mac_test.machine_off_on_purpose(target),
                                  mac_test.OffOnPurpose(f"enabled.{target}=off"))
 
+    def off_on_purpose(self, *arguments: str) -> int:
+        with mock.patch.object(sys, "argv", ["mac_test.py", "off-on-purpose", *arguments]):
+            return mac_test.main()
+
+    def test_off_on_purpose_exits_0_for_each_off_signal_and_1_in_use(self) -> None:
+        mac_test_conf, build_targets_conf = self.root / "mac_test.conf", self.root / "build_targets.conf"
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
+        # The block alone: it counts for every session but its holder.
+        self.assertEqual(self.off_on_purpose(), 0)
+        self.assertEqual(self.off_on_purpose("--asking", "nate"), 0)
+        self.assertEqual(self.off_on_purpose("--asking", "hana"), 1)
+        (self.root / "mac-state/block.json").unlink()
+        self.assertEqual(self.off_on_purpose(), 1)
+        for name, settings, path in (("offload", "offload=off\n", mac_test_conf),
+                                     ("enabled", "enabled.mac=off\n", build_targets_conf)):
+            _ = write_config_fixture(path, settings)
+            with self.subTest(signal=name):
+                self.assertEqual(self.off_on_purpose("--asking", "hana"), 0)
+            _ = write_config_fixture(path, settings.replace("=off", "=on"))
+            with self.subTest(signal=name, state="in use"):
+                self.assertEqual(self.off_on_purpose("--asking", "hana"), 1)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

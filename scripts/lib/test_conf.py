@@ -63,7 +63,7 @@ class ConfTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Configuration test")
         _ = self.git("config", "user.email", "conf@example.invalid")
 
-    def test_config_reads_record_all_resolvers_and_cache_the_log_path(self) -> None:
+    def test_config_reads_record_all_resolvers_in_the_log_their_environment_names(self) -> None:
         self.write("value=one\n")
         log = self.root / "reads"
         program = """from pathlib import Path
@@ -84,8 +84,11 @@ conf.check('example', 'value', 'two')
         self.assertEqual(result.stderr, "")
         self.assertTrue(log.is_file(), "The reader must record its config reads")
         self.assertEqual(set(log.read_text().splitlines()), {"example"})
-        self.assertGreaterEqual(len(log.read_text().splitlines()), 8)
-        self.assertFalse(log.with_suffix(".other").exists())
+        self.assertGreaterEqual(len(log.read_text().splitlines()), 4)
+        # verify_helper.py runs many commands in one process, so each read uses the log its environment names.
+        other = log.with_name(log.name + ".other")
+        self.assertEqual(set(other.read_text().splitlines()), {"example"})
+        self.assertGreaterEqual(len(other.read_text().splitlines()), 4)
 
     def test_config_read_log_context_restores_the_cached_destination(self) -> None:
         self.write("value=one\n")

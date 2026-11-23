@@ -1648,8 +1648,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         metadata.parent.mkdir()
         _ = subprocess.run(["git", "clone", "-q", "--separate-git-dir", str(metadata),
                             str(self.repo), str(separate)], check=True)
-        target_settings = conf.ConfigRead(self.root / "mac_test.conf", self.root / "mac_test.conf",
-                                          conf.settings("offload=on\nlinux_only..claude=\nlinux_only.metadata=\n"), False)
+        target_settings = conf.ConfigRead(self.root / "mac_test.conf",
+                                          conf.settings("offload=on\nlinux_only..claude=\nlinux_only.metadata=\n"))
         with mock.patch.object(eligibility, "read_target_settings", return_value=target_settings):
             for checkout in (self.checkout, self.repo, separate):
                 with self.subTest(checkout=checkout.name):
@@ -1774,8 +1774,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_wait_reservation_retry_keeps_the_exact_claim_after_an_origin_change(self) -> None:
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
-        target_settings = conf.ConfigRead(self.root / "mac_test.conf", self.root / "mac_test.conf",
-                                          conf.settings("offload=on\nlinux_only.checkout=\n"), False)
+        target_settings = conf.ConfigRead(self.root / "mac_test.conf",
+                                          conf.settings("offload=on\nlinux_only.checkout=\n"))
         for assigned in (True, False):
             with self.subTest(assigned=assigned):
                 git = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
