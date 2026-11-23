@@ -3570,6 +3570,8 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     send.assert_not_called()
 
     def test_lost_nextest_permission_reply_releases_the_unused_command_fence(self) -> None:
+        from dataclasses import replace
+
         from scripts.build_hold.owning_session import NoOwningSession
         from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
         from scripts.copies import copies
@@ -3625,6 +3627,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             raise wire.AdmissionUnavailable("fixture lost the reply")
 
         config = eligibility.read_config(Path(os.environ["MAC_TEST_CONFIG"]))
+        config = replace(config, connection=replace(config.connection, host="claim-mac"))
         with (mock.patch.object(offload, "probe_mac", side_effect=prepare),
               mock.patch.object(offload, "ensure_mac_disk_floor", return_value=offload.MacDiskReady(100)),
               mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
@@ -3635,6 +3638,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
               mock.patch.object(controller, "stream_mac_run") as stream, redirect_stdout(io.StringIO())):
             result = offload.claimed_run(controller, config, request, eligibility.KnownRepository("alpha"), time.monotonic())
         self.assertIsInstance(result, offload.DeclinedMacRun)
+        self.assertEqual(controller.attempt_evidence.cleanup, "unconfirmed")
         stream.assert_not_called()
         self.assertFalse(fence.with_suffix(".group").exists())
         self.assertTrue(self.paths.run.exists())

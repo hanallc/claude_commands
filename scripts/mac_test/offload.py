@@ -3130,13 +3130,11 @@ def claimed_run(
             report_leftover_check(checked, request)
         raise
     finally:
-        evidence.cleanup = "confirmed" if release_allowed else "unconfirmed"
-        evidence.evidence_at = time.time()
-        if release_allowed:
-            evidence.unresolved_count = 0
-        if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
+        can_release = release_allowed and isinstance(controller.pending, SettledDispatchOperations)
+        if can_release:
             released = release_claim(controller, request.target)
             if isinstance(released, ClaimReleaseUnconfirmed):
+                can_release = False
                 retain_mac_claim_for_watcher(controller, request.target, config.host)
             if sync_after_release:
                 from scripts.buildlog import sync as buildlog_sync
@@ -3145,6 +3143,10 @@ def claimed_run(
                     buildlog_sync.sync_target(request.target)
         else:
             retain_mac_claim_for_watcher(controller, request.target, config.host)
+        evidence.cleanup = "confirmed" if can_release else "unconfirmed"
+        evidence.evidence_at = time.time()
+        if can_release:
+            evidence.unresolved_count = 0
 
 
 def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
