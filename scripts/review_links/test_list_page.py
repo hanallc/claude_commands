@@ -7725,7 +7725,9 @@ try{
    check(form.elements.words.value==='New draft during send','a newer draft survives the send');
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
   }
-  check(!form.querySelector('[data-send-status]').textContent,'The saved action shows no status message: '+action);
+  const savedStatus=form.querySelector('[data-send-status]').textContent;
+  if(action==='tell') check(savedStatus==='sent to morty','The saved Tell names its producer: '+savedStatus);
+  else check(!savedStatus,'The saved action shows no status message: '+action);
   if(action==='remove' || action==='park'){
    check(!recordIsOpen(row) && row.querySelector('[data-detail]').hidden,
     'The saved action collapses the row: '+action);

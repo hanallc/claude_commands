@@ -461,7 +461,7 @@ class TheListTests(unittest.TestCase):
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
                     + f"Run `{launcher} update --id L{number}` to update it. "
                     + "Use any of `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, "
-                    + "`--evidence`, `--add-evidence`."))
+                    + "`--evidence`, `--add-evidence`, `--title`, `--done-when`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)

@@ -424,7 +424,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     producer_name = owner_name(members, entry.item.producer)
     producer_label = html.escape(producer_name, quote=True)
     words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
-    return (f'<form method="post" data-recipient-name="{producer_label}" data-feedback-form>' + hidden
+    return (f'<form method="post" data-feedback-form data-recipient-name="{producer_label}">' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
