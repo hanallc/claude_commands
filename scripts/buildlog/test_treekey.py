@@ -154,8 +154,9 @@ class TreeKeyTests(unittest.TestCase):
         self.assertEqual(list(marks.iterdir()), [])
         self.assertEqual(untrusted, key(self.repo))
         self.assertEqual(sorted(path.name for path in marks.iterdir()), ["filter", "fsmonitor"])
+        # A driver name with = no longer stops the key: the environment keeps the key and the value apart.
         _ = git("config", "filter.a=b.clean", str(self.base / "filter"), cwd=self.repo)
-        self.assertIsNone(treekey.tree_key(str(self.repo), checkout_programs=False))
+        self.assertEqual(treekey.tree_key(str(self.repo), checkout_programs=False), untrusted)
 
     def test_a_key_without_checkout_programs_does_not_read_submodule_work_trees(self) -> None:
         _ = git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(self.clone), "sub", cwd=self.repo)

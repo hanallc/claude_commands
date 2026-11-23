@@ -29,7 +29,7 @@ in a submodule reads the submodule config), and git fetches no missing object.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 import hashlib
 import os
 import subprocess
@@ -42,10 +42,9 @@ GIT_TIMEOUT_S = 10
 NO_FETCH_ENVIRONMENT = {"GIT_NO_LAZY_FETCH": "1"}
 
 
-def git(directory: str, *args: str, options: Sequence[str] = (),
-        environment: Mapping[str, str] | None = None) -> subprocess.Popen[bytes]:
+def git(directory: str, *args: str, environment: Mapping[str, str] | None = None) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
-        ["git", "--no-optional-locks", *options, "-C", directory, *args],
+        ["git", "--no-optional-locks", "-C", directory, *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -53,22 +52,24 @@ def git(directory: str, *args: str, options: Sequence[str] = (),
     )
 
 
-def no_program_options(directory: str, environment: Mapping[str, str]) -> list[str] | None:
-    """The options that turn off the fsmonitor and each filter driver of the config, or None.
+def no_program_environment(directory: str, environment: Mapping[str, str]) -> dict[str, str] | None:
+    """The environment that turns off the fsmonitor and each filter driver of the config, or None.
 
-    A driver name with = cannot be given to -c, so it gives None.
+    GIT_CONFIG_COUNT has the scope of -c, so it wins over every config file of the checkout.
     """
     drivers = finish([git(directory, "config", "--null", "--name-only", "--get-regexp",
                           r"^filter\..+\.(clean|process)$", environment=environment)], missing_ok=True)
     if drivers is None:
         return None
-    options = ["-c", "core.fsmonitor=false"]
+    settings = [("core.fsmonitor", "false")]
     for driver in sorted({name.rpartition(b".")[0] for name in drivers[0].split(b"\0") if name}):
-        if b"=" in driver:
-            return None
         name = os.fsdecode(driver)
-        options += ["-c", f"{name}.clean=", "-c", f"{name}.process=", "-c", f"{name}.required=false"]
-    return options
+        settings += [(f"{name}.clean", ""), (f"{name}.process", ""), (f"{name}.required", "false")]
+    result = {**environment, "GIT_CONFIG_COUNT": str(len(settings))}
+    for index, (key, value) in enumerate(settings):
+        result[f"GIT_CONFIG_KEY_{index}"] = key
+        result[f"GIT_CONFIG_VALUE_{index}"] = value
+    return result
 
 
 def finish(processes: list[subprocess.Popen[bytes]], *, missing_ok: bool = False) -> list[bytes] | None:
@@ -112,21 +113,20 @@ def committed_tree_key(tree_id: bytes) -> str:
 
 def tree_key(directory: str, *, checkout_programs: bool = True) -> str | None:
     """The key of the worktree; with checkout_programs=False, git runs no program that the checkout names."""
-    options: list[str] = []
     submodules: list[str] = []
     environment = None if checkout_programs else {**os.environ, **NO_FETCH_ENVIRONMENT}
     try:
         if environment is not None:
-            found = no_program_options(directory, environment)
-            if found is None:
+            environment = no_program_environment(directory, environment)
+            if environment is None:
                 return None
-            options, submodules = found, ["--ignore-submodules=dirty"]
+            submodules = ["--ignore-submodules=dirty"]
         processes = [
-            git(directory, "rev-parse", "--show-toplevel", "HEAD^{tree}", options=options, environment=environment),
+            git(directory, "rev-parse", "--show-toplevel", "HEAD^{tree}", environment=environment),
             # Staged, unstaged, deleted and untracked alike, every untracked file
             # by name; porcelain names paths from the top in any folder.
             git(directory, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames", *submodules,
-                options=options, environment=environment),
+                environment=environment),
         ]
     except OSError:
         return None
