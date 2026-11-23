@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -275,6 +276,12 @@ class NewItemTests(unittest.TestCase):
                     with self.subTest(start=start, flags=flags):
                         code, output, errors = self.run_main("scheduled", "natedev", f"Check the chart. {start}", *flags)
                         self.assertEqual((code, output, errors), (new_item.Outcome.REFUSED, "", f"new_item: {reason}\n"))
+            exited = replace(BOB, exited=staff.Exited("2026-11-20", "nate", "Test exit"))
+            for members in (replace(MEMBERS, pending_retire=(BOB.id,)), replace(MEMBERS, rows=tuple(
+                    exited if row == BOB else row for row in MEMBERS.rows))):
+                with self.subTest(pending=bool(members.pending_retire)), mock.patch.object(staff, "snapshot", return_value=members):
+                    result = self.run_main("scheduled", "natedev", "Check the chart. Start Fri Nov 27 13:00.")
+                    self.assertEqual(result, (new_item.Outcome.REFUSED, "", "new_item: bob is unavailable. Choose another recipient.\n"))
             self.assertEqual(the_list.records(MORTY.id), [])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 

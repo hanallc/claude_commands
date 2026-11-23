@@ -1214,17 +1214,22 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     elif choice == new_item_dialog.PageRecipient.SELECTED:
-        row = _recipient(identity, members)
-        if (row.id not in members.rows_by_id or not _page_owner_is_active(row, members)
-                or not _submission_owner_is_active(row, members)):
-            raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
-        return row
+        return selected_recipient(identity, members)
     elif page and page != "list":
         configured = page_owner(page, conf.read_or_repository("console"), members)
         if isinstance(configured, PageOwnerUnavailable):
             raise SubmissionConflict("The page owner is unavailable. Open New item again.")
         identity = configured.id
     return _active_recipient(identity, members)
+
+
+def selected_recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
+    """Require the selected recipient to be available to receive a new item."""
+    row = _recipient(identity, members)
+    if (row.id not in members.rows_by_id or not _page_owner_is_active(row, members)
+            or not _submission_owner_is_active(row, members)):
+        raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
+    return row
 
 
 def _active_recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:

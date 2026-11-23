@@ -41,9 +41,9 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
-from scripts.lib import atomic_file, conf, file_lock, scratch
+from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
-from scripts.production import change_routing, change_review, staff, tidy_wrapped
+from scripts.production import change_routing, change_review, investigation, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
@@ -60,6 +60,99 @@ QUEUE_MOVE_PATH = "/console/builds/queue-move"
 SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
 STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
+
+
+# Use the native submission store and its per-draft lock for Scheduled Sends.
+submission_draft_folder = cast(Callable[[str], Path], getattr(review_submissions, "_request_folder"))
+
+
+@dataclass(frozen=True)
+class ScheduledDraftDetails:
+    fingerprint: str
+    keeper: staff.StaffId
+    assignment: str
+    readback: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class PendingScheduledDraft(ScheduledDraftDetails):
+    """The Scheduled payload is claimed. The receipt is pending."""
+
+
+class ScheduledNoticeState(Enum):
+    PENDING = "pending"
+    STARTED = "started"
+    FINISHED = "finished"
+
+
+@dataclass(frozen=True)
+class SavedScheduledDraft(ScheduledDraftDetails):
+    id: str
+    notice: ScheduledNoticeState = ScheduledNoticeState.PENDING
+    notice_warning: str = ""
+
+    def response(self) -> dict[str, object]:
+        return {"id": self.id, "list_key": f"{self.keeper}/{self.id}",
+                "receipt": new_item.filing_receipt(self.assignment, self.id), "readback": self.readback,
+                "notice_warning": self.notice_warning}
+
+
+@dataclass(frozen=True)
+class NativeDraftClaim:
+    saved_id: str
+
+
+class NoDraftClaim(Enum):
+    UNCLAIMED = "unclaimed"
+
+
+def read_scheduled_draft(folder: Path) -> PendingScheduledDraft | SavedScheduledDraft | NativeDraftClaim | NoDraftClaim:
+    """Read the pending claim or the receipt for a New item draft."""
+    for filename in ("receipt.json", "pending.json"):
+        path = folder / filename
+        try:
+            data = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        if not isinstance(data, dict):
+            raise OSError(f"Cannot read the New item draft at {path}.")
+        fields = cast(dict[str, object], data)
+        identity = fields.get("id")
+        if fields.get("kind") != new_item_dialog.SCHEDULED_KIND:
+            return NativeDraftClaim(identity if filename == "receipt.json" and isinstance(identity, str)
+                                    and re.fullmatch(r"[QPI][1-9][0-9]*", identity) else "")
+        fingerprint, keeper = fields.get("fingerprint"), fields.get("keeper")
+        assignment, readback = fields.get("assignment"), fields.get("readback")
+        if (not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                or not isinstance(keeper, str) or not isinstance(assignment, str)
+                or not isinstance(readback, list) or len(cast(list[object], readback)) != 2):
+            raise OSError(f"Cannot read the Scheduled draft at {path}.")
+        start, repeat = cast(list[object], readback)
+        if not isinstance(start, str) or not isinstance(repeat, str):
+            raise OSError(f"Cannot read the Scheduled read-back at {path}.")
+        owner = the_list.staff_id(keeper, "List keeper")
+        if filename == "pending.json":
+            return PendingScheduledDraft(fingerprint, owner, assignment, (start, repeat))
+        notice, warning = fields.get("notice"), fields.get("notice_warning")
+        if (not isinstance(identity, str) or not re.fullmatch(r"L[1-9][0-9]*", identity)
+                or not isinstance(notice, str) or not isinstance(warning, str)):
+            raise OSError(f"Cannot read the Scheduled receipt at {path}.")
+        return SavedScheduledDraft(fingerprint, owner, assignment, (start, repeat), identity,
+                                   ScheduledNoticeState(notice), warning)
+    if (folder / "list-receipt-key").exists() or (folder / "moved.json").exists():
+        return NativeDraftClaim("")
+    return NoDraftClaim.UNCLAIMED
+
+
+def write_scheduled_draft(folder: Path, draft: PendingScheduledDraft | SavedScheduledDraft) -> None:
+    """Publish the Scheduled claim or receipt under the draft lock."""
+    fields = {"kind": new_item_dialog.SCHEDULED_KIND, **asdict(draft)}
+    filename = "pending.json"
+    if isinstance(draft, SavedScheduledDraft):
+        fields["notice"] = draft.notice.value
+        filename = "receipt.json"
+    atomic_file.write_text_atomic(folder / filename, json.dumps(fields), new_file_mode=0o600)
+    atomic_file.sync_folder(folder)
 
 
 def published_console_page(root: Path, path: str) -> str:
@@ -1802,6 +1895,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": f"{error} Try Send again."})
             return
         except (OSError, ValueError, RuntimeError, TypeError) as error:
+            if isinstance(error, OSError) and valid_token and self.recover_scheduled_kind_conflict(draft):
+                return
             print(f"review-links New item Send: {error}", file=sys.stderr)
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
@@ -1832,45 +1927,99 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                                  attached=review_submissions.PAGE_SCREENSHOT in details.images)
 
     def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
-        """File one Scheduled item for each browser draft."""
-        fingerprint = hashlib.sha256(json.dumps([request.recipient_id, request.words]).encode()).hexdigest()
-        folder = server.store_folder / ".scheduled-drafts"
-        path = folder / f"{request.request_id}.json"
+        """File or recover a Scheduled item under the shared draft lock."""
+        fingerprint = hashlib.sha256(json.dumps([request.page, request.recipient_id, request.words]).encode()).hexdigest()
         try:
             with server.list_store_access(), server.staff_read_scope():
-                folder.mkdir(mode=0o700, exist_ok=True)
-                with file_lock.exclusive(folder / ".lock"):
-                    if path.exists():
-                        record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-                        response = record.get("response")
-                        if not isinstance(response, dict):
-                            self.json_response(409, {"error": "The save is unconfirmed. Check the List before sending again."})
-                            return
-                        result = cast(dict[str, object], response)
-                        if record.get("fingerprint") != fingerprint:
-                            self.new_item_saved(result, str(result["id"]), True)
-                            return
-                    else:
-                        # Keep the claim if a file error leaves the save result unknown.
-                        atomic_file.write_text_atomic(path, json.dumps({"fingerprint": fingerprint}), new_file_mode=0o600)
-                        try:
-                            saved = new_item.create_scheduled(request.recipient_id, request.words)
-                        except new_item.FilingRefused:
-                            path.unlink()
-                            raise
-                        result = {"id": saved.id, "list_key": saved.list_key,
-                                  "readback": saved.readback, "notice_warning": saved.notice_warning}
-                        atomic_file.write_text_atomic(path, json.dumps({"fingerprint": fingerprint, "response": result}),
-                                                      new_file_mode=0o600)
+                folder = submission_draft_folder(request.request_id)
+                folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with exclusive(folder / ".lock"):
+                    claim = read_scheduled_draft(folder)
+                    if isinstance(claim, NativeDraftClaim):
+                        self.other_kind_draft(claim.saved_id)
+                        return
+                    if isinstance(claim, SavedScheduledDraft) and claim.fingerprint != fingerprint:
+                        self.new_item_saved(claim.response(), claim.id, True)
+                        return
+                    if isinstance(claim, PendingScheduledDraft) and claim.fingerprint != fingerprint:
+                        self.other_kind_draft()
+                        return
+                    saved = self.finish_scheduled_draft(folder, request, fingerprint, claim)
         except new_item.FilingRefused as error:
-            status = 400 if error.outcome is new_item.Outcome.REFUSED else 409
+            status = 400 if error.reason is new_item.FilingRefusal.INVALID_SCHEDULE else 409
             self.json_response(status, {"error": str(error)})
             return
-        except (OSError, ValueError, KeyError, TypeError, staff.StaffRefused) as error:
-            print(f"review-links Scheduled Send: {error}", file=sys.stderr)
-            self.json_response(503, {"error": f"Could not confirm the Scheduled save. {new_item.MAY_BE_FILED}"})
+        except new_item_dialog.SubmissionConflict as error:
+            self.json_response(409, {"error": str(error)})
             return
-        self.new_item_saved(result, str(result["id"]), False)
+        except new_item_dialog.SubmissionError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        except (OSError, ValueError, TypeError, staff.StaffRefused) as error:
+            print(f"review-links Scheduled Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
+            return
+        self.new_item_saved(saved.response(), saved.id, False)
+
+    def finish_scheduled_draft(self, folder: Path, request: new_item_dialog.ScheduledSubmission, fingerprint: str,
+                               claim: NoDraftClaim | PendingScheduledDraft | SavedScheduledDraft) -> SavedScheduledDraft:
+        if isinstance(claim, SavedScheduledDraft):
+            saved = claim
+        else:
+            identity = new_item.ScheduledDraftIdentity(request.request_id)
+            item = (identity.saved_item(claim.keeper) if isinstance(claim, PendingScheduledDraft)
+                    else new_item.UnfiledScheduledDraft.UNSAVED)
+            if isinstance(item, new_item.UnfiledScheduledDraft):
+                with investigation.recipient_locks(request.recipient_id):
+                    try:
+                        members = staff.snapshot()
+                        owner = review_submissions.selected_recipient(request.recipient_id, members)
+                        filing = new_item.prepare_scheduled(owner, request.words, members)
+                    except (new_item.FilingRefused, new_item_dialog.SubmissionError):
+                        (folder / "pending.json").unlink(missing_ok=True)
+                        atomic_file.sync_folder(folder)
+                        raise
+                    claim = PendingScheduledDraft(fingerprint, filing.keeper, filing.assignment, filing.readback)
+                    write_scheduled_draft(folder, claim)
+                    item = filing.save(identity)
+            assert isinstance(claim, PendingScheduledDraft)
+            saved = SavedScheduledDraft(claim.fingerprint, claim.keeper, claim.assignment, claim.readback, item.id)
+            write_scheduled_draft(folder, saved)
+        if saved.notice is ScheduledNoticeState.PENDING:
+            (folder / "pending.json").unlink(missing_ok=True)
+            item = the_list.load(saved.keeper, saved.id)
+            write_scheduled_draft(folder, replace(saved, notice=ScheduledNoticeState.STARTED))
+            warning = new_item.scheduled_notice(item, saved.keeper, staff.snapshot())
+            saved = replace(saved, notice=ScheduledNoticeState.FINISHED, notice_warning=warning)
+            write_scheduled_draft(folder, saved)
+        elif saved.notice is ScheduledNoticeState.STARTED:
+            saved = replace(saved, notice_warning="The assignment notice result is unconfirmed. The List item is saved.")
+        return saved
+
+    def other_kind_draft(self, saved_id: str = "") -> None:
+        if saved_id:
+            self.new_item_saved({"id": saved_id}, saved_id, True)
+        else:
+            self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
+
+    def recover_scheduled_kind_conflict(self, draft: object) -> bool:
+        if not isinstance(draft, str) or not review_submissions.is_draft_id(draft):
+            return False
+        try:
+            folder = submission_draft_folder(draft)
+            if not folder.is_dir():
+                return False
+            with exclusive(folder / ".lock"):
+                claim = read_scheduled_draft(folder)
+        except (OSError, ValueError):
+            return False
+        if isinstance(claim, SavedScheduledDraft):
+            self.new_item_saved(claim.response(), claim.id, True)
+            return True
+        if isinstance(claim, PendingScheduledDraft):
+            self.other_kind_draft()
+            return True
+        return False
 
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
         if edited:

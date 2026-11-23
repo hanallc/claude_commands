@@ -763,6 +763,7 @@ class ScheduledSubmission:
     request_id: str
     recipient_id: staff.StaffId
     words: str
+    page: str
 
 
 def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
@@ -775,7 +776,7 @@ def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
     recipient = staff.StaffId(_text(fields.get("recipient_id"), "Recipient ID", 128))
     check_recipient_id(recipient)
     return ScheduledSubmission(read_request_id(fields.get("request_id")), recipient,
-                               read_words(fields.get("words"), "Your words"))
+                               read_words(fields.get("words"), "Your words"), page)
 
 
 KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
@@ -898,7 +899,7 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 #review-new-item .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
 #review-new-item [data-scheduled-help] { margin: 0; color: var(--ink-2); }
-#review-new-item .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
+#review-new-item.scheduled-locked .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item [data-recipient-group] { display: flow-root; }
@@ -1001,6 +1002,7 @@ SCRIPT = r'''(() => {
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  const listSendKey = 'console.list.pending-send';
+ const submittedKey = 'console.new-item.submitted';
  const listDraftId = /^r6-[0-9a-f]{32}$/;
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '';
@@ -1008,7 +1010,8 @@ SCRIPT = r'''(() => {
  let selectedRecipient = '';
  let pageOwner = '';
  let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
- let awaitingEarlierSend = false;
+ let awaitingEarlierSend = false, submittedDraft;
+ let draftDatabase;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -1029,6 +1032,12 @@ SCRIPT = r'''(() => {
  function updateSend() {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
+  const recovering = pendingItem?.kind === 'scheduled';
+  const locked = recovering || (scheduled && !!savedItem);
+  dialog.classList.toggle('scheduled-locked', locked);
+  words.readOnly = locked;
+  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
+  send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
   sentDetails.hidden = scheduled;
   scheduledHelp.hidden = !scheduled || !!savedItem;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
@@ -1037,7 +1046,7 @@ SCRIPT = r'''(() => {
     ? awaitingEarlierSend || Boolean(pendingItem && pendingItem.kind !== 'scheduled')
     : pendingItem?.kind === 'scheduled');
   }
-  send.disabled = !!savedItem || sending || !token || (scheduled && awaitingEarlierSend) || (!pendingItem &&
+  send.disabled = !!savedItem || sending || !token || (scheduled && awaitingEarlierSend && !recovering) || (!pendingItem &&
     (!recipient || !words.value.trim() || words.value.length > words.maxLength));
  }
 
@@ -1046,8 +1055,12 @@ SCRIPT = r'''(() => {
   const proposal = form.elements.kind.value === 'proposal';
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
-   selectedRecipient = null;
-   storeListDraft();
+   if (pendingItem?.kind === 'scheduled' && selectedRecipient === pendingItem.recipient_id) {
+    available.push({id: selectedRecipient, name: submittedDraft?.recipientName || selectedRecipient});
+   } else {
+    selectedRecipient = null;
+    storeListDraft();
+   }
   }
   recipientChips.replaceChildren();
   for (const recipient of available) {
@@ -1077,7 +1090,7 @@ SCRIPT = r'''(() => {
  }
 
  function editDraft(event) {
-  if (sending) return;
+  if (sending || pendingItem?.kind === 'scheduled') return;
   if (pendingItem) pendingEdited = true;
   if (event?.target.name === 'kind') {
    showRecipients();
@@ -1157,7 +1170,7 @@ SCRIPT = r'''(() => {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   failure.definiteRefusal = response.status >= 400 && response.status < 500;
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
@@ -1464,7 +1477,62 @@ SCRIPT = r'''(() => {
   } catch (_) {}
  }
 
+ function draftTransaction(mode, action) {
+  draftDatabase ||= new Promise((resolve, reject) => {
+   const request = indexedDB.open('console.new-item', 1);
+   request.onupgradeneeded = () => request.result.createObjectStore('submitted');
+   request.onsuccess = () => resolve(request.result);
+   request.onerror = () => reject(request.error);
+  });
+  return draftDatabase.then(database => new Promise((resolve, reject) => {
+   const transaction = database.transaction('submitted', mode);
+   const request = action(transaction.objectStore('submitted'));
+   transaction.oncomplete = () => resolve(request.result);
+   transaction.onabort = () => reject(transaction.error);
+  }));
+ }
+
+ async function storeSubmittedDraft(payload) {
+  const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
+  const draft = {payload, recipientName, selectedKind: form.elements.kind.value};
+  const earlier = sessionStorage.getItem(submittedKey);
+  let pointer;
+  try {
+   sessionStorage.setItem(submittedKey, JSON.stringify(draft));
+  } catch (failure) {
+   if (failure?.name !== 'QuotaExceededError') throw failure;
+   await draftTransaction('readwrite', store => store.put(draft, payload.request_id));
+   pointer = payload.request_id;
+   sessionStorage.setItem(submittedKey, pointer);
+  }
+  if (earlier && listDraftId.test(earlier) && earlier !== pointer) {
+   void draftTransaction('readwrite', store => store.delete(earlier)).catch(() => {});
+  }
+  submittedDraft = draft;
+ }
+
+ async function restoreSubmittedDraft() {
+  if (submittedDraft) return submittedDraft;
+  const stored = sessionStorage.getItem(submittedKey);
+  if (!stored) return;
+  const draft = listDraftId.test(stored)
+   ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
+  if (listDraftId.test(draft?.payload?.request_id || '')) submittedDraft = draft;
+  else throw new Error('Could not restore the submitted New item.');
+  return submittedDraft;
+ }
+
+ function clearSubmittedDraft() {
+  const stored = sessionStorage.getItem(submittedKey);
+  sessionStorage.removeItem(submittedKey);
+  submittedDraft = undefined;
+  if (stored && listDraftId.test(stored)) {
+   void draftTransaction('readwrite', store => store.delete(stored)).catch(() => {});
+  }
+ }
+
  function finishDraft() {
+  clearSubmittedDraft();
   draftId = deferredCapture = pendingItem = undefined;
   awaitingEarlierSend = false;
   pendingEdited = false;
@@ -1478,13 +1546,12 @@ SCRIPT = r'''(() => {
   const saved = Boolean(item);
   const scheduled = saved && item.id.startsWith('L');
   confirmation.textContent = scheduled
-   ? ['Saved List item ' + item.id.slice(1) + '.', ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
+   ? ['Saved List item ' + item.id.slice(1) + '.', item.receipt?.replace(/ List item [1-9][0-9]*\.$/, ''),
+      ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
    : saved ? 'Saved ' + item.id + '.' : '';
   confirmation.hidden = savedControls.hidden = !saved;
   body.hidden = saved && !scheduled;
   sendControls.hidden = saved;
-  words.readOnly = scheduled;
-  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = scheduled;
   updateSend();
   if (saved) done.focus();
  }
@@ -1514,7 +1581,6 @@ SCRIPT = r'''(() => {
  function setSending(value) {
   sending = value;
   for (const control of [...fields, ...previews.querySelectorAll('button')]) control.disabled = value;
-  send.textContent = value ? 'Sending…' : 'Send';
   form.setAttribute('aria-busy', String(value));
   updateSend();
  }
@@ -1559,9 +1625,31 @@ SCRIPT = r'''(() => {
   focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
+   const restored = await restoreSubmittedDraft();
+   if (controller.signal.aborted) return;
+   const original = restored?.payload;
+   if (original) {
+    const changedPage = original.page !== page;
+    if (original.kind === 'scheduled' || (!keepDraft && original.page !== 'list') || original.defer_capture || changedPage) {
+     pendingItem = original;
+    }
+    draftId = original.request_id;
+    ownerPage = original.page;
+    awaitingEarlierSend = true;
+    if (changedPage) pageContext = undefined;
+    if ((!keepDraft && !words.value) || original.kind === 'scheduled') {
+     form.elements.kind.value = restored.selectedKind || original.kind;
+     selectedRecipient = original.recipient_id;
+     words.value = original.words;
+    }
+    if (original.kind === 'scheduled') setError('Retry to confirm the Scheduled save.');
+    showBugPage();
+    showSentDetails();
+    updateSend();
+   }
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) selectedRecipient = data.page_owner || '';
+   if (newDraft && !original) selectedRecipient = data.page_owner || '';
    setOptions(data);
    startCapture();
    showSentDetails();
@@ -1587,10 +1675,7 @@ SCRIPT = r'''(() => {
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
                    page: ownerPage, page_recipient: 'selected'};
   storeListDraft();
-  if (kind === 'scheduled') {
-   pendingItem = payload;
-   return payload;
-  }
+  if (kind === 'scheduled') return payload;
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
@@ -1619,17 +1704,17 @@ SCRIPT = r'''(() => {
   setSending(true);
   try {
    const item = await submissionPayload();
-   if (item.kind !== 'scheduled') {
-    awaitingEarlierSend = true;
-    storeListDraft();
-   }
+   if (!submittedDraft || submittedDraft.payload !== item) await storeSubmittedDraft(item);
+   if (item.kind === 'scheduled') pendingItem = item;
+   awaitingEarlierSend = true;
+   storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
    const sendItem = () => post({...item, token});
    let result;
    try {
     result = await sendItem();
    } catch (failure) {
-    if (onList || !failure?.staleToken) throw failure;
+    if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
     if (!pendingItem && selectedRecipient !== item.recipient_id) return;
@@ -1643,8 +1728,11 @@ SCRIPT = r'''(() => {
   } catch (failure) {
    if (failure?.definiteRefusal) {
     if (!failure.staleToken) {
+     const scheduled = pendingItem?.kind === 'scheduled';
+     clearSubmittedDraft();
      pendingItem = deferredCapture = undefined;
      pendingEdited = false;
+     if (scheduled) showRecipients();
     }
     awaitingEarlierSend = failure.staleToken && hadEarlierSend;
     storeListDraft();

@@ -3118,6 +3118,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("producer_map"), f"{showrunner.id}={producer.id}\n")
         _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
         # The dialog sends Feedback as an Investigation.
         kinds = [kind if kind != "feedback" else new_item_dialog.SubmissionKind.INVESTIGATION
                  for kind, _, _ in new_item_dialog.KINDS]
@@ -3167,6 +3168,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                                                  ("Check the Scheduled item.", "FREQ=DAILY"))
                                 self.assertEqual(result["readback"], [
                                     "Starts: Mon Nov 30 2099 09:00 UTC (04:00 EST)", "Repeats: Daily"])
+                                self.assertIn(f"List item {item.number}.", str(result["receipt"]))
+                                if owner == showrunner.id:
+                                    self.assertIn("Producer: producer (set for", str(result["receipt"]))
                                 count = len(the_list.records(morty.id))
                                 repeat = self.new_item_http(encoded, finished=True)
                                 self.assertEqual((repeat.status, json.loads(repeat.body)), (200, result))
@@ -3185,6 +3189,66 @@ class ReviewLinksServerTests(unittest.TestCase):
                                               request_id="r6-" + uuid4().hex)
                             response = self.new_item_http(self.new_item_body(request), finished=True)
                             self.assertEqual(response.status, 200, response.body)
+            scheduled = {"token": self.server.new_item_token, "kind": "scheduled", "page": "builds",
+                         "page_recipient": "selected", "recipient_id": showrunner.id,
+                         "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
+            draft = "r6-" + uuid4().hex
+            bug = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, showrunner.id), page="builds",
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED, request_id=draft)
+            first = self.new_item_http(self.new_item_body(bug), finished=True)
+            self.assertEqual(first.status, 200, first.body)
+            before = {item.id for item in the_list.records(morty.id)}
+            denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft}).encode(), finished=True)
+            self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, json.loads(first.body)["id"]))
+            self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+            for failure in ("List write", "receipt write"):
+                with self.subTest(failure=failure):
+                    draft = "r6-" + uuid4().hex
+                    body = json.dumps({**scheduled, "request_id": draft}).encode()
+                    before = {item.id for item in the_list.records(morty.id)}
+                    notices.clear()
+                    write = serve.write_scheduled_draft
+
+                    def fail_receipt(folder: Path, claim: serve.PendingScheduledDraft | serve.SavedScheduledDraft) -> None:
+                        if isinstance(claim, serve.SavedScheduledDraft):
+                            raise OSError("The receipt write failed.")
+                        write(folder, claim)
+
+                    with (patch.object(the_list, "add", side_effect=OSError("The List write failed."))
+                          if failure == "List write" else patch.object(serve, "write_scheduled_draft", fail_receipt)):
+                        reply = self.new_item_http(body, finished=True)
+                    self.assertEqual(reply.status, 503, reply.body)
+                    self.assertEqual(notices, [])
+                    saved_before_retry = {item.id for item in the_list.records(morty.id)} - before
+                    self.assertEqual(len(saved_before_retry), int(failure == "receipt write"))
+                    native = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, showrunner.id),
+                                     page="builds", page_recipient=new_item_dialog.PageRecipient.SELECTED,
+                                     request_id=draft)
+                    denied = self.new_item_http(self.new_item_body(native), finished=True)
+                    self.assertEqual((denied.status, json.loads(denied.body)["code"]), (409, "draft_pending"))
+                    reply = self.new_item_http(body, finished=True)
+                    self.assertEqual(reply.status, 200, reply.body)
+                    receipt = cast(dict[str, object], json.loads(reply.body))
+                    self.assertEqual({item.id for item in the_list.records(morty.id)} - before, {receipt["id"]})
+                    self.assertTrue(saved_before_retry <= {receipt["id"]})
+                    self.assertEqual(notices, [producer.id, showrunner.id])
+                    denied = self.new_item_http(self.new_item_body(native), finished=True)
+                    self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, receipt["id"]))
+
+            members = staff.snapshot()
+            before = {item.id for item in the_list.records(morty.id)}
+            for row in (showrunner, producer):
+                exited = replace(row, exited=staff.Exited("2026-11-20", "nate", "Test exit"))
+                for unavailable in (replace(members, pending_retire=(row.id,)), replace(members, rows=tuple(
+                        exited if member.id == row.id else member for member in members.rows))):
+                    with self.subTest(recipient=row.name, pending=bool(unavailable.pending_retire)), patch.object(
+                            staff, "snapshot", return_value=unavailable):
+                        body = json.dumps({**scheduled, "request_id": "r6-" + uuid4().hex}).encode()
+                        denied = self.new_item_http(body, finished=True)
+                        self.assertEqual(denied.status, 409, denied.body)
+                        refusal = cast(dict[str, object], json.loads(denied.body))
+                        self.assertIn(f"{row.name} is unavailable.", str(refusal["error"]))
+            self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
 
     def test_standard_new_item_refuses_the_list_producer_with_an_unreadable_document(self) -> None:
         case = self.review_fixture()

@@ -11,10 +11,9 @@ import re
 import secrets
 import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time
-from enum import IntEnum, StrEnum
+from enum import Enum, IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -22,7 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, producer_map, repeat_rule, staff, the_list
-from scripts.review_links import for_you, new_item_dialog, review_page
+from scripts.review_links import for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
@@ -326,13 +325,22 @@ def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, 
 def result_line(item_type: ItemType | Literal["scheduled"], member: staff.StaffRow, mapped: producer_map.MappedProducer,
                 members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
     """Say who does the work, who tracks it and why, and the List item number."""
+    assignment = assignment_receipt(item_type, member, mapped, members, this_session=this_session)
+    return filing_receipt(assignment, list_key.partition("/")[2])
+
+
+def assignment_receipt(item_type: ItemType | Literal["scheduled"], member: staff.StaffRow,
+                       mapped: producer_map.MappedProducer, members: staff.StaffSnapshot, *, this_session: bool) -> str:
     to = unit_of(member, members) + (", this session" if this_session else "")
     producer = ""
     if member.kind != "producer":
         why = "set for" if mapped.set_by == member else "from"
         producer = f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
-    number = list_key.partition("/")[2].removeprefix("L")
-    return f"{item_type.capitalize()} → {to}.{producer} List item {number}."
+    return f"{item_type.capitalize()} → {to}.{producer}"
+
+
+def filing_receipt(assignment: str, identity: str) -> str:
+    return f"{assignment} List item {identity.removeprefix('L')}."
 
 
 def console_address() -> for_you.ConsoleAddress:
@@ -440,29 +448,40 @@ def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.Map
         _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
 
 
+class FilingRefusal(StrEnum):
+    INVALID_SCHEDULE = "invalid schedule"
+    UNKNOWN_ASSIGNEE = "unknown assignee"
+    UNMAPPED_PRODUCER = "unmapped producer"
+    UNAVAILABLE_PRODUCER = "unavailable producer"
+
+
 class FilingRefused(ValueError):
     """The filing checks failed before the item was saved."""
 
-    def __init__(self, outcome: Outcome, reason: str) -> None:
-        super().__init__(reason)
-        self.outcome: Outcome = outcome
+    def __init__(self, reason: FilingRefusal, message: str) -> None:
+        super().__init__(message)
+        self.reason: FilingRefusal = reason
 
 
 def _assignment(assignee: str, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, producer_map.MappedProducer]:
     member = producer_map.find_member(assignee, members, producer_map.ASSIGNEE_KINDS)
     if isinstance(member, producer_map.UnknownMember):
-        raise FilingRefused(Outcome.UNKNOWN_NAME, unknown_name(member, members))
+        raise FilingRefused(FilingRefusal.UNKNOWN_ASSIGNEE, unknown_name(member, members))
+    return member, _mapped_producer(member, members)
+
+
+def _mapped_producer(member: staff.StaffRow, members: staff.StaffSnapshot) -> producer_map.MappedProducer:
     mapped = producer_map.producer_for(member.id, members)
     if isinstance(mapped, producer_map.NoProducer):
-        raise FilingRefused(Outcome.NO_PRODUCER, producer_question(member, mapped, members))
-    return member, mapped
+        raise FilingRefused(FilingRefusal.UNMAPPED_PRODUCER, producer_question(member, mapped, members))
+    return mapped
 
 
 def _checked_schedule(words: str) -> Scheduled:
     try:
         return read_schedule(words, now=the_list.now(), zone=user_zone())
     except (ValueError, OverflowError) as error:
-        raise FilingRefused(Outcome.REFUSED, str(error)) from error
+        raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, str(error)) from error
 
 
 class ListAssignmentNotice(Protocol):
@@ -484,35 +503,87 @@ def _assignment_warning(item: the_list.ListItem, keeper: staff.StaffId, member: 
     return "At least one assignment notice failed. The List item is saved."
 
 
+class DirectScheduledFiling(StrEnum):
+    CLI = "direct CLI filing"
+
+
+class UnfiledScheduledDraft(Enum):
+    UNSAVED = "no saved List item"
+
+
 @dataclass(frozen=True)
-class SavedScheduledItem:
+class ScheduledDraftIdentity:
     id: str
-    list_key: str
-    receipt: str
+
+    def evidence(self) -> str:
+        return f"New item draft {self.id}"
+
+    def saved_item(self, keeper: staff.StaffId) -> the_list.ListItem | UnfiledScheduledDraft:
+        evidence = self.evidence()
+        try:
+            records = list(the_list.folder(keeper).iterdir())
+        except FileNotFoundError:
+            return UnfiledScheduledDraft.UNSAVED
+        for path in records:
+            if not re.fullmatch(r"L[1-9][0-9]*\.md", path.name):
+                continue
+            item = the_list.load(keeper, path.stem)
+            if not item.log:
+                continue
+            added = item.log[0].what
+            if (isinstance(added, the_list.FieldChange) and added.action == "Added"
+                    and added.fields.get("evidence") == evidence):
+                return item
+        return UnfiledScheduledDraft.UNSAVED
+
+
+@dataclass(frozen=True)
+class ScheduledFiling:
+    keeper: staff.StaffId
+    member: staff.StaffRow
+    producer: staff.StaffId
+    schedule: Scheduled
+    assignment: str
     readback: tuple[str, str]
-    notice_warning: str
+
+    def save(self, draft: ScheduledDraftIdentity | DirectScheduledFiling = DirectScheduledFiling.CLI) -> the_list.ListItem:
+        run = self.schedule.first if isinstance(self.schedule, the_list.ScheduledSeries) else self.schedule
+        changes: the_list.ItemChanges = {
+            "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
+            "unit": self.member.name if self.member.kind == "unit" else "",
+        }
+        if isinstance(draft, ScheduledDraftIdentity):
+            # The List saves this field in the creation log with the item.
+            changes["evidence"] = draft.evidence()
+        return the_list.add(self.keeper, " ".join(run.words.split()), owner=self.member.id, source=SOURCE, changes=changes)
 
 
-def create_scheduled(assignee: str, words: str, *,
-                     show_schedule: Callable[[tuple[str, str]], None] | None = None) -> SavedScheduledItem:
-    """File Nate's Scheduled item with the selected owner and its mapped producer."""
+def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot) -> ScheduledFiling:
+    """Check the schedule, owner and producer before the List write."""
     schedule = _checked_schedule(words)
-    members = staff.snapshot()
-    member, mapped = _assignment(assignee, members)
+    if isinstance(assignee, str):
+        member, mapped = _assignment(assignee, members)
+    else:
+        member, mapped = assignee, _mapped_producer(assignee, members)
+    if isinstance(assignee, str) or member.id != mapped.producer.id:
+        try:
+            _ = review_submissions.selected_recipient(mapped.producer.id, members)
+        except new_item_dialog.SubmissionConflict as error:
+            raise FilingRefused(FilingRefusal.UNAVAILABLE_PRODUCER, str(error)) from error
     keeper = the_list.producer_id(members, "morty")
     run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
     if run.start.astimezone(UTC) <= the_list.now():
-        raise FilingRefused(Outcome.REFUSED, "The start must be in the future.")
-    readback = schedule_lines(schedule)
-    if show_schedule is not None:
-        show_schedule(readback)
-    item = the_list.add(keeper, " ".join(run.words.split()), owner=member.id, source=SOURCE, changes={
-        "state": the_list.ItemState.SCHEDULED, "schedule": schedule, "producer": mapped.producer.id,
-        "unit": member.name if member.kind == "unit" else "",
-    })
-    key = f"{keeper}/{item.id}"
-    receipt = result_line(new_item_dialog.SCHEDULED_KIND, member, mapped, members, this_session=False, list_key=key)
-    return SavedScheduledItem(item.id, key, receipt, readback, _assignment_warning(item, keeper, member, members))
+        raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, "The start must be in the future.")
+    assignment = assignment_receipt(new_item_dialog.SCHEDULED_KIND, member, mapped, members, this_session=False)
+    return ScheduledFiling(keeper, member, mapped.producer.id, schedule, assignment, schedule_lines(schedule))
+
+
+def scheduled_notice(item: the_list.ListItem, keeper: staff.StaffId, members: staff.StaffSnapshot) -> str:
+    """Send the assignment notices after filing the item."""
+    member = members.by_id(staff.StaffId(item.owner))
+    if member is None:
+        return "The owner is unavailable. The List item is saved."
+    return _assignment_warning(item, keeper, member, members)
 
 
 class Arguments(argparse.Namespace):
@@ -551,10 +622,14 @@ def main(arguments: list[str] | None = None) -> int:
             if args.preview:
                 _say_schedule(schedule_lines(_checked_schedule(words)))
             else:
-                saved = create_scheduled(args.assignee, words, show_schedule=_say_schedule)
-                print(saved.receipt)
-                if saved.notice_warning:
-                    print(saved.notice_warning)
+                members = staff.snapshot()
+                filing = prepare_scheduled(args.assignee, words, members)
+                _say_schedule(filing.readback)
+                saved = filing.save()
+                print(filing_receipt(filing.assignment, saved.id))
+                warning = scheduled_notice(saved, filing.keeper, members)
+                if warning:
+                    print(warning)
             return Outcome.FILED
         item_type = ItemType(args.item_type)
         members = staff.snapshot()
@@ -572,11 +647,11 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
     except FilingRefused as error:
-        if error.outcome is Outcome.REFUSED:
+        if error.reason in (FilingRefusal.INVALID_SCHEDULE, FilingRefusal.UNAVAILABLE_PRODUCER):
             print(f"new_item: {error}", file=sys.stderr)
-        else:
-            print(error)
-        return error.outcome
+            return Outcome.REFUSED
+        print(error)
+        return Outcome.NO_PRODUCER if error.reason is FilingRefusal.UNMAPPED_PRODUCER else Outcome.UNKNOWN_NAME
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
