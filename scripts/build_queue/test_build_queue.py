@@ -39,7 +39,10 @@ class QueueTests(NotificationGuardedTestCase):
         super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
-        _ = self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read))
+        def fixture_read(_wait: admission_client.QueueReadWait = "page read") -> records.QueueRead:
+            return self.fixture.read()
+
+        _ = self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=fixture_read))
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "build_admission.conf"
         write_memory_config(config)
@@ -165,6 +168,35 @@ class QueueTests(NotificationGuardedTestCase):
                     assert isinstance(step.run, LiveBuildRun)
                     self.assertEqual(entry["run"], wire.RunIdentity(step.run.pid, step.run.start_time))
                 self.assertEqual(admission_client.priority_clear("bump-session", why=WORDS), wire.Ok())
+
+    def test_bump_waits_while_a_live_service_answers_slowly(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        # Write the limits before the service runs; a write while it serves races its config read.
+        write_memory_config(self.root / "build_admission.conf", query_timeout_seconds="0.5", silence_seconds="2")
+        admission = self.private_mutation_service()
+        labels = {"head-id": UnitLabels("head", unit="demo"), "worker-id": UnitLabels("worker", unit="berth")}
+        self.labels_read.return_value = labels
+
+        def answer(request: wire.Request) -> wire.Reply:
+            with admission.loop_turn():
+                reply, = admission.server.handle_request(request)
+            return reply
+
+        def slow_view() -> Exchange:
+            # The live service sends its answer in pieces; the last piece comes after the page limit.
+            return Exchange(TimedChunk(0.3, b" "), TimedChunk(0.3, b" "), answer=answer)
+
+        transport = ScriptedTransport(admission.clock, slow_view(), slow_view())
+        with mock.patch.object(admission_client, "CLOCK", admission.clock), \
+             mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket), \
+             mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()), \
+             mock.patch.object(memory_admit, "priority_labels", return_value=labels):
+            status, output, errors = self.bump_output("2", "--words", WORDS)
+        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(output, "queue priority set for berth (step #2): first step now #2\n")
+        self.assertEqual([type(request) for request in transport.requests], [wire.ViewRequest, wire.ViewRequest])
+        self.assertGreater(admission.clock.monotonic(), 1.2)
 
     def test_bump_stores_the_words_and_the_askers_staff_name(self) -> None:
         _ = self.fixture.waiter(100, "head-id", "head")
@@ -299,14 +331,12 @@ class QueueTests(NotificationGuardedTestCase):
         return status, output.getvalue(), errors.getvalue()
 
 
-if __name__ == "__main__":
-    _ = unittest.main()
-
 class ServiceQueryFailureTests(unittest.TestCase):
-    def test_views_use_one_query_deadline_for_missing_and_silent_services(self) -> None:
+    def test_bump_reads_fail_at_once_when_down_and_after_silence_when_silent(self) -> None:
         for silent in (False, True):
             with self.subTest(silent=silent), AdmissionFixture() as fixture:
-                timeout = records.read_memory_config().query_timeout_seconds
+                fixture.configure(query_timeout_seconds=0.5, silence_seconds=2)
+                timeout = 2
                 for arguments in (["4"], ["1"]):
                     exchange = (Exchange(TimedChunk(timeout / 4, b"{"), TimeoutError()) if silent
                                 else Exchange(connect_error=FileNotFoundError()))
@@ -324,7 +354,7 @@ class ServiceQueryFailureTests(unittest.TestCase):
                     self.assertEqual(len(transport.requests), 1 if silent else 0)
                     self.assertEqual(status, 2)
                     self.assertEqual(output.getvalue(), "")
-                    reason = "no answer in 0.5 s" if silent else "no socket"
+                    reason = "no answer in 2 s" if silent else "no socket"
                     self.assertEqual(errors.getvalue(),
                         f"build queue: admission service unavailable: {reason}\n")
 
@@ -337,3 +367,7 @@ class ServiceQueryFailureTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             with fixture.serving():
                 self.assertEqual(memory_admit.queue_read(), reply.reading)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

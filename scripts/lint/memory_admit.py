@@ -23,10 +23,12 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
+if TYPE_CHECKING:
+    from scripts.build_queue.admission_client import QueueReadWait
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -3144,9 +3146,9 @@ def sampling_context(row: Reservation) -> dict[str, object]:
 
 
 class QueueServiceReader(Protocol):
-    def view(self) -> QueueRead: ...
+    def view(self, wait: QueueReadWait, /) -> QueueRead: ...
 
 
-def queue_read() -> QueueRead:
+def queue_read(wait: QueueReadWait = "page read") -> QueueRead:
     client = cast(QueueServiceReader, cast(object, importlib.import_module("scripts.build_queue.admission_client")))
-    return client.view()
+    return client.view(wait)

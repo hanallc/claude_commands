@@ -75,7 +75,7 @@ def parse_command(arguments: list[str]) -> BumpCommand | UsageRefused:
 
 def bump(selector: str, actor: str, why: str | admission_protocol.WordsNotGiven,
          scope: WholeUnitBump | OneRunBump) -> int:
-    reading = memory_admit.queue_read()
+    reading = memory_admit.queue_read("command read")
     labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
     matches = [position for position, step in enumerate(reading.view.waiting, 1)
                if queue_evidence.step_labels(step, labels).session == selector]
@@ -103,7 +103,7 @@ def bump(selector: str, actor: str, why: str | admission_protocol.WordsNotGiven,
     if isinstance(result, admission_protocol.Refused):
         print(f"build queue: {result.reason}")
         return 3
-    reading = memory_admit.queue_read()
+    reading = memory_admit.queue_read("command read")
     first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
                   if bump_covers(target, unit, memory_admit.queue_unit(step.unit, step.session_id, labels), step.run)),
                  NoWaitingStep())

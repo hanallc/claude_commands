@@ -25,7 +25,7 @@ import shlex
 import subprocess
 import sys
 from types import TracebackType
-from typing import TYPE_CHECKING, Callable, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
 import uuid
 
 from scripts.build_queue import execution_identity
@@ -50,6 +50,14 @@ from scripts.lib.atomic_file import write_text_atomic
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()
+
+type QueueReadWait = Literal["page read", "command read"]
+"""How long a queue read waits for an answer.
+
+A page read waits `query_timeout_seconds`, so the Builds page does not hang.
+A command read waits `silence_seconds`, so a typed command waits while a live service is slow.
+Both fail at once when the service is down.
+"""
 
 
 class ClientClock(Protocol):
@@ -393,7 +401,9 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest,
+           wait: QueueReadWait = "page read") -> wire.Reply:
+    """Send one query. `wait` sets the read limit; a placement call ignores it and waits while a live service is slow."""
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
@@ -403,7 +413,8 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-    timeout = records.read_memory_config().query_timeout_seconds
+    configuration = records.read_memory_config()
+    timeout = configuration.silence_seconds if wait == "command read" else configuration.query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
     try:
         with _connect(_remaining_seconds(deadline)) as connection:
@@ -639,9 +650,9 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
     return records.BuildHistoryGeneration(reply.generation)
 
 
-def view() -> records.QueueRead | wire.CloudQueueRead:
+def view(wait: QueueReadWait = "page read") -> records.QueueRead | wire.CloudQueueRead:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    reply = _query(wire.ViewRequest())
+    reply = _query(wire.ViewRequest(), wait)
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
     records.warn_configuration_diagnostics(reply.reading.diagnostics)

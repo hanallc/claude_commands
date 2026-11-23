@@ -2174,6 +2174,7 @@ Direct test instances can supply a fixed reader.
 Persistence reuses each unchanged record's encoding.
 The state bytes, atomic writes, and lifecycle commit order stay the same.
 `query_timeout_seconds` stays 0.5.
+The bump command reads the queue with the live-service wait: it waits up to `silence_seconds` for a slow service and fails at once when the service is down.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
 
