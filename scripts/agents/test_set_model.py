@@ -22,6 +22,7 @@ from scripts.herdr import herdr
 from scripts.lib import models_registry
 from scripts.message import codex_daemon
 from scripts.production import session_staff, staff, unit_lookup
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 REGISTRY = """[producer_defaults]
 model=claude:fable:high
@@ -205,7 +206,7 @@ class SetModelTests(unittest.TestCase):
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "last_success"),
             "CLAUDE_CONFIG_DIR": str(self.root),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence"),
-            "HERDR_BIN": "/nonexistent/herdr", "CONF_DIR": str(config), "PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}",
+            "HERDR_BIN": MISSING_HERDR_BIN, "CONF_DIR": str(config), "PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}",
         })))
         FakeHerdr.fixtures = {}
         FakeHerdr.calls = []

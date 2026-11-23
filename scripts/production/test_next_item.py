@@ -41,6 +41,7 @@ from scripts.lib import urgency
 from scripts.lib.urgency import Entry, Urgency
 
 from scripts.nightly_review import candidates
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 # The production an item in the tree test belongs to: each item's text holds `<name>-item`.
@@ -82,7 +83,7 @@ class NextItemTests(unittest.TestCase):
         self.root = Path(folder.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
-                "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
+                "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN})))
         _ = self.enterContext(isolated_source_readers())
         _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
         with contextlib.ExitStack() as stack:
