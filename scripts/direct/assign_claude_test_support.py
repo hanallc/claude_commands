@@ -310,7 +310,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             with patch.dict(os.environ, config_environment(self.root)):
                 _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
                     unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
-            _ = commit_repository(self.working_dir, "base")
+            # The worktree model and a phase launch need HEAD; Git ignores .unit.toml, so the base commit is empty.
+            _ = commit_repository(self.working_dir, "base", allow_empty=True)
         (self.root / "codex").symlink_to(sys.executable)
         _ = (self.root / "paths").write_text("src/\n")
         notes = self.root / "notes"

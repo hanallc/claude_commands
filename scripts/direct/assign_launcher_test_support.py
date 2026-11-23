@@ -271,11 +271,12 @@ class AssignLauncherFixture(unittest.TestCase):
         self.project.mkdir(parents=True)
         _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
-        _ = unit_config.write(self.project, unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")),
-                                                                unit_config.NoAppPort(), ()))
         _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
         self.commit_project()
         self.project = make_fixture_worktree(self.project, "fixture", "project")
+        # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
+        _ = unit_config.write(self.project, unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")),
+                                                                unit_config.NoAppPort(), ()))
         owner = staff.by_id(self.native.fixture.parent.id)
         assert owner is not None
         parent = staff.local_snapshot().parent_of(owner)

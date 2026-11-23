@@ -489,11 +489,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(phase_reservation.read_state(phase), {
             "kind": phase_reservation.ACTIVE, "active_phase_reservation": {**facts, "phase": "1"}})
 
-    def test_adopting_a_unit_home_saves_a_real_target_directory(self) -> None:
+    def test_adopting_a_unit_home_moves_a_real_target_directory_into_its_output(self) -> None:
         worktree = self.unrecorded_unit_home()
         target = worktree / "target"
         target.mkdir()
         _ = (target / "artifact").write_text("existing output\n")
+        inode = target.stat().st_ino
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
@@ -502,8 +503,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
             record = worktrees.read_record(worktrees.record_file(worktree))
         self.assertEqual((record.stage, record.layout), (worktrees.MakeStage.DONE, expected))
         self.assertEqual(target.readlink(), expected.output)
-        saved, = worktree.parent.glob(".saved-target-*/target/artifact")
-        self.assertEqual(saved.read_text(), "existing output\n")
+        # An empty output takes the earlier target by rename, so the build cache stays warm.
+        self.assertEqual(expected.output.stat().st_ino, inode)
+        self.assertEqual((expected.output / "artifact").read_text(), "existing output\n")
+        self.assertEqual(list(worktree.parent.glob(".saved-target-*")), [])
 
     def test_adopting_a_unit_home_retries_after_output_setup_fails(self) -> None:
         worktree = self.unrecorded_unit_home()

@@ -55,9 +55,11 @@ class AssignmentFixtureIsolationTests(unittest.TestCase):
         with patch.dict(os.environ, locations):
             try:
                 case.setUp()
-                self.assertTrue(locations.keys().isdisjoint(os.environ))
+                self.assertFalse({name for name, value in locations.items() if os.environ.get(name) == value})
                 self.assertEqual({name for name in os.environ if name.startswith("GIT_")},
-                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"})
+                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TEMPLATE_DIR"})
+                # The worktree model gets the fixture's own empty templates, never the inherited folder.
+                self.assertEqual(Path(os.environ["GIT_TEMPLATE_DIR"]), case.home / "git-templates")
                 write_text_atomic(case.project / "fixture.txt", "Private work.\n")
                 case.commit_project("Record private work.")
             finally:
