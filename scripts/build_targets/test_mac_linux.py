@@ -876,6 +876,18 @@ fi
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
 
+    def test_free_now_recovers_the_guest_enable_key_from_the_repository(self) -> None:
+        paths = mac_test.state_paths(mac_linux.TARGET)
+        configuration = self.registry.with_name('mac_linux.conf')
+        _ = write_config_fixture(configuration, 'slots=1\n')
+        fallback = self.registry.parent / 'repository' / self.registry.name
+        _ = write_config_fixture(fallback, 'enabled.mac-linux=on\n')
+        _ = self.registry.write_text(self.registry.read_text().replace('enabled.mac-linux=on\n', ''))
+        with (patch.dict(os.environ), patch.object(conf, 'directory', return_value=self.registry.parent),
+              patch.object(conf, '_repository_path', return_value=fallback)):
+            _ = os.environ.pop('CONF_DIR', None)
+            self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
+
     def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
         _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
         paths = mac_test.state_paths(mac_linux.TARGET)
