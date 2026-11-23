@@ -37,6 +37,23 @@ def exit_trap() -> str:
     return match.group(0)
 
 
+def hold_trap_and_lookup() -> str:
+    """The hold-wait EXIT trap through the cached-pass exit."""
+    match = re.search(
+        r"(?ms)^trap 'hold_status=.*?^if \[\[ \"\$MAC_ONLY\" == 0 \]\] && cache_lookup; then\n.*?^fi\n", SOURCE,
+    )
+    if match is None:
+        raise AssertionError("missing the hold-wait trap and cache lookup in verify.sh")
+    return match.group(0)
+
+
+def temporary_folder(test: unittest.TestCase) -> Path:
+    """A folder that the test removes when it ends."""
+    directory = Path(tempfile.mkdtemp())
+    test.addCleanup(shutil.rmtree, directory, True)
+    return directory
+
+
 def run_bash(script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
     # A socket on standard input makes Bash read the system bashrc, which changes BASH_COMMAND.
     return subprocess.run(
@@ -50,7 +67,8 @@ class TreeWatchCleanupTests(unittest.TestCase):
 
     def run_test_path(self, step_status: int) -> subprocess.CompletedProcess[str]:
         script = "set -euo pipefail\n" + shell_functions(
-            VERIFY, "run_cleanup", "after_tree_change", "stop_tree_watch", "cancel_tree_run", "finish_tree_watch",
+            VERIFY, "run_cleanup", "remove_tree_watch_folder", "after_tree_change", "stop_tree_watch",
+            "cancel_tree_run", "finish_tree_watch",
         )
         script += f"""
 verify_helper() {{ printf 'build folders: remove refused\\n' >&2; return {REMOVE_REFUSED}; }}
@@ -60,8 +78,7 @@ run_local_test() {{ return "$STEP_STATUS"; }}
 TREE_WATCH_PID="" TREE_WATCH_DIR="" BUILD_FOLDERS_SCRIPT=build_folders.py
 """
         script += test_case_body()
-        with tempfile.TemporaryDirectory() as directory:
-            return run_bash(script, directory, str(step_status))
+        return run_bash(script, str(temporary_folder(self)), str(step_status))
 
     def test_passing_step_exits_zero_and_reports_the_cleanup(self) -> None:
         result = self.run_test_path(0)
@@ -82,7 +99,7 @@ class FolderRemovalTests(unittest.TestCase):
     """A failed tree-watch folder removal prints one line and changes no exit path."""
 
     def run_script(self, names: tuple[str, ...], body: str) -> tuple[subprocess.CompletedProcess[str], Path]:
-        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run_cleanup", *names)
+        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run_cleanup", "remove_tree_watch_folder", *names)
         script += f"""
 verify_helper() {{
     if [[ "$2" == tool ]]; then printf '%s\\n' "$FIXTURE_DIR"; return 0; fi
@@ -94,8 +111,7 @@ FIXTURE_DIR=$1 BUILD_FOLDERS_SCRIPT=build_folders.py TREE_WATCH_DIR=$1 TREE_WATC
 MAC_RUNNER_PID="" MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB="" CMD=test RUN_STARTED=$SECONDS
 """
         script += body
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
+        directory = temporary_folder(self)
         return run_bash(script, str(directory)), directory
 
     def assert_cleanup_line(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -144,11 +160,42 @@ printf 'folder=[%s]\\n' "$TREE_WATCH_DIR"
         self.assertIn("folder=[]\n", result.stdout)
 
 
+class HoldWaitTrapTests(unittest.TestCase):
+    """A cached pass exits 0 when the hold-wait folder removal fails in the EXIT trap."""
+
+    def test_cached_pass_exits_zero_and_reports_the_cleanup(self) -> None:
+        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run_cleanup", "finish_hold_wait")
+        script += f"""
+verify_helper() {{ printf 'build folders: remove refused\\n' >&2; return {REMOVE_REFUSED}; }}
+interrupt_hold_wait() {{ :; }}
+phase_wait_finish_all() {{ :; }}
+collect_hold_wait() {{ :; }}
+release_wait_claim() {{ :; }}
+remove_step_record() {{ :; }}
+finish_verify_run() {{ :; }}
+initialize_step_record() {{ :; }}
+note_event() {{ :; }}
+cache_lookup() {{ LOOKUP_STATUS=0; printf 'verify.sh: recorded pass\\n'; }}
+HOLD_WAIT_DIR=$1 HOLD_WAITER_PID="" MAC_ONLY=0 BUILD_FOLDERS_SCRIPT=build_folders.py
+"""
+        script += hold_trap_and_lookup() + "printf 'no cached exit\\n'\n"
+        result = run_bash(script, str(temporary_folder(self)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "verify.sh: recorded pass\n", result.stderr)
+        self.assertIn(
+            f"verify.sh: cleanup failed: hold-wait folder removal (status {REMOVE_REFUSED})\n", result.stderr,
+        )
+
+
 class ExitTrapTests(unittest.TestCase):
     """A step failure keeps its old result; an unexpected stop keeps its run log as stopped.log."""
 
-    def run_exit_trap(self, command: str, last: str) -> tuple[subprocess.CompletedProcess[str], Path]:
-        script = "set -euo pipefail\n" + shell_functions(VERIFY, "run", "report_stop", "verify_exit", "finish_run")
+    def run_exit_trap(
+        self, command: str, last: str, names: tuple[str, ...] = (),
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        script = "set -euo pipefail\n" + shell_functions(
+            VERIFY, "run", "report_stop", "verify_exit", "finish_run", *names,
+        )
         script += f"""
 run_step() {{ return "$STEP_STATUS"; }}
 finish_step_token() {{ return "$2"; }}
@@ -165,8 +212,7 @@ printf 'this run\\n' > "$RUN_LOG"
 {exit_trap()}
 {last}
 """
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
+        directory = temporary_folder(self)
         return run_bash(script, str(directory)), directory
 
     def test_failed_step_prints_no_stop_line(self) -> None:
@@ -182,6 +228,20 @@ printf 'this run\\n' > "$RUN_LOG"
         self.assertEqual(result.returncode, TEST_FAILED, result.stderr)
         self.assertEqual((directory / "record").read_text(encoding="utf-8"), "fail\n", result.stderr)
 
+    def test_failed_taplo_format_in_the_held_sequence_is_a_step_failure(self) -> None:
+        last = """
+lint_copy_begin() { :; }
+lint_rewrite() { :; }
+lint_copy_return() { :; }
+workspace_taplo() ( run taplo fmt )
+run_lint_held_sequence
+"""
+        result, directory = self.run_exit_trap("lint", last, ("run_lint_held_sequence",))
+        self.assertEqual(result.returncode, TEST_FAILED, result.stderr)
+        self.assertNotIn("stopped by a failed command", result.stderr)
+        self.assertEqual((directory / "record").read_text(encoding="utf-8"), "fail\n", result.stderr)
+        self.assertEqual((directory / "stopped.log").read_text(encoding="utf-8"), "older stop\n")
+
     def test_failed_check_step_removes_its_run_log(self) -> None:
         result, directory = self.run_exit_trap("check", "run cargo check")
         self.assertEqual(result.returncode, TEST_FAILED, result.stderr)
@@ -196,20 +256,20 @@ printf 'this run\\n' > "$RUN_LOG"
                 self.assertEqual(result.returncode, REMOVE_REFUSED, result.stderr)
                 self.assertEqual(
                     result.stderr,
-                    f"verify.sh: stopped by a failed command (status {REMOVE_REFUSED}): {REFUSED_COMMAND};"
+                    f"verify.sh: stopped by a failed command (status {REMOVE_REFUSED}) in main: {REFUSED_COMMAND};"
                     + f" run log kept: {stopped}\n",
                 )
                 self.assertEqual(stopped.read_text(encoding="utf-8"), "this run\n")
                 self.assertFalse((directory / "run.log").exists(), result.stderr)
                 self.assertFalse((directory / "record").exists(), result.stderr)
 
-    def test_failed_return_names_the_function_not_the_return(self) -> None:
+    def test_failed_return_names_its_function_and_command(self) -> None:
         last = f"helper() {{ local status={REMOVE_REFUSED}; return \"$status\"; }}\nouter() {{ helper; }}\nouter"
         result, directory = self.run_exit_trap("lint", last)
         self.assertEqual(result.returncode, REMOVE_REFUSED, result.stderr)
         self.assertEqual(
             result.stderr,
-            f"verify.sh: stopped by a failed command (status {REMOVE_REFUSED}) in outer;"
+            f"verify.sh: stopped by a failed command (status {REMOVE_REFUSED}) in outer: return \"$status\";"
             + f" run log kept: {directory / 'stopped.log'}\n",
         )
         self.assertFalse((directory / "record").exists(), result.stderr)

@@ -602,6 +602,7 @@ run_cleanup() {
     shift
     "$@" || status=$?
     (( status == 0 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
+    return 0
 }
 
 # One parent-owned helper serves command substitutions and cleanup traps.
@@ -2054,6 +2055,12 @@ stop_tree_watch() {
     fi
 }
 
+# Remove the tree-watch folder, if there is one. A failed removal prints one line.
+remove_tree_watch_folder() {
+    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
+    TREE_WATCH_DIR=""
+}
+
 find_mac_runner_pid() {
     # Set the caller's runner_pid without a subshell, which would lose job state.
     local latest_job=${!:-}
@@ -2100,8 +2107,7 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch_folder
     exit "$TREE_CHANGED_STATUS"
 }
 
@@ -2110,11 +2116,7 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    if [[ ! -s "$TREE_WATCH_DIR/start" ]]; then
-        run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-        TREE_WATCH_DIR=""
-        return 0
-    fi
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { remove_tree_watch_folder; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
@@ -2126,8 +2128,7 @@ start_tree_watch() {
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch_folder
 }
 
 # Match the checkout selection for Python on standard input.
@@ -2299,8 +2300,7 @@ forward_mac_runner_signal() {
     if [[ "$signal_name" == INT ]]; then signal_name=TERM; fi
     find_mac_runner_pid
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch_folder
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
@@ -4337,8 +4337,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || run_cleanup "tree-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch_folder
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
@@ -4373,21 +4372,20 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
+
 # A failed step returns from run() with the status it recorded, and errexit
 # stops verify.sh at that return. Any other failed command that is not an
 # exit is an unexpected stop, such as a failed helper. It gives no verdict:
-# report it, and keep its run log as stopped.log in the cache folder. Each
-# stop replaces the older log, and finish_run sees no run log to record.
+# report it with its function and command, and keep its run log as
+# stopped.log in the cache folder. Each stop replaces the older log, and
+# finish_run sees no run log to record. Known limit: a caller can handle a
+# step failure, and then a different return can stop with the same status.
+# That return reads as a step failure.
 report_stop() {
-    local command=$1 caller=$2 where kept=""
+    local command=$1 caller=$2 kept=""
     case "$command" in
         exit|"exit "*) return 0 ;;
-        return|"return "*)
-            [[ "$EXIT_STATUS" != "$LAST_STEP_STATUS" ]] || return 0
-            where=" in $caller"
-            [[ "$caller" != main ]] || where=""
-            ;;
-        *) where=": $command" ;;
+        return|"return "*) [[ "$EXIT_STATUS" != "$LAST_STEP_STATUS" ]] || return 0 ;;
     esac
     if [[ -n "$RUN_LOG" ]]; then
         if [[ -n "$CACHE_DIR" ]] && mv -f -- "$RUN_LOG" "$CACHE_DIR/stopped.log"; then
@@ -4397,7 +4395,7 @@ report_stop() {
         fi
         RUN_LOG=""
     fi
-    printf 'verify.sh: stopped by a failed command (status %s)%s%s\n' "$EXIT_STATUS" "$where" "$kept" >&2
+    printf 'verify.sh: stopped by a failed command (status %s) in %s: %s%s\n' "$EXIT_STATUS" "$caller" "$command" "$kept" >&2
 }
 
 # EXIT alone would report success for a failed cargo run, so branch on the
