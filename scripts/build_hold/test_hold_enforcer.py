@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1395,7 +1395,7 @@ class HoldEnforcerTests(unittest.TestCase):
         attempts: list[str] = []
         sent: list[tuple[str, str]] = []
 
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
+        def send(_entries: Sequence[build_hold.ReleaseEntry], to: str, notice: str) -> build_hold.ReleaseNoticeResult:
             attempts.append(to)
             if to == f"codex:{closed.current_session}":
                 return build_hold.ReleaseWorkerClosed()
@@ -1431,7 +1431,7 @@ class HoldEnforcerTests(unittest.TestCase):
         with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
             result = build_hold.send_stopped_runs_release([{**entry, "run": run}], "released", staff.initial_snapshot())
         self.assertEqual(result, failure)
-        send.assert_called_once_with({**entry, "run": run}, address,
+        send.assert_called_once_with([{**entry, "run": run}], address,
                                      "released Restart the stopped run checks for worker. Run ID checks.")
 
     def test_release_does_not_name_a_run_if_enforcer_exits_before_signaling(self) -> None:

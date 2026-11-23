@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -1622,29 +1622,46 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
                          "staff_id": str(worker.id), "director_dir": ""}}
                 for index in range(count)]
 
-    def release_runs(self, runs: list[build_hold.ReleaseEntry],
-                     send: Callable[[build_hold.ReleaseEntry, str, str], build_hold.ReleaseNoticeResult]) -> str:
+    def release_runs(self, runs: list[build_hold.ReleaseEntry], sent: list[tuple[str, str]],
+                     closed: Sequence[str] = ()) -> str:
         cycle = build_hold.open_cycle(datetime.fromisoformat("2026-11-22T10:00:00+00:00"))
         cycle["holders"] = {"holder": {"since": "2026-11-22T10:00:00+00:00", "released_at": "2026-11-22T10:05:00+00:00"}}
         cycle["release_started_at"] = "2026-11-22T10:05:00+00:00"
         cycle["entries"] = runs
         build_hold.save_cycle(cycle)
-        with mock.patch.object(build_hold, "send_release_to", side_effect=send):
+        with mock.patch.object(build_hold, "send_release_to", side_effect=self.recorder(sent, closed)):
             return build_hold.notify_released_cycle(cycle)
+
+    def recorder(self, sent: list[tuple[str, str]], closed: Sequence[str] = (),
+                 ) -> Callable[[Sequence[build_hold.ReleaseEntry], str, str], build_hold.ReleaseNoticeResult]:
+        """Record each send attempt. An address in closed answers that its worker is closed."""
+        def send(_entries: Sequence[build_hold.ReleaseEntry], to: str, notice: str) -> build_hold.ReleaseNoticeResult:
+            sent.append((to, notice))
+            return build_hold.ReleaseWorkerClosed() if to in closed else build_hold.ReleaseDelivered()
+        return send
 
     def run_deliveries(self) -> list[str]:
         return [entry["delivery"] for entry in self.cycle()["entries"] if "run" in entry]
+
+    def pending_runs(self, runs: list[build_hold.ReleaseEntry]) -> None:
+        pending = build_hold.release_directory() / "pending-release.json"
+        intent = build_hold.read_release_intent(pending)
+        assert not isinstance(intent, build_hold.NoReleaseIntent)
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        notices["runs"] = runs
+        _ = pending.write_text(json.dumps(intent))
+
+    def resume(self, sent: list[tuple[str, str]]) -> None:
+        with mock.patch.object(build_hold, "send_release_to", side_effect=self.recorder(sent)):
+            result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "released, builds may resume.\n", ""))
 
     def test_release_sends_one_notice_for_many_stopped_runs_of_one_session(self) -> None:
         director = fixture_member("showrunner", name="director")
         worker = fixture_member("worker", name="phases", parent=director.id)
         sent: list[tuple[str, str]] = []
-
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
-            sent.append((to, notice))
-            return build_hold.ReleaseDelivered()
-
-        self.assertEqual(self.release_runs(self.stopped_runs(worker, 50), send), "")
+        self.assertEqual(self.release_runs(self.stopped_runs(worker, 50), sent), "")
         (to, notice), = sent
         self.assertEqual(to, f"codex:{worker.current_session}")
         self.assertIn("Restart the 50 stopped runs for phases: python3.13 unittest (Run IDs phases-0, phases-1, ", notice)
@@ -1657,38 +1674,49 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         first = fixture_member("worker", name="first", parent=director.id)
         second = fixture_member("worker", name="second", parent=director.id)
         sent: list[tuple[str, str]] = []
-
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
-            sent.append((to, notice))
-            return build_hold.ReleaseDelivered()
-
         runs = [entry for pair in zip(self.stopped_runs(first, 3), self.stopped_runs(second, 3), strict=True)
                 for entry in pair]
-        _ = self.release_runs(runs, send)
+        _ = self.release_runs(runs, sent)
         self.assertEqual([to for to, _ in sent], [f"codex:{first.current_session}", f"codex:{second.current_session}"])
         self.assertIn("for first: python3.13 unittest (Run IDs first-0, first-1, first-2).", sent[0][1])
         self.assertIn("for second: python3.13 unittest (Run IDs second-0, second-1, second-2).", sent[1][1])
         self.assertEqual(self.run_deliveries(), ["Delivered"] * 6)
 
-    def test_closed_worker_runs_fall_back_to_the_director_in_one_notice(self) -> None:
+    def test_closed_workers_runs_fall_back_to_their_director_in_one_notice(self) -> None:
         director = fixture_member("showrunner", name="director")
-        worker = fixture_member("worker", name="closed", parent=director.id)
-        attempts: list[str] = []
-        sent: list[str] = []
+        workers = [fixture_member("worker", name=f"closed-{index}", parent=director.id) for index in range(3)]
+        closed = [f"codex:{worker.current_session}" for worker in workers]
+        sent: list[tuple[str, str]] = []
+        _ = self.release_runs([entry for worker in workers for entry in self.stopped_runs(worker, 2)], sent, closed)
+        self.assertEqual([to for to, _ in sent], [*(f"codex:{worker.current_session}" for worker in workers),
+                                                  str(director.id)])
+        self.assertIn(
+            " Restart the 6 stopped runs. For closed-0: python3.13 unittest (Run IDs closed-0-0, closed-0-1)."
+            + " For closed-1: python3.13 unittest (Run IDs closed-1-0, closed-1-1)."
+            + " For closed-2: python3.13 unittest (Run IDs closed-2-0, closed-2-1).", sent[-1][1])
+        self.assertEqual(self.run_deliveries(), ["Delivered"] * 6)
 
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
-            attempts.append(to)
-            if to == f"codex:{worker.current_session}":
-                return build_hold.ReleaseWorkerClosed()
-            sent.append(notice)
-            return build_hold.ReleaseDelivered()
+    def test_release_splits_a_long_run_list_into_notices_that_fit_one_argument(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="phases", parent=director.id)
+        sent: list[tuple[str, str]] = []
+        with mock.patch.object(build_hold, "RELEASE_NOTICE_RUN_LIMIT", 4):
+            _ = self.release_runs(self.stopped_runs(worker, 10), sent)
+        self.assertEqual([to for to, _ in sent], [f"codex:{worker.current_session}"] * 3)
+        self.assertIn("Restart the 4 stopped runs for phases: python3.13 unittest (Run IDs phases-0, phases-1, "
+                      + "phases-2, phases-3).", sent[0][1])
+        self.assertIn("Restart the 2 stopped runs for phases: python3.13 unittest (Run IDs phases-8, phases-9).",
+                      sent[2][1])
+        self.assertEqual(self.run_deliveries(), ["Delivered"] * 10)
 
-        _ = self.release_runs(self.stopped_runs(worker, 4), send)
-        self.assertEqual(attempts, [f"codex:{worker.current_session}", str(director.id)])
-        notice, = sent
-        self.assertIn("Restart the 4 stopped runs for closed: python3.13 unittest "
-                      + "(Run IDs closed-0, closed-1, closed-2, closed-3).", notice)
-        self.assertEqual(self.run_deliveries(), ["Delivered"] * 4)
+    def test_release_names_each_session_of_a_notice_once(self) -> None:
+        runs = [build_hold.new_entry(session, "worker") for session in ("codex:a", "codex:b", "codex:a")]
+        delivered = subprocess.CompletedProcess[str]([], 0, "", "")
+        with mock.patch.object(subprocess, "run", return_value=delivered) as send:
+            _ = build_hold.send_release_to([runs[0]], "codex:a", "released.")
+            _ = build_hold.send_release_to(runs, "codex:a", "released.")
+        texts = [args[args.index("--text") + 1] for args in (cast(list[str], call.args[0]) for call in send.call_args_list)]
+        self.assertEqual(texts, ["released. Session codex:a.", "released. Sessions codex:a, codex:b."])
 
     def test_resumed_release_sends_one_notice_per_recipient_for_pending_runs(self) -> None:
         director = fixture_member("showrunner", name="director")
@@ -1696,27 +1724,30 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         queue = fixture_member("worker", name="queue", parent=director.id)
         self.leave_release_pending("holder", [(phases.name, f"codex:{phases.current_session}"),
                                               (queue.name, f"codex:{queue.current_session}")])
-        pending = build_hold.release_directory() / "pending-release.json"
-        intent = build_hold.read_release_intent(pending)
-        assert not isinstance(intent, build_hold.NoReleaseIntent)
-        notices = intent["notices"]
-        assert notices["kind"] == "cycle"
-        notices["runs"] = [*self.stopped_runs(phases, 300), *self.stopped_runs(queue, 7)]
-        _ = pending.write_text(json.dumps(intent))
+        self.pending_runs([*self.stopped_runs(phases, 300), *self.stopped_runs(queue, 7)])
         sent: list[tuple[str, str]] = []
-
-        def send(_entry: build_hold.ReleaseEntry, to: str, notice: str) -> build_hold.ReleaseNoticeResult:
-            sent.append((to, notice))
-            return build_hold.ReleaseDelivered()
-
-        with mock.patch.object(build_hold, "send_release_to", side_effect=send):
-            result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
-        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "released, builds may resume.\n", ""))
+        self.resume(sent)
         self.assertEqual([to for to, _ in sent], [f"codex:{phases.current_session}", f"codex:{queue.current_session}"])
         self.assertIn("Restart the 300 stopped runs for phases:", sent[0][1])
         self.assertIn("phases-299", sent[0][1])
         self.assertIn("Restart the 7 stopped runs for queue:", sent[1][1])
         self.assertEqual(self.run_deliveries(), ["Delivered"] * 307)
+
+    def test_resumed_release_names_only_the_runs_not_yet_delivered(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        phases = fixture_member("worker", name="phases", parent=director.id)
+        self.leave_release_pending("holder", [(phases.name, f"codex:{phases.current_session}")])
+        runs = self.stopped_runs(phases, 3)
+        self.pending_runs(runs)
+        cycle = self.cycle()
+        cycle["entries"].append({**runs[0], "delivery": "Delivered"})
+        build_hold.save_cycle(cycle)
+        sent: list[tuple[str, str]] = []
+        self.resume(sent)
+        (_, notice), = sent
+        self.assertIn("Restart the 2 stopped runs for phases: python3.13 unittest (Run IDs phases-1, phases-2).", notice)
+        self.assertNotIn("phases-0", notice)
+        self.assertEqual(self.run_deliveries(), ["Delivered"] * 3)
 
     def test_closed_codex_result_stays_pending_until_the_worker_can_receive_it(self) -> None:
         parent = fixture_member("showrunner", name="runner")
