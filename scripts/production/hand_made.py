@@ -302,6 +302,21 @@ def sets_variable(argv: Sequence[str]) -> bool:
     return False
 
 
+def main_folder(path: str) -> bool:
+    """Tell if python runs a file of the folder when it gets the folder as its script.
+
+    Python imports __main__ from the folder, so each entry with that name and any suffix counts, for example
+    __main__.py or __main__.pyc. A folder that cannot be listed counts too, because python can still open a
+    file in it by its name.
+    """
+    if not os.path.isdir(path):
+        return False
+    try:
+        return any(name.startswith("__main__") for name in os.listdir(path))
+    except OSError:
+        return True
+
+
 def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[CheckedFile, ...]:
     """Read each program file of the command; max_bytes limits the sum of all files."""
     if runs_module(argv):
@@ -313,9 +328,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
     if sets_variable(argv):
         raise Refused("env NAME=VALUE is refused: a variable can make the program load code that the check does not "
                       + "read; set the variable outside the hand made command")
-    if any(os.path.isfile(os.path.join(repo, word, "__main__.py")) for word in argv[1:]):
-        raise Refused("a word names a folder with a __main__.py: python runs that folder as a package that the check "
-                      + "cannot read; run the program file by its path")
+    if any(main_folder(os.path.join(repo, word)) for word in argv[1:]):
+        raise Refused("a word names a folder with a __main__ file, such as __main__.py or __main__.pyc: python runs "
+                      + "that file, and the check cannot read it; run the program file by its path")
     for name in PATH_LIST_VARIABLES:
         for entry in os.environ[name].split(os.pathsep) if name in os.environ else ():
             if not entry or not os.path.isabs(entry) or in_checkout(Path(entry).resolve(), repo):

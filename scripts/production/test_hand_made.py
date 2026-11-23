@@ -579,8 +579,19 @@ class ProgramFileTests(unittest.TestCase):
         package = self.repo / "build"
         package.mkdir()
         _ = self.write(package / "__main__.py", "import os\n")
-        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__.py"):
+        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
             _ = self.read("python3", "build")
+
+    def test_a_word_that_names_a_folder_with_a_compiled_main_file_is_refused(self) -> None:
+        package = self.repo / "build"
+        package.mkdir()
+        _ = self.write(package / "__main__.pyc", "compiled\n")
+        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
+            _ = self.read("python3", "build")
+
+    def test_a_word_that_names_a_plain_folder_is_not_refused(self) -> None:
+        (self.repo / "test").mkdir()
+        self.assertEqual(self.read("cargo", "test"), [])
 
     def test_a_later_path_outside_the_checkout_with_no_start_line_is_read(self) -> None:
         script = self.write(self.root / "outside.sh", "rm -rf ~/work\n")
