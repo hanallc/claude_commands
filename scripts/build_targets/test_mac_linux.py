@@ -28,7 +28,7 @@ from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import mac_run
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
-from scripts.lib import build_folders, conf, process_group
+from scripts.lib import conf, process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -184,8 +184,8 @@ def checked_git(repo, *args):
     return subprocess.check_output(['git', *args], cwd=repo, text=True).strip()
 
 
-def WholeMachine(*, gate_parent):
-    return gate_parent
+def WholeMachine():
+    return 'configured gate root'
 
 
 def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
@@ -194,8 +194,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
     assert Path(os.environ['XDG_RUNTIME_DIR']).is_relative_to(repo / 'target')
-    assert machine.path == Path(os.environ['TMPDIR'])
-    assert machine.path.is_relative_to(repo / 'target')
+    assert machine == 'configured gate root'
     assert (Path.home() / '.claude/config').resolve() == repo / 'config'
     assert os.environ['CARGO_TARGET_DIR'] == str(repo / 'target')
     assert Path(os.environ['RUSTUP_HOME']).is_relative_to(repo / 'target')
@@ -755,18 +754,6 @@ fi
         self.assertEqual(raised.exception.repository, 'other-repo')
         self.assertIn('source repository is other-repo', str(self.route()))
         self.assert_guest_clean()
-
-    def test_gate_uses_the_runtime_parent_inside_the_copy(self) -> None:
-        runtime = self.guest_home / 'build/claude/caller/1/target/mac-linux/tmp'
-        runtime.mkdir(parents=True)
-        machine = gate.WholeMachine(gate_parent=build_folders.ExplicitBuildParent(runtime))
-        with (patch.object(build_folders, 'configured_gate_root', return_value=self.guest_home),
-              patch.dict(os.environ, {gate.GATE_MODULE_TEMP_DIR: ''})):
-            self.assertEqual(gate.gate_work_parent(machine), runtime)
-            self.assertEqual(gate.gate_work_parent(gate.WholeMachine()), self.guest_home)
-            with patch.dict(os.environ, {gate.GATE_MODULE_TEMP_DIR: str(runtime.parent)}):
-                self.assertEqual(gate.gate_work_parent(machine), runtime)
-                self.assertEqual(gate.gate_work_parent(gate.WholeMachine()), runtime.parent)
 
     def test_local_timeout_kills_the_recorded_group_and_proves_end(self) -> None:
         configuration = self.registry.with_name('mac_linux.conf')

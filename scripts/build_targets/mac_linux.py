@@ -1527,7 +1527,8 @@ def run_copy(request_path: Path, reply: int) -> None:
     if tree != request['tree']:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
-    machine = gate.WholeMachine(gate_parent=build_folders.ExplicitBuildParent(Path(os.environ['TMPDIR'])))
+    # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
+    machine = gate.WholeMachine()
     token = copies.COMMAND_LOCKS.set(descriptors)
     # natedev reads this line: a failure before it lets natedev take the gate.
     print(run_start_line(request['attempt']), file=sys.stderr, flush=True)

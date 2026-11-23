@@ -208,16 +208,9 @@ class HoldExemptNamedModuleMachine:
 
 
 @dataclass(frozen=True)
-class ConfiguredGateParent:
-    """Use the gate parent from build_folders.conf."""
-
-
-@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
-    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
-        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1653,13 +1646,6 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
-def gate_work_parent(machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine) -> Path:
-    """Select the folder for gate recovery, state, and tests."""
-    if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
-        return machine.gate_parent.path
-    return _gate_job_parent()
-
-
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1693,7 +1679,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     runner = module_runner(repo)
-    gate_parent = gate_work_parent(machine)
+    gate_parent = _gate_job_parent()
     if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
     report_retained_gate_test_folders(gate_parent)
