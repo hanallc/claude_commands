@@ -409,6 +409,10 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.repository)], check=True, capture_output=True)
         _ = (self.repository / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
         _ = subprocess.run(["git", "-C", str(self.repository), "add", "Cargo.toml"], check=True, capture_output=True)
+        # A Mac claim needs a history key; a repository without an origin takes it from its root commit.
+        _ = subprocess.run(["git", "-C", str(self.repository), "-c", "user.name=fixture",
+                            "-c", "user.email=fixture@example.invalid", "commit", "-q", "--no-gpg-sign", "-m", "root"],
+                           check=True, capture_output=True)
         self.state = self.root / "state"
         self.info = self.root / "step-info"
         self.result = self.root / "watch-result"
