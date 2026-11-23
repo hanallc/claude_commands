@@ -111,6 +111,27 @@ As built (checkpoint c5d84e9c32 on `natedev-postmaster-relayfix`, tip 18765b08b2
 - `STATE/relay_mismatches.jsonl` still records each changed model input, now with `summary_changed`.
 - Tests: rows in `scripts/message/test_send.py`. As-built: `docs/as-built/session-roster.md`.
 
+### Phase 7 — A long relay message does not time out  · status: done
+
+As built (checkpoint 2683705a47 on `natedev-postmaster-relaybig`, base 5e02a261da with main 99f0deddd1):
+
+- Cause: the relay model typed the whole message into its SendMessage call, so a 22 KB message hit `relay timed out after 40 s`.
+- `relay_prompt` in `scripts/message/send.py` carries the target, the summary and `RELAY_MESSAGE_STAND_IN` ("approved text"), not the message. The guard sets the approved message.
+- `read_relay` and `_log_relay_mismatch` compare the model's `message` with the stand-in. The proxy forward check against the approved text is unchanged.
+- Live proof: a 22,231-char message arrived whole in 8.7 s, with no `guard set` detail.
+- Tests: rows in `scripts/message/test_send.py`. As-built: `docs/as-built/session-roster.md`.
+
+### Phase 8 — A one-line push text  · status: done
+
+As built (checkpoint 6e39bb203c, stacked on phase 7 on `natedev-postmaster-relaybig`):
+
+- `PushText.one_line` in `scripts/notify/push_texts.py`. `catalog()` refuses it on an entry with an action, a session or a body. `fingerprint` includes it only when True.
+- `RenderedPush.posted_title` is empty and `posted_body` is the rendered title for a one-line text. `scripts/notify/pushover.py` leaves out the Pushover `title`; the phone shows the app name. The `Sent by:` footer stays.
+- `review.py` approval drafts and `--ask` output show the text as posted.
+- No live entry sets the flag. Accounts sets the entries after nate's words.
+- Tests: `scripts/notify/test_push_texts.py`, `test_pushover.py`, `test_review.py`. As-built: `docs/as-built/message-clarity.md`.
+- Gate: the showrunner asked for direct tests instead of the queue (11-22 17:44 PST). 718 tests in `scripts.message.test_send` and all `scripts/notify` test modules passed. The merge gate is the full proof.
+
 ## Acceptance gate
 
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
