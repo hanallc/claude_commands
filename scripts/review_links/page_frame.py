@@ -193,12 +193,12 @@ function pageHoldsInput(){
 // Returns refresh facts when the fresh page has another script version, else null.
 // A held reload returns only the busy reason, so the status keeps the data and answer times it has.
 // The page keeps the held reload and loads the newer page as soon as the hold ends.
-let pageReloadHeld=null;
+let pageReloadHeld=null,pageReloadListening=false;
 function reloadForNewScript(page,held=()=>false){
  const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
  const fresh=page instanceof Document ? version(page) : page,own=version(document);
  if(!fresh || !own || fresh===own){pageReloadHeld=null;return null;}
- if(held() || pageHoldsInput()){pageReloadHeld=held;return {busy:'A newer page loads when your edit ends.'};}
+ if(held() || pageHoldsInput()){pageReloadHeld=held;listenForHoldEnd();return {busy:'A newer page loads when your edit ends.'};}
  location.reload();
  return pageRefreshFacts();
 }
@@ -206,9 +206,14 @@ function reloadForNewScript(page,held=()=>false){
 function reloadWhenHoldEnds(){
  if(pageReloadHeld && !pageReloadHeld() && !pageHoldsInput()){pageReloadHeld=null;location.reload();}
 }
+// The first held reload adds these listeners, so the script has no top-level page effects.
 // The bubble phase lets the page's own handlers run first. A close event does not bubble, so its check waits one task.
-for(const name of ['input','change','selectionchange']) document.addEventListener(name,reloadWhenHoldEnds);
-document.addEventListener('close',()=>setTimeout(reloadWhenHoldEnds,0),true);
+function listenForHoldEnd(){
+ if(pageReloadListening) return;
+ pageReloadListening=true;
+ for(const name of ['input','change','selectionchange']) document.addEventListener(name,reloadWhenHoldEnds);
+ document.addEventListener('close',()=>setTimeout(reloadWhenHoldEnds,0),true);
+}
 function pageRequestSeconds(){
  return Number(document.querySelector('[data-request-timeout-seconds]')?.dataset.requestTimeoutSeconds);
 }

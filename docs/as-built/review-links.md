@@ -238,6 +238,7 @@ A held reload can follow a timed-out save at once. Then the words do not show, a
 While the reload waits, the status shows Paused: **A newer page loads when your edit ends.** It never shows Failed for a hold.
 When `reloadForNewScript` holds a reload, it records the hold. When the hold ends, the page reloads at once.
 The shared `reloadWhenHoldEnds` checks the hold on the 1 s status clock and on each `input`, `change`, `close` and `selectionchange` event.
+The first held reload adds these event listeners, so the shared script has no effect on the page when it loads.
 It listens in the bubble phase, so the page's own handlers run first. A `close` event does not bubble, so its check runs one task later.
 Each save end calls the page refresh's `changed`, so the check also runs then.
 A selection holds the reload only while it shows. A selection in a hidden row or a closed dialog has no client rects and does not hold it.
