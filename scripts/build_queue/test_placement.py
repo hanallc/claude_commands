@@ -46,13 +46,13 @@ ALLOWED_HOST = placement.AllowedHost()
 HANA_REPOSITORY = "https://github.com/hanallc/hana"
 
 
-# The settings these tests depend on. A tune of the repository settings must not change a test.
-MAC_TEST_PINS = "offload=on\n"
+# The mac_test settings these tests depend on. A tune of the repository settings must not change a test.
+MAC_TEST_PINS = "offload=on\nprobe_timeout_s=15\nlinux_only.hana=hana_video,hana_clerestory\n"
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Write a fixture setting file with the module's pins under the test's own overrides."""
-    pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" else ""
+    """Write a fixture settings file. A new mac_test file gets the pins in place of the repository values."""
+    pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" and not path.exists() else ""
     return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
 
 
@@ -63,12 +63,8 @@ class PlacementFixture(AdmissionFixture):
 
     def __init__(self) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.settings_pinned: bool = False
         super().__init__()
-        settings = conf.path("mac_test")
-        if settings.parent != self.root:
-            self.close()
-            raise AssertionError(f"a placement test must not read the live settings: {settings}")
-        _ = write_config_fixture(settings)
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -78,6 +74,13 @@ class PlacementFixture(AdmissionFixture):
 
     @override
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
+        settings = conf.path("mac_test")
+        if settings.parent != self.root:
+            raise AssertionError(f"a placement test must not read the live settings: {settings}")
+        if not self.settings_pinned:
+            settings.unlink(missing_ok=True)
+            _ = write_config_fixture(settings)
+            self.settings_pinned = True
         server = super().new_server(start=False)
         self.read_host_evidence = server.read_provider_evidence
         server.host_probe = self.read_provider
@@ -555,25 +558,32 @@ class PlacementTests(unittest.TestCase):
     def test_a_tune_of_the_repository_settings_reaches_no_placement_fixture(self) -> None:
         original = cast(Callable[[str], Path], getattr(memory_test_support, "_template"))
         repository = original("mac_test.conf").read_text().splitlines()
+        tunes = {"offload": ("on", "off"), "probe_timeout_s": ("15", "16"),
+                 "linux_only.hana": ("hana_video,hana_clerestory", "hana_video")}
+        readings: dict[str, list[dict[str, str]]] = {}
         with TemporaryDirectory() as folder:
-            for offload in ("on", "off"):
-                tuned = Path(folder) / offload / "mac_test.conf"
+            for tune in ("pinned", "tuned"):
+                values = {key: pair[tune == "tuned"] for key, pair in tunes.items()}
+                tuned = Path(folder) / tune / "mac_test.conf"
                 tuned.parent.mkdir()
-                _ = tuned.write_text("".join(f"offload={offload}\n" if line.startswith("offload=") else line + "\n"
-                                             for line in repository))
+                _ = tuned.write_text("".join(
+                    f"{key}={values[key]}\n" if (key := line.partition("=")[0]) in values else line + "\n"
+                    for line in repository))
 
                 def template(name: str, tuned: Path = tuned) -> Path:
                     return tuned if name == tuned.name else original(name)
 
-                with self.subTest(offload=offload), mock.patch.object(memory_test_support, "_template", template):
-                    with PlacementFixture() as fixture:
-                        self.assertEqual(conf.read("mac_test").text("offload"), "on")
-                        settings, _, _ = self.target_settings_fixture(fixture)
-                        self.assertEqual(conf.read(settings).text("offload"), "on")
-        with mock.patch.object(conf, "directory", return_value=Path.home() / ".claude" / "config"):
+                with mock.patch.object(memory_test_support, "_template", template), PlacementFixture() as fixture:
+                    settings, _, _ = self.target_settings_fixture(fixture)
+                    readings[tune] = [{key: conf.read(file).text(key) for key in tunes} for file in ("mac_test", settings)]
+        self.assertEqual(readings["tuned"], readings["pinned"])
+
+    def test_a_placement_fixture_refuses_settings_outside_its_root(self) -> None:
+        with TemporaryDirectory() as outside, mock.patch.object(conf, "directory", return_value=Path(outside)):
             with self.assertRaisesRegex(AssertionError, "must not read the live settings"):
                 with PlacementFixture():
                     pass
+            self.assertEqual(list(Path(outside).iterdir()), [])
 
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
