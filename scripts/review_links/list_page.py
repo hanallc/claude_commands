@@ -24,7 +24,8 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_question, page_version
+from scripts.review_links import record_table, review_link
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -1627,7 +1628,7 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    const response=await fetch(location.pathname,{method:'POST',body:data,signal:listRequestSignal()});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1780,7 +1781,7 @@ function bindFeedbackForm(form){
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
      await tableView.rowSettled(item);
-    saving--;
+    saving--;pageRefresh.changed();
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
      if(!stale && listOwnsFocus()){
@@ -1865,7 +1866,6 @@ function updateLinkedRows(rows,updates){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || dateTimePickerOpen(document)) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
  const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
@@ -1874,10 +1874,9 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  await tableView.settled();
- if(saving || dateTimePickerOpen(document) || !current()) return;
- // A closed item keeps its words only in drafts, so they hold the reload too.
- const newer=reloadForNewScript(page,()=>pageHoldsInput() || [...drafts.values()].some(draft=>draft.words));
- if(newer) return newer;
+ if(!current()) return;
+ const newer=reloadForNewScript(page,()=>saving>0);
+ if(newer || saving || dateTimePickerOpen(document)) return newer;
  if(!fresh) throw new Error('The page has no list.');
  refreshNeeded=false;
  const revealCreated=createdItem && rowIn(fresh,createdItem);
@@ -2063,4 +2062,5 @@ document.addEventListener('review-item-created',event=>{
 });
 void loadListCounts();
 })();''')
-SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, STYLE, DIALOGS, SCRIPT)
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, DIALOGS, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

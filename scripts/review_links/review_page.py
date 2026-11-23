@@ -26,7 +26,8 @@ from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
 from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
-from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
+from scripts.review_links import change_browser, change_page, console, for_you, page_frame, page_version, record_table
+from scripts.review_links import review_items, review_link
 from scripts.review_links import new_item_dialog, review_submissions
 from scripts.review_links import question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
@@ -1117,13 +1118,14 @@ def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str) ->
                + '<template data-card-body>' + body + '</template>'
                + '<div data-card-settings hidden>' + html.escape(settings) + '</div>'
                + '<script>' + record_table.DATE_TIME_SCRIPT + page_frame.MOTION_SCRIPT
-               + page_frame.CARD_SUBMIT_SCRIPT + record_table.DETAIL_SCRIPT + REVIEW_CARD_SCRIPT + CARD_VIEW_SCRIPT + '</script>')
+               + page_frame.CARD_SUBMIT_SCRIPT + page_frame.SAVE_TIMEOUT_SCRIPT + record_table.DETAIL_SCRIPT + REVIEW_CARD_SCRIPT
+               + CARD_VIEW_SCRIPT + '</script>')
     return change_page.document(content, 'Review card')
 
 
 def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: float) -> bytes:
     """Build the controls and compact index without any card body."""
-    show = 'open'
+    show = SHELL_SHOW
     entries = snapshot.entries
     owners = {entry['owner']:(entry['ownerName'], entry['ownerHtml']) for entry in entries}
     owners.update({entry['sourceOwner']:(entry['sourceName'], entry['sourceHtml'])
@@ -1133,16 +1135,6 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         identity, label = html.escape(owner, quote=True), html.escape(name, quote=True)
         owner_chips += (f'<button id="review-owner-{identity}" type="button" data-owner-chip="{identity}" '
                         +f'data-owner-name="{label}" aria-pressed="false">{markup or label} <b></b></button>')
-    chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
-    chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
-                     +' <b></b></button>' for kind in TYPE_CHIPS)
-    chips += ('<button type="button" data-type-chip="investigations" aria-pressed="false" hidden>'
-              'Investigations and Bugs <b></b></button>')
-    shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
-                    +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
-                    +' <b></b></button>' for value, label in SHOWS)
-    headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
-                      +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-request-timeout-seconds="{snapshot.request_timeout_seconds}" '
@@ -1151,26 +1143,15 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
         +page_frame.title('Review', 'review', SCRIPT_VERSION)
-        +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
-        +'<input type="search" id="list-search" placeholder="Filter by id or words" data-reload-safe></div>'
-        +'<div class="review-queue">'
-        +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
-        +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
+        +SHELL_FILTERS
         +record_table.labelled_chip_row('Owner', owner_chips, chip_classes='review-types', chip_id='list-owner')
-        +'<div class="list-filters">'
-        +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
-        +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
-        +'</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p><p data-hidden-action-status role="status" hidden></p>'
+        +SHELL_NOTICES
         +'<ul data-review-source-notices'+('' if snapshot.notices else ' hidden')+'>'
         +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.notices)+'</ul>'
         +'<ul data-for-you-notices hidden>'
         +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.action_notices)+'</ul>'
         +'<script type="application/json" data-review-index>'+index+'</script><script>'+CARD_REQUEST_SCRIPT+'</script>'
-        +'<div class="list-table"><table aria-label="Review">'
-        +CARD_COLUMNS+'<thead><tr>'+headers+'</tr></thead>'
-        +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
-        +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
-        +record_table.render_dialog()+'<script>'+SCRIPT+'</script>')
+        +SHELL_TABLE+record_table.render_dialog()+'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
@@ -1652,10 +1633,12 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,recover,finished}){
+// The save ends after `seconds`, the page_request_timeout_seconds setting.
+// A save without an answer calls `failed` with words that say the result is unknown, and `unknown` true.
+async function saveReviewAction(data,{seconds,confirmedSave,saved,failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
-  const response=await fetch(location.pathname,{method:'POST',body:data});
+  const response=await fetch(location.pathname,{method:'POST',body:data,signal:AbortSignal.timeout(seconds*1000)});
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -1665,7 +1648,7 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,r
  }catch(error){
   if(confirmed) displayFailed();
   else if(conflict) await recover(error.message);
-  else failed(error.message);
+  else{const unknown=saveTimeoutWords(error,seconds);failed(unknown || error.message,Boolean(unknown));}
  }finally{
   await finished(conflict);
  }
@@ -1761,6 +1744,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   report('Saving…');
   let saved=false;
   await saveReviewAction(data,{
+   seconds:requestTimeoutSeconds,
    saved:result=>{
     saved=true;
     report('Saved: '+result.answer);
@@ -1770,7 +1754,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
      frame.dispatchEvent(new Event('review-card-saved'));
     }
    },
-   failed:reason=>report('Not saved: '+reason),
+   failed:(reason,unknown)=>report(unknown ? reason : 'Not saved: '+reason),
    displayFailed:()=>report('Saved; the item could not refresh.'),
    recover,
    finished:()=>{if(!saved) busy(false);}
@@ -2097,7 +2081,7 @@ function bindForm(row){
     else view.showActionResult(row,submission,key,result);
    };
    const settle=async()=>{
-    pendingSaves.delete(key);setCardSubmitting(form,false);drawSaveState(key);
+    pendingSaves.delete(key);setCardSubmitting(form,false);drawSaveState(key);pageRefresh.changed();
     if(isDeferredLink(key)){
      const link=deferredLink;
      await afterRowAnimations(()=>{
@@ -2109,11 +2093,12 @@ function bindForm(row){
      followItemLink({inheritFilters:true,unappliedOnly:true});
     }
    };
-   const fail=reason=>{
+   const fail=(reason,unknown)=>{
     pendingSaves.delete(key);
-    showResult({kind:'failure',message:'Not saved: '+reason});
+    showResult({kind:'failure',message:unknown ? reason : 'Not saved: '+reason});
    };
    await saveReviewAction(data,{
+   seconds:pageRequestSeconds(),
    confirmedSave:()=>{
     pending.saved=true;
     if(view.currentItemRequest(request) && reviewDrafts.get(key)?.stamp===draftAtSubmit?.stamp){
@@ -2237,7 +2222,6 @@ async function refresh(_supersede=false,current=()=>true){
  }
 }
 async function refreshReview(current){
- if(pendingSaves.size || dateTimePickerOpen(document)) return;
  const canApply=()=>!pendingSaves.size && current();
  const options={cache:'no-store',signal:reviewRequestSignal()};
  const delivery=view.deliveryRequest(),query=new URLSearchParams({version:'1'});
@@ -2245,10 +2229,9 @@ async function refreshReview(current){
  const response=await fetch(location.pathname+'?'+query,options);
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
- if(!canApply() || dateTimePickerOpen(document)) return;
- // A closed item keeps its words only in reviewDrafts, so they hold the reload too.
- const newer=reloadForNewScript(version.script,()=>pageHoldsInput() || [...reviewDrafts.values()].some(stored=>stored.draft.feedback));
- if(newer) return newer;
+ if(!current()) return;
+ const newer=reloadForNewScript(version.script,()=>pendingSaves.size>0);
+ if(newer || !canApply() || dateTimePickerOpen(document)) return newer;
  view.itemError('');
  const finishDelivery=async()=>{
   if(!delivery || version.delivery_pending!==false) return;
@@ -2392,5 +2375,36 @@ window.consoleNavigate=place=>{
  location.hash=recordPlaceParams(target).toString();
 };
 })(legacyReviewPlace);''')
-SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, record_table.STYLE, record_table.DATE_TIME_STYLE,
-                                           STYLE, CARD_REQUEST_SCRIPT, record_table.render_dialog(), SCRIPT)
+# The fixed shell markup. A refresh reads only the index and card bodies, so a change here needs a reload.
+SHELL_SHOW = 'open'
+SHELL_TYPE_CHIPS = (
+    '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
+    + ''.join('<button id="review-type-' + kind + '" type="button" data-type-chip="' + kind + '" aria-pressed="false">'
+              + icon(kind) + LABELS[kind] + ' <b></b></button>' for kind in TYPE_CHIPS)
+    + '<button type="button" data-type-chip="investigations" aria-pressed="false" hidden>'
+    + 'Investigations and Bugs <b></b></button>')
+SHELL_SHOW_CHIPS = ''.join('<button id="review-show-' + value.lower().replace(' ', '-') + '" type="button" data-show-chip="'
+                           + value + '" aria-pressed="' + str(value == SHELL_SHOW).lower() + '">' + label
+                           + ' <b></b></button>' for value, label in SHOWS)
+SHELL_FILTERS = (
+    '<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
+    + '<input type="search" id="list-search" placeholder="Filter by id or words" data-reload-safe></div>'
+    + '<div class="review-queue">'
+    + record_table.labelled_chip_row('Type', SHELL_TYPE_CHIPS, chip_classes='review-types')
+    + record_table.labelled_chip_row('State', SHELL_SHOW_CHIPS, chip_classes='review-types review-shows', chip_id='list-show'))
+SHELL_NOTICES = (
+    '<div class="list-filters">'
+    + '<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
+    + ' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
+    + '</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p>'
+    + '<p data-hidden-action-status role="status" hidden></p>')
+SHELL_TABLE = (
+    '<div class="list-table"><table aria-label="Review">' + CARD_COLUMNS + '<thead><tr>'
+    + ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
+              + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
+    + '</tr></thead><tbody data-window-before></tbody><tbody data-window-after></tbody>'
+    + '</table><p data-empty hidden>No items in this view.</p></div></div></div>')
+SHELL_PARTS = (SHELL_FILTERS, SHELL_NOTICES, SHELL_TABLE, record_table.render_dialog())
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, record_table.STYLE, record_table.DATE_TIME_STYLE,
+                 STYLE, CARD_REQUEST_SCRIPT, *SHELL_PARTS, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

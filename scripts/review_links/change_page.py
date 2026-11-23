@@ -1661,7 +1661,7 @@ summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible
         + page_frame.CONSOLE_READY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
-# The static style and script that `document` puts around each page, for `page_frame.script_version`.
+# The static style and script that `document` puts around each page, for `page_version.script_version`.
 DOCUMENT_ASSETS = document("", "").decode()
 
 

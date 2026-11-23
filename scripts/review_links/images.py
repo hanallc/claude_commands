@@ -24,7 +24,8 @@ from scripts.production.delivery_state import QuestionSendState
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
-from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, page_version
+from scripts.review_links import review_link
 
 PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -244,11 +245,12 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
+    request_timeout = settings.whole("page_request_timeout_seconds")
     content = (STYLE + page_frame.title("Images", "images", SCRIPT_VERSION)
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-refresh-seconds="{refresh_seconds}"'
-               + f' {card_motion.attributes()}'
+               + f' {card_motion.attributes()} data-request-timeout-seconds="{request_timeout}"'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
@@ -461,7 +463,6 @@ function bind(root) {
     if (cardSubmitBlocked(form)) return;
     const question = event.submitter?.value === 'question';
     const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
-    delete status.dataset.refreshFailed;
     if (question && !form.elements.feedback.value.trim()) {
       status.textContent = 'Enter a question first.';
       return;
@@ -474,12 +475,11 @@ function bind(root) {
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
     status.textContent = '';
-    let postFailed = false;
     setCardSubmitting(form, true);
     sending++;
     try {
       if (!question) await motion.removeCard(card, apply);
-      const response = await fetch(location.pathname, {method: 'POST', body});
+      const response = await fetch(location.pathname, {method: 'POST', body, signal: pageRequestSignal()});
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
@@ -492,36 +492,28 @@ function bind(root) {
         pageRefresh.restart();
       }
     } catch (error) {
-      postFailed = true;
       if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = 'Not sent: ' + error.message;
+      status.textContent = saveTimeoutWords(error) || 'Not sent: ' + error.message;
       apply();
     } finally {
       sending--;
       setCardSubmitting(form, false);
-      if (question && !postFailed) void pageRefresh.refresh(true);
-      else void refresh().catch(error => {
-        if (postFailed) return;
-        status.dataset.refreshFailed = 'true';
-        status.textContent = 'Update failed: ' + error.message;
-      });
+      pageRefresh.changed();
+      void pageRefresh.refresh(true);
     }
   }));
 }
 async function refresh(_supersede=false,current=()=>true) {
-  if (sending) return;
   const own = ++refreshRequest;
-  const isCurrent = () => own === refreshRequest && !sending && current();
+  const isCurrent = () => own === refreshRequest && current();
   try {
     const response = await fetch(location.pathname, {cache: 'no-store'});
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const fresh = page.querySelector('[data-images]');
     if (!isCurrent()) return;
-    // A draft can wait on a card that the address hides, so every card form counts.
-    const newer = reloadForNewScript(page, () => pageHoldsInput()
-      || [...list.querySelectorAll('form[data-image-form] textarea')].some(field => field.value !== ''));
-    if (newer) return newer;
+    const newer = reloadForNewScript(page, () => sending > 0);
+    if (newer || sending) return newer;
     if (!fresh) throw new Error('The page has no image list.');
     const facts = pageRefreshFacts(page);
     // Keep drafts and action results on cards that the server still shows.
@@ -531,8 +523,7 @@ async function refresh(_supersede=false,current=()=>true) {
       const previous = forms.get(form.elements.image.value);
       if (!previous) return;
       form.elements.feedback.value = previous.elements.feedback.value;
-      const oldStatus = previous.querySelector('[data-image-status]');
-      if (!oldStatus.dataset.refreshFailed) form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
+      form.querySelector('[data-image-status]').textContent = previous.querySelector('[data-image-status]').textContent;
     });
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
@@ -549,7 +540,7 @@ async function refresh(_supersede=false,current=()=>true) {
     if (wasWaiting && waiting.hidden) scrollToLinkedImage();
     return facts;
   } catch (error) {
-    if (isCurrent()) throw error;
+    if (isCurrent() && !sending) throw error;
   }
 }
 function selectImage(target) {
@@ -571,7 +562,8 @@ bind(list);
 apply();
 scrollToLinkedImage();
 })();"""
-SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)
 
 
 def main(arguments: list[str]) -> int:

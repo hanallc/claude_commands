@@ -237,17 +237,22 @@ NEWER_SCRIPT_PROBE = r"""<script>
  const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+ const until=async test=>{for(let wait=0;wait<60;wait++){try{if(await test()) return true;}catch(_){}await pause(50);}return false;};
  const line=()=>document.querySelector('[data-page-status]');
  const status=()=>line().dataset.state+': '+line().textContent.replace(/\s+/g,' ');
  const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
  const placed=()=>PLACED;
- const expected=sessionStorage.getItem('reload-probe');
+ const expected=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
  if(expected){
   sessionStorage.removeItem('reload-probe');
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   for(let wait=0;wait<10;wait++){await flush();await pause(50);}
-  check(Math.abs(scrollY-Number(expected))<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected);
+  check(expected.ready,'the page reloaded before the hold ended');
+  check(expected.top>0,'the end of the hold keeps a scrolled place');
+  check(Math.abs(scrollY-expected.top)<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected.top);
   check(placed(),'the reload keeps the open place');
+  if(expected.saves) check(sessionStorage.getItem('reload-probe-timeout'),'the save ends by its timeout');
+  sessionStorage.removeItem('reload-probe-timeout');
   send();return;
  }
  try{
@@ -255,44 +260,72 @@ NEWER_SCRIPT_PROBE = r"""<script>
   PLACE
   await flush();
   check(scrollY>0 && placed(),'the probe starts at a scrolled place');
+  // A reload before ready() is a failure. The reload must keep the scroll place that the page has when it unloads.
+  // The end of a hold can move that place, for example by scroll anchoring when a picker closes.
+  const ready=()=>sessionStorage.setItem('reload-probe',JSON.stringify({ready:true,top:scrollY,saves:SAVES}));
+  sessionStorage.setItem('reload-probe',JSON.stringify({ready:false,top:scrollY,saves:SAVES}));
+  addEventListener('pagehide',()=>{
+   const probe=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
+   if(probe) sessionStorage.setItem('reload-probe',JSON.stringify({...probe,top:scrollY}));
+  });
+  sessionStorage.removeItem('reload-probe-timeout');
   const newer=NEWER,realFetch=window.fetch;
-  window.fetch=(url,options)=>newer(url,options,realFetch) ?? realFetch(url,options);
+  let posts=0,timedOut=false;
+  window.fetch=(url,options)=>{
+   // The save never answers, so only its timeout signal can end it. The reload after it checks the marker.
+   if(SAVES && options?.method==='POST'){
+    posts++;
+    return new Promise((_,reject)=>options.signal?.addEventListener('abort',()=>{
+     timedOut=true;sessionStorage.setItem('reload-probe-timeout','1');reject(options.signal.reason);
+    },{once:true}));
+   }
+   return newer(url,options,realFetch) ?? realFetch(url,options);
+  };
   const type=(field,words)=>{field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));};
-  const draft=DRAFT;
-  type(draft,'typed words');
-  AFTER
-  const held='A newer page loads at the next refresh after the open edit ends.';
-  await refresh();
-  check(line().dataset.state==='Paused' && status().includes(held),'a draft defers the reload: '+status());
-  // A held reload answers now, so a draft that outlasts the age limit stays Paused, not Late.
-  const now=Date.now,limit=JSON.parse(line().dataset.statusOptions).ageLimit;
-  Date.now=()=>now()+(limit+5)*1000;
-  await refresh();
-  check(line().dataset.state==='Paused' && status().includes(held),'a long draft stays Paused: '+status());
-  Date.now=now;
-  END
-  sessionStorage.setItem('reload-probe',String(scrollY));
-  await refresh();
-  for(let wait=0;wait<30;wait++) await pause(100);
+  START
+  if(SAVES) check(await until(()=>posts>0),'the save starts');
+  if(HOLDS){
+   const held='A newer page loads when your edit ends.';
+   await refresh();
+   check(line().dataset.state==='Paused' && status().includes(held),'the hold defers the reload: '+status());
+   // A held reload answers now, so a hold that outlasts the age limit stays Paused, not Late.
+   const now=Date.now,options=JSON.parse(line().dataset.statusOptions);
+   Date.now=()=>now()+(options.ageLimit+5)*1000;
+   await refresh();
+   check(line().dataset.state==='Paused' && status().includes(held),'a long hold stays Paused: '+status());
+   Date.now=now;
+   // A save timeout ends the hold, so the checks above must run while the save still waits.
+   if(SAVES) check(!timedOut,'the Paused checks run before the save timeout');
+   ready();
+   // The end of the hold reloads the page at once. No refresh call follows.
+   END
+  }else{
+   ready();
+   await refresh();
+  }
+  // A save waits for its timeout, then the page reloads.
+  for(let wait=0;wait<100;wait++) await pause(100);
   sessionStorage.removeItem('reload-probe');
-  failures.push('the page did not reload after the draft ended; its status is '+status());
+  failures.push('the page did not reload; its status is '+status());
  }catch(error){failures.push(String(error));}
  send();
 })();</script>"""
 
 
-def newer_script_reload_results(page: str, *, newer: str, draft: str, place: str, placed: str = "true",
-                                after: str = "", end: str = "type(draft,'');") -> list[list[str]]:
-    """Prove in Firefox that a draft defers the reload for a newer page script and the reload keeps the place.
+def newer_script_reload_results(page: str, *, newer: str, place: str, start: str, placed: str = "true",
+                                holds: bool = True, saves: bool = False, end: str = "") -> list[list[str]]:
+    """Prove in Firefox when a newer page script reloads the page, and that the reload keeps the place.
 
     `newer` is a JavaScript function `(url, options, fetch)` that answers a refresh request with the newer
-    page and returns undefined for other requests. `draft` is a JavaScript expression for a visible text
-    field. `place` runs before the draft and scrolls the page; `placed` is true while the open place shows.
-    `after` runs after the typing, for example to close the item. `end` ends the draft and any open edit
-    around it; `type(field, words)` types into a field.
+    page and returns undefined for other requests. `place` scrolls the page; `placed` is true while the open
+    place shows. `start` sets up the page state, for example a typed draft; `type(field, words)` types into a field.
+    When `holds` is true, a refresh shows Paused. Then `end` ends the hold, and the page must reload with no
+    refresh call. Else the next refresh reloads. When `saves` is true, `start` starts a save that never answers.
+    Its timeout ends the hold, and it must not end before the Paused checks are done.
     """
-    probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place)
-             .replace("DRAFT", draft).replace("AFTER", after).replace("END", end).replace("NEWER", newer))
+    probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place).replace("START", start)
+             .replace("END", end).replace("HOLDS", "true" if holds else "false")
+             .replace("SAVES", "true" if saves else "false").replace("NEWER", newer))
     return firefox_probe_results(page.replace("</body>", probe + "</body>").encode())
 
 
@@ -511,9 +544,11 @@ class AccountsPageTests(unittest.TestCase):
                 os.environ, {"REVIEW_LINKS_ROOT": str(root)}):
             source = accounts_page.page().decode()
         setup = """<script>
-const realFetch=window.fetch.bind(window);let clearForm;
+const realFetch=window.fetch.bind(window);let clearForm,holdRefresh=false,heldRefresh=null;
+// After holdRefresh, the first refresh waits for the probe, and later refreshes never answer.
 window.fetch=(url,options)=>options?.method==='POST'
  ? (clearForm=new URLSearchParams(options.body),Promise.resolve({ok:true,json:async()=>({state:'saved'})}))
+ : holdRefresh ? new Promise(resolve=>{if(!heldRefresh) heldRefresh=resolve;})
  : realFetch(url,options);
 </script>"""
         probe = r"""<script>
@@ -532,8 +567,15 @@ window.fetch=(url,options)=>options?.method==='POST'
   check(panel.hidden && document.activeElement===button,'Escape closes the panel and restores focus');
   button.click();document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
   check(panel.hidden,'an outside click closes the panel');
-  button.click();clear.click();await paint();
+  // A refresh that starts while the panel is open must not bring the alert back after the clear.
+  const old='<!doctype html>'+document.documentElement.outerHTML;
+  button.click();holdRefresh=true;document.dispatchEvent(new Event('visibilitychange'));await paint();
+  check(heldRefresh,'a refresh is in flight while the panel is open');
+  clear.click();await paint();
+  heldRefresh?.({ok:true,text:async()=>old});
+  for(let wait=0;wait<5;wait++) await paint();
   check(panel.hidden && !button.isConnected,'Clear closes the panel and removes the button');
+  check(!document.querySelector('[data-quota-account=claude1]'),'a refresh from before the clear does not bring the alert back');
   check(clearForm.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
    'Clear posts the account and level');
   check(percent.textContent==='4%' && getComputedStyle(percent).color===color,'the percentage keeps its color');
@@ -783,7 +825,9 @@ window.fetch=(url,options)=>options?.method==='POST'
         self.assertEqual(table.count('title="No usage rate is available."'), 4)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "review_links.conf",
+                                 "page_refresh_seconds=15\naccounts_page_seconds=30\npage_request_timeout_seconds=5\n")
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.page()
         rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
@@ -797,11 +841,27 @@ window.fetch=(url,options)=>options?.method==='POST'
         setup = "<script>localStorage.removeItem('roles-sort');Date.now=()=>200000;</script>"
         newer_reply = "()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE})".replace(
             "NEWER_PAGE", json.dumps(newer).replace("</", "<\\/"))
+        # The page has no text field of its own, so the probe adds one.
         place = ("document.querySelector('[data-accounts]').before(document.createElement('textarea'));"
                  + "scrollTo({top:120,behavior:'instant'});")
         page = rendered.replace("<script>", setup + "<script>", 1)
-        self.assertEqual(newer_script_reload_results(page, newer=newer_reply, place=place,
-                                                     draft="document.querySelector('textarea')"), [[]])
+        draft = "type(document.querySelector('textarea'),'typed words');"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, start=draft,
+                end="type(document.querySelector('textarea'),'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, holds=False,
+                start=draft + "document.querySelector('textarea').hidden=true;"), [[]])
+        with self.subTest(hold="a color save that never answers"):
+            # The save closes the color dialog, so only the save holds the reload.
+            save = ("document.querySelector('[data-color-key=\"account.claude1\"]').click();"
+                    + "type(document.querySelector('#account-color-value'),'#123456');"
+                    + "document.querySelector('[data-color-picker] [data-color-save]').click();"
+                    + "check(!document.querySelector('[data-color-picker]').open,'the save closes the color dialog');")
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, start=save, saves=True), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
@@ -1737,10 +1797,11 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   pick('invalid');
   check(!picker.checkValidity() && action('try').disabled && action('save').disabled,
    'an invalid hex value cannot be tried or saved');
+  // A held refresh still reads the page, so it can find a newer script. It does not change the view.
   pick('#123456');timer().load();await flush();
-  check(calls===0 && label().style.color===original && swatch.style.background===originalSwatch,
-   'picking a color keeps the page unchanged without a request');
-  action('try').click();
+  check(calls===1 && swatch.isConnected && label().style.color===original && swatch.style.background===originalSwatch,
+   'a held refresh reads the page and keeps the view and the pick unchanged');
+  calls=0;action('try').click();
   check(popup.open && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)' && calls===0,
    'Try paints the account name and swatch without a request');
   check(swatch.dataset.savedColor==='#af875f','Try keeps the saved color unchanged');
@@ -1775,7 +1836,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
    !action('try').disabled && !action('save').disabled,'a failed save restores the reopened picker and its usable controls');
   check(line().textContent.includes('claude1: reopened save failed') && !line().querySelector('[data-color-save-error]').hidden,
    'a failed reopened save reports its error in the page status');
-  check(calls===0 && swatch.isConnected && state()==='Paused','the reopened dialog keeps refresh paused after a failed save');
+  check(swatch.isConnected && state()==='Paused','the reopened dialog keeps refresh paused after a failed save');
   pick('#234567');action('try').click();
   check(label().style.color==='rgb(35, 69, 103)' && swatch.style.background==='rgb(35, 69, 103)',
    'Try remains usable after the reopened save fails');
@@ -1798,7 +1859,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(form.get('key')==='account.claude1' && form.get('value')==='#123456' && [...form.keys()].length===2 &&
    saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','Save sends the form fields');
   timer().load();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
-  check(calls===0 && swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
+  check(swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
   other.click();
   check(popup.open && picker.value===other.dataset.savedColor,'another swatch opens while a save is pending');
   picker.value='#fedcba';action('save').click();
@@ -1808,7 +1869,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   saves[1].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)',
    'success stores the second account color');
-  check(calls===0 && swatch.isConnected,'refresh remains held until every POST completes');
+  check(swatch.isConnected,'refresh remains held until every POST completes');
   other.click();
   saves[0].resolve({ok:false,json:async()=>({reason:'tune: cannot publish'})});await flush();
   check(popup.open && picker.value==='#fedcba','a failed earlier save keeps another account dialog open');
@@ -1824,11 +1885,11 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   saves[2].reject(new Error('network unavailable'));await flush();
   check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)' &&
    other.style.background==='rgb(254, 220, 186)','a network failure restores the second account prior colors');
-  check(label().style.color==='rgb(171, 205, 239)' && calls===0,'a network failure preserves another pending color and the refresh hold');
+  check(label().style.color==='rgb(171, 205, 239)' && swatch.isConnected,'a network failure preserves another pending color and the refresh hold');
   check(line().textContent.includes('claude2: network unavailable'),'the page status line reports network errors');
   swatch.click();
   saves[3].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
-  check(popup.open && swatch.dataset.savedColor==='#abcdef' && calls===0,'success keeps a newly opened chooser intact');
+  check(popup.open && swatch.dataset.savedColor==='#abcdef' && swatch.isConnected,'success keeps a newly opened chooser intact');
   action('cancel').click();
   check(label().style.color==='rgb(171, 205, 239)','Cancel retains a color that saved while the chooser was open');
   swatch.click();picker.value='#234567';action('save').click();
@@ -1842,7 +1903,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(popup.open && swatch.dataset.savedColor==='#234567' && label().style.color==='rgb(35, 69, 103)' &&
    swatch.style.background==='rgb(35, 69, 103)','a queued failure restores the previous successful color');
   action('cancel').click();
-  swatch.click();picker.value='#abcdef';action('save').click();
+  swatch.click();picker.value='#abcdef';action('save').click();calls=0;
   saves[6].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(swatch.dataset.savedColor==='#abcdef','success stores the chosen color before refresh');
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');

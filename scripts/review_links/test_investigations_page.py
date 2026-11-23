@@ -126,9 +126,13 @@ class InvestigationsPageTests(unittest.TestCase):
         assert_status_states(self, body, 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(self.root / "config" / "review_links.conf",
+                                 "page_refresh_seconds=15\npage_request_timeout_seconds=5\n")
         for hour in range(10, 15):
             _ = self.file(UNIT.id, f"Find cause {hour}", f"2026-11-16T{hour}:00:00+00:00")
+        ready = self.file(UNIT.id, "Find the ready cause", "2026-11-16T15:00:00+00:00")
+        _ = investigation.answer(UNIT.id, ready.id, "The cause is known.")
         body = investigations_page.render(self.root / "reviews").decode()
         self.assertEqual(body.count(f'data-script-version="{investigations_page.SCRIPT_VERSION}"'), 1)
         newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
@@ -138,9 +142,20 @@ class InvestigationsPageTests(unittest.TestCase):
         place = ("location.hash='owner=&show=all';await new Promise(resolve=>setTimeout(resolve,50));"
                  + "document.querySelector('[data-cards]').before(document.createElement('textarea'));"
                  + "scrollTo({top:120,behavior:'instant'});")
-        self.assertEqual(newer_script_reload_results(
-            body, newer=newer, place=place, draft="document.querySelector('textarea')",
-            placed="document.querySelector('#investigation-show').value==='all'"), [[]])
+        placed = "document.querySelector('#investigation-show').value==='all'"
+        draft = "type(document.querySelector('textarea'),'typed words');"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, start=draft,
+                end="type(document.querySelector('textarea'),'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, holds=False,
+                start=draft + "document.querySelector('textarea').hidden=true;"), [[]])
+        with self.subTest(hold="a Mark read save that never answers"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, saves=True,
+                start="document.querySelector('[data-read-form]').requestSubmit();"), [[]])
 
     def test_order_uses_answer_time_then_filed_time_then_read_time(self) -> None:
         items: list[investigation.Investigation] = []

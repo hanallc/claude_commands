@@ -200,23 +200,53 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
-A page passes `page_frame.script_version(<its static script, style and markup>)` to `title`, which puts it on the status line as `data-script-version`.
+A page passes `page_version.script_version(*VERSION_PARTS)` to `title`, which puts it on the status line as `data-script-version`.
+`VERSION_PARTS` holds the page's static script, style and markup.
+The hash also covers `page_version.SHARED_PARTS`, the parts that each page shares: the frame style and refresh script, the owner heading assets (`PAGE_SCRIPT_ERRORS`, `HEADING_STYLE`, `OWNER_STYLE`), `CONSOLE_DIALOG_ASSETS` and the New item dialog script and style.
 A page in `change_page.document` adds `change_page.DOCUMENT_ASSETS`, the style and script around each page.
-`reloadForNewScript(page)` runs after the loader's stale-request check and before it swaps content.
+`reloadForNewScript(page, held)` is the first step of each refresh after the loader's stale-request check.
+It runs before any page early return and before the page swaps content.
 When the fetched page has another version, it reloads the page.
 Accounts, Images, The List, Review, the Changes and Questions pages, and Investigations call it.
 An open page then never runs an old script on a fragment from a changed page script. No page has a second reload rule.
 Review reads its snapshot version as JSON, so that answer names the script version as `script`, and Review passes the string.
-While the page holds typed text, a selection, or an open dialog or menu, the reload waits. The status shows Paused: **A newer page loads at the next refresh after the open edit ends.**
+A Review refresh reads only the index and the card bodies. Its version also hashes `SHELL_PARTS`, the fixed shell markup: the search field, the Type and State chips, the notices and the table head.
+Only a visible edit or a save in flight holds the reload. The shared `pageHoldsInput` finds a visible edit:
+- a shown text field with unsaved text,
+- an open dialog, menu or date picker,
+- a shown text selection that is not empty.
 A text field marked `data-reload-safe` holds the reload only while it has focus, because the address restores its words after a short wait.
 The List and Review search fields carry it.
-A page can give its own hold test. Each one also holds for words that no visible field shows:
-- The List and Review hold for the words of a closed item. A successful send clears the stored words.
-- Images holds for feedback on a card that the address hides.
-- The Changes and Questions pages hold for a save in progress and for text on a card that is not shown.
-A held reload answers with only the busy reason. The status keeps the data it shows and counts the answer as current, so a long draft stays Paused and never shows Late.
+Words that the user cannot see, such as the words of a closed item or a hidden card, do not hold the reload, and the reload loses them.
+Each page passes its save in flight as `held`:
+- Accounts: its `hold()`, which covers the color popup, the move menu, the quota panel and their pending saves,
+- Images: `sending`,
+- The List: `saving`,
+- Review: `pendingSaves`,
+- the Changes and Questions pages: `activeSaves`,
+- Investigations: `sending`.
+The New item dialog stays open while it sends, so the open dialog holds the reload.
+Each save fetch ends after `page_request_timeout_seconds` in `config/review_links.conf`, so a save that never answers ends the hold.
+Each page writes the key at render as `data-request-timeout-seconds`. The shared `pageRequestSignal()` reads it for Accounts, Images, Investigations and the Changes and Questions pages.
+The List uses `listRequestSignal()` and Review uses `reviewRequestSignal()`. The Review card frame and the New item dialog read the key from their own settings.
+The New item screenshot request has no time limit.
+When a save fetch ends by its time limit, the result of the save is not known.
+The shared `saveTimeoutWords` then gives **No answer in N s. The save can still finish.**, with N from `page_request_timeout_seconds`.
+Accounts, Images, Investigations, the Changes and Questions pages and Review show these words in place of **Not saved**, **Not sent** or the Accounts failure words.
+An Accounts color save that ends by its time limit keeps the new color. The next refresh shows the true color.
+A held reload can follow a timed-out save at once. Then the words do not show, and the loaded page shows the true state.
+While the reload waits, the status shows Paused: **A newer page loads when your edit ends.** It never shows Failed for a hold.
+When `reloadForNewScript` holds a reload, it records the hold. When the hold ends, the page reloads at once.
+The shared `reloadWhenHoldEnds` checks the hold on the 1 s status clock and on each `input`, `change`, `close` and `selectionchange` event.
+It listens in the bubble phase, so the page's own handlers run first. A `close` event does not bubble, so its check runs one task later.
+Each save end calls the page refresh's `changed`, so the check also runs then.
+A selection holds the reload only while it shows. A selection in a hidden row or a closed dialog has no client rects and does not hold it.
+The check does not wait for a timed refresh, so a page with refresh period 0 also reloads.
+There is no time limit on a hold.
+A held reload answers with only the busy reason. A page hold does not keep this answer back.
+The status keeps the data it shows and counts the answer as current, so a long edit stays Paused and never shows Late.
+Before the first data, a held answer shows Paused with its reason.
 The browser keeps the scroll place across the reload. The address keeps the open row, the shown card and the filters.
-On Review an open item is a dialog, so the reload waits until the item closes.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.
@@ -799,7 +829,7 @@ The page converts that time to UTC for the request.
 A preset resolves its time again at the click.
 The arrow keys, Home and End move between items, Enter picks one and Escape closes the menu.
 A click outside the menu closes it.
-The page refresh waits while a Later menu is open.
+While a Later menu is open, a refresh checks only the script version.
 The server stores a preset time, sent as UTC, in the user zone.
 Waiting cards for questions, investigations, proposals and efficiencies retain their Open actions.
 Unowned questions retain only Later.
@@ -930,7 +960,7 @@ One click opens the picker: a saturation and brightness area, a hue slider, a la
 The popup uses the console theme and stays inside the viewport.
 Try paints every swatch and word of that key without a request.
 Cancel or Escape restores the saved color.
-The page pauses refresh while the popup is open or a save is pending.
+While the popup is open or a save is pending, the status shows Paused and a refresh checks only the script version.
 Save closes the popup at once and posts `key` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
 Saves of one key publish in order; saves of different keys run at the same time.
 The server accepts configured `account.` keys, configured keys in `ROLE_COLOR_KEYS`, and valid `model.<id>` keys.
@@ -965,7 +995,7 @@ Arrow keys, Home and End move between the items.
 Escape, Tab, a click outside, a scroll, or a resize closes the menu.
 Focus returns to the arrow button.
 The menu stays inside the viewport.
-The page pauses refresh while the menu is open and while a move save is pending.
+While the menu is open or a move save is pending, the status shows Paused and a refresh checks only the script version.
 A choice posts `group` and `to` to `/console/accounts.html` as form data.
 The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
 The new entry replaces the group's first next move, or becomes its only one, with no hold.
@@ -1167,8 +1197,8 @@ A completed refresh fades the card out and closes the dialog.
 A revision replacement fades the old card out and slides the new card in.
 Both transitions use the configured card durations and respect reduced motion.
 If the List request fails or times out, the next periodic refresh can update the row.
-List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
-Periodic and console visibility refreshes skip a pending List action.
+List and Review refresh, save, counts, and linked record requests use `page_request_timeout_seconds`.
+During a pending List action, periodic and console visibility refreshes check only the script version.
 A refused List action restores the confirmed row and shows the reason.
 A refresh for a saved Review change or a new item waits until pending List actions end.
 An explicit item target joins the linked selection and opens its card.
@@ -1362,7 +1392,7 @@ The dialog shows a parked item's parking condition above the buttons.
 **Until delivered** sits above the shared calendar and 24-hour time field.
 Click Until delivered to save this choice and move the item to Parked.
 The picker aligns with the right edge of the text box.
-The page refresh waits while the picker is open.
+While the picker is open, a refresh checks only the script version.
 **Save** sends the chosen time in UTC.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
 The server reads a date as midnight in the user zone.
@@ -1555,7 +1585,7 @@ Each answer button posts the image id, the button's answer, the feedback text an
 The server checks the token.
 **Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Otherwise the card leaves the page at once, and the request runs in the background.
-The page skips its refresh while a send runs.
+While a send runs, a refresh checks only the script version.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
 The page also hides an image while the server recovers its verified delivery on startup.
 A failed or uncertain delivery returns the card with a delivery notice.
@@ -1569,6 +1599,7 @@ After a send, the record gets `feedback_at` and the page hides the image; the im
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.
 The card goes back in its place with one line: **Not sent: <reason>**.
+A send that ends by its time limit shows **No answer in N s. The save can still finish.** in place of that line.
 An agent deletes an image with this command:
 
 ```sh
@@ -1778,6 +1809,7 @@ Each answer uses a background `fetch` POST.
 The row shows **Saving…** during the save and **Saved: <result>** after success.
 The row then leaves the view without opening another card.
 A failed save keeps the row and typed text and shows **Not saved: <reason>**.
+A save that ends by its time limit shows **No answer in N s. The save can still finish.** in place of that line.
 
 The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
 The first `change_page.page_url` call creates the folder and the manifest with a hard link, so two first requests keep one secret.

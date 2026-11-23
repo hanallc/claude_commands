@@ -968,7 +968,7 @@ if(example.filterOn){
 ''')
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
         # The probe types "typed words", so every title matches it as a search.
         for number in range(30):
             _ = self.add(f"Check typed words {number}")
@@ -982,20 +982,38 @@ if(example.filterOn){
                   + "await new Promise(resolve=>setTimeout(resolve,500));")
         place = toggle + f"scrollTo({{top:{row}.getBoundingClientRect().top+scrollY-40,behavior:'instant'}});"
         words = f"recordDetails({row}).querySelector('textarea[name=words]')"
-        with self.subTest(draft="words of a closed item"):
-            # A closed item keeps its words only in the page's drafts, so they still hold the reload.
+        opened = f"recordIsOpen({row})"
+        with self.subTest(hold="the words of an open item"):
             self.assertEqual(newer_script_reload_results(
-                markup, newer=newer, place=place, draft=words, placed=f"recordIsOpen({row})",
-                after=toggle + f"check(!recordIsOpen({row}),'the item closes with its words');",
-                end=toggle + f"type({words},'');"), [[]])
-        with self.subTest(draft="search words"):
+                markup, newer=newer, place=place, placed=opened, start=f"type({words},'typed words');",
+                end=f"type({words},'');"), [[]])
+        with self.subTest(hold="none, for the words of a closed item"):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, holds=False,
+                start=f"type({words},'typed words');" + toggle + f"check(!{opened},'the item closes with its words');"),
+                [[]])
+        with self.subTest(hold="search words while the field has focus"):
             # The address keeps the search words only after a short wait, so the field holds while it has focus.
             # A headless frame never has focus, so the probe gives it focus as a user's typing does.
+            search = ("(field=>{document.hasFocus=()=>true;field.focus({preventScroll:true});type(field,'typed words');})"
+                      + "(document.querySelector('#list-search'));")
             self.assertEqual(newer_script_reload_results(
-                markup, newer=newer, place=place, placed=f"recordIsOpen({row})",
-                draft="(field=>{document.hasFocus=()=>true;field.focus({preventScroll:true});return field;})"
-                      + "(document.querySelector('#list-search'))",
-                end="draft.blur();"), [[]])
+                markup, newer=newer, place=place, placed=opened, start=search, end="document.hasFocus=()=>false;"),
+                [[]])
+        with self.subTest(hold="an open Park picker"):
+            picker = f"recordDetails({row}).querySelector('[data-later-toggle]')"
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened,
+                start=f"{picker}.click();check(dateTimePickerOpen(document),'the picker opens');",
+                end=f"{picker}.click();check(!dateTimePickerOpen(document),'the picker closes');"), [[]])
+        with self.subTest(hold="a Mark read save that never answers"):
+            # The save has no visible edit, so only the save holds the reload.
+            short = markup.replace('data-request-timeout-seconds="15"', 'data-request-timeout-seconds="5"', 1)
+            self.assertNotEqual(short, markup)
+            save = (f"const form=recordDetails({row}).querySelector('form');"
+                    + "form.requestSubmit(form.querySelector('[value=\"read\"]'));")
+            self.assertEqual(newer_script_reload_results(
+                short, newer=newer, place=place, placed=opened, start=save, saves=True), [[]])
 
     def browser_row_expansion(self, steps: str) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -7461,12 +7479,15 @@ try{
  const refusedForm=recordDetails(refreshed).querySelector('form');
  holdPost=true;
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
- dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- check(reads.length===3,'The shared status event makes no List request during a row save.');
+ // A held refresh still reads the page, so it can find a newer script. It does not change the rows.
+ const heldRows=rows();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+ check(reads.length===4 && rows().length===heldRows.length && rows().every((row,i)=>row===heldRows[i]),
+  'The shared status event reads the page and keeps the rows during a row save.');
  finishPost({ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
  holdPost=false;finishPost=undefined;
  await refused;
- check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');
+ check(reads.length===4 && refreshed.isConnected,'A refused row save makes no List request after the event.');
  check(refreshed.dataset.unread==='true' && refusedForm.elements.words.value==='Keep my draft' &&
        refusedForm.querySelector('[data-send-status]').textContent==='Not saved: The row save was refused.',
        'A refusal restores the unread state and shows the reason beside the draft.');
