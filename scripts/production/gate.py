@@ -91,13 +91,12 @@ from scripts.production import (  # noqa: E402
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
-    ALL_MODULES as ALL_MODULES, AllModules as AllModules, CloudGateRoute,
+    ALL_MODULES as ALL_MODULES, AllModules as AllModules,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
-from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
@@ -111,7 +110,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
-from scripts.build_queue import admission_client, admission_records, admission_wire, placement  # noqa: E402
+from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement  # noqa: E402
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import (  # noqa: E402
@@ -192,6 +191,7 @@ class GateArguments(argparse.Namespace):
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    command: tuple[str, ...] = ()
 
 
 class NightlyRunState(Enum):
@@ -1331,7 +1331,7 @@ def matches_routed_gate_tree(repo: Path, tree: str) -> bool:
     return isinstance(routed, NoRoutedGateTree) or routed.tree == tree
 
 
-def read_gate_checkout(cloud: CloudGateRoute, repo: Path) -> tuple[str, set[str]]:
+def read_gate_checkout(cloud: AssignedCloudGateRoute, repo: Path) -> tuple[str, set[str]]:
     try:
         return cloud.working_tree(repo)
     except (affected_modules.GraphError, OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -1506,7 +1506,7 @@ class PendingEmptyAffectedPass(PendingTestPass):
     started_at: float
 
 
-def finalize_gate(cloud: CloudGateRoute, routed: RoutedGateTree, run: GateRun) -> GateRun:
+def finalize_gate(cloud: AssignedCloudGateRoute, routed: RoutedGateTree, run: GateRun) -> GateRun:
     """Validate the checkout and publish an eligible pass."""
     pending = routed.pending_pass
     modules_match = False
@@ -2434,9 +2434,9 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
-            with admission_records.default_owner(args.unit):
+            with admission_records.default_owner(args.unit), gate_suite_target(args, repo, target) as assigned:
                 suites = run_gate_suites(repo, module_time_limit_s=float(args.module_time_limit_s),
-                                         source="checkpoint", full=args.full, gate_job=args.gate_job, target=target)
+                                         source="checkpoint", full=args.full, gate_job=args.gate_job, target=assigned)
         finally:
             if previous_unit is None:
                 _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
@@ -3044,7 +3044,7 @@ def _nightly_unit(args: GateArguments) -> str:
     return copies.checked_owner(str(units[0].id))
 
 
-def nightly(args: GateArguments) -> int:
+def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
     unit = _nightly_unit(args)
     run: GateRun | NightlyRunState = NightlyRunState.NOT_STARTED
     result_sent = False
@@ -3058,9 +3058,10 @@ def nightly(args: GateArguments) -> int:
         with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
-                run = run_suites(clone, NIGHTLY_TYPE_DIRS,
-                                 module_time_limit_s=args.module_time_limit_s, full=True)
-            except (GateRefused, OSError, subprocess.SubprocessError) as error:
+                with gate_suite_target(args, clone, target) as assigned:
+                    run = run_gate_suites(clone, NIGHTLY_TYPE_DIRS, module_time_limit_s=args.module_time_limit_s,
+                                          full=True, gate_job=args.gate_job, target=assigned, nightly_types=True)
+            except (GateRefused, first_step.FirstStepRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),
                                             kind=GateJobKind.RUNNER_FAILURE),), 0, 0)
@@ -3146,12 +3147,35 @@ class MacLinuxAssignment:
     assignment: placement.PlacementAssignment
 
 
-# The checked target of a gate: a target name, the checked guest assignment, or no assignment.
-GateTarget = str | MacLinuxAssignment | NoGateAssignment
+@dataclass(frozen=True)
+class AwsGateAssignment:
+    """A checked AWS scaler assignment."""
+
+    assignment: placement.PlacementAssignment
+
+
+GateTarget = str | MacLinuxAssignment | AwsGateAssignment | NoGateAssignment
 
 
 class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
+
+
+@contextmanager
+def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> Generator[GateTarget]:
+    """Keep the queue placement for the test checkout until the suites end."""
+    if not isinstance(target, NoGateAssignment):
+        yield target
+        return
+    targets = first_step.gate_targets(args.command, source)
+    if not targets:
+        yield "natedev"
+        return
+    with first_step.admitted_run(args.command, source, targets=targets) as admitted:
+        if not isinstance(admitted.grant, first_step.GatePlacement):
+            raise GateAssignmentRefused("The queue returned no gate placement")
+        admitted.handoff(source)
+        yield gate_start_target(args, args.command)
 
 
 def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarget:
@@ -3185,6 +3209,8 @@ def placement_target(
         return placed
     if placed.assignment.destination.target == "mac-linux":
         return MacLinuxAssignment(placed.assignment)
+    if placed.assignment.destination.target == "aws":
+        return AwsGateAssignment(placed.assignment)
     return placed.assignment.destination.target
 
 
@@ -3239,6 +3265,21 @@ class GuestNotStartedOutcome(Protocol):
     def reason(self) -> str: ...
 
 
+class GuestToolSettings(Protocol):
+    def command(self, shell: str) -> tuple[str, ...]: ...
+
+
+class AssignedCloudGateRoute(Protocol):
+    """Run AWS tests and identify the checked-out tree."""
+
+    def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
+
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
+              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              gate_job: StepJob | GateJobNotRecorded,
+              assignment: placement.PlacementAssignment) -> GateRun | str: ...
+
+
 class MacLinuxGateRoute(Protocol):
     """Run the tests and type checks in the Mac Linux guest."""
 
@@ -3246,6 +3287,21 @@ class MacLinuxGateRoute(Protocol):
               module_time_limit_s: float, selected: AllModules | TreeSelection,
               gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str],
               assignment: placement.PlacementAssignment) -> GateRun | GuestNotStartedOutcome | str: ...
+
+    def new_run_settings(self) -> GuestToolSettings | GuestNotStartedOutcome | str: ...
+
+
+def guest_has_type_tools(guest: MacLinuxGateRoute) -> bool:
+    try:
+        settings = guest.new_run_settings()
+        if isinstance(settings, str) or not hasattr(settings, 'command'):
+            return False
+        command = cast(GuestToolSettings, settings).command(
+            'command -v "${GATE_BASEDPYRIGHT:-basedpyright}" && command -v "${GATE_UV:-uv}"')
+        return subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30, check=False).returncode == 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
 
 
 def report_mac_linux_took_no_run(reason: str, assignment: placement.PlacementAssignment) -> MacLinuxTookNoRun:
@@ -3261,12 +3317,12 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
-                    target: GateTarget) -> GateRun:
+                    target: GateTarget, nightly_types: bool = False, named: Sequence[str] = ()) -> GateRun:
     """Route the whole test selection to the target that gate_start_target checked: the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
-    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
+    cloud = cast(AssignedCloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
@@ -3278,20 +3334,20 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
-    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
+    def run_cloud(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job)
+                              selected=selection, gate_job=gate_job, assignment=assignment)
         if isinstance(outcome, str):
-            if not isinstance(target, NoGateAssignment):
-                raise GateRefused(f"AWS gate failed: {outcome}")
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
-        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
+            raise GateRefused(f"AWS gate failed: {outcome}")
+        return finish_remote(outcome)
 
     def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
-        outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job, type_dirs=type_dirs, assignment=assignment)
+        local_types = nightly_types and bool(type_dirs) and not guest_has_type_tools(guest)
+        outcome = guest.route(repo, mode=mode, full=full,
+                              module_time_limit_s=sys.float_info.max if named else module_time_limit_s,
+                              selected=selection, gate_job=gate_job, type_dirs=() if local_types else type_dirs,
+                              assignment=assignment)
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
@@ -3304,7 +3360,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if job.returncode:
                     print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
                           file=sys.stderr, flush=True)
-        return outcome
+        return finish_remote(outcome) if local_types else outcome
 
     def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
         absent = [name for name in type_dirs if not (repo / name).exists()]
@@ -3322,7 +3378,9 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
     match gate_target_kind(target) if isinstance(target, str) else target:
-        case "natedev":
+        case "natedev" | NoGateAssignment():
+            if named:
+                return run_named_modules(repo, named, mode)
             # A gate assigned to natedev checks its checkout at the end, like every other gate.
             return run_routed(lambda _routed, _dirty: run_local(type_dirs))
         case MacLinuxAssignment(assignment=guest_assignment):
@@ -3334,21 +3392,20 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             if not enabled:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
             run_selected = partial(run_guest, guest_assignment)
-        case "aws":
-            if type_dirs:
-                raise GateRefused("The AWS gate route does not support type checks")
-            run_selected = run_cloud
-        case NoGateAssignment():
-            run_selected = run_cloud
+        case AwsGateAssignment(assignment=aws_assignment):
+            run_selected = partial(run_cloud, aws_assignment)
         case _:
             raise GateRefused(f"The gate does not support the assigned target {target}")
 
     def select_and_run(routed: RoutedGateTree, dirty: set[str]) -> GateRun:
+        if named:
+            selection = TreeSelection(tuple(f"scripts/{name}" for name in named), routed.tree)
+            run = run_selected(selection)
+            return replace(run, selection_certified=False, coverage=ModuleCoverage.SUBSET)
         if mode is SuiteMode.GATE:
             return run_selected(ALL_MODULES)
 
         selected: AllModules | TreeSelection = ALL_MODULES
-        whole_suite = full
         if not full:
             tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
                            else head_test_tree(repo))
@@ -3356,85 +3413,22 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 raise GateRefused("The checkout changed before test selection")
             modules = discover_test_modules(repo)
             selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-            unassigned = isinstance(target, NoGateAssignment)
-            if ledger.reuse(report=not unassigned and not type_dirs):
-                if unassigned:
-                    return run_local(type_dirs)
-                if type_dirs:
+            if ledger.reuse(report=not type_dirs):
+                if type_dirs and isinstance(target, MacLinuxAssignment):
                     return run_selected(TreeSelection((), routed.tree))
-                return GateRun((), 0.0, 0.0, tests_reused=True)
-            whole_suite = isinstance(selection, FullSuite)
+                return finish_remote(GateRun((), 0.0, 0.0, tests_reused=True))
             paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
             selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), routed.tree)
             if isinstance(selection, AffectedSelection) and not selection.modules:
                 if type_dirs:
-                    return run_local(type_dirs) if unassigned else run_selected(selected)
+                    if isinstance(target, MacLinuxAssignment):
+                        return run_selected(selected)
+                    return finish_remote(GateRun((), 0.0, 0.0, selection_certified=True))
                 routed.pending_pass = PendingEmptyAffectedPass(ledger, selection, modules, NO_FULL_RUN_REQUIRED,
                                                               started_at=time.time())
                 return GateRun((), 0.0, 0.0, selection_certified=True)
 
-        # Nate ordered the Mac split off on 2026-11-21.
         return run_selected(selected)
-
-        mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
-        try:
-            mac = mac_gate_process.load_mac_gate_route(mac_module)
-        except ModuleNotFoundError as error:
-            if error.name != mac_module:
-                raise
-            return run_cloud(selected)
-        exclusions = mac.read_modules(repo)
-        if isinstance(exclusions, MacGateExcludeFileMissing):
-            return run_cloud(selected)
-        excluded = set(exclusions.paths)
-        if isinstance(selected, AllModules):
-            modules = discover_test_modules(repo)
-            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), routed.tree)
-        else:
-            assignment = selected
-        mac_paths = tuple(path for path in assignment.paths if path not in excluded)
-        linux_paths = tuple(path for path in assignment.paths if path in excluded)
-        if mac_paths:
-            with mac_gate_process.start_mac_gate(
-                    mac_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                    selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
-                if linux_paths or type_dirs:
-                    linux = run_local_subset(linux_paths, type_dirs)
-                else:
-                    linux = GateRun((), 0.0, 0.0, selection_certified=True)
-                outcome = mac_result.result()
-
-            if isinstance(outcome, mac_gate_process.MacGateMiss):
-                print("Mac gate uses natedev: " + outcome.reason, flush=True)
-                outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
-
-            def module_path(job: GateJobResult) -> str:
-                return f"scripts/{job.suite}/{job.module}"
-
-            requested_paths = set(mac_paths)
-            passed_jobs = tuple(job for job in outcome.jobs
-                                if job.kind is GateJobKind.TEST_MODULE and job.returncode == 0
-                                and not job.killed_for and not job.tripwire_tripped and module_path(job) in requested_paths)
-            passed_paths = {module_path(job) for job in passed_jobs}
-            mac_pass = replace(outcome, jobs=passed_jobs, time_limit_report="",
-                               executions=outcome.executions or outcome.jobs)
-            run = combine_gate_runs(linux, mac_pass, seconds=max(linux.seconds, mac_pass.seconds))
-            missing = tuple(path for path in mac_paths if path not in passed_paths)
-            if missing:
-                print(f"Mac gate uses natedev for {len(missing)} modules without a pass", flush=True)
-                complete_local_run = whole_suite and not linux_paths and not passed_paths
-                if complete_local_run:
-                    local = run_local(())
-                else:
-                    local = run_local_subset(missing, ())
-                run = combine_gate_runs(run, local, seconds=run.seconds + local.seconds)
-                if complete_local_run:
-                    run = replace(run, tests_reused=local.tests_reused, coverage=local.coverage)
-        elif whole_suite:
-            run = run_local(type_dirs)
-        else:
-            run = run_local_subset(linux_paths, type_dirs)
-        return run
 
     return run_routed(select_and_run)
 
@@ -3505,15 +3499,14 @@ def unwind_tests_only_on_sigterm() -> Generator[None]:
 def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
-            repo = Path(args.repo).resolve()
+            repo = Path(args.repo).expanduser().resolve()
             # The copy record names the owner only when the caller and its process family name none,
             # so a bad copy record never refuses a run whose caller gave an owner.
             unowned = isinstance(admission_records.request_owner(""), admission_records.OwnerNotGiven)
             owner = copies.source_owner(repo) if unowned else ""
             with gate_recovery(repo), admission_records.default_owner(owner):
-                run = (run_named_modules(repo, args.modules, mode) if args.modules else
-                       run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
-                                       mode=mode, gate_job=args.gate_job, target=target))
+                run = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
+                                      mode=mode, gate_job=args.gate_job, target=target, named=args.modules)
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
@@ -3593,7 +3586,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(arguments))
-    args.gate_job = gate_job_for_command(["gate.py", *arguments])
+    args.command = ("gate.py", *arguments)
+    args.gate_job = gate_job_for_command(args.command)
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -3612,16 +3606,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        target = gate_start_target(args, arguments)
-    except GateRefused as error:
+        target = gate_start_target(args, args.command)
+        if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
+                and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
+            target = "natedev"
+        return run_gate_command(args, target)
+    except (GateRefused, first_step.FirstStepRefused) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
+
+
+def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
-        with test_run_folder():
-            return run_tests_only(args, SuiteMode.TARGETED, target)
+        with test_run_folder(), gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
+            return run_tests_only(args, SuiteMode.TARGETED, assigned)
     if args.tests_only:
-        with unwind_tests_only_on_sigterm():
-            return run_tests_only(args, SuiteMode.GATE, target)
+        with (unwind_tests_only_on_sigterm(),
+              gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned):
+            return run_tests_only(args, SuiteMode.GATE, assigned)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)
@@ -3630,7 +3632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.nightly:
                 with admission_records.default_owner(args.unit):
                     try:
-                        return nightly(args)
+                        return nightly(args, target)
                     finally:
                         _sweep_nightly_build_folders()
             if args.promote_only:
