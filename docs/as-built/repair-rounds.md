@@ -196,6 +196,8 @@ nate decides step 3 of the push lock plan (one landing queue) from these times.
 The helper tracks active holds in the process.
 A nested call in the same process uses the existing hold for that path.
 A different repository takes its own lock.
+A caller can give a series of acquisitions one wait budget.
+Each acquisition reduces the budget by the time it spends acquiring the lock.
 The helper does not change `os.environ`.
 `held_environment(checkout)` gives a named child `MAIN_PUSH_LOCK_HELD` with the absolute lock path.
 It refuses when the process does not hold that lock.
