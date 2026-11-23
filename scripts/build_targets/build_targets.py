@@ -1324,14 +1324,24 @@ def hold_waited_on(holds: build_hold.NatedevHolds,
                    owner: OwningSession | NoOwningSession,
                    directory: Path, caller_lineage: CallerLineage) -> build_hold.Holder | NoBlockingHold:
     """Choose the oldest hold that applies to the caller and belongs to another session."""
+    return blocking_hold(holds, own_hold_key(owner, directory), caller_lineage)
+
+
+def own_hold_key(owner: OwningSession | NoOwningSession, directory: Path) -> str:
+    """Name the hold file of the owner's session, or give an empty name."""
     from scripts.build_hold import build_hold
 
-    own_key = ""
     if isinstance(owner, OwningSession):
         try:
-            own_key = build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
+            return build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
         except ValueError:
             pass
+    return ""
+
+
+def blocking_hold(holds: build_hold.NatedevHolds, own_key: str,
+                  caller_lineage: CallerLineage) -> build_hold.Holder | NoBlockingHold:
+    """Choose the oldest hold that applies to the caller, other than the hold of its own session."""
     for holder in holds.in_force:
         kept = (isinstance(caller_lineage, ConfirmedCallerLineage)
                 and bool(caller_lineage.processes.intersection(holder.keep)))
