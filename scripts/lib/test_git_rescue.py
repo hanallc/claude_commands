@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import git_rescue
-from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -41,12 +41,12 @@ class GitRescueTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = write_fixture_git_config(self.root)
+        # clear=True drops the caller's GIT_* variables, such as GIT_DIR or GIT_INDEX_FILE.
         self.enterContext(mock.patch.dict(os.environ, {
-            "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1",
+            **fixture_git_environment(self.root),
             "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
             "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
-        }))
+        }, clear=True))
         self.source = self.root / "source"
         self.source.mkdir()
         _ = self.git(self.source, "init", "-q", "-b", "trunk")
@@ -75,6 +75,20 @@ class GitRescueTests(unittest.TestCase):
 
     def index_bytes(self) -> bytes:
         return Path(self.git(self.slot, "rev-parse", "--path-format=absolute", "--git-path", "index")).read_bytes()
+
+    def test_a_caller_git_variable_does_not_reach_the_fixture_commands(self) -> None:
+        folder = self.root / "caller"
+        folder.mkdir()
+        caller = {"GIT_INDEX_FILE": str(folder / "index"), "GIT_DIR": str(folder / "repository.git")}
+        probe = GitRescueTests("test_clean_reachable_worktree_needs_no_rescue_even_with_generated_data")
+        with mock.patch.dict(os.environ, caller):
+            try:
+                probe.setUp()
+                self.assertFalse(set(caller) & set(os.environ))
+                _ = probe.git(probe.source, "add", "tracked.txt")
+            finally:
+                probe.doCleanups()
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_clean_reachable_worktree_needs_no_rescue_even_with_generated_data(self) -> None:
         generated = self.slot / "generated"

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -147,7 +148,14 @@ def waiting_steps_text(count: int) -> str:
     return f"{count} step waits" if count == 1 else f"{count} steps wait"
 
 
-def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN) -> str | None:
+def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN,
+               live_agrees: Callable[[SavedAlert], bool] | None = None) -> str | None:
+    """Format the saved reading.
+
+    A view passes `live_agrees`, and a Mac condition line shows only when the live Mac state agrees with it.
+    The watch passes None, because it formats the reading that it just wrote from the live state.
+    A view calls `mac_idle.view_alert_line`, never this function directly.
+    """
     saved = read_alert(path)
     if isinstance(saved, NoSavedAlert):
         return None
@@ -163,19 +171,22 @@ def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = Blo
         return f"MAC IDLE WATCH: Mac state unreadable: {display_field(saved['detail'])}."
     admission_error = saved.get("admission_error", "")
     query_reason = f"admission query failed: {display_field(admission_error)}" if admission_error else ""
+    quiet = f"MAC IDLE WATCH: {query_reason}." if query_reason else None
     if saved["state"] == "busy" or saved["waiting"] == 0:
-        return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
+        return quiet
     waiting = saved["waiting"]
     if saved["state"] == "unreachable":
+        if live_agrees is not None and not live_agrees(saved):
+            return quiet
         return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting_steps_text(waiting)} for the Mac."
     elapsed = now - saved["since"]
-    if elapsed < settings.alert_seconds:
-        return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
+    if elapsed < settings.alert_seconds or (saved["cause"] == "blocked" and block is BlockText.OMITTED):
+        return quiet
+    if live_agrees is not None and not live_agrees(saved):
+        return quiet
     holder, detail = display_field(saved["holder"]), display_field(saved["detail"])
     suffix = f"; {query_reason}" if query_reason else ""
     if saved["cause"] == "blocked":
-        if block is BlockText.OMITTED:
-            return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
         return (f"MAC BLOCKED by {holder} since {clock_text(saved['since'], zone)} ({detail}): {waiting_steps_text(waiting)} "
                 f"for the Mac, idle {int(elapsed // 60)} min; /build:mac unblock clears it{suffix}.")
     if saved["cause"] == "claim_idle":
