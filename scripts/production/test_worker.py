@@ -38,6 +38,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, detached, unit_runs
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
@@ -4534,8 +4535,7 @@ class WorkerCommandTests(unittest.TestCase):
         resolve.assert_not_called()
 
     def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        start_new_command(self)
         rows = [self.fixture.worker(name) for name in ("impl", "review", "test")]
         for index, row in enumerate(rows, 1):
             self.fixture.world.add(row, f"w1:p{index}")

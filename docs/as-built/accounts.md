@@ -796,9 +796,9 @@ Explicit folders have no repository fallback.
 The [shared configuration contract](showrunner-automation.md#shared-runtime-configuration) defines reads, limits, and publication.
 
 `note_file.notes_dir()` gives `AGENT_NOTES_DIR` and an explicit `AGENTS_DIR` override precedence.
-Its private cached helper reads `notes_directory` at most once per process.
+Its private cached helper reads `notes_directory` again only when the accounts configuration file stamp changes.
 Account creation, identity resolution, and missing-note instructions use that same helper.
-A new process sees a changed notes-folder setting.
+A later call in the same process sees a changed notes-folder setting.
 
 The default usage age is ten minutes.
 Codex alert readings use the same `usage_stale_minutes` setting.

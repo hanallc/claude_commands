@@ -40,6 +40,7 @@ from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
 from scripts.direct import progress_history
 from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, herdr_types, pass_notices, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
@@ -186,8 +187,8 @@ class DetachedRunsTests(unittest.TestCase):
         evidence = detached_runs.live_run_evidence_for_staff(path.parent, frozenset({self.worker_id}))
         self.assertEqual(evidence.runs, (record,))
         self.assertEqual(len(evidence.read_errors), 1)
+        start_new_command(self)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            unit_runs.report_anomaly.cache_clear()
             evidence.report_errors()
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(damaged), errors.getvalue())

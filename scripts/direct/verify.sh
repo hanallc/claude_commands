@@ -595,6 +595,19 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
+# Remove the tool folder $2 with build_folders.py remove. An empty $2 does nothing.
+# $1 names the removal in the line that a failure prints.
+# Status 1 means that another process holds the lock. The folder stays for collection.
+# Status 2 means that build_folders.py printed its error. Neither status prints a line here.
+# A higher status prints one line. Return 0, so the step status stays the exit status of the call.
+remove_tool_folder() {
+    local what=$1 folder=$2 status=0
+    [[ -n "$folder" ]] || return 0
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || status=$?
+    (( status <= 2 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
+    return 0
+}
+
 # One parent-owned helper serves command substitutions and cleanup traps.
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
@@ -885,6 +898,8 @@ run() {
     if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         exit "$status"
     fi
+    # The EXIT trap reads this status: a return with it is a step failure.
+    LAST_STEP_STATUS=$status
     return "$status"
 }
 
@@ -1925,7 +1940,7 @@ finish_hold_wait() {
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
+        remove_tool_folder "hold-wait folder removal" "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
@@ -1948,6 +1963,7 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
+LAST_STEP_STATUS=""
 RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
@@ -2104,15 +2120,9 @@ cancel_tree_run() {
 }
 
 remove_tree_watch() {
-    [[ -n "$TREE_WATCH_DIR" ]] || return 0
-    local folder="$TREE_WATCH_DIR" remove_status=0
+    local folder="$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || remove_status=$?
-    # Status 1 leaves the folder for collection. Status 2 already has a diagnostic.
-    if (( remove_status > 2 )); then
-        printf 'verify.sh: cannot remove the tree watch folder %s (status %s).\n' "$folder" "$remove_status" >&2
-    fi
-    return 0
+    remove_tool_folder "tree-watch folder removal" "$folder"
 }
 
 start_tree_watch() {
@@ -2311,8 +2321,7 @@ forward_mac_runner_signal() {
     if [[ "$signal_name" == INT ]]; then signal_name=TERM; fi
     find_mac_runner_pid
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
@@ -3352,7 +3361,7 @@ stop_copy_watch() {
             esac
         done < "$COPY_WATCH_DIR/result"
     fi
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$COPY_WATCH_DIR"
+    remove_tool_folder "copy-watch folder removal" "$COPY_WATCH_DIR"
     COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
     if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         BUILDLOG_MAC_COPY="$COPY_WORD"
@@ -4444,14 +4453,41 @@ finish_exit_diagnostics() {
     rm -f -- "$exit_diagnostics" || true
 }
 
+# A failed step returns from run() with the status it recorded, and errexit
+# stops verify.sh at that return. Any other failed command that is not an
+# exit is an unexpected stop, such as a failed helper. It gives no verdict:
+# report it with its function and command, and keep its run log as
+# stopped.log in the cache folder. Each stop replaces the older log, and
+# finish_run sees no run log to record. Known limit: a caller can handle a
+# step failure, and then a different return can stop with the same status.
+# That return reads as a step failure.
+report_stop() {
+    local command=$1 caller=$2 kept=""
+    case "$command" in
+        exit|"exit "*) return 0 ;;
+        return|"return "*) [[ "$EXIT_STATUS" != "$LAST_STEP_STATUS" ]] || return 0 ;;
+    esac
+    if [[ -n "$RUN_LOG" ]]; then
+        if [[ -n "$CACHE_DIR" ]] && mv -f -- "$RUN_LOG" "$CACHE_DIR/stopped.log"; then
+            kept="; run log kept: $CACHE_DIR/stopped.log"
+        else
+            rm -f -- "$RUN_LOG"
+        fi
+        RUN_LOG=""
+    fi
+    printf 'verify.sh: stopped by a failed command (status %s) in %s: %s%s\n' "$EXIT_STATUS" "$caller" "$command" "$kept" >&2
+}
+
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it. $2 is the command
 # that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
 # hold stop ends the run-log readers, runs this trap with the status of the
 # last command, often 0. Only an exit command completes a run, so any other
 # command records the run as interrupted (status 128: the signal is
-# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
-# so one failed cleanup command does not end the trap with its status.
+# unknown here) and writes no pass. A failed step reaches this trap as an
+# exit or as the return of run(); report_stop handles every other failed
+# command. Cleanup is best effort: errexit is off, so one failed cleanup
+# command does not end the trap with its status.
 verify_exit() {
     exec 2>/dev/null
     exec 2>>"${exit_diagnostics:-/dev/null}" || true
@@ -4465,7 +4501,7 @@ verify_exit() {
         finish_verify_run "$EXIT_STATUS" >&2
         printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" >&2
     else
-        if (( EXIT_STATUS == 0 )); then outcome=completed; fi
+        if (( EXIT_STATUS == 0 )); then outcome=completed; else report_stop "$2" "${FUNCNAME[1]:-main}"; fi
         local exit_output=""
         # Keep result messages on stdout and release resources before writing to the pipe.
         exit_output="$(mktemp "${TMPDIR:-/tmp}/verify-result.XXXXXX" 2>/dev/null)" || exit_output=""
@@ -4697,7 +4733,8 @@ run_lint_held_sequence() {
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
     lint_rewrite fmt_cargo --all
-    workspace_taplo
+    # The subshell hides run()'s status, so exit with the step failure here.
+    workspace_taplo || exit "$?"
     lint_copy_return || exit 1
     workspace_taplo --check || exit "$?"
     lint_status=0

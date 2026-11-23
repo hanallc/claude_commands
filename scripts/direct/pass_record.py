@@ -22,7 +22,6 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
@@ -225,11 +224,12 @@ def inherited_registry_text(encoded: str) -> str:
             raise ValueError("invalid model configuration; start a new operation")
 
 
-@cache
 def config_digest() -> str:
-    """Hash the launch registry and direct settings once per process.
+    """Hash the launch registry and direct settings at each call.
 
-    Return empty text when either source is unavailable. Telemetry must not stop a run.
+    A call costs about 30 microseconds, and a cache would keep an old digest in a
+    long-lived process (verify_helper.py). Return empty text when either source is
+    unavailable. Telemetry must not stop a run.
     """
     try:
         encoded = os.environ.get("MODELS_LAUNCH_CONFIGURATION", "")
