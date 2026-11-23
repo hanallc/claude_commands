@@ -523,8 +523,11 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
             write_record(paths.state / "alert.json", saved)
+        # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
         if (isinstance(reading, MacUnreachable)
-                and now - saved["since"] >= settings.push_seconds and not saved["pushed"]):
+                and now - saved["since"] >= settings.push_seconds and not saved["pushed"]
+                and isinstance(mac_test.machine_off_on_purpose(mac_test.StatePaths(paths.mac_state)),
+                               mac_test.MachineInUse)):
             saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):

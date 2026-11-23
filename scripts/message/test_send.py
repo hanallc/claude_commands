@@ -6642,6 +6642,44 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertFalse((self.root / "log.jsonl").exists())
         self.assertEqual(self.relayed, [])
 
+    def mac_locked_main(self) -> tuple[int, str, mock.MagicMock]:
+        arguments = ["--to", "user", "--text-id", "mac.locked", "--value", "sender=hana",
+                     "--value", "waiting=One unit's phase waits for 2 shots", "--clears-when", "true"]
+        with (mock.patch.object(send, "send", return_value=send.Result("sent", "to the user")) as sent,
+              redirect_stdout(output := io.StringIO())):
+            code = send.main(arguments)
+        return code, output.getvalue(), sent
+
+    def test_mac_locked_push_waits_for_a_mac_in_use(self) -> None:
+        from scripts.mac_test import mac_test
+
+        state = self.root / "mac-state"
+        state.mkdir()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(state)})))
+        mac_test_conf, build_targets_conf = self.root / "config/mac_test.conf", self.root / "config/build_targets.conf"
+        since = datetime.fromtimestamp(1000, timezone.utc)
+        block = mac_test.block_record(mac_test.ActiveMacBlock(
+            "nate", "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue("nate"),
+            mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+        for name, offload, enabled, blocked in (("block", "on", "on", True), ("offload", "off", "on", False),
+                                                ("enabled", "on", "off", False)):
+            _ = write_config_fixture(mac_test_conf, f"offload={offload}\n")
+            _ = write_config_fixture(build_targets_conf, f"enabled.mac={enabled}\n")
+            if blocked:
+                _ = (state / "block.json").write_text(json.dumps(block))
+            with self.subTest(signal=name):
+                code, output, sent = self.mac_locked_main()
+                self.assertEqual(code, 0)
+                self.assertIn("not sent: the Mac is off on purpose", output)
+                sent.assert_not_called()
+            (state / "block.json").unlink(missing_ok=True)
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
+        _ = write_config_fixture(build_targets_conf, "enabled.mac=on\n")
+        code, output, sent = self.mac_locked_main()
+        self.assertEqual(code, 0)
+        self.assertIn("SENT: to the user", output)
+        sent.assert_called_once()
+
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
                      "--action", "Choose retry.", "--text", "The build stopped."]

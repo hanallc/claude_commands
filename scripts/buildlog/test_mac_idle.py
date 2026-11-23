@@ -75,7 +75,8 @@ class MacIdleTests(NotificationGuardedTestCase):
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
-                                 "alert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+                                 "offload=on\nalert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+        _ = write_config_fixture(self.root / "build_targets.conf")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
@@ -651,6 +652,47 @@ done
             self.assertEqual(command[command.index("--key") + 1], "mac-idle-1760")
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["messaged"], saved["pushed"]), (True, True))
+
+    def test_mac_off_on_purpose_sends_no_push_and_a_mac_in_use_still_pushes(self) -> None:
+        def offload_off() -> None:
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+
+        def offload_on() -> None:
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+
+        def mac_disabled() -> None:
+            _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
+
+        def mac_enabled() -> None:
+            _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
+
+        def unblock() -> None:
+            (self.paths.mac_state / "block.json").unlink()
+
+        self.unreachable()
+        for signal_name, turn_off, turn_on in (("block", self.block, unblock), ("offload", offload_off, offload_on),
+                                               ("enabled", mac_disabled, mac_enabled)):
+            (self.paths.state / "alert.json").unlink(missing_ok=True)
+            mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
+            turn_off()
+            with self.subTest(signal=signal_name), \
+                 mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
+                 mock.patch.object(subprocess, "run",
+                                   return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
+                for now in (1180, 1600, 1660):
+                    mac_idle.watch_once(self.paths, now)
+                run.assert_not_called()
+                notify.assert_called_once()
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                self.assertEqual((saved["state"], saved["pushed"]), ("unreachable", False))
+                line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1660, ZoneInfo("UTC"))
+                self.assertIn("MAC UNREACHABLE", line or "")
+                turn_on()
+                mac_idle.watch_once(self.paths, 1720)
+                run.assert_called_once()
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
+                self.assertTrue(mac_idle.read_record(self.paths.state / "alert.json")["pushed"])
 
     def test_parked_app_claim_alert_names_holder_and_never_repairs(self) -> None:
         self.waiting_steps(7)

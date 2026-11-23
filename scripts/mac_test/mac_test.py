@@ -547,6 +547,44 @@ def read_claim_block(paths: StatePaths) -> MacBlockState:
     return read_block(paths.block)
 
 
+@dataclass(frozen=True)
+class OffOnPurpose:
+    """The user turned the machine off. No watcher sends an outage push for it."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class MachineInUse:
+    """No block or setting turns the machine off, so an outage push goes to the user."""
+
+
+MACHINE_IN_USE = MachineInUse()
+
+
+def machine_off_on_purpose(paths: StatePaths) -> OffOnPurpose | MachineInUse:
+    """The one rule for every outage push: a block, offload=off or enabled.<machine>=off turns a machine off.
+
+    An unreadable record or setting proves nothing, so the machine counts as in use and a real outage still pushes.
+    """
+    try:
+        block = read_block(paths.block)
+    except (OSError, UnicodeError, StateReadError):
+        block = NO_MAC_BLOCK
+    if not isinstance(block, NoMacBlock):
+        return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
+    try:
+        settings = conf.read(config_path("" if paths.target == "mac" else paths.target))
+        if not settings.value("offload", conf.on_off, default=True):
+            return OffOnPurpose("offload=off")
+        enabled = f"enabled.{paths.target}"
+        if not conf.read("build_targets").value(enabled, conf.on_off, default=True):
+            return OffOnPurpose(f"{enabled}=off")
+    except (OSError, ValueError, ConfigError):
+        pass
+    return MACHINE_IN_USE
+
+
 def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBlockState:
     """Return the block that prevents this session from starting new work."""
     block = read_claim_block(paths)

@@ -216,6 +216,8 @@ PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\bcodex_credit_account
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)
+# A Mac that the user turned off is not locked: mac_test.machine_off_on_purpose stops this push.
+MAC_LOCKED_TEXT = "mac.locked"
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
                  + ' --value session=<session> --value machine=<machine> --value "go=<the Go: line to type>"'
@@ -5897,6 +5899,12 @@ def main(argv: list[str]) -> int:
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":
                 print("not sent: probe sessions never push to the phone")
                 return 0
+            if options.to == USER and options.text_id == MAC_LOCKED_TEXT:
+                from scripts.mac_test import mac_test
+                machine = mac_test.machine_off_on_purpose(mac_test.state_paths())
+                if isinstance(machine, mac_test.OffOnPurpose):
+                    print(f"not sent: the Mac is off on purpose ({machine.reason})")
+                    return 0
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
