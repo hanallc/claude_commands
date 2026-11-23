@@ -1903,7 +1903,7 @@ def close(parent: StaffId, name: WorkerName, *,
 
 def close_with_read(parent: StaffId, name: WorkerName, read: PaneRead | PaneReadUnavailable, *,
                     lock: WorkerLockHold) -> Closed | Kept | UncertainWorker:
-    """Close with a pane read the caller made under this worker lock, so the close reads no pane again."""
+    """Close with a pane read the caller made under this worker lock; no pane is read again before the close decision."""
     return _close(parent, name, lock, read)
 
 

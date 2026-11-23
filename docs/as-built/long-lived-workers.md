@@ -978,7 +978,7 @@ Daemon sessions retain their `codex:<thread>` route.
 Unit retirement stops workers through the pane worker path.
 DONE closure preserves worker rows and conversations.
 Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
-`worker.py end` reads the panes once and observes the worker pane from that read.
+`worker.py end` reads the panes once before its close decision and observes the worker pane from that read.
 The close in `end` uses the same read through `worker_panes.close_with_read`.
 For a stopped or closed worker, it reads the worker lock, the live detached runs, the newest pass and every older active pass in the worker's launcher runs.
 A pass waits on DONE when the current transcript shows its delivered prompt with no DONE, the pass has an instance id, its launcher is not live and no detached result is pending.
@@ -986,7 +986,9 @@ A pass waits on DONE when the current transcript shows its delivered prompt with
 It gives `HeldByOtherCheck` for the first other hold, else `DoneWaits` with each pass that waits on DONE.
 For `DoneWaits`, `end` cancels each of those passes in its own run with `progress_history.cancel_worker_pass_instances`.
 For `HeldByOtherCheck`, `end` cancels no pass.
-A failed read prints one anomaly line, cancels no pass, and `end` continues to the close.
+A failed read before the first cancel prints one anomaly line, cancels no pass, and `end` continues to the close.
+A failed read or write during the cancels stops them; the passes canceled before it stay canceled.
+When `end` does not exit 0 after a cancel, one anomaly line names each canceled pass and its run.
 Any other hold keeps the pass, for example:
 - the worker lock;
 - a live launcher, or a launcher with no completed pass;

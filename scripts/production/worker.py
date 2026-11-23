@@ -1405,7 +1405,8 @@ def _cancel_passes_without_done(parent: StaffId, row: staff.StaffRow, record: st
     """Cancel the passes of a stopped or closed worker that wait on a DONE no process can send.
 
     Read every pass check before the first write. Cancel no pass when another check holds the worker
-    or when a read fails. Return the canceled passes.
+    or when a read before the first cancel fails. A failure during the cancels stops them; the passes
+    canceled before it stay canceled. Return the canceled passes.
     """
     if isinstance(panes, worker_panes.PaneReadUnavailable):
         return ()
