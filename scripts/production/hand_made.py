@@ -30,6 +30,7 @@ import math
 import os
 from pathlib import Path, PurePath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -47,7 +48,7 @@ from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
-from scripts.production import hand_made_guest, hand_made_mac
+from scripts.production import hand_made_guest, hand_made_limit, hand_made_mac
 from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineFailed, MachineRun, Output,
                                                 Placed, Program, ProgramPlace, Refused, discard, in_checkout, note,
                                                 stream)
@@ -601,11 +602,21 @@ def program_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in PROGRAM_VARIABLES | SHOWN_VARIABLES}
 
 
+def natedev_refusal(program: Program) -> str:
+    """Why natedev cannot take the program: a checkout that holds the tools that check the run, or an output
+    folder that the limit cannot bind."""
+    return hand_made_limit.limit_refusal(program.argv, program.repo, program_environment())
+
+
 @dataclass
 class NatedevRun:
-    """The program in its natedev queue place, started from the file that the check found."""
+    """The program in its natedev queue place, started from the file that the check found, under the read limit.
+
+    temp is the attempt temp folder in the queue place folder; the end of the place removes it.
+    """
     place: ProgramPlace
     program: Program
+    temp: Path
     started_at: float | None = None
 
     @property
@@ -613,13 +624,40 @@ class NatedevRun:
         return self.place.peak_bytes or None
 
     def run(self, output: Output) -> int:
-        start, argv = self.program.start, self.program.argv
-        process = self.place.popen([str(start), *argv[1:]] if start is not None else list(argv),
-                                   cwd=self.program.repo, env=program_environment(), stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.started_at = time.time()
-        with process:
-            return stream(process, output)
+        """Run the program under bwrap.
+
+        A checkout that holds the tools that check the run, a limit that bwrap does not set up, an output folder
+        that the limit cannot bind (the program can change the target link after the check), or a cargo failure
+        from offline mode ends the attempt as a refusal.
+        """
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise Refused(hand_made_limit.BWRAP_MISSING)
+        environment = program_environment()
+        refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
+        if refusal:
+            raise Refused(refusal)
+        self.temp.mkdir(exist_ok=True)
+        status_read, status_write = os.pipe()
+        try:
+            try:
+                command = hand_made_limit.limit_argv(bwrap, self.program, self.temp, environment, status_write)
+                process = self.place.popen(command, cwd=self.program.repo, env=environment, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(status_write,))
+            finally:
+                os.close(status_write)
+            self.started_at = time.time()
+            tail = hand_made_limit.OutputTail(output)
+            with process:
+                status = stream(process, tail)
+            if hand_made_limit.setup_failed(status, status_read):
+                self.started_at = None
+                raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
+            if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
+                raise Refused(hand_made_limit.NO_NETWORK)
+            return status
+        finally:
+            os.close(status_read)
 
 
 @contextmanager
@@ -630,7 +668,7 @@ def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[Mac
     held = HeldReservation(placed.grant)
     try:
         with line.local_place(held) as place:
-            yield NatedevRun(place, program)
+            yield NatedevRun(place, program, line.folder / "tmp")
     finally:
         line.close(placed, held.status, "")
 
@@ -640,7 +678,7 @@ def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[Mac
 LOCAL_MACHINE = "natedev"
 # One entry for each machine.
 ROUTES: Mapping[str, Machine] = {
-    LOCAL_MACHINE: Machine(natedev_route),
+    LOCAL_MACHINE: Machine(natedev_route, natedev_refusal),
     "mac": Machine(hand_made_mac.mac_route, hand_made_mac.mac_refusal),
     hand_made_guest.MACHINE: Machine(hand_made_guest.guest_route, hand_made_guest.guest_refusal)}
 

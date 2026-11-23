@@ -770,6 +770,8 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.herdr.test_worker_panes import PaneWorld
 
         root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        # The fixture files are disposable; on a loaded disk each fsync waits for seconds.
+        _ = cast(object, fixture.enter_context(patch.object(os, "fsync")))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),
@@ -962,7 +964,8 @@ class MixedRestartTests(ShutdownTestCase):
         endpoint = root / "config/herdr/sessions/agents/herdr.sock"
         endpoint.parent.mkdir(parents=True)
         server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
-        thread = Thread(target=server.serve_forever, daemon=True)
+        # A short poll makes shutdown return at once, not after the default half second.
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         _ = fixture.callback(server.server_close)
         _ = fixture.callback(server.shutdown)

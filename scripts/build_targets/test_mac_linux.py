@@ -378,9 +378,9 @@ class GuestCommandParityTests(unittest.TestCase):
             for argv, word in ((('bash', 'target/run.sh'), 'target/run.sh'), (('bash', 'helper'), 'helper')):
                 with self.subTest(word=word):
                     self.assertEqual(self.refusal(*argv),
-                                     f'The guest refuses the command word {word}: the guest cannot read '
-                                     + f'{self.copy / Path(word).parts[0]}: Permission denied, and natedev read no '
-                                     + 'file there.')
+                                     f'The guest refuses the command word {word}: '
+                                     + f'{self.copy / Path(word).parts[0]} cannot be checked (Permission denied), '
+                                     + 'and natedev read no file there.')
 
     def test_a_later_bare_word_with_an_unread_file_in_the_copy_is_refused(self) -> None:
         # The copy keeps the stamp that an earlier run wrote, and bash opens a later word from the copy.
@@ -445,6 +445,10 @@ class GuestCommandParityTests(unittest.TestCase):
         # A link to itself makes os.stat fail with ELOOP: the check cannot tell what the word names.
         (self.copy / 'loop').symlink_to('loop')
         self.assertTrue(mac_linux.main_folder(str(self.copy / 'loop')))
+        # The refusal names the stat error, not a __main__ file.
+        self.assertEqual(self.refusal('python3', 'loop'),
+                         f'The guest refuses the command word loop: {self.copy / "loop"} cannot be checked '
+                         + '(Too many levels of symbolic links), and natedev read no file there.')
         self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing')))
         self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing' / 'below')))
 
@@ -487,7 +491,9 @@ class MacLinuxRouteTests(unittest.TestCase):
             + 'run.time_limit_seconds=7\n',
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
-        _ = (config / 'machines.conf').write_text('mac.hosts=fixture-mac\n', encoding='utf-8')
+        _ = (config / 'machines.conf').write_text(
+            'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
+            + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
@@ -514,8 +520,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = self.git('remote', 'add', 'origin', 'https://example.test/claude_commands.git')
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
             (self.repo / folder).mkdir(parents=True)
-        model = Path(__file__).resolve().parents[2] / 'config/build_folders.conf'
-        _ = (self.repo / 'config/build_folders.conf').write_bytes(model.read_bytes())
+        _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()

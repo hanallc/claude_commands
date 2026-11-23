@@ -1,13 +1,16 @@
 """Configured displays change independently of their record keys."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import redirect_stderr
+from contextvars import ContextVar, copy_context
 from io import StringIO
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from typing import override
+from typing import cast, override
 
 from scripts.lib import names
 
@@ -46,22 +49,63 @@ def fixture_names(*, worker: str = "worker", director: str = "unit director") ->
     )
 
 
+def clear_runtime_names() -> None:
+    """Drop the cached runtime load, so the next call loads again."""
+    cached = cast(object, getattr(names, "_runtime_names"))
+    cast(Callable[[], None], getattr(cached, "cache_clear"))()
+
+
+def new_command_errors() -> ContextVar[frozenset[names.NamesError]]:
+    """An empty set of reported errors, as a new command starts with."""
+    return ContextVar("reported_names_errors", default=frozenset[names.NamesError]())
+
+
 class NamesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        names.runtime_names.cache_clear()
-        self.addCleanup(names.runtime_names.cache_clear)
+        clear_runtime_names()
+        self.addCleanup(clear_runtime_names)
 
-    def test_runtime_configuration_is_loaded_once_even_when_a_later_read_would_change(self) -> None:
+    def test_runtime_configuration_loads_once_while_the_file_stays_the_same(self) -> None:
         original = fixture_names(worker="builder")
         with patch.object(names, "load_names", side_effect=(original, fixture_names(worker="maker"))) as load:
             self.assertEqual(names.runtime_names(), original)
             self.assertEqual(names.runtime_names(), original)
         load.assert_called_once_with()
 
+    def test_runtime_configuration_loads_again_after_the_file_changes(self) -> None:
+        # verify_helper.py runs many commands in one process, and an edit between two of them must show.
+        with tempfile.TemporaryDirectory() as directory, redirect_stderr(StringIO()):
+            path = Path(directory) / "names.toml"
+            _ = path.write_text(NAMES_TOML, encoding="utf-8")
+            displays: list[str] = []
+            load = names.load_names
+            with patch.object(names, "CONFIG_PATH", path), patch.object(names, "load_names", lambda: load(path)):
+                for history in ('["worker"]', '["builder", "worker"]'):
+                    edit = path.with_suffix(".new")
+                    _ = edit.write_text(NAMES_TOML.replace('["worker"]', history), encoding="utf-8")
+                    os.replace(edit, path)
+                    loaded = names.runtime_names()
+                    assert isinstance(loaded, names.Names), loaded
+                    displays.append(loaded.job("worker"))
+        self.assertEqual(displays, ["worker", "builder"])
+
+    def test_each_command_reports_an_error_once(self) -> None:
+        # verify_helper.py runs each call in a copy of its context, as a new process starts a new context.
+        error = names.MissingKey("jobs", "once-in-each-command")
+        output = StringIO()
+
+        def command() -> None:
+            for _ in range(2):
+                names.report_error(error)
+        with redirect_stderr(output):
+            for _ in range(2):
+                copy_context().run(command)
+        self.assertEqual(output.getvalue().count("once-in-each-command"), 2)
+
     def test_configuration_errors_name_the_file_table_and_entry_in_plain_text(self) -> None:
         output = StringIO()
-        with patch.object(names, "_reported_errors", set[names.NamesError]()), redirect_stderr(output):
+        with patch.object(names, "_reported_errors", new_command_errors()), redirect_stderr(output):
             names.report_error(names.MissingKey("jobs", "worker"))
         self.assertEqual(output.getvalue(), f"names: {names.CONFIG_PATH}: [jobs] has no worker entry\n")
         for error, detail in (
@@ -118,7 +162,7 @@ class NamesTests(unittest.TestCase):
         error = names.UnreadableNames("/fixture/missing-names.toml", "fixture denied")
         output = StringIO()
         with patch.object(names, "load_names", return_value=error), \
-                patch.object(names, "_reported_errors", set[names.NamesError]()), redirect_stderr(output):
+                patch.object(names, "_reported_errors", new_command_errors()), redirect_stderr(output):
             self.assertEqual(names.runtime_names(), error)
             self.assertEqual(names.runtime_names(), error)
         self.assertEqual(output.getvalue().count("fixture denied"), 1)
