@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
@@ -62,6 +63,11 @@ def repository_key(directory: str) -> str:
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
+    return git_root_key(directory)
+
+
+def git_root_key(directory: str) -> str:
+    """Read the history key for a Git repository without an origin."""
     roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
                    directory, GIT_TIMEOUT_S)
     return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
@@ -85,21 +91,158 @@ def repo_name(directory: str) -> str | None:
 
 def git_common_dir(directory: str) -> str | None:
     """Return the Git folder that the repository worktrees share."""
+    checkout = _git_checkout(directory)
+    return str(checkout.common_dir) if checkout is not None else None
+
+
+def _git_checkout(directory: str) -> git_files.Checkout | None:
     try:
-        return str(git_files.locate(Path(directory)).common_dir)
+        return git_files.locate(Path(directory))
     except git_files.GitFilesError:
         return None
 
 
-def source_git_dir(common: str) -> str:
-    """Follow local clone sources to the original Git folder.
+@dataclass(frozen=True)
+class MacSourceRepository:
+    """The source Git folder and key from the shared origin."""
 
-    A shared clone records borrowed objects in alternates. A local clone records a local origin.
-    Return the current folder when neither source exists.
-    """
+    git_dir: str
+    key: str
+
+
+class UnrecordedSourceCheckout:
+    """Git gives the shared metadata path without the main checkout path."""
+
+
+# A source repository with no origin is keyed by its Git folder.
+NO_ORIGIN_KEY_PREFIX = "git-dir:"
+
+
+def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | UnrecordedSourceCheckout:
+    """Follow local clone origins from the checkout to the source repository."""
+    origin = _mac_origin(Path(common))
+    directory = worktree
+    seen = {common}
+    while origin:
+        if _relative_local_origin(origin):
+            source_directory = _relative_origin_directory(Path(common), directory)
+            if isinstance(source_directory, UnrecordedSourceCheckout):
+                return source_directory
+            directory = source_directory
+        source = _local_origin_checkout(origin, directory)
+        if source is None or str(source.common_dir) in seen:
+            return MacSourceRepository(common, remote_identity(origin, directory))
+        common = str(source.common_dir)
+        seen.add(common)
+        directory = str(source.toplevel)
+        origin = _mac_origin(source.common_dir)
+    return MacSourceRepository(common, NO_ORIGIN_KEY_PREFIX + common)
+
+
+def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:
+    # Resolve relative origins from the primary checkout.
+    configured = _git_config(common, "--local", "--includes", "--default", str(common.parent), "--get", "core.worktree")
+    configured.check_returncode()
+    directory = (common / configured.stdout.removesuffix("\n")).resolve()
+    try:
+        source = git_files.at(directory)
+    except git_files.NotACheckout:
+        source = None
+    if source is not None and source.git_dir == common and source.common_dir == common:
+        return str(source.toplevel)
+    current = git_files.locate(Path(worktree))
+    if current.git_dir == common and current.common_dir == common:
+        return str(current.toplevel)
+    return UnrecordedSourceCheckout()
+
+
+def _git_config(common: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Read Git configuration from the shared Git directory."""
+    environment = {**os.environ, "GIT_CONFIG_COUNT": "0"}
+    for name in ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS"):
+        _ = environment.pop(name, None)
+    return subprocess.run(
+        ["git", "--git-dir", str(common), "config", *arguments],
+        cwd=common, env=environment, capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+    )
+
+
+def _mac_rewrites_without_worktree(common: Path) -> str:
+    from tempfile import NamedTemporaryFile
+
+    paths: list[str] = []
+    for variable in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"):
+        result = subprocess.run(
+            ["git", "--git-dir", os.devnull, "var", variable], cwd=common, capture_output=True,
+            text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 1:
+            result.check_returncode()
+            paths.extend(result.stdout.removesuffix("\n").split("\n"))
+    paths.append(str(common / "config"))
+
+    # The config must support a second read for hasconfig includes.
+    with NamedTemporaryFile(mode="w", encoding="utf-8") as configuration:
+        _ = configuration.write("[include]\n")
+        for path in paths:
+            escaped = str(common / path).replace("\\", "\\\\").replace('"', '\\"')
+            _ = configuration.write(f' path = "{escaped}"\n')
+        configuration.flush()
+        result = _git_config(common, "--file", configuration.name, "--includes", "--null",
+                             "--show-scope", "--get-regexp", r"^url\..*\.insteadof$")
+    if result.returncode == 1:
+        return ""
+    result.check_returncode()
+    return result.stdout
+
+
+def _mac_origin(common: Path) -> str:
+    urls: list[str] = []
+    if (common / "config.worktree").exists():
+        # A worktree origin can activate a conditional include in another scope.
+        result = _git_config(common, "--local", "--includes", "--null", "--get-all", "remote.origin.url")
+        if result.returncode == 1:
+            return ""
+        result.check_returncode()
+        urls.append(result.stdout.split("\0", 1)[0])
+        fields = _mac_rewrites_without_worktree(common).split("\0")
+        scopes = ("command",)
+    else:
+        result = _git_config(common, "--includes", "--null", "--show-scope",
+                             "--get-regexp", r"^(remote\.origin\.url|url\..*\.insteadof)$")
+        if result.returncode == 1:
+            return ""
+        result.check_returncode()
+        fields = result.stdout.split("\0")
+        scopes = ("system", "global", "local")
+    rewrites: dict[str, list[str]] = {}
+    for scope, entry in zip(fields[::2], fields[1::2]):
+        if scope not in scopes:
+            continue
+        key, separator, value = entry.partition("\n")
+        if not separator:
+            continue
+        if key == "remote.origin.url":
+            if scope == "local":
+                urls.append(value)
+        else:
+            base = key.removeprefix("url.").removesuffix(".insteadof")
+            rewrites.setdefault(base, []).append(value)
+    if not urls:
+        return ""
+    origin = urls[0]
+    prefix, base = max(
+        ((prefix, base) for base, prefixes in rewrites.items() for prefix in prefixes if origin.startswith(prefix)),
+        key=lambda rewrite: len(rewrite[0]), default=("", ""),
+    )
+    return (base + origin[len(prefix):]).strip()
+
+
+def source_git_dir(common: str) -> str:
+    """Follow local clone sources without a Git command."""
     seen = {common}
     while True:
-        source = borrowed_git_dir(common) or local_origin_git_dir(common)
+        source = borrowed_git_dir(common) or _stored_local_origin_git_dir(common)
         if source is None or source in seen:
             return common
         seen.add(source)
@@ -117,8 +260,25 @@ def borrowed_git_dir(common: str) -> str | None:
     return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
 
 
-def local_origin_git_dir(common: str) -> str | None:
+def local_origin_git_dir(origin: str, directory: str = "") -> str | None:
     """Return the shared Git folder when origin names a local directory."""
+    checkout = _local_origin_checkout(origin, directory)
+    return str(checkout.common_dir) if checkout is not None else None
+
+
+def _relative_local_origin(origin: str) -> bool:
+    return ":" not in origin and not os.path.isabs(origin)
+
+
+def _local_origin_checkout(origin: str, directory: str) -> git_files.Checkout | None:
+    url = origin.removeprefix("file://")
+    if directory and _relative_local_origin(origin):
+        url = os.path.join(directory, url)
+    return _git_checkout(url) if os.path.isabs(url) and os.path.isdir(url) else None
+
+
+def _stored_local_origin_git_dir(common: str) -> str | None:
+    """Read a local origin from the repository configuration without a Git command."""
     try:
         with open(os.path.join(common, "config"), encoding="utf-8") as handle:
             lines = handle.read().splitlines()
@@ -130,8 +290,5 @@ def local_origin_git_dir(common: str) -> str | None:
         if text.startswith("["):
             in_origin = text == '[remote "origin"]'
         elif in_origin and text.partition("=")[0].strip() == "url":
-            url = text.partition("=")[2].strip().removeprefix("file://")
-            if not os.path.isabs(url) or not os.path.isdir(url):
-                return None
-            return git_common_dir(url)
+            return local_origin_git_dir(text.partition("=")[2].strip())
     return None

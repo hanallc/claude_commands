@@ -31,7 +31,10 @@ class ClaimProcessStartTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             root = fixture.root
             repository = root / "hana"
-            repository.mkdir()
+            _ = subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            _ = subprocess.run(["git", "-C", str(repository), "-c", "user.name=Fixture",
+                                "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
+                                "commit", "-qm", "Fixture", "--allow-empty"], check=True)
             alias = root / "checkout"
             alias.symlink_to(repository, target_is_directory=True)
             _ = write_config_fixture(root / "mac_test.conf", "offload=on\nlinux_only.hana=\n", template="mac_test")
@@ -104,8 +107,10 @@ class ClaimProcessStartTests(unittest.TestCase):
                             redirect_stdout(io.StringIO()), redirect_stderr(errors):
                         self.assertEqual(mac_test.command_claim(reserve, paths, watch_claim=False, session=reserve.session), 0)
                         reserved, = mac_test.read_claims(paths)
-                        if stored_raw_path:
-                            mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw})
+                        saved = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
+                            reserved.path.name, reserved.path.stem, claim_state.KnownMacHistoryKey("fixture-history"))
+                        mac_test.write_json(reserved.path, {**reserved.record, "worktree": raw if stored_raw_path else canonical,
+                            "repo_key": saved.key, "repo_name": saved.mirror_name, "mac_repository": saved.record()})
                         status = mac_test.command_claim(adopt, paths, watch_claim=False, session=adopt.session)
                     self.assertEqual(status, 0, errors.getvalue())
                     self.assertEqual(reserved.record["worktree"], canonical)
@@ -120,7 +125,7 @@ class ClaimProcessStartTests(unittest.TestCase):
             first, second = root / "first", root / "second"
             first.mkdir()
             second.mkdir()
-            scope = mac_test.RepositoryScope("hana")
+            scope = mac_test.RepositoryScope("hana", "fixture-hana-key")
             session = OwningSession("fixture-session")
 
             def read_start(pid: int) -> identity.ProcessStart:
@@ -183,9 +188,10 @@ class ClaimProcessStartTests(unittest.TestCase):
                   redirect_stdout(output)):
                 with mac_test.locked(paths.lock):
                     result = mac_test.take_over_kept_claim(args, held, {**record}, session=session)
-                self.assertEqual(result, mac_test.ClaimFinished(13))
+                self.assertEqual(result, mac_test.ClaimFinished(13, ("leftovers: fixture-box", "slot: 2")))
+                self.assertEqual(output.getvalue(), "")
                 self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, session=session), 13)
-            self.assertEqual(output.getvalue().splitlines(), ["leftovers: fixture-box", "slot: 2"] * 2)
+            self.assertEqual(output.getvalue().splitlines(), ["leftovers: fixture-box", "slot: 2"])
             saved, = mac_test.read_claims(paths)
             self.assertEqual(saved.scope, scope)
             self.assertEqual(claim_state.claim_identity(saved.record), claim_state.claim_identity(record))
@@ -203,13 +209,14 @@ class ClaimProcessStartTests(unittest.TestCase):
                 root = Path(directory)
                 paths = (mac_test.StatePaths(root, "box", platform="linux") if check == "leased slot"
                          else mac_test.StatePaths(root))
-                scope = mac_test.RepositoryScope("hana")
+                scope = mac_test.RepositoryScope("hana", "fixture-hana-key")
                 session = OwningSession("fixture-session")
                 record: mac_test.ProcessBoundClaim = {
                     "claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
                     "submitting_session": session.session_id, "pid": 41, "proc_start": "40000",
                     "what": "waiting", "worktree": str(root), "since": "2026-11-04T00:00:00+00:00",
-                    "repo_name": "other" if check == "scope" else "hana", "repo_key": "",
+                    "repo_name": "other" if check == "scope" else "hana",
+                    "repo_key": "fixture-other-key" if check == "scope" else scope.key,
                 }
                 args = mac_test.CliArguments()
                 args.pid, args.from_pid = 42, 40 if check == "pid" else 41
@@ -242,28 +249,35 @@ class ClaimProcessStartTests(unittest.TestCase):
                 with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stderr(errors), \
                         redirect_stdout(io.StringIO()):
                     result = mac_test.adopt_wait_claim(args, paths, scope, session=session)
-                self.assertEqual(result, mac_test.ClaimFinished(11 if check == "leased slot" else 12))
-                self.assertEqual(errors.getvalue().splitlines(), [f"cannot adopt the Mac claim: {check}"])
+                self.assertEqual(result, mac_test.ClaimDenied(11 if check == "leased slot" else 12,
+                                                             f"cannot adopt the Mac claim: {check}", to_stderr=True))
+                self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(mac_test.read_claims(paths), before)
 
     def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
-        cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int]], ...] = (
-            ("mac", mac_test.RepositoryScope("hana"), mac_test.RepositoryScope("hana"), [0, 11]),
-            ("mac", mac_test.RepositoryScope("hana"), mac_test.RepositoryScope("other"), [0, 0]),
-            ("mac", mac_test.WHOLE_MAC, mac_test.RepositoryScope("hana"), [0, 11]),
-            ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11]),
+        hana = mac_test.RepositoryScope("hana", "https://fixture.invalid/team/hana")
+        other = mac_test.RepositoryScope("other", "https://fixture.invalid/team/other")
+        cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int], int], ...] = (
+            ("mac", hana, hana, [0, 11], 1),
+            ("mac", hana, other, [0, 0], 2),
+            ("mac", mac_test.WHOLE_MAC, hana, [0, 11], 0),
+            ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11], 1),
         )
-        for provider, first_scope, second_scope, expected in cases:
+        for provider, first_scope, second_scope, expected, expected_authorizations in cases:
             with self.subTest(provider=provider, first=first_scope, second=second_scope), PlacementFixture() as fixture:
                 target = "mac" if provider == "mac" else "box"
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", template="mac_test")
+                _ = write_config_fixture(fixture.root / "machines.conf", "mac.hosts=fixture-mac\n")
+                _ = write_config_fixture(fixture.root / "build_folders.conf",
+                                         "# whole: 1..\nslots.fixture-mac.default_max=1\n")
                 paths = mac_test.StatePaths(fixture.root / "provider", target,
                     platform="macos" if provider == "mac" else "linux")
                 assignments: list[placement.PlacementAssignment] = []
                 requests: list[wire.PlacementRequest] = []
+                worktrees: dict[str, Path] = {}
                 for scope in (first_scope, second_scope):
                     request = placement_request(fixture)
                     destination = placement.PlacementDestination(provider, target, "fixture-host", scope,
@@ -273,10 +287,16 @@ class ClaimProcessStartTests(unittest.TestCase):
                     _ = publish_candidate(fixture, request)
                     assignments.append(assignment_for(fixture, request))
                     requests.append(request)
+                    worktree = fixture.root
+                    if provider == "mac" and isinstance(scope, mac_test.RepositoryScope):
+                        worktree = fixture.root / request.episode
+                        _ = subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+                        _ = subprocess.run(["git", "-C", str(worktree), "remote", "add", "origin", scope.key], check=True)
+                    worktrees[request.episode] = worktree
 
                 def acquire(assignment: placement.PlacementAssignment) -> int:
                     args = mac_test.CliArguments()
-                    args.pid, args.target, args.worktree = assignment.owner.pid, target, str(fixture.root)
+                    args.pid, args.target, args.worktree = assignment.owner.pid, target, str(worktrees[assignment.episode])
                     args.what = "nextest hana"
                     return mac_test.command_claim(args, paths, watch_claim=False,
                         session=assignment.session, assignment=assignment)
@@ -296,11 +316,19 @@ class ClaimProcessStartTests(unittest.TestCase):
                     exact = claim_state.claim_identity(claim.record)
                     args = mac_test.CliArguments()
                     args.pid, args.from_pid, args.target = assigned.owner.pid, assigned.owner.pid, target
-                    args.worktree, args.remote = str(fixture.root), assigned.destination.host
+                    args.worktree, args.remote = str(worktrees[assigned.episode]), assigned.destination.host
                     args.claim_id, args.episode, args.attempt = exact.claim_id, exact.episode, exact.attempt
-                    with redirect_stdout(io.StringIO()):
-                        self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False,
-                            session=assigned.session, assignment=assigned), 0)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        adopted_status = mac_test.command_claim(args, paths, watch_claim=False,
+                            session=assigned.session, assignment=assigned)
+                    if provider == "mac" and isinstance(claim.scope, claim_state.WholeMacScope):
+                        self.assertEqual(adopted_status, 12)
+                        self.assertEqual(output.getvalue().strip(),
+                            "the Mac reservation needs retirement under the execution lease")
+                        self.assertEqual(mac_test.read_claims(paths), held)
+                        continue
+                    self.assertEqual(adopted_status, 0, output.getvalue())
                     reference = placement.ProviderClaimReference(provider, target, assigned.destination.scope,
                         exact.claim_id, exact.episode, exact.attempt)
                     holder = coordinator_holder(assigned)
@@ -311,7 +339,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                         assigned, reference, holder)).replies()
                     self.assertIsInstance(reply, wire.FirstAuthorization)
                     authorizations += isinstance(reply, wire.FirstAuthorization)
-                self.assertEqual(authorizations, expected.count(0))
+                self.assertEqual(authorizations, expected_authorizations)
 
     def test_darwin_adoption_requires_both_live_start_matches(self) -> None:
         old_start = "Tue Nov  3 23:00:00 2026"
@@ -342,6 +370,13 @@ class ClaimProcessStartTests(unittest.TestCase):
                     retained = mac_test.read_run(paths.run)
                     assert not isinstance(retained, mac_test.NoRun)
                     mac_test.write_json(paths.run, {**retained, "remote_host": "mac"})
+                else:
+                    waiting = mac_test.read_run(paths.run)
+                    assert not isinstance(waiting, mac_test.NoRun)
+                    saved_mirror = claim_state.MacRepositoryIdentity("fixture-key", "fixture-mirror",
+                        paths.run.name, paths.run.stem, claim_state.KnownMacHistoryKey("fixture-history"))
+                    mac_test.write_json(paths.run, {**waiting, "repo_key": saved_mirror.key,
+                        "repo_name": saved_mirror.mirror_name, "mac_repository": saved_mirror.record()})
                 args = mac_test.CliArguments()
                 args.pid, args.from_pid, args.worktree, args.remote = 42, 41, str(root), "mac"
                 args.claim_id, args.episode, args.attempt = requested.claim_id, requested.episode, requested.attempt
@@ -370,8 +405,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                         before = paths.run.read_bytes()
                         unrelated = mac_test.adopt_wait_claim(
                             args, paths, mac_test.WHOLE_MAC, session=OwningSession("unrelated-session"))
-                        self.assertIsInstance(unrelated, mac_test.ClaimFinished)
-                        assert isinstance(unrelated, mac_test.ClaimFinished)
+                        assert isinstance(unrelated, mac_test.ClaimDenied)
                         self.assertEqual(unrelated.status, 12)
                         self.assertEqual(paths.run.read_bytes(), before)
                     if cleanup and expected == 13:
@@ -381,12 +415,11 @@ class ClaimProcessStartTests(unittest.TestCase):
                             placement.SubmittingOwner("natedev", 42, new_start), session, 0)
                         result_status = mac_test.command_claim(args, paths, watch_claim=False,
                             session=session, assignment=assigned)
-                        result = mac_test.ClaimFinished(result_status)
                     else:
                         result = mac_test.adopt_wait_claim(args, paths, mac_test.WHOLE_MAC, session=session)
-                self.assertIsInstance(result, mac_test.ClaimFinished)
-                assert isinstance(result, mac_test.ClaimFinished)
-                self.assertEqual(result.status, expected)
+                        assert isinstance(result, (mac_test.ClaimFinished, mac_test.ClaimDenied))
+                        result_status = result.status
+                self.assertEqual(result_status, expected)
                 saved = mac_test.read_run(paths.run)
                 self.assertNotIsInstance(saved, mac_test.NoRun)
                 assert not isinstance(saved, mac_test.NoRun)
