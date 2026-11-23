@@ -275,6 +275,21 @@ class MergeGateCheckpointTests(MergeGateFixture):
         allocate.assert_called_once_with(mock.ANY, "g", gate_root)
         self.assert_all_modules_started()
 
+    def test_nested_gate_uses_the_inherited_module_folder_only_under_the_gate_root(self) -> None:
+        gate_root = self.fixture_root.parent
+        module = gate_root / "inherited-module"
+        module.mkdir()
+        outside = gate_root.parent / f"{gate_root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        for inherited, parent in ((module, module.resolve()), (outside, gate_root)):
+            with self.subTest(inherited=inherited.name):
+                with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(inherited)}),
+                      mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+                    result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                allocate.assert_called_once_with(mock.ANY, "g", parent)
+
     @gate_suites("hooks", "message")
     def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
         prepare = gate.test_module_environment
