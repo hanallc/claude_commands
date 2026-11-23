@@ -1191,9 +1191,6 @@ def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, mer
     return SnapshotOrigin(CloneSourceCommit(str(source.resolve()), committed_base), envrc)
 
 
-SNAPSHOT_ORIGIN = "snapshot-origin.json"
-
-
 def write_snapshot_origin(tree: Path, origin: SnapshotOrigin, policy: SourcePolicy) -> None:
     """Bind a private checkout to the repository and commit that supplied it."""
     source = Path(origin.base.repository)
@@ -1203,7 +1200,7 @@ def write_snapshot_origin(tree: Path, origin: SnapshotOrigin, policy: SourcePoli
             return
     envrc = origin.envrc
     snapshot_commit = commit_at(tree, "HEAD")
-    write_text_atomic(tree.parent / SNAPSHOT_ORIGIN, json.dumps({
+    write_text_atomic(tree.parent / copy_record.SNAPSHOT_ORIGIN, json.dumps({
         "repository": origin.base.repository, "source_commit": origin.base.commit,
         "checkout": str(tree.resolve()), "snapshot_commit": snapshot_commit,
         "envrc_reference": envrc.value if isinstance(envrc, EnvrcReference) else "merge",
@@ -1220,7 +1217,7 @@ def read_snapshot_origin(tree: Path, caller: Path) -> SnapshotOrigin | CloneSour
     """
     try:
         repository = str(caller.resolve())
-        raw = cast(object, json.loads((tree.parent / SNAPSHOT_ORIGIN).read_text()))
+        raw = cast(object, json.loads((tree.parent / copy_record.SNAPSHOT_ORIGIN).read_text()))
         if not isinstance(raw, dict):
             return CloneSource.UNAPPROVED
         binding = cast(dict[str, object], raw)

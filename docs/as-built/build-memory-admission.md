@@ -120,6 +120,9 @@ The owner uses `host:pid:start_time`.
 Absent fields use `-`.
 The command returns 0 for current, 1 for closed or unknown, and 2 for an unreachable service.
 A live service that answers slowly makes it wait, as the placement requests do. A missing socket or a refused connection returns 2 at once.
+A service that stays silent until `unreachable_limit_seconds` returns 2 with "build queue unreachable for <time>".
+A query holds no step and no cargo token, so its reason does not say "step stopped; cargo token given back".
+`_query` does not print a refusal. The caller prints the reason once.
 The Mac cargo gate runs this check over ssh. A failed check refuses the call with the status and the last error line of the check.
 The check grants no permission and records no caller version.
 The status and replay paths share the same placement lifetime check.
@@ -693,7 +696,8 @@ Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Cargo estimates separate compile history from no-compile history.
 `index_step_evidence` joins each anonymous peak by host, call id, and step.
 `StepEvidence` keeps its shape and compile count independent.
-For a test step (`TEST_STEPS`: `nextest`, `test`, `t`), it also keeps the decoded argv as `arguments`.
+For a test step (`TEST_STEPS`: `nextest`, `test`, `t`) or a `check` step, it also keeps the decoded argv as `arguments`.
+`history_selection` reads it for test steps, and `same_check_targets` reads it for check.
 `history_selection` gives each anonymous row its package, scope and filter set.
 A recorded field wins. Only a missing field is parsed from `arguments`, once, through `test_selection`.
 A row with neither keeps the recorder defaults: no package, `full`, no filters.
@@ -729,6 +733,10 @@ With one to four own rows, a non-build estimate uses their largest peak or a low
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
 Other steps, and requests with no package, keep the recorded scope rule.
+A check estimate keeps only rows whose check targets match the request (`check_targets`): `--all-targets` or named targets.
+Test code raises the check peak, so an all-target check never takes its need from lib and bin checks.
+A check peak without recorded arguments has unknown targets, so no check estimate uses it.
+A new peak joins its estimate when the buildlog index records its arguments.
 A filtered compile estimate (`filtered_history_peak`) takes the larger of two ranked anonymous peaks:
 the exact filter set's rows and the package's filtered rows.
 Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
