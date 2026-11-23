@@ -7,7 +7,7 @@ Use this command for a long build or test command that you run by hand, and for 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/hand_made.py --why '<why>' --machine <natedev|mac|mac-linux> [--machine ...] [--repo <checkout>] -- <command...>`.
 
 - `--why` is required. It goes into the record.
-- `--machine` is required. Give it once for each machine that can take the run. This phase accepts `natedev`, `mac` and `mac-linux` (the Mac Linux guest); another name is refused.
+- `--machine` is required. Give it once for each machine that can take the run. This phase accepts `natedev`, `mac` and `mac-linux` (the Mac Linux guest); another name is refused. For now, the command refuses `mac-linux`, because the guest has no read limit (see the guest part below).
 - `--repo` is the checkout that runs the command. It must be the top folder of a git work tree. The default is the current folder.
 
 The command does four steps:
@@ -89,6 +89,7 @@ On the Mac:
 
 On the Mac Linux guest:
 
+- The guest takes no hand made run until it has its own read limit. The command refuses `mac-linux` with "the guest has no read limit yet", before each other check below. The rest of this part applies when the guest has its read limit.
 - The run comes to the guest through the `mac-linux` queue line, the line of a gate run on the guest. The guest takes one run at a time.
 - A guest that is off (`enabled.mac-linux=off` in `build_targets.conf`) cannot take the run.
 - A guest in retry backoff can take the run. Its line waits for the backoff end, and another named machine can take the run in that time.
@@ -124,7 +125,7 @@ The exit status is the status of the command, or 2 for an attempt that ended wit
 
 After a no, change the command or the script, then start a new attempt. A check with no answer (timeout, model exit, bad JSON, schema failure, a program file that cannot be read, or program files over the size limit together) also ends the attempt with no run.
 
-Known gap: the check reads command words, not the value rules of each tool, so it cannot close these forms. On natedev, the read limit closes them: the program cannot read a path outside the limit. The Mac and the guest keep these forms until each has its own read limit.
+Known gap: the check reads command words, not the value rules of each tool, so it cannot close these forms. On natedev, the read limit closes them: the program cannot read a path outside the limit. The Mac keeps these forms until it has its own read limit. The guest takes no run until it has its own read limit.
 
 1. A prefix option to an existing file in an outside folder, such as `cc -B/home/u/out/p-`: the tool runs other entries of that folder.
 2. A value that the tool resolves against an earlier value, such as `make -C src -C build`.
