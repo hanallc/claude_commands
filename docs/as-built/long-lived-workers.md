@@ -979,12 +979,15 @@ Unit retirement stops workers through the pane worker path.
 DONE closure preserves worker rows and conversations.
 Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
 `worker.py end` first observes the worker pane.
-For a stopped or closed worker, it reads the worker lock, the live detached runs and every pass in the worker's launcher runs.
-When a delivered pass waits on a DONE that no process can send, `end` cancels the worker's open passes with `progress_history.cancel_worker_passes`.
+For a stopped or closed worker, it reads the worker lock, the live detached runs, the newest pass and every older open pass in the worker's launcher runs.
+A pass waits on DONE when its prompt is delivered, its transcript has no DONE and no detached result is pending.
+When every hold is such a DONE wait, `end` cancels exactly those passes with `progress_history.cancel_worker_passes`.
+When any other check holds the worker, `end` cancels no pass.
+Other holds are the worker lock, a live or unreadable detached run, a pending detached result and a DONE with an unsaved reply.
+`end` cancels no pass of an open worker.
 `end` then closes the pane and retires the row, as for any other worker.
-`end` cancels no pass of an open worker or of a worker with a live detached run.
-It also cancels no pass that has a DONE with an unsaved reply, because recovery must save that reply.
-When such a hold remains, `end` prints the blocker, exits 7 and leaves the pass active.
+For a stopped worker, the close check refuses each remaining hold: `end` prints the blocker, exits 7 and leaves the pass active.
+A closed worker has no pane to close, so `end` runs no close check: it exits 0 and retires the row, and a remaining pass stays active.
 `remove_workers.py` resolves the selected staff member before it calls the worker command.
 Shutdown keeps saved Claude child launcher commands in `ClaudeChildResume`.
 Pane worker resume messages keep the fixed staff id and dispatch id.
@@ -1071,6 +1074,7 @@ Text rows place open panes first and retain the current order inside each group.
 
 A pass hold makes the state `busy`.
 On a stopped or closed worker, a hold that waits on a DONE shows `stopped` instead, because no process can send that DONE.
+The JSON `work` field stays `busy` for that worker, because dispatch still refuses it.
 `list all --all-parents` applies the same rule when it reads the panes; with `--json` and no pane read, the hold stays `busy`.
 A row whose pane is not open prints `-` for the account.
 Saved dispatch rows print `-` for Pane and use their recorded dispatch state.

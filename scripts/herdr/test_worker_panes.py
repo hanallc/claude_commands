@@ -2288,29 +2288,46 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
         self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Closed)
 
+    def ended_delivered_pass(self, name: str, pane: str, status: str, *, done: bool) -> worker_panes.StoppedWorker:
+        """Leave a canceled or interrupted delivered pass on a stopped pane, with or without a DONE."""
+        row = self.worker(name)
+        self.world.add(row, pane, live=False)
+        self.dispatch(row, "impl")
+        dispatch = "dispatch-" + row.name
+        prompt = f"End your final reply with DONE {dispatch}."
+        run = self.root / "run"
+        progress_history.save_dispatch_delivery(run, dispatch, pass_recorder.DispatchDelivery(
+            prompt, dispatch, str(self.root / f"{name}-reply"), "", progress_history.NO_COMPLETION_ACTIONS))
+        path = run / "progress_history_state.json"
+        fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+        fields["pass"][row.name]["status"] = status
+        write_text_atomic(path, json.dumps(fields))
+        source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+        entries: list[dict[str, object]] = [{"type": "user", "message": {"role": "user", "content": prompt}}]
+        if done:
+            entries.append({"type": "assistant", "message": {"role": "assistant", "content": "DONE " + dispatch}})
+        with source.open("a") as stream:
+            _ = stream.write("".join(json.dumps(entry) + "\n" for entry in entries))
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.StoppedWorker)
+        return observed
+
     def test_ended_delivered_pass_without_done_allows_a_stopped_pane_to_close(self) -> None:
         for index, status in enumerate(("canceled", "interrupted"), start=1):
             with self.subTest(status=status):
-                row = self.worker(f"impl-{status}")
-                self.world.add(row, f"w1:p{index}", live=False)
-                self.dispatch(row, "impl")
-                dispatch = "dispatch-" + row.name
-                prompt = f"End your final reply with DONE {dispatch}."
-                run = self.root / "run"
-                progress_history.save_dispatch_delivery(run, dispatch, pass_recorder.DispatchDelivery(
-                    prompt, dispatch, str(self.root / "reply"), "", progress_history.NO_COMPLETION_ACTIONS))
-                path = run / "progress_history_state.json"
-                fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
-                fields["pass"][row.name]["status"] = status
-                write_text_atomic(path, json.dumps(fields))
-                source = worker_admission.transcript_source(row, staff.ClaudeBackend())
-                with source.open("a") as stream:
-                    _ = stream.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
-                observed = self.observation(row)
-                assert isinstance(observed, worker_panes.StoppedWorker)
+                observed = self.ended_delivered_pass(f"impl-{status}", f"w1:p{index}", status, done=False)
                 self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
-                self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)),
+                self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(observed.row.name)),
                                       worker_panes.Closed)
+
+    def test_ended_delivered_pass_with_an_unsaved_done_reply_keeps_a_stopped_pane(self) -> None:
+        for index, status in enumerate(("canceled", "interrupted"), start=1):
+            with self.subTest(status=status):
+                observed = self.ended_delivered_pass(f"impl-done-{status}", f"w1:p{index}", status, done=True)
+                self.assertIsInstance(worker_panes.can_close(observed), worker_panes.Kept)
+                self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(observed.row.name)),
+                                      worker_panes.Kept)
+                self.assertIsInstance(self.observation(observed.row), worker_panes.StoppedWorker)
 
     def test_launcher_can_close_its_own_completed_turn_while_it_holds_the_lock(self) -> None:
         opened = self.start()

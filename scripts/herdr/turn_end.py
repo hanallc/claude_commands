@@ -1062,7 +1062,7 @@ def _handle_locked(event: WorkerEvent,
                 worker_panes.observe_worker(parent.id, row, record), worker_panes.StoppedWorker))
             if event.kind == EventKind.TURN_END or stopped:
                 dispatch = worker_panes.worker_dispatch_state(row, run, hold)
-                if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                if not isinstance(dispatch, worker_panes.WorkerHold):
                     closed = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
                     if stopped and not isinstance(closed, worker_panes.Closed):
                         blocker = closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason

@@ -4940,14 +4940,20 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("w1:p0", self.fixture.world.locations)
         self.assertEqual(worker.end(self.fixture.parent.id, staff.WorkerName.parse("impl")), worker.ExitCode.OK)
 
-    def submitted_without_done(self, name: str, pane_state: Literal["working", "stopped", "closed"]) -> staff.StaffRow:
-        """Leave a delivered pass with no DONE on a working, stopped or closed pane."""
+    def submitted_without_done(self, name: str, pane_state: Literal["working", "stopped", "closed"], *,
+                               late_done: bool = False) -> staff.StaffRow:
+        """Leave a delivered pass with no DONE on a working, stopped or closed pane.
+
+        With `late_done`, the transcript gets the DONE after the dispatch, and the reply stays unsaved.
+        """
         self.agent.without_done = True
         self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "impl", self.prompt,
             session_dir=self.run_dir, slot=name, phase="8", kind="impl", launcher_command=["assign.sh"],
             reply=self.run_dir / f"{name}.md"), worker.DispatchSubmission.SUBMITTED)
-        pane = self.agent.submitted[-1][0]
+        pane, line = self.agent.submitted[-1]
         row = self.agent.row(pane)
+        if late_done:
+            self.agent.append(pane, "assistant", "DONE " + line.split("DONE ")[-1].split()[0].removesuffix("."))
         if pane_state == "working":
             self.fixture.world.locations[pane]["agent_status"] = "working"
         else:
@@ -4997,6 +5003,91 @@ class WorkerCommandTests(unittest.TestCase):
                               errors.getvalue())
                 self.assertEqual(staff.by_id(row.id), row)
                 self.assertEqual(self.pass_status(name), "active")
+
+    def end_kept(self, name: str) -> str:
+        """Run end, require exit 7, and return its error text."""
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        self.assertIs(code, worker.ExitCode.KEPT, errors.getvalue())
+        return errors.getvalue()
+
+    def test_end_keeps_a_stopped_worker_whose_done_reply_is_unsaved(self) -> None:
+        name = "impl-late-done"
+        reply = self.run_dir / f"{name}.md"
+        atomic_file.write_text_atomic(reply, "The previous report.\n")
+        row = self.submitted_without_done(name, "stopped", late_done=True)
+        self.assertIn("submitted pass awaits completion", self.end_kept(name))
+        self.assertEqual(self.pass_status(name), "active")
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(reply.read_text(), "The previous report.\n")
+
+    def test_end_keeps_a_stopped_worker_with_a_finished_result_not_in_the_transcript(self) -> None:
+        name = "impl-unseen-result"
+        row = self.submitted_without_done(name, "stopped")
+        pane = self.agent.submitted[-1][0]
+        path, record = self.detached_record(row, name, run=worker_panes.worker_run(row, record=staff.snapshot()))
+        record.update(delivery=f"sent: worker {row.name} at {pane}", worker_received=True)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.assertIn("a detached run result awaits a matching DONE", self.end_kept(name))
+        self.assertEqual(self.pass_status(name), "active")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_cancels_no_pass_when_an_older_pass_in_another_run_holds(self) -> None:
+        name = "impl-two-runs"
+        row = self.submitted_without_done(name, "stopped")
+        other_run = self.fixture.root / "private" / "older-pass"
+        saved = cast(dict[str, object], json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))
+        saved.update({"pass": {}, "history_file": str(other_run / "history.jsonl")})
+        atomic_file.write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps(saved))
+        _ = progress_history.begin_dispatch(other_run, slot="older-slot", phase="8", role="impl", worker_name=row.name,
+            worker_id=row.id, launcher_command=["assign.sh", "impl"], prompt=self.prompt, kind="impl", lens="")
+        newer = cast(dict[str, dict[str, dict[str, object]]],
+                     json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))["pass"][name]["started_at"]
+        assert isinstance(newer, (int, float))
+        older_path = other_run / unit_runs.STATE_FILE
+        fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(older_path.read_text()))
+        fields["pass"]["older-slot"]["started_at"] = newer - 60
+        atomic_file.write_text_atomic(older_path, json.dumps(fields))
+        with patch.object(detached_run_process, "runs_command", return_value=True):
+            _ = self.end_kept(name)
+        older = cast(dict[str, dict[str, dict[str, object]]], json.loads(older_path.read_text()))
+        self.assertEqual((self.pass_status(name), older["pass"]["older-slot"]["status"]), ("active", "active"))
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_retires_a_closed_worker_with_a_live_detached_run_and_keeps_its_pass(self) -> None:
+        name = "impl-closed-detached"
+        row = self.submitted_without_done(name, "closed")
+        path, record = self.detached_record(row, name, run=worker_panes.worker_run(row, record=staff.snapshot()))
+        record.update(status="running", pid=101)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+
+        def supervises(pid: int, _path: Path) -> bool:
+            return pid == 101
+
+        with (patch.object(detached_run_process, "supervises", side_effect=supervises),
+              patch.object(detached_run_process, "supervisor_records", return_value={path.resolve(): frozenset({101})}),
+              redirect_stderr(io.StringIO()) as errors):
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        # A closed worker has no pane to close, so end runs no close check and retires the row.
+        self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(self.pass_status(name), "active")
+
+    def test_list_all_shows_busy_work_for_every_hold_on_a_stopped_worker(self) -> None:
+        held = self.submitted_without_done("impl-late-done", "stopped", late_done=True)
+        waiting = self.submitted_without_done("impl-waits", "stopped")
+        for scope in ((), ("--all-parents",)):
+            with self.subTest(scope=scope):
+                code, output, errors = self.text_command("list", "all", *scope)
+                self.assertEqual(code, 0, errors)
+                states = {cells[1]: cells[5] for cells in output}
+                self.assertEqual((states[held.name], states[waiting.name]), ("busy", "stopped"))
+                code, listing, errors = self.command("list", "all", "--json", *scope)
+                self.assertEqual(code, 0, errors)
+                rows = {str(row["name"]): row for row in cast(list[dict[str, object]], json.loads(listing))}
+                self.assertEqual((rows[held.name]["work"], rows[waiting.name]["work"]), ("busy", "busy"))
+                if scope:
+                    self.assertEqual((rows[held.name]["state"], rows[waiting.name]["state"]), ("active", "active"))
 
     def test_list_all_shows_a_worker_that_waits_on_done_without_a_process_as_stopped(self) -> None:
         pane_states: tuple[Literal["stopped", "closed"], ...] = ("stopped", "closed")

@@ -400,21 +400,30 @@ def _saved_reply_evidence(receipt: DispatchReceipt, reply_file: str) -> worker_p
     return worker_panes.Kept("the transcript has no completed dispatch receipt")
 
 
+SUBMITTED_PASS_AWAITS_COMPLETION = "submitted pass awaits completion"
+
+
 def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                         run: Path, reply_file: str, require_completion: bool,
-                        detached_results: worker_panes.PassDetachedResults) -> worker_panes.CloseAllowed | worker_panes.Kept:
-    """Check one pass receipt for detached results and any required DONE."""
+                        detached_results: worker_panes.PassDetachedResults,
+                        ) -> worker_panes.CloseAllowed | worker_panes.Kept | worker_panes.AwaitsDone:
+    """Check one pass receipt for detached results and any required DONE.
+
+    The receipt reads the detached results also when DONE is required, so a DONE wait has no pending result.
+    """
     receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run,
-                               require_transcript=True, pane_pass=detached_results, require_done=require_completion)
+                               require_transcript=True, pane_pass=detached_results)
     if isinstance(receipt, DispatchEvidenceUnknown):
         return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
     if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
         return worker_panes.Kept("a detached run result awaits a matching DONE")
-    if require_completion and not isinstance(_saved_reply_evidence(receipt, reply_file), worker_panes.CloseAllowed):
-        # A DONE with an unsaved reply is not a DONE wait: recovery must save that reply.
-        cause = (worker_panes.HoldCause.AWAITS_DONE if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted))
-                 else worker_panes.HoldCause.OTHER_CHECK)
-        return worker_panes.Kept("submitted pass awaits completion", cause)
+    if not require_completion:
+        return worker_panes.CloseAllowed()
+    if isinstance(receipt, (DispatchSubmitted, DispatchNotSubmitted)):
+        return worker_panes.AwaitsDone(SUBMITTED_PASS_AWAITS_COMPLETION)
+    # A DONE with an unsaved reply is not a DONE wait: recovery must save that reply.
+    if not isinstance(_saved_reply_evidence(receipt, reply_file), worker_panes.CloseAllowed):
+        return worker_panes.Kept(SUBMITTED_PASS_AWAITS_COMPLETION)
     return worker_panes.CloseAllowed()
 
 
@@ -1089,9 +1098,14 @@ def _worker_dispatch_state(row: staff.StaffRow, record: staff.StaffSnapshot, det
         return worker_panes.worker_dispatch_state(row, run, lock, detached=detached, record=record,
                                                   related_runs=related, read=read)
     except (OSError, ValueError) as error:
-        detail = " ".join(str(error).splitlines())
-        unit_runs.report_anomaly(f"anomaly: {row.name}: {detail}")
-        return worker_panes.DispatchHoldsWorker(detail)
+        return worker_panes.DispatchHoldsWorker(_dispatch_anomaly(row, error))
+
+
+def _dispatch_anomaly(row: staff.StaffRow, error: OSError | ValueError) -> str:
+    """Report an unreadable dispatch state once and return its one-line detail."""
+    detail = " ".join(str(error).splitlines())
+    unit_runs.report_anomaly(f"anomaly: {row.name}: {detail}")
+    return detail
 
 
 def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, role: WorkerRole, *,
@@ -1119,7 +1133,7 @@ def select_worker(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot
         with progress_history.dispatch_reads(record, directories):
             for item in reusable:
                 state = _worker_dispatch_state(item.row, record, detached)
-                if not isinstance(state, worker_panes.DispatchHoldsWorker):
+                if not isinstance(state, worker_panes.WorkerHold):
                     return WorkerName.parse(item.row.name)
     for item in candidates:
         if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -1223,7 +1237,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 detached = _worker_detached_work(record, current, (row.id,))
                 with progress_history.dispatch_reads(record, directories):
                     state = _worker_dispatch_state(row, record, detached, hold)
-                if isinstance(state, worker_panes.DispatchHoldsWorker):
+                if isinstance(state, worker_panes.WorkerHold):
                     refusal = worker_panes.StartRefusal.BUSY_ROLE_CHANGE
                     print(f"{refusal.value}: workers unavailable: {row.name}", file=sys.stderr)
                     return ExitCode.BUSY
@@ -1369,17 +1383,26 @@ def end(parent: StaffId, name: WorkerName, *,
 
 def _cancel_passes_without_done(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot,
                                 lock: worker_panes.WorkerLockHold) -> None:
-    """Cancel the passes of a stopped or closed worker that wait on a DONE no process can send."""
+    """Cancel the passes of a stopped or closed worker that wait on a DONE no process can send.
+
+    Cancel no pass when another check holds any open pass of the worker.
+    """
     observed = worker_panes.observe_worker(parent, row, record)
     if not isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
         return
     rows = tuple(item for item in record.rows if item.kind != "worker" or item.reports_to(parent))
     directories = worker_panes.worker_run_directories(replace(record, rows=rows))
     detached = _worker_detached_work(record, directories, (row.id,))
-    state = _worker_dispatch_state(row, record, detached, lock)
-    if isinstance(state, worker_panes.DispatchHoldsWorker) and state.cause is worker_panes.HoldCause.AWAITS_DONE:
-        for run in detached.launcher_runs.by_worker[row.id]:
-            _ = progress_history.cancel_worker_passes(run, row.id)
+    runs = detached.launcher_runs.by_worker[row.id]
+    try:
+        waits = worker_panes.done_wait_passes(row, runs[0], lock, detached=detached, record=record, related_runs=runs[1:])
+    except (OSError, ValueError) as error:
+        _ = _dispatch_anomaly(row, error)
+        return
+    instances = frozenset(wait.instance_id for wait in waits if wait.instance_id)
+    if instances:
+        for run in runs:
+            _ = progress_history.cancel_worker_passes(run, row.id, instances)
 
 
 def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
@@ -2094,11 +2117,10 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
                 pane, displayed = _worker_pane_state(observed, dispatch)
                 status = work = displayed
             elif status not in ("paused", "exited"):
-                if (isinstance(dispatch, worker_panes.DispatchHoldsWorker)
-                        and dispatch.cause is worker_panes.HoldCause.AWAITS_DONE
+                if (isinstance(dispatch, worker_panes.DispatchAwaitsDone)
                         and isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))):
-                    status, work = "stopped", "idle"
-                elif isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                    status, work = "stopped", "busy"
+                elif isinstance(dispatch, worker_panes.WorkerHold):
                     status, work = "active", "busy"
                 elif status == "active":
                     status = dispatch.value if isinstance(dispatch, worker_panes.ReleasedWorkerPass) else "completed"
@@ -2128,7 +2150,7 @@ def _worker_pane_state(state: worker_panes.WorkerPane,
             "starting" if state.status == "starting" else activity))
         if classified in ("paused", "exited", "busy"):
             return "open", classified
-        if isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+        if isinstance(dispatch, worker_panes.WorkerHold):
             return "open", "busy"
         return "open", activity
     if isinstance(state, worker_panes.StoppedWorker):
@@ -2137,9 +2159,9 @@ def _worker_pane_state(state: worker_panes.WorkerPane,
         pane, displayed = "closed", "-"
     else:
         pane, displayed = "unknown", "-"
-    if isinstance(dispatch, worker_panes.DispatchHoldsWorker) and session_state.staff_state(row) == "active":
+    if isinstance(dispatch, worker_panes.WorkerHold) and session_state.staff_state(row) == "active":
         no_process = isinstance(state, (worker_panes.StoppedWorker, worker_panes.ClosedWorker))
-        return pane, "stopped" if no_process and dispatch.cause is worker_panes.HoldCause.AWAITS_DONE else "busy"
+        return pane, "stopped" if no_process and isinstance(dispatch, worker_panes.DispatchAwaitsDone) else "busy"
     return pane, displayed
 
 
@@ -2161,8 +2183,10 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
                 continue
             dispatch_state = _worker_dispatch_state(state.row, record, detached)
             pane, displayed_state = _worker_pane_state(state, dispatch_state)
-            work = (displayed_state if isinstance(state, worker_panes.OpenWorker) or displayed_state == "busy"
-                    else worker_panes.worker_state(state))
+            # A DONE wait shows "stopped", but dispatch still refuses the worker.
+            held = isinstance(dispatch_state, worker_panes.WorkerHold) and session_state.staff_state(state.row) == "active"
+            work = (displayed_state if isinstance(state, worker_panes.OpenWorker)
+                    else "busy" if held else worker_panes.worker_state(state))
             facts: dict[str, object] = {"state": type(state).__name__, "work": work}
             if as_json:
                 saved = dispatches.by_worker.get(state.row.id, WorkerDispatchRecord({}, 0)).fields

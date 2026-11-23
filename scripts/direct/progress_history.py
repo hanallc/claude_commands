@@ -1578,14 +1578,19 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
                 pass_recorder.append_event(state, pass_recorder.record_event(state, "pass_refused", pass_recorder.now_epoch(), passed))
 
 
-def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
-    """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
+def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId,
+                         instance_ids: frozenset[str] | None = None) -> int:
+    """End each open pass of a stopped worker as canceled. Return the number of passes ended.
+
+    With `instance_ids`, end only the open passes with one of those instance ids.
+    """
     if not pass_recorder.state_path(session_dir).is_file():
         return 0
     with pass_recorder.recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = pass_recorder.read_state(session_dir)
-        slots = [slot for slot, passed in pass_recorder.open_passes(state).items() if passed.get("worker_id") == worker_id]
+        slots = [slot for slot, passed in pass_recorder.open_passes(state).items() if passed.get("worker_id") == worker_id
+                 and (instance_ids is None or passed.get("instance_id") in instance_ids)]
         return sum(pass_recorder.close_slot_pass(session_dir, state, slot, "canceled", pass_recorder.now_epoch()) for slot in slots)
 
 

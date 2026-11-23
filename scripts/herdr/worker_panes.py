@@ -209,17 +209,16 @@ class CloseAllowed:
     """The close checks permit closure; the pane remains open."""
 
 
-class HoldCause(Enum):
-    """Tell a DONE wait apart from every other hold."""
-
-    AWAITS_DONE = "the delivered pass has no DONE reply"
-    OTHER_CHECK = "another close check holds the worker"
-
-
 @dataclass(frozen=True)
 class Kept:
     blocker: str
-    cause: HoldCause = field(default=HoldCause.OTHER_CHECK, compare=False)
+
+
+@dataclass(frozen=True)
+class AwaitsDone:
+    """A delivered pass waits on its DONE reply, and no other pass check holds it."""
+
+    blocker: str
 
 
 @dataclass(frozen=True)
@@ -889,7 +888,7 @@ class RecordedCompletionEvidence(Protocol):
 
     def pass_reply_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                             run: Path, reply_file: str, require_completion: bool,
-                            detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
+                            detached_results: PassDetachedResults) -> CloseAllowed | Kept | AwaitsDone: ...
 
 
 class RecordedPassClose(Enum):
@@ -930,7 +929,14 @@ def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
 @dataclass(frozen=True)
 class DispatchHoldsWorker:
     blocker: str
-    cause: HoldCause = field(default=HoldCause.OTHER_CHECK, compare=False)
+
+
+@dataclass(frozen=True)
+class DispatchAwaitsDone:
+    """A delivered pass waits on its DONE reply; dispatch still refuses the worker."""
+
+    blocker: str
+    instance_id: str
 
 
 @dataclass(frozen=True)
@@ -954,7 +960,8 @@ class ReleasedWorkerPass(Enum):
     STALE_ACTIVE = "the launcher ended without finishing the pass"
 
 
-WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
+WorkerHold = DispatchHoldsWorker | DispatchAwaitsDone
+WorkerDispatchState = WorkerHold | CompletedWorkerPass | ReleasedWorkerPass
 
 
 def check_worker_lock(row: staff.StaffRow,
@@ -991,27 +998,67 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
                           record: staff.StaffSnapshot | None = None, related_runs: Sequence[Path] = (),
                           read: Callable[[Path], dict[str, object]] = run_state,
                           ) -> WorkerDispatchState:
-    """Check the worker lock, detached runs, and all saved passes for this worker."""
+    """Check the worker lock, detached runs, and all saved passes for this worker.
 
+    Return a DONE wait only when no other check holds the worker.
+    """
+    states = _dispatch_states(row, run, lock, detached, record, related_runs, read)
+    newest = next(states)
+    if isinstance(newest, DispatchHoldsWorker):
+        return newest
+    wait = newest if isinstance(newest, DispatchAwaitsDone) else None
+    for state in states:
+        if isinstance(state, DispatchHoldsWorker):
+            return state
+        if wait is None and isinstance(state, DispatchAwaitsDone):
+            wait = state
+    return newest if wait is None else wait
+
+
+def done_wait_passes(row: staff.StaffRow, run: Path, lock: WorkerLockHold, *, detached: RunningDetachedWorkers,
+                     record: staff.StaffSnapshot, related_runs: Sequence[Path] = (),
+                     ) -> tuple[DispatchAwaitsDone, ...]:
+    """Return each open pass that waits on DONE; return none when another check holds the worker."""
+    waits: list[DispatchAwaitsDone] = []
+    for state in _dispatch_states(row, run, lock, detached, record, related_runs, run_state):
+        if isinstance(state, DispatchHoldsWorker):
+            return ()
+        if isinstance(state, DispatchAwaitsDone):
+            waits.append(state)
+    return tuple(waits)
+
+
+def _dispatch_states(row: staff.StaffRow, run: Path, lock: WorkerLockHold | WorkerLockAtUse,
+                     detached: RunningDetachedWorkers | DetachedWorkAtUse, record: staff.StaffSnapshot | None,
+                     related_runs: Sequence[Path], read: Callable[[Path], dict[str, object]],
+                     ) -> Generator[WorkerDispatchState]:
+    """Yield the newest pass state, then the state of each older active pass.
+
+    A held lock or a live detached run yields one hold and no pass state.
+    """
     locked = check_worker_lock(row, lock)
     if isinstance(locked, Kept):
-        return DispatchHoldsWorker(locked.blocker)
+        yield DispatchHoldsWorker(locked.blocker)
+        return
     if isinstance(detached, DetachedWorkAtUse):
         live_runs = cast(Callable[..., Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
         live = bool(live_runs(run / "detached_runs", row.name, identity=row.id))
     else:
         if row.id in detached.unreadable_workers:
-            return DispatchHoldsWorker("a detached run record is unreadable")
+            yield DispatchHoldsWorker("a detached run record is unreadable")
+            return
         live = row.id in detached.staff_ids
     if live:
-        return DispatchHoldsWorker("a detached run is live")
+        yield DispatchHoldsWorker("a detached run is live")
+        return
     record = staff.local_snapshot() if record is None else record
     if isinstance(detached, DetachedWorkAtUse):
         # Direct pane operations use the current pass.
         passed = worker_pass(row, run, record=record)
         if passed:
-            return _pass_dispatch_state(row, run, passed, passed.get("status"), passed.get("instance_id"),
-                                        live_runs_checked=False)
+            yield _pass_dispatch_state(row, run, passed, passed.get("status"), passed.get("instance_id"),
+                                       live_runs_checked=False)
+            return
         passes = []
     else:
         passes = [(directory, item) for directory in dict.fromkeys((run, *related_runs))
@@ -1020,22 +1067,19 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
         latest = progress_history.last_dispatch(row.id)
         if (not isinstance(latest, progress_history.RecordedDispatch)
                 or latest.status is progress_history.DispatchDetailNotRecorded.UNRECORDED):
-            return ReleasedWorkerPass.NO_PROMPT_DELIVERED
-        return _pass_dispatch_state(row, run, {}, latest.status, latest.instance_id, live_runs_checked=False)
+            yield ReleasedWorkerPass.NO_PROMPT_DELIVERED
+        else:
+            yield _pass_dispatch_state(row, run, {}, latest.status, latest.instance_id, live_runs_checked=False)
+        return
 
     passes.sort(key=lambda item: _pass_started_at(item[1]), reverse=True)
     directory, passed = passes[0]
-    newest = _pass_dispatch_state(row, directory, passed, passed.get("status"), passed.get("instance_id"),
-                                  live_runs_checked=True)
-    if isinstance(newest, DispatchHoldsWorker):
-        return newest
+    yield _pass_dispatch_state(row, directory, passed, passed.get("status"), passed.get("instance_id"),
+                               live_runs_checked=True)
     for directory, passed in passes[1:]:
         if passed.get("status") == "active":
-            state = _pass_dispatch_state(row, directory, passed, "active", passed.get("instance_id"),
-                                         live_runs_checked=True)
-            if isinstance(state, DispatchHoldsWorker):
-                return state
-    return newest
+            yield _pass_dispatch_state(row, directory, passed, "active", passed.get("instance_id"),
+                                       live_runs_checked=True)
 
 
 def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, object], status: object,
@@ -1051,8 +1095,10 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
         hold = evidence.pass_reply_evidence(row, delivery, run=run, reply_file=reply_file, require_completion=active,
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
+        if isinstance(hold, AwaitsDone):
+            return DispatchAwaitsDone(hold.blocker, dispatch if isinstance(dispatch, str) else "")
         if isinstance(hold, Kept):
-            return DispatchHoldsWorker(hold.blocker, hold.cause)
+            return DispatchHoldsWorker(hold.blocker)
         if active:
             return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
@@ -1079,7 +1125,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
 def _idle_checks(row: staff.StaffRow, run: Path,
                  lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     state = worker_dispatch_state(row, run, lock)
-    return Kept(state.blocker) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
+    return Kept(state.blocker) if isinstance(state, WorkerHold) else CloseAllowed()
 
 
 def stage_two_completion_id(dispatch_id: str) -> str:
@@ -1098,7 +1144,7 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     if isinstance(worker, ClosedWorker):
         return _idle_checks(worker.row, directory, lock)
     state = worker_dispatch_state(worker.row, directory, lock)
-    if isinstance(state, DispatchHoldsWorker):
+    if isinstance(state, WorkerHold):
         return Kept(state.blocker)
 
     if isinstance(state, CompletedWorkerPass):
@@ -1410,7 +1456,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
     run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-    if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
+    if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), WorkerHold):
         run = worker_run(owner, record=record, scanned=runs)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
@@ -1543,7 +1589,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(current, OpenWorker):
         passed = worker_pass(current.row, allowed.run)
         dispatch = worker_dispatch_state(current.row, worker_run(current.row, record=record), lock)
-        if passed.get("kind") != role and isinstance(dispatch, DispatchHoldsWorker):
+        if passed.get("kind") != role and isinstance(dispatch, WorkerHold):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, dispatch.blocker)
         if not switching:
             matches = _live_policy(current, policy, client, same_role=keep_model and passed.get("kind") == role)
