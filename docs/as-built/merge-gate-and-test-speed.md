@@ -537,6 +537,12 @@ A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
 A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
 
+The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
+Each kind comes from the newest full, non-aborted gate that recorded it.
+A changed config file selects each module that reads it in its source or in its config read record. A module with no record is selected.
+The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
+Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
+
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
 It prints module names when ten or fewer modules are selected.
 A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.
