@@ -8,7 +8,7 @@ from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
 from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
 import errno
@@ -359,7 +359,7 @@ class SocketPeer:
 
 
 class RefillMark(threading.local):
-    pending: bool = False
+    clear_pending: bool = False
 
 
 class GaplessRefill:
@@ -369,16 +369,19 @@ class GaplessRefill:
         self.mark: RefillMark = RefillMark()
 
     def clear(self) -> None:
-        self.mark.pending = True
+        """The clear waits for the next update() from this thread, so a direct os.environ.clear() keeps the environment while a fixture is open."""
+        self.mark.clear_pending = True
 
     def update(self, values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+        cleared, self.mark.clear_pending = self.mark.clear_pending, False
         target = dict(values, **keywords)
-        cleared, self.mark.pending = self.mark.pending, False
         for key, value in target.items():
             self.environ[key] = value
         if cleared:
             for key in [key for key in self.environ if key not in target]:
-                del self.environ[key]
+                # The loop thread can remove the same key first, for example ADMISSION_SOURCE_RELOAD.
+                with suppress(KeyError):
+                    del self.environ[key]
 
 
 class AdmissionFixture(ExitStack):

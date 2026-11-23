@@ -11,7 +11,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -5202,6 +5202,7 @@ class ServiceTests(unittest.TestCase):
             fixture_cgroup = gate.builds_slice_cgroup()
             probing = threading.Event()
             probed = threading.Event()
+            probe_waits: list[bool] = []
             loop_reads: list[Path] = []
             child_prints: list[str] = []
             # An empty PATH cannot find printenv; the child reads only the variable under test.
@@ -5211,9 +5212,7 @@ class ServiceTests(unittest.TestCase):
 
             def probe_or_serve(timeout: float) -> None:
                 # The probe turn reads the environment and does no other work.
-                if not probing.is_set():
-                    serve_once(timeout)
-                elif not probed.is_set():
+                if probing.is_set() and not probed.is_set():
                     try:
                         loop_reads.append(gate.builds_slice_cgroup())
                         # The loop starts its own threads too, for example the reading alert and the roster.
@@ -5226,18 +5225,27 @@ class ServiceTests(unittest.TestCase):
                         child_prints.append(child.stdout)
                     finally:
                         probed.set()
+                else:
+                    serve_once(timeout)
+
+            refill_update = os.environ.update
+
+            def probe_update(values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+                # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
+                probing.set()
+                probe_waits.append(probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                refill_update(values, **keywords)
 
             with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
-                # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
-                saved = dict(os.environ)
-                os.environ.clear()
+                update_probe = mock.patch.object(os.environ, "update", probe_update)
                 try:
-                    probing.set()
-                    loop_read = probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS)
+                    with mock.patch.dict(os.environ, {"ADMISSION_PATCH_DICT_PROBE": "1"}):
+                        # The probe wraps only the update of this exit; the patch.dict entry already ran.
+                        _ = update_probe.start()
                 finally:
-                    os.environ.update(saved)
-                probing.clear()
-            self.assertTrue(loop_read)
+                    _ = update_probe.stop()
+                self.assertNotIn("ADMISSION_PATCH_DICT_PROBE", os.environ)
+            self.assertEqual(probe_waits, [True])
             self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
             self.assertEqual(child_prints, [f"{fixture_cgroup}\n"])
 
