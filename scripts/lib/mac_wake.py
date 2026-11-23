@@ -5,6 +5,7 @@
 
 start() runs the watcher in its own session when a pull waits and no watcher holds the lock.
 The notes timer calls it each quota pass, so a watcher comes back after a reboot.
+The watcher works in its lock folder, so it never holds the caller's folder (a worktree move needs it free).
 A fixture queue (ZONE_STATE, XDG_STATE_HOME or HOME moved) starts no watcher;
 MAC_WAKE_PROGRAM replaces this file in tests.
 """
@@ -81,6 +82,7 @@ def watch() -> int:
     """Hold the lock; probe the Mac, pausing between probes, and drain the queue when it answers."""
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chdir(path.parent)
     with path.open("a") as handle:
         if not _try_lock(handle):
             return 0

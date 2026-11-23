@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import chdir, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest import mock
@@ -29,6 +29,7 @@ class MacWakeTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(chdir(self.root))
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("MAC_WAKE_PROGRAM", "ZONE_SSH")}
         environment["ZONE_STATE"] = str(self.root / "zone")
@@ -108,6 +109,10 @@ class MacWakeTests(unittest.TestCase):
             self.assertEqual(mac_wake.watch(), 0)
         self.assertEqual(run.call_count, 2)
         pause.assert_called_once_with(10)
+
+    def test_watch_leaves_the_caller_folder_for_the_lock_folder(self) -> None:
+        self.assertEqual(mac_wake.watch(), 0)
+        self.assertEqual(Path.cwd(), mac_wake.lock_path().parent.resolve())
 
     def test_a_second_watcher_exits_while_the_first_holds_the_lock(self) -> None:
         self.queue_pull()
