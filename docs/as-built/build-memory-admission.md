@@ -441,7 +441,8 @@ The service removes its AWS queue snapshot during a configuration refusal.
 The pass uses that policy for readings, decisions, and explanations. Its stored inputs preserve the evidence for counterfactual release advice.
 Queries project the stored `PassResult` through `queue_read_from_pass`. A release marks the stored result stale; the next query computes its evidence once without granting a step.
 `admission_client.view()` supplies one `QueueRead` for the complete queue page, the feed and probes. It gives up after `query_timeout_seconds`.
-`queue_read()` reads for a person (`/build:bump`) through `view_for_person()`. The connection keeps the `query_timeout_seconds` limit, so a down service refuses at once. A busy service gets up to `person_query_timeout_seconds` to answer, and the command prints one line that it waits.
+`queue_read()` reads for a person (`/build:bump <selector>`) through `view_for_person()`. The connection keeps the `query_timeout_seconds` limit, so a down service refuses at once. A busy service gets up to `person_query_timeout_seconds` to answer, and the command prints one line that it waits.
+`/build:bump clear [unit]` reads no view. It sends only `priority_clear`, with the program limits.
 A failed query raises `AdmissionUnavailable` within its bound: "no connection in <limit> s" for the connection, "no answer in <limit> s" for the answer. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
 The Builds page shows the saved Mac idle alert first, in red.
