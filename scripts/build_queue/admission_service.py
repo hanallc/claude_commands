@@ -1389,11 +1389,20 @@ def durable_copy(value: object) -> object:
     return value
 
 
+@dataclass(frozen=True)
+class PublishedPlacement:
+    request: wire.PlacementRequest
+    encoded_request: str
+    assignment: records.SavedPlacementAssignment | None
+    reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
+
+
 @dataclass
 class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
     wait_positions: dict[str, int]
+    placements: dict[str, PublishedPlacement]
     view_bytes: bytes = b""
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
@@ -3006,6 +3015,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
+        self.published.placements = self._publish_placement_replies()
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -3352,7 +3362,19 @@ class AdmissionServer:
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
-        self.published = PublishedReplies(view, explain, positions)
+        placements = self.published.placements if isinstance(self.published, PublishedReplies) else {}
+        self.published = PublishedReplies(view, explain, positions, placements)
+
+    def _publish_placement_replies(self) -> dict[str, PublishedPlacement]:
+        replies: dict[str, PublishedPlacement] = {}
+        for episode, request in self.placement_requests.items():
+            if not self._placement_owner_live(request.owner):
+                continue
+            assignment = self.assignments.get(self.current_assignments.get(episode, ""))
+            reply = self._placement_reply(request, self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
+            if not isinstance(reply, wire.DispatchStatus):
+                replies[episode] = PublishedPlacement(request, wire.encode_request(request), assignment, reply)
+        return replies
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3570,6 +3592,8 @@ class AdmissionServer:
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
+        if isinstance(self.published, PublishedReplies):
+            _ = self.published.placements.pop(episode, None)
         started = isinstance(ending, ReleaseStatus)
         if not started and "verify" in record.queue_waiter and record.sidecar:
             try:
@@ -5171,6 +5195,17 @@ done
             self.next_pass = self.clock.monotonic()
             return [wire.Ok()]
         if isinstance(request, wire.PlacementRequest):
+            previous = self.placement_requests.get(request.episode)
+            if (isinstance(self.pending_configuration, NoPass) and isinstance(self.published, PublishedReplies)
+                    and (published := self.published.placements.get(request.episode)) is not None
+                    and published.request is previous and published.encoded_request == wire.encode_request(request)):
+                assignment = self.assignments.get(self.current_assignments.get(request.episode, ""))
+                # A retry can settle a remote attempt after its claim holder ends.
+                if assignment is published.assignment and (assignment is None or not self._ended_claim_holder(assignment)):
+                    return [published.reply]
+            identity = self._placement_identity(request)
+            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+            request = replace(request, identity=self._named_identity(identity, members=members))
             if not self._placement_owner_live(request.owner):
                 if request.owner.host == self.host and not isinstance(self.system_reader, NoSystemReader):
                     pending = self.pending_coordinators.get(request.owner)
@@ -5185,7 +5220,6 @@ done
                 return [wire.Refused("submitting owner is not live on the coordinator")]
             if request.owner in self.pending_coordinators:
                 del self.pending_coordinators[request.owner]
-            previous = self.placement_requests.get(request.episode)
             if previous is not None and (previous.owner != request.owner or previous.since != request.since
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
@@ -5199,14 +5233,6 @@ done
                 except (OSError, ValueError) as error:
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
-            if (isinstance(connection, Connection) and previous == request
-                    and not isinstance(self.system_reader, NoSystemReader)
-                    and self.system_reader.latest.started_monotonic <= self.last_pass_started
-                    and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
-                    and isinstance(self.last_result, gate.PassResult)
-                    and self.clock.monotonic() < self.next_pass):
-                return [self._placement_reply(request,
-                    self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
@@ -5428,10 +5454,6 @@ done
             return [wire.Ok()]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
-        if isinstance(request, wire.PlacementRequest):
-            identity = self._placement_identity(request)
-            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
-            request = replace(request, identity=self._named_identity(identity, members=members))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -5895,7 +5917,10 @@ done
             process = self.system_reader.latest.processes.get(pid)
             identity = LiveOwnerIdentity(process.start) if process is not None else OwnerProcessGone()
         if isinstance(identity, LiveOwnerIdentity):
-            self.caller_versions[records.run_owner(pid, identity.start_time)] = request.code_version
+            caller = records.run_owner(pid, identity.start_time)
+            if isinstance(request, wire.PlacementRequest) and self.caller_versions.get(caller) == request.code_version:
+                return
+            self.caller_versions[caller] = request.code_version
             if persist_change:
                 self.persist()
 
