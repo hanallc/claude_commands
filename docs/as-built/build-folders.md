@@ -68,6 +68,33 @@ A new unit or style production uses `worktree` as its main short name. The branc
   Add `--list <file>` to supply names for specific worktrees during the full switch.
   Omit `--dry-run` to apply the full plan, resume saved moves, and link main output.
   Moved worktrees of retired units have no assigned output.
+- `worktrees.py migrate --repo <word> --dry-run` prints the plan for one repository.
+  `<word>` is the repo word (`build_folders.repo_word`).
+  The plan has the main checkout, its worktrees, its scratch clones, and its saved moves, and it links the main output as `--all` does.
+  `--list <file>` supplies names, as it does for `--all`. `--repo` and `--all` do not go together.
+  This form takes no Mac claim on any machine.
+- `worktrees.py migrate --repo <word> --host mac` runs on natedev only (`remote.local_machine()`) and migrates that repository on the Mac.
+  It holds the repository's Mac claim on natedev (`mac_run.repository_claim`, target `mac`, kind `mirror`, what `migrate --repo <word>`).
+  The claim id has the `mac-linux-` prefix, so the Mac activity watch does not release it. The holder releases it.
+  The claim identity comes from natedev's main checkout for `<word>`. Without that checkout, the command prints `kept: <word>: natedev has no main checkout for the Mac claim (…)` and exits 1.
+  Inside the claim it runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py migrate --until-input-ends --repo <word>` over ssh to the `host` of the `mac` target.
+  The ssh options are `mac_linux.SSH`, which include `ServerAliveInterval=15` and `ServerAliveCountMax=2`, so a dead link ends ssh.
+  It prints the Mac output and returns the Mac exit status.
+  The ssh input stays open while natedev holds the claim. `--until-input-ends` sends SIGINT to the Mac run when its input ends.
+  On a stop, natedev closes the ssh input and waits for ssh to end before it releases the claim.
+  The claim is released at the end, also when ssh fails.
+  A busy claim prints `kept: <word> busy with <what>`, a refused claim prints `kept: <word> claim refused: <reason>`, and both exit 1 with no ssh.
+  `--dry-run` takes no claim and passes `--dry-run` to the Mac.
+  `--host` needs `--repo`, takes no `--list`, and is refused on the Mac.
+- Before migration links a real `target` folder to its output, it checks the target.
+  This applies to a main checkout and to an already moved worktree that still has a real `target`. That worktree links to the output in its worktree record.
+  1. A process scan of the target must find no holder. A holder keeps the checkout as `target in use (pids …)`.
+  2. Migration takes a non-blocking exclusive flock on each Cargo lock (`sweep.LOCK_NAMES`) at `target/*/` and `target/*/*/`. A held lock keeps the checkout as `kept: <lock> held`.
+  3. Migration holds the flocks through the rename and the link.
+  When the output is not empty, migration moves the target to `.saved-target-*/target` beside the checkout instead.
+  If a new `target` appears between the move and the link, migration keeps the checkout as `rerun: …`. The reason names the folder that holds the earlier target: the output, or `.saved-target-*/target` when the output was not empty. Run migration again.
+  A held or changed build-folder lock keeps the checkout as `kept: <output>: the build folder lock is held. Rerun when idle`.
+  In each case migration goes on with the next checkout.
 - `worktrees.py old-links` lists recorded links and the live sessions that use them.
   `--remove-unused` removes a link only after a completed move with a verified destination and no possible live user.
   Unreadable session evidence or an earlier link through that path keeps the link.

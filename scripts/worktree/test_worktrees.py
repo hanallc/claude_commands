@@ -20,7 +20,8 @@ import sys
 import tempfile
 from typing import Callable, NamedTuple, TypedDict, cast, override
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
@@ -31,11 +32,13 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
+from scripts.build_queue import mac_run
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import build_folders, build_slots, cargo_output, conf, git_exclude, git_files, scratch
 from scripts.message import sessions
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import mac_test
 from scripts.production import staff
 from scripts.worktree import worktree_links, worktrees
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
@@ -919,7 +922,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
         missing_selection = self.command(self.root, self.migration_command("--dry-run"))
         self.assertEqual(missing_selection.returncode, 2, missing_selection.stdout + missing_selection.stderr)
-        self.assertIn("specify --list FILE or --all", missing_selection.stderr)
+        self.assertIn("specify --list FILE, --all or --repo WORD", missing_selection.stderr)
         for flags in (["--dry-run"], []):
             with self.subTest(flags=flags):
                 result = self.command(self.root, [*command, *flags])
@@ -932,6 +935,321 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 self.assertFalse((self.trees / "origin/fixture-unit/unlisted").exists())
         self.assertEqual(listed.readlink(), new)
         self.assertIn(f"worktree {unlisted}", self.git(main, "worktree", "list", "--porcelain"))
+
+    def other_main(self) -> Path:
+        """Make the main checkout of a second repository, `other`."""
+        other_origin = self.root / "other.git"
+        _ = self.git(self.root, "init", "--bare", "--initial-branch=main", str(other_origin))
+        other = self.home / "rust/other"
+        _ = self.git(self.root, "clone", str(other_origin), str(other))
+        _ = self.git(other, "commit", "--allow-empty", "-m", "Other fixture")
+        return other
+
+    def real_target(self, checkout: Path) -> Path:
+        """Give the checkout a real target folder with an artifact, and give its Cargo lock."""
+        profile = checkout / "target/debug"
+        profile.mkdir(parents=True)
+        _ = (profile / "artifact").write_text("warm")
+        lock = profile / ".cargo-lock"
+        lock.touch()
+        return lock
+
+    def moved_worktree_with_real_target(self) -> tuple[Path, Path, Path]:
+        """Move a worktree, then put a real target where its link was; give the checkout, its output, and its Cargo lock."""
+        main = self.migration_main()
+        old = self.add_linked_tree(main, self.trees / "source", "source")
+        list_file = self.root / "list"
+        _ = list_file.write_text(f"{old} fixture-unit source\n")
+        moved = self.command(self.root, self.migration_command("--list", list_file))
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        new = self.trees / "origin/fixture-unit/source"
+        (new / "target").unlink()
+        return new, self.root / "build/origin/fixture-unit/source", self.real_target(new)
+
+    def real_main_target(self) -> tuple[Path, Path]:
+        """Make the main checkout with a real target folder and give the checkout and its Cargo lock."""
+        main = self.migration_main()
+        return main, self.real_target(main)
+
+    def test_migration_repo_selects_one_repository(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        tree = self.add_linked_tree(main, self.trees / "origin-fixture-unit-repair", "repair")
+        other = self.other_main()
+        other_tree = self.add_linked_tree(other, self.trees / "other-fixture-unit-probe", "probe")
+        command = self.migration_command("--repo", "origin")
+        for flags in (["--dry-run"], []):
+            with self.subTest(flags=flags):
+                result = self.command(self.root, [*command, *flags])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"main output {main} -> {self.root}/build/origin/main", result.stdout)
+                self.assertIn(f"move {tree} -> {self.trees}/origin/fixture-unit/repair |", result.stdout)
+                self.assertNotIn(str(other), result.stdout)
+                self.assertNotIn(str(other_tree), result.stdout)
+        self.assertEqual((main / "target").readlink(), self.root / "build/origin/main")
+        self.assertEqual(tree.readlink(), self.trees / "origin/fixture-unit/repair")
+        self.assertFalse(os.path.lexists(other / "target"))
+        self.assertFalse(other_tree.is_symlink())
+
+    def test_migration_refuses_repo_with_all(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        result = self.command(self.root, self.migration_command("--repo", "origin", "--all", "--dry-run"))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("not allowed with argument", result.stderr)
+        self.assertFalse(os.path.lexists(main / "target"))
+
+    def mac_migration(self, repo: str, *, dry_run: bool, ssh_status: int = 0,
+                      claim_error: Exception | None = None) -> tuple[int, str, list[str], list[str]]:
+        """Run the natedev form with a fake claim layer and a fake ssh call; give the status, output, events, and commands."""
+        events: list[str] = []
+        commands: list[str] = []
+        claims: list[tuple[object, ...]] = []
+
+        @contextmanager
+        def fake_claim(*arguments: object) -> Generator[None]:
+            claims.append(arguments)
+            if claim_error is not None:
+                raise claim_error
+            events.append("claim")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        def fake_ssh(command: str) -> int:
+            events.append("ssh")
+            commands.append(command)
+            return ssh_status
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(mac_run, "repository_claim", fake_claim),
+              patch.object(worktrees, "_run_on_mac", fake_ssh),
+              redirect_stdout(output := StringIO())):
+            status = worktrees.migrate_on_mac(repo, dry_run=dry_run)
+        if claims:
+            main = self.home / "rust/origin"
+            self.assertEqual(claims, [(main, "mac", f"migrate --repo {repo}", mac_test.MacClaimKind.MIRROR)])
+        return status, output.getvalue(), events, commands
+
+    def test_mac_host_migration_holds_the_claim_around_the_ssh_run(self) -> None:
+        self.layout_fixture()
+        _ = self.migration_main()
+        status, output, events, commands = self.mac_migration("origin", dry_run=False)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(events, ["claim", "ssh", "release"])
+        self.assertEqual(commands, [f"{worktrees._MAC_MIGRATE} origin"])  # pyright: ignore[reportPrivateUsage]
+
+    def test_mac_host_migration_runs_no_ssh_when_the_claim_is_busy(self) -> None:
+        self.layout_fixture()
+        _ = self.migration_main()
+        busy = mac_run.MacClaimBusy("mac", "native Mac run")
+        status, output, events, commands = self.mac_migration("origin", dry_run=False, claim_error=busy)
+        self.assertEqual(status, 1)
+        self.assertEqual(output, "kept: origin busy with native Mac run\n")
+        self.assertEqual((events, commands), ([], []))
+
+    def test_mac_host_dry_run_takes_no_claim_and_passes_the_dry_run(self) -> None:
+        self.layout_fixture()
+        _ = self.migration_main()
+        status, output, events, commands = self.mac_migration("origin", dry_run=True,
+                                                              claim_error=AssertionError("claimed"))
+        self.assertEqual(status, 0, output)
+        self.assertEqual(events, ["ssh"])
+        self.assertEqual(commands, [f"{worktrees._MAC_MIGRATE} origin --dry-run"])  # pyright: ignore[reportPrivateUsage]
+
+    def test_mac_host_ssh_failure_releases_the_claim_and_gives_its_status(self) -> None:
+        self.layout_fixture()
+        _ = self.migration_main()
+        status, output, events, _commands = self.mac_migration("origin", dry_run=False, ssh_status=255)
+        self.assertEqual(status, 255, output)
+        self.assertEqual(events, ["claim", "ssh", "release"])
+
+    def test_mac_host_migration_refuses_a_repo_with_no_natedev_checkout(self) -> None:
+        self.layout_fixture()
+        status, output, events, commands = self.mac_migration("missing", dry_run=False)
+        self.assertEqual(status, 1)
+        self.assertTrue(output.startswith("kept: missing: natedev has no main checkout for the Mac claim ("), output)
+        self.assertEqual((events, commands), ([], []))
+
+    def test_mac_host_needs_repo_and_natedev(self) -> None:
+        self.layout_fixture()
+        for arguments in (["--host", "mac", "--all"], ["--host", "mac", "--repo", "origin", "--list", os.devnull]):
+            with self.subTest(arguments=arguments):
+                result = self.command(self.root, self.migration_command(*arguments))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--host needs --repo WORD and takes no --list", result.stderr)
+        with (patch.object(sys, "argv", ["worktrees.py", "migrate", "--repo", "origin", "--host", "mac"]),
+              patch.object(remote, "local_machine", return_value="mac"), redirect_stderr(errors := StringIO()),
+              self.assertRaises(SystemExit) as refused):
+            _ = worktrees.main()
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("--host runs on natedev only", errors.getvalue())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_migration_keeps_a_main_checkout_whose_target_a_process_uses(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+                              cwd=main / "target/debug", stdin=subprocess.PIPE, env=self.environment) as child:
+            self.register_process(child.pid)
+            result = self.command(self.root, self.migration_command("--repo", "origin"))
+            _ = child.communicate(b"")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"keep {main}: target in use (pids {child.pid})", result.stdout)
+        self.assertNotIn(f"main output {main} ->", result.stdout)
+        self.assertEqual((main / "target/debug/artifact").read_text(), "warm")
+        self.assertFalse((main / "target").is_symlink())
+
+    def test_migration_keeps_a_main_checkout_with_a_held_cargo_lock(self) -> None:
+        self.layout_fixture()
+        main, lock = self.real_main_target()
+        with lock.open("rb") as descriptor:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for flags in (["--dry-run"], []):
+                with self.subTest(flags=flags):
+                    result = self.command(self.root, [*self.migration_command("--all"), *flags])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(f"keep {main}: kept: {lock} held", result.stdout)
+                    self.assertNotIn(f"main output {main} ->", result.stdout)
+        self.assertEqual((main / "target/debug/artifact").read_text(), "warm")
+        self.assertFalse((main / "target").is_symlink())
+
+    def test_migration_moves_a_free_main_target_into_the_main_output(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        result = self.command(self.root, self.migration_command("--repo", "origin"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = self.root / "build/origin/main"
+        self.assertIn(f"main output {main} -> {output}", result.stdout)
+        self.assertEqual((main / "target").readlink(), output)
+        self.assertEqual((output / "debug/artifact").read_text(), "warm")
+        with (output / "debug/.cargo-lock").open("rb") as descriptor:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_migration_asks_for_a_rerun_when_a_new_main_target_appears_after_the_move(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        target = main / "target"
+        output = self.root / "build/origin/main"
+        rename = os.rename
+
+        def rename_then_build(source: str | os.PathLike[str], destination: str | os.PathLike[str], *,
+                              src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+            rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            if Path(source) == target:
+                target.mkdir()
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(os, "rename", rename_then_build),
+              redirect_stdout(output_text := StringIO())):
+            status = worktrees.migrate_worktrees(None, scope=worktrees.MigrationScope.REPOSITORY,
+                                                 repo="origin", dry_run=False)
+        self.assertEqual(status, 0, output_text.getvalue())
+        self.assertIn(f"keep {main}: rerun: a new {target} appeared after the move; the earlier target is in {output}",
+                      output_text.getvalue())
+        self.assertNotIn(f"main output {main} ->", output_text.getvalue())
+        self.assertEqual((output / "debug/artifact").read_text(), "warm")
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_migration_links_the_real_target_of_an_already_moved_worktree(self) -> None:
+        self.layout_fixture()
+        new, output, lock = self.moved_worktree_with_real_target()
+        command = self.migration_command("--repo", "origin")
+        with lock.open("rb") as descriptor:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = self.command(self.root, command)
+        self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
+        self.assertIn(f"keep {new}: kept: {lock} held", held.stdout)
+        self.assertFalse((new / "target").is_symlink())
+        result = self.command(self.root, command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"output {new} -> {output}", result.stdout)
+        self.assertEqual((new / "target").readlink(), output)
+        self.assertEqual((output / "debug/artifact").read_text(), "warm")
+
+    def test_migration_all_links_the_real_target_of_an_already_moved_worktree(self) -> None:
+        self.layout_fixture()
+        new, output, _lock = self.moved_worktree_with_real_target()
+        result = self.command(self.root, self.migration_command("--all"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"output {new} -> {output}", result.stdout)
+        self.assertEqual((new / "target").readlink(), output)
+        self.assertEqual((output / "debug/artifact").read_text(), "warm")
+
+    def test_migration_keeps_a_checkout_whose_new_target_appears_after_the_save_and_goes_on(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        other = self.other_main()
+        _ = self.real_target(other)
+        output = self.root / "build/origin/main"
+        output.mkdir(parents=True)
+        _ = (output / "earlier").write_text("kept")
+        target = main / "target"
+        rename = os.rename
+
+        def rename_then_build(source: str | os.PathLike[str], destination: str | os.PathLike[str], *,
+                              src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+            rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            if Path(source) == target:
+                target.mkdir()
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(os, "rename", rename_then_build),
+              redirect_stdout(text := StringIO()), redirect_stderr(StringIO())):
+            status = worktrees.migrate_worktrees(None, scope=ALL_WORKTREES, dry_run=False)
+        self.assertEqual(status, 0, text.getvalue())
+        saved, = (self.home / "rust").glob(".saved-target-*/target")
+        self.assertIn(f"keep {main}: rerun: a new {target} appeared after the move; the earlier target is in {saved}",
+                      text.getvalue())
+        self.assertEqual((saved / "debug/artifact").read_text(), "warm")
+        self.assertEqual((output / "earlier").read_text(), "kept")
+        self.assertFalse(target.is_symlink())
+        self.assertIn(f"main output {other} -> {self.root}/build/other/main", text.getvalue())
+        self.assertEqual((other / "target").readlink(), self.root / "build/other/main")
+        self.assertEqual((self.root / "build/other/main/debug/artifact").read_text(), "warm")
+
+    def test_migration_keeps_a_checkout_whose_build_folder_lock_is_held_and_goes_on(self) -> None:
+        self.layout_fixture()
+        main, _lock = self.real_main_target()
+        other = self.other_main()
+        _ = self.real_target(other)
+        output = self.root / "build/origin/main"
+        output.parent.mkdir(parents=True)
+        with output.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.command(self.root, self.migration_command("--all"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"keep {main}: kept: {output}: the build folder lock is held. Rerun when idle", result.stdout)
+        self.assertEqual((main / "target/debug/artifact").read_text(), "warm")
+        self.assertFalse((main / "target").is_symlink())
+        self.assertIn(f"main output {other} -> {self.root}/build/other/main", result.stdout)
+        self.assertEqual((other / "target").readlink(), self.root / "build/other/main")
+
+    def test_run_ssh_closes_the_input_and_waits_for_ssh_on_a_stop(self) -> None:
+        marker = self.root / "ended"
+        child = "import pathlib, sys; sys.stdin.buffer.read(); pathlib.Path(sys.argv[1]).write_text('ended')"
+        wait = cast(Callable[[subprocess.Popen[bytes], float | None], int], getattr(subprocess.Popen, "wait"))
+        calls: list[float | None] = []
+
+        def stopped_once(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return wait(process, timeout)
+
+        with patch.object(subprocess.Popen, "wait", stopped_once), self.assertRaises(KeyboardInterrupt):
+            _ = worktrees._run_ssh((sys.executable, "-c", child, str(marker)))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(marker.read_text(), "ended")
+
+    def test_mac_run_stops_when_its_input_ends(self) -> None:
+        code = ("import threading\nfrom scripts.worktree import worktrees\n"
+                + "worktrees._interrupt_when_input_ends()\nthreading.Event().wait()\n")
+        result = subprocess.run([sys.executable, "-c", code], cwd=CHECKOUT, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, check=False, timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("KeyboardInterrupt", result.stderr)
 
     def test_migration_refuses_rows_for_numbered_hana_copies(self) -> None:
         self.layout_fixture()
