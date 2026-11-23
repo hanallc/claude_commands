@@ -17,7 +17,7 @@ class OffloadCommandTests(SeededCleanupFixture):
             ["git", "-C", str(self.repository), "remote", "add", "origin", "https://example.invalid/repos/hana.git"],
             check=True, capture_output=True,
         )
-        _ = self.write_kept_claim()
+        _ = self.write_kept_claim(legacy=True)
         legacy = self.state_directory / "run.json"
         _ = self.claim_file.rename(legacy)
 
@@ -30,7 +30,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(cleanup["args"][-2], "previous-mac")
 
     def test_cleanup_keeps_legacy_claim_with_relative_worktree(self) -> None:
-        record = self.write_kept_claim()
+        record = self.write_kept_claim(legacy=True)
         legacy = self.state_directory / "run.json"
         self.claim_file.unlink()
         _ = legacy.write_text(json.dumps({**record, "worktree": "."}))
