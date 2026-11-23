@@ -24,6 +24,7 @@ from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
@@ -372,6 +373,18 @@ class MergeGateCheckpointTests(MergeGateFixture):
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
+        self.assert_not_pushed()
+
+    def test_a_mac_linux_guest_that_took_no_run_undoes_the_merge_with_one_line(self) -> None:
+        cause = "the guest did not arm the run: fixture SSH refused the connection"
+        with mock.patch.object(gate, "run_gate_suites",
+                               side_effect=gate.MacLinuxTookNoRun(f"Mac Linux guest took no run: {cause}")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1:],
+                         [f"Mac Linux guest took no run: {cause}; merge undone, not pushed"])
+        self.assertNotIn("REFUSED", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
     def test_merge_checkout_behind_origin_is_refused(self) -> None:

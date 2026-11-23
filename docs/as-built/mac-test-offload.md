@@ -87,7 +87,7 @@ The Mac Linux route runs the suite in a numbered copy.
 The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
 Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
 The reply descriptor is a copy of the stream standard output.
-The runner starts the sandbox, and `dbus-run-session` if the guest has it, with standard output on standard error.
+The runner starts the sandbox, and `dbus-run-session` if the guest has it, for the gate run with standard output on standard error.
 Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.

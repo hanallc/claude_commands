@@ -33,6 +33,11 @@ class GuestFailed(MachineFailed):
         super().__init__(text, MAC_LINUX_NO_ANSWER)
 
 
+def took_no_run(cause: str) -> GuestFailed:
+    """The failure of a guest that took no run, as "mac-linux: <cause>"."""
+    return GuestFailed(f"{MACHINE}: {cause}")
+
+
 def linked_path(path: Path, repo: Path) -> bool:
     """A path in the checkout with .. or a symbolic link in it, from the checkout down."""
     relative = path.relative_to(repo)
@@ -49,9 +54,9 @@ def run_owner(repo: Path) -> str:
         mac_linux.check_repository(repo)
         unit = step_identity(HAND_MADE.step, str(repo)).unit
     except mac_linux.route_errors() as error:
-        raise GuestFailed(f"{MACHINE}: {error}") from error
+        raise took_no_run(str(error)) from error
     if not unit:
-        raise GuestFailed(f"{MACHINE}: the run has no owner unit for a numbered copy")
+        raise took_no_run("the run has no owner unit for a numbered copy")
     return unit
 
 
@@ -93,9 +98,9 @@ def run_settings() -> mac_linux.GuestSettings:
     try:
         settings = mac_linux.new_run_settings()
     except mac_linux.route_errors() as error:
-        raise GuestFailed(f"{MACHINE}: {error}") from error
+        raise took_no_run(str(error)) from error
     if isinstance(settings, mac_linux.GuestNotStarted):
-        raise GuestFailed(f"{MACHINE}: {settings.reason}")
+        raise took_no_run(settings.reason)
     if isinstance(settings, str):
         raise GuestFailed(settings)
     return settings
@@ -110,7 +115,7 @@ def mac_claim(repo: Path) -> Generator[None]:
         try:
             stack.enter_context(mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE))
         except MacRunRefused as error:
-            raise GuestFailed(f"not started: {error}") from error
+            raise took_no_run(str(error)) from error
         yield
 
 

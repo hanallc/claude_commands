@@ -1445,27 +1445,36 @@ def run_guest(request_path: Path) -> int:
             reply = os.dup(1)
             try:
                 # The -c entry selects the numbered copy as the Python checkout.
-                return run_sandboxed(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
-                                                             request_path, reply),
-                                     copy.path, environment, reply=reply)
+                return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
+                                                                  request_path, reply),
+                                          copy.path, environment, reply)
             finally:
                 os.close(reply)
 
 
-def run_sandboxed(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str], *,
-                  reply: int | None = None) -> int:
-    """Run the command in the sandbox, under dbus-run-session if the guest has it.
+def run_sandboxed(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str]) -> int:
+    """Run the argv command in the sandbox, with its standard output on the stream standard output."""
+    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
+                          check=False, pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
-    With a reply descriptor, the standard output of the run goes to standard error, so only the gate writes
-    to the stream standard output, through the reply descriptor. Output of dbus-run-session or of a service
-    that it starts cannot come before the reply.
+
+def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],
+                       reply: int) -> int:
+    """Run the gate in the sandbox, with its standard output on standard error.
+
+    Only the gate writes to the stream standard output, through the reply descriptor. Output of
+    dbus-run-session or of a service that it starts cannot come before the reply.
     """
+    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=sys.stderr.fileno(), check=False,
+                          pass_fds=(*build_folders.held_build_folder_descriptors(), reply)).returncode
+
+
+def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
+    """The sandbox command, under dbus-run-session if the guest has it."""
     if shutil.which('dbus-run-session'):
         command = ['dbus-run-session', '--', *command]
-    held = build_folders.held_build_folder_descriptors()
-    return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy, env=environment,
-                          stdin=subprocess.DEVNULL, stdout=None if reply is None else sys.stderr.fileno(),
-                          check=False, pass_fds=held if reply is None else (*held, reply)).returncode
+    return sandboxed_suite_command(tmp, command)
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
@@ -1485,8 +1494,10 @@ def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
 def run_copy(request_path: Path, reply: int) -> None:
     """Run the candidate's gate and write one JSON result to the reply descriptor.
 
-    run_guest points standard output at standard error, so only the reply descriptor reaches the stream.
+    run_sandboxed_gate points standard output at standard error, so only the reply descriptor reaches the stream
+    standard output.
     """
+    os.set_inheritable(reply, False)
     from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.production import gate
