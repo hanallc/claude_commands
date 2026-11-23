@@ -17,17 +17,17 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout, suppress
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextvars import ContextVar, copy_context
-from threading import Event
+from threading import Event, Lock
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast, override
 from importlib import import_module
 from uuid import uuid4
 
@@ -306,6 +306,10 @@ class FollowUp:
     operator: bool = False
     director_check: bool = False
 
+    def line(self) -> str:
+        reason = " ".join(self.reason.split()).rstrip(".")
+        return f"{self.name}: {reason}. {self.step}".rstrip()
+
 
 class FollowUpFields(TypedDict):
     name: str
@@ -347,12 +351,16 @@ class BulkReport:
     stop_plan_recorded: bool = False
     stop_signal: signal.Signals | None = None
     not_started: dict[str, str] = field(default_factory=dict)
+    reboot: bool = False
+    on_finish: Callable[[str, int, int], None] | None = None
+    _progress_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     def track(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
         owner = record.parent_of(row) if row.kind == "worker" else row
-        self.targets[row.id] = f"{owner.name} / {row.name}" if row.kind == "worker" and owner is not None else row.name
-        if owner is not None and owner.kind in ("unit", "showrunner"):
-            self.units[row.id] = owner.name
+        with self._progress_lock:
+            self.targets[row.id] = f"{owner.name} / {row.name}" if row.kind == "worker" and owner is not None else row.name
+            if owner is not None and owner.kind in ("unit", "showrunner"):
+                self.units[row.id] = owner.name
 
     def failure(self, key: str, name: str, reason: str) -> None:
         self.issues[key] = FollowUp(self.targets.get(key, name), reason, f"Nate runs {self.retry} again.", operator=True)
@@ -387,8 +395,12 @@ class BulkReport:
         return f"Nate {repair}. Then Nate runs {self.retry} again."
 
     def finish(self, key: str) -> None:
-        self.completed.add(key)
-        _ = self.issues.pop(key, None)
+        with self._progress_lock:
+            first = key not in self.completed
+            self.completed.add(key)
+            _ = self.issues.pop(key, None)
+            if first and self.on_finish is not None:
+                self.on_finish(self.targets[key], len(self.completed), len(self.targets))
 
     def mark_not_started(self, keys: Iterable[str], retry: str) -> None:
         step = _plain_terminal_step(retry)
@@ -415,12 +427,10 @@ class BulkReport:
         self.issues.update({key: FollowUp(**issue) for key, issue in data["issues"].items()})
         self.inherited.update(self.issues)
 
-    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> list[str]:
+    def follow_ups(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> dict[str, FollowUp]:
         status = "stopped" if self.command == "agents stop --all" else "back"
         targets = self.targets.keys() if self.fixed_targets is None else self.fixed_targets
         completed = targets & self.completed
-        suffix = " (dry run)" if dry_run else ""
-        lines = [f"{self.command}: {len(completed)} of {len(targets)} sessions {status}{suffix}.", *self.preview]
         issues = dict(self.issues)
         for key in self.not_started.keys() - completed:
             earlier = issues.get(key)
@@ -444,9 +454,16 @@ class BulkReport:
                     reason = f"{reason}. {cause.reason}"
                 step = cause.step if cause is not None else f"Nate runs {self.retry} again."
                 issues[key] = FollowUp(self.targets[key], reason, step, operator=True)
-        for item in sorted(issues.values(), key=lambda issue: (issue.name, issue.reason)):
-            reason = " ".join(item.reason.split()).rstrip(".")
-            lines.append(f"{item.name}: {reason}. {item.step}".rstrip())
+        return issues
+
+    def lines(self, *, dry_run: bool = False, failure: FollowUp | None = None) -> list[str]:
+        status = "stopped" if self.command == "agents stop --all" else "back"
+        targets = self.targets.keys() if self.fixed_targets is None else self.fixed_targets
+        suffix = " (dry run)" if dry_run else ""
+        lines = [f"{self.command}: {len(targets & self.completed)} of {len(targets)} sessions {status}{suffix}.", *self.preview]
+        issues = self.follow_ups(dry_run=dry_run, failure=failure)
+        lines.extend(item.line() for item in sorted(issues.values(), key=lambda issue: (issue.name, issue.reason)))
+        received = self.stop_signal
         actions: list[str] = []
         units = {item.unit or self.units.get(key, "") for key, item in issues.items() if item.operator or item.unit} - {""}
         if units:
@@ -478,6 +495,15 @@ class BulkReport:
 
 _BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
 _DETACHED_CHILD: ContextVar[bool] = ContextVar("_DETACHED_CHILD", default=False)
+
+
+@contextmanager
+def use_report(report: BulkReport) -> Generator[None]:
+    token = _BULK_REPORT.set(report)
+    try:
+        yield
+    finally:
+        _BULK_REPORT.reset(token)
 
 
 def _create_log(files: ExitStack, path: Path) -> io.FileIO:
@@ -527,9 +553,11 @@ _Result = TypeVar("_Result")
 def _collect_restart_results(jobs: Mapping[staff.StaffId, Callable[[], _Result]],
                              record: Callable[[staff.StaffId, Future[_Result]], None]) -> None:
     with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as pool:
-        futures = {identity: pool.submit(copy_context().run, job) for identity, job in jobs.items()}
-        for identity, future in futures.items():
-            record(identity, future)
+        futures = {pool.submit(copy_context().run, job): identity for identity, job in jobs.items()}
+        report = _BULK_REPORT.get()
+        ready = as_completed(futures) if report is not None and report.reboot else iter(futures)
+        for future in ready:
+            record(futures[future], future)
 
 
 def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
@@ -581,10 +609,9 @@ def run_command(action: Callable[[], int], command: BulkCommand) -> int:
             report.log_error = error
             print(f"Could not write the log at {path}. {_error_reason(error)}", flush=True)
 
-        token = _BULK_REPORT.set(report)
         output = io.StringIO()
         try:
-            with redirect_stdout(output), redirect_stderr(output):
+            with use_report(report), redirect_stdout(output), redirect_stderr(output):
                 code = action()
         except UnknownAccountName as error:
             report.issues[""] = FollowUp(report.command, _error_reason(error), "Nate selects an available account.", operator=True)
@@ -593,8 +620,6 @@ def run_command(action: Callable[[], int], command: BulkCommand) -> int:
                 subprocess.SubprocessError) as error:
             report.failure("", report.command, _error_reason(error))
             code = 2
-        finally:
-            _BULK_REPORT.reset(token)
         log = report.log_stream
         if report.writer is LogWriter.CHILD:
             print(f"  {_background_status(report.command)}", flush=True)
@@ -939,6 +964,7 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
 class PaneConversations:
     codex: herdr.CodexConversations
     names: dict[str, str]
+    live_panes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -947,6 +973,7 @@ class RestartObservations:
     runs: dict[str, list[str]]
     pane_owners: frozenset[staff.StaffId]
     pane_names: dict[str, str]
+    live_panes: frozenset[str] = frozenset()
 
 
 def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartObservations:
@@ -954,7 +981,7 @@ def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartOb
                        and record.find(kind="worker", parent=row.id))
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
     panes = _codex_conversations(client)
-    return RestartObservations(panes.codex, runs, owners, panes.names)
+    return RestartObservations(panes.codex, runs, owners, panes.names, panes.live_panes)
 
 
 def leaves_record(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -965,6 +992,25 @@ def leaves_record(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
     skip = worker.not_restored(row, record, runs=runs)
     return None if skip is None else skip.reason
+
+
+class RestoredWorkers(set[staff.StaffId]):
+    """Report each worker when restore records its result."""
+
+    def __init__(self, report: BulkReport, record: staff.StaffSnapshot) -> None:
+        super().__init__()
+        self.report: BulkReport = report
+        self.record: staff.StaffSnapshot = record
+
+    @override
+    def add(self, element: staff.StaffId, /) -> None:
+        if element in self:
+            return
+        super().add(element)
+        row = self.record.rows_by_id.get(element)
+        if row is not None:
+            self.report.track(row, self.record)
+            self.report.finish(element)
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -991,7 +1037,9 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
             return ""
     else:
         return ""
-    report = worker.RestoreReport()
+    bulk = _BULK_REPORT.get()
+    report = (worker.RestoreReport(restored=RestoredWorkers(bulk, record))
+              if bulk is not None and bulk.reboot else worker.RestoreReport())
     try:
         with defer_worker_anomalies():
             result = worker.restore(parent.id, record=record, only=only, started_panes=started_panes,
@@ -1375,10 +1423,19 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
     """Read panes once for native Codex identities and report names."""
     live: dict[str, tuple[int, ...]] = {}
     names: dict[str, str] = {}
+    live_panes: set[str] = set()
     resolved_tabs: set[str] = set()
+    report = _BULK_REPORT.get()
+    checking_reboot = report if report is not None and report.reboot and report.command == "agents stop --all" else None
     try:
         panes = client.listed("pane")
-    except (OSError, ValueError, herdr_types.HerdrFailure):
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        if checking_reboot is not None:
+            stopped = False
+            with suppress(OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+                stopped = "status: stopped" in client.run("status", "server").splitlines()
+            if not stopped:
+                _discovery_anomaly(f"Could not check the Herdr panes. {_error_reason(error)}")
         return PaneConversations(herdr.codex_conversations(), names)
     try:
         tabs = {herdr.json_text(tab.get("tab_id"), "tab id"):
@@ -1386,11 +1443,23 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
     except (OSError, ValueError, herdr_types.HerdrFailure):
         tabs = {}
     for pane in panes:
+        display = "Herdr pane"
         try:
             pane_id = herdr.json_text(pane.get("pane_id"), "pane id")
+            display = f"Herdr pane {pane_id}"
             tab_name = tabs.get(str(pane.get("tab_id", "")), "")
             label = herdr.json_text(pane.get("label") or "", "pane label")
             display = f"{tab_name} {label} ({pane_id})".strip()
+            if checking_reboot is not None:
+                info = client.result("pane", "process-info", "--pane", pane_id).get("process_info")
+                owner = herdr.foreground_pane_conversation(info, pane)
+                if isinstance(owner, pane_launch.ProvedPaneConversation):
+                    names[owner.identity] = display
+                    live_panes.add(owner.identity)
+                    if owner.kind == "codex":
+                        live[owner.identity] = ()
+                        resolved_tabs.add(f"{tab_name} (Codex thread unknown)")
+                continue
             if identity := herdr.pane_session(pane):
                 names[identity] = display
             if pane.get("agent") != "codex":
@@ -1401,11 +1470,15 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
             live[identity] = ()
             names[identity] = display
             resolved_tabs.add(f"{tab_name} (Codex thread unknown)")
-        except (OSError, ValueError, herdr_types.HerdrFailure):
-            continue
+        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+            if checking_reboot is not None:
+                checking_reboot.issues[display] = FollowUp(display,
+                    f"Could not identify the session in this pane. {_error_reason(error)}",
+                    "Nate checks which session uses this pane and runs agents reboot again.", operator=True)
     observed = herdr.codex_conversations()
     return PaneConversations(herdr.CodexConversations(
-        {**live, **observed.live}, tuple(reason for reason in observed.unknown if reason not in resolved_tabs)), names)
+        {**live, **observed.live}, tuple(reason for reason in observed.unknown if reason not in resolved_tabs)),
+        names, frozenset(live_panes))
 
 
 @herdr.observation_snapshot()
@@ -1420,6 +1493,9 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     observed = _observations(record, client) if observed is None else observed
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     codex = observed.codex
+    report = _BULK_REPORT.get()
+    reboot = report is not None and report.reboot
+    candidates: dict[str, str] = {}
     rows = [row for row in record.rows if not isinstance(selection, SelectedRestartRows) or row.id in selection.ids]
     with ExitStack() as selection_scope:
         if isinstance(selection, AllRestartRows):
@@ -1438,17 +1514,20 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             _ = selection_scope.enter_context(session_records.use_registry_for_liveness(registry))
             candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
                 (f" in {folder}" if (folder := session.get("cwd")) else "") for session in running.records}
-            for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
+            threads = (codex.live.keys() if reboot else
+                       herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex))
+            for identity in threads:
                 _ = candidates.setdefault(identity, identity)
-            owned = {row.current_session for row in record.rows}
-            for identity in sorted(candidates.keys() - owned):
-                if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-                    name = " ".join(observed.pane_names.get(identity, candidates[identity]).splitlines())
-                    if (report := _BULK_REPORT.get()) is not None:
-                        report.issues[f"unassigned:{identity}"] = FollowUp(name, "The live session has no staff row",
-                            "Nate checks who owns this session.", operator=True)
-                    else:
-                        print(f"{name}: restart anomaly: unassigned live session", file=sys.stderr)
+            if not reboot:
+                owned = {row.current_session for row in record.rows}
+                for identity in sorted(candidates.keys() - owned):
+                    if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
+                        name = " ".join(observed.pane_names.get(identity, candidates[identity]).splitlines())
+                        if report is not None:
+                            report.issues[f"unassigned:{identity}"] = FollowUp(name, "The live session has no staff row",
+                                "Nate checks who owns this session.", operator=True)
+                        else:
+                            print(f"{name}: restart anomaly: unassigned live session", file=sys.stderr)
             owners = [row for row in record.rows if row.id in observed.pane_owners]
             observations = worker_panes.observe_parents(owners, record) if owners else {}
         else:
@@ -1467,7 +1546,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
         complete = isinstance(reading, CompleteLiveRows) and not any(
             isinstance(state, (UncertainWorker, ProcessUnknownWorker))
             for state in workers.values())
-        if (report := _BULK_REPORT.get()) is not None:
+        if report is not None:
             for state in workers.values():
                 if isinstance(state, (UncertainWorker, ProcessUnknownWorker)) and state.row.id not in report.issues:
                     report.track(state.row, record)
@@ -1477,11 +1556,27 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             selected.extend(active_workers)
         positions = {row.id: index for index, row in enumerate(record.rows)}
         selected.sort(key=lambda row: positions[row.id])
-    if save_tabs:
+    if report is not None and reboot:
+        identified = {row.current_session for row in selected}
+        for identity in sorted((observed.live_panes | candidates.keys()) - identified):
+            name = observed.pane_names.get(identity, candidates.get(identity, identity))
+            report.issues[f"unassigned:{identity}"] = FollowUp(name,
+                "Could not match the live session to a staff row that reboot can save",
+                "Nate checks the staff row for this session and runs agents reboot again.", operator=True)
+        if not report.issues:
+            for reason in dict.fromkeys(codex.unknown):
+                report.issues[reason] = FollowUp("Codex", reason,
+                    "Nate checks the session identity and runs agents reboot again.", operator=True)
+    if save_tabs and (selected or not reboot):
         try:
-            client.save_layout()
+            if reboot:
+                client.record_layout()
+            else:
+                client.save_layout()
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+            if reboot:
+                _discovery_anomaly(f"Could not save the Herdr layout. {_error_reason(error)}")
         for row, pane in row_panes(selected, client):
             try:
                 client.remember_row_tab(str(row.id), pane)
@@ -1781,6 +1876,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     if report is not None:
         for row in selected:
             report.track(row, record)
+        if report.reboot and stop_all and (isinstance(reading, PartialLiveRows) or report.issues):
+            return 1
         if report.fixed_targets is not None:
             missing = report.fixed_targets.difference(row.id for row in selected) - report.issues.keys()
             for key in missing:
@@ -1815,12 +1912,16 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             step_command = resume_retry([member]) if resuming else retry
             _report_record_busy(member, record.rows_by_id[staff.StaffId(member)].name, error, step_command)
 
-    # The record saves only members that a restart starts; the stop still reaches every member.
-    leaving = {str(row.id) for row in selected if stop_all and leaves_record(row, record, runs=observed.runs) is not None}
+    # Reboot saves every selected row before it can stop the server.
+    leaving = {str(row.id) for row in selected if stop_all and not (report is not None and report.reboot)
+               and leaves_record(row, record, runs=observed.runs) is not None}
     saved_by_holder = {holder: [member for member in members if member not in leaving]
                        for holder, members in members_by_holder.items()}
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
+        if report is not None and report.reboot:
+            _discovery_anomaly("The stop includes the session that runs this reboot")
+            return 1
         return _detach_stop(command, selected, record)
     lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (
@@ -1851,8 +1952,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
     if report is not None and _DETACHED_CHILD.get() and stop_all:
         _record_stop_plan(report, (row for row in selected if row.id not in refused_workers))
+    saved_before: set[str] = set()
     if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
-        prune_live_rows(reading, command=replace(command, verb="held-sessions", all_rows=False))
+        if report is not None and report.reboot:
+            saved_before = set(shutdown_record.read())
+        else:
+            prune_live_rows(reading, command=replace(command, verb="held-sessions", all_rows=False))
 
     pre_stop_codex = observed.codex
     keep_running = (frozenset(row.id for row in record.rows if row.kind == "worker" and row.id not in worker_policies)
@@ -1910,7 +2015,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                             previous_hold = current.paused
                     except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound) as error:
                         _anomaly(holder, f"Could not save the exit hold. {_error_reason(error)}")
-                        shutdown_record.remove_started([str(holder.id)])
+                        if holder.id not in saved_before:
+                            shutdown_record.remove_started([str(holder.id)])
                         return False, ()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
@@ -1929,7 +2035,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 if not stopped and holder.kind != "worker":
                     if previous_hold is not None:
                         _ = staff.set_hold(str(holder.id), previous_hold)
-                    shutdown_record.remove_started([str(holder.id)])
+                    if holder.id not in saved_before:
+                        shutdown_record.remove_started([str(holder.id)])
                 return stopped, workers
         finally:
             recorded.set()
@@ -2015,7 +2122,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         {identity: pids for identity, pids in observed.codex.live.items() if identity not in selected_sessions},
         observed.codex.unknown))
     present = False
-    if holders:
+    if holders or (report is not None and report.reboot and not stop_all):
         try:
             server = herdr.restore_server(client.session, int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000),
                                      session_kind=herdr.security_session())
@@ -2045,14 +2152,14 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
                 replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
 
-    def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
-        if (started_holder and holder.kind == "producer"
+    def remove_started(holder: staff.StaffRow) -> None:
+        if (holder.kind == "producer"
                 and (isinstance(holder.exited, staff.Exited) or isinstance(holder.paused, staff.Paused))):
             _ = staff.resume(str(holder.id))
         resolved = resume_checks.worker_restores.resolved(holder.id)
         done = [member for member in members_by_holder[holder.id]
                 if (member_id := staff.StaffId(member)) not in blocked_workers
-                and (member_id in resolved or (started_holder and record.rows_by_id[member_id].kind != "worker"))]
+                and (member_id in resolved or record.rows_by_id[member_id].kind != "worker")]
         if done:
             try:
                 shutdown_record.remove_started(done)
@@ -2103,9 +2210,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     isinstance(current.paused, staff.Paused) or isinstance(current.exited, staff.Exited)):
                 if report is not None:
                     hold = "exited" if isinstance(current.exited, staff.Exited) else "paused"
+                    step = "The director resumes the session when ready." if report.reboot else "The session stays stopped."
                     for member in members_by_holder[holder.id]:
-                        report.issues[member] = FollowUp(report.targets[member], f"{current.name} is {hold}",
-                            "The session stays stopped.")
+                        report.issues[member] = FollowUp(report.targets[member], f"{current.name} is {hold}", step)
                 print(f"{current.name}: {'exited' if isinstance(current.exited, staff.Exited) else 'paused'}")
                 return RestartDisposition.HELD
             if holder.id in unconfirmed:
@@ -2120,10 +2227,10 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                             _ = _restore_workers(current, current_record, observed=observed,
                                                  reports=resume_checks.worker_restores)
                     except WorkerRestoreIncomplete:
-                        remove_started(holder, started_holder=False)
+                        remove_started(holder)
                         raise
                     print(f"{current.name}: unchanged")
-                    remove_started(current, started_holder=True)
+                    remove_started(current)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
@@ -2141,9 +2248,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                       target_account="" if isinstance(account, AllRestartAccounts) else account,
                                       worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
             except WorkerRestoreIncomplete:
-                remove_started(holder, started_holder=False)
+                remove_started(holder)
                 raise
-            remove_started(current, started_holder=True)
+            remove_started(current)
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     restarted: set[Path] = set()

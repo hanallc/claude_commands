@@ -1,6 +1,7 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.agents import remote
@@ -607,9 +608,8 @@ class RestartFixtureTests(RestartTestCase):
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "result", return_value={"panes": [{
             "pane_id": "w9:p9", "workspace_id": "w9", "session_id": "host-session", "label": "host"}]}))
-        fixture = SessionLaunchTests("test_restart_reads_a_claude_transcript_without_a_pane_launch_record")
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, SessionLaunchTests(
+            "test_restart_reads_a_claude_transcript_without_a_pane_launch_record"))
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), herdr.Herdr("agents")).rows, [])
         self.assertEqual(errors.getvalue(), "")
@@ -1125,8 +1125,7 @@ class WorkerRestartTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.case.setUp()
-        self.addCleanup(self.case.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.case)
         world = self.case.fixture.world
         world.locations["w1:p0"]["agent_session"] = {"value": self.case.fixture.parent.current_session}
 
@@ -1560,7 +1559,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "restart anomaly: efficiency-unit: worker macdata-bytes not restored: pane identity is unavailable; "
             + "run worker.py restore in efficiency-unit"])
-        self.assertEqual(shutdown_record.read(), [str(owner.id), str(bad.id)])
+        self.assertEqual(shutdown_record.read(), [str(bad.id)])
 
     def test_bulk_command_output_with_twenty_units_and_506_finished_dispatches(self) -> None:
         history_sizes = (1, 2, 3, 3, 4, 5, 5, 5, 6, 8, 12, 18, 20, 29, 46, 54, 63, 65, 68, 89)
@@ -2496,6 +2495,44 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         messages.assert_called_once_with(child)
         close.assert_not_called()
 
+    def test_reboot_reports_the_first_worker_before_the_second_worker_restores(self) -> None:
+        from scripts.agents import reboot
+
+        owner = self.rows[0]
+        first, second = (replace(row, kind="worker", name=name, unit_type=staff.NotUnit(),
+                                parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+                         for row, name in zip(self.rows[1:], ("first", "second"), strict=True))
+        record = staff.StaffSnapshot((owner, first, second))
+        run = self.root / "idle-worker"
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
+        states: list[worker_panes.WorkerPane] = [
+            worker_panes.OpenWorker(first, "w1:p1", "terminal-1", herdr.AgentStatus.IDLE),
+            worker_panes.OpenWorker(second, "w1:p2", "terminal-2", herdr.AgentStatus.IDLE),
+        ]
+        shutdown_record.save([owner.id, first.id, second.id])
+        reboot.Checkpoint(reboot.Step.START).save(self.root / "agents/reboot/reboot.json")
+        output = io.StringIO()
+
+        def messages(row: staff.StaffRow) -> list[str]:
+            if row.id == second.id:
+                self.assertIn(f"2 of 3 back - {owner.name} / {first.name}", output.getvalue())
+                self.assertNotIn(f"back - {owner.name} / {second.name}", output.getvalue())
+            return ["user:\nOne moment."]
+
+        with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
+              patch.object(worker_panes, "worker_run", return_value=run),
+              patch.object(worker_panes, "_transcript_messages", side_effect=messages) as transcripts,
+              patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root), "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(output)):
+            self.assertEqual(shutdown.main(["reboot"]), 0)
+        self.assertEqual(transcripts.call_args_list, [call(first), call(second)])
+        progress = [line for line in output.getvalue().splitlines() if "back -" in line]
+        self.assertEqual(len(progress), 3)
+        self.assertIn(f"3 of 3 back - {owner.name} / {second.name}", progress[2])
+        self.assertEqual(shutdown_record.read(), [])
+
     def test_restart_sends_an_unsubmitted_dispatch_even_when_the_worker_is_working(self) -> None:
         owner = self.rows[0]
         child = replace(self.rows[1], kind="worker", name="impl", unit_type=staff.NotUnit(),
@@ -2936,9 +2973,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             with self.subTest(unselected_evidence_incomplete=incomplete), ExitStack() as scope:
                 unselected: list[staff.StaffRow] = []
                 if incomplete:
-                    fixture = WorkerPaneTests("runTest")
-                    fixture.setUp()
-                    _ = scope.callback(fixture.doCleanups)
+                    fixture = set_up_fixture(scope.callback, WorkerPaneTests("runTest"))
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
                     _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
@@ -3630,9 +3665,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         from scripts.herdr.test_worker_panes import WorkerPaneTests
         from dataclasses import replace
 
-        case = WorkerPaneTests("runTest")
-        case.setUp()
-        self.addCleanup(case.doCleanups)
+        case = set_up_fixture(self.addCleanup, WorkerPaneTests("runTest"))
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
@@ -4880,6 +4913,96 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("producers", row.name))])
         self.assertEqual(shutdown_record.read(), [])
 
+    def test_reboot_refuses_a_live_codex_pane_with_an_unknown_thread(self) -> None:
+        from scripts.agents import reboot
+
+        pane = {"pane_id": "w1:p9", "tab_id": "w1:t9", "label": "scratch", "agent": "codex"}
+        planned = reboot.MoveResult("session_move: would move 0 folders (0.00 GiB), kept 0 live, refused 0 other", 0, ())
+
+        def results(*arguments: str) -> dict[str, object]:
+            if arguments == ("pane", "list"):
+                return {"panes": [*self.panes(), pane]}
+            if arguments == ("pane", "process-info", "--pane", "w1:p9"):
+                return {"process_info": {"foreground_processes": [{"pid": 990109, "argv": ["codex"]}]}}
+            return self.layout_result(*arguments)
+
+        def native(pid: int, _kind: str, _reported: str = "") -> herdr.NativeAgentProcess:
+            if pid == 990109:
+                raise herdr_types.HerdrFailure("Codex thread is unknown")
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(
+                str(self.rows[pid - 990100].current_session)), "fixture-start", {})
+
+        with (patch.object(herdr.Herdr, "result", side_effect=results),
+              patch.object(herdr.Herdr, "record_layout"),
+              patch.object(herdr, "native_process", side_effect=native),
+              patch.object(reboot, "stop_server") as server,
+              patch.object(reboot, "move_folders", return_value=planned),
+              patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root), "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["reboot"]), 1)
+            reboot.Checkpoint(reboot.Step.SERVER).save(self.root / "agents/reboot/reboot.json")
+            self.assertEqual(shutdown.main(["reboot"]), 1)
+        issue = ("scratch (w1:p9): Could not identify the session in this pane. Codex thread is unknown. "
+                 + "Nate checks which session uses this pane and runs agents reboot again.")
+        self.assertEqual(output.getvalue().splitlines().count(issue), 2)
+        server.assert_not_called()
+        self.assertEqual(self.stops, [])
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_reboot_retry_keeps_previous_restart_entries_when_a_stop_fails(self) -> None:
+        from scripts.agents import reboot
+
+        row, already_stopped, _other = self.rows
+        self.running = {str(row.current_session)}
+        earlier = [str(already_stopped.id), str(row.id)]
+        shutdown_record.save(earlier)
+        reboot.Checkpoint(reboot.Step.SERVER).save(self.root / "agents/reboot/reboot.json")
+        planned = reboot.MoveResult("session_move: would move 0 folders (0.00 GiB), kept 0 live, refused 0 other", 0, ())
+        with (patch.object(herdr.Herdr, "record_layout"),
+              patch.object(restart, "stop_row", return_value=False) as stop,
+              patch.object(reboot, "stop_server") as server,
+              patch.object(reboot, "move_folders", return_value=planned),
+              patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root), "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["reboot"]), 1)
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[0], row)
+        server.assert_not_called()
+        self.assertEqual(shutdown_record.read(), earlier)
+
+    def test_reboot_reuses_bulk_stop_and_restart_for_a_producer(self) -> None:
+        from scripts.agents import reboot
+
+        row = fixture_member("producer", name="TEST-agent")
+        self.rows = (row,)
+        self.running = {str(row.current_session)}
+        planned = reboot.MoveResult("session_move: would move 0 folders (0.00 GiB), kept 1 live, refused 0 other", 0, ())
+        moved = reboot.MoveResult("session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 0 other", 0, ())
+
+        def producer_snapshot() -> staff.StaffSnapshot:
+            return staff.StaffSnapshot(tuple(staff.snapshot().find(kind="producer")))
+
+        with (patch.object(staff, "initial_snapshot", side_effect=producer_snapshot),
+              patch.object(herdr.Herdr, "record_layout",
+                           side_effect=(herdr_types.HerdrFailure("layout unavailable"), None)) as saved_layout,
+              patch.object(reboot, "stop_server") as server,
+              patch.object(reboot, "move_folders", side_effect=(planned, planned, moved)),
+              patch.dict(os.environ, {"USER_ZONE": "UTC", "XDG_CONFIG_HOME": str(self.root),
+                                      "HERDR_PANE_ID": "", "HERDR_ENV": ""}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["reboot"]), 1)
+            self.assertIn("Could not save the Herdr layout", output.getvalue())
+            self.assertEqual(self.stops, [])
+            server.assert_not_called()
+            self.assertEqual(shutdown.main(["reboot"]), 0)
+        self.assertEqual(saved_layout.call_count, 2)
+        server.assert_called_once()
+        self.assertEqual(self.stops, [row.id])
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab("producers", row.name))])
+        self.assertEqual(shutdown_record.read(), [])
+        self.assertIn(f"1 of 1 stopped - {row.name}", output.getvalue())
+        self.assertIn(f"1 of 1 back - {row.name}", output.getvalue())
+
     def test_stop_all_reports_a_failed_hold_write_and_keeps_stopping_other_rows(self) -> None:
         blocked = fixture_member("producer", name="TEST-agent")
         ready = fixture_member("producer", name="owner")
@@ -5435,7 +5558,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore_attempt) as restore):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
+            self.assertEqual(shutdown_record.read(), [str(child.id)])
             self.assertEqual(restart.restart(), 0)
         self.assertEqual([item.args[0] for item in restore.call_args_list], [holder.id, holder.id])
         self.assertEqual(len(self.launches), 1)
@@ -5467,7 +5590,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore)):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(len(shutdown_record.read()), 3)
+            self.assertEqual(shutdown_record.read(), [str(child.id) for child in children])
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(restart.restart(only=(str(holder.id),)), 0)
         self.assertEqual(resumed, {child.id for child in children})
@@ -5490,9 +5613,7 @@ class RetainedSplitRestartTests(RestartTestCase):
         from scripts.production import worker
         from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 
-        fixture = StaffTestCase()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
+        fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         root = fixture.root
         config = root / "conf"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):

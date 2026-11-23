@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import admission_records
@@ -182,8 +183,7 @@ class VerifyRoutingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.runner_session = staff.caller_identity()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.addCleanup(self.fixture.tearDown)
         root = self.fixture.root
         self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root / "buildlog")}))

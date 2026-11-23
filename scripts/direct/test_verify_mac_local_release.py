@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 from typing import final
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -67,9 +68,7 @@ printf 'owned child stopped; inherited job kept\\n'
         for released_by_command in (False, True):
             with self.subTest(released_by_command=released_by_command):
                 # This test owns a separate fixture for each release variant.
-                fixture = VerifyMacOffloadFixture("runTest")
-                fixture.setUp()
-                self.addCleanup(fixture.doCleanups)
+                fixture = set_up_fixture(self.addCleanup, VerifyMacOffloadFixture("runTest"))
                 cycle = fixture.routing_fixture()
                 process = fixture.start_routing()
                 if released_by_command:
