@@ -954,22 +954,28 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
 
 
 def _mac_mirror_name(source: "MacSourceRepository") -> str:
-    """Name the mirror after the checkout that lends its objects when it has the same origin.
+    """Name the mirror after the last checkout in the lending chain that has the same origin.
 
     A prepared or merged copy is a shared clone in a folder named for the copy.
-    Its own folder name is not the repository name; the lending checkout's name is.
+    A task clone is a shared clone too, so a copy of a task clone borrows twice.
+    The folder names of these clones are not the repository name; the first lender's name is.
     """
     from scripts.buildlog import repository
 
-    lender = repository.borrowed_git_dir(source.git_dir)
-    if lender is not None:
+    named = source.git_dir
+    seen = {named}
+    lender = repository.borrowed_git_dir(named)
+    while lender is not None and lender not in seen:
+        seen.add(lender)
         try:
             lent = repository.mac_source_repository(str(Path(lender).parent), lender)
         except (OSError, SubprocessError, ValueError):
-            lent = None
-        if isinstance(lent, repository.MacSourceRepository) and lent.key == source.key:
-            return Path(lent.git_dir).parent.name
-    return Path(source.git_dir).parent.name
+            break
+        if not isinstance(lent, repository.MacSourceRepository) or lent.key != source.key:
+            break
+        named = lent.git_dir
+        lender = repository.borrowed_git_dir(lender)
+    return Path(named).parent.name
 
 
 def has_mac_worktree(worktree: str) -> bool:
