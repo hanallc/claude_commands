@@ -375,6 +375,7 @@ class CliArguments(argparse.Namespace):
         self.attempt: str = ""
         self.identity: bool = False
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
+        self.asking: str = ""
 
 
 def state_paths(target: str = "") -> StatePaths:
@@ -3206,6 +3207,8 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
     _ = commands.add_parser("watch-claim")
+    off = commands.add_parser("off-on-purpose", help="exit 0 when the user turned the Mac off, 1 when it is in use")
+    _ = off.add_argument("--asking", default="", metavar="SESSION")
 
     def parsed_session(value: str) -> SubmittingSession:
         return OwningSession(value) if value else NoOwningSession()
@@ -3240,6 +3243,9 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
         return command_release(args, paths)
     if args.command == "free-now":
         return command_free_now(args, paths)
+    if args.command == "off-on-purpose":
+        asking = AskingSession(args.asking) if args.asking else NO_ASKING_SESSION
+        return int(not isinstance(machine_off_on_purpose("mac", asking), OffOnPurpose))
     if args.command == "status" and args.target:
         return command_target_status(paths)
     try:

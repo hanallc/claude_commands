@@ -219,6 +219,7 @@ PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with 
                      + PAID_CREDITS_QUEUED_CALL)
 # A Mac that the user turned off is not locked: mac_test.machine_off_on_purpose stops this push.
 # The session that holds the Mac block still pushes.
+# A sent push also stops when the user turns the Mac off: see mac_locked_check.
 MAC_LOCKED_TEXT = "mac.locked"
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
@@ -4736,6 +4737,17 @@ def template_values(options: Options) -> dict[str, str]:
     return {key: item for key, _, item in (value.partition("=") for value in options.values)}
 
 
+def mac_locked_check(sender: str, clears_when: str) -> str:
+    """The clear check that a mac.locked push stores.
+
+    It passes when the user turns the Mac off, or when the caller's check passes.
+    """
+    scripts = Path(__file__).resolve().parents[1]
+    asking = ["--asking", sender] if sender else []
+    off = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose", *asking])
+    return f"{off} || {shlex.join(['/bin/sh', '-c', clears_when])}"
+
+
 def reviewed_waits(options: Options) -> Options:
     """Review the waits sentence within the configured budget.
 
@@ -5916,6 +5928,8 @@ def main(argv: list[str]) -> int:
                 if isinstance(mac_use, mac_test.OffOnPurpose):
                     print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
                     return EXIT["skipped"]
+                if options.clears_when:
+                    options = options._replace(clears_when=mac_locked_check(sender or "", options.clears_when))
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
