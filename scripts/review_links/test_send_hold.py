@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import contextlib
+import io
 import json
 import shutil
 import tempfile
@@ -8,7 +11,7 @@ import time
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.review_links import page_frame, send_hold
@@ -89,10 +92,11 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
         self.assertEqual(len(replays.sent), 1)
 
-    def test_the_holds_are_busy_while_a_replay_runs(self) -> None:
-        started, finish = threading.Event(), threading.Event()
+    def test_a_stop_waits_for_a_running_replay_and_no_replay_starts_after_it(self) -> None:
+        started, finish, calls = threading.Event(), threading.Event(), list[str]()
 
-        def slow(_path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
+        def slow(path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
+            calls.append(path)
             started.set()
             _ = finish.wait(5)
             return OK
@@ -100,11 +104,51 @@ class HoldsTests(unittest.TestCase):
         holds = Holds(self.folder, slow)
         hold_id = holds.hold("/review", {}, b"words", 0.0)
         self.assertTrue(started.wait(5))
-        self.assertTrue(holds.busy())
+        self.assertFalse(holds.stop_if_idle())
+        # The saved file already says the send may have left, so a crash now never sends it again.
+        saved = cast(send_hold.ReleasedFile, json.loads((self.folder / f"{hold_id}.json").read_text(encoding="utf-8")))
+        self.assertEqual((saved["status"], json.loads(base64.b64decode(saved["body"]))),
+                         (503, {"reason": send_hold.MAY_HAVE_LEFT}))
         self.assertIs(holds.result(hold_id, wait=0), HoldState.PENDING)
         finish.set()
         self.assertEqual(holds.result(hold_id, wait=5), OK)
-        self.assertFalse(holds.busy())
+        self.assertTrue(holds.stop_if_idle())
+        late = holds.hold("/list", {}, b"later", 0.0)
+        time.sleep(0.2)
+        self.assertEqual(calls, ["/review"])
+        replays = Replays()
+        after = Holds(self.folder, replays)
+        after.recover()
+        self.assertEqual(after.result(late, wait=5), OK)
+        self.assertEqual(replays.sent, [("/list", {}, b"later")])
+
+    def test_a_crash_during_a_replay_leaves_a_may_have_left_result(self) -> None:
+        holds = Holds(self.folder, Replays())
+        hold_id = holds.hold("/review", {}, b"words", 60)
+        _ = holds.undo(hold_id)
+        released = send_hold.released_file(send_hold.failed(send_hold.MAY_HAVE_LEFT))
+        _ = (self.folder / f"{hold_id}.json").write_text(json.dumps(released), encoding="utf-8")
+        replays = Replays()
+        after = Holds(self.folder, replays)
+        after.recover()
+        result = after.result(hold_id, wait=0)
+        assert isinstance(result, HeldResponse)
+        self.assertEqual(result.status, 503)
+        self.assertEqual(replays.sent, [])
+
+    def test_a_bad_hold_file_is_skipped_and_the_folder_is_private(self) -> None:
+        holds = Holds(self.folder, Replays())
+        hold_id = holds.hold("/review", {}, b"words", 60)
+        self.assertEqual(self.folder.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.folder / f"{hold_id}.json").stat().st_mode & 0o777, 0o600)
+        _ = (self.folder / f"{'1' * 24}.json").write_text("not json", encoding="utf-8")
+        _ = (self.folder / f"{'2' * 24}.json").write_text('{"state": "other"}', encoding="utf-8")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            Holds(self.folder, Replays()).recover()
+            holds.expire()
+        self.assertIn("unknown state", stderr.getvalue())
+        self.assertIs(holds.result("1" * 24, wait=0), HoldState.MISSING)
 
     def test_a_failed_replay_gives_a_503_result(self) -> None:
         def refused(_path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
@@ -141,6 +185,7 @@ class HoldsTests(unittest.TestCase):
 HELD_SEND_PROBE = r"""<script>
 (async () => {
  const failures = [], calls = [], hold = 'a'.repeat(24), late = 'b'.repeat(24), flaky = 'c'.repeat(24);
+ const modal = 'd'.repeat(24), closing = 'e'.repeat(24), broken = 'f'.repeat(24);
  const host = window.top.document;
  const check = (ok, label) => { if (!ok) failures.push(label); };
  const wait = ms => new Promise(done => setTimeout(done, ms));
@@ -151,6 +196,9 @@ HELD_SEND_PROBE = r"""<script>
   if (url === '/send') return new Response(JSON.stringify({hold, seconds: 1.2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
   if (url === '/late') return new Response(JSON.stringify({hold: late, seconds: 5}), {status: 202, headers: {'X-Send-Hold': 'held'}});
   if (url === '/flaky') return new Response(JSON.stringify({hold: flaky, seconds: .2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
+  for (const [path, id] of [['/modal', modal], ['/closing', closing], ['/broken', broken]])
+   if (url === path) return new Response(JSON.stringify({hold: id, seconds: 30}), {status: 202, headers: {'X-Send-Hold': 'held'}});
+  if (url === '/send-hold/' + broken + '/undo') throw new TypeError('offline');
   if (url === '/send-hold/' + late + '/undo') return new Response('{"outcome":"already sent"}', {status: 409});
   if (url === '/send-hold/' + flaky && calls.filter(([, called]) => called === url).length < 2) throw new TypeError('restart');
   if (url === '/plain') return new Response('{"plain":true}', {status: 200});
@@ -197,6 +245,42 @@ HELD_SEND_PROBE = r"""<script>
  const flakyStarted = performance.now();
  check((await heldFetch('/flaky', {method: 'POST', body: 'words'})).status === 200, 'A lost result read is read again.');
  check(performance.now() - flakyStarted >= 1000, 'The read waits before it tries again.');
+ const newestToast = () => [...host.querySelectorAll('[data-send-undo]')].at(-1);
+ const stack = () => host.querySelector('[data-send-undo-stack]');
+ const dialog = host.createElement('dialog');
+ host.body.append(dialog);
+ const inDialog = heldFetch('/modal', {method: 'POST', body: 'words'});
+ await wait(100);
+ const dialogToast = newestToast();
+ check(stack()?.parentElement === host.body, 'The toast starts in the page body.');
+ dialog.showModal();
+ await wait(50);
+ check(stack()?.parentElement === dialog && dialog.contains(dialogToast), 'The toast moves into a modal dialog that opens.');
+ dialog.close();
+ await wait(50);
+ check(stack()?.parentElement === host.body, 'The toast moves back to the body when the dialog closes.');
+ dialog.remove();
+ dialogToast?.querySelector('button')?.click();
+ await inDialog.then(() => check(false, 'Undo in the dialog rejects the send.'),
+                     error => check(error instanceof SendUndone, 'Undo in the dialog gives SendUndone.'));
+ const closingSend = heldFetch('/closing', {method: 'POST', body: 'words'});
+ await wait(100);
+ const closingToast = newestToast();
+ window.top.dispatchEvent(new window.top.PageTransitionEvent('pagehide'));
+ check(calls.some(([method, url]) => method === 'POST' && url === '/send-hold/' + closing + '/send'),
+       'A pagehide on the top window posts the send.');
+ check(closingToast && !closingToast.isConnected, 'A pagehide on the top window removes the toast.');
+ check((await closingSend).status === 200, 'A send that left on pagehide reads its result.');
+ const brokenSend = heldFetch('/broken', {method: 'POST', body: 'words'});
+ await wait(100);
+ const brokenToast = newestToast();
+ brokenToast?.querySelector('button')?.click();
+ const failedText = 'Undo failed. The send can still leave.';
+ for (let step = 0; step < 100 && brokenToast?.textContent !== failedText; step++) await wait(50);
+ check(calls.filter(([, url]) => url === '/send-hold/' + broken + '/undo').length === 2, 'Undo tries two times.');
+ check(brokenToast?.textContent === failedText,
+       'An Undo whose two posts fail says the send can still leave.');
+ check((await brokenSend).status === 200, 'A failed Undo leaves the send to continue.');
  await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
 })().catch(error => fetch('/results', {method: 'POST', body: JSON.stringify([String(error)])}));
 </script>"""

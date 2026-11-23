@@ -588,11 +588,18 @@ function showSendUndo(hold,seconds){
   const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
   host.head.append(style);
  }
- const place=[...host.querySelectorAll('dialog')].filter(dialog=>dialog.matches(':modal')).pop() || host.body;
- let stack=place.querySelector(':scope>[data-send-undo-stack]');
+ let stack=host.querySelector('[data-send-undo-stack]');
  if(!stack){
-  stack=host.createElement('div');stack.dataset.sendUndoStack='';stack.setAttribute('role','status');place.append(stack);
+  stack=host.createElement('div');stack.dataset.sendUndoStack='';stack.setAttribute('role','status');
  }
+ // The stack moves to the top open modal dialog, or to the body, so no dialog hides it or makes it inert.
+ const rehome=()=>{
+  const place=[...host.querySelectorAll('dialog')].filter(dialog=>dialog.matches(':modal')).pop() || host.body;
+  if(stack.parentElement!==place) place.append(stack);
+ };
+ rehome();
+ const watch=new MutationObserver(rehome);
+ watch.observe(host.body,{subtree:true,childList:true,attributes:true,attributeFilter:['open']});
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
  toast.dataset.sendUndo='';text.textContent='Sending';button.type='button';button.textContent='Undo';
@@ -604,7 +611,7 @@ function showSendUndo(hold,seconds){
  return new Promise(resolve=>{
   let done=false;
   const remove=()=>{
-   toast.remove();view.removeEventListener('pagehide',closed);
+   toast.remove();watch.disconnect();view.removeEventListener('pagehide',closed);removeEventListener('pagehide',remove);
    if(!stack.children.length) stack.remove();
   };
   const finish=undone=>{
@@ -616,19 +623,24 @@ function showSendUndo(hold,seconds){
    if(done) return;
    done=true;remove();
    fetch(SEND_HOLD_PATH+'/'+hold+'/send',{method:'POST',keepalive:true}).catch(()=>{});
+   // A page that comes back from the browser cache reads the result.
+   resolve(false);
   };
   view.addEventListener('pagehide',closed);
+  // A card frame that goes away takes its toast with it; the server timer sends.
+  if(view!==window) addEventListener('pagehide',remove);
   fade.finished.then(()=>finish(false),()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
-   let undone=false;
-   try{
-    undone=(await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'})).ok;
-   }catch{}
-   if(undone){finish(true);return;}
-   // The server released the send before the Undo reached it.
+   let answer=null;
+   for(let tries=0;tries<2 && !answer;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   }
+   if(answer?.ok){finish(true);return;}
    done=true;resolve(false);
-   text.textContent='Too late to undo. Sent.';button.remove();bar.remove();fade.cancel();
+   // A 409 says the server released the send before the Undo reached it.
+   text.textContent=answer?.status===409 ? 'Too late to undo. Sent.' : 'Undo failed. The send can still leave.';
+   button.remove();bar.remove();fade.cancel();
    pause(3000).then(remove);
   });
  });
@@ -645,7 +657,7 @@ async function heldFetch(url,init={}){
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
    if(response.headers.get('X-Send-Hold')!=='pending') return response;
   }catch(error){
-   if(++failures>30) throw error;
+   if(++failures>=30) throw error;
    await pause(1000);
   }
  }

@@ -1743,7 +1743,7 @@ function bindFeedbackForm(form){
      if(!confirmedByReadback){
       if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
       const message=undone ? error.message : (refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'success' : 'failure',message});
+      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
      }
      // The return animation uses the confirmed sort keys.
      if(refused && wasHidden && !item.hidden) tableView.applyAction();

@@ -5731,6 +5731,65 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 """)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_undo_keeps_the_card_words_and_a_second_send_posts_again(self) -> None:
+        setup = r"""<script>
+const realFetch=fetch,posts=[];
+window.setInterval=()=>0;
+window.fetch=async(url,options)=>{
+ if(options?.method!=='POST') return realFetch(url,options);
+ if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+ posts.push(new URLSearchParams(options.body));
+ if(posts.length===1)
+  return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ return Response.json({answer:'works',state:'Done',later:0});
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const host=window.top.document,words='Keep these words.';
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const key=document.querySelector('[data-list-item][data-type="change"]').dataset.key;
+  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  row().querySelector('.list-toggle').click();
+  let form=await readyReviewCard(row());
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  host.querySelector('[data-send-undo] button').click();
+  const cardForm=()=>row()?.isConnected && !row().hidden ? recordDetails(row())?.querySelector('[data-review-form]') : null;
+  const undone=()=>cardForm()?.querySelector('[data-send-status]').textContent==='Undone. Edit and send again.';
+  await until(()=>undone() || (row()?.isConnected && !row().hidden && !cardForm()),'Undo did not return the item.');
+  if(!cardForm()) row().querySelector('.list-toggle').click();
+  await until(undone,'The card did not say that the send was undone.');
+  form=cardForm();
+  check(form.elements.feedback.value===words,'After Undo the card keeps the words.');
+  await until(()=>!form.querySelector('[value="works"]').disabled,'The card did not enable Send after Undo.');
+  // The row comes back with a short fade, and a Send during that fade does nothing, so Send again until it posts.
+  let next=0;
+  await until(()=>{
+   if(posts.length<2 && performance.now()>next){
+    next=performance.now()+250;cardForm()?.requestSubmit(cardForm().querySelector('[value="works"]'));
+   }
+   return posts.length===2;
+  },'The second Send did not post.');
+  check(posts.every(post=>post.get('outcome')==='works' && post.get('feedback')===words),
+   'The second Send posts the same words again.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
         self.check_card_motion(browser_markup(self.root), r"""
  const [first,second,next]=rows(),firstPanel=motionKey(first),secondPanel=motionKey(second);

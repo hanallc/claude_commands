@@ -2835,8 +2835,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     with self.branch_deletions_lock:
                         if self.branch_deletions:
                             return
-                    # A restart during a replay could lose its result, and recovery would then send it again.
-                    if self.send_holds.busy():
+                    # A restart waits for each replay, and no replay starts after this stop.
+                    if not self.send_holds.stop_if_idle():
                         return
                     raise CodeChanged(f"code changed: {path}")
             self.module_stamps.update(stamps)

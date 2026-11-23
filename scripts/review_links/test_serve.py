@@ -889,6 +889,59 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/not-an-id/undo")[0], 404)
         self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
 
+    def raw_held_post(self, headers: list[str], body: bytes) -> bytes:
+        """Send one marked Review POST with these extra header lines, end the send side, and return the answer."""
+        host = f"127.0.0.1:{self.port}"
+        lines = [f"POST {review_page.PAGE_PATH} HTTP/1.1", f"Host: {host}", f"Origin: http://{host}",
+                 f"{send_hold.HOLD_HEADER}: 1", "Content-Type: application/x-www-form-urlencoded", *headers]
+        answer = b""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=TEST_HANG_GUARD_SECS) as connection:
+            connection.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
+            connection.shutdown(socket.SHUT_WR)
+            while chunk := connection.recv(65536):
+                answer += chunk
+        return answer
+
+    def test_a_marked_send_without_one_exact_size_is_refused_and_not_held(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        # The first three are refused before the body is read, so they send no body.
+        for case, headers, body, reason in (
+            ("two sizes", ["Content-Length: 5", "Content-Length: 5"], b"", b"The send has no valid size."),
+            ("chunked", ["Content-Length: 5", "Transfer-Encoding: chunked"], b"", b"The send has no valid size."),
+            ("too large", [f"Content-Length: {serve.HELD_SEND_LIMIT + 1}"], b"", b"The send is empty or too large."),
+            ("short body", ["Content-Length: 100"], b"words", b"The send is incomplete."),
+        ):
+            with self.subTest(case=case):
+                answer = self.raw_held_post(headers, body)
+                self.assertEqual(answer.split(b" ", 2)[1], b"400", answer[:300])
+                self.assertIn(reason, answer)
+        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
+
+    def test_a_held_review_answer_leaves_after_the_undo_time_with_its_normal_answer(self) -> None:
+        case = self.review_fixture(changes=1)
+        key = "page-owner/C1"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        form = case.card_body(cache.get(), key, "works", "The held answer.")
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        self.review_post_done.clear()
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              patch.object(cache, "save", wraps=cache.save) as save):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertEqual((status, hold, fields["seconds"]), (202, "held", 1), fields)
+            save.assert_not_called()
+            self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+            status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
+            self.assertEqual((status, hold), (200, ""), answer)
+            self.assertTrue({"answer", "version", "delivery_pending"} <= answer.keys(), answer)
+            self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
+            save.assert_called_once()
+        rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
+        self.assertEqual(rows["C1"]["Verdict"], "works: The held answer.")
+
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
         default = case.ready_submission_recipient()
@@ -7017,6 +7070,21 @@ class ServerCodeHealthTests(unittest.TestCase):
         server.service_actions()
         self.assertEqual(server.module_stamps, stamps)
         status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
+        self.elapsed = 110.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            server.service_actions()
+        self.assertIn(str(self.module_file), str(changed.exception))
+
+    def test_a_running_send_replay_defers_restart_until_the_holds_stop(self) -> None:
+        server = self.start_server()
+        stamps = dict(server.module_stamps)
+        _ = self.module_file.write_text("VALUE = 'changed during a held send replay'\n")
+        os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        self.elapsed = 105.0
+        with patch.object(server.send_holds, "stop_if_idle", return_value=False) as stop:
+            server.service_actions()
+        stop.assert_called_once_with()
+        self.assertEqual(server.module_stamps, stamps)
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
             server.service_actions()

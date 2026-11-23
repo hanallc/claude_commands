@@ -2038,14 +2038,16 @@ These sends wait:
 5. The change browser: each answer except Skip.
 
 The browser marks the send with the `X-Undo-Hold: 1` header.
-The server saves the whole request in `<root>/.review-link-holds/<id>.json` and answers 202 with `X-Send-Hold: held`.
+The server saves the body, with the Content-Type, Origin, Host and Accept headers, in `<root>/.review-link-holds/<id>.json`.
+Only the owner can read the folder and its files. The server answers 202 with `X-Send-Hold: held`.
 The 202 body gives the hold id and `seconds`, the Undo time.
 Nothing is saved and nothing is sent before the time ends.
 When `undo_seconds` is zero, the server does not hold the send and handles it at once.
 
 The page shows a toast with the word Sending, an **Undo** button and a bar at the bottom center of the top page.
 The toast uses the console colors.
-An open modal dialog holds the toast, so the dialog cannot cover it.
+The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
+When a card frame goes away, its toast goes too, and the server timer sends.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
 **Undo** posts `/send-hold/<id>/undo`. The server deletes the saved request and answers 200.
 The page then shows "Undone. Edit and send again." and keeps the words, the item and the dialog.
@@ -2055,15 +2057,21 @@ When the console page closes, it posts `/send-hold/<id>/send`, and the server se
 One second after the time ends, the server sends the saved request to its own bound address.
 The normal handler then saves and sends, as for a send that does not wait.
 An undo after that time gets 409, and the send continues. The toast then says "Too late to undo. Sent."
+An Undo that fails two times says "Undo failed. The send can still leave."
 The page reads `GET /send-hold/<id>`. The server answers 202 with `X-Send-Hold: pending` until the send ends.
 It then gives the saved response, so each page shows its normal result.
-A read that loses its connection tries again each second, for at most 30 tries.
-A failed connection to itself gives a 503 result. A handler that runs longer than 5 minutes also gives 503.
+A read that loses its connection tries again each second. After 30 failed reads, the page shows the error.
+A failed connection to itself gives a 503 result.
+Before the replay, the server writes a 503 result: "The send may have left. Check before you send again."
+A server that stops during a replay keeps that result, so it never sends the request two times.
+A handler that runs longer than 5 minutes gives the same result, because it can still finish.
 
 Each saved request is a file, so a server restart sends each request it finds when its time ends.
-The server does not restart for a code change while a held send runs, so a send cannot leave two times.
+A code change restarts the server only when no replay runs. After that check, no replay starts.
+A file that is not a valid hold gets one stderr line, and the server skips it.
 A page can read a result again until the sweep deletes it, 10 minutes after the send.
-A New item that waited through a restart gets the stale token answer, as other sends after a restart do.
+A New item that waited through a restart gets the stale token answer. The List page shows it.
+Other pages load a new token and send again, with a new Undo time.
 The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
 An undo needs the console host and origin, as other POST requests do.
 

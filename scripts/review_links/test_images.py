@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
@@ -507,6 +508,45 @@ class ImagesTests(ImagesFixture):
             (["feedback"], ["Retry after refresh fails."]), (["feedback"], ["Keep until next feedback."]),
             (["feedback"], ["Routine feedback."]),
         ])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_undo_returns_the_card_and_says_edit_and_send_again(self) -> None:
+        _ = self.register()
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const realFetch = window.fetch.bind(window), host = window.top.document, posts = [];
+ const until = async (test, label) => {
+  const end = performance.now() + 8000;
+  while (!test()) {
+   if (performance.now() > end) throw new Error(label);
+   await new Promise(resolve => setTimeout(resolve, 20));
+  }
+ };
+ window.fetch = async (path, options = {}) => {
+  if (String(path).endsWith('/undo')) return Response.json({outcome: 'undone'});
+  if (options.method !== 'POST') return new Promise(() => {});
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold: 'a'.repeat(24), seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
+ };
+ try {
+  const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
+  const status = form.querySelector('[data-image-status]');
+  form.elements.feedback.value = 'Too dark.';
+  form.requestSubmit(form.querySelector('button[value="feedback"]'));
+  await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
+  host.querySelector('[data-send-undo] button').click();
+  await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
+  check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+  check(posts.length === 1 && posts[0].get('action') === 'feedback', 'Undo sends nothing more.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+})();
+</script>"""
+        page = images.render(self.status).decode().replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")

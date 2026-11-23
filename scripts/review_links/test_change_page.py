@@ -34,6 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -4042,6 +4043,53 @@ class ChangePageTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_undo_puts_an_early_answer_back_in_the_list_and_skip_sends_no_hold(self) -> None:
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch.bind(window),host=window.top.document,posts=[];
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ window.fetch=async(url,request={})=>{
+  if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(request.method!=='POST') return new Promise(()=>{});
+  const held=new Headers(request.headers).get('X-Undo-Hold');
+  posts.push([request.body.get('outcome'),held]);
+  if(held==='1') return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  return Response.json({answer:''});
+ };
+ try{
+  if(!current) show();
+  const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
+  field.value='Keep these words.';
+  const saving=save(row,form,'works');
+  check(current!==row && row.dataset.pending==='false','Works shows the next change during the hold.');
+  await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  host.querySelector('[data-send-undo] button').click();
+  await saving;
+  check(row.dataset.pending==='true' && !form.hidden && field.value==='Keep these words.',
+   'After Undo the change is back in the list with its words.');
+  check(saveNotice.textContent==='Undone: '+row.dataset.shown+'. It is back in the list. Open it',
+   'The notice says that the undone change is back in the list.');
+  const open=saveNotice.querySelector('button');
+  check(open?.textContent==='Open it','The notice has an Open it button.');
+  open?.click();
+  check(current===row,'Open it shows the change again.');
+  await save(row,form,'skip');
+  check(JSON.stringify(posts)===JSON.stringify([['works','1'],['skip',null]]),'Skip sends no hold header.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = self.browser("changes")[2].replace('</body>', probe + '</body>')
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     def test_submit_writes_through_verdict_and_a_fresh_get_reads_the_saved_record(self) -> None:
         reply = self.request(self.page_path, self.answer())

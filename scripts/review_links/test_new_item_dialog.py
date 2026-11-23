@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -920,8 +921,8 @@ const send = async () => {
 """
 
 
-def bug_fixture_page(*, photo: bool = False) -> bytes:
-    probe = BUG_PROBE.replace("__PHOTO__", json.dumps(photo))
+def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
+    probe = script.replace("__PHOTO__", json.dumps(photo))
     return (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Review</title>'
             f'{page_frame.PAGE_SCRIPT_ERRORS}<style>{console_theme.CSS}{page_frame.OWNER_STYLE.removeprefix("<style>").removesuffix("</style>")}'
@@ -935,6 +936,63 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
+
+UNDO_PROBE = r"""
+const failures = [];
+const check = (value, description) => { if (!value) failures.push(description); };
+const wire = [], fetchHTTP = window.fetch, host = window.top.document;
+window.fetch = async (path, options = {}) => {
+ path = String(path);
+ if (path.endsWith('/undo')) return Response.json({outcome:'undone'});
+ if (!path.startsWith('/console/review/new-item')) return fetchHTTP(path, options);
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const payload = JSON.parse(options.body);
+ // The screenshot stays pending, so the first Send keeps its item for a retry.
+ if (payload.page_capture) return new Promise(() => {});
+ wire.push([payload, new Headers(options.headers).get('X-Undo-Hold')]);
+ if (wire.length === 1) return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ return Response.json({id:'I1',key:'bug/owner/I1'});
+};
+const dialog = document.querySelector('dialog');
+const words = dialog.querySelector('textarea'), error = dialog.querySelector('.new-item-error');
+const send = dialog.querySelector('[type="submit"]'), confirmation = dialog.querySelector('#new-item-saved');
+const until = async (test, label) => {
+ const end = performance.now() + 8000;
+ while (!test()) {
+  if (performance.now() > end) throw new Error(label);
+  await new Promise(resolve => setTimeout(resolve, 20));
+ }
+};
+const type = text => {
+ words.value = text;
+ words.dispatchEvent(new Event('input', {bubbles:true}));
+};
+(async () => {
+ try {
+  document.querySelector('[data-owner-new]').click();
+  await until(() => dialog.querySelector('[data-recipients] input:checked'), 'The dialog did not load its recipients.');
+  type('The first words.');
+  await until(() => !send.disabled, 'Send did not become available.');
+  send.click();
+  await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
+  host.querySelector('[data-send-undo] button').click();
+  await until(() => !error.hidden && error.textContent === 'Undone. Edit and send again.',
+              'The dialog did not say that the send was undone.');
+  check(dialog.open && words.value === 'The first words.', 'After Undo the dialog keeps the item and its words.');
+  type('The edited words.');
+  await until(() => !send.disabled, 'Send did not return after Undo.');
+  send.click();
+  await until(() => !confirmation.hidden, 'The second Send did not save.');
+  check(Boolean(wire[0]?.[0].defer_capture), 'The first Send waits for the screenshot, so the dialog keeps its item.');
+  check(wire.length === 2 && wire[0][0].words === 'The first words.' &&
+        wire[1][0].words === 'The edited words.' && wire[1][1] === '1',
+        'The Send after Undo posts the edited words.');
+ } catch (failure) {
+  failures.push(String(failure));
+ }
+ await fetchHTTP('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
 
 LIST_RETRY_PROBE = r'''
 const failures = [];
@@ -1387,6 +1445,10 @@ class NewItemDialogTests(unittest.TestCase):
         fixture = DialogFixture(temporary)
         capture_dialogs(temporary / "bug.png", {1440: fixture}, pages={1440: bug_fixture_page()})
         self.assertEqual(fixture.results, [])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_send_after_undo_posts_the_edited_words(self) -> None:
+        self.assertEqual(firefox_probe_results(bug_fixture_page(script=UNDO_PROBE)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:

@@ -2171,7 +2171,7 @@ function bindForm(row){
    failed:fail,
    undone:message=>{
     pendingSaves.delete(key);
-    showResult({kind:'success',message});
+    showResult({kind:'undone',message});
    },
    displayFailed:()=>{
     if(!view.currentItemRequest(request)) return;

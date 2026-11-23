@@ -5822,6 +5822,38 @@ window.fetch=async(_url,options)=>{
 ''', reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_undo_keeps_the_words_and_leaves_the_row_unsent(self) -> None:
+        self.browser_action_sequence(r'''
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ const before={state:row.dataset.state,unread:row.dataset.unread};
+ const listFetch=window.fetch;let undos=0;
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){undos++;return Response.json({outcome:'undone'});}
+  if(options.method==='POST' && !requests.length){
+   requests.push(new URLSearchParams(options.body));
+   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return listFetch(path,options);
+ };
+ const words=form.elements.words,notice=form.querySelector('[data-send-status]');
+ words.value='Tell morty after Undo.';words.dispatchEvent(new Event('input'));
+ submit('tell');
+ await until(()=>document.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+ document.querySelector('[data-send-undo] button').click();
+ await until(()=>notice.textContent==='Undone. Edit and send again.','The row did not say that the send was undone.');
+ check(words.value==='Tell morty after Undo.','After Undo the Tell keeps its words.');
+ check(row.dataset.state===before.state && row.dataset.unread===before.unread,
+  'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
+ check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
         steps = r'''
  const view=document.querySelector('[data-record-inline-view]');
