@@ -698,7 +698,11 @@ class CopyWatchProcessTests(unittest.TestCase):
                 admission = caller_admission(self, self.root, self.environment)
                 with admission.loop_turn():
                     newer = placement_request(admission)
-                    destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+                    # The newer copy competes only for the exact destination of the call, repository key included.
+                    mirror = claim_state.mac_repository_identity(str(self.repository))
+                    assert isinstance(mirror, claim_state.ResolvedMacMirror)
+                    scope = claim_state.RepositoryScope(mirror.mirror_name, mirror.key)
+                    destination = placement.PlacementDestination("mac", "mac", "mac", scope)
                     newer = replace(newer, episode=f"v-newer-{poll_s}", purpose=placement.SpeculativeCopy("newer-parent", 2000.0),
                         constraints=replace(newer.constraints, candidates=(placement.PlacementCandidate(destination),)))
                     _ = admission.server.handle_request(newer)
