@@ -838,6 +838,25 @@ class GateRecoveryTests(MergeGateFixture):
                     process.kill()
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
+    def test_recovery_reports_every_refusal_in_its_own_directory(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        unreadable = GateRefused("cannot recover gate 5000001: start is unreadable")
+        rollback = gate.RollbackRecoveryRefused("gate recovery kept the rollback record")
+        refusals = {directory / "a.json": unreadable, directory / "b.json": rollback}
+        for path in refusals:
+            self.write(path, "{}")
+
+        def refuse(path: Path) -> None:
+            raise refusals[path]
+
+        with (mock.patch.object(gate, "recover_gate_record", side_effect=refuse) as recover,
+              self.assertRaises(GateRefused) as refused):
+            gate.recover_gate_directory(directory, own_directory=directory)
+        self.assertEqual(recover.call_count, 2)
+        self.assertIs(type(refused.exception), GateRefused)
+        self.assertEqual(str(refused.exception), f"{unreadable}\n{rollback}")
+
     def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment):
             directory = gate.gate_run_directory(self.checkout)

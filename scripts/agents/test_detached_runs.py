@@ -2242,6 +2242,16 @@ class StoppedDiagnosticFixture:
     diagnostics: Path
 
 
+@dataclass(frozen=True)
+class StoppedPanePass:
+    agent: test_worker.DispatchAgent
+    row: staff.StaffRow
+    pane: str
+    dispatch: str
+    reply: Path
+    detached_record: Path
+
+
 class PaneRunDeliveryTests(unittest.TestCase):
     fixture: pane_support.WorkerPaneTests = pane_support.WorkerPaneTests()
     holder_sender: contextlib.ExitStack  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -3545,7 +3555,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
         self.assertEqual(case.agent.notices[1:], [message])
 
-    def test_a_failed_stop_notice_retries_with_the_late_reply_path(self) -> None:
+    def stopped_pane_pass(self) -> StoppedPanePass:
+        """Start a pane pass with no reply and save its stopped detached run."""
         agent = test_worker.DispatchAgent(self.fixture)
         agent.pane_commands(self)
         row = self.fixture.worker("impl", family="codex")
@@ -3555,24 +3566,87 @@ class PaneRunDeliveryTests(unittest.TestCase):
         reply.unlink(missing_ok=True)
         delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", delivery.line)
-        path = self.create_stopped_run(row, dispatch)
-        agent.notice_failures = 1
+        return StoppedPanePass(agent, row, pane, dispatch, reply, self.create_stopped_run(row, dispatch))
+
+    def late_done(self, case: StoppedPanePass) -> Path:
+        """Send a late DONE for the stopped pass and return its saved reply."""
+        result = f"The work is complete.\nDONE {case.dispatch}"
+        case.agent.append(case.pane, "assistant", result)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(case.row.current_session), reply=result)),
+                             turn_end.TurnOutcome.STOPPED)
+        late_reply = case.reply.with_name(f"reply_late_{case.dispatch}.txt")
+        self.assertEqual(late_reply.read_text().rstrip(), result)
+        return late_reply
+
+    def assert_stop_notices(self, case: StoppedPanePass, late_reply: Path) -> None:
+        """The director has the stop notice, then the late reply path, and the record settles the second."""
+        stopped, replaced = case.agent.notices
+        self.assertNotIn("reply", stopped)
+        self.assertIn(f"stopped; reply {late_reply}\nPass {case.dispatch}.", replaced)
+        record = pass_notices.read(self.run_dir, case.dispatch)
+        assert record is not None
+        self.assertIn(record.notices["stopped"].text, replaced)
+        self.assertTrue(record.notices["stopped"].settled)
+
+    def test_a_failed_stop_notice_retries_with_the_late_reply_path(self) -> None:
+        case = self.stopped_pane_pass()
+        case.agent.notice_failures = 1
         with (patch.object(detached_runs, "_group_is_live", return_value=False),
               contextlib.redirect_stderr(io.StringIO())):
-            _ = detached_runs.main(["deliver", str(path)])
-        self.assertEqual(agent.notices, [])
-        self.assertFalse(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
+            _ = detached_runs.main(["deliver", str(case.detached_record)])
+        self.assertEqual(case.agent.notices, [])
+        self.assertFalse(pass_notices.is_settled(self.run_dir, case.dispatch, "stopped"))
 
-        result = f"The work is complete.\nDONE {dispatch}"
-        agent.append(pane, "assistant", result)
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=result)),
-                             turn_end.TurnOutcome.STOPPED)
-        late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
-        self.assertEqual(late_reply.read_text().rstrip(), result)
-        notice, = agent.notices
-        self.assertIn(f"stopped; reply {late_reply}\nPass {dispatch}.", notice)
-        self.assertTrue(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
+        late_reply = self.late_done(case)
+        notice, = case.agent.notices
+        self.assertIn(f"stopped; reply {late_reply}\nPass {case.dispatch}.", notice)
+        self.assertTrue(pass_notices.is_settled(self.run_dir, case.dispatch, "stopped"))
+
+    def test_a_late_reply_staged_during_the_stop_notice_send_reaches_the_director(self) -> None:
+        case = self.stopped_pane_pass()
+        deliver = send.send
+        late_replies: list[Path] = []
+
+        def stage_late_reply(options: send.Options) -> send.Result:
+            result = deliver(options)
+            if not late_replies:
+                # The stop notice send holds the delivery lock, so the late reply only stages its text here.
+                with patch.object(pass_notices, "_deliver"):
+                    late_replies.append(self.late_done(case))
+            return result
+
+        with (patch.object(send, "send", side_effect=stage_late_reply),
+              patch.object(detached_runs, "_group_is_live", return_value=False)):
+            self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 0)
+        late_reply, = late_replies
+        self.assertEqual(len(case.agent.notices), 1)
+        self.assertFalse(pass_notices.is_settled(self.run_dir, case.dispatch, "stopped"))
+        pass_notices.deliver(self.run_dir, case.dispatch, ("stopped",))
+        self.assert_stop_notices(case, late_reply)
+
+    def test_a_late_reply_after_a_stop_notice_crash_reaches_the_director_through_retry(self) -> None:
+        case = self.stopped_pane_pass()
+        deliver = send.send
+
+        def accept(options: send.Options) -> send.Result:
+            result = deliver(options)
+            assert options.key is not None
+            message = send.Message(send.staff_queue_key(self.fixture.parent.id), case.row.name, "", "", options.key)
+            send.record_acceptance(message, send.now())
+            return result
+
+        _ = self.enterContext(patch.object(send, "STATE", self.fixture.root / "message-state"))
+        _ = self.enterContext(patch.object(send, "send", side_effect=accept))
+        with (patch.object(pass_notices, "_settle", side_effect=KeyboardInterrupt),
+              patch.object(detached_runs, "_group_is_live", return_value=False),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = detached_runs.main(["deliver", str(case.detached_record)])
+        self.assertEqual(len(case.agent.notices), 1)
+        with patch.object(pass_notices, "_deliver"):
+            late_reply = self.late_done(case)
+        pass_notices.retry(self.run_dir)
+        self.assert_stop_notices(case, late_reply)
 
     def test_legacy_diagnostics_without_a_saved_sender_keep_the_record_readable(self) -> None:
         case = self.stopped_diagnostic_fixture()

@@ -38,6 +38,8 @@ class Notice:
     source_event_id: str = ""
     settled: bool = False
     legacy_stamp: str = ""
+    # A replacement text has its own delivery key, so a send of the earlier text cannot hide it.
+    revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,10 @@ class Route:
     instance_id: str
     director_id: staff.StaffId
     worker_name: str
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _path(run: Path, instance: str) -> Path:
@@ -105,12 +111,14 @@ class PassNotices:
             if fields is None:
                 raise ValueError(f"{path}: invalid pass notice frame")
             if isinstance(key := fields.get("settled"), str):
-                if record is not None and (notice := record.notices.get(key)) is not None:
+                # The settle frame names the text that was sent; an older frame names no text.
+                sent = fields.get("text_sha256")
+                if (record is not None and (notice := record.notices.get(key)) is not None
+                        and (sent is None or sent == _digest(notice.text))):
                     record.notices[key] = replace(notice, settled=True)
                 continue
             route = _read_route(path, fields)
             notices = pass_record.object_dict(fields.get("notices")) or {}
-            replaces = fields.get("replaces_unsettled") is True
             if record is None:
                 record = cls(route, {})
                 # Apply the legacy event only to the first complete publication.
@@ -118,8 +126,10 @@ class PassNotices:
                 notices = {**initial, **{key: value for key, value in notices.items() if key not in initial}}
             for key, value in notices.items():
                 if key in seen:
-                    if replaces and (saved := record.notices.get(key)) is not None and not saved.settled:
-                        record.notices[key] = _read_notice(path, key, value)
+                    replacement = _read_notice(path, key, value)
+                    if (replacement.revision and (saved := record.notices.get(key)) is not None
+                            and not saved.settled and saved.text != replacement.text):
+                        record.notices[key] = replacement
                     continue
                 seen.add(key)
                 notice = _read_notice(path, key, value)
@@ -147,7 +157,8 @@ def _read_notice(path: Path, key: str, value: object) -> Notice:
         raise ValueError(f"{path}: incomplete pass notice {key}")
     return Notice(text, sender, NoticeKind(pass_record.string(fields.get("kind"))),
                   pass_record.string(fields.get("transition")), pass_record.string(fields.get("source_event_id")),
-                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")))
+                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")),
+                  pass_record.string(fields.get("revision")))
 
 
 def _append(path: Path, content: dict[str, object]) -> None:
@@ -162,14 +173,11 @@ def _append(path: Path, content: dict[str, object]) -> None:
         os.close(descriptor)
 
 
-def _publish(path: Path, route: Route, notices: dict[str, Notice], *, initial: dict[str, Notice] | None = None,
-             staged: StagedText = StagedText.FIRST) -> None:
+def _publish(path: Path, route: Route, notices: dict[str, Notice], *, initial: dict[str, Notice] | None = None) -> None:
     content: dict[str, object] = {"route": asdict(route),
                                  "notices": {key: asdict(notice) for key, notice in notices.items()}}
     if initial:
         content["initial"] = {key: asdict(notice) for key, notice in initial.items()}
-    if staged is StagedText.REPLACES_UNSETTLED:
-        content["replaces_unsettled"] = True
     _append(path, content)
 
 
@@ -177,8 +185,10 @@ def stage_result(run: Path, route: Route, key: str, notice: Notice, *, legacy: L
                  staged: StagedText = StagedText.FIRST) -> None:
     path = _path(run, route.instance_id)
     initial = {key if legacy.matches_replay else "status:1": legacy.settled_event(notice)} if legacy.saved else {}
+    if staged is StagedText.REPLACES_UNSETTLED:
+        notice = replace(notice, revision=_digest(notice.text))
     with _locked(path, "record"):
-        _publish(path, route, {key: notice}, initial=initial, staged=staged)
+        _publish(path, route, {key: notice}, initial=initial)
 
 
 def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNoticeStamp) -> str:
@@ -209,7 +219,7 @@ def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNotic
 
 
 def _diagnostics(sender: str, messages: dict[str, bool]) -> dict[str, Notice]:
-    return {f"diagnostic:{hashlib.sha256(text.encode()).hexdigest()}":
+    return {f"diagnostic:{_digest(text)}":
             Notice(text, sender, NoticeKind.DIAGNOSTIC, settled=settled)
             for text, settled in messages.items()}
 
@@ -245,13 +255,14 @@ def import_legacy_diagnostics(run: Path, route: Route, sender: str) -> None:
             legacy.unlink(missing_ok=True)
 
 
-def _delivery_key(route: Route, key: str) -> str:
-    return f"worker-completion:{route.instance_id}:{key}"
+def _delivery_key(route: Route, key: str, notice: Notice) -> str:
+    first = f"worker-completion:{route.instance_id}:{key}"
+    return f"{first}:{notice.revision}" if notice.revision else first
 
 
-def _received(route: Route, key: str) -> bool:
+def _received(route: Route, key: str, notice: Notice) -> bool:
     message = send.Message(send.staff_queue_key(route.director_id), route.worker_name, "", "",
-                           _delivery_key(route, key))
+                           _delivery_key(route, key, notice))
     return send.confirmed_skip(message, timedelta(minutes=REPEAT_MINUTES), send.now()) is not None
 
 
@@ -293,16 +304,16 @@ def _send(run: Path, route: Route, key: str, notice: Notice) -> send.Result:
     body = (_completion_text(run, route.instance_id, notice.text)
             if notice.kind == NoticeKind.RESULT and key != "stopped" else notice.text)
     options = send.parse(["--to", prefix + str(director.current_session), "--from", route.worker_name,
-                          "--text", body, "--key", _delivery_key(route, key),
+                          "--text", body, "--key", _delivery_key(route, key, notice),
                           "--recipient-key", send.staff_queue_key(route.director_id),
                           "--repeat-minutes", str(REPEAT_MINUTES)])
     return send.send(options._replace(sender_origin=send.ForwardedSender(send.read_sender_stamp(notice.sender_native_id)),
                                       shown_sender=send.ShownSender(route.worker_name)))
 
 
-def _settle(path: Path, key: str) -> None:
+def _settle(path: Path, key: str, notice: Notice) -> None:
     with _locked(path, "record"):
-        _append(path, {"settled": key})
+        _append(path, {"settled": key, "text_sha256": _digest(notice.text)})
 
 
 def read(run: Path, instance: str) -> PassNotices | None:
@@ -340,13 +351,13 @@ def _deliver_held(path: Path, keys: Collection[str], *, retry: bool = False) -> 
         if status_blocked and notice.kind == NoticeKind.STATUS:
             continue
         try:
-            if not retry or not _received(record.route, key):
+            if not retry or not _received(record.route, key, notice):
                 result = _send(path.parent, record.route, key, notice)
                 if not isinstance(result, send.RepeatGuardHeld) and result.outcome not in ("sent", "skipped"):
                     if result.outcome == "held" and notice.kind == NoticeKind.DIAGNOSTIC:
                         continue
                     raise ValueError(result.detail)
-            _settle(path, key)
+            _settle(path, key, notice)
         except (OSError, ValueError, staff.StaffRefused) as error:
             if not retry:
                 raise

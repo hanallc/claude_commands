@@ -160,6 +160,26 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual(self.hook_runs(), [f"{self.repo}|{commit}|main"] * 3)
         self.assertEqual(self.completion().read_text(), commit + "\n")
 
+    def test_a_failed_hook_rerun_keeps_the_requested_git_config(self) -> None:
+        self.install_hook()
+        _ = self.write(Path(self.environment["TEST_HOOK_FAIL"]), "fail\n")
+        commit = self.next_commit()
+        settings = ("core.fsync=committed",)
+        failed = land_main.land(self.repo, commit, git_config=settings)
+        assert isinstance(failed.hook, land_main.HookFailed)
+        self.assertIn(" --git-config core.fsync=committed", failed.hook.rerun_command)
+
+        Path(self.environment["TEST_HOOK_FAIL"]).unlink()
+        # The lock path read in main_push_lock is outside the landing Git calls.
+        with mock.patch.object(land_main, "run_git", wraps=land_main.run_git) as commands:
+            self.assertIsInstance(land_main.retry_hook(self.repo, commit, "main", "", git_config=settings),
+                                  land_main.HookDone)
+        self.assertTrue(commands.call_args_list)
+        for call in commands.call_args_list:
+            environment = cast(dict[str, str] | None, call.kwargs.get("environment"))
+            assert environment is not None, call
+            self.assertEqual(environment["GIT_CONFIG_PARAMETERS"], "'core.fsync'='committed'")
+
     def test_a_commit_behind_origin_skips_the_push_and_hook(self) -> None:
         self.install_hook()
         commit = self.next_commit("older\n")
