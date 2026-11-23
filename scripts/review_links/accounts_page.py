@@ -690,7 +690,7 @@ def page() -> bytes:
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
+            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"">' + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
             + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
@@ -1058,6 +1058,8 @@ async function refresh(supersede=false,current=()=>true) {
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
   if (request !== newestRequest || !current() || hold()) return;
+  const newer = reloadForNewScript(page);
+  if (newer) return newer;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : null;
@@ -1287,6 +1289,7 @@ quotaClear.addEventListener('click',async()=>{
 for(const name of ['resize','scroll']) addEventListener(name,()=>closeQuota(false),{passive:true});
 for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
 })();"""
+SCRIPT_VERSION = page_frame.script_version(POPUP, MENU, QUOTA_PANEL, STYLE, SCRIPT)
 
 
 if __name__ == "__main__":

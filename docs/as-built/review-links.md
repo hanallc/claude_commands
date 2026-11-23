@@ -200,6 +200,11 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
+A page passes `page_frame.script_version(<its static script, style and markup>)` to `title`, which puts it on the status line as `data-script-version`.
+`reloadForNewScript(page)` runs before the loader swaps content. When the fetched page has another version, it reloads the page.
+An open page then never runs an old script on a fragment from a changed page script.
+While the page holds typed text, a selection, or an open dialog or menu, the reload waits. The status shows Paused: **A newer page loads when the open edit ends.**
+The reload keeps the scroll place. Accounts calls it.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.

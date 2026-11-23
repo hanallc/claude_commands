@@ -3749,8 +3749,9 @@ class ChangePageTests(unittest.TestCase):
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
                          "row.dataset.key===current?.dataset.key", "ordered.slice(previous+1)"):
                 self.assertIn(rule, body)
-            # The one full reload is for a page whose script is older than the server's.
-            self.assertEqual(body.count('location.reload'), 1)
+            # Both full reloads are for a page whose script is older than the server's:
+            # this page's own check and the shared reloadForNewScript.
+            self.assertEqual(body.count('location.reload'), 2)
             self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)

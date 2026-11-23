@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -126,8 +127,13 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
-    """Build the title and refresh status."""
+def script_version(*parts: str) -> str:
+    """Hash a page's static script, style and markup; an open page reloads when its version changes."""
+    return hashlib.sha256("\0".join((STYLE, REFRESH_SCRIPT, *parts)).encode()).hexdigest()[:16]
+
+
+def title(text: str, page: str, version: str = "") -> str:
+    """Build the title and refresh status; `version` comes from `script_version`."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -140,7 +146,8 @@ def title(text: str, page: str) -> str:
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
-            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
+            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" '
+            + (f'data-script-version="{version}" ' if version else '') + 'data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
@@ -167,7 +174,34 @@ CONSOLE_READY_SCRIPT = """(() => {
 })();"""
 
 
-REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
+REFRESH_SCRIPT = r'''function restoreScrollAfterReload(){
+ try{
+  const key='page-reload-scroll:'+location.href,top=sessionStorage.getItem(key);
+  if(top===null) return;
+  sessionStorage.removeItem(key);
+  const restore=()=>scrollTo({top:Number(top),behavior:'instant'});
+  if(document.readyState==='complete') restore();else addEventListener('load',restore,{once:true});
+ }catch{}
+}
+function pageHoldsInput(){
+ const shown=node=>node.checkVisibility ? node.checkVisibility() : node.getClientRects().length>0;
+ if([...document.querySelectorAll('dialog[open],[role=dialog],[role=menu]')].some(shown)) return true;
+ if(getSelection()?.isCollapsed===false) return true;
+ return [...document.querySelectorAll('textarea,input:is([type=text],[type=search],[type=url],[type=email],[type=number],:not([type]))')]
+  .some(field=>shown(field) && field.value!==field.defaultValue);
+}
+// A fragment from a changed page script can need a newer script than this page runs.
+// Returns the refresh facts when the fresh page has another script version, else null.
+function reloadForNewScript(page){
+ const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
+ const fresh=version(page),own=version(document);
+ if(!fresh || !own || fresh===own) return null;
+ if(pageHoldsInput()) return {...pageRefreshFacts(page),busy:'A newer page loads when the open edit ends.'};
+ try{sessionStorage.setItem('page-reload-scroll:'+location.href,String(scrollY));}catch{}
+ location.reload();
+ return pageRefreshFacts(page);
+}
+function pageRefreshFacts(page=document){
  const line=page.querySelector('[data-page-status]');
  if(!line || !line.dataset.readAt) throw new Error('The page has no data time.');
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
@@ -185,6 +219,7 @@ function restoreFocusAfterRefresh(){
  };
 }
 function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
+ restoreScrollAfterReload();
  const line=document.querySelector('[data-page-status]');
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;

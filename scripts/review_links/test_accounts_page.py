@@ -718,6 +718,61 @@ window.fetch=(url,options)=>options?.method==='POST'
         self.assertEqual(table.count('title="No usage rate is available."'), 4)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+        with patch.object(accounts, "read_status", return_value=sort_reading()):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
+        self.assertEqual(rendered.count(f'data-script-version="{accounts_page.SCRIPT_VERSION}"'), 1)
+        # A newer server's layout that this script cannot sort: the same entries made the old script throw
+        # "insertBefore: parameter 1 is not of type 'Node'" on every update.
+        newer = re.sub(r'(data-sort-table="roles" data-sort-default="role" data-sort-orders=")[^"]*"',
+                       lambda match: match.group(1) + html.escape(json.dumps({"role": [{"index": 0, "details": True}]})) + '"',
+                       rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"), count=1)
+        self.assertNotEqual(newer, rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"))
+        setup = '''<script>
+localStorage.removeItem('roles-sort');Date.now=()=>200000;
+window.fetch=()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE});
+</script>'''.replace("NEWER_PAGE", json.dumps(newer).replace("</", "<\\/"))
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+ const line=()=>document.querySelector('[data-page-status]');
+ const status=()=>line().dataset.state+': '+line().textContent.replace(/\\s+/g,' ');
+ const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
+ const expected=sessionStorage.getItem('reload-probe');
+ if(expected){
+  sessionStorage.removeItem('reload-probe');
+  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+  await flush();
+  check(Math.abs(scrollY-Number(expected))<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected);
+  send();return;
+ }
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='300px';await flush();
+  const draft=document.createElement('textarea');
+  document.querySelector('[data-accounts]').before(draft);draft.value='typed words';
+  scrollTo({top:120,behavior:'instant'});
+  const view=document.querySelector('[data-accounts]');
+  await refresh();
+  check(document.querySelector('[data-accounts]')===view,'a draft keeps the old tables');
+  check(line().dataset.state==='Paused' && status().includes('A newer page loads when the open edit ends.'),
+   'a draft defers the reload: '+status());
+  draft.value='';
+  sessionStorage.setItem('reload-probe',String(scrollY));
+  await refresh();
+  for(let wait=0;wait<30;wait++) await pause(100);
+  sessionStorage.removeItem('reload-probe');
+  failures.push('the page did not reload after the draft ended; its status is '+status());
+ }catch(error){failures.push(String(error));}
+ send();
+})();</script>'''
+        page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.page()
