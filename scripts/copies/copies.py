@@ -453,11 +453,17 @@ def unit_owner(name: str) -> str:
 
 
 def source_owner(source: Path) -> str:
-    """Use the standing checkout owner, copy owner or staff owner."""
+    """Use the recorded owner, or the configured verify owner."""
+    return recorded_owner(source) or fallback_owner("verify")
+
+
+def recorded_owner(source: Path, *,
+                   intent: scratch.RemovalIntentAccess = scratch.RemovalIntentAccess.RECOVER) -> str:
+    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
     for active in reversed(ACTIVE_GATES.get()):
         if active.tree == source.resolve():
             return active.owner
-    record = scratch.task_of(source)
+    record = scratch.task_of(source, intent=intent)
     if isinstance(record, copy_record.Registered):
         owner = record.fields.get("owner_unit")
         if isinstance(owner, str):
@@ -470,7 +476,7 @@ def source_owner(source: Path) -> str:
             return str(member.id)
     except staff.StaffUnreadable:
         pass
-    return fallback_owner("verify")
+    return ""
 
 
 def fallback_owner(role: str) -> str:
