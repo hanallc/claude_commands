@@ -1,6 +1,7 @@
 """Check the dates and words of List repeat rules."""
 from __future__ import annotations
 
+import sys
 import unittest
 from datetime import datetime
 from itertools import islice
@@ -58,20 +59,21 @@ class RepeatRuleTests(unittest.TestCase):
                     self.assertIs(rule.next_after(start, dates[-1], 730), repeat_rule.NoNextRun.REMAINING)
 
         start = datetime.fromisoformat("9999-12-30T23:00-05:00")
-        for text, expected, error in (
-            ("FREQ=DAILY", ("9999-12-30 23:00",), ""),
-            ("FREQ=DAILY;COUNT=2", (), "COUNT crosses the supported date limit"),
+        for text, limit, expected, error in (
+            ("FREQ=DAILY", 730, ("9999-12-30 23:00",), ""),
+            ("FREQ=DAILY;COUNT=2", 730, (), "COUNT crosses the supported date limit"),
+            ("FREQ=DAILY", sys.maxsize + 1, ("9999-12-30 23:00",), ""),
         ):
-            with self.subTest(text=text):
+            with self.subTest(text=text, limit=limit):
                 rule = repeat_rule.parse(text)
                 if error:
                     with self.assertRaisesRegex(ValueError, error):
-                        _ = tuple(rule.runs(start, 730))
+                        _ = tuple(rule.runs(start, limit))
                 else:
-                    dates = tuple(rule.runs(start, 730))
+                    dates = tuple(rule.runs(start, limit))
                     self.assertEqual(tuple(run.strftime("%Y-%m-%d %H:%M") for run in dates), expected)
                     self.assertEqual(rule.describe(start), "Daily")
-                    self.assertIs(rule.next_after(start, dates[-1], 730), repeat_rule.NoNextRun.REMAINING)
+                    self.assertIs(rule.next_after(start, dates[-1], limit), repeat_rule.NoNextRun.REMAINING)
 
     def test_rule_refuses_parts_outside_the_repeat_menu(self) -> None:
         for text, error in (

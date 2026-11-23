@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -431,11 +432,54 @@ class TheListTests(unittest.TestCase):
                         row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
                         self.assertIn(f"· next {next_start}", row)
                         if live_limit == 1 and end:
+                            code, _, errors = self.command("update", "--id", identity, "--scope", "following",
+                                                           "--source", "nate", "--repeat", "FREQ=DAILY")
+                            self.assertEqual((code, errors), (0, ""))
+                            self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
                             code, output, errors = self.command("update", "--id", identity, "--scope", "following",
-                                                                "--source", "nate", "--repeat", "FREQ=DAILY")
+                                                                "--source", "nate", "--repeat", "FREQ=DAILY;COUNT=1")
                             self.assertEqual((code, output), (1, ""))
                             self.assertIn("no runs left under the limit of 1", errors)
                             self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
+
+        for rule, words in (
+            ("FREQ=DAILY", "Read the figures.\nSend the total."),
+            ("FREQ=DAILY;UNTIL=20261203T170000Z", "Read the December figures."),
+            ("FREQ=DAILY;COUNT=4", "Send the December total."),
+        ):
+            with self.subTest(words_only=rule):
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+                code, output, errors = self.add_scheduled(start, "--repeat", rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=2"))
+                code, _, errors = self.command("update", "--id", identity, "--scope", "following", "--source", "nate",
+                                               "--do", words)
+                self.assertEqual((code, errors), (0, ""))
+                after = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(after, the_list.ScheduledSeries)
+                self.assertEqual(after, replace(before, first=replace(before.first, words=words)))
+                self.assertEqual(tuple((run.number, run.run.start) for run in after.runs()),
+                                 tuple((run.number, run.run.start) for run in before.runs()))
+                self.assertEqual(tuple(run.run.words for run in after.runs()), (words, words, words))
+
+        with self.subTest(allowance="above sys.maxsize"):
+            allowance = sys.maxsize + 1
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={allowance}"))
+            code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
+            self.assertEqual((code, errors), (0, ""))
+            identity = output.splitlines()[-1]
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+            code, output, errors = self.command("list")
+            self.assertEqual((code, errors), (0, ""))
+            row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
+            self.assertIn("· next 2026-11-30T17:00:00+00:00", row)
+            after = the_list.load(MORTY.id, identity).schedule
+            assert isinstance(after, the_list.ScheduledSeries)
+            self.assertEqual(after.run_allowance, allowance)
 
     def test_repeated_item_updates_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
