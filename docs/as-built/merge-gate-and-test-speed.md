@@ -57,6 +57,9 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
+In each test, merge, nightly or promote mode, the gate checks the assignment once when it starts, before any merge, hold wait or run.
+For a natedev assignment, `copies.py` keeps its memory reservation through the handoff, and the gate ends it after that check, before it takes its own.
+A mode that cannot route the gate (`--module`, `--nightly`, `--promote-only`) takes only a natedev assignment.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
 An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
