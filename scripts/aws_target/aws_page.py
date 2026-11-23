@@ -416,38 +416,46 @@ def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.C
         return {'kind': 'off'}
     if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
         return {'kind': 'invalid'}
+    return launch_evidence(records)
+
+
+def launch_evidence(records: Sequence[dict[str, object]]) -> NoLaunchEvidence | LaunchesWorking | LaunchesRefused:
+    """Read the rows newest first. The newest good launch ends the read; the refusals after it are the current run.
+
+    A capacity or price refusal does not end the run. The run starts at its oldest refusal and shows the newest code.
+    """
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
-    counted_refusals: set[str] = set()
-    state: LaunchState = {'kind': 'no-evidence'}
-    for row in sorted(records, key=lambda row: float(str(row['time']))):
+    attempt_times: list[float] = []
+    refusals: list[tuple[float, OtherLaunchRefusal, object]] = []
+    good_launch_times: list[float] = []
+    for row in reversed(sorted(records, key=lambda row: float(str(row['time'])))):
         evidence = classify_launch_row(row, requested_attempts)
+        if evidence is LaunchRowEvidence.NO_ATTEMPT:
+            continue
         at = float(str(row['time']))
+        attempt_times.append(at)
         if evidence is LaunchRowEvidence.LAUNCHED:
-            state = {'kind': 'working', 'last_good_at': at, 'latest_attempt_at': at}
-            counted_refusals.clear()
-        elif isinstance(evidence, NormalLaunchRefusal):
-            if state['kind'] != 'no-evidence':
-                state['latest_attempt_at'] = at
-        elif isinstance(evidence, OtherLaunchRefusal):
-            attempt = row.get('attempt')
-            count = state['count'] if state['kind'] == 'refused' else 0
-            if not isinstance(attempt, str) or attempt not in counted_refusals:
-                count += 1
-                if isinstance(attempt, str) and attempt:
-                    counted_refusals.add(attempt)
-            refused: LaunchesRefused = {
-                'kind': 'refused', 'code': evidence, 'latest_attempt_at': at,
-                'reason': LAUNCH_REFUSAL_REASONS.get(evidence, 'The launch could not proceed.'),
-                'first_at': state['first_at'] if state['kind'] == 'refused' else at,
-                'count': count,
-            }
-            if state['kind'] == 'working':
-                refused['last_good_at'] = state['last_good_at']
-            elif state['kind'] == 'refused' and 'last_good_at' in state:
-                refused['last_good_at'] = state['last_good_at']
-            state = refused
-    return state
+            good_launch_times.append(at)
+            break
+        if isinstance(evidence, OtherLaunchRefusal):
+            refusals.append((at, evidence, row.get('attempt')))
+    if not refusals:
+        if not good_launch_times:
+            return {'kind': 'no-evidence'}
+        return {'kind': 'working', 'last_good_at': good_launch_times[0], 'latest_attempt_at': attempt_times[0]}
+    # One attempt with several refusal rows counts once. A row without an attempt ID counts by itself.
+    named = {attempt for _, _, attempt in refusals if isinstance(attempt, str) and attempt}
+    count = len(named) + sum(not (isinstance(attempt, str) and attempt) for _, _, attempt in refusals)
+    code = refusals[0][1]
+    refused: LaunchesRefused = {
+        'kind': 'refused', 'code': code, 'latest_attempt_at': attempt_times[0],
+        'reason': LAUNCH_REFUSAL_REASONS.get(code, 'The launch could not proceed.'),
+        'first_at': refusals[-1][0], 'count': count,
+    }
+    if good_launch_times:
+        refused['last_good_at'] = good_launch_times[0]
+    return refused
 
 
 class QuotaRequestOutcome(StrEnum):

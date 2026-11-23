@@ -241,7 +241,11 @@ class MachineWatchTests(NotificationGuardedTestCase):
             with self.subTest(machine=name):
                 _ = turn_off()
                 self.make_unusable(name)
-                self.step("waiting", step_record.StepState.WAITING_SSH, (name,))
+                # natedev has no unusable cause, so its outage is a step that waits for its hold.
+                if name == "natedev":
+                    self.step("waiting", step_record.StepState.WAITING_HOLD, (name,))
+                else:
+                    self.step("waiting", step_record.StepState.WAITING_SSH, (name,), selected=name)
                 for now in (START, START + HOUR, START + 2 * HOUR):
                     self.unusable_pass(name, now)
                 self.assertEqual(self.commands, [])
@@ -265,7 +269,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
             _ = stream.write("".join(json.dumps(row) + "\n" for row in rows))
 
     def test_a_refused_cloud_gate_credential_makes_the_gpu_route_unusable(self) -> None:
-        """The newest row decides, and the outage starts at the first refusal of the current run."""
+        """The newest refusal decides, and the outage starts at the first refusal of the current run."""
         refused = {"result": "refused", "error_code": "AuthFailure"}
         self.write_launches({"time": START - 10 * HOUR, "result": "launched"}, {"time": START - 9 * HOUR, **refused},
                             {"time": START - 8 * HOUR, "result": "launched"}, {"time": START - 2 * HOUR, **refused},
@@ -274,6 +278,15 @@ class MachineWatchTests(NotificationGuardedTestCase):
             machine_watch.Unusable("AWS could not authenticate the launch credentials."), START - 2 * HOUR))
         self.write_launches({"time": START + 60, "result": "launched"})
         self.assertIs(machine_watch.refused_credential(), machine_watch.USABLE)
+
+    def test_a_capacity_refusal_does_not_end_a_credential_refusal_run(self) -> None:
+        """The watch reads the run as the AWS page does: a capacity refusal is part of the run."""
+        refused = {"result": "refused", "error_code": "AuthFailure"}
+        self.write_launches({"time": START - 10 * HOUR, "result": "launched"}, {"time": START - 3 * HOUR, **refused},
+                            {"time": START - 2 * HOUR, "result": "refused", "error_code": "InsufficientInstanceCapacity"},
+                            {"time": START, **refused})
+        self.assertEqual(machine_watch.refused_credential(), machine_watch.Outage(
+            machine_watch.Unusable("AWS could not authenticate the launch credentials."), START - 3 * HOUR))
 
     def test_an_old_credential_refusal_sends_at_the_first_pass(self) -> None:
         self.write_launches({"time": START - HOUR, "result": "refused", "error_code": "AuthFailure"})

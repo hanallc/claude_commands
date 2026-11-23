@@ -109,6 +109,14 @@ Reading = Outage | NoOutage | NoChange
 
 
 @dataclass(frozen=True)
+class NoFreshAlert:
+    """The Mac idle watch saved no reading, or its reading is older than stale_seconds."""
+
+
+NO_FRESH_ALERT = NoFreshAlert()
+
+
+@dataclass(frozen=True)
 class Usable:
     """No fixed cause stops builds from using the machine."""
 
@@ -207,27 +215,21 @@ def nate_repairs(transport: ExecutionTransport | LocalMachine) -> bool:
 
 
 def refused_credential() -> Outage | Usable:
-    """The newest cloud gate launch row decides. A credential refusal makes the GPU route unusable.
+    """Use the launch evidence of the AWS page. A credential refusal makes the GPU route unusable.
 
-    The outage starts at the first refusal of the current run of refusals, so a run that is older than the notice
-    time sends its notice at once.
+    The run of refusals starts at its oldest refusal after the newest good launch, so a run that is older than the
+    notice time sends its notice at once. Only a credential code counts as the newest refusal: another code, such as
+    a service error, can end by itself. The read takes every row, as the page does, because a fallback row counts
+    only when no row anywhere requested its attempt. On natedev this costs about 80 ms each minute.
     """
     from scripts.aws_target import aws_page, ledger
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    refusals: list[tuple[float, str]] = []
-    for launch in ledger.gate_launches_newest_first(ssh_target_state_directory("aws")):
-        evidence = aws_page.classify_launch_row(launch.row, frozenset())
-        if evidence is aws_page.LaunchRowEvidence.NO_ATTEMPT:
-            continue
-        if not (isinstance(evidence, aws_page.OtherLaunchRefusal) and evidence in aws_page.LAUNCH_REFUSAL_REASONS):
-            break
-        refusals.append((launch.at, aws_page.LAUNCH_REFUSAL_REASONS[evidence]))
-    if not refusals:
+    every_row = ledger.recent_gate_launches(ssh_target_state_directory("aws"), since=0.0)
+    evidence = aws_page.launch_evidence(every_row)
+    if evidence["kind"] != "refused" or evidence["code"] not in aws_page.LAUNCH_REFUSAL_REASONS:
         return USABLE
-    newest_reason = refusals[0][1]
-    first_refusal_at = refusals[-1][0]
-    return Outage(Unusable(newest_reason), first_refusal_at)
+    return Outage(Unusable(evidence["reason"]), evidence["first_at"])
 
 
 def unusable(target: Target, transport: ExecutionTransport | LocalMachine) -> Outage | Usable:
@@ -289,17 +291,17 @@ def waiting_steps(target: Target) -> int:
     return sum(waits_for(record, target) for record in records)
 
 
-def fresh_alert(paths: WatchPaths, now: float) -> mac_idle_alert.SavedAlert | None:
+def fresh_alert(paths: WatchPaths, now: float) -> mac_idle_alert.SavedAlert | NoFreshAlert:
     saved = mac_idle_alert.read_alert(paths.mac.state / "alert.json")
     if not isinstance(saved, dict) or now - saved["written"] > mac_idle_alert.read_idle_config().stale_seconds:
-        return None
+        return NO_FRESH_ALERT
     return saved
 
 
 def mac_reading(paths: WatchPaths, now: float) -> Reading:
     """Read the Mac idle watch result of this pass. It knows Mac claims, CI jobs and disk exclusions."""
     saved = fresh_alert(paths, now)
-    if saved is None or saved["state"] == "unreadable":
+    if isinstance(saved, NoFreshAlert) or saved["state"] == "unreadable":
         return NO_CHANGE
     if saved["state"] == "unreachable":
         # The Mac reads unreachable only after a failed probe. While no step waits, its clear check ends the push.
@@ -357,8 +359,9 @@ def push_to_nate(machine: str, since: float, now: float) -> bool:
 
     rendered = push_texts.render(UNREACHABLE_TEXT, machine=machine, minutes=str(int((now - since) // 60)))
     start = str(int(since))
-    return mac_idle.send_user_push(
+    return push_texts.send_user_push(
         rendered, sender=SENDER, key=f"machine-watch-{machine}-{start}",
+        send_timeout_s=mac_idle_alert.read_idle_config().send_timeout_s,
         clears_when=f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/machine_watch.py cleared --machine {machine} --since {start}")
 
 
@@ -414,7 +417,7 @@ def watch_idle_block(machine: str, paths: WatchPaths, now: float, notice: float)
 
     path = paths.state / f"{machine}-block.json"
     saved = fresh_alert(paths, now)
-    if saved is None or (saved["state"], saved["cause"]) != ("idle", "blocked"):
+    if isinstance(saved, NoFreshAlert) or (saved["state"], saved["cause"]) != ("idle", "blocked"):
         path.unlink(missing_ok=True)
         return
     try:

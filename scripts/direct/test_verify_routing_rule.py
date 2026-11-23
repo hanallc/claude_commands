@@ -213,8 +213,10 @@ def add_peer_target(root: Path) -> None:
 
 
 class RemoteWaitStateTests(VerifyMacOffloadFixture):
-    def test_a_declined_ssh_step_names_its_target_in_each_wait_state(self) -> None:
-        """The machine watch counts a waiting_ssh step only for the target that the state names."""
+    """The machine watch counts a waiting_ssh step only for the target that the state names."""
+
+    def declined_states(self, mode: str, reason: str) -> list[str]:
+        """Run try_mac_test on peer with a runner answer, and return each published step state."""
         add_peer_target(self.root)
         states = self.root / "step-states"
         assigned = self.assigned_remote("peer", "nextest")
@@ -223,9 +225,17 @@ class RemoteWaitStateTests(VerifyMacOffloadFixture):
             + 'STEP_ASSIGNED_TARGET=peer STEP_ASSIGNED_PLATFORM=linux\n'
             + 'try_mac_test "$MAC_TEST_CONFIG" || true\n',
             extra={"MAC_TEST_CONFIG": str(self.root / "linux.conf"), "TEST_DIRECT_ASSIGNMENT": str(assigned),
-                   "TEST_STEP_STATES": str(states), "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy"})
+                   "TEST_STEP_STATES": str(states), "TEST_RUNNER_MAC": mode, "TEST_RUNNER_REASON": reason})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(states.read_text().splitlines(), ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
+        return states.read_text().splitlines()
+
+    def test_a_declined_ssh_step_names_its_target_in_each_wait_state(self) -> None:
+        self.assertEqual(self.declined_states("declined", "busy"),
+                         ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
+
+    def test_an_unusable_runner_result_names_the_target_in_its_wait_state(self) -> None:
+        """A runner that writes no result takes the runner-declined branch."""
+        self.assertEqual(self.declined_states("none", ""), ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
 
 
 class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
