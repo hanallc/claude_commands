@@ -164,6 +164,24 @@ SPINE_VERSION = 1
 SKILL_NAME = "unit-history"
 
 
+# The event that cancels one wrong checkpoint event of the same run. The run
+# file keeps both lines; every run-history loader drops the cancelled checkpoint.
+CHECKPOINT_VOIDED = "checkpoint_voided"
+
+
+def without_voided_checkpoints(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Drop each checkpoint event that a checkpoint_voided event of the same run names.
+
+    Give the events of one run file. Every run-history loader calls this one rule.
+    """
+    voided = {string(event.get("voided_event_id")) for event in events
+              if event.get("event_type") == CHECKPOINT_VOIDED} - {""}
+    if not voided:
+        return events
+    return [event for event in events
+            if event.get("event_type") != "checkpoint" or string(event.get("event_id")) not in voided]
+
+
 # Where the early reviewer lives between its launch and the ready sentinel that
 # releases its real pass. A pass opened before the sentinel would file a verdict
 # on a final diff that does not exist yet, so an early launch has nowhere to be

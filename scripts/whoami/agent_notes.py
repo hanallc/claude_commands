@@ -10,8 +10,9 @@ hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 (/quota_refresh) is the run after the user reports a usage reset.
 `usage-only` reads and saves usage, then starts `renew-logins` when renewal is due.
+Off natedev, it then completes the local group members that are off the current group selection.
 `renew-logins` renews expired local Claude logins under its own schedule lock.
-It sends no quota alerts and runs neither account moves nor the Codex pacer.
+Neither sends quota alerts or runs refusal moves or the Codex pacer.
 `blocked` records a launch that Codex refused for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
@@ -59,7 +60,7 @@ from scripts.whoami.quota_alert import (AgentNote, alert, blocked, current_sessi
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
-from scripts.maintenance.settings import positive, usage_only_intervals
+from scripts.maintenance.settings import InvalidPartSchedule, Part, part_cadence, positive, usage_only_intervals
 from scripts.lib.user_zone import user_zone
 
 
@@ -67,6 +68,9 @@ from scripts.lib.user_zone import user_zone
 SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
 # Read low accounts every two minutes so exhaustion moves keep their cadence.
 LIVE_USAGE_REMAINING_THRESHOLD = 10
+# natedev's refusal part waits one interval after its last run ends, then the next job tick, so two plans can be
+# almost two intervals apart. A third interval covers a slow pass.
+COMPLETION_PLAN_INTERVALS = 3
 
 
 def read_sessions_seen() -> dict[str, str]:
@@ -588,7 +592,7 @@ def positive_poll_seconds(value: str) -> float:
 
 
 def usage_only(*, poll_seconds: float = 0) -> None:
-    """Read each due account, then start renewal without waiting for a probe."""
+    """Read each due account, start renewal without waiting for a probe, then complete local group members."""
     from scripts.accounts import accounts, refusal_watch
 
     for line in _publish_mac_token():
@@ -617,6 +621,40 @@ def usage_only(*, poll_seconds: float = 0) -> None:
     except Exception as error:
         reason = str(error).splitlines()[0] if str(error) else type(error).__name__
         print(f"login renewal: {reason}", file=sys.stderr)
+    if not role_map.is_role_map_host():
+        complete_local_groups(poll_seconds=poll_seconds, report_seconds=intervals.claude_seconds)
+
+
+def complete_local_groups(*, poll_seconds: float = 0, report_seconds: float) -> None:
+    """Complete this machine's off-target group members at the cadence of natedev's refusal pass."""
+    try:
+        with locked_history(schedule_directory("group-completion")) as history:
+            if isinstance(history, ScheduleBusy):
+                return
+            now = datetime.now(timezone.utc)
+            cadence = part_cadence(Part.REFUSALS)
+            # Start jitter must not add a poll, as for usage reads.
+            interval = (report_seconds if isinstance(cadence, InvalidPartSchedule) else cadence.interval_seconds) - poll_seconds / 2
+            if not history.is_due("group completion", interval, now.timestamp()):
+                return
+            try:
+                if isinstance(cadence, InvalidPartSchedule):
+                    print(f"group completion: {cadence.reason}", file=sys.stderr)
+                    return
+                from scripts.accounts import refusal_watch
+                from scripts.agents import stop_resume
+
+                max_age = timedelta(seconds=COMPLETION_PLAN_INTERVALS * cadence.interval_seconds)
+                # Moves continue in their own process, as they do from the notes timer.
+                with stop_resume.detached_moves():
+                    for line in refusal_watch.complete_local_groups(now, max_age=max_age):
+                        print(line)
+            finally:
+                # A failed move or a bad setting waits for the next interval.
+                history.record("group completion", now.timestamp())
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"group completion: {reason}", file=sys.stderr)
 
 
 def renew_logins() -> None:

@@ -1106,16 +1106,16 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
- const search=query.trim().toLowerCase();
- if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ // Use one clock read for the rows, the owner selection, and the counts.
+ const now=Date.now();
+ if(normalizeOwner) owner=options.selectOwner?.(rows,currentSelection({now})) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- // One clock read per pass, so rows and counts agree when a time passes mid-pass.
- const active={...currentSelection(),now:Date.now()};
+ const active=currentSelection({now});
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
@@ -1225,7 +1225,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
  restoreLog();
- options.applied?.(selection,active);
+ options.applied?.(selection,active,{rows,matches,count});
  const reset=options.emptyFilters && noResults ? resetSelection(active.now) : null;
  const canResetToResults=reset!==null && rows.some(item=>matches(item,reset));
  const filteredEmpty=options.emptyFilters && updateEmptyResult(table,{
@@ -1317,8 +1317,9 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const bannerHeight=banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(bannerHeight+16)+'px';
+ const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+ row.style.scrollMarginTop=(inset+16)+'px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
@@ -1399,12 +1400,13 @@ function bind(){
   apply(true,{animate:true});
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
+  if(type===button.dataset.typeChip) return;
   type=button.dataset.typeChip;changeFilter();
  }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
  preserveRecordRowTop,holdLog,restoreLog,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return openItem && !openItem.hidden && location.hash===placeHash && openItem.dataset.key===key &&
    opened.has(key) && detailMissing.hidden && viewDetail.contains(form);

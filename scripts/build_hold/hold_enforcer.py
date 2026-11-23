@@ -43,7 +43,6 @@ from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.lib.process_group import send_process_group
 
 
 def ci_placement_lines(proc_root: Path) -> list[str]:
@@ -549,7 +548,7 @@ def stop_with_restart_notice(
 def stop_waiting_run(
     run: WaitingRun, holder: build_hold.Holder, processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
     *, signal_process: Callable[[int, int], None] = os.kill,
-    signal_group: Callable[[int, int], None] = send_process_group,
+    signal_group: Callable[[int, int], None] | None = None,
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
 ) -> StoppedRun | RunIdentityChanged:
     """Check process identities before TERM and record each stopped gate."""
@@ -560,8 +559,21 @@ def stop_waiting_run(
 
     process = run.process
     identity = process.identity
-    holders = (holder, *build_hold.natedev_holds(build_hold.holder_directory()).in_force)
-    if isinstance(keeping_holder(process, build_hold.audit_ancestors(process, processes), processes, holders), build_hold.Holder):
+    holder_directory = build_hold.holder_directory()
+    holders = build_hold.natedev_holds(holder_directory).in_force
+    if holder not in holders:
+        return RunIdentityChanged(run)
+
+    def kept(candidate: build_hold.AuditProcess) -> bool:
+        lineage = build_hold.audit_ancestors(candidate, processes)
+        return isinstance(keeping_holder(candidate, lineage, processes, holders), build_hold.Holder)
+
+    def supervisor_is_current(run: DetachedRun) -> bool:
+        supervisor = run.supervisor.identity
+        return (build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+                and supervisor_matches(supervisor_args(supervisor.pid, proc_root), run.path, run.supervisor.cwd))
+
+    if kept(process):
         return RunIdentityChanged(run)
     if build_hold.process_start_time(identity.pid, proc_root) != identity.start_time:
         return RunIdentityChanged(run)
@@ -570,12 +582,7 @@ def stop_waiting_run(
         return RunIdentityChanged(run)
     if isinstance(detached, DetachedRun):
         override_guard.require_shared_state_write(Path(__file__), "build_hold/hold_enforcer.py", detached.path)
-        supervisor = detached.supervisor.identity
-        if isinstance(keeping_holder(detached.supervisor, build_hold.audit_ancestors(detached.supervisor, processes),
-                                     processes, holders), build_hold.Holder):
-            return RunIdentityChanged(run)
-        if (build_hold.process_start_time(supervisor.pid, proc_root) != supervisor.start_time
-                or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
+        if kept(detached.supervisor) or not supervisor_is_current(detached):
             return RunIdentityChanged(run)
     classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, OwningSession) else "no_session"
     build = build_hold.AuditedBuild(process, run.owner, classification, ())
@@ -584,14 +591,15 @@ def stop_waiting_run(
     def gate_is_current() -> bool:
         return build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
 
-    def verify_group(run: DetachedRun) -> detached_runs.CommandGroup | detached_runs.CommandGroupUnverified:
-        supervisor = run.supervisor.identity
+    def verify_gate(run: DetachedRun) -> bool:
+        if build_hold.natedev_holds(holder_directory).in_force != holders:
+            return False
+        if not gate_is_current() or not supervisor_is_current(run) or kept(process) or kept(run.supervisor):
+            return False
+        if signal_group is None:
+            return True
         command = detached_runs.command_group(run.path)
-        if (command is not None and gate_is_current()
-                and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
-                and build_hold.process_start_time(command.group, proc_root) == command.started):
-            return command
-        return detached_runs.CommandGroupUnverified()
+        return command is not None and build_hold.process_start_time(command.group, proc_root) == command.started
 
     ancestors = build_hold.audit_ancestors(process, processes)
     recipients = notice_recipients(run.owner, build_hold.run_agent(process, ancestors))
@@ -602,9 +610,9 @@ def stop_waiting_run(
     def stop(request_id: str) -> bool:
         if isinstance(detached, DetachedRun):
             supervised = detached
-            return detached_runs.stop_with_reason(
-                supervised.path, reason, verify_group=lambda: verify_group(supervised), signal_group=signal_group,
-                hold_request_id=request_id)
+            return detached_runs.stop_command(
+                supervised.path, reason, check=lambda: verify_gate(supervised), stop_pass=False,
+                signal_group=signal_group, hold_request_id=request_id)
         if not gate_is_current():
             return False
         signal_process(identity.pid, signal.SIGTERM)

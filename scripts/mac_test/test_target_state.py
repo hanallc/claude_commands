@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
@@ -95,7 +96,7 @@ class IsolatedTargetState(unittest.TestCase):
             lines.extend((f"kind.{name}=ssh", f"platform.{name}={platform}",
                           f"settings.{name}={settings.name}"))
         lines.extend(("kind.natedev=local", "platform.natedev=linux"))
-        _ = self.config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _ = self.config.write_text("\n".join(lines) + "\n" + UNREACHABLE_WAIT_FIXTURE, encoding="utf-8")
         _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
@@ -231,9 +232,10 @@ class TargetStateTests(IsolatedTargetState):
         _ = write_config_fixture(legacy, "offload=on\nci_repo=", template="mac_test")
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"), encoding="utf-8")
+        arguments = ["free-now", "--repo-root", str(self.root)]
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
-            selected = self.invoke_mac(["free-now", "--target", "mac"])
-            default = self.invoke_mac(["free-now"])
+            selected = self.invoke_mac([*arguments, "--target", "mac"])
+            default = self.invoke_mac(arguments)
         self.assertEqual((selected.returncode, selected.stdout.strip()), (1, "off"))
         self.assertEqual((default.returncode, default.stdout.strip()), (0, "free"))
 
