@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.lib import models_registry
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 
 import hashlib
@@ -156,7 +157,7 @@ class LocalReviewTests(unittest.TestCase):
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
+        _ = self.enterContext(mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
         registry = write_registry(self.root / "models.conf")
 
         def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
@@ -1503,6 +1504,28 @@ class LocalReviewTests(unittest.TestCase):
                 assert isinstance(result, review.Unreviewed)
                 self.assertTrue(result.why)
 
+    def test_model_program_and_model_name_errors_keep_the_review_unavailable_text(self) -> None:
+        result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft), failure="missing"))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: claude unavailable")
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft)))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: no model alias")
+
+    def test_structured_call_returns_runner_and_model_name_errors_as_model_unavailable(self) -> None:
+        def broken(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            del argv, timeout, env
+            raise PermissionError("claude is not executable")
+
+        def call(runner: review.ProcessRunner) -> review.StructuredOutcome:
+            return review.structured_call(runner, Path("claude"), {}, model="opus", effort="high", system_prompt="",
+                                          schema={}, prompt="", deadline=time.monotonic() + 60).outcome
+
+        self.assertEqual(call(broken), review.ModelUnavailable("claude is not executable"))
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            self.assertEqual(call(FakeReviewer(verdict(self.draft))), review.ModelUnavailable("no model alias"))
+
     def test_unexpected_review_faults_send_the_original_push(self) -> None:
         keys = self.root / "keys"
         _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
@@ -1647,10 +1670,10 @@ class LocalReviewTests(unittest.TestCase):
         runner = FakeReviewer(verdict(self.draft))
         create_claude_account("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
+        with (mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)
-        select.assert_called_once_with("unit")
+        select.assert_called_once_with("units")
         self.assertEqual(result.metadata.account, "claude3")
         for call in runner.calls:
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(directory))

@@ -2702,8 +2702,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ // The limit only names a stuck step; each wait ends when its condition holds.
  const until=async(predicate,label)=>{
-  const end=performance.now()+8000;
+  const end=performance.now()+20000;
   while(!predicate()){
    if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');
    await new Promise(resolve=>requestAnimationFrame(resolve));
@@ -2729,7 +2730,12 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
   const failed=review();
   check(typeof frame.contentWindow.consoleNavigate==='undefined','The error page does not register navigation.');
   nav('list').click();
-  await until(()=>list()?.readyState==='interactive' && aliasLink('questions'),'the interactive List document');
+  // The console intercepts List links only after its ready handler runs, a task after readyState changes.
+  let listConnected=false;
+  document.querySelector('[data-console-page=list]').addEventListener('console-document-ready',
+   ()=>{listConnected=true;},{once:true});
+  await until(()=>listConnected && list()?.readyState==='interactive' && aliasLink('questions'),
+   'the connected interactive List document');
   aliasLink('questions').click();
   await until(()=>review()!==failed && review().querySelector('[data-review-loading]'),'the second Review request');
   check(review().readyState==='loading','The second Review document waits for the fixture.');

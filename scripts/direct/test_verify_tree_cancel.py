@@ -50,7 +50,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertTrue(watch.is_dir(), "cleanup removed a folder with a held lock")
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertNotIn("cannot remove the tree watch folder", errors)
+        self.assertNotIn("cleanup failed: tree-watch folder removal", errors)
         cache = self.board / "verify_cache"
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)
         self.assertEqual(list(cache.glob("*.fail")), [])
