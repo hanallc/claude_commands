@@ -185,8 +185,10 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.record_clone("2", clone)
         directory = phase_reservation.phase_directory(self.session, "2")
         foreign = make_fixture_worktree(self.first, "other-unit", "p3")
-        for requested, reason in ((clone, f"{str(clone)!r} is not in the subpath of"),
-                                  (self.main, f"{str(self.main)!r} is not in the subpath of"),
+        model = self.session.parent / "worktrees" / "<repo>" / "<unit>" / "<short name>"
+        outside = f"the checkout is not at {model}"
+        for requested, reason in ((clone, outside),
+                                  (self.main, outside),
                                   (foreign, "the checkout is for unit 'other-unit'")):
             with self.subTest(requested=requested):
                 code, errors = self.claim("2", requested)
