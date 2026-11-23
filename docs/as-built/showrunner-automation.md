@@ -1027,6 +1027,17 @@ An unstaffed session requires an explicit native id and an explicit unit name.
       The run is open when the staff row's open run has the name of the run file. Then the merge check reads the production checkout.
       If no such merge clears the approval, the row gets `RowCheck.COMMIT_UNREAD` and ends its text with `commit not in a local repository`.
       `land_queue.land_state` gives `in the merge line` for a running or waiting merge, else `not in the merge line`.
+    - **Dropped hash:** `stranded.py drop --unit <unit name> --commit <hash> --by "<who>" --why "<reason>"` records a hash dropped on purpose.
+      The command finds the one active unit with that name, and resolves the commit to its full hash in the unit home repository.
+      It refuses an empty `--by` or `--why`, a `--commit` that is not 7 to 40 hex characters, an unknown unit, a home that is not on this machine, and an unknown commit.
+      A name such as `HEAD` or `main` is not a hash, so the command refuses it. A refusal exits 2.
+      `<showrunner state root>/stranded_dropped.json` holds the records of all productions, in a list of `DroppedRecord` entries.
+      Each entry has `unit_id` (the unit staff id), `commit` (the full hash), `by`, `why` and `at` (UTC epoch).
+      The command adds one entry under a file lock and writes the file atomically. Earlier entries stay.
+      Inside the lock, the command reads the file strictly. When the file is not a list of valid entries, it refuses the drop and does not change the file.
+      Rule 1 reads the file leniently: an unreadable file has no entries, and a malformed entry is skipped.
+      Rule 1 skips an approval when an entry has the same unit and a commit that starts with the approved hash.
+      A drop is for one commit, so a later approval of a new commit for the same phase shows again.
     - **Changed tree:** the unit trees are the local home trees and the linked trees that belong to one unit.
       Each repository lists its linked trees once, and `finished_worktrees.tree_unit` reads each tree's checkout record once.
       The record names the unit. A tree without a unit in its record belongs to the unit whose home folder holds it.
@@ -1041,7 +1052,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
       A live folder inside the tree skips the tree. A detached run of the tree's unit skips the tree.
       A queue step with the unit's name and a folder outside every production tree also skips the unit's trees.
       An unread run source gives the row `RowCheck.LIVE_RUNS_UNREAD` and ends its text with `live runs unread`.
-    - **Message:** the agent-notes part `stranded` (`[parts.stranded]` in `config/agent_notes.toml`, every 600 s) calls `stranded.main`.
+    - **Message:** the agent-notes part `stranded` (`[parts.stranded]` in `config/agent_notes.toml`, every 600 s) calls `stranded.main` with no arguments.
       For each showrunner with a notifier folder, it sends one message with the new rows through `send.py --from stranded`.
       `~/.local/state/showrunner/<showrunner id>/stranded_sent.json` keeps the sent row keys.
       A send keeps the current keys that were sent before, plus the new keys. A key whose row is gone drops out, so the row sends again if it returns.

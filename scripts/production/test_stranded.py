@@ -1,12 +1,14 @@
 """The stranded list: approved hashes not on main, old changed unit trees, and the once-only notice."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import Mock, patch
@@ -364,6 +366,65 @@ class StrandedTests(unittest.TestCase):
             self.assertTrue(stranded.send_notice(self.owner, "Stranded work."))
         argv = cast(list[str], run.call_args.args[0])
         self.assertEqual(argv[argv.index("--repeat-minutes") + 1], "60")
+
+
+    def test_a_drop_record_removes_the_row_of_its_commit_only(self) -> None:
+        self.write_run(self.review(33, verdict="APPROVE", reviewed_commit=self.approved, reviewed_tree=str(self.home)))
+        self.assertEqual(len(stranded.rows("show", self.now)), 1)
+        record = stranded.drop("natest", self.approved[:10], by="builds", why="replaced by phase 422", now=self.now)
+        assert self.unit is not None
+        self.assertEqual(record, {"unit_id": self.unit.id, "commit": self.approved, "by": "builds",
+                                  "why": "replaced by phase 422", "at": self.now})
+        self.assertEqual(stranded.rows("show", self.now), [])
+        _ = (self.home / "tracked.txt").write_text("four\n")
+        newer = commit_repository(self.home, "newer approved work")
+        self.write_run(self.review(33, verdict="APPROVE", reviewed_commit=newer, reviewed_tree=str(self.home)))
+        self.assertEqual([row.text for row in stranded.rows("show", self.now)],
+                         [self.approved_text("not in the merge line", newer)])
+
+    def test_the_drop_command_refuses_an_unknown_commit_or_an_empty_reason(self) -> None:
+        base = ["drop", "--unit", "natest", "--by", "builds"]
+        printed, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(printed), redirect_stderr(errors):
+            self.assertEqual(stranded.main([*base, "--commit", "0123456789abcdef", "--why", "replaced"]), 2)
+            self.assertEqual(stranded.main([*base, "--commit", "HEAD", "--why", "replaced"]), 2)
+            self.assertEqual(stranded.main([*base, "--commit=--git-dir", "--why", "replaced"]), 2)
+            self.assertEqual(stranded.main([*base, "--commit", self.approved, "--why", " "]), 2)
+            self.assertEqual(stranded.main(["drop", "--unit", "nobody", "--commit", self.approved, "--by", "builds",
+                                            "--why", "replaced"]), 2)
+            self.assertFalse(stranded.dropped_path().exists())
+            self.assertEqual(stranded.main([*base, "--commit", self.approved, "--why", "replaced"]), 0)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"stranded drop refused: natest: no commit 0123456789abcdef in {self.home}",
+            "stranded drop refused: --commit HEAD is not a hash of 7 to 40 hex characters",
+            "stranded drop refused: --commit --git-dir is not a hash of 7 to 40 hex characters",
+            "stranded drop refused: --by and --why must not be empty",
+            "stranded drop refused: no unit named nobody"])
+        self.assertEqual(printed.getvalue(),
+                         f"dropped natest {self.approved[:10]} by builds: replaced ({stranded.dropped_path()})\n")
+        self.assertEqual([record["commit"] for record in stranded.read_dropped()], [self.approved])
+
+    def test_a_second_drop_keeps_the_earlier_record(self) -> None:
+        _ = stranded.drop("natest", self.approved, by="builds", why="first", now=self.now)
+        _ = stranded.drop("natest", self.main, by="sdlc", why="second", now=self.now + 1)
+        self.assertEqual([(record["commit"], record["by"], record["why"]) for record in stranded.read_dropped()],
+                         [(self.approved, "builds", "first"), (self.main, "sdlc", "second")])
+
+
+    def test_a_drop_refuses_a_record_file_it_cannot_read_and_keeps_it(self) -> None:
+        path = stranded.dropped_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        assert self.unit is not None
+        good = {"unit_id": self.unit.id, "commit": self.main, "by": "builds", "why": "first", "at": 1.0}
+        for text in (json.dumps([good]) + ",", json.dumps([good, {"unit_id": self.unit.id}]), json.dumps(good)):
+            _ = path.write_text(text)
+            with self.assertRaises(stranded.DropRefused):
+                _ = stranded.drop("natest", self.approved, by="builds", why="second", now=self.now)
+            self.assertEqual(path.read_text(), text)
+        self.assertEqual(stranded.read_dropped(), [])
+        _ = path.write_text(json.dumps([good]))
+        _ = stranded.drop("natest", self.approved, by="builds", why="second", now=self.now)
+        self.assertEqual([record["why"] for record in stranded.read_dropped()], ["first", "second"])
 
 
 if __name__ == "__main__":

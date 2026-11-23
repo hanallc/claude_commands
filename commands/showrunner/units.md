@@ -167,6 +167,12 @@ The rows use these forms, with times in the user zone:
 
 The approved row says `in the merge line` when the hash is in the production's merge line.
 A merge of the same unit and phase on main at or after the approval clears the row.
+To remove an approved hash that is dropped on purpose, run this command:
+`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/stranded.py" drop --unit <unit name> --commit <hash> --by "<who>" --why "<reason>"`.
+The command finds the full commit in the unit home repository. It refuses a `--commit` that is not a hash of 7 to 40 hex characters, an unknown unit or commit, and an empty `--by` or `--why`.
+It also refuses when the record file is not a list of valid records, so no record is lost.
+The record holds the unit staff id, the full commit, `by`, `why` and the time.
+A drop is for one commit. A later approval of a new commit for the same phase shows again.
 The unit trees are the unit's home tree and the linked trees that belong to the unit.
 A tree belongs to only one unit, and the home tree of another staff row belongs to no other unit.
 A live run is a step record, a detached run of the unit, or a build queue run or wait in the tree.

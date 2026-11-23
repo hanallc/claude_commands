@@ -13,6 +13,7 @@ try:
 except FileNotFoundError:
     pass
 
+import argparse
 import hashlib
 import json
 import re
@@ -23,14 +24,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_runs, remote
 from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot
 from scripts.buildlog import store
 from scripts.direct import pass_record, plan_history, step_record
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.lib.user_zone import short_time
@@ -41,6 +42,7 @@ from scripts.worktree import finished_worktrees, worktrees
 
 SENDER = "stranded"
 SENT_FILE = "stranded_sent.json"
+DROPPED_FILE = "stranded_dropped.json"
 STATUS_WORKERS = 8
 FULL_HASH = re.compile(r"[0-9a-f]{7,40}")
 # A backticked hash, or the second hash of a backticked range; it has at least one letter.
@@ -243,8 +245,10 @@ def approved_rows(members: Sequence[staff.StaffRow], reads: board_reads.BoardRea
     When no local repository holds the commit, a closed run gives no row.
     For an open run, a phase merge in the production checkout clears the approval.
     Else the row shows with `commit not in a local repository` and is not sent.
+    A drop record of the unit and the commit removes the row.
     """
     found: dict[str, StrandedRow] = {}
+    dropped = read_dropped()
     for member in members:
         for run in reads.history.get(member.id, []):
             phases = board_reads.completed_phase_histories(reads.run(run.path).events)
@@ -253,7 +257,7 @@ def approved_rows(members: Sequence[staff.StaffRow], reads: board_reads.BoardRea
                 if isinstance(approval, NoApproval) or now - approval.at < limit:
                     continue
                 key = f"approved:{member.id}:{phase}:{approval.commit}"
-                if key in found:
+                if key in found or is_dropped(dropped, member.id, approval.commit):
                     continue
                 evidence = approval_evidence(reads, approval, member)
                 if isinstance(evidence, NoRepository) and not (
@@ -450,6 +454,94 @@ def rows(production: str, now: float, reads: board_reads.BoardReads | PassReads 
             *tree_rows(members, snapshot, board, live, now=now, limit=limit)]
 
 
+class DroppedRecord(TypedDict):
+    """A hash dropped on purpose: the unit staff id, the full commit, who dropped it, why, and when (UTC epoch)."""
+
+    unit_id: staff.StaffId
+    commit: str
+    by: str
+    why: str
+    at: float
+
+
+class DropRefused(Exception):
+    """The drop command cannot write a record."""
+
+
+def dropped_path() -> Path:
+    """One record file for all productions."""
+    return state_root() / DROPPED_FILE
+
+
+class NotARecord(Enum):
+    NOT_A_RECORD = "the entry is not a drop record"
+
+
+def dropped_record(entry: object) -> DroppedRecord | NotARecord:
+    if not isinstance(entry, dict):
+        return NotARecord.NOT_A_RECORD
+    fields = cast(dict[str, object], entry)
+    unit_id, commit, by, why = (fields.get(name) for name in ("unit_id", "commit", "by", "why"))
+    at = fields.get("at")
+    if (isinstance(unit_id, str) and isinstance(commit, str) and isinstance(by, str) and isinstance(why, str)
+            and isinstance(at, int | float) and not isinstance(at, bool)):
+        return DroppedRecord(unit_id=staff.StaffId(unit_id), commit=commit, by=by, why=why, at=float(at))
+    return NotARecord.NOT_A_RECORD
+
+
+def read_dropped() -> list[DroppedRecord]:
+    """The drop records for rule 1; a missing or unreadable file has none, and a malformed entry is skipped."""
+    try:
+        value = cast(object, json.loads(dropped_path().read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return []
+    return [record for entry in (cast(list[object], value) if isinstance(value, list) else [])
+            if not isinstance(record := dropped_record(entry), NotARecord)]
+
+
+def read_dropped_strictly(path: Path) -> list[DroppedRecord]:
+    """The drop records for a new drop. A file that is not a list of valid records refuses the drop, so no record is lost."""
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        raise DropRefused(f"{path} is not readable JSON; repair it first: {error}") from error
+    entries = cast(list[object], value) if isinstance(value, list) else []
+    records = [record for entry in entries if not isinstance(record := dropped_record(entry), NotARecord)]
+    if not isinstance(value, list) or len(records) != len(entries):
+        raise DropRefused(f"{path} is not a list of drop records; repair it first")
+    return records
+
+
+def is_dropped(records: Sequence[DroppedRecord], unit_id: staff.StaffId, commit: str) -> bool:
+    """A record names this unit and this commit. An approval from reply text can name an abbreviated hash."""
+    return any(record["unit_id"] == unit_id and record["commit"].startswith(commit.lower()) for record in records)
+
+
+def drop(unit: str, commit: str, *, by: str, why: str, now: float) -> DroppedRecord:
+    """Record that a unit commit is dropped on purpose, so rule 1 does not show it again."""
+    if not by.strip() or not why.strip():
+        raise DropRefused("--by and --why must not be empty")
+    if not FULL_HASH.fullmatch(commit.lower()):
+        raise DropRefused(f"--commit {commit} is not a hash of 7 to 40 hex characters")
+    members = [row for row in staff.active(staff.snapshot(), "unit") if row.name == unit]
+    if len(members) != 1:
+        raise DropRefused(f"no unit named {unit}" if not members else f"{len(members)} units named {unit}")
+    home = local_home(members[0])
+    if isinstance(home, HomeNotLocal):
+        raise DropRefused(f"{unit}: {home.value}")
+    resolved = worktrees.git(home, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False)
+    if resolved.returncode or not FULL_HASH.fullmatch(full := resolved.stdout.strip()):
+        raise DropRefused(f"{unit}: no commit {commit} in {home}")
+    record = DroppedRecord(unit_id=members[0].id, commit=full, by=by.strip(), why=why.strip(), at=now)
+    path = dropped_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path.with_name(path.name + ".lock")):
+        write_text_atomic(path, json.dumps([*read_dropped_strictly(path), record], indent=2) + "\n")
+    return record
+
+
 def sent_path(owner: staff.StaffRow) -> Path:
     return state_root() / owner.id / SENT_FILE
 
@@ -520,8 +612,30 @@ def notify_all(now: float) -> list[str]:
     return failures
 
 
-def main() -> int:
-    failures = notify_all(pass_record.now_epoch())
-    for failure in failures:
-        print(f"stranded list not sent for {failure}", file=sys.stderr)
-    return 1 if failures else 0
+def main(arguments: Sequence[str] = ()) -> int:
+    """With no arguments, send the new rows. `drop` records a hash dropped on purpose."""
+    if not arguments:
+        failures = notify_all(pass_record.now_epoch())
+        for failure in failures:
+            print(f"stranded list not sent for {failure}", file=sys.stderr)
+        return 1 if failures else 0
+    parser = argparse.ArgumentParser(prog="stranded.py", description="With no command, send the new stranded rows.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    dropping = commands.add_parser("drop", help="record a hash dropped on purpose; the stranded list skips it")
+    _ = dropping.add_argument("--unit", required=True, help="the unit staff name")
+    _ = dropping.add_argument("--commit", required=True, help="the commit; it must be in the unit home repository")
+    _ = dropping.add_argument("--by", required=True, help="who dropped the hash")
+    _ = dropping.add_argument("--why", required=True, help="why the hash is dropped")
+    parsed = parser.parse_args(arguments)
+    unit, commit, by, why = (cast(str, getattr(parsed, name)) for name in ("unit", "commit", "by", "why"))
+    try:
+        record = drop(unit, commit, by=by, why=why, now=pass_record.now_epoch())
+    except (DropRefused, OSError, staff.StaffRefused) as error:
+        print(f"stranded drop refused: {error}", file=sys.stderr)
+        return 2
+    print(f"dropped {unit} {record['commit'][:10]} by {record['by']}: {record['why']} ({dropped_path()})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
