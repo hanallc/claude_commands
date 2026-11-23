@@ -1107,14 +1107,25 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
         raise ValueError('The buildlog record differs from the result')
 
 
-def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, record_id: str) -> bool:
-    """Search the bytes that another import could have appended for this record."""
+@dataclass(frozen=True)
+class AppendedRecord:
+    row: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AppendRequired:
+    """The destination still needs this record."""
+
+
+def _appended_record(marker: Path, handle: BinaryIO, destination: Path,
+                     record_id: str) -> AppendedRecord | AppendRequired:
+    """Read the row that an earlier import appended for this record."""
     try:
         saved = read(marker)
     except FileNotFoundError:
-        return False
+        return AppendRequired()
     if saved.get('id') != record_id or saved.get('destination') != str(destination):
-        return False
+        return AppendRequired()
     offset = saved.get('offset')
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError('The gate import marker has an invalid file offset')
@@ -1126,12 +1137,15 @@ def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, 
             except ValueError:
                 continue
             if isinstance(previous, dict) and cast(dict[str, object], previous).get('id') == record_id:
-                return True
-    return False
+                return AppendedRecord(cast(dict[str, object], previous))
+    return AppendRequired()
 
 
 def import_record(folder: Path, row: dict[str, object]) -> None:
-    record = ledger.mapping(row['record'])
+    transferred = ledger.mapping(row['record'])
+    transferred_modules = cast(list[gate_record.ModuleRun], transferred['modules'])
+    modules = gate_record.without_module_reads(transferred_modules)
+    record = {**transferred, 'modules': modules}
     host = ledger.text(record, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
@@ -1143,19 +1157,30 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     with store.locked_append(destination) as handle:
         # The lock repairs a partial row before it gives us the offset.
         offset = handle.tell()
-        if not _import_already_appended(marker, handle, destination, record_id):
+        appended = _appended_record(marker, handle, destination, record_id)
+        if isinstance(appended, AppendRequired):
             save(marker, {'id': record_id, 'destination': str(destination), 'offset': offset})
             # An older box names the step merge-gate or targeted-test.
             record = {**record, 'step': gate.SuiteMode.step(ledger.text(record, 'step'))}
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
-                cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
+            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at, modules,
+                                          gate_box.execution_records(run))
             store.append_locked(handle, record)
+        else:
+            record = appended.row
+    gate_record.update_recent_times(record)
+    try:
+        gate_record.update_latest_module_reads(record, transferred_modules, host=store.host_name())
+    except (OSError, ValueError, RecursionError) as error:
+        detail = ' '.join(str(error).splitlines())
+        print(f'latest module reads not written: {detail}', file=sys.stderr)
+        return
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.
-        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, record_id)
+        retained = {**row, 'record': {**transferred, 'modules': modules}}
+        imported['result'] = keep_result(json.dumps(retained).encode(), store.CLOUD_GATE_PLACE, at, record_id)
     except OSError as error:
         gate_record.report_not_written(error)
     save(folder / 'imported.json', imported)
