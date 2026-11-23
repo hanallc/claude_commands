@@ -6,7 +6,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,7 @@ from types import FrameType
 from typing import cast, override
 from unittest import mock
 
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
 from scripts.buildlog import index
 from scripts.buildlog import launches
 from scripts.buildlog import record
@@ -65,9 +65,14 @@ class LaunchRecordingTests(unittest.TestCase):
             ["git", "init", "--quiet", "--initial-branch=main", str(self.worktree)],
             check=True, capture_output=True,
         )
+        aws_settings = base / 'config/aws_target.conf'
+        install_cost_settings(aws_settings)
+        write_gate_config(base / 'config/cloud_gate.conf')
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(base / "config"),
+            "AWS_TARGET_CONFIG": str(aws_settings),
+            "BUILD_TARGETS_STATE_DIR": str(base / "targets"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),
@@ -286,26 +291,25 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(imports["after"], imports["before"])
         self.assertIs(imports["record"], False)
 
-    def test_signal_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
+    def test_ctrl_c_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
         recorder_path = str(Path(record.__file__).resolve())
 
         def interrupt_recording(*profile_event: object) -> None:
             frame = cast(FrameType, profile_event[0])
             if (profile_event[1] == "call" and frame.f_code.co_name == "launch"
                     and frame.f_code.co_filename == recorder_path):
-                raise hana_shot.ExitSignal(signal.SIGTERM)
+                raise KeyboardInterrupt
 
         port = 15815
         with self.fake_launch_process(port) as process:
             previous_profile = sys.getprofile()
             try:
                 sys.setprofile(interrupt_recording)
-                with self.assertRaises(hana_shot.ExitSignal) as caught:
+                with self.assertRaises(KeyboardInterrupt):
                     _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
-            self.assertEqual(caught.exception.number, signal.SIGTERM)
             self.assertEqual(process.poll(), 0)
             self.assertFalse(hana_shot.launch_state_path(port).exists())
             self.assertFalse((self.root.parent / f"new-scratch-{port}").exists())

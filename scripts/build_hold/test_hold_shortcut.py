@@ -13,6 +13,7 @@ from typing import override
 from scripts.build_hold import test_build_hold
 from scripts.lib import test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
@@ -46,10 +47,11 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
         cache = self.scratch / "cache"
         seed_interpreter_cache(cache, python)
         self.environment = {
-            **os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            **memory_gate_shell_environment(), "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "XDG_CACHE_HOME": str(cache), "CLAUDE_PYTHON": "",
             "BUILDLOG_CALL_ID": "c1", "BUILDLOG_CALLER": "verify",
             "BUILDLOG_HOLD_PID": "12345", "BUILDLOG_HOLD_WAIT_FILE": str(self.wait_file),
+            "BUILD_TARGETS_SCRIPT": str(MEMORY_GATE.parent.parent / "build_targets" / "build_targets.py"),
             "TEST_STARTS": str(self.starts), "TEST_STATUS": "0", "GLOBIGNORE": "",
         }
         _ = self.environment.pop("CLAUDE_PYTHON", None)

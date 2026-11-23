@@ -70,12 +70,24 @@ class EtaProjectionUnavailable(NamedTuple):
     """The reported progress cannot support an ETA projection."""
 
 
+class CompleteRunHistory(NamedTuple):
+    """Every row of a run history was read."""
+
+    events: list[dict[str, object]]
+
+
+class IncompleteRunHistory(NamedTuple):
+    """The readable events cannot prove that an event is absent."""
+
+    events: list[dict[str, object]]
+
+
 @dataclass
 class HistorySnapshot:
     """Share staff and run history reads within one report."""
 
     record: staff.StaffSnapshot
-    events: dict[Path, list[dict[str, object]]] = field(default_factory=dict)
+    histories: dict[Path, CompleteRunHistory | IncompleteRunHistory] = field(default_factory=dict)
     plans: dict[Path, tuple[list[PlanPhase], list[str]]] = field(default_factory=dict)
 
     @cached_property
@@ -107,34 +119,51 @@ def staff_record() -> staff.StaffSnapshot:
     return snapshot.record if isinstance(snapshot, HistorySnapshot) else staff.snapshot()
 
 
-def _read_run_events(path: Path) -> list[dict[str, object]]:
-    """Read run events under a shared lock and skip invalid JSON rows."""
+def _read_run_history(path: Path) -> CompleteRunHistory | IncompleteRunHistory:
     try:
         with path.open(encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
             lines = handle.read().splitlines()
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except (OSError, UnicodeError):
-        return []
+        return IncompleteRunHistory([])
     events: list[dict[str, object]] = []
+    complete = True
     for line in lines:
         try:
             event = cast(object, json.loads(line))
         except json.JSONDecodeError:
+            event = None
+        if not isinstance(event, dict):
+            complete = False
             continue
-        if isinstance(event, dict):
-            events.append(cast(dict[str, object], event))
-    return events
+        fields = cast(dict[str, object], event)
+        kind = fields.get("event_type")
+        if not isinstance(kind, str) or not kind or (
+            kind == "phase_started"
+            and not all(pass_recorder.string(fields.get(key)) for key in ("phase_id", "phase_instance_id"))
+        ):
+            complete = False
+        events.append(fields)
+    events = pass_recorder.without_voided_checkpoints(events)
+    if complete and events and events[0].get("event_type") == "run_started":
+        return CompleteRunHistory(events)
+    return IncompleteRunHistory(events)
+
+
+def read_run_history(path: Path) -> CompleteRunHistory | IncompleteRunHistory:
+    """Read each run's history once within a report."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, NoHistorySnapshot):
+        return _read_run_history(path)
+    if path not in snapshot.histories:
+        snapshot.histories[path] = _read_run_history(path)
+    return snapshot.histories[path]
 
 
 def read_run_events(path: Path) -> list[dict[str, object]]:
-    """Read each run's events once within a report, or directly outside it."""
-    snapshot = _history_snapshot.get()
-    if isinstance(snapshot, NoHistorySnapshot):
-        return _read_run_events(path)
-    if path not in snapshot.events:
-        snapshot.events[path] = _read_run_events(path)
-    return snapshot.events[path]
+    """Return the readable events for reports that can use partial history."""
+    return read_run_history(path).events
 
 
 def history_root() -> Path:
@@ -213,7 +242,7 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     try:
         with path.open(encoding="utf-8") as handle:
             first_line = handle.readline()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     try:
         parsed = cast(object, json.loads(first_line))

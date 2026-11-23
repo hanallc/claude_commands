@@ -6,7 +6,8 @@ from pathlib import Path
 import subprocess
 import unittest
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_records import process_start_time
+from scripts.build_queue.admission_test_support import caller_admission, only_admitted
 from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_doc_test_support import VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
@@ -30,10 +31,11 @@ else:
 class VerifyAdmissionSignalsTests(VerifyDocFixture):
     def test_nested_verify_refuses_before_a_token_or_admission_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
-        grant = admission.occupy_host()
+        start = process_start_time(os.getpid())
+        assert start is not None
+        outer = admission.request(owner=wire.Owner(os.getpid(), start))
         with admission.loop_turn():
-            outer = next(row for row in admission.server.reservations.values()
-                         if row.reservation_id == grant.reservation)
+            grant = only_admitted(admission.server.handle_request(outer))
         self.environment["BUILDLOG_RESERVED_STEP"] = (
             f"{grant.reservation}\t{outer.owner.pid}\t{admission.state_dir.resolve()}")
         result = subprocess.run(["bash", str(VERIFY), "doc"], cwd=self.repo,
@@ -76,6 +78,10 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                 output, errors = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, output + errors)
                 self.assertEqual(processes_carrying(marker), set())
+                self.assertEqual(list((self.root / "slots").glob("*")), [])
+                with admission.loop_turn():
+                    self.assertFalse(any(request.owner.pid == process.pid
+                                         for request in admission.server.placement_requests.values()))
                 self.assertEqual(self.cargo_calls() if self.events.exists() else [], [])
                 self.assertNotEqual(process.pid, os.getpid())
 

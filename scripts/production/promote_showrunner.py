@@ -197,7 +197,9 @@ def save_promotion(promotion: Promotion, target: Path) -> None:
 
 def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) -> int:
     """Finish our saved conversation in its child tab, without launching it again."""
-    place = herdr.herdr_place_of(pid)
+    place = herdr.process_placement(pid)
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        raise Refusal(place.reason)
     if (isinstance(place, herdr.NotInHerdr)
             or herdr.Herdr(place.session).native_session(place.pane, "claude", herdr.PROGRAM_TIMEOUT_SECONDS)
             != promotion.claude.session_id):
@@ -207,10 +209,11 @@ def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) ->
     prompt = f"/showrunner:produce {promotion.child.doc} resume"
     transcript = herdr.SessionTranscript(target, promotion.claude.session_id)
     outcome = herdr.submitted_prompt(transcript, prompt, at)
-    if not isinstance(outcome, herdr.PromptSubmitted):
+    if outcome.state != "confirmed":
         outcome = herdr.Herdr(place.session).submit_opening_prompt(
-            place.pane, herdr.OpeningPrompt(prompt, transcript), at, 90_000)
-    if isinstance(outcome, herdr.PromptNotSubmitted):
+            place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), at, 90_000)
+    if outcome.state != "confirmed":
+        print(f"promote_showrunner: {outcome.reason}", file=sys.stderr)
         return add_showrunner.SESSION_NOT_READY
     if not add_showrunner.showrunner_appeared(promotion.child.name):
         return 1
@@ -331,9 +334,10 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
     _ = parser.add_argument("--check", action="store_true", help="run every refusal and stop nothing")
     args = parser.parse_args(argv)
-    record = staff.snapshot()
     unit_name = cast(str, args.unit)
     child_name = cast(str, args.production) or unit_name
+    staff.validate_unit_name_for_write(child_name)
+    record = staff.snapshot()
     document = cast(Path | ProductionDocumentDefault, args.doc)
     model = cast(str, args.model)
     effort = cast(str, args.effort)
@@ -384,7 +388,7 @@ def _main(argv: list[str]) -> int:
             raise Refusal(f"{unit} now runs a different conversation; kept its promotion record")
         stopped = stop(promotion._replace(marked=current, claude=current.claude)
             if current is not None and isinstance(current.claude, unit_lookup.LiveClaude) else promotion)
-    except Refusal as refusal:
+    except (OSError, Refusal) as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
         return 2
     if not stopped:

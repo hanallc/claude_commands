@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.buildlog import index
 from scripts.buildlog import parse
 from scripts.buildlog import repository
@@ -202,6 +203,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["tests_skipped"], 0)
         self.assertEqual(result["tests_flaky"], 1)
         self.assertEqual(result["tests_retried"], 2)
+        self.assertEqual(result.get("observed_tests"), {
+            "by_binary": {
+                "alpha": ["tests::fails", "tests::adds", "tests::flaky", "tests::slow"],
+                "beta": ["tests::doubles"],
+            },
+            "complete": True,
+        })
         # The warning cargo repeats for the lib test target counts once.
         self.assertEqual(result["warnings"], 1)
         rows = {row["test"]: row for row in result["tests"] or []}
@@ -218,6 +226,7 @@ class FixtureTests(unittest.TestCase):
         tests = {row["test"] for row in result["tests"] or []}
         self.assertEqual(tests, {"tests::fails", "tests::flaky", "tests::slow"})
         self.assertEqual(result["tests_run"], 5)
+        self.assertEqual(result.get("observed_tests"), facts("nextest", "nextest").get("observed_tests"))
 
     def test_mend_times_and_fixes(self) -> None:
         result = facts("mend", "mend")
@@ -244,9 +253,7 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         self.enterContext(mock.patch.dict(os.environ))
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]
@@ -384,8 +391,9 @@ class NextestFormTests(unittest.TestCase):
             _ = write_config_fixture(config / "test_times.conf")
             _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
-                self.assertEqual((rows, summaries), ([], []))
+                result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((result.timing_rows, result.summaries), ([], []))
+                self.assertEqual(result.observed, {"by_binary": {}, "complete": False})
                 with self.assertRaises(ValueError):
                     _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
 
@@ -418,6 +426,7 @@ class NextestFormTests(unittest.TestCase):
         result = parse.log_facts("nextest", "  TRY 1 FAIL [   0.003s] (───) alpha tests::fails\n")
         self.assertIsNone(result["tests_run"])
         self.assertEqual([row["test"] for row in result["tests"] or []], ["tests::fails"])
+        self.assertEqual(result.get("observed_tests"), {"by_binary": {"alpha": ["tests::fails"]}, "complete": False})
 
 
 class CargoSubcommandTests(unittest.TestCase):

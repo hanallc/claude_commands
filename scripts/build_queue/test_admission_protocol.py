@@ -1,12 +1,14 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, memory_gate_shell_environment
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -25,6 +27,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
@@ -57,6 +60,35 @@ class ProtocolTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "placement requires version 3"):
                         _ = wire.encode_reply(reply, version=2)
 
+    def test_placement_status_report_parses_across_service_and_client_versions(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt,
+                                                                include_permission=True)
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused("runner"),
+                                                     placement.DispatchPathSettled(), NOW)
+            known = status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("runner"),
+                placement.NoProviderClaim(), placement.PermissionConsumed(NOW), report)
+            reply = status_wire.PlacementStatusReply(known)
+            encoded = wire.encode_reply(reply)
+            self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            status = cast(dict[str, object], cast(dict[str, object], envelope["data"])["status"])
+            # An older service sends no report: the client reads no report, so Verify keeps the lost path.
+            del status["report"]
+            older_service = wire.parse_reply(json.dumps(envelope), status_request)
+            self.assertEqual(older_service,
+                             status_wire.PlacementStatusReply(replace(known, report=placement.NoTerminalReport())))
+            # An older client reads a reply with a field it does not know.
+            status["field_from_a_newer_service"] = "ignored"
+            self.assertEqual(wire.parse_reply(json.dumps(envelope), status_request), older_service)
+
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
@@ -76,32 +108,40 @@ class ProtocolTests(unittest.TestCase):
                     self.assertIsInstance(parsed.run, wire.NoRun)
                     self.assertIsInstance(parsed.prerequisite, placement.TokenNotRequired)
                     self.assertIsInstance(parsed.purpose, placement.NormalStep)
-                    self.assertEqual(parsed.constraints.source_key, placement.SourceKeyKnown(old_source) if old_source
-                        else placement.SourceKeyUnavailable("older request has no source key"))
+                    self.assertEqual(parsed.constraints.source_key, execution_identity.SourceKeyKnown(old_source) if old_source
+                        else execution_identity.SourceKeyUnavailable("older request has no source key"))
             assignment = placement.PlacementAssignment(current.episode, "older-attempt",
                 current.constraints.candidates[0].destination, current.constraints.source_key,
                 current.owner, current.constraints.session, current.since)
             claim = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
                 assignment.destination.scope, "older-claim", assignment.episode, assignment.attempt)
+            refusal = wire.ClaimFailure("settings-refusal", assignment, "off",
+                refusal_settings=records.RefusalSettings("disabled-settings"))
+            self.assertEqual(wire.parse_request(wire.encode_request(refusal)), refusal)
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(refusal)))
+            del cast(dict[str, object], envelope["data"])["refusal_settings"]
+            self.assertEqual(wire.parse_request(json.dumps(envelope)),
+                replace(refusal, refusal_settings=records.NoRefusalSettings()))
             consume = cast(dict[str, object], json.loads(wire.encode_request(wire.ConsumePermission("older-consume", assignment, claim))))
             del cast(dict[str, object], consume["data"])["holder"]
             parsed_consume = wire.parse_request(json.dumps(consume))
             assert isinstance(parsed_consume, wire.ConsumePermission)
             self.assertIsInstance(parsed_consume.holder, placement.ClaimHolderUnconfirmed)
             report = cast(dict[str, object], json.loads(wire.encode_request(wire.ExecutionReport(
-                "older-report", assignment, claim, placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
+                "older-report", assignment, claim, execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
             report_data = cast(dict[str, object], report["data"])
             report_data["outcome"] = ""
             del report_data["path"]
             parsed_report = wire.parse_request(json.dumps(report))
             assert isinstance(parsed_report, wire.ExecutionReport)
-            self.assertIsInstance(parsed_report.evidence, placement.ExecutionEvidenceUnavailable)
+            self.assertIsInstance(parsed_report.evidence, execution_identity.ExecutionEvidenceUnavailable)
             self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
             self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
 
 
     def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
-        for operation in ("import", "release reply"):
+        identity = wire.Identity("session", "caller", "test-modules", "/fixture", job=StepJob("test-modules", modules=3))
+        for operation in ("import", "release reply", "recorded job"):
             with self.subTest(operation=operation):
                 source = "import json, sys; from scripts.build_queue import admission_client; "
                 if operation == "release reply":
@@ -109,8 +149,15 @@ class ProtocolTests(unittest.TestCase):
                         "wire = admission_client.wire; "
                         "reply = wire.parse_reply(wire.encode_reply(wire.Ok()), wire.ReleaseRequest('request', 'reservation', 0)); "
                         "assert isinstance(reply, wire.Ok); ")
+                arguments: list[str] = []
+                if operation == "recorded job":
+                    source += (
+                        "wire = admission_client.wire; "
+                        "identity = wire.parse_record(sys.argv[1], wire.Identity); "
+                        "assert identity.job.modules == 3; ")
+                    arguments.append(wire.encode_record(identity))
                 source += "print(json.dumps(sorted(sys.modules)))"
-                result = subprocess.run([sys.executable, "-c", source],
+                result = subprocess.run([sys.executable, "-c", source, *arguments],
                     cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                     timeout=TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -140,6 +187,19 @@ class ProtocolTests(unittest.TestCase):
                         envelope["v"] = version
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
 
+    def test_the_owning_session_survives_the_request_wire(self) -> None:
+        with AdmissionFixture() as fixture:
+            for session in (OwningSession("fps-run"), NoOwningSession(), wire.SessionNotSent()):
+                with self.subTest(session=session):
+                    request = replace(fixture.request(), session=session)
+                    self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
+            older = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(
+                replace(fixture.request(), session=OwningSession("fps-run")))))
+            del older["data"]["session"]
+            parsed = wire.parse_request(json.dumps(older))
+            assert isinstance(parsed, wire.AdmitRequest)
+            self.assertEqual(parsed.session, wire.SessionNotSent())
+
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
         from scripts.build_queue.test_placement import placement_request, coordinator_holder
 
@@ -155,11 +215,11 @@ class ProtocolTests(unittest.TestCase):
                 wire.ClaimFailure("foreign-claim", assignment, "busy",
                     replace(claim, episode="previous-episode", attempt="previous-attempt")),
                 wire.ConsumePermission("consume", assignment, claim),
-                wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
-                wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
+                wire.ExecutionReport("report", assignment, claim, execution_identity.ExecutionNotStarted()),
+                wire.ExecutionReport("report-observed", assignment, claim, execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
                 wire.ExecutionReport("report-unavailable", assignment, claim,
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
                 wire.ConsumePermission("consume-child", assignment, claim, holder=coordinator_holder(assignment)),
                 wire.PrerequisiteReport("token-held", request.episode, request.owner, placement.TokenHeld()),
                 wire.CancelPlacement("cancel", request.episode, request.owner, "caller ended"),
@@ -169,14 +229,14 @@ class ProtocolTests(unittest.TestCase):
             requests.append(replace(request, local=wire.LocalAdmissionUnavailable("old caller")))
             requests.append(replace(request, purpose=placement.SpeculativeCopy("local-parent", fixture.clock.now())))
             for outcome, evidence, path in (
-                (placement.AttemptRunning(), placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
+                (placement.AttemptRunning(), execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
                     placement.DispatchPathPending("start child runs")),
-                (placement.AttemptCompleted(17), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.PrelaunchRefused("disk"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.AttemptCancelled("caller ended"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCompleted(17), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.PrelaunchRefused("disk"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCancelled("caller ended"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
                 (placement.AttemptOutcomeUnavailable("unreachable"),
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
                     placement.DispatchPathPending("start child has no result")),
             ):
                 requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))
@@ -300,11 +360,19 @@ class ProtocolTests(unittest.TestCase):
             line = json.dumps(encoded) + "\n"
             self.assertEqual(wire.parse_reply(line), reply)
             granted = admitted_reply()
-            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            exchange = Exchange(line.encode())
+            transport = ScriptedTransport(fixture.clock, exchange)
             waits: list[wire.Wait] = []
-            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
-                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
-                result = client.admit(request, waits.append, lambda: request)
+
+            def receive_wait(wait: wire.Wait) -> None:
+                waits.append(wait)
+                exchange.events.append(wire.encode_reply(granted).encode())
+
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(socket, "socket", side_effect=transport.socket),
+                  mock.patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  redirect_stderr(io.StringIO())):
+                result = client.admit(request, receive_wait, lambda: request)
             self.assertEqual(waits, [reply])
             self.assertEqual(result, granted)
             self.assertEqual(len(transport.requests), 1)
@@ -391,8 +459,13 @@ class ProtocolTests(unittest.TestCase):
         for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
             with self.subTest(name=name):
                 self.assertEqual(f"production/{name}" in admission_code.ADMISSION_CODE_PATHS, expected)
+        source = Path(__file__).resolve().parents[1]
+        test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
+        admission_modules = {str(path.relative_to(source))
+                             for path in (source / "build_queue").glob("admission_*.py")
+                             if path.name not in test_modules}
+        self.assertEqual(sorted(admission_modules.difference(admission_code.ADMISSION_CODE_PATHS)), [])
         with AdmissionFixture() as fixture:
-            source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"
             for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh", "lib/py"):
                 target = scripts / relative
@@ -400,7 +473,8 @@ class ProtocolTests(unittest.TestCase):
                 _ = target.write_bytes((source / relative).read_bytes())
                 target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
-            environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
+            environment = memory_gate_shell_environment()
+            _ = environment.pop("BUILDLOG_ADMISSION_CODE_VERSION", None)
             command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"
@@ -499,6 +573,30 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                                 _ = decode_legacy(json.dumps(envelope))
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
                         self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
+
+    def test_verify_metadata_is_optional_and_older_decoders_ignore_it(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            old = fixture.request(step="build")
+            assert isinstance(old.profile, records.StepProfile)
+            old = replace(old, profile=replace(old.profile,
+                peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, 10))))
+            facts = records.VerifyCall("build", "verify build sample --release", 1, 1)
+            request = replace(old, identity=replace(old.identity, verify=facts))
+            encoded = wire.encode_request(request)
+            self.assertEqual(wire.parse_request(encoded), request)
+            old_message = wire.encode_request(old)
+            self.assertNotIn('"verify":', old_message)
+            self.assertEqual(wire.parse_request(old_message), old)
+            placed = placement_request(fixture)
+            placed = replace(placed, identity=replace(placed.identity, verify=facts))
+            self.assertEqual(wire.parse_request(wire.encode_request(placed)), placed)
+            for version in (1, 2):
+                previous = cast(dict[str, object], json.loads(old_message))
+                current = cast(dict[str, object], json.loads(encoded))
+                previous["v"] = current["v"] = version
+                self.assertEqual(decode_legacy(json.dumps(previous)), decode_legacy(json.dumps(current)))
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:

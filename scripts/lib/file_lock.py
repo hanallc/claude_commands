@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 PROC_LOCKS = "/proc/locks"
@@ -19,10 +22,64 @@ class LockResult(Enum):
     BUSY = "busy"
 
 
+class LockAvailability(Enum):
+    AVAILABLE = "available"
+    HELD = "held"
+
+
+def probe_existing_exclusive(path: Path) -> LockAvailability:
+    """Probe the lock without waiting or creating a file."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return LockAvailability.AVAILABLE
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"{path}: expected a regular lock file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return LockAvailability.HELD
+    finally:
+        os.close(descriptor)
+    return LockAvailability.AVAILABLE
+
+
+@dataclass(frozen=True)
+class ExclusiveLock:
+    """Own a locked descriptor that a child can inherit."""
+
+    descriptor: int
+
+    def close(self) -> None:
+        """Close this handle without releasing a child's inherited lock."""
+        os.close(self.descriptor)
+
+    def release(self) -> None:
+        """Release the shared lock and close this handle."""
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            self.close()
+
+
+def take_exclusive(path: Path) -> ExclusiveLock | Literal[LockResult.BUSY]:
+    """Acquire a lock without waiting; transfer its ownership to the caller."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return LockResult.BUSY
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return ExclusiveLock(descriptor)
+
+
 @contextmanager
 def exclusive(path: Path, *, wait: bool = True) -> Generator[LockResult]:
     """Release an acquired lock when the operation ends."""
-    with path.open("a+", encoding="utf-8") as stream:
+    with path.open("a", encoding="utf-8") as stream:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError:

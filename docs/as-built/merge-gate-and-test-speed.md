@@ -52,6 +52,92 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Whole gate route
+
+The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
+The assignment must match the gate's placement episode and submitting process.
+The queue must confirm that the saved attempt is current.
+If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
+An assignment to `natedev` runs the gate on natedev.
+An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
+The AWS route refuses assigned gates that request type checks.
+An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
+The gate reads the guest switch after it confirms the `mac-linux` assignment.
+If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
+The guest test timer uses `run.time_limit_seconds`.
+The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
+When the test timer expires, the gate returns the guest's time-limit report.
+If the first guest probe fails, the route records a retry backoff for `mac-linux`.
+The route reads and writes this record independently of the placement registry.
+If the write fails, the route adds the write error to the probe failure.
+`mac_test.free_now` reads this backoff now.
+Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
+After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
+This one setting is for every machine. The `mac-linux` and AWS routes read it.
+The setting accepts whole numbers from 1 to 86400 seconds.
+The route takes the Mac repository claim before the first SSH request.
+The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
+If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
+The route sends no more cleanup requests.
+The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
+The queue's guestkeep change will retain the Mac claim until a later proof.
+If the guest starts no test run, the route returns `GuestNotStarted`.
+This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The new assignment goes into the same file, and the gate runs again on the assigned machine.
+The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
+If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
+A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
+If no named machine remains, the gate step stops with "Gate placement blocked".
+A refused placement during the retry stops the gate step with "Gate placement blocked".
+A failure after the guest armed the run is not placed again: the gate fails.
+`copies.py run` with named gate targets does not place the gate again yet.
+If the guest cannot return a result, the gate fails and reports the guest and the reason.
+If the guest returns a failure, the gate reports the guest and the failed jobs.
+A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
+When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
+If AWS refuses that unassigned run, natedev runs the selection.
+
+On natedev, a hand made run starts its program under `bwrap` with a read limit (`scripts/production/hand_made_limit.py`).
+The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
+A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
+The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
+The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
+The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
+natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
+The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
+When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
+When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
+
+The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
+It holds one argv, the work name and the owner unit, in place of the test selection.
+A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
+A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
+After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
+`GuestRefusedCommand` ends the attempt as a refusal and gives nothing back, as a refused word on the Mac does.
+`GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
+Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
+The request also holds the checkout path of each file that natedev read for an argv word.
+After the checkout and clean of the numbered copy, `command_refusal` checks each argv word; a failed word ends the run before the start.
+The guest then prints a refused line with the attempt, and `wait_for_start` raises `GuestRefusedCommand`.
+A later word that names a `main_folder` fails: python runs a `__main__` file of that folder, such as `__main__.py` or `__main__.pyc`. Natedev uses the same `main_folder`.
+A word with a checked file passes. For another word with a slash, the path from the copy must have no `..` and no symbolic link in a part, and its last part must not exist.
+Another later word with no slash must name no entry of the copy other than a plain folder, for example the `.lint-sweep-used` stamp.
+The check uses `lstat` on each part and follows no link outside the sandbox. An `lstat` error other than a missing part fails the word.
+For a word with no slash, each guest PATH match must be in `TOOL_FOLDERS` or be a compiled file outside the copy.
+For a later word, each readable PATH match counts, because bash finds a script name on PATH with no execute bit.
+The check reads PATH outside the sandbox; the sandbox `/tmp` and `/dev/shm` start empty, so the sandbox finds no file there that the check does not see.
+The guest prints a lock line with the attempt to stderr when it has taken the run lock.
+A failed lock step exits with `GUEST_NOT_LOCKED_STATUS`.
+The guest prints a start line with the attempt before it starts the argv.
+`GuestCommand.start` returns at that line, and a stream that ends before it is a start failure with the guest output.
+A stream that ends before the lock line with `GUEST_NOT_LOCKED_STATUS` raises `GuestNotLocked`, and `finish` proves no end.
+The gate route still proves the end after a failed lock step.
+The guest runs the argv in its numbered copy and streams the output to the caller.
+The stream sends no byte count and no full bundle after a refused delta bundle.
+A current assignment to an unsupported target fails and reports the target.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
@@ -72,7 +158,7 @@ Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
 Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
-An explicit type request and the nightly checker remain local.
+The nightly type check runs on natedev.
 
 The route tries all public zones at `m7a.8xlarge`, then all zones at `m7a.4xlarge`.
 Both sizes use one-time Spot with termination on interruption and shutdown.
@@ -98,6 +184,9 @@ The history counts an older file of cloud gate runs under a box name as `aws` to
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
 Local fallback prints `Cloud gate uses natedev: <reason>`.
 These lines contain no account, instance, or subnet identifier.
@@ -152,6 +241,7 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
 | `log_push_s` | `5` | Send progress logs. |
 | `result_poll_s` | `2` | Check remote results. |
+| `unreachable_wait_seconds` (`build_targets.conf`) | `600` | End a run whose box sends no new log for this long, counted from launch. The box ends. An assigned run fails with `unreachable`; a run with no assignment runs again on natedev. Paired trials are not checked. |
 | `observe_outage_s` | `180` | Keep polling a running box through a short AWS outage. |
 | `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
 | `api_timeout_s` | `30` | Bound each scaler API command. |
@@ -164,9 +254,9 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `expiry_memory_mib` | `128` | Size the expiry function. |
 | `shared_usd_per_month` | `1` | Price shared gate resources before creation. |
 | `credential_file` | `~/.config/aws-build/credentials` | Select the service's private scaler file. |
-| `packages` | See the configured list below. | Prepare the common trial and production tools. |
+| `packages` | List in `config/cloud_gate.conf`. | Prepare tools for cloud gates and paired trials. |
 
-The package list contains `git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq gcc pkg-config tmux taplo zsh bash gh sqlite chromium util-linux awscli2`.
+The list includes bubblewrap for tests that need a sandbox.
 The existing `aws_target.conf` supplies the profile, region, placement, accounting settings, and shared limits.
 
 Fake AWS tests cover launch order, lost replies, restart recovery, expiry, termination, result validation, fallback, and concurrent cap reservations.
@@ -212,7 +302,7 @@ The regression tests observe complete operations and child processes.
 | Test | Observation |
 |---|---|
 | `test_resolve_reuses_the_stored_role_and_live_model_identity` | Worker reuse reads the registry zero times with both operation snapshots cleared. |
-| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor publishes its row with exactly two registry reads. |
+| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor saves its row with one registry read under the lock. |
 | `test_sync_codex_catalog.sh` | Lock contention produces no registry reads; an acquired lock permits reads before an invalid cache fails. |
 | `test_failed_catalog_sync_warns_and_returns_the_current_configuration` | Both fresh factories warn after sync failure and return the current path and text. |
 
@@ -242,12 +332,24 @@ A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or
 A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
 Python files are not callers in this rule.
 Merge gates and nightly runs use all modules.
-Default merge and tests-only runs do not run basedpyright.
+Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
-An explicit `--type-dirs scripts` runs the check by hand.
 The queue reservation and the runner governor use separate configuration keys.
+Gate startup checks recovery records for dead gate processes across checkouts.
+A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Successful recovery removes a record if it names no retained folders.
+Recovery reports retained folders for manual removal and keeps their finished record.
+The scanner skips finished records on later runs.
+If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
+Each gate process reports a refused record once.
+The gate keeps that record and checks the remaining records.
+A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
+A descriptor variable name ends in `_FD` or `_FDS`, or contains `_FD_`.
+Gate jobs keep only the descriptor numbers that the gate passes to the child.
+Gate jobs drop the systemd socket count `LISTEN_FDS`.
+On Linux, the gate passes its source descriptor to test modules for interpreter startup.
 After the parallel pass, up to eight failed modules run once more, alone.
 The final test results decide the gate.
 On Linux, `module_run.py` adopts orphaned test processes in a separate parent before it imports test code.
@@ -289,6 +391,14 @@ The completion case retains its strict socket send.
 
 ## How it works
 
+### Mac gate journal cleanup
+
+Each Mac gate attempt stores its process groups in `~/.local/state/mac-gate/<attempt>/run.json` on the Mac.
+When a task has an end receipt, cleanup checks each live recorded group against its saved process start.
+Cleanup stops the confirmed groups and removes the journal, even when the temporary build folder is gone.
+The receipt stays with a retained checkout.
+See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
+
 ### Targeted tests: `scripts/production/targeted_test.py`
 
 The entry has its own parser and description.
@@ -303,7 +413,7 @@ Queue tables and cards use `[names]`; `test-affected` has the shown name `test a
 Other step IDs keep their display text.
 Sentences use `[prose]`, then the shown name as a fallback.
 The step column fits `test affected`.
-Build holds apply to both entries. Their test children keep the same hold rules.
+Build holds apply to both entries, with the configured exemption for named module runs.
 Temporary folders use each step's prefix from `config/build_folders.conf`.
 
 Each `gate_run` record carries `step`. Old records retain an empty step in the index.
@@ -313,13 +423,21 @@ This record changes no selection and refuses no run.
 
 ### The gate: `scripts/production/merge_gate.py`
 
-**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
+**Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
-`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
-This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
-A red module runs once more alone, as in the gate.
-The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
-`--module` without `--tests-only` is refused.
+Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+Use the module names that the gate prints.
+A standalone named run waits for the build hold to clear and takes one local admission reservation.
+The named run of the unit in `max_runs.exempt_unit` does not wait for the build hold.
+A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
+It reads the reservation from the state folder in the grant and checks that release has not started.
+The child runs one module at a time and takes no additional CPU slot.
+The Builds page shows the run while it holds the reservation.
+The reservation counts as one run under `max_runs.natedev.claude_commands`.
+Modules share the CPU slots and use the memory governor.
+A failed module can run once more alone.
+The named run has no time limit and creates no gate record or passed-tree entry.
+The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -327,7 +445,6 @@ After the last promotion step, it adds rows only for merges on `origin/main`.
 It prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
 A line with `after <step>` waits for the completed `live` step.
 The session runs `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
-`--type-dirs` (alias `--type-dir`) defaults to no folders.
 A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 `GateArguments(argparse.Namespace)` defines the arguments; each refusal raises `GateRefused`.
 
@@ -448,12 +565,25 @@ A failure of only the type check removes an existing marker and does not require
 Every red nightly waits for the result lock before it saves its result.
 It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
-The gate sends no red result push.
+The gate sends each author unit its own type diagnostics.
+Git blame identifies the commit for each diagnostic on the tested tree.
+The gate checks for a `fast-track(<unit>)` subject first.
+For other commits, it uses the earliest checkpoint receipt whose merge added the commit.
+The gate skips main integration receipts and commits already present in the merge's first parent.
+The gate reads the receipt file without a lock and skips incomplete rows.
+The gate uses the producer ID saved for the merge.
+When the merge has no producer record, the gate matches the receipt's plan to a unit under the production owner.
+When every diagnostic reaches its author and the tests pass, the gate assigns the result to the unit with the most diagnostics.
+Each unit notice shows up to 20 diagnostic lines and counts any omitted lines.
+The gate caps each diagnostic line at 512 bytes.
+The notice names the files and gives a `basedpyright` command.
+When the file list exceeds 512 bytes, the notice shows part of the list and gives the command for all of `scripts`.
+The notice to the production owner also shows up to 20 lines from the list of author units and their diagnostics.
 `${GATE_STATE_DIR:-~/.local/state/gate}/nightly-red/<id>.json` stores each red result.
 The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
-The notice names the failed test files and includes the result ID.
+When a result needs manual assignment, the notice names the failed test files and includes the result ID.
 After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
 The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
@@ -462,7 +592,9 @@ It saves the assignment before it sends `nightly.assigned`.
 The push places the receipt and assignment status before the failure list.
 The phone retains that status when it truncates a long failure list.
 A rerun prints `unchanged` after the sender accepts the push.
-Only `nightly-assigned` sends the user push, and the push names the assignee.
+Both automatic and manual assignment send a user push.
+The push names the assignee when the receipt is confirmed.
+If automatic assignment has no confirmed receipt, the push shows the nightly result without a receipt time.
 An unassigned red result never sends a user push.
 `merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
 The alert repeats once in each later deadline window until the fix is assigned.
@@ -472,7 +604,8 @@ A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
 Assignment and the check use the same file lock.
-A failed push keeps the result pending; run `nightly-assigned` again to send it.
+A failed push keeps the result pending.
+The next `nightly-check` retries the push for each assigned result with pending delivery.
 Each red result uses the key `nightly-result:<id>`.
 The sender suppresses a second accepted push for the complete `datetime` range.
 This also prevents another push when the gate cannot save its acceptance state.
@@ -486,9 +619,10 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 **Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE, machine=SharedMachine()) -> GateRun`):
 
 `SharedMachine` is the default and keeps the existing shared scheduling behavior.
+`HoldExemptNamedModuleMachine` uses shared scheduling and skips the build hold.
 `WholeMachine` uses one job per CPU and runs every discovered module without reruns.
 It uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
-Both modes use one launch loop with the same commands, test environments, timeouts, tripwires, and process cleanup.
+All three modes use the same launch loop, commands, test environments, module timeouts, tripwires, and process cleanup.
 `WholeMachine` prints each completed job's name, exit status, and seconds.
 `WholeMachine.module_seconds` supplies recorded times to `module_order`, which places unknown modules first, then measured modules from slowest to fastest.
 Without recorded times, `WholeMachine` keeps the discovery order. It writes no module times file.
@@ -509,12 +643,13 @@ The guest timeline records CPU busy percent between samples from the aggregate `
 The guest result records busy CPU seconds, gate seconds, vCPU count, and CPU use percent during the gate.
 CPU use percent equals 100 times busy CPU seconds divided by vCPU count times gate seconds.
 The trial text table shows CPU use percent for each size and run.
-The admission, scheduling caches, and rerun rules below apply to `SharedMachine`.
+The admission, scheduling caches, and rerun rules below apply to `SharedMachine` and `HoldExemptNamedModuleMachine`.
 
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
-- Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
+- Before any job starts it refuses (and the merge rolls back) if the test list is empty or `/dev/shm` is not writable. The nightly runner also requires the `scripts` folder.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
-- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `gate` reservation through `queue_place`.
+- **Shared admission.** `gate_reservation` obtains one `gate` reservation through `queue_place`.
+  `SharedMachine` waits for the build hold to end before it requests admission.
   Targeted tests use step `test-affected` through the same reservation path.
   It reads `program_first_peak_gib.gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
@@ -538,23 +673,38 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Stop signals interrupt the wait without a masked blocking read.
   Cleanup returns all registered slots.
   Steve recovers a byte at process exit if a signal interrupts its registration after the read.
-  The gate checks holds again after the blocking read.
+  `SharedMachine` checks holds again after the blocking read.
   If a hold prevents admission, the gate returns the slot before it waits for the hold.
   An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
   Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
   The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
   Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
-- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
+- Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
+  The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  Both modes use the configured gate root for top-level runs.
+  If that root contains the calling module folder, the nested gate uses the module folder as its parent.
+  The outer gate removes the nested gate files when it removes the module folder.
+  The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
+  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  On Linux, the bootstrap first checks for a verified gate parent.
+  It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
+  If neither check proves a gate launch, it reads the cgroup name once.
+  For a matching direct test scope, one systemd query checks for a finite runtime limit and SIGKILL.
+  A process with an existing limit keeps its current folder and reads no test limit configuration.
+  A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
+  Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
+  Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
+  At the deadline the watchdog stops the test first and then prints the limit line. The watchdog stops only the test process, not its children.
+  Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
+  The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `targeted_test.py` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
+  `gate.py --affected` uses the same test-folder context for its outer run.
+  These folders use `<inherited TMPDIR>/test-runs/r*`.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that test-runs parent.
+  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -562,10 +712,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - Each test module gets a fresh `BUILDLOG_DIR` inside its temp root, so its log rows cannot reach the real build log.
 - Each test module starts with tripwires for `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH: any call, including lookup commands, exits 99 and fails the module with the tool and arguments; a module can put its own stubs first. Each module also gets a private `BUILDLOG_LIVE_MEMORY_TRIPWIRE` record path: a recorded read of `/proc/meminfo` or `/proc/pressure/memory` fails the module with `a test read live memory`, the path and the arguments, even if its tests pass. Neither kind of tripwire failure runs again, including after a signal during a natedev hold. An incomplete or invalid memory record also fails the module and prints `a test read live memory (unreadable record):` with the raw line. The types job gets no live memory tripwire.
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.
-- A requested basedpyright job (`types`) starts first; only nightly and an explicit `--type-dirs` request it.
+- In the nightly run, the basedpyright job (`types`) starts first.
   `--pythonpath` selects `typecheck-venv` in the state directory.
-  The venv holds the pinned `TYPECHECK_REQUIREMENTS`: pillow and fake-bpy-module dated 2026-08-22.
-  These packages resolve `bpy` and `PIL`.
+  The venv uses the pinned `fake-bpy-module==20260822` to resolve `bpy`.
   The gate builds the venv with uv under a lock when it is absent or its pins change.
   A failed build makes the types job red and prints the cause and build command.
   Basedpyright then does not run.
@@ -584,6 +733,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   `GateJobResult.cpu_seconds` retains the reaped CPU time for that job.
 - **Rerun alone.** After all parallel jobs end, each failed test module runs once more, alone.
   Jobs killed at the module time limit and `types` do not run again.
+  The gate also excludes jobs that trigger a tripwire, including the live config guard.
   If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
   Memory stops use their separate retry count even when ordinary failures exceed this limit.
   Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
@@ -721,72 +871,72 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
-2. Resume each item that the merge branch already contains through the single command's route, in file order.
+2. Fetch the merge branch and the unit branches from origin.
+   If the merge branch fetch fails, ask each current requester to send the checkpoint again when origin is available.
+   Leave existing results unchanged when this fetch fails.
+   Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
+   Resolve every item to a commit before writing the record or starting a merge.
+   Refuse the batch and name the item if it cannot resolve to a commit.
+   Record each item's argument line and resolved commit in Git's internal directory, in batch order.
+   Normalize shell quoting and keep the argument order.
+   Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
+   Identify checkpoint merges by their subjects and second parents.
+   If the record is missing or differs, refuse the batch and tell the requester how to start again.
+   Remove the record after the push or when the batch ends without unpushed merges.
+   If record removal fails, report a warning and continue.
+   Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
 4. Check each remaining item and make its own merge commit.
 5. Test all code paths changed from the published merge branch tip through HEAD once.
 6. Use one `tested_main_push` hold, one push, and one local promotion.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
-A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
-A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
+A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
+A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
+A published merge with a promotion marker keeps its completed result.
+For other stops, the existing resume rules apply.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's merged item retests its unpublished paths when it resumes.
-A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A held or failed item before the push starts drops from the batch.
-Every later item from the same unit drops with it and receives a report that names the stopped item.
-The checkout returns to the starting tip before each retry.
-Retries continue until an attempt passes or no item remains.
-Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+Before each gate run, record the tested tip and each row's selected commands in memory.
+For attribution, compare a merged row with its merge's first parent.
+Compare an unmerged row with the destination tip before preparation.
+A red report names the failed test step and says whether the row selects it.
+If command selection failed for a row, report unknown changed paths and include the error.
+The batch stops at the first failed test command.
+The next queued item can proceed after the batch exits.
+Before publication, the shared stop attempts to restore the starting tip.
+The batch record lists each row tip.
+The batch adds each main target to the record before Git starts the merge.
+The stop accepts HEAD at the expected tip or at a merge with that first parent and a recorded second parent.
+The batch reads MERGE_HEAD after every merge command.
+A successful command with an open merge stops the batch.
+The stop aborts a merge with a recorded target or an empty or unreadable MERGE_HEAD.
+The stop preserves an open merge to an unrelated target and reports the refusal.
+The stop aborts the merge before it queries origin.
+If abort restores the starting tip, the stop skips the query and reset.
+Without an open merge, the stop runs the reset even at the starting tip to clear merge state.
+A reset that moves HEAD requires origin to match the recorded published tip or the starting tip.
+The stop sends every notice before it writes result records.
+Rollback and result-record errors appear after the notices.
+Each run starts a fresh shared test log. Tests after main moves append to the same log.
+Publication rollback checks the live origin before it restores the tip.
+It also removes unpublished formatter commits.
+
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
 An ancestry hold names the first unmerged commit by its short hash and subject.
-Reset aborts an unfinished merge only when no merge was unfinished at batch start.
-An earlier unfinished merge and its staged edits remain unchanged.
-A red test identifies its items through the shared checkpoint test selector.
-Candidates are the code items that select a red command, or all code items when none selects it.
-When no code item remains, every remaining item is a candidate.
-One candidate drops directly.
-For multiple candidates, a binary search finds the first merge that makes the red commands fail.
-Each probe resets the checkout to a candidate's unpublished merge commit.
-It merges the same main commit that the red test tip holds, without another fetch.
-A conflict stops the search and drops every candidate.
-The probe selects test steps again from the batch paths at that tip.
-It runs only unresolved red steps that the tip still selects.
-A red step absent from that selection counts as green.
-Full tests and probes use the same runner and flake rules.
-The starting tip is treated as green; the last candidate is known red.
-Seven candidates need at most three probes.
-Each probe reports its item, merge commit, and green or red result.
-Each batch invocation clears its shared test log once before the first attempt.
-Full tests, probes, main retests, and all retries append to that log.
-The search restores the starting tip and drops the causing item and that unit's later items.
-A cancelled probe or another non-red stop drops every candidate with that stop.
-A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
-The push start is the boundary for drop, reset, and retry.
-Once the push starts, a failure drops no items and starts no batch reset or retry.
-Only `push_rollback` can undo a failed push after it checks the live origin.
-Each item receives the stop report.
+A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
-`test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
-It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows resume the merged item alone, including a shrink-only batch.
-The rerun row resumes the promotion of two pushed items and then lands a new item.
-The held-batch rows preserve an earlier unfinished merge and its staged edits.
-They also land a clean item after two holds and remove a held unit's later item.
-The history rows merge closing items for an older plan after the configured plan changes.
-The shared-red row uses two probes to identify the middle item and land the other two.
-The main-integration row keeps new main content at every probe and drops the first item.
-The package-rename row skips the renamed test at the earlier tip and drops the second item.
+`test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
+`test_merge_checkpoint_rerun.py` covers shared publication and recovery after interruption.
 
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 
@@ -831,7 +981,7 @@ It releases the lock after the local main push and before the Mac pull.
 New files can be selected.
 `copies.standing` supplies an isolated checkout of `origin/main`.
 The command applies the patch with `git apply --3way`.
-It runs direct test modules for changed Python files, imports each changed module, and checks the basedpyright footer.
+It runs the direct tests for changed Python files and imports each changed module.
 The check uses `merge_gate.test_module_environment` and its tripwires.
 An empty helper module can pass discovery; a failed package import cannot.
 The fast check uses no full merge gate or queue admission.
@@ -938,9 +1088,6 @@ Repository imports use `scripts.<folder>` package names, including mock patch ta
 Entry scripts load that helper after their docstring and future imports.
 Bare `python3 <path>` therefore imports the entry's own checkout from any caller folder.
 A copied entry without the helper can use an existing `PYTHONPATH`.
-`package_imports.py bootstrap <checkout>` adds the four-line block to new entry scripts.
-It preserves CRLF and skips test and test-support modules.
-The command provides no import converter.
 
 The gate starts test modules through the checked tree's `scripts/lib/py`.
 It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.
@@ -952,7 +1099,7 @@ Outside the gate, it retains inherited Python paths after that root.
 It preserves the caller's working directory, interpreter cache, version floor, and `CLAUDE_PYTHON` override.
 `module_run.py` and `fast_track.py` load tests by package name.
 The cloud guest bootstrap supplies its own root after a fresh clone.
-The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
+Blender uses its own interpreter and sets `PYTHONPATH` explicitly.
 
 `update_registration.state_block` imports `merged_checkpoints` in its body.
 This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
@@ -1069,7 +1216,7 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **The governor controls starts.** A job can exceed the governor after admission.
   A memory peak does not kill the job or fail the gate.
-- **Module time limit.** The gate kills a module that reaches `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
+- **Module time limit.** For regular runs, the gate stops a module at `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
   Its result starts `killed: still running after 1800 s, the module time limit`, and the gate fails.
   This prevents a stalled module from holding every gate behind it.
 
@@ -1242,9 +1389,27 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
 
-The merge gate owns module folders through `temporary_build_folder` contexts.
-The contexts remove folders after success or an exception.
-Style lint uses the same context and keeps its standing Cargo target.
+The merge gate owns each module folder through a `tool_folder` context.
+The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
+The runner puts its config-read log, scratch root, and review root inside that folder.
+Before test discovery, the runner guards the real home’s `.claude/config` against Python writes.
+Python child processes inherit the guard through a temporary startup hook.
+The runner removes the hook at the end of the run. A child checks that the hook still exists before it records a violation.
+The guard records a violation in the module folder even when a test catches the error.
+The gate reads that record as a tripwire and fails the module without a rerun.
+For directory entry changes, the guard resolves symlinks in the parent path.
+For file content writes, it also resolves the final symlink.
+
+The guard covers Python file operations that emit audit events. Non-Python programs run outside the guard.
+Python children can bypass the hook by replacing `PYTHONPATH` or disabling Python startup hooks.
+Writes through an already open file descriptor also fall outside the guard.
+The Python open audit event omits the directory descriptor. The guard skips relative paths in this event.
+
+The runner supervisor removes these folders after it reaps the test processes, including after gate death on Linux.
+The gate repairs permissions if necessary when it removes the module folder.
+After gate death, recovery reports the retained gate folder for removal.
+Standalone runners keep separate leases for their folders.
+Style lint uses a temporary leased folder and keeps its standing Cargo target.
 Style review keeps its input folder because the review worker reads it after preparation exits.
 
 

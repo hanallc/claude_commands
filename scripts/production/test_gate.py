@@ -3,27 +3,34 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
 
 import unittest
 import fcntl
 
-import json
 import io
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
+import tempfile
+import time
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.process_start import Gone
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
@@ -48,7 +55,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        runner = recorded_showrunner("fixture-showrunner", doc)
+        runner = fixture_member("showrunner", name="fixture-showrunner", runtime_id=staff.caller_identity(),
+                                doc=staff.LiveDoc(remote.local_machine(), doc))
+        self.environment.update(build_fixture_sessions(runner.current_session))
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
@@ -59,6 +68,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         checkout.parent.mkdir(parents=True)
         _ = self.git(self.checkout, "clone", str(self.checkout), str(checkout))
         self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        with mock.patch.dict(os.environ, self.environment):
+            commit = self.git(checkout, "rev-parse", "HEAD")
+            scratch.register_copy(checkout, task="gate:fixture", owner_unit="fixture",
+                                  source_path=str(self.checkout), source_commit=commit,
+                                  copy_commit=commit, target_mode="none", seed_source="", borrows_from="")
         observed: list[Path] = []
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
@@ -113,6 +127,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                             0, 0, tests_reused=True)
 
                     def merge(arguments: gate.GateArguments) -> int:
+                        self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
                             return checkpoint(arguments)
                         finally:
@@ -218,9 +233,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
                     if fails:
                         with self.assertRaisesRegex(RuntimeError, "module preparation failed"):
-                            _ = self.run_gate("--tests-only", "--full", type_dirs=())
+                            _ = self.run_gate("--tests-only", "--full")
                     else:
-                        result = self.run_gate("--tests-only", "--full", type_dirs=())
+                        result = self.run_gate("--tests-only", "--full")
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
@@ -247,6 +262,49 @@ class MergeGateCheckpointTests(MergeGateFixture):
         timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
+        gate_root = self.fixture_root.parent
+        missing = gate_root / "missing-module"
+        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
+              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
+        self.assert_all_modules_started()
+
+    @gate_suites("hooks", "message")
+    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+        prepare = gate.test_module_environment
+        gate_root = self.fixture_root.parent
+        legacy_run = Path("test-runs/test-run-abcdefgh")
+        inherited_run = gate_root / legacy_run
+        inherited_run.mkdir(parents=True)
+        deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
+        deep_tmpdir.mkdir()
+        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
+                   Path("style-socket-abcdefgh/outside.sock"))
+        for flag in ("--tests-only", "--affected"):
+            for inherited in (gate_root, inherited_run, deep_tmpdir):
+                with self.subTest(mode=flag, inherited=inherited):
+                    job_folders: list[Path] = []
+
+                    def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                        job_folders.append(root)
+                        return prepare(root, environment)
+
+                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                          mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
+                        result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
+                    for root in job_folders:
+                        self.assertEqual(root.parent.parent, gate_root)
+                        relative = root.relative_to(gate_root)
+                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
+                            for suffix in sockets:
+                                socket_path = platform_root / relative / legacy_run / suffix
+                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"
@@ -281,11 +339,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.checkout / "docs" / "plans" / "build-followups-log.md").read_text(), "log\n")
 
-    def test_missing_type_dir_is_refused_before_any_suite_runs(self) -> None:
-        result = self.run_gate("--type-dirs", "accounts")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("type dirs not found", result.stderr)
-        self.assertIn("accounts", result.stderr)
+    def test_merge_refuses_type_check_options_before_any_suite_runs(self) -> None:
+        result = self.run_gate("--type-dirs", "scripts")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("unrecognized arguments: --type-dirs scripts", result.stderr)
         self.assertEqual(self.module_events(), [])
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
@@ -398,7 +455,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {production} | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {production} | {producer} | 012345abcdef |" for day in days}
         self.assertRegex(written, r"^\| C8 \| [^|]+ \| \d{4}-\d\d-\d\d \d\d:\d\d · ")
         self.assertIn(re.sub(r" \d\d:\d\d · ", " · ", written, count=1), rows)
         self.assertIn(f"Change review: {written}", result.stdout)
@@ -472,19 +529,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
-        self.write(self.state / "types-barrier", "overlap")
-        self.write(self.state / "types-hold", "hold")
-        memory = gate.process_memory_mib
-
-        def sample_and_release(roots: set[int]) -> dict[int, float]:
-            measured = memory(roots)
-            for call in self.calls():
-                if call["tool"] == "basedpyright" and measured.get(call["pid"], 0) > 0:
-                    (self.state / "types-sampled").touch()
-            return measured
-
-        with mock.patch.object(gate, "process_memory_mib", side_effect=sample_and_release):
-            result = self.run_gate()
+        result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
@@ -502,14 +547,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(len({row["pid"] for row in starts}), self.module_count)
         self.assertEqual(len({row["tmpdir"] for row in starts}), self.module_count)
         self.assertTrue(all(not Path(row["tmpdir"]).exists() for row in starts))
-        type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
-        self.assertEqual(len(type_calls), 1)
-        venv = self.state / "runner" / "typecheck-venv"
-        self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
-        peaks = cast(dict[str, float], json.loads((self.state / "runner" / "types_peak_mib.json").read_text()))
-        self.assertEqual(list(peaks), ["scripts/production"])
-        self.assertGreater(peaks["scripts/production"], 0)
-        self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
         for suite in self.suites:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
         peak = re.search(r"peak memory: ([\d.]+) GiB", result.stdout)
@@ -555,7 +593,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
                      "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "phase-2",
-                     "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+                     "--body", "Fixture checkpoint gate.",
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
@@ -566,6 +604,99 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn("style sync: invalid production", output.getvalue())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+
+@final
+class GateRecoveryTests(MergeGateFixture):
+    def test_recovery_skips_record_removed_during_owner_check(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        pool = self.root / "tokens"
+        os.mkfifo(pool)
+        descriptor = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        status = os.fstat(descriptor)
+        token = gate.HeldGateToken(str(pool), status.st_dev, status.st_ino, b"t".hex())
+        recovery = gate.GateRecovery(directory / "owner.json", str(self.checkout), 5_000_001, "owner",
+                                     tokens=[token])
+        recovery.save()
+
+        def finish_owner(_pid: int) -> Gone:
+            _ = os.write(descriptor, b"t")
+            recovery.finish()
+            return Gone()
+
+        with (mock.patch.object(gate, "process_start", side_effect=finish_owner) as read_start,
+              mock.patch.dict(os.environ, self.environment)):
+            gate.recover_gate_directory(directory, own_directory=directory)
+
+        read_start.assert_called_once_with(recovery.pid)
+        self.assertFalse(recovery.path.exists())
+        self.assertEqual(os.read(descriptor, 2), b"t")
+
+    def test_tests_only_sigterm_closes_the_active_record(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+        command = [*self.gate_command(), "--tests-only", "--repo", str(self.checkout),
+                   "--module", "hooks/test_first.py"]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                self.assertEqual(len(list(records.glob(f"{process.pid}-*.json"))), 1)
+                process.send_signal(signal.SIGTERM)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(list(records.glob("*.json")), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            directory = gate.gate_run_directory(self.checkout)
+        directory.mkdir(parents=True)
+        unfinished = gate.GateRecovery(directory / "unfinished.json", str(self.checkout), 5_000_001, "dead-owner")
+        unfinished.save()
+        folder = self.root / "retained"
+        canary = folder / "canary"
+        self.write(canary, "fixture data")
+        finished = gate.GateRecovery(directory / "finished.json", str(self.checkout), 5_000_002, "dead-owner",
+                                     folders=[str(folder)], finished=True)
+        finished.save()
+        saved = finished.path.read_text()
+
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(directory.glob("*.json")), [finished.path])
+        self.assertEqual(finished.path.read_text(), saved)
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertNotIn(str(folder), result.stderr)
+
+
+class LiveConfigTripwireTests(unittest.TestCase):
+    def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        job_root = root / "job"
+        job_root.mkdir()
+        marker = job_root / "live-config-writes"
+        _ = marker.write_text("/fixture/config/console.conf\n")
+        log = job_root / "output.log"
+        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
+        job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
+                                  time.time(), log.open("w+"), log, "test_fixture.py")
+        self.addCleanup(job.output.close)
+        with mock.patch.object(gate, "kill_job_group"):
+            result = gate.finish_gate_job(job, 0)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a test attempted to write live configuration at /fixture/config/console.conf", result.output)
+        self.assertFalse(job_root.exists())
 
 
 if __name__ == "__main__":

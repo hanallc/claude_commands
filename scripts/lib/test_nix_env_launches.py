@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 from typing import cast, override
@@ -15,6 +14,8 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.herdr import herdr, herdr_sessions
 from scripts.herdr import herdr_types
 from scripts.production import add_unit, add_showrunner
@@ -94,7 +95,10 @@ class HerdrLaunchTests(NixFixture):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture")
         self.assertIsInstance(result, herdr.AgentLaunched)
         self.assertEqual(opened.call_args.args[3], str(self.work))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture",
+            "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
         started.assert_called_once()
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
@@ -167,7 +171,9 @@ class HerdrLaunchTests(NixFixture):
             _ = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [],
                                    herdr.NoOpeningPrompt(), 100, agent="fixture", unset_environment=frozenset({"REMOVE_ME"}))
         self.assertNotIn("REMOVE_ME", cast(dict[str, str], ensure.call_args.args[1]))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
 
     def test_add_unit_uses_session_cwd_before_opening(self) -> None:
         request = add_unit.UnitLaunch(production=self.production(), identity=add_unit.UnitIdentity("unit", "worker"),
@@ -241,18 +247,8 @@ class ShellLaunchTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.scripts = self.home / ".claude/scripts"
-        _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/agent_exec.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh",
-                         "make_a_worktree/direnv_allow.sh", "buildlog/__init__.py", "buildlog/store.py"):
-            destination = self.scripts / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if relative == "agents/agent_exec.sh":
-                destination.symlink_to(ROOT / "scripts" / relative)
-            else:
-                _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
-        (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
+        self.scripts = copy_helpers(self.home, *VERIFY_HELPERS, "scripts/accounts", "scripts/maintenance",
+                                    "scripts/astra", "scripts/usage", "scripts/cli_agent", "scripts/make_a_worktree")
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
         _ = (self.scripts / "agents/models_config.sh").write_text(
             (ROOT / "scripts/agents/models_config.sh").read_text()
@@ -279,7 +275,8 @@ print('{"type":"result","result":"fixture completed"}')
             run, name, cwd, prompt, summary, log = args
             command = test_claude_worker.worker_command(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log))
         if relative == "agents/agent_exec.sh":
-            command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
+            with patch("scripts.direct.assign_launcher_test_support.ASSIGN", self.scripts / "direct/assign.sh"):
+                command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
         return subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS, check=False)
 
@@ -313,7 +310,6 @@ print('{"type":"result","result":"fixture completed"}')
     def test_claude_worker(self) -> None:
         _ = (self.home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
-        (self.scripts / "production").symlink_to(ROOT / "scripts/production", target_is_directory=True)
         self.env["CLAUDE_CONFIG_DIR"] = ""
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")

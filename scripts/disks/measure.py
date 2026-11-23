@@ -13,17 +13,19 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePath
 from typing import NotRequired, TypedDict, cast
 
 from scripts.buildlog import disk, filesystem
 from scripts.disks import disks_page
 from scripts.disks.disks_page import DATA_FILE, LOCK_FILE
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, process_stop
 from scripts.lib.atomic_file import write_text_atomic
 
 LOCK_BUSY_EXIT = 3
@@ -50,6 +52,7 @@ class Drive(TypedDict):
 
 
 class DisksData(TypedDict):
+    generation: NotRequired[int]
     measured_at: float
     render_seconds: float
     keep_bytes: int
@@ -66,7 +69,9 @@ class Mount:
 
 
 def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
-    """This machine's mounts in mount order, or none where the system has no mount table, as on the Mac."""
+    """Read the mounts in mount order from the Linux table or a supplied file."""
+    if sys.platform != "linux" and table == MOUNT_TABLE:
+        return ()
     try:
         lines = table.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -80,7 +85,7 @@ def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
 
 def drive_path(path: PurePath, mounts: Sequence[Mount]) -> PurePath:
     """Where the measure finds a path. A path under a mount of a subfolder, such as /session on natedev,
-    is measured under the mount of its whole file system, such as /build/session."""
+    is measured under the mount of its whole file system, such as /home/natepiano/session."""
     # The last mount at a point covers the earlier ones.
     holding = max(((len(mount.point.parts), index, mount) for index, mount in enumerate(mounts)
                    if mount.point == path or mount.point in path.parents), default=None)
@@ -151,7 +156,8 @@ def run_command(argv: Sequence[str], timeout_seconds: int) -> subprocess.Complet
 
 def dust_command(mount: str, settings: MeasureSettings) -> list[str]:
     """Walk one filesystem with dust under a memory cap at the lowest CPU priority."""
-    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={settings.memory_max}", "--",
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            *process_stop.scope_slice_args(), "-p", f"MemoryMax={settings.memory_max}", "--",
             "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
             "-z", str(settings.keep_bytes - 1),  # Dust keeps sizes above this value, so include the floor.
             "-d", str(settings.max_depth), "-n", str(settings.max_lines),
@@ -256,29 +262,76 @@ def measure_drive(mount: str, settings: MeasureSettings, floors: dict[int, int |
     return drive
 
 
+@dataclass(frozen=True)
+class MeasureReservation:
+    generation: int
+    lock: file_lock.ExclusiveLock
+
+
+class TimerMeasure(Enum):
+    REQUEST = "request"
+
+
 def measure(settings: MeasureSettings, runner: Runner = run_command,
-            floors: Callable[[Sequence[str]], dict[int, int | None]] = drive_floors) -> int:
+            floors: Callable[[Sequence[str]], dict[int, int | None]] = drive_floors,
+            *, reservation: MeasureReservation | TimerMeasure = TimerMeasure.REQUEST) -> int:
     settings.output_folder.mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(settings.output_folder / LOCK_FILE, wait=False) as lock:
-        if lock is file_lock.LockResult.BUSY:
-            print("a measure is already running")
-            return LOCK_BUSY_EXIT
+    active = settings.output_folder / disks_page.ACTIVE_FILE
+    coordination = settings.output_folder / disks_page.COORD_FILE
+    if isinstance(reservation, TimerMeasure):
+        with file_lock.exclusive(coordination):
+            lock = file_lock.take_exclusive(settings.output_folder / LOCK_FILE)
+            if lock is file_lock.LockResult.BUSY:
+                print("a measure is already running")
+                return LOCK_BUSY_EXIT
+            try:
+                generation = disks_page.published_generation(settings.output_folder) + 1
+                write_text_atomic(active, str(generation) + "\n", new_file_mode=0o644)
+            except BaseException:
+                lock.release()
+                raise
+            reservation = MeasureReservation(generation, lock)
+    data: DisksData = {"generation": reservation.generation, "measured_at": 0.0, "render_seconds": 0.0,
+                       "keep_bytes": settings.keep_bytes, "drives": []}
+    complete = False
+    try:
         started = time.perf_counter()
         found = floors(settings.drives)
-        data: DisksData = {"measured_at": time.time(), "render_seconds": 0.0, "keep_bytes": settings.keep_bytes,
-                           "drives": []}
         with ThreadPoolExecutor(max_workers=len(settings.drives)) as pool:
             drives = [pool.submit(measure_drive, mount, settings, found, runner) for mount in settings.drives]
             data["drives"] = [drive.result() for drive in drives]
         data["render_seconds"] = time.perf_counter() - started
-        write_text_atomic(settings.output_folder / DATA_FILE, json.dumps(data) + "\n", new_file_mode=0o644)
+        complete = True
+    finally:
+        with file_lock.exclusive(coordination):
+            try:
+                if complete:
+                    data["measured_at"] = time.time()
+                    write_text_atomic(settings.output_folder / DATA_FILE, json.dumps(data) + "\n", new_file_mode=0o644)
+            finally:
+                try:
+                    active.unlink(missing_ok=True)
+                finally:
+                    reservation.lock.release()
     print(f"measured {len(settings.drives)} drives on {socket.gethostname()}")
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _ = argparse.ArgumentParser(description=__doc__).parse_args(argv)
-    return measure(read_settings())
+    parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("--generation", type=int, default=0)
+    _ = parser.add_argument("--lock-fd", type=int, default=-1)
+    args = parser.parse_args(argv, namespace=MeasureArguments())
+    if args.generation == 0 and args.lock_fd == -1:
+        return measure(read_settings())
+    if args.generation <= 0 or args.lock_fd < 0:
+        parser.error("--generation and --lock-fd must specify one reservation")
+    return measure(read_settings(), reservation=MeasureReservation(args.generation, file_lock.ExclusiveLock(args.lock_fd)))
+
+
+class MeasureArguments(argparse.Namespace):
+    generation: int = 0
+    lock_fd: int = -1
 
 
 if __name__ == "__main__":

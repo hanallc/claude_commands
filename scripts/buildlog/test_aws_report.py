@@ -1,5 +1,6 @@
 """Render AWS costs, wait estimates, and peer exchange evidence."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
 from datetime import UTC, date, datetime
@@ -22,7 +23,7 @@ from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-from scripts.aws_target import ledger, measurement
+from scripts.aws_target import ledger, measurement, run_cost
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
@@ -165,8 +166,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual([row[0] for row in token.waits], [60.0])
 
     def test_mixed_host_report_uses_the_required_lead_and_preserves_negative_run_savings(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         self.comparison_rows()
         self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step(target=""))
         output = self.render()
@@ -302,12 +302,12 @@ class AwsReportTests(MeasurementFixture):
         for attempt, size, mode, at, box_s, gate_s in (
             ('merge-m', 'm7a.8xlarge', 'gate', MIDNIGHT - 3600, 100, 60),
             ('target-m', 'm7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 200, 30),
-            ('merge-c', 'c7a.8xlarge', 'gate', MIDNIGHT - 3600, 300, 180),
-            ('target-c', 'c7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 100, 90),
-            ('unbilled-m', 'm7a.8xlarge', 'gate', NOW, 600, 120),
-            ('unbilled-c', 'c7a.8xlarge', 'test-affected', NOW, 400, 150),
-            ('old', 'old.8xlarge', 'gate', MIDNIGHT - 86401, 100, 90),
-            ('future', 'future.8xlarge', 'test-affected', MIDNIGHT + 86400, 100, 90),
+            ('merge-c', 'c7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 300, 180),
+            ('target-c', 'c7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 100, 90),
+            ('unbilled-m', 'm7a.8xlarge', 'merge-gate', NOW, 600, 120),
+            ('unbilled-c', 'c7a.8xlarge', 'targeted-test', NOW, 400, 150),
+            ('old', 'old.8xlarge', 'merge-gate', MIDNIGHT - 86401, 100, 90),
+            ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
         ):
             launches.extend((
                 {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched',
@@ -317,8 +317,11 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
             {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'gate', 'result': 'finished', 'gate_s': 30},
             {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
-            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'test-affected', 'result': 'finished', 'gate_s': 30},
-            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused'}))
+            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused',
+             'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused',
+             'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
         charges = self.state / 'charges'
         charges.mkdir(exist_ok=True)
@@ -346,6 +349,36 @@ class AwsReportTests(MeasurementFixture):
             self.assertNotIn(f'| {size} |', output)
         self.assertIn('Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC 2026-01-14 through 2026-01-15 (2 days)', output)
         self.assertIn('billed days only; 4 rows omitted with no kind or matching launch.', output)
+
+        start = datetime.fromtimestamp(MIDNIGHT - 86400, UTC)
+        end = datetime.fromtimestamp(NOW + 1, UTC)
+        evidence = run_cost.run_evidence(launches, start, end, 'us-east-2')
+        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('gate',))
+        self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
+        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('merge-gate', 'gate'))
+        self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
+        self.assertEqual(evidence.refusals_per_launch('m7a.8xlarge', 'us-east-2', ('test-affected',))[1:], (0, 1))
+        self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('test-affected',))[1:], (2, 0))
+
+    def test_billed_allocations_include_new_modes_and_skip_zero_box_time(self) -> None:
+        region = 'us-east-2'
+        unknown_only = ('c7a.4xlarge', region, DAY)
+        mixed_modes = ('m7a.8xlarge', region, DAY)
+        zero_box_time = ('m7a.8xlarge', 'us-west-2', DAY)
+        bills: dict[run_cost.DayKey, tuple[Decimal, Decimal]] = {
+            key: (Decimal('0.60'), Decimal(1)) for key in (unknown_only, mixed_modes, zero_box_time)
+        }
+        runs = [
+            run_cost.FinishedGateRun(*unknown_only[:2], 'gpu-size-trial', DAY, Decimal(60), Decimal(100)),
+            run_cost.FinishedGateRun(*mixed_modes[:2], 'merge-gate', DAY, Decimal(60), Decimal(100)),
+            run_cost.FinishedGateRun(*mixed_modes[:2], 'gpu-size-trial', DAY, Decimal(60), Decimal(200)),
+            run_cost.FinishedGateRun(*zero_box_time[:2], 'targeted-test', DAY, Decimal(0), Decimal(0)),
+        ]
+        self.assertEqual(run_cost.billed_allocations(bills, runs), {
+            (*unknown_only, 'gpu-size-trial'): Decimal('0.60'),
+            (*mixed_modes, 'merge-gate'): Decimal('0.20'),
+            (*mixed_modes, 'gpu-size-trial'): Decimal('0.40'),
+        })
 
     def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
         events: list[dict[str, object]] = [
@@ -445,8 +478,7 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('$22.00 of the $20.00 daily limit', output)
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         at = NOW + 86400
         result = measurement.read_charges(self.settings, self.state, at, self.charge_fetch(Decimal(3)))
         reading = narrow(self, result, measurement.ChargeRead)
@@ -511,6 +543,16 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn("latest failure none", mac)
         self.assertNotIn("AWS report data synchronized at", output)
         self.assertNotIn("AWS report data never synchronized", output)
+
+    def test_natedev_day_report_names_no_peer_for_the_mac_linux_guest(self) -> None:
+        path = self.root / 'build_targets.conf'
+        _ = path.write_text(path.read_text().replace('targets=natedev,mac', 'targets=natedev,mac,mac-linux')
+            + 'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n')
+        _ = (self.root / 'mac_linux.conf').write_text('ssh.hops=mac linux-guest\nguest.user=gate-runner\n')
+        self.exchange("mac", ok=True, at=NOW - 60)
+        output = self.render()
+        self.assertIn("current", self.peer_line(output, "mac"))
+        self.assertNotIn("mac-linux (", output)
 
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
         self.add_spare_peer()

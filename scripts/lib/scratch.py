@@ -1,9 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Scratch folders that belong to a task, and go when the task ends.
+"""Manage scratch folders and record when their tasks end.
 
-Agents made loose folders in /tmp and ~/rust (repo copies, repros, test trees) and nothing removed
-them. Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each
-scratch folder belongs to a task, and the thing that ends the task removes it:
+Each folder belongs to a task. The end command keeps the folder for a manual removal list.
 
     scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]   make one; prints its path
     scratch.py new --worker [--name <word>]   make a worker folder under TMPDIR; prints its path
@@ -12,7 +10,7 @@ scratch folder belongs to a task, and the thing that ends the task removes it:
     scratch.py release <path>    drop a hold
     scratch.py renew <path>      mark it changed
     scratch.py hand-over <path> --to <unit> --task <task>  replace owner and task without moving it
-    scratch.py end --task <task>  remove every folder and held folder of the task
+    scratch.py end --task <task>  record task completion and list the retained folders
     scratch.py list              each folder and hold, its task and its last change
 
 A task, and what ends it:
@@ -37,7 +35,7 @@ folder is not held and goes with its session's other content. Any other folder l
 task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its record keeps the time.
 scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
-The holds record indexes their paths, so task removal does not scan TMPDIR.
+The holds record lists their paths, so task end can find them.
 `--visible` (rows only) puts it in VISIBLE_ROOT
 as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
@@ -46,20 +44,19 @@ ender can fail. A row's folder waits for its verdict, and VISIBLE_ROOT is never 
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
-A retry resumes removal when no regular file has a newer ctime than the intent.
+A retry compares ref file metadata with the intent and checks other file timestamps.
+The retry validates the structure of Git metadata before it can resume removal.
 A retry checks changed, intact sources for unsaved work.
 A retry keeps changed, partly deleted sources and names the changed file.
 Completion removes Cargo recovery evidence before task recovery evidence.
 
-A hold keeps a folder that must stay where it is (a repo the user checks a change in). Its record
-(task, maker, reason) is in the machine's HOLDS file, not in the folder, where a repo would show it
-as uncommitted work. `end` removes a held folder with the task's other folders, unless a repo in
-it holds work that is on no remote (unsaved_work): that hold stays, marked ended, for the folder
-audit to name to its maker. The scratch guard hook
-(scripts/hooks/pre-tool-use-scratch-guard.py) refuses a loose folder in /tmp, ~/rust and the
-other roots.
+A hold protects a folder at its current path.
+The machine's HOLDS file records the task, maker, and reason.
+Task end marks the hold ended and keeps the folder.
+The scratch guard hook refuses loose folders in /tmp, ~/rust, and other configured roots.
+The hook is in scripts/hooks/pre-tool-use-scratch-guard.py.
 
-Copies live at <roots.copies>/<pair>/<copy>. Their records also name source and copy commits,
+Legacy copy records also name source and copy commits,
 target mode, seed, borrowed git directory, owner and land target. Open phases and borrowed parents
 stay; an unreadable record, phase state or land target needs repair. Shared .claude-busy locks
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
@@ -82,35 +79,50 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from threading import get_ident
-from typing import Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
+from urllib.parse import unquote_to_bytes
 
-from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
+from scripts.lib import build_folders, cargo_output, conf, copy_record, git_files, removal_guard, session_folder, time_limit  # noqa: E402
+from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
+from scripts.lib.build_folders import (  # noqa: E402
+    BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path, collector_lease,
+    folder_removal_lease, inherited_temporary_parent, open_busy_mark, require_no_removal_mark,
+    BUSY as BUSY, REMOVAL_RECORD_PREFIX as REMOVAL_RECORD_PREFIX, REMOVAL_RECORD_SUFFIX as REMOVAL_RECORD_SUFFIX,
+    removal_mark as removal_mark,
+)
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
-# Deletion intent stays outside the source until source and Cargo cleanup finish.
-REMOVAL_RECORD_PREFIX = ".scratch-removing-"
-REMOVAL_RECORD_SUFFIX = ".json"
 HOLDS_ENV = "SCRATCH_HOLDS"
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-BUSY = ".claude-busy"
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 REMOVAL_VERSION = 1
+
+
+class BusyMarkOwnership(Enum):
+    """Use a private scope for one lock acquisition."""
+    LOCAL = "local"
+
+
+@dataclass
+class BusyMarkScope:
+    """Track the descriptors that this scope owns across related acquisitions."""
+    held: dict[Path, int] = field(default_factory=dict)
+    created: set[Path] = field(default_factory=set)
 
 
 @dataclass
@@ -119,6 +131,8 @@ class _HeldRemovalLock:
     path: Path
     process: int
     thread: int
+    lease: FolderRemovalLease
+    marks: BusyMarkScope
     active: bool = True
 
 
@@ -139,6 +153,11 @@ class StaleRemoval:
 @dataclass(frozen=True)
 class Live:
     why: str
+
+
+@dataclass(frozen=True)
+class LandedRemoteCheckNeeded(Live):
+    """The branch landed. Check the remote to verify the remaining work."""
 
 
 @dataclass(frozen=True)
@@ -208,7 +227,7 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
                   land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "",
                   repository_identity: str = "") -> None:
     scratch_settings = conf.read("scratch")
-    if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
+    if not copy_record.is_legacy_copy_slot(path.resolve()) or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
@@ -229,7 +248,7 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
 
 @dataclass(frozen=True)
 class GitDirectory:
-    path: Path
+    checkout: git_files.Checkout
 
 
 @dataclass(frozen=True)
@@ -237,25 +256,47 @@ class NoGitDirectory:
     pass
 
 
-def git_directory(repo: Path) -> GitDirectory | NoGitDirectory:
-    """Resolve the checkout's Git metadata, including a linked worktree's pointer; a linked .git is refused."""
-    if (repo / ".git").is_symlink():
-        return NoGitDirectory()
+@dataclass(frozen=True)
+class UnreadableGitDirectory:
+    reason: str
+
+
+GitDirectoryState = GitDirectory | NoGitDirectory | git_files.MissingReferencedGitDirectory | UnreadableGitDirectory
+
+
+def git_directory(repo: Path) -> GitDirectoryState:
+    """Read the Git directory of a checkout without following a linked .git entry."""
+    dot_git = repo / ".git"
     try:
-        return GitDirectory(git_files.at(repo).git_dir)
-    except git_files.GitFilesError:
+        if not stat.S_ISDIR(repo.stat().st_mode):
+            return NoGitDirectory()
+        if dot_git.is_symlink():
+            return UnreadableGitDirectory(f"{dot_git}: symbolic link")
+        checkout = git_files.at(repo)
+        if not checkout.git_dir.is_relative_to(checkout.toplevel):
+            # Changes to external metadata do not change the files in the checkout.
+            _ = git_files.head(checkout)
+        else:
+            git_files.check_internal_head(checkout)
+        return GitDirectory(checkout)
+    except (FileNotFoundError, NotADirectoryError, git_files.NotACheckout):
         return NoGitDirectory()
+    except git_files.MissingReferencedGitDirectory as error:
+        return error
+    except (OSError, git_files.UnreadableGitFiles) as error:
+        return UnreadableGitDirectory(str(error))
 
 
 def busy_path(path: Path) -> Path:
-    """One busy-lock location; Git metadata keeps the lock out of saved source."""
+    """Keep a checkout's busy mark in its Git directory."""
     git = git_directory(path)
     if isinstance(git, GitDirectory):
-        return git.path / BUSY
-    if os.path.lexists(path / ".git"):
-        if removal_mark(path).is_file() or empty_lost_worktree(path):
-            return path / ".git" / BUSY if (path / ".git").is_dir() and not (path / ".git").is_symlink() else path / BUSY
-        raise OSError(f"{path}: cannot locate Git metadata for its busy lock")
+        return git.checkout.git_dir / BUSY
+    if isinstance(git, UnreadableGitDirectory):
+        raise OSError(git.reason)
+    if isinstance(git, git_files.MissingReferencedGitDirectory):
+        if not (removal_mark(path).is_file() or empty_lost_worktree(path, git)):
+            raise OSError(f"{path}: cannot locate Git metadata for its busy lock")
     return path / BUSY
 
 
@@ -263,6 +304,14 @@ def busy_path(path: Path) -> Path:
 def copy_lock(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
+    """Hold a numbered copy lease or the busy mark of a legacy copy."""
+    numbered = copy_record.numbered_copy_checkout(path)
+    if isinstance(numbered, Path):
+        with build_folders.numbered_copy_use_lease(numbered) as lease:
+            if isinstance(lease, build_folders.NumberedCopyUseRefused):
+                raise ScratchError(lease.reason)
+            yield
+        return
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     folder = copy_record.copy_folder(path)
@@ -273,7 +322,7 @@ def copy_lock(path: Path, *,
             return
         folder = path
     mark = busy_path(folder)
-    lock = os.open(mark, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock = open_busy_mark(mark, create=True)
     try:
         fcntl.flock(lock, fcntl.LOCK_SH)
         with copy_record_lock(folder, scratch_settings=scratch_settings):
@@ -291,6 +340,7 @@ def copy_lock(path: Path, *,
                 raise ScratchError(pending.reason)
             if isinstance(pending, copy_record.Registered):
                 raise ScratchError(f"{folder}: removal has already started; finish cleanup first")
+            require_no_removal_mark(folder.resolve().parent)
             exclude_copy_metadata(folder)
         yield
     finally:
@@ -302,6 +352,8 @@ def copy_record_lock(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
     """Serialize record changes and deletion on the existing directory, without creating a file."""
+    if copy_record.is_numbered_copy_path(path):
+        raise ScratchError(f"{path}: the copy lease owns this record")
     with directory_record_lock(path, wait=True, scratch_settings=scratch_settings):
         yield
 
@@ -355,47 +407,63 @@ def directory_record_lock(path: Path, *, wait: bool,
             os.close(descriptor)
 
 
+def _held_removal_lock(path: Path) -> _HeldRemovalLock | None:
+    return next((held for held in _REMOVAL_LOCKS.get()
+                 if held.active and held.path == path.absolute()
+                 and held.process == os.getpid() and held.thread == get_ident()), None)
+
+
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
     """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
     A held lease on the folder or on any folder below it is busy, and the busy mark is then
     not created."""
     key = path.absolute()
-    if any(held.active and held.path == key and held.process == os.getpid() and held.thread == get_ident()
-           for held in _REMOVAL_LOCKS.get()):
+    if _held_removal_lock(key) is not None:
         yield True
         return
-    with (collector_lease(path, children=True, wait=not removal_mark(path).is_file()) as free,
-          busy_locks(path, create=free and not removal_mark(path).is_file()) as idle):
-        if not free or not idle:
-            yield False
-            return
-        held = _HeldRemovalLock(key, os.getpid(), get_ident())
-        token = _REMOVAL_LOCKS.set((*_REMOVAL_LOCKS.get(), held))
-        try:
-            yield True
-        finally:
-            held.active = False
-            _REMOVAL_LOCKS.reset(token)
+    with folder_removal_lease(path, children=True, wait=not removal_mark(path).is_file()) as lease:
+        free = not isinstance(lease, RefusedRemovalLease)
+        marks = BusyMarkScope()
+        with busy_locks(path, create=free, scope=marks) as idle:
+            if not free or not idle:
+                yield False
+                return
+            held = _HeldRemovalLock(key, os.getpid(), get_ident(), lease, marks)
+            token = _REMOVAL_LOCKS.set((*_REMOVAL_LOCKS.get(), held))
+            try:
+                yield True
+            finally:
+                held.active = False
+                _REMOVAL_LOCKS.reset(token)
 
 
 @contextmanager
-def judgment_lock(path: Path) -> Generator[bool]:
+def judgment_lock(path: Path, *, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> Generator[bool]:
     """Check the folder's lease lock and existing busy marks without creating metadata during a scan or dry run.
     Leases below the folder are checked only at removal, so status reads do not walk the tree."""
-    with collector_lease(path) as free, busy_locks(path, create=False) as idle:
+    with collector_lease(path) as free, busy_locks(path, create=False, scope=scope) as idle:
         yield free and idle
+
+
+class BusyMarkHeld(Exception):
+    def __init__(self, lock: Path) -> None:
+        super().__init__(str(lock))
+        self.lock: Path = lock
 
 
 @contextmanager
 def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = None,
-               wait: bool = False) -> Generator[bool]:
+               wait: bool = False, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL,
+               raise_if_held: bool = False) -> Generator[bool]:
     """Hold busy marks; optionally export live descriptors or wait for their release.
 
     Exported descriptors belong to this context. A child can retain the same
     flock with subprocess pass_fds; callers must not close them themselves.
     """
-    held: list[int] = []
+    scope = BusyMarkScope() if scope is BusyMarkOwnership.LOCAL else scope
+    held: dict[Path, int] = {}
+    created: set[Path] = set()
     acquired = True
     try:
         try:
@@ -408,24 +476,45 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                 # Locks left by older callers still protect their work. Never create them in a checkout.
                 _ = marks.setdefault(owner / BUSY, False)
             for mark, creating in marks.items():
-                if not creating and not os.path.lexists(mark):
+                if mark in scope.held:
                     continue
+                if not creating:
+                    try:
+                        _ = mark.lstat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
                 try:
-                    fd = os.open(mark, os.O_RDONLY | os.O_NOFOLLOW | (os.O_CREAT if creating else 0), 0o600)
+                    fd = open_busy_mark(mark, create=False)
                 except FileNotFoundError:
-                    if creating:
-                        acquired = False
-                        break
-                    continue
-                held.append(fd)
-                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                    if not creating:
+                        continue
+                    try:
+                        fd = open_busy_mark(mark, create=True, exclusive=True)
+                    except FileExistsError:
+                        fd = open_busy_mark(mark, create=False)
+                    else:
+                        created.add(mark)
+                held[mark] = fd
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                except BlockingIOError as error:
+                    if raise_if_held:
+                        raise BusyMarkHeld(mark) from error
+                    raise
+                if not os.path.samestat(os.fstat(fd), mark.stat(follow_symlinks=False)):
+                    raise OSError(f"{mark}: the busy mark changed")
         except OSError:
             acquired = False
-        if acquired and inherited_fds is not None:
-            inherited_fds.extend(held)
+        if acquired:
+            scope.held.update(held)
+            scope.created.update(created)
+            if inherited_fds is not None:
+                inherited_fds.extend(held.values())
         yield acquired
     finally:
-        for fd in held:
+        scope.created.difference_update(created)
+        for mark, fd in held.items():
+            _ = scope.held.pop(mark, None)
             os.close(fd)
 
 
@@ -477,7 +566,7 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
                   *, removal: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> copy_record.Registered:
-    """The only record-write path: read, change and publish under the directory lock."""
+    """Read, change and publish a legacy task record under the directory lock."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     with copy_record_lock(path, scratch_settings=scratch_settings):
@@ -788,12 +877,13 @@ def new_worker(word: str = "", *,
 def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
-    """Move a loose folder into a scratch root and record its task. A git worktree's link moves
-    with it unrepaired: `git worktree repair` from the new place fixes it when it must work."""
+    """Move a loose folder into a scratch root and record its task."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if source.is_symlink() or not source.is_dir():
         raise ScratchError(f"{source} is no folder")
+    if protected_build_path(source) or os.path.lexists(source / ".git"):
+        raise ScratchError(f"{source}: use worktrees.py make <repo> <unit> <short-name> for editable work")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, visible, scratch_settings=scratch_settings)
@@ -802,11 +892,6 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     write_record(path, task, moment, scratch_settings=scratch_settings)
     index_in_session(path, task, scratch_settings=scratch_settings)
     return path
-
-
-def removal_mark(path: Path) -> Path:
-    """The deletion intent beside the source remains until source and Cargo cleanup finish."""
-    return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
 
 
 def removal_target(mark: Path) -> Path | None:
@@ -832,13 +917,23 @@ def folder_record(path: Path) -> Path:
     return record if record.is_file() else removal_mark(path)
 
 
+class RemovalIntentAccess(Enum):
+    """Select whether a stale removal intent may be cleared."""
+
+    RECOVER = "recover"
+    READ_ONLY = "read only"
+
+
 def pending_removal(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Read deletion intent and check the identity of its source."""
     record = checked_removal(path)
     if not isinstance(record, StaleRemoval):
         return record
+    if intent is RemovalIntentAccess.READ_ONLY:
+        return copy_record.UnreadableRecord(f"{path}: the saved removal intent belongs to an earlier folder")
     # A lifetime scan may already own a different copy's record lock. Never wait
     # on a sibling merely to discard an old deletion intent.
     with directory_record_lock(path, wait=False, scratch_settings=scratch_settings) as acquired:
@@ -882,43 +977,144 @@ def checked_removal(path: Path) -> copy_record.Registered | copy_record.NotRegis
 
 def task_of(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Read folder task evidence; plain files have no task record."""
-    if os.path.isfile(path):
+    if os.path.isfile(path) or copy_record.is_numbered_copy_path(path):
         return copy_record.NotRegistered()
     record = copy_record.read_record(path / copy_record.RECORD)
-    return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
+    return pending_removal(path, scratch_settings=scratch_settings, intent=intent) if isinstance(record, copy_record.NotRegistered) else record
 
 
-def is_throwaway(path: Path) -> bool:
+def is_throwaway(path: Path, *, intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER) -> bool:
     """Identify a folder that code creates without edits from a person."""
-    record = task_of(path)
+    record = task_of(path, intent=intent)
     return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
-def pending_copy_paths(base: Path) -> Iterator[Path]:
-    if not base.exists():
+def protected_build_path(path: Path) -> bool:
+    """Keep managed build and source paths outside legacy scratch removal."""
+    try:
+        locations = (path.parent.resolve() / path.name, path.resolve())
+    except (OSError, RuntimeError):
+        return True
+    build = copy_record.build_root()
+    workspace = copy_record.worktree_root()
+    for location in locations:
+        if location.is_relative_to(build):
+            scratch_root = copy_record.root().resolve()
+            if not (scratch_root != build and location.is_relative_to(scratch_root)
+                    or location.is_relative_to(build / "session")):
+                return True
+        if location.is_relative_to(workspace):
+            parts = location.relative_to(workspace).parts
+            if len(parts) < 2 or copy_record.copy_folder(workspace.joinpath(*parts[:2])) is None:
+                return True
+    return False
+
+
+def is_managed_worktree(path: Path) -> bool:
+    """Check for a checkout path in the configured source layout."""
+    root = copy_record.worktree_root()
+    return path.is_relative_to(root) and len(path.relative_to(root).parts) == 3
+
+
+def _raise_copy_scan_error(_path: Path, error: OSError) -> None:
+    raise error
+
+
+def _legacy_copy_entries(folder: Path, *,
+                         unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    """Read a legacy copy folder. Let its caller decide how to handle access errors."""
+    try:
+        yield from folder.iterdir()
+    except FileNotFoundError:
         return
-    for pair in base.iterdir():
-        if pair.is_dir() and not pair.is_symlink():
-            yield from marked_folders(pair.iterdir())
+    except OSError as error:
+        unreadable(folder, error)
 
 
-def copy_paths() -> Iterator[Path]:
+class LegacyPairScan(Enum):
+    CLEANUP = "find legacy copy records"
+    BORROWERS = "find legacy copy records and possible Git borrowers"
+
+
+GIT_BORROWER_ENTRIES = (".git", "HEAD", "objects", "commondir")
+
+
+def _entry_exists(path: Path) -> bool:
+    """Check the entry without following a symbolic link."""
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _legacy_pair_entry(entry: Path, scan: LegacyPairScan) -> bool:
+    try:
+        mode = entry.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        return removal_target(entry) is not None
+    return (_entry_exists(entry / copy_record.RECORD)
+            or scan is LegacyPairScan.BORROWERS
+            and any(_entry_exists(entry / name) for name in GIT_BORROWER_ENTRIES))
+
+
+def legacy_copy_pairs(base: Path, *, scan: LegacyPairScan = LegacyPairScan.CLEANUP,
+                      unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    """Find legacy copy pairs in the shared or dedicated root."""
+    try:
+        if not stat.S_ISDIR(base.lstat().st_mode) or base.resolve().is_relative_to(copy_record.build_root()):
+            return
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        unreadable(base, error)
+        return
+    shared_source_root = base == copy_record.worktree_root()
+    for pair in _legacy_copy_entries(base, unreadable=unreadable):
+        try:
+            if not stat.S_ISDIR(pair.lstat().st_mode):
+                continue
+            if shared_source_root and not any(_legacy_pair_entry(entry, scan)
+                    for entry in _legacy_copy_entries(pair, unreadable=unreadable)):
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            unreadable(pair, error)
+            continue
+        yield pair
+
+
+def pending_copy_paths(base: Path, *,
+                       unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error) -> Iterator[Path]:
+    for pair in legacy_copy_pairs(base, unreadable=unreadable):
+        try:
+            yield from marked_folders(_legacy_copy_entries(pair, unreadable=unreadable))
+        except OSError as error:
+            unreadable(pair, error)
+
+
+def copy_paths(*, scan: LegacyPairScan = LegacyPairScan.CLEANUP) -> Iterator[Path]:
     """Each pair/copy without following links. An unreadable registry fails closed."""
     base = copy_record.copies_root()
-    if not base.exists():
-        return
-    for pair in base.iterdir():
-        if pair.is_dir() and not pair.is_symlink():
-            for path in pair.iterdir():
-                if path.is_dir() and not path.is_symlink():
-                    yield path
+    for pair in legacy_copy_pairs(base, scan=scan):
+        for path in _legacy_copy_entries(pair):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                yield path
 
 
 def registered_copy_paths() -> Iterator[Path]:
-    """List native copies and adopted copies from the existing holds."""
-    paths = set(copy_paths())
+    """List copies that can have legacy borrow records."""
+    paths = set(copy_paths(scan=LegacyPairScan.BORROWERS))
     for held in holds():
         path = Path(held)
         record = task_of(path)
@@ -928,29 +1124,70 @@ def registered_copy_paths() -> Iterator[Path]:
     yield from sorted(paths)
 
 
-def record_lifetime(path: Path, now: float, ending_task: str = "", *,
-    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> Live | Ended | Unknown:
-    """Read end evidence while the caller holds any required removal lock."""
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
-    removal = pending_removal(path, scratch_settings=scratch_settings)
-    if isinstance(removal, copy_record.UnreadableRecord):
-        return Unknown(removal.reason)
-    record = task_of(path, scratch_settings=scratch_settings)
-    if isinstance(record, copy_record.UnreadableRecord):
-        return Unknown(record.reason)
-    if isinstance(record, copy_record.NotRegistered):
-        return Unknown(f"repair record {path / copy_record.RECORD}: copy is not registered")
+def numbered_source_lifetime(path: Path) -> Live | Ended | Unknown:
+    """Check whether removing this folder would remove a numbered copy's Git source."""
+    try:
+        root = path.resolve()
+        for record in build_folders.numbered_copy_records():
+            if isinstance(record, build_folders.UnreadableNumberedCopySource):
+                return Unknown(f"{record.path}: cannot check numbered copy source: {record.reason}")
+            copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+            if any(folder.is_relative_to(root)
+                   for folder in (copy.source, copy.git_directory, copy.common_directory)):
+                return Live(f"borrowed: {copy.path} still uses its Git source")
+    except (OSError, ValueError, RuntimeError) as error:
+        return Unknown(f"cannot read numbered copy sources: {error}")
+    return Ended("no numbered copy uses its Git source")
+
+
+class UnregisteredBorrowCandidate(Enum):
+    POSSIBLE_BORROWER = "possible borrower"
+    WORKTREE_SUBFOLDER = "worktree subfolder"
+
+
+def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
+    """Check the pair and candidate for Git entries without reading their targets."""
+    pair = path.parent
+    if pair.parent != copy_record.copies_root():
+        return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as descriptors:
+        pair_fd = os.open(pair, flags)
+        _ = descriptors.callback(os.close, pair_fd)
+        candidate_fd = os.open(path.name, flags, dir_fd=pair_fd)
+        _ = descriptors.callback(os.close, candidate_fd)
+        try:
+            _ = os.stat(".git", dir_fd=pair_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+        for name in GIT_BORROWER_ENTRIES:
+            try:
+                _ = os.stat(name, dir_fd=candidate_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+    return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
+
+
+def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead,
+                    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER) -> Live | Ended | Unknown:
+    """Check the copy registry for borrowers of this folder's Git objects."""
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
         for child in registered_copy_paths():
+            try:
+                mode = child.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(mode):
+                protection = Unknown(f"{child}: cannot check borrowed objects through a link")
+                break
             if child.resolve() == path.resolve():
                 continue
-            if not child.exists():
-                continue
-            other = task_of(child, scratch_settings=scratch_settings)
+            other = task_of(child, scratch_settings=scratch_settings, intent=intent)
             if isinstance(other, copy_record.NotRegistered):
+                if _unregistered_borrow_candidate(child) is UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER:
+                    continue
                 protection = Unknown(f"repair record {child / copy_record.RECORD}: cannot rule out borrowed objects")
                 break
             if isinstance(other, copy_record.UnreadableRecord):
@@ -965,38 +1202,97 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
                 break
     except OSError as error:
         protection = Unknown(f"repair copies registry {copy_record.copies_root()}: {error}")
+    return protection
+
+
+@dataclass(frozen=True)
+class DescendantLocksHeld:
+    """The descendant checks passed. The supplied stack holds the locks."""
+
+    checkouts: tuple[Path, ...]
+
+
+def lock_descendant_clones(path: Path, locks: ExitStack, scope: BusyMarkScope, *, create: bool,
+                           scratch_settings: conf.ConfigRead) -> DescendantLocksHeld | KeptFolder:
+    """Hold descendant busy marks and check each clone for borrowers."""
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    clones: list[Path] = []
+    try:
+        for top, directories, files, _ in os.fwalk(path, onerror=unreadable, follow_symlinks=False):
+            if ".git" in directories:
+                directories.remove(".git")
+                checkout = True
+            else:
+                checkout = ".git" in files
+            child = Path(top)
+            if child == path:
+                continue
+            if not checkout and (copy_record.RECORD in files or copy_record.RECORD in directories):
+                record = copy_record.read_record(child / copy_record.RECORD)
+                if isinstance(record, copy_record.UnreadableRecord):
+                    return KeptFolder(path, record.reason)
+                checkout = isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True
+            if checkout:
+                if not locks.enter_context(busy_locks(child, create=create, scope=scope)):
+                    return KeptFolder(path, f"{child}: {BUSY_REASON}")
+                clones.append(child)
+    except OSError as error:
+        return KeptFolder(path, f"cannot check descendant clones: {error}")
+
+    for child in clones:
+        state = borrow_lifetime(child, scratch_settings=scratch_settings)
+        if not isinstance(state, Ended):
+            return KeptFolder(path, f"{child}: {state.why if isinstance(state, Live) else state.reason}")
+    return DescendantLocksHeld(tuple(clones))
+
+
+def record_lifetime(path: Path, now: float, ending_task: str = "", *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
+) -> Live | Ended | Unknown:
+    """Read end evidence while the caller holds any required removal lock."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    removal = pending_removal(path, scratch_settings=scratch_settings, intent=intent)
+    if isinstance(removal, copy_record.UnreadableRecord):
+        return Unknown(removal.reason)
+    record = task_of(path, scratch_settings=scratch_settings, intent=intent)
+    if isinstance(record, copy_record.UnreadableRecord):
+        return Unknown(record.reason)
+    if isinstance(record, copy_record.NotRegistered):
+        return Unknown(f"repair record {path / copy_record.RECORD}: copy is not registered")
+    protection = borrow_lifetime(path, scratch_settings=scratch_settings, intent=intent)
     if isinstance(removal, copy_record.Registered):
         return Ended(f"deletion intent for task {removal.task}") if isinstance(protection, Ended) else protection
     if record.task.startswith("phase:"):
         run, phase = record.fields.get("run_dir"), record.fields.get("phase_id")
         if not isinstance(run, str) or not run or not isinstance(phase, str) or not phase:
             return Unknown(f"repair record {path / copy_record.RECORD}: phase needs run_dir and phase_id")
-        progress = Path(run) / "progress_history_state.json"
+        progress = Path(run) / recorder_state.STATE_FILENAME
         try:
-            raw = cast(object, json.loads(progress.read_text(encoding="utf-8")))
-            if not isinstance(raw, dict):
-                raise ValueError("expected progress object")
-            state = cast(dict[str, object], raw)
+            state = recorder_state.read_state(progress)
             current = state.get("phase")
-            parked = state.get("open_phases", [])
-            if not isinstance(current, dict) or not isinstance(parked, list):
+            opened = state.get("open_phases", [])
+            if (current is not None and not isinstance(current, dict)) or not isinstance(opened, list):
                 raise ValueError("invalid phase state")
-            phases: list[object] = [cast(object, current), *cast(list[object], parked)]
-            for item in phases:
+            for item in cast(list[object], opened):
                 if not isinstance(item, dict):
                     raise ValueError("invalid phase record")
-                fields = cast(dict[str, object], item)
-                if str(fields.get("id")) == phase:
-                    status = fields.get("status")
-                    if status == "active" or item in parked:
-                        return Live(f"open phase: {phase} in {run}")
-                    # finish-phase's --status choices in progress_history.py; no shared constant exists.
-                    if status not in ("completed", "stopped", "error", "finished", "complete", "ended"):
+                if cast(dict[str, object], item).get("id") == phase:
+                    return Live(f"open phase: {phase} in {run}")
+            if isinstance(current, dict):
+                fields = cast(dict[str, object], current)
+                if fields.get("id") == phase:
+                    if fields.get("status") not in ("completed", "stopped", "error", "finished", "complete", "ended"):
                         raise ValueError("unreadable phase status")
                     return Ended(f"phase {phase} ended in {progress}") if isinstance(protection, Ended) else protection
             if record.task == ending_task or task_has_end_evidence(record):
                 return Ended(f"task {record.task} ended; phase is no longer open in {progress}") if isinstance(protection, Ended) else protection
             raise ValueError(f"phase {phase} has no end record")
+        except recorder_state.OldRecorderState as error:
+            return Unknown(str(error))
         except (OSError, ValueError, UnicodeError) as error:
             return Unknown(f"repair progress file {progress}: {error}")
     if record.task.startswith("landed:"):
@@ -1022,9 +1318,11 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
             return Live(f"not landed: origin/{branch} is not in {target}")
         if ancestor.returncode:
             return Unknown(f"repair land target {target} in source checkout {source_path}: {ancestor.stderr.strip()}")
-        problem = unsaved_work(path, scratch_settings=scratch_settings)
-        if problem is not None:
-            return Unknown(problem) if "git cannot" in problem else Live("not landed: " + problem)
+        work = _removal_work(path, scratch_settings, publication=RemoteInspection.LOCAL_ONLY)
+        if isinstance(work, RemoteKeptFolder):
+            return LandedRemoteCheckNeeded(work.reason) if isinstance(protection, Ended) else protection
+        if isinstance(work, KeptFolder):
+            return Unknown(work.reason) if "git cannot" in work.reason else Live("not landed: " + work.reason)
         return Ended(f"origin/{branch} landed in {target}") if isinstance(protection, Ended) else protection
     if record.task == ending_task or task_has_end_evidence(record):
         return Ended(f"task {record.task} ended") if isinstance(protection, Ended) else protection
@@ -1039,11 +1337,12 @@ def task_has_end_evidence(record: copy_record.Registered) -> bool:
 
 def lifetime(path: Path, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> Live | Ended | Unknown:
     with judgment_lock(path) as idle:
         if not idle:
             return Live(BUSY_REASON)
-    return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings)
+    return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings, intent=intent)
 
 
 def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Folder]:
@@ -1166,21 +1465,10 @@ def save_cargo_outputs(path: Path) -> tuple[SavedCargoOutput, ...]:
             saved.append(SavedCargoOutput(roots, tuple(Path(peer) for peer in cast(list[str], peers)),
                                           tuple(Path(root).resolve() for root in cast(list[str], shared)), float(saved_at)))
         return tuple(saved)
-    found: list[SavedCargoOutput] = []
-    checkouts = set(repos(path))
-    if (path / "Cargo.toml").is_file():
-        checkouts.add(path)
-    for checkout in sorted(checkouts):
-        if not (checkout / "Cargo.toml").is_file():
-            continue
-        roots = cargo_output.read_cargo_output_roots(checkout)
-        if isinstance(roots, cargo_output.CargoOutputUnavailable):
-            print(f"scratch: cannot read Cargo output for {checkout}: {roots.reason}", file=sys.stderr)
-            continue
-        if roots.workspace_root.is_relative_to(path) and roots not in [item.roots for item in found]:
-            found.append(SavedCargoOutput(roots, cargo_checkout_peers(roots.workspace_root),
-                                          ((checkout / "target").resolve(),) if (checkout / "target").is_symlink() else (),
-                                          time.time()))
+    found = [SavedCargoOutput(roots, cargo_checkout_peers(roots.workspace_root),
+                             ((checkout / "target").resolve(),) if (checkout / "target").is_symlink() else (),
+                             time.time())
+             for checkout, roots in cargo_workspace_outputs(path) if roots.workspace_root.is_relative_to(path)]
     if found:
         atomic_record(mark, [{"workspace_root": str(item.roots.workspace_root),
                              "target_directory": str(item.roots.target_directory),
@@ -1191,20 +1479,54 @@ def save_cargo_outputs(path: Path) -> tuple[SavedCargoOutput, ...]:
     return tuple(found)
 
 
-def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None:
-    """Run the shared guard without importing the sweep back into scratch."""
-    if not any(not item.roots.build_directory.is_relative_to(path.resolve())
-               and item.roots.build_directory.exists() for item in saved):
-        return
-    result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
-                             "--clean-cargo-output", str(path.resolve())],
-                            capture_output=True, text=True, check=False)
-    if result.returncode == CARGO_OUTPUT_KEPT_STATUS:
-        raise CargoOutputKept(result.stderr.strip())
-    if result.returncode:
-        raise OSError(result.stderr.strip() or "Cargo output cleanup failed")
-    if result.stderr:
-        print(result.stderr.strip(), file=sys.stderr)
+def cargo_workspace_outputs(path: Path) -> Iterator[tuple[Path, cargo_output.CargoOutputRoots]]:
+    """Read Cargo output paths from checkouts inside the source folder."""
+    found: set[cargo_output.CargoOutputRoots] = set()
+    checkouts = set(repos(path))
+    if (path / "Cargo.toml").is_file():
+        checkouts.add(path)
+    for checkout in sorted(checkouts):
+        if not (checkout / "Cargo.toml").is_file():
+            continue
+        roots = cargo_output.read_cargo_output_roots(checkout, options=("--locked",))
+        if isinstance(roots, cargo_output.CargoOutputUnavailable):
+            print(f"scratch: cannot read Cargo output for {checkout}: {roots.reason}", file=sys.stderr)
+            continue
+        if roots not in found:
+            found.add(roots)
+            yield checkout, roots
+
+
+def report_retained_cargo_outputs(path: Path) -> bool:
+    """Report external Cargo folders and return whether Cargo reported any output paths."""
+    root = path.resolve()
+    seen = False
+    kept: set[Path] = set()
+    for _, roots in cargo_workspace_outputs(root):
+        seen = True
+        for output in (roots.target_directory, roots.build_directory):
+            if not output.is_relative_to(root) and output.is_dir():
+                kept.add(output)
+    for output in sorted(kept):
+        report_retained_task_folder(output, "Cargo output is outside the crate workspace")
+    return seen
+
+
+def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...], *,
+                        source: removal_guard.Identity | None = None) -> None:
+    """List external outputs for review without running a deletion process."""
+    if source is not None and removal_guard.identity(path.lstat()) != source:
+        raise CargoOutputKept(f"{path}: source identity changed")
+    plan = removal_guard.RemovalList(removal_guard.Tool.CARGO)
+    for item in saved:
+        folder = item.roots.build_directory
+        if folder.is_relative_to(path) or item.borrows_build_directory() or not folder.exists():
+            continue
+        _ = plan.add_manual(removal_guard.Tool.CARGO, folder, path, 0, "external Cargo output")
+    if source is not None and removal_guard.identity(path.lstat()) != source:
+        raise CargoOutputKept(f"{path}: source identity changed")
+    if plan.rows:
+        plan.report()
 
 
 @dataclass(frozen=True)
@@ -1238,10 +1560,11 @@ class ExpiredFolderRemoval:
 
 
 class SourceDeletion(Enum):
-    """Select the existing source deletion method after all safety checks pass."""
+    """Select the source deletion method and its scope."""
     STANDARD = "standard"
     SWEEP = "sweep"
     RUN = "run"
+    CRATE_WORKSPACE_ONLY = "crate_workspace_only"
 
 
 class _GitWorkAssessment(Protocol):
@@ -1253,9 +1576,8 @@ class _GitWorkAssessment(Protocol):
 
 
 class _SweepRemoval(Protocol):
-    """Use the existing sweep checks and deletion method at the module boundary."""
-    def git_work(self, path: Path) -> _GitWorkAssessment: ...
-    def delete_tree(self, path: str) -> None: ...
+    """Use the sweep's saved-work check."""
+    def git_work(self, path: Path, *, verified_repos: tuple[Path, ...]) -> _GitWorkAssessment: ...
 
 
 class _WorkspaceRescue(Protocol):
@@ -1277,24 +1599,71 @@ class RepositoryRemovalEvidence(TypedDict):
 
 def removal_source_files(path: Path) -> dict[str, int]:
     """Read every regular file's ctime, including files inside Git directories."""
-    found: dict[str, int] = {}
-
-    def visit(folder: Path) -> None:
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                status = Path(entry.path).lstat()
-                if stat.S_ISDIR(status.st_mode):
-                    visit(Path(entry.path))
-                elif stat.S_ISREG(status.st_mode):
-                    found[str(Path(entry.path).relative_to(path))] = status.st_ctime_ns
-
-    visit(path)
-    return found
+    root = path.resolve()
+    return removal_regular_files(root, removal_entries(root))
 
 
-def empty_lost_worktree(path: Path) -> bool:
-    """Identify an empty linked worktree whose source Git directory disappeared."""
-    return ((path / ".git").is_file() and not isinstance(git_directory(path), GitDirectory)
+def removal_entries(root: Path) -> dict[Path, git_files.RemovalEntry]:
+    try:
+        return git_files.scan_removal_tree(root)
+    except git_files.UnreadableGitFiles as error:
+        raise OSError(str(error)) from error
+
+
+def removal_regular_files(root: Path, entries: Mapping[Path, git_files.RemovalEntry]) -> dict[str, int]:
+    return {str(entry.path.relative_to(root)): entry.status.st_ctime_ns
+            for entry in entries.values() if stat.S_ISREG(entry.status.st_mode)}
+
+
+def removal_checkouts(path: Path, descendants: tuple[Path, ...]) -> tuple[git_files.Checkout, ...]:
+    checkouts: list[git_files.Checkout] = []
+    for folder in (path, *descendants):
+        git = git_directory(folder)
+        if isinstance(git, UnreadableGitDirectory):
+            raise OSError(git.reason)
+        if isinstance(git, GitDirectory):
+            checkouts.append(git.checkout)
+    return tuple(checkouts)
+
+
+def removal_ref_entries(entries: Mapping[Path, git_files.RemovalEntry],
+                        checkouts: tuple[git_files.Checkout, ...]) -> Iterator[git_files.RemovalEntry]:
+    directories = {directory for checkout in checkouts for directory in (checkout.git_dir, checkout.common_dir)}
+    directories.update(path for path, entry in entries.items()
+                       if path.name == ".git" and stat.S_ISDIR(entry.status.st_mode))
+    if not directories:
+        return
+    files = {directory / name for directory in directories for name in ("HEAD", "packed-refs")}
+    prefixes = tuple(str(directory / name) + os.sep for directory in directories for name in ("refs", "reftable"))
+    for path, entry in entries.items():
+        if not stat.S_ISDIR(entry.status.st_mode) and (path in files or str(path).startswith(prefixes)):
+            yield entry
+
+
+def removal_ref_stat(entry: git_files.RemovalEntry) -> tuple[int, int, int]:
+    """Identify Git's replacement of a ref file without reading the file."""
+    status = entry.status
+    return status.st_ino, status.st_size, status.st_mtime_ns
+
+
+def changed_removal_ref(root: Path, refs: Iterable[git_files.RemovalEntry], recorded: object,
+                        legacy_mtime: int | None) -> Path | None:
+    if recorded is None:
+        # A legacy mark and its refs use filesystem timestamps.
+        # An old versioned mark cannot compare its wall time with ref ctime.
+        return min((entry.path for entry in refs
+                    if legacy_mtime is None or entry.status.st_ctime_ns >= legacy_mtime), default=None)
+    if not isinstance(recorded, dict):
+        raise OSError(f"{root}: invalid removal ref evidence")
+    previous = cast(dict[str, object], recorded)
+    return min((entry.path for entry in refs
+                if previous.get(str(entry.path.relative_to(root))) != list(removal_ref_stat(entry))), default=None)
+
+
+def empty_lost_worktree(path: Path, git: GitDirectoryState) -> bool:
+    """Check that a worktree with a missing Git directory has no source files."""
+    return (isinstance(git, (NoGitDirectory, git_files.MissingReferencedGitDirectory))
+            and (path / ".git").is_file()
             and set(removal_source_files(path)).issubset({".git", copy_record.RECORD, BUSY}))
 
 
@@ -1318,17 +1687,51 @@ def repository_removal_evidence(path: Path, *, scratch_settings: conf.ConfigRead
     return evidence
 
 
-def recovery_state(path: Path, pending: copy_record.Registered, *,
-                   scratch_settings: conf.ConfigRead) -> RemovalRetry | KeptFolder:
+def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkScope, *,
+                   scratch_settings: conf.ConfigRead, descendant_checkouts: tuple[Path, ...] = ()) -> RemovalRetry | KeptFolder:
     """Resume unchanged sources and check changed sources before another deletion attempt."""
-    intent = pending.fields.get("removal_intent_ns", removal_mark(path).stat().st_mtime_ns)
+    mark_mtime = removal_mark(path).stat().st_mtime_ns
+    intent = pending.fields.get("removal_intent_ns", mark_mtime)
     if type(intent) is not int:
         return KeptFolder(path, "invalid removal intent time")
-    files = removal_source_files(path)
-    changed = next((name for name, ctime in sorted(files.items()) if ctime > intent), "")
-    if not changed:
+    # A changed file can share the mark's timestamp and still come after the intent.
+    source_cutoff = min(intent, mark_mtime)
+    versioned = "removal_version" in pending.fields
+    regular_cutoff = source_cutoff if versioned else source_cutoff + 1
+    saved_files = pending.fields.get("removal_files")
+    previous = (git_files.RecordedRemovalFiles(frozenset(name for name in cast(list[object], saved_files)
+                                                         if isinstance(name, str)))
+                if pending.fields.get("removal_version") == REMOVAL_VERSION and isinstance(saved_files, list)
+                else git_files.LegacyRemovalFiles())
+    removal_root = path.resolve()
+    try:
+        checkouts = removal_checkouts(path, descendant_checkouts)
+        git_files.check_internal_removal_entries(checkouts, previous, removal_root=removal_root)
+        entries = git_files.scan_removal_tree(removal_root, checkouts=checkouts, previous=previous)
+        refs = {entry.path: entry for entry in removal_ref_entries(entries, checkouts)}
+        legacy_mtime = None if versioned else mark_mtime
+        recorded_refs = pending.fields.get("removal_ref_files")
+        ref_change = changed_removal_ref(removal_root, refs.values(), recorded_refs, legacy_mtime)
+        if ref_change is not None:
+            change = "may have changed" if recorded_refs is None else "changed"
+            return ChangedRemovalRef(path, f"ambiguous source: {ref_change} {change} after removal intent")
+        busy_marks = {removal_root / mark.relative_to(path): os.fstat(scope.held[mark])
+                      for mark in scope.created if mark.is_relative_to(path)}
+    except (OSError, git_files.UnreadableGitFiles) as error:
+        return KeptFolder(path, str(error))
+
+    # Exempt only the busy mark that the retry created and still holds.
+    changed = min((entry.path for entry in entries.values()
+                   if entry.path not in refs
+                   and ((stat.S_ISREG(entry.status.st_mode) and entry.status.st_ctime_ns >= regular_cutoff)
+                        or (stat.S_ISLNK(entry.status.st_mode) and entry.status.st_ctime_ns >= source_cutoff))
+                   and (entry.path not in busy_marks or not os.path.samestat(entry.status, busy_marks[entry.path]))),
+                  default=RemovalRetry.UNCHANGED)
+    if changed is RemovalRetry.UNCHANGED:
         return RemovalRetry.UNCHANGED
-    reason = f"ambiguous source: {path / changed} changed after removal intent"
+    reason = f"ambiguous source: {changed} changed after removal intent"
+    files = {str(entry.path.relative_to(removal_root)) for entry in entries.values()
+             if stat.S_ISREG(entry.status.st_mode)}
     found = repos(path, scratch_settings=scratch_settings)
     if pending.fields.get("removal_version") == REMOVAL_VERSION:
         raw = pending.fields.get("removal_repositories")
@@ -1351,8 +1754,9 @@ def recovery_state(path: Path, pending: copy_record.Registered, *,
     else:
         # Old marks cannot identify a checkout whose Git directory disappeared.
         metadata = {copy_record.RECORD, BUSY, *verified_mirror_metadata(path)}
-        if any(name not in metadata and not any((path / name).is_relative_to(repo) for repo in found)
-               for name in files):
+        if any(str(entry.path.relative_to(removal_root)) not in metadata
+               and not any(entry.path.is_relative_to(repo.resolve()) for repo in found)
+               for entry in entries.values() if stat.S_ISREG(entry.status.st_mode) or stat.S_ISLNK(entry.status.st_mode)):
             return KeptFolder(path, reason + "; legacy source has no complete repository evidence")
     for repo in found:
         if not isinstance(git_directory(repo), GitDirectory):
@@ -1360,6 +1764,68 @@ def recovery_state(path: Path, pending: copy_record.Registered, *,
         if _git(repo, "fsck", "--connectivity-only", "--no-reflogs").returncode:
             return KeptFolder(path, reason + f"; Git objects are incomplete in {repo}")
     return RemovalRetry.RECHECK
+
+
+@dataclass(frozen=True)
+class KeptFolder:
+    """A folder that cleanup retains for the stated reason."""
+
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class ChangedRemovalRef(KeptFolder):
+    """The retry must keep a folder whose Git ref changed."""
+
+
+@dataclass(frozen=True)
+class RemoteKeptFolder(KeptFolder):
+    """A folder with work that requires remote publication evidence."""
+
+
+@dataclass(frozen=True)
+class LocalRemoteKeptFolder(RemoteKeptFolder):
+    """The local remote cannot supply independent evidence for removal."""
+
+
+@dataclass(frozen=True)
+class RemoteStorageUnproven(LocalRemoteKeptFolder):
+    """The local remote's repository or object storage could not be verified."""
+
+
+@dataclass(frozen=True)
+class RemoteInsideRemovalTree(LocalRemoteKeptFolder):
+    """Removal would delete a local repository that could supply publication evidence."""
+
+
+@dataclass(frozen=True)
+class RemovalWorkSaved:
+    """The work check found no unsaved work in these repositories."""
+
+    repositories: tuple[Path, ...] = ()
+
+
+class RemovalWorkCheck(Enum):
+    STANDARD = "standard"
+    LANDED = "landed"
+
+
+def check_removal_work(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval,
+                       scratch_settings: conf.ConfigRead, *, publication: PublicationCheck,
+                       check: RemovalWorkCheck) -> RemovalWorkSaved | KeptFolder:
+    """Check current work under the removal locks."""
+    if not isinstance(request, ExpiredFolderRemoval):
+        return _removal_work(path, scratch_settings, publication=publication)
+    verified_repos: tuple[Path, ...] = ()
+    if check is RemovalWorkCheck.LANDED:
+        work = _removal_work(path, scratch_settings, publication=publication)
+        if isinstance(work, KeptFolder):
+            return work
+        verified_repos = work.repositories
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    work = sweep.git_work(path, verified_repos=verified_repos)
+    return RemovalWorkSaved() if work.name == "SAVED" else KeptFolder(path, work.value)
 
 
 def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: bool = False) -> None:
@@ -1378,7 +1844,38 @@ def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: 
     removal_mark(path).unlink(missing_ok=True)
 
 
-def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval = FOLDER_REMOVAL, *,
+def remove_numbered_folder(path: Path, *, dry_run: bool) -> RemovedCopy | KeptFolder:
+    """Keep a numbered checkout for manual review."""
+    _ = dry_run
+    copy = build_folders.numbered_copy_record(path)
+    if isinstance(copy, build_folders.UnreadableNumberedCopySource):
+        return KeptFolder(path, copy.reason)
+    if isinstance(copy, build_folders.NoNumberedCopySource) and not os.path.lexists(path):
+        return RemovedCopy()
+    reason = "the numbered copy requires manual review"
+    report_retained_task_folder(path, reason)
+    return KeptFolder(path, reason)
+
+
+def delete_sweep_tree(path: str) -> None:
+    """Remove a source owned by the legacy folder audit."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+        return
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        for _, _, _, descriptor in os.fwalk(path, follow_symlinks=False):
+            os.fchmod(descriptor, 0o700)
+        shutil.rmtree(path)
+
+
+@dataclass(frozen=True)
+class FinishAbsentRemoval:
+    """Complete a saved removal only while its source is absent."""
+
+
+def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval | FinishAbsentRemoval = FOLDER_REMOVAL, *,
                   source_deletion: SourceDeletion = SourceDeletion.STANDARD, dry_run: bool = False,
                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> RemovedCopy | KeptFolder:
@@ -1386,15 +1883,30 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     path = path.absolute()
-    lock = judgment_lock if dry_run else removal_lock
-    with lock(path) as idle:
+    numbered = copy_record.numbered_copy_checkout(path)
+    if isinstance(numbered, Path):
+        if isinstance(request, TaskRemoval):
+            return KeptFolder(path, NUMBERED_COPY_HOLD_REFUSAL)
+        if (source_deletion is not SourceDeletion.STANDARD or path.is_symlink()
+                or numbered.resolve() != path.resolve()
+                or isinstance(request, (SelectedCopyRemoval, ExpiredFolderRemoval))):
+            return KeptFolder(path, "the numbered copy owner handles removal")
+        return remove_numbered_folder(numbered, dry_run=dry_run)
+    if protected_build_path(path):
+        return KeptFolder(path, "the build folder owner handles removal")
+    scope = BusyMarkScope()
+    lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
+    with lock as idle:
         if not idle:
             pending = pending_removal(path, scratch_settings=scratch_settings)
             if isinstance(pending, copy_record.Registered) and path.is_dir():
-                recovery = recovery_state(path, pending, scratch_settings=scratch_settings)
+                recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings)
                 if isinstance(recovery, KeptFolder):
                     return recovery
-            if os.path.lexists(path / ".git") and not isinstance(git_directory(path), GitDirectory):
+            git = git_directory(path)
+            if isinstance(git, UnreadableGitDirectory):
+                return KeptFolder(path, git.reason)
+            if isinstance(git, git_files.MissingReferencedGitDirectory):
                 return KeptFolder(path, f"ambiguous source: Git metadata is incomplete in {path}")
             if isinstance(request, TaskRemoval) and not dry_run and path.is_dir() and isinstance(pending, copy_record.NotRegistered):
                 with copy_record_lock(path, scratch_settings=scratch_settings):
@@ -1405,9 +1917,12 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         fields = {**record.fields, "ended": request.now, "ended_task": request.task}
                         _ = update_record(path, lambda current: fields, scratch_settings=scratch_settings)
             return KeptFolder(path, BUSY_REASON)
+        publication = RemoteInspection.LOCAL_ONLY if dry_run else RemovalAdvertisements(path, scratch_settings)
         present = os.path.lexists(path)
         record_lock = copy_record_lock(path, scratch_settings=scratch_settings) if path.is_dir() and not path.is_symlink() else nullcontext()
-        with record_lock:
+        with record_lock, ExitStack() as descendants:
+            if isinstance(request, FinishAbsentRemoval) and os.path.lexists(path):
+                return KeptFolder(path, "source exists again")
             pending = pending_removal(path, scratch_settings=scratch_settings)
             if isinstance(pending, copy_record.UnreadableRecord):
                 return KeptFolder(path, pending.reason)
@@ -1431,18 +1946,38 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             if not present:
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
-                if not dry_run:
+                if not dry_run and source_deletion is not SourceDeletion.CRATE_WORKSPACE_ONLY:
                     finish_removal(path)
                 return RemovedCopy()
+            if isinstance(request, FinishAbsentRemoval):
+                return KeptFolder(path, "source exists again")
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
+            held = _held_removal_lock(path)
+            if held is not None:
+                scope = held.marks
+            descendant_checkouts: tuple[Path, ...] = ()
+            if path.is_dir() and not path.is_symlink():
+                checked = lock_descendant_clones(path, descendants, scope, create=not dry_run,
+                                                 scratch_settings=scratch_settings)
+                if isinstance(checked, KeptFolder):
+                    return checked
+                descendant_checkouts = checked.checkouts
             recovery = RemovalRetry.RECHECK
             if isinstance(pending, copy_record.Registered):
-                recovery = recovery_state(path, pending, scratch_settings=scratch_settings)
-                if isinstance(recovery, KeptFolder):
+                recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                                          descendant_checkouts=descendant_checkouts)
+                if isinstance(recovery, KeptFolder) and not isinstance(recovery, ChangedRemovalRef):
                     return recovery
-            # An empty linked worktree has no source files to preserve when its Git directory disappears.
-            empty_run_worktree = source_deletion is SourceDeletion.RUN and empty_lost_worktree(path)
+            git = git_directory(path)
+            if isinstance(git, UnreadableGitDirectory):
+                return KeptFolder(path, git.reason)
+            if (isinstance(git, (GitDirectory, git_files.MissingReferencedGitDirectory))
+                    or descendant_checkouts or (path / "objects").is_dir()):
+                protection = numbered_source_lifetime(path)
+                if not isinstance(protection, Ended):
+                    return KeptFolder(path, protection.why if isinstance(protection, Live) else protection.reason)
+            empty_run_worktree = source_deletion is SourceDeletion.RUN and empty_lost_worktree(path, git)
             task_request = TaskRemoval(request.expected.task, request.now) if isinstance(request, SelectedCopyRemoval) else request
             copy = (copy_record.copy_folder(path) == path.resolve()
                     or isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True)
@@ -1452,30 +1987,33 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                     original_fields = record.fields
                     record = update_record(path, lambda current: {**original_fields, "ended": task_request.now,
                                            "ended_task": task_request.task}, scratch_settings=scratch_settings)
-                if copy:
-                    state = record_lifetime(path, task_request.now, scratch_settings=scratch_settings)
-                    if not isinstance(state, Ended):
-                        return KeptFolder(path, state.why if isinstance(state, Live) else state.reason)
-            if isinstance(request, ExpiredFolderRemoval) and copy_record.copy_folder(path) == path.resolve():
-                state = record_lifetime(path, request.now, scratch_settings=scratch_settings)
-                if not isinstance(state, Ended):
+            check = RemovalWorkCheck.STANDARD
+            if (isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered) and copy
+                    or isinstance(task_request, ExpiredFolderRemoval) and copy_record.copy_folder(path) == path.resolve()):
+                state = record_lifetime(path, task_request.now, scratch_settings=scratch_settings)
+                if isinstance(state, LandedRemoteCheckNeeded) and isinstance(publication, RemovalAdvertisements):
+                    check = RemovalWorkCheck.LANDED
+                elif not isinstance(state, Ended):
                     return KeptFolder(path, state.why if isinstance(state, Live) else state.reason)
-            if (recovery is RemovalRetry.RECHECK and not empty_run_worktree
-                    and (not is_throwaway(path) or isinstance(pending, copy_record.Registered))):
-                if isinstance(request, ExpiredFolderRemoval):
-                    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
-                    work = sweep.git_work(path)
-                    problem = work.value if work.name != "SAVED" else None
-                else:
-                    problem = unsaved_work(path, scratch_settings=scratch_settings)
+            if (check is RemovalWorkCheck.LANDED or
+                    ((recovery is RemovalRetry.RECHECK or isinstance(recovery, ChangedRemovalRef)) and not empty_run_worktree
+                     and (not is_throwaway(path) or isinstance(pending, copy_record.Registered)))):
+                work = check_removal_work(path, request, scratch_settings, publication=publication, check=check)
+                if isinstance(recovery, ChangedRemovalRef):
+                    # Keep the ref even when Git finds that its commit is published.
+                    return work if isinstance(work, KeptFolder) else recovery
+                if isinstance(work, LocalRemoteKeptFolder) or (check is RemovalWorkCheck.LANDED and isinstance(work, KeptFolder)):
+                    return work
                 rescue = (isinstance(pending, copy_record.NotRegistered)
                           and isinstance(record, copy_record.Registered)
                           and (selected or "crate_run" in record.fields))
                 if rescue and not dry_run and isinstance(record, copy_record.Registered):
                     copies = cast(_WorkspaceRescue, cast(object, import_module("scripts.copies.copies")))
                     copies.rescue_workspace(path, record)
-                if problem is not None and not (rescue and not selected):
-                    return KeptFolder(path, problem)
+                if isinstance(work, KeptFolder) and not (rescue and not selected):
+                    return work
+            if isinstance(recovery, ChangedRemovalRef):
+                return recovery
             if dry_run:
                 return RemovedCopy()
             if isinstance(record, copy_record.Registered):
@@ -1488,28 +2026,65 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         raise ScratchError("cannot clear Claude trust: " + "; ".join(trust.reasons))
             if path.is_symlink() or not path.is_dir():
                 if source_deletion is SourceDeletion.SWEEP:
-                    cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
+                    delete_sweep_tree(str(path))
                 else:
                     path.unlink()
                 return RemovedCopy()
-            saved = save_cargo_outputs(path)
-            clean_cargo_outputs(path, saved)
+            lease = (held.lease if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
+                     and record.fields.get("test_hana_clone") is True and held is not None
+                     and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
+            sidecars = lease.sidecar_identities() if lease is not None else {}
+            has_cargo_manifest = isinstance(pending, copy_record.Registered) and any(
+                (folder / "Cargo.toml").is_file() for folder in (path, *descendant_checkouts))
+            source = removal_guard.identity(path.lstat())
+            if source_deletion is SourceDeletion.CRATE_WORKSPACE_ONLY:
+                has_cargo_output = report_retained_cargo_outputs(path)
+            else:
+                saved = save_cargo_outputs(path)
+                if removal_guard.identity(path.lstat()) != source:
+                    return KeptFolder(path, "source identity changed before Cargo output review")
+                clean_cargo_outputs(path, saved)
+                has_cargo_output = bool(saved)
+            if isinstance(pending, copy_record.Registered) and (has_cargo_manifest or has_cargo_output):
+                # Cargo preparation can change the source without finding any Cargo outputs.
+                recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                                          descendant_checkouts=descendant_checkouts)
+                if (recovery is RemovalRetry.RECHECK or isinstance(recovery, ChangedRemovalRef)) and not empty_run_worktree:
+                    work = check_removal_work(path, request, scratch_settings, publication=publication, check=check)
+                    if isinstance(work, KeptFolder):
+                        return work
+                    if recovery is RemovalRetry.RECHECK:
+                        recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                                                  descendant_checkouts=descendant_checkouts)
+                if isinstance(recovery, KeptFolder):
+                    return recovery
             if isinstance(pending, copy_record.NotRegistered):
                 directory = path.stat()
                 fields: dict[str, object] = dict(record.fields) if isinstance(record, copy_record.Registered) else {
                     "task": task_request.task if isinstance(task_request, TaskRemoval) else "gate:folder-removal"}
+                repositories = [] if empty_run_worktree else repository_removal_evidence(path, scratch_settings=scratch_settings)
+                root = path.resolve()
+                entries = removal_entries(root)
+                checkouts = removal_checkouts(path, descendant_checkouts)
+                references = {str(entry.path.relative_to(root)): removal_ref_stat(entry)
+                              for entry in removal_ref_entries(entries, checkouts)}
                 fields.update(removal_version=REMOVAL_VERSION, copy_path=str(path.resolve()),
                               copy_device=directory.st_dev, copy_inode=directory.st_ino,
-                              removal_repositories=[] if empty_run_worktree else repository_removal_evidence(path, scratch_settings=scratch_settings),
-                              removal_files=sorted(removal_source_files(path)), removal_intent_ns=time.time_ns())
+                              removal_repositories=repositories,
+                              removal_files=sorted(removal_regular_files(root, entries)), removal_ref_files=references,
+                              removal_intent_ns=time.time_ns())
                 atomic_record(removal_mark(path), fields)
+            if removal_guard.identity(path.lstat()) != source:
+                return KeptFolder(path, "source identity changed before removal")
             if source_deletion is SourceDeletion.SWEEP:
-                cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
+                delete_sweep_tree(str(path))
             elif source_deletion is SourceDeletion.RUN:
                 cast(_RunSourceRemoval, cast(object, import_module("scripts.direct.remove_run_scratch"))).remove_tree(path)
             else:
                 remove(path)
             finish_removal(path, cargo_cleaned=True)
+            if lease is not None:
+                lease.unlink_sidecars(sidecars)
             return RemovedCopy()
 
 
@@ -1543,13 +2118,14 @@ def remove_marked(path: Path, *, source_deletion: SourceDeletion = SourceDeletio
         raise ScratchError(f"{path}: kept: {result.reason}")
 
 
-def clear_finished_copy_removals(base: Path, *,
+def clear_finished_copy_removals(base: Path, *, skip: Collection[Path] = (),
+    unreadable: Callable[[Path, OSError], None] = _raise_copy_scan_error,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[KeptFolder]:
-    """Complete absent sources through the same coordinator used for task cleanup."""
+    """Finish legacy copy removals whose checkout is absent."""
     kept: list[KeptFolder] = []
-    for path in sorted(pending_copy_paths(base)):
-        if not os.path.lexists(path):
+    for path in sorted(pending_copy_paths(base, unreadable=unreadable)):
+        if path not in skip and not os.path.lexists(path):
             try:
                 result = remove_folder(path, scratch_settings=scratch_settings)
             except (ScratchError, OSError) as error:
@@ -1610,12 +2186,17 @@ def locked_holds(*,
         yield holds(scratch_settings=scratch_settings)
 
 
+NUMBERED_COPY_HOLD_REFUSAL = "the numbered copy lease owns its lifetime and does not permit task holds"
+
+
 def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
     """Hold an existing folder for `task`; return the task."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    if copy_record.is_numbered_copy_path(path):
+        raise ScratchError(f"{path}: {NUMBERED_COPY_HOLD_REFUSAL}")
     if path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path} is no folder")
     if not reason.strip():
@@ -1639,8 +2220,17 @@ def release(path: Path, *, scratch_settings: conf.ConfigRead | UseConfiguredValu
     return True
 
 
-def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
+def _git_read_environment() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_TRACE")}
+    env.update(GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0", GIT_NO_LAZY_FETCH="1",
+               GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0")
+    return env
+
+
+def _git(repo: Path, *arguments: str, input: str | None = None,
+         timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(repo), *arguments], input=input, capture_output=True, text=True,
+                          errors="surrogateescape", check=False, env=_git_read_environment(), timeout=timeout)
 
 
 def repos(path: Path, *, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Path]:
@@ -1690,13 +2280,268 @@ def verified_mirror_metadata(repo: Path) -> tuple[str, ...]:
     return floor_claims.MIRROR_METADATA
 
 
-def repo_problem(repo: Path) -> str | None:
-    """Why removing this repo loses work, or None. A linked worktree's branches and stash live in its
-    source repo, so only its own changes and its HEAD count."""
+class RemoteInspection(Enum):
+    """Select whether removal can ask a remote for its current tips."""
+
+    LOCAL_ONLY = "local-only"
+    ADVERTISE = "advertise"
+
+
+@dataclass(frozen=True)
+class RemotePublicationUnproven:
+    """Removal needs remote evidence or the remote evidence was insufficient."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class RepositoryWorkKept:
+    """The repository has work to keep, or Git cannot verify its work."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class AdvertisedIds:
+    """Object IDs from the named remotes during this removal attempt."""
+
+    ids: frozenset[str]
+
+
+@dataclass
+class RemovalAdvertisements:
+    """Reuse only the remote evidence while the removal locks are held."""
+
+    root: Path
+    settings: conf.ConfigRead
+    by_repository: dict[tuple[int, int], AdvertisedIds] = field(default_factory=dict)
+
+    def read(self, repo: Path, remotes: list[str]) -> AdvertisedIds | RemotePublicationUnproven | LocalRemoteKeptFolder:
+        try:
+            directory = (repo / ".git").stat()
+            identity = (directory.st_dev, directory.st_ino)
+            if identity in self.by_repository:
+                return self.by_repository[identity]
+            result = _read_advertisements(self.root, repo, remotes, self.settings.whole("removal_remote_timeout_seconds"))
+        except (OSError, ValueError, conf.Unusable) as error:
+            return RemotePublicationUnproven(f"git cannot check remote publication: {error}")
+        if isinstance(result, AdvertisedIds):
+            self.by_repository[identity] = result
+        return result
+
+
+PublicationCheck = RemovalAdvertisements | Literal[RemoteInspection.LOCAL_ONLY]
+
+
+def _local_remote_paths(repo: Path, url: str) -> Iterator[Path]:
+    """Find paths Git can use for a local URL."""
+    if url.startswith("file://"):
+        _, separator, path = os.fsdecode(unquote_to_bytes(url[len("file://"):])).partition("/")
+        if not separator:
+            raise ValueError("file URL has no path")
+        url = path if path.startswith("~") else "/" + path
+    elif re.match(r"^[^/]+:", url):
+        return
+    location = repo.resolve() / Path(url).expanduser()
+    yield location
+    yield location / ".git"
+    if location.name:
+        suffixed = location.with_name(location.name + ".git")
+        yield suffixed
+        yield suffixed / ".git"
+
+
+class RemoteStorage(Enum):
+    """Describe whether a named remote can supply independent storage."""
+
+    INDEPENDENT = "independent"
+    ABSENT = "absent"
+
+
+class _RemovalTreeDependency(ValueError):
+    """A path used by a local remote lies inside the removal tree."""
+
+
+def _remote_storage_path(path: Path, root: Path) -> Path:
+    """Check the path and its resolved location."""
+    location = Path(os.path.normpath(path))
+    if location.is_relative_to(root):
+        raise _RemovalTreeDependency(str(location))
+    resolved = path.resolve(strict=True)
+    if resolved.is_relative_to(root):
+        raise _RemovalTreeDependency(str(resolved))
+    return resolved
+
+
+def _read_alternate_paths(objects: Path, root: Path, deadline: float) -> Iterator[Path]:
+    alternates = objects / "info/alternates"
+    try:
+        path = _remote_storage_path(alternates, root)
+    except FileNotFoundError:
+        try:
+            _ = alternates.lstat()
+        except FileNotFoundError:
+            return
+        raise
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        while line := source.readline(65536):
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("inspect local object storage", 0)
+            if len(line) == 65536 or b"\0" in line:
+                raise ValueError(f"{path} has an invalid alternate")
+            if line != b"\n" and not line.startswith(b"#"):
+                yield objects / os.fsdecode(line.removesuffix(b"\n"))
+
+
+def _check_remote_objects(objects: Path, root: Path, deadline: float) -> None:
+    pending = [objects]
+    visited: set[Path] = set()
+    while pending:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("inspect local object storage", 0)
+        folder = _remote_storage_path(pending.pop(), root)
+        if folder in visited:
+            continue
+        if not folder.is_dir():
+            raise ValueError(f"{folder} is not an object directory")
+        visited.add(folder)
+        pending.extend(_read_alternate_paths(folder, root, deadline))
+
+
+def _check_local_remote(repo: Path, locations: tuple[Path, ...], root: Path, deadline: float) -> RemoteStorage:
+    """Verify the Git folders and object directories that a local URL can use."""
+    found = False
+    checked = False
+    for candidate in locations:
+        try:
+            resolved = _remote_storage_path(candidate, root)
+        except FileNotFoundError:
+            try:
+                _ = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            raise
+        found = True
+        git_dir_result = _git(repo, "rev-parse", "--resolve-git-dir", str(candidate),
+                              timeout=max(0, deadline - time.monotonic()))
+        if git_dir_result.returncode:
+            if resolved.is_file() or (resolved / "HEAD").exists():
+                raise ValueError(f"cannot resolve the Git directory at {candidate}")
+            continue
+        git_dir = _remote_storage_path(repo / git_dir_result.stdout.removesuffix("\n"), root)
+        directories = _git(repo, "--git-dir", str(git_dir), "rev-parse", "--path-format=absolute",
+                           "--git-common-dir", "--git-path", "objects", timeout=max(0, deadline - time.monotonic()))
+        paths = directories.stdout.removesuffix("\n").split("\n")
+        if directories.returncode or len(paths) != 2 or any(not Path(path).is_absolute() for path in paths):
+            raise ValueError(f"cannot resolve the common and object directories at {git_dir}")
+        _ = _remote_storage_path(Path(paths[0]), root)
+        _check_remote_objects(Path(paths[1]), root, deadline)
+        checked = True
+    if found and not checked:
+        raise ValueError("the URL gives no readable Git repository")
+    return RemoteStorage.INDEPENDENT if checked else RemoteStorage.ABSENT
+
+
+def _read_advertisements(root: Path, repo: Path, remotes: list[str], timeout: int
+                        ) -> AdvertisedIds | RemotePublicationUnproven | LocalRemoteKeptFolder:
+    """Read all named remotes under one deadline."""
+    deadline = time.monotonic() + timeout
+    env = _git_read_environment()
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="false", SSH_ASKPASS="false", SSH_ASKPASS_REQUIRE="never")
+    removal_root = root.resolve()
+    absent: set[str] = set()
+    ids: set[str] = set()
+    for remote in remotes:
+        unverified = f"{repo}: cannot verify local remote {remote!r} storage"
+        if deadline <= time.monotonic():
+            return RemoteStorageUnproven(root, f"{unverified}: inspection timed out (limit {timeout} s)")
+        try:
+            if "GIT_SSH_COMMAND" not in env and "GIT_SSH" not in env:
+                ssh = _git(repo, "config", "--get", "core.sshCommand", timeout=max(0, deadline - time.monotonic()))
+                if ssh.returncode == 1:
+                    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+                elif ssh.returncode:
+                    return RemotePublicationUnproven("git cannot read the configured SSH command")
+            configured = _git(repo, "ls-remote", "--get-url", "--", remote,
+                              timeout=max(0, deadline - time.monotonic()))
+            url = configured.stdout.removesuffix("\n")
+            if configured.returncode or not url:
+                return RemoteStorageUnproven(root, f"{unverified}: cannot resolve its URL")
+            locations = tuple(_local_remote_paths(repo, url))
+            if locations:
+                if any(env.get(key) for key in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                                                "GIT_ALTERNATE_OBJECT_DIRECTORIES")):
+                    raise ValueError("Git environment overrides local repository storage")
+                storage = _check_local_remote(repo, locations, removal_root, deadline)
+                if storage is RemoteStorage.ABSENT:
+                    absent.add(remote)
+        except subprocess.TimeoutExpired:
+            return RemoteStorageUnproven(root, f"{unverified}: inspection timed out (limit {timeout} s)")
+        except _RemovalTreeDependency as error:
+            return RemoteInsideRemovalTree(root, f"{repo}: local remote {remote!r} points inside the removal tree: {error}")
+        except (OSError, RuntimeError, ValueError) as error:
+            return RemoteStorageUnproven(root, f"{unverified}: {error}")
+    for remote in remotes:
+        failure = f"git cannot read remote {remote!r}"
+        timed_out = RemotePublicationUnproven(f"{failure}: ls-remote timed out (limit {timeout} s)")
+        if deadline <= time.monotonic():
+            return timed_out
+        query = time_limit.capture(["git", "-C", str(repo.absolute()), "ls-remote", "--", remote],
+                                   deadline=deadline, env=env)
+        if query.returncode == time_limit.TIMED_OUT:
+            return timed_out
+        if query.returncode:
+            lines = query.stderr.strip().splitlines()
+            detail = next((line for line in lines if line.startswith(("fatal:", "error:", "remote: error:"))),
+                          lines[0] if lines else f"Git exited {query.returncode}")
+            return RemotePublicationUnproven(f"{failure}: {detail}")
+        if remote in absent:
+            return RemoteStorageUnproven(root, f"{repo}: cannot verify local remote {remote!r} storage: URL was absent")
+        for line in query.stdout.splitlines():
+            oid, separator, ref = line.partition("\t")
+            if not separator or not ref or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+                return RemotePublicationUnproven(f"{failure}: Git advertised an invalid ref")
+            ids.add(oid)
+    return AdvertisedIds(frozenset(ids))
+
+
+def _work_at_advertised_tips(repo: Path, advertised: AdvertisedIds) -> RemovalWorkSaved | RemotePublicationUnproven:
+    """Check current refs against advertised IDs that exist locally."""
+    object_ids = sorted(advertised.ids)
+    objects = _git(repo, "cat-file", "--batch-check=%(objecttype)", input="".join(f"{oid}\n" for oid in object_ids))
+    kinds = objects.stdout.splitlines()
+    if objects.returncode or len(kinds) != len(object_ids):
+        return RemotePublicationUnproven("git cannot check which advertised objects exist locally")
+    excluded: list[str] = []
+    missing = False
+    for oid, kind in zip(object_ids, kinds, strict=True):
+        if kind in ("commit", "tag", "tree", "blob"):
+            excluded.append(f"^{oid}\n")
+        elif kind == f"{oid} missing":
+            missing = True
+        else:
+            return RemotePublicationUnproven("git cannot check which advertised objects exist locally")
+    remaining = _git(repo, "rev-list", "-n1", "HEAD", "--branches", "--tags", "--stdin", input="".join(excluded))
+    if remaining.returncode:
+        return RemotePublicationUnproven("git cannot check its commits against the advertised tips")
+    if not remaining.stdout.strip():
+        return RemovalWorkSaved()
+    reason = "it has commits that are on no remote"
+    if missing:
+        reason = "git cannot verify publication: advertised tips are missing locally and known tips do not cover all commits"
+    return RemotePublicationUnproven(reason)
+
+
+def _repo_problem(repo: Path, *, publication: PublicationCheck
+                  ) -> RemovalWorkSaved | RepositoryWorkKept | RemotePublicationUnproven | LocalRemoteKeptFolder:
+    """Find work that removal could lose. Check only the linked worktree's files and HEAD."""
     linked = (repo / ".git").is_file()
     status = _git(repo, "status", "--porcelain", "--untracked-files=normal")
     if status.returncode:
-        return f"git cannot read it ({(status.stderr.strip().splitlines() or ['no message'])[0]})"
+        return RepositoryWorkKept(f"git cannot read it ({(status.stderr.strip().splitlines() or ['no message'])[0]})")
     changes = status.stdout.splitlines()
     record = copy_record.read_record(repo / copy_record.RECORD)
     if isinstance(record, copy_record.Registered):
@@ -1706,129 +2551,149 @@ def repo_problem(repo: Path) -> str | None:
         generated = {f"?? {name}" for name in metadata}
         changes = [line for line in changes if line not in generated]
     if changes:
-        return "it has uncommitted changes"
-    if _git(repo, "rev-parse", "--verify", "--quiet", "HEAD").returncode:
-        return None
+        return RepositoryWorkKept("it has uncommitted changes")
+    head = _git(repo, "rev-parse", "--verify", "--quiet", "HEAD")
+    if head.returncode:
+        return RemovalWorkSaved()
     if not linked and not _git(repo, "rev-parse", "--verify", "--quiet", "refs/stash").returncode:
-        return "it has a stash"
-    if not linked and not _git(repo, "remote").stdout.strip():
-        return "it has commits and no remote"
+        return RepositoryWorkKept("it has a stash")
+    remotes: list[str] = []
+    if not linked:
+        configured = _git(repo, "remote")
+        if configured.returncode:
+            return RepositoryWorkKept("git cannot list its remotes")
+        remotes = configured.stdout.splitlines()
+        if not remotes:
+            return RepositoryWorkKept("it has commits and no remote")
     tips = ("HEAD", "--not", "--branches", "--remotes") if linked else ("HEAD", "--branches", "--tags", "--not", "--remotes")
     unpushed = _git(repo, "rev-list", "-n1", *tips)
     if unpushed.returncode:
-        return "git cannot list its commits"
-    return "it has commits that are on no remote" if unpushed.stdout.strip() else None
+        return RepositoryWorkKept("git cannot list its commits")
+    if not unpushed.stdout.strip():
+        return RemovalWorkSaved()
+    if remotes:
+        if not isinstance(publication, RemovalAdvertisements):
+            return RemotePublicationUnproven("a remote check is needed to verify publication")
+        advertised = publication.read(repo, remotes)
+        if not isinstance(advertised, AdvertisedIds):
+            return advertised
+        return _work_at_advertised_tips(repo, advertised)
+    return RepositoryWorkKept("it has commits that are on no remote")
+
+
+def repo_problem(repo: Path) -> str | None:
+    """Give the reason to keep a repository, or None when its work is saved."""
+    problem = _repo_problem(repo, publication=RemoteInspection.LOCAL_ONLY)
+    return None if isinstance(problem, RemovalWorkSaved) else problem.reason
+
+
+def _removal_work(path: Path, scratch_settings: conf.ConfigRead, *,
+                  publication: PublicationCheck) -> RemovalWorkSaved | KeptFolder:
+    repositories = tuple(repos(path, scratch_settings=scratch_settings))
+    for repo in repositories:
+        problem = _repo_problem(repo, publication=publication)
+        if isinstance(problem, RemotePublicationUnproven):
+            return RemoteKeptFolder(path, f"{repo}: {problem.reason}")
+        if isinstance(problem, LocalRemoteKeptFolder):
+            return problem
+        if isinstance(problem, RepositoryWorkKept):
+            return KeptFolder(path, f"{repo}: {problem.reason}")
+    return RemovalWorkSaved(repositories)
 
 
 def unsaved_work(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str | None:
-    """`<repo>: <why>` for the first repo in `path` whose work removal would lose, or None."""
+    """Give the first reason to keep a repository in this folder."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    for repo in repos(path, scratch_settings=scratch_settings):
-        problem = repo_problem(repo)
-        if problem is not None:
-            return f"{repo}: {problem}"
-    return None
+    work = _removal_work(path, scratch_settings, publication=RemoteInspection.LOCAL_ONLY)
+    return work.reason if isinstance(work, KeptFolder) else None
 
 
-@dataclass(frozen=True)
-class KeptFolder:
-    """A folder that cleanup retains for the stated reason."""
+def retained_folder_exists(path: Path) -> bool:
+    """Keep a path in the report unless lstat confirms it is absent."""
+    try:
+        _ = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
-    path: Path
-    reason: str
+
+_RETAINED_TASK_FOLDER_PREFIX = "kept for a manual removal list: "
+_RETAINED_TASK_FOLDER_REASON = " (scratch, "
 
 
-class TaskCleanup(list[Path]):
-    """List removed paths for existing callers and report retained folders separately."""
+def retained_task_folder_notice(path: Path, reason: str) -> str:
+    return f"{_RETAINED_TASK_FOLDER_PREFIX}{path}{_RETAINED_TASK_FOLDER_REASON}{reason})"
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.kept: list[KeptFolder] = []
+
+def is_retained_task_folder_notice(detail: str) -> bool:
+    """Recognize the format of a saved scratch notice."""
+    return (detail.startswith(_RETAINED_TASK_FOLDER_PREFIX)
+            and _RETAINED_TASK_FOLDER_REASON in detail and detail.endswith(")"))
+
+
+def report_retained_task_folder(path: Path, reason: str) -> None:
+    print(retained_task_folder_notice(path, reason), file=sys.stderr)
+
+
+def record_task_end(path: Path, task: str, moment: float, *,
+                    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Mark the current task ended in an existing folder record."""
+    def mark_ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+        if not isinstance(record, copy_record.Registered) or record.task != task:
+            raise ScratchError(f"{path}: the folder task changed")
+        return {**record.fields, "ended": moment, "ended_task": task}
+
+    with copy_record_lock(path, scratch_settings=scratch_settings):
+        current = copy_record.read_record(path / copy_record.RECORD)
+        if not isinstance(current, copy_record.Registered) or current.task != task:
+            raise ScratchError(f"{path}: the folder task changed")
+        if not task_has_end_evidence(current):
+            _ = update_record(path, mark_ended, scratch_settings=scratch_settings)
 
 
 def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = lambda _: False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> TaskCleanup:
-    """Remove task folders and report each retained folder with its reason."""
+) -> list[KeptFolder]:
+    """Record task completion and keep its folders for manual removal."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     _ = checked_task(task, False)
-    removed = TaskCleanup()
-    kept: dict[Path, str] = {}
+    kept: list[KeptFolder] = []
     moment = time.time() if now is None else now
-
-    def selected(path: Path) -> bool:
-        if keep(path):
-            kept[path] = "selected by the keep rule"
-            return False
-        return True
-
-    def remove_task_folder(path: Path, *, require_task: bool = True) -> bool:
-        try:
-            outcome = remove_folder(path, TaskRemoval(task, moment, require_task), scratch_settings=scratch_settings)
-            if isinstance(outcome, KeptFolder):
-                kept[path] = outcome.reason
-                return False
-        except (ScratchError, OSError) as error:
-            kept[path] = str(error)
-            return False
-        _ = kept.pop(path, None)
-        removed.append(path)
-        return True
-
-    for folder in folders(scratch_settings=scratch_settings):
-        if folder.task == task and selected(folder.path):
-            _ = remove_task_folder(folder.path)
+    paths = {folder.path.resolve(): folder.path for folder in folders(scratch_settings=scratch_settings)
+             if folder.task == task}
     with locked_holds(scratch_settings=scratch_settings) as found:
+        task_holds = {Path(name): record for name, record in found.items() if record["task"] == task}
+        for path in task_holds:
+            _ = paths.setdefault(path, path)
+        protected = {path for path in paths.values() if keep(path)}
         changed = False
-        for path, record in list(found.items()):
-            if record["task"] != task or not selected(Path(path)):
-                continue
-            changed = True
-            held = Path(path)
-            copies = Path(os.path.realpath(copy_record.copies_root()))
-            if copies.is_relative_to(held.resolve()) or held.parent == copies:
-                for copy in list(copy_paths()):
-                    if copy.is_relative_to(held) and selected(copy):
-                        _ = remove_task_folder(copy, require_task=False)
-                try:
-                    unfinished = clear_finished_copy_removals(copies, scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    kept[held] = str(error)
-                    record["ended"] = moment
-                    continue
-                for retained in unfinished:
-                    kept[retained.path] = retained.reason
-                if any(retained.path.is_relative_to(held) for retained in unfinished):
-                    kept[held] = "the container has unfinished copy removals"
-                    record["ended"] = moment
-                    continue
-                remove_empty_copy_pairs(copies)
-                # A container hold never takes recursive deletion through the copies root.
-                if held != copies and held.exists():
-                    try:
-                        held.rmdir()
-                    except OSError as error:
-                        kept[held] = str(error)
-                        record["ended"] = moment
-                        continue
-                if held == copies and any(copy_paths()):
-                    kept[held] = "the container has retained copies"
-                    record["ended"] = moment
-                    continue
-                del found[path]
-                continue
-            if (os.path.lexists(held) or removal_mark(held).exists() or cargo_removal_mark(held).exists()) and not remove_task_folder(held):
+        for path, record in task_holds.items():
+            if paths[path] not in protected and not record["ended"]:
                 record["ended"] = moment
-                continue
-            del found[path]
+                changed = True
         if changed:
             write_holds(found, scratch_settings=scratch_settings)
-    removed.kept = [KeptFolder(path, reason) for path, reason in kept.items()]
-    return removed
+
+    for path in paths.values():
+        if not retained_folder_exists(path):
+            continue
+        reason = "selected by the keep rule" if path in protected else f"task {task} ended"
+        try:
+            if path not in protected and not path.is_symlink():
+                current = copy_record.read_record(path / copy_record.RECORD)
+                if isinstance(current, copy_record.Registered) and current.task == task:
+                    record_task_end(path, task, moment, scratch_settings=scratch_settings)
+        except (ScratchError, OSError) as error:
+            reason = " ".join(str(error).splitlines())
+        report_retained_task_folder(path, reason)
+        kept.append(KeptFolder(path, reason))
+    return kept
 
 
 def end_selected_copy(path: Path, expected: copy_record.Registered, now: float,
@@ -1872,16 +2737,6 @@ def remove_task_copy_locked(path: Path, task: str, now: float, *, require_task: 
     return remove_task_copy(path, task, now, require_task=require_task, scratch_settings=scratch_settings)
 
 
-def remove_empty_copy_pairs(base: Path) -> None:
-    if base.is_dir():
-        for pair in base.iterdir():
-            if pair.is_dir() and not pair.is_symlink():
-                try:
-                    pair.rmdir()
-                except OSError:
-                    pass
-
-
 def chosen_task(arguments: argparse.Namespace) -> str:
     """The --task given, the until: task of --until, or "" for the default."""
     until = cast(str, arguments.until)
@@ -1923,6 +2778,8 @@ def main(argv: list[str]) -> int:
     try:
         if command in ("cargo-save", "cargo-clean"):
             path = Path(cast(str, arguments.path)).resolve()
+            if protected_build_path(path):
+                raise ScratchError(f"{path}: the build folder owner handles Cargo output")
             saved = save_cargo_outputs(path)
             if command == "cargo-clean":
                 clean_cargo_outputs(path, saved)
@@ -1951,19 +2808,13 @@ def main(argv: list[str]) -> int:
                       run_dir=cast(str, arguments.run_dir), land_target=cast(str, arguments.land_target), scratch_settings=scratch_settings)
             print(path)
         elif command == "end":
-            result = end(cast(str, arguments.task), scratch_settings=scratch_settings)
-            for path in result:
-                print(f"removed {path}")
-            for folder in result.kept:
-                print(f"scratch: kept {folder.path}: {folder.reason}", file=sys.stderr)
-            if result.kept:
-                return 1
+            _ = end(cast(str, arguments.task), scratch_settings=scratch_settings)
         else:
             now = time.time()
             for folder in folders(scratch_settings=scratch_settings):
                 print(f"{folder.path}\t{folder.task}\t{(now - folder.changed) / 3600:.1f} h since a change")
             for path, record in sorted(holds(scratch_settings=scratch_settings).items()):
-                state = "ended, unsaved work" if record["ended"] else "held"
+                state = "ended" if record["ended"] else "held"
                 print(f"{path}\t{record['task']}\t{state}: {record['reason']}")
     except (ScratchError, OSError) as error:
         print(f"scratch: {error}", file=sys.stderr)

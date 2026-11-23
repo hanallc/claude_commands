@@ -44,10 +44,9 @@ class AdminSecretTests(unittest.TestCase):
         self.credentials = self.root / 'credentials'
         _ = self.credentials.write_text('[build-scaler]\naws_access_key_id=scaler-id\naws_secret_access_key=scaler-secret\n')
         self.credentials.chmod(0o600)
-        source = (Path(__file__).resolve().parents[2] / 'config/aws_target.conf').read_text()
-        replacements = {'admin_secret_file': str(self.path), 'deployment_price_file': str(self.root / 'price')}
-        _ = self.settings.write_text('\n'.join(key + '=' + replacements[key] if '=' in line and
-            (key := line.partition('=')[0]) in replacements else line for line in source.splitlines()) + '\n')
+        _ = self.settings.write_text(
+            f'admin_secret_file={self.path}\ndeployment_profile=build-admin\n'
+            + '# range: 0.001..\naws_timeout_s=30\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'GNUPGHOME': str(self.home),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials), 'AWS_SESSION_TOKEN': '', 'AWS_SECURITY_TOKEN': ''})))
 

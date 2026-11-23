@@ -10,14 +10,18 @@ from typing import Literal, NotRequired, TypedDict, cast, get_args
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, snapshot_with_head_cause, wait_reply
+from scripts.build_queue.queue_fixture import fixture_reservation, head_reading
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
-from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.production import staff
+from scripts.production.staff import StaffId
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,8 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
             for dependency in ("snapshot_codec", "placement", "admission_records"):
                 source = source.replace("from scripts.build_queue import " + dependency + " as ",
                                         "import _pinned_" + dependency + " as ")
+                source = source.replace(f"from scripts.build_queue import {dependency}\n",
+                                        f"import _pinned_{dependency} as {dependency}\n")
             for dependency in ("admission_wire", "placement"):
                 source = source.replace("from scripts.build_queue." + dependency + " import (",
                                         "from _pinned_" + dependency + " import (")
@@ -76,6 +82,84 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
 
 
 class SnapshotCodecTests(unittest.TestCase):
+    def test_snapshot_replies_preserve_the_ended_step_identity(self) -> None:
+        reading = head_reading()
+        now = reading.explanation.now
+        run = LiveBuildRun(42, "start", now - 1)
+        identity = records.EndedStepFacts("test", "hana", "hana", "/fixture/hana", StaffId("fixed-director"))
+        held = records.BetweenStepsSlot(run, "finished", GIB, now + 10, identity)
+        for slot in (held, records.ContinuationSlot(held, "next")):
+            inputs = replace(reading.explanation.decided_from, slots=(slot,))
+            explanation = replace(reading.explanation, decided_from=inputs)
+            current = replace(reading, explanation=explanation)
+            for reply in (wire.ViewReply(current), wire.ExplainReply(explanation), wire.MineReply(current)):
+                with self.subTest(slot=type(slot).__name__, reply=type(reply).__name__):
+                    self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+
+            raw = cast(dict[str, object], codec.snapshot_value(inputs))
+            older, = cast(list[dict[str, object]], raw["slots"])
+            if isinstance(slot, records.ContinuationSlot):
+                older = cast(dict[str, object], older["slot"])
+            del older["identity"]
+            parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+            retained = replace(held, identity=records.HoldPredatesStepFacts())
+            expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
+            self.assertEqual(parsed, replace(inputs, slots=(expected,)))
+
+            older["identity"] = {"kind": "EndedStepIdentity", "source": "step", "name": "test hana",
+                                 "staff_id": "fixed-director"}
+            parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+            absent = records.EndedStepFactNotRecorded()
+            recovered = records.EndedStepFacts("test hana", records.PackageNotRecorded(), absent, absent,
+                                              StaffId("fixed-director"))
+            retained = replace(held, identity=recovered)
+            expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
+            self.assertEqual(parsed, replace(inputs, slots=(expected,)))
+
+    def test_older_hold_snapshot_recovers_the_caller_from_its_reservation(self) -> None:
+        inputs = head_reading().explanation.decided_from
+        reservation = fixture_reservation(42, GIB)
+        reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
+            "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": "saved caller"})
+        run = LiveBuildRun(42, "start", inputs.now - 10)
+        facts = records.EndedStepFacts("check", "hana", "hana", "/fixture/hana", records.NoEndedStepStaff())
+        held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
+        for slot in (held, records.ContinuationSlot(held, "successor")):
+            with self.subTest(slot=type(slot).__name__):
+                current = replace(inputs, reservations=(reservation,), slots=(slot,))
+                raw = cast(dict[str, object], codec.snapshot_value(current))
+                encoded, = cast(list[dict[str, object]], raw["slots"])
+                if isinstance(slot, records.ContinuationSlot):
+                    encoded = cast(dict[str, object], encoded["slot"])
+                del cast(dict[str, object], encoded["identity"])["caller_name"]
+                parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+                decoded, = parsed.slots
+                slot_read = decoded.slot if isinstance(decoded, records.ContinuationSlot) else decoded
+                self.assertEqual(slot_read.identity, replace(facts, caller_name="saved caller"))
+
+    def test_hold_caller_candidates_use_reservation_and_fixed_staff_in_order(self) -> None:
+        inputs = head_reading().explanation.decided_from
+        member = staff.StaffRow(StaffId("fixed"), "unit", "staff name", staff.StaffRoot(),
+                                current_session=StaffId("current"))
+        run = LiveBuildRun(42, "start", inputs.now - 10)
+        for stored, reserved, expected in (
+            ("recorded name", "reserved name", "recorded name"),
+            (records.EndedStepFactNotRecorded(), "reserved name", "reserved name"),
+            ("$OWNER", "owner not recorded", "staff name"),
+        ):
+            with self.subTest(stored=stored, reserved=reserved):
+                reservation = fixture_reservation(42, GIB)
+                reservation.update(reservation_id="finished", queue_waiter={"pid": 42,
+                    "start_time": "start", "since": inputs.now - 10, "need": GIB, "session_name": reserved})
+                facts = records.EndedStepFacts("gate", "hana", "hana", "/fixture/hana", member.id,
+                                               caller_name=stored)
+                held = records.BetweenStepsSlot(run, "finished", GIB, inputs.now + 10, facts)
+                current = replace(inputs, reservations=(reservation,), slots=(held,))
+                with codec.snapshot_staff(staff.StaffSnapshot((member,))):
+                    parsed = cast(records.QueueInputs, codec.parse_snapshot_value(codec.snapshot_value(current),
+                                                                                 records.QueueInputs))
+                self.assertEqual(parsed.slots, (replace(held, identity=replace(facts, caller_name=expected)),))
+
     def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
         for revision in (CI_CLIENT, "1be2f8932"):
@@ -151,7 +235,7 @@ class SnapshotCodecTests(unittest.TestCase):
 
             remote = records.RunningStep("remote-session", "remote build", "test", "/private", 0,
                 records.RemoteMemoryUnavailable("the provider has no memory reading"), pid=records.PidNotRecorded(),
-                execution=placement.ExecutionEvidenceUnavailable("no remote process", 100), assignment_host="fixture-mac")
+                execution=execution_identity.ExecutionEvidenceUnavailable("no remote process", 100), assignment_host="fixture-mac")
             snapshot = replace(service_snapshot(), running=(remote,))
             with self.subTest(message="Phase 44 snapshot"):
                 raw = codec.snapshot_value(snapshot)
@@ -177,7 +261,7 @@ class SnapshotCodecTests(unittest.TestCase):
                     self.assertEqual(type(parse_reply(text)).__name__, type(reply).__name__)
 
             destination = placement.PlacementDestination("mac", "mac", "fixture-mac", WholeMacScope())
-            for source in (placement.SourceKeyKnown("source-a"), placement.SourceKeyUnavailable("no source")):
+            for source in (execution_identity.SourceKeyKnown("source-a"), execution_identity.SourceKeyUnavailable("no source")):
                 assignment = placement.PlacementAssignment("episode", "attempt", destination, source,
                     placement.SubmittingOwner("fixture-local", 42, "start"), NoOwningSession(), 100)
                 claim = placement.ProviderClaimReference("mac", "mac", destination.scope, "claim", "episode", "attempt")
@@ -188,7 +272,7 @@ class SnapshotCodecTests(unittest.TestCase):
                         self.assertEqual(wire.parse_reply(text), reply)
                         parsed_assignment = cast(object, getattr(parse_reply(text), "assignment"))
                         self.assertEqual(cast(str, getattr(parsed_assignment, "source_key")),
-                                         source.key if isinstance(source, placement.SourceKeyKnown) else "")
+                                         source.key if isinstance(source, execution_identity.SourceKeyKnown) else "")
 
     def test_every_snapshot_reply_keeps_remote_rows_out_of_the_pinned_memory_union(self) -> None:
         from scripts.build_queue.queue_fixture import head_reading
@@ -258,6 +342,10 @@ class SnapshotCodecTests(unittest.TestCase):
             records.EstimateExpired: records.EstimateExpired(1000.0),
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
+            records.RunLimitWait: records.RunLimitWait(2, 2, "claude_commands", "natedev"),
+            placement.CargoFolderWait: placement.CargoFolderWait(),
+            records.BuildSpaceLow: records.BuildSpaceLow(125, 150),
+            records.BuildSpaceUnreadable: records.BuildSpaceUnreadable("fixture disk offline"),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -278,9 +366,15 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
+                        legacy_wait = (records.GpuSlotWait | records.RunLimitWait | records.NatedevHeld | placement.CargoFolderWait
+                                       | records.BuildSpaceHold)
                         self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld))
-                                         else type(cause).__name__)
+                                         "BehindHead" if isinstance(cause, legacy_wait) else type(cause).__name__)
+                        if isinstance(cause, records.BuildSpaceHold):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")), "the build space floor")
+                        if isinstance(cause, records.RunLimitWait):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")),
+                                             "2 of 2 claude_commands runs on natedev")
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")
@@ -320,7 +414,7 @@ class SnapshotCodecTests(unittest.TestCase):
         destination = placement.PlacementDestination("ssh", "mac", "fixture-mac", RepositoryScope("hana"))
         profile = records.StepProfile("hana", "zsh", "tree", records.ExpectedPeak(GIB, "measured", 5), estimated_at=1000.0)
         for kind in (*placement.MAC_RUN_KINDS, "test", placement.CommandKindNotSent()):
-            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("source-a"), ("/bin/zsh", "-c", "true"),
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source-a"), ("/bin/zsh", "-c", "true"),
                 "/repo/hana", "hana", NoOwningSession(), (placement.PlacementCandidate(destination),), command_kind=kind)
             request = wire.PlacementRequest("episode-a", placement.SubmittingOwner("natedev", 42, "100"), 1000.0,
                                             profile, constraints)

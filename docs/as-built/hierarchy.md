@@ -11,7 +11,7 @@ The hierarchy connects the user's product choices to work in separate repository
 | Role | Responsibility | Contract |
 | --- | --- | --- |
 | User, the executive producer | Decides product direction, scope changes, and irreversible actions. | [Decision criteria](../decision_criteria.md) |
-| Producer | Runs its own named job through shared producer management. | `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md` |
+| Producer | Runs its own named job through shared producer management. | `commands/producer/produce.md`; morty also loads `commands/producer/morty.md` |
 | Showrunner | Coordinates units, resolves dependencies, integrates checkpoints, and presents user decisions. | `commands/showrunner/produce.md` |
 | Unit director | Defines assignments, dispatches workers, checks results, and prepares checkpoints. | `commands/unit/direct.md` |
 | Worker | Changes or inspects its assigned files through a native Claude or Codex conversation. | [Worker lifecycle](long-lived-workers.md) |
@@ -19,7 +19,7 @@ The hierarchy connects the user's product choices to work in separate repository
 
 Morty, brain, and dwight have staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
-Dwight's role is strategist.
+Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
 The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 
@@ -115,7 +115,9 @@ A replacement process in that terminal stays open.
 Records and logs live under `<run>/detached_runs/`.
 `detached_run_process.py` proves supervisor identity before a caller stops a run.
 The command runs in its own session, and the record saves its process group.
-`detached_runs.py stop` signals that group, so the supervisor stays alive and delivers the result.
+`detached_runs.py stop` signals the command group.
+The supervisor stays alive and delivers the result.
+A worker that stops its own run keeps its pass active and receives the STOPPED result.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
@@ -211,7 +213,12 @@ A cleanup failure prints its step and returns nonzero.
 The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
 
-Workers create private work folders with `scratch.py new --worker [--name <word>]`.
+The director creates a model worktree for a parallel phase or trial project.
+The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
+The director sends the reported paths to the showrunner as a removal list.
+Workers use numbered copies for tests and proofs that need source copies.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+Workers use `scratch.py new --worker [--name <word>]` only for downloads and files unrelated to builds, tests, gates, or source copies.
 Names have the form `<showrunner>-<unit>-<worker>-<suffix>[-<word>]` under `TMPDIR`.
 `scratch.worker_task(staff_id) -> str` names their shared task.
 `scratch.end(task)` removes folders for that exact task and permits retries.

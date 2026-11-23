@@ -299,10 +299,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
             measured = float((self.state / "cpu-measured" / key).read_text())
             self.assertGreaterEqual(measured, work["leader"] + work["child"])
             self.assertGreaterEqual(results[key].cpu_seconds, measured - 0.02, key)
-            self.assertLess(results[key].cpu_seconds, measured + 0.5, key)
-        sleeper = results["lib/test_second.py"]
-        self.assertLess(sleeper.cpu_seconds, 0.25)
-        self.assertGreaterEqual(sleeper.seconds, workloads["lib/test_second.py"]["sleep"])
+            # Only one process of a job uses CPU at a time, so its CPU is at most its wall time less its sleep.
+            # Load adds only wall time to this bound.
+            self.assertLessEqual(results[key].cpu_seconds, results[key].seconds - work["sleep"], key)
         self.assertGreater(results["types/basedpyright"].cpu_seconds, 0.0)
         ranked = sorted(results, key=lambda key: (-results[key].cpu_seconds, key))
         self.assertEqual(ranked[0], "lib/test_first.py")
@@ -396,7 +395,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         with mock.patch.object(gate, "start_gate_job", side_effect=observed):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(available_at_start, [b""] * (self.module_count + 1))
+        self.assertEqual(available_at_start, [b""] * self.module_count)
         self.assertEqual(self.jobserver_tokens(), b"Q")
         events = self.module_events()
         self.assertEqual([row["event"] for row in events], ["start", "finish"] * self.module_count)
@@ -471,7 +470,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertIn("memory governor 0.261719 GiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
 
     @gate_suites("lib", "hooks")

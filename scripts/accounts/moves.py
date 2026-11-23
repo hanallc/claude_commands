@@ -5,13 +5,19 @@ import fcntl
 import json
 import os
 import re
-from dataclasses import dataclass
+import shlex
+import sys
+from dataclasses import dataclass, field
+from hashlib import sha256
 from importlib import import_module
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
+from scripts.agents.stop_results import MoveHandedOff, StopFailed
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -50,10 +56,15 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
 
 
-class RequestedMove(MoveCommon, RequestedFields):
+class RecordedMoveRequest(MoveCommon, RequestedFields):
     terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[MoveCause]
+    scope: NotRequired[ReadOnly[Literal["group", "session"]]]
+
+
+class RequestedMove(RecordedMoveRequest):
+    scope: Literal["group", "session"]
 
 
 class ConfirmedMove(MoveCommon):
@@ -89,7 +100,9 @@ class RoomAgainMove(MoveCommon):
     label: HistoricalAccountLabel
 
 
-MoveEntry = RequestedMove | ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveOutcomeEntry = ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveEntry = RecordedMoveRequest | MoveOutcomeEntry
+MoveWriteEntry = RequestedMove | MoveOutcomeEntry
 
 
 @dataclass(frozen=True)
@@ -136,6 +149,184 @@ JournalEntry = MoveEntry | RoutingEntry
 
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "accounts" / "moves.jsonl"
+
+
+@dataclass(frozen=True)
+class MoveInProgress(MoveHandedOff):
+    account: str
+    command: str = field(default="", compare=False)
+
+
+@dataclass(frozen=True)
+class MoveWaitingForRow(StopFailed):
+    """The batch could not take the session or staff row lock."""
+
+    command: str = field(default="", compare=False)
+
+
+@dataclass(frozen=True)
+class MoveSuperseded(StopFailed):
+    """A later request replaced this detached move."""
+
+    reason: str = "a newer move ran"
+
+
+class ExplicitMoveTarget(Enum):
+    REQUESTED_ACCOUNT = "use the requested account"
+    GROUP_ACCOUNT = "use the account requested by a group operation"
+
+
+@dataclass(frozen=True)
+class FollowGroupAccount:
+    group: role_map.ClaudeGroup
+
+
+@dataclass(frozen=True)
+class MoveMember:
+    reference: str
+    name: str
+
+
+@dataclass(frozen=True)
+class MoveBatchResult:
+    target: str | FollowGroupAccount
+    pending: tuple[MoveMember, ...]
+
+
+def native_row_key(reference: str) -> str:
+    return "native-" + sha256(reference.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LatestMoveRequest:
+    request_id: str
+    target: str
+    explicit_group_scope: bool = False
+
+
+class NoLatestMoveRequest:
+    """The session has no saved move request."""
+
+
+@dataclass(frozen=True)
+class PendingMoveRequest:
+    member: MoveMember
+    request: LatestMoveRequest
+
+
+def latest_request_path(native_session: str) -> Path:
+    return store_file().parent / "latest-requests" / native_row_key(native_session)
+
+
+def write_latest_request(native_session: str, request: LatestMoveRequest, *, name: str = "") -> None:
+    """Replace the request while the caller holds the session locks."""
+    path = latest_request_path(native_session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields: dict[str, str | bool] = {"request_id": request.request_id, "target": request.target,
+        "name": name or "unnamed session", "native_session": native_session}
+    if request.explicit_group_scope:
+        fields["explicit_group_scope"] = True
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
+
+
+def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoLatestMoveRequest()
+    except RecursionError as error:
+        raise ValueError("move request JSON exceeds the nesting limit") from error
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        request_id, target = fields.get("request_id"), fields.get("target")
+        explicit_group_scope = fields.get("explicit_group_scope", False)
+        native_session, name = fields.get("native_session"), fields.get("name")
+        if (isinstance(request_id, str) and request_id and isinstance(target, str) and target
+                and (not target.startswith("group:") or target[6:] in role_map.CLAUDE_GROUPS)
+                and isinstance(native_session, str) and native_session and latest_request_path(native_session) == path
+                and isinstance(name, str) and name and isinstance(explicit_group_scope, bool)):
+            return PendingMoveRequest(MoveMember(native_session, name),
+                                      LatestMoveRequest(request_id, target, explicit_group_scope))
+    raise ValueError("invalid latest move request")
+
+
+def read_latest_request(native_session: str) -> LatestMoveRequest | NoLatestMoveRequest:
+    saved = _read_move_request(latest_request_path(native_session))
+    return saved if isinstance(saved, NoLatestMoveRequest) else saved.request
+
+
+def pending_move_requests() -> tuple[PendingMoveRequest, ...]:
+    pending: list[PendingMoveRequest] = []
+    for path in sorted(latest_request_path("").parent.glob("native-*")):
+        try:
+            saved = _read_move_request(path)
+        except (OSError, ValueError):
+            print(f"Could not read move request {path.name}.", file=sys.stderr)
+            continue
+        if isinstance(saved, PendingMoveRequest):
+            pending.append(saved)
+    return tuple(pending)
+
+
+MOVE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py"
+RETRY_COMMAND = f"{MOVE_COMMAND} retry"
+
+
+def batch_move_command(reference: str, destination: str | FollowGroupAccount) -> str:
+    options = (["--group", destination.group] if isinstance(destination, FollowGroupAccount)
+               else ["--target", destination])
+    return f"{MOVE_COMMAND} batch {shlex.join([*options, '--', reference])}"
+
+
+def remove_latest_request(native_session: str, request_id: str) -> None:
+    """Remove only this request while the caller holds the session locks."""
+    current = read_latest_request(native_session)
+    if isinstance(current, LatestMoveRequest) and current.request_id == request_id:
+        latest_request_path(native_session).unlink(missing_ok=True)
+
+
+def _batch_path(batch_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
+        raise ValueError("invalid move batch id")
+    return store_file().parent / "move-results" / f"{batch_id}.json"
+
+
+def read_batch_result(batch_id: str) -> MoveBatchResult:
+    value = cast(object, json.loads(_batch_path(batch_id).read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError("invalid move batch result")
+    fields = cast(dict[str, object], value)
+    group, target, pending = fields.get("group"), fields.get("target"), fields.get("pending")
+    if group is not None:
+        if group not in role_map.CLAUDE_GROUPS:
+            raise ValueError("invalid move batch group")
+        target = FollowGroupAccount(group)
+    if not isinstance(target, (str, FollowGroupAccount)) or not isinstance(pending, list):
+        raise ValueError("invalid move batch result")
+    members: list[MoveMember] = []
+    for member in cast(list[object], pending):
+        if not isinstance(member, dict):
+            raise ValueError("invalid move batch member")
+        saved = cast(dict[str, object], member)
+        reference, name = saved.get("reference"), saved.get("name")
+        if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
+            raise ValueError("invalid move batch member")
+        members.append(MoveMember(reference, name))
+    return MoveBatchResult(target, tuple(members))
+
+
+def legacy_batch_ids() -> tuple[str, ...]:
+    """Read newer reports first when more than one report names a session."""
+    directory = store_file().parent / "move-results"
+    reports: list[tuple[int, str]] = []
+    for path in directory.glob("*.json"):
+        if not re.fullmatch(r"[a-f0-9]{32}", path.stem):
+            continue
+        try:
+            reports.append((path.stat().st_mtime_ns, path.stem))
+        except FileNotFoundError:
+            continue
+    return tuple(batch_id for _, batch_id in sorted(reports, reverse=True))
 
 
 def _valid(value: object) -> bool:
@@ -188,6 +379,8 @@ def _valid(value: object) -> bool:
     kind = fields.get("kind")
     if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand", "auto")):
         return False
+    if "scope" in fields and (kind != "requested" or fields["scope"] not in ("group", "session")):
+        return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
             return False
@@ -199,7 +392,7 @@ def _valid(value: object) -> bool:
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
-def _canonical_entry(entry: MoveEntry) -> MoveEntry:
+def _canonical_entry[Entry: MoveEntry](entry: Entry) -> Entry:
     from scripts.whoami.note_file import canonical_label
 
     fields: dict[str, object] = dict(entry)
@@ -207,7 +400,7 @@ def _canonical_entry(entry: MoveEntry) -> MoveEntry:
         value = fields.get(field)
         if isinstance(value, str):
             fields[field] = canonical_label(value)
-    return cast(MoveEntry, cast(object, fields))
+    return cast(Entry, cast(object, fields))
 
 
 
@@ -301,7 +494,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
-def append_move(entry: MoveEntry) -> None:
+def append_move(entry: MoveWriteEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     entry = _canonical_entry(entry)
     if entry["kind"] == "requested":
@@ -315,21 +508,24 @@ def append_move(entry: MoveEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output, path)
-        if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
-            _ = output.seek(0)
-            for line in output:
+        lines = worker_names.migrate_locked_journal(output, path)
+        if entry["kind"] in ("requested", "confirmed", "wait ended", "room again", "failed"):
+            for line in lines:
                 try:
                     previous = cast(object, json.loads(line))
                 except ValueError:
                     continue
-                if _valid(previous):
-                    held = cast(dict[str, object], previous)
-                    if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
-                            and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
-                            and (entry["kind"] != "confirmed" or
-                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
-                        return
+                if not _valid(previous):
+                    continue
+                held = cast(dict[str, object], previous)
+                if held.get("kind") != entry["kind"] or held.get("move_id") != entry["move_id"]:
+                    continue
+                if entry["kind"] == "requested":
+                    return
+                if (held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
+                        and (entry["kind"] != "confirmed" or
+                             (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
+                    return
         _ = output.seek(0, os.SEEK_END)
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 

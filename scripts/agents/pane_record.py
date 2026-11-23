@@ -4,7 +4,7 @@ Each herdr session has one file under `~/.local/state/herdr-panes`.
 The file keeps the account, flags, and environment for each pane. Staff supplies each unit folder.
 The Claude SessionStart hook records Claude launches.
 The normal herdr start path records Codex launches after it proves the foreground process.
-The seed command records plain Codex clients through their tab's staff row.
+The seed command records the proved native owner of each pane.
 
 Stored member references use fixed staff ids.
 Runtime observations prove the current conversation before a stop or resume.
@@ -25,12 +25,14 @@ except FileNotFoundError:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 if TYPE_CHECKING:
     from scripts.herdr import herdr
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
 
 from scripts.herdr import herdr_types, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity, models_registry
+from scripts.lib.transcripts import open_transcript, transcript_paths, transcript_source
 from scripts.message import sessions
 from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
 from scripts.herdr.pane_launch import (
@@ -49,6 +52,7 @@ from scripts.herdr.pane_launch import (
     RESUME_FLAGS as RESUME_FLAGS,
     ClaudeArguments as ClaudeArguments,
     parse_claude_arguments as parse_claude_arguments,
+    parse_claude_flags as parse_claude_flags,
 )
 
 RECORD_DIR = pane_launch.record_directory()
@@ -106,7 +110,7 @@ def resume_launch(entry: PaneLaunch) -> pane_launch.CurrentLaunch:
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
-           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> pane_launch.CurrentLaunch:
+           arguments: pane_launch.LaunchArguments, *, kind: Literal["claude", "codex"] = "claude") -> pane_launch.CurrentLaunch:
     """Retain plugin paths only in the shutdown restore record."""
     entry = pane_launch.launch(pane_id, session_id, cwd, legacy_identity.without_legacy_identity(environment), arguments, kind=kind)
     if kind == "claude":
@@ -116,12 +120,131 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
     return entry
 
 
-def resume_arguments(entry: PaneLaunch) -> list[str]:
-    """Build backend arguments from a launch with its current conversation id."""
-    return _resume_arguments(resume_launch(entry) if "session_id" not in entry else entry)
+class ClaudeTurnSettings(NamedTuple):
+    """The model and optional effort from one real assistant turn."""
+
+    model: str
+    effort: str
 
 
-def _resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
+class NoClaudeTurn(NamedTuple):
+    """No readable assistant turn records a model for this session."""
+
+
+class ClaudeResumeSettings(NamedTuple):
+    """The model and effort flags for a Claude resume. Empty values omit flags."""
+
+    model: str = ""
+    effort: str = ""
+
+    def arguments(self) -> list[str]:
+        arguments: list[str] = []
+        if self.model:
+            arguments.extend(("--model", self.model))
+        if self.effort:
+            arguments.extend(("--effort", self.effort))
+        return arguments
+
+
+NO_CLAUDE_RESUME_SETTINGS = ClaudeResumeSettings()
+
+
+def claude_resume_settings(preferred: ClaudeTurnSettings | NoClaudeTurn | ClaudeResumeSettings, *,
+                           fallback: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS,
+                           explicit_model: str = "") -> ClaudeResumeSettings:
+    """Resolve each Claude resume flag from its own available settings."""
+    if isinstance(preferred, NoClaudeTurn):
+        preferred = NO_CLAUDE_RESUME_SETTINGS
+    return ClaudeResumeSettings(explicit_model or preferred.model or fallback.model,
+                                preferred.effort or fallback.effort)
+
+
+def _transcript_lines_from_end(path: Path) -> Iterator[bytes]:
+    """Read newest entries first without loading the whole conversation."""
+    with open_transcript(path) as stream:
+        offset = stream.seek(0, os.SEEK_END)
+        pending = b""
+        while offset:
+            size = min(offset, 65536)
+            offset -= size
+            _ = stream.seek(offset)
+            lines = (stream.read(size) + pending).split(b"\n")
+            pending = lines[0]
+            yield from reversed(lines[1:])
+        if pending:
+            yield pending
+
+
+def claude_turn_settings(session_id: str, *config_dirs: Path) -> ClaudeTurnSettings | NoClaudeTurn:
+    """Read the latest real assistant turn across the session's Claude homes.
+
+    A dated turn wins over an undated turn. Use file mtime, then path, for ties.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        return NoClaudeTurn()
+    matches = set(sessions.transcript_locations(session_id))
+    for directory in config_dirs:
+        matches.update(path.resolve() for path in transcript_paths(directory / "projects", f"*/{session_id}.jsonl"))
+    turns: dict[tuple[bool, datetime, int, str], ClaudeTurnSettings] = {}
+    for path in matches:
+        try:
+            modified = transcript_source(path).stat().st_mtime_ns
+            for line in _transcript_lines_from_end(path):
+                if b'"assistant"' not in line:
+                    continue
+                try:
+                    value = cast(object, json.loads(line))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                record = cast(dict[str, object], value)
+                message = record.get("message")
+                if record.get("type") != "assistant" or not isinstance(message, dict):
+                    continue
+                model = cast(dict[str, object], message).get("model")
+                if isinstance(model, str) and model and model != "<synthetic>":
+                    effort = record.get("effort")
+                    timestamp = record.get("timestamp")
+                    stamp = datetime.min.replace(tzinfo=UTC)
+                    dated = False
+                    if isinstance(timestamp, str):
+                        try:
+                            parsed = datetime.fromisoformat(timestamp)
+                            if parsed.tzinfo is not None:
+                                stamp = parsed.astimezone(UTC)
+                                dated = True
+                        except (ValueError, OverflowError):
+                            pass
+                    turns[dated, stamp, modified, str(path)] = ClaudeTurnSettings(
+                        model, effort if isinstance(effort, str) else "")
+                    break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return turns[max(turns)] if turns else NoClaudeTurn()
+
+
+def _no_claude_role_fallback() -> ClaudeResumeSettings:
+    return NO_CLAUDE_RESUME_SETTINGS
+
+
+def resume_arguments(entry: PaneLaunch, *,
+                     claude_role_fallback: Callable[[], ClaudeResumeSettings] = _no_claude_role_fallback) -> list[str]:
+    """Build resume arguments with the latest Claude settings when available."""
+    current = resume_launch(entry) if "session_id" not in entry else entry
+    if pane_launch.saved_kind(current) == "codex":
+        return _resume_arguments(current)
+    homes = tuple(Path(directory) for directory in (current.get("config_dir", ""),
+        current["environment"].get("CLAUDE_CONFIG_DIR", "")) if directory)
+    turn = claude_turn_settings(current["session_id"], *homes)
+    settings = claude_resume_settings(turn, fallback=ClaudeResumeSettings(model=current["model"]))
+    if not settings.model or not settings.effort:
+        settings = claude_resume_settings(settings, fallback=claude_role_fallback())
+    return _resume_arguments(current, claude_settings=settings)
+
+
+def _resume_arguments(entry: pane_launch.NativePaneLaunch, *,
+                      claude_settings: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS) -> list[str]:
     if pane_launch.saved_kind(entry) == "codex":
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
@@ -133,8 +256,7 @@ def _resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
         arguments.extend(("-n", entry["name"]))
     if entry["remote_control"]:
         arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    if entry["model"]:
-        arguments.extend(("--model", entry["model"]))
+    arguments.extend(claude_settings.arguments())
     for directory in entry.get("plugin_directories", []):
         arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
@@ -157,7 +279,7 @@ def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
                 continue
             policy.extend((option, value))
         current["codex_policy"] = policy
-    arguments = _resume_arguments(current)
+    arguments = _resume_arguments(current, claude_settings=ClaudeResumeSettings(model=settings.model))
     if settings.kind == "claude":
         arguments.extend(("--effort", settings.effort))
     return arguments
@@ -357,14 +479,13 @@ def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd:
     return entry
 
 
-def _conversation_of(config_dir: str, pid: int) -> str:
-    """The conversation id Claude keeps for its own process, `<config>/sessions/<pid>.json`."""
-    try:
-        value = cast(object, json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return ""
-    session_id = cast(dict[str, object], value).get("sessionId") if isinstance(value, dict) else None
-    return session_id if isinstance(session_id, str) else ""
+def _account_local_conversation(config_dir: str, pid: int) -> str:
+    """Read the account-local registry entry for the proved Claude PID."""
+    value = cast(object, json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text(encoding="utf-8")))
+    identity = cast(dict[str, object], value).get("sessionId") if isinstance(value, dict) else None
+    if not isinstance(identity, str) or not identity:
+        raise ValueError(f"no conversation id for {pid}")
+    return identity
 
 
 def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
@@ -378,45 +499,39 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
             continue
         context = f"herdr {session}:{pane_id} process info"
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"), context)
-        processes = [herdr.json_object(item, context) for item in herdr.json_items(info.get("foreground_processes"), context)]
-        found = [item for item in processes
-                 if isinstance(argv := item.get("argv"), list)
-                 and (herdr.is_claude_process([str(part) for part in cast(list[object], argv)])
-                      or herdr.is_codex_process([str(part) for part in cast(list[object], argv)]))]
-        if not found:
+        owner = herdr.foreground_pane_owner(info)
+        if isinstance(owner, herdr.NoForegroundAgent):
             continue
-        arguments = [str(part) for part in cast(list[object], found[0].get("argv"))]
-        kind: Literal["claude", "codex"] = "codex" if herdr.is_codex_process(arguments) else "claude"
-        pid = found[0].get("pid")
-        if isinstance(pid, bool) or not isinstance(pid, int):
-            print(f"{pane_id}: no {kind} process id")
+        if isinstance(owner, herdr.UnprovedForegroundOwner):
+            print(f"{pane_id}: {owner.reason}")
             continue
-        if kind == "codex":
+        if isinstance(owner, herdr.ProvedClaudeForeground):
+            pid = owner.pid
+            started = sessions.process_start(pid)
+            if not started:
+                print(f"{pane_id}: process start is unavailable for {pid}")
+                continue
             try:
-                observed = herdr.native_process(pid, "codex")
+                environment = _process_environment(pid)
+                config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+                session_id = _account_local_conversation(config_dir, pid)
             except (OSError, ValueError):
                 print(f"{pane_id}: no conversation id for {pid}")
                 continue
-            session_id, started, environment = observed.identity.id, observed.started, observed.environment
+            if sessions.process_start(pid) != started:
+                print(f"{pane_id}: process start changed for {pid}")
+                continue
         else:
             try:
-                environment = _process_environment(pid)
-            except (OSError, ValueError) as error:
-                print(f"{pane_id}: cannot read the environment of {pid}: {error}")
+                native = herdr.read_foreground_pane_owner(owner, pane)
+                session_id = native.current_identity
+                started, environment = native.started, native.environment
+            except (OSError, ValueError, herdr_types.HerdrFailure):
+                print(f"{pane_id}: no conversation id for {owner.pid}")
                 continue
-            config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-            session_id = _conversation_of(config_dir, pid)
-            started = sessions.process_start(pid)
-        if not session_id:
-            print(f"{pane_id}: no conversation id for {pid}")
-            continue
-        cwd = found[0].get("cwd")
-        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments, kind=kind)
-        entry["pid"] = pid
-        if not started:
-            print(f"{pane_id}: process start is unavailable for {pid}")
-            continue
-        entry["proc_start"] = started
+        cwd = owner.cwd if isinstance(owner.cwd, str) else ""
+        entry = launch(pane_id, session_id, cwd, environment, owner.arguments, kind=owner.kind)
+        entry.update(pid=owner.pid, proc_start=started)
         write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0

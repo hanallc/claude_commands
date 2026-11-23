@@ -21,6 +21,24 @@ from scripts.mac_test.offload_test_support import OffloadCommandFixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
+class MacDiskFloorTests(unittest.TestCase):
+    def test_free_space_above_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(120, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(120))
+
+    def test_free_space_equal_to_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(100, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(100))
+
+    def test_free_space_below_the_floor_starts_no_sweep_or_command(self) -> None:
+        with (mock.patch.object(offload, "ensure_mac_disk_floor") as sweep_floor,
+              mock.patch.object(subprocess, "Popen") as command):
+            result = offload.check_mac_disk_floor(offload.ProbeSnapshot(99, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskShort(99, 100))
+        sweep_floor.assert_not_called()
+        command.assert_not_called()
+
+
 class FloorSweepTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -37,7 +55,8 @@ class FloorSweepTests(unittest.TestCase):
             **config_environment(self.root), "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
         self.settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(self.settings, "free_floor_gib=100\nfloor_sweep_timeout_s=9\n")
+        _ = write_config_fixture(self.settings, "host=mac\nfree_floor_gib=100\nfloor_sweep_timeout_s=9\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
         self.controller = offload.ProcessController()
         self.repository = eligibility.KnownRepository("hana")
         self.before = offload.ProbeSnapshot(50, "fake-mac")
@@ -137,7 +156,7 @@ class FloorSweepTests(unittest.TestCase):
                     _ = sweep.mac_floor_settings(conf.read(self.settings))
 
     def test_selector_rejects_its_assignment_text_and_near_miss_paths(self) -> None:
-        configured = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root")
+        configured = "~/.fixture-mirrors"
         for root in (configured, "~/fixture-mirrors"):
             _ = write_config_fixture(self.settings, f"mirror_root={root}\n")
             relative = root.removeprefix("~/")
@@ -214,7 +233,8 @@ select_leftovers
             if needle in path.read_text():
                 found.append(str(path.relative_to(repository)))
         self.assertEqual(found, [])
-        configured = conf.read(repository / "config/mac_test.conf").text("mirror_root")
+        _ = write_config_fixture(self.settings, f"mirror_root=~/{needle}\n")
+        configured = conf.read(self.settings).text("mirror_root")
         self.assertEqual(configured, "~/" + needle)
         root = "~/fixture-mirrors"
         _ = write_config_fixture(self.settings,

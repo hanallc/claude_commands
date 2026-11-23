@@ -1,4 +1,4 @@
-"""Store console images and temporary change images without page dependencies."""
+"""Store console images, image questions and temporary change images."""
 from __future__ import annotations
 
 import html
@@ -9,11 +9,13 @@ import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, file_lock
 from scripts.production import change_routing
+from scripts.review_links import question_record
 
 CHANGE_FOLDER = "change-images"
 IMAGES_FOLDER = "images"
@@ -21,6 +23,7 @@ RECORD = ".review-link-image.json"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
+LOCK = ".review-link-images.lock"
 # Chrome clips a headless screenshot below about 150 pixels.
 MIN_OUTPUT_IMAGE_HEIGHT = 160
 
@@ -36,6 +39,7 @@ class ImageRecord(TypedDict):
     before: NotRequired[str]
     # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
+    questions: NotRequired[list[question_record.StoredQuestion]]
 
 
 def read_record(folder: Path) -> ImageRecord:
@@ -59,6 +63,14 @@ def read_record(folder: Path) -> ImageRecord:
         record["before"] = before
     if isinstance(feedback_at := fields.get("feedback_at"), str):
         record["feedback_at"] = feedback_at
+    if "questions" in fields:
+        questions = fields["questions"]
+        if not isinstance(questions, list):
+            raise ValueError(f"{folder.name}: invalid image questions")
+        checked = [question_record.read(question) for question in cast(list[object], questions)]
+        if len({question.question_id for question in checked}) != len(checked):
+            raise ValueError(f"{folder.name}: duplicate question id")
+        record["questions"] = [question_record.stored(question) for question in checked]
     return record
 
 
@@ -66,8 +78,51 @@ def write_record(folder: Path, record: ImageRecord) -> None:
     atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
 
 
+@dataclass(frozen=True)
+class ImageQuestionStore:
+    """Keep question changes and the answer's return mark in one image write."""
+
+    root: Path
+
+    def folder(self, item: str) -> Path:
+        if not IDENTITY.fullmatch(item):
+            raise question_record.AnswerRefused('not an image id')
+        folder = self.root / item
+        if folder.is_symlink() or not folder.is_dir():
+            raise question_record.AnswerRefused(f'no image {item}')
+        return folder
+
+    def questions(self, item: str) -> tuple[question_record.Question, ...]:
+        record = read_record(self.folder(item))
+        return tuple(question_record.read(question) for question in record.get('questions', []))
+
+    def add(self, item: str, question: question_record.Question) -> None:
+        with file_lock.exclusive(self.root / LOCK):
+            folder = self.folder(item)
+            record = read_record(folder)
+            questions = [question_record.read(saved) for saved in record.get('questions', [])]
+            if any(saved.question_id == question.question_id for saved in questions):
+                raise question_record.AnswerRefused('This image already has that question id.')
+            record['questions'] = [question_record.stored(saved) for saved in (*questions, question)]
+            write_record(folder, record)
+
+    def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
+        with file_lock.exclusive(self.root / LOCK):
+            folder = self.folder(item)
+            record = read_record(folder)
+            questions = [question_record.read(saved) for saved in record.get('questions', [])]
+            current = next((question for question in questions if question.question_id == question_id), None)
+            if current is None or current.answer is not None:
+                raise question_record.AnswerRefused('This image has no open question with that id.')
+            record['questions'] = [question_record.stored(question_record.Question(
+                question.question_id, question.asked_at, question.words, answer)
+                if question.question_id == question_id else question) for question in questions]
+            _ = record.pop('feedback_at', None)
+            write_record(folder, record)
+
+
 def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
-                  *, before: Path | None = None) -> ImageRecord:
+                  *, before: Path | None = None, identity: str = "", private: bool = False) -> ImageRecord:
     """Publish one image or a pair with one record and one atomic folder rename."""
     sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
     for _, source in sources:
@@ -75,10 +130,12 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
             raise ValueError(f"{source}: use one of {', '.join(sorted(SUFFIXES))}")
         if not source.is_file():
             raise ValueError(f"{source}: no such image file")
-    folder.mkdir(parents=True, exist_ok=True)
-    identity = secrets.token_hex(6)
+    identity = identity or secrets.token_hex(6)
+    if not IDENTITY.fullmatch(identity):
+        raise ValueError("Invalid image ID.")
+    folder.mkdir(mode=0o700 if private else 0o777, parents=True, exist_ok=True)
     draft = folder / (DRAFT_PREFIX + identity)
-    draft.mkdir(mode=0o755)
+    draft.mkdir(mode=0o700 if private else 0o755)
     try:
         files = {stem: stem + source.suffix.casefold() for stem, source in sources}
         # The last source is the after image of a pair, or the single image.
@@ -88,7 +145,11 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
         if "before" in files:
             record["before"] = files["before"]
         for stem, source in sources:
-            _ = shutil.copyfile(source, draft / files[stem])
+            target = draft / files[stem]
+            if private:
+                atomic_file.write_bytes_atomic(target, source.read_bytes(), mode=0o600)
+            else:
+                _ = shutil.copyfile(source, target)
         write_record(draft, record)
         # The page shows a folder only after its images and record are complete.
         _ = draft.rename(folder / identity)

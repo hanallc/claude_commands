@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from scripts.direct import step_record
     from scripts.mac_test import mac_test
     from scripts.buildlog import mac_idle_alert
+    from zoneinfo import ZoneInfo
     from scripts.message.unit_labels import UnitLabels
 else:
     from scripts.direct import step_record
@@ -270,8 +271,11 @@ class NatedevJobOnMac:
     """A local or CI job is working on the Mac."""
 
 
+@dataclass(frozen=True)
 class FreeMac:
     """No block or live claim reserves the Mac."""
+
+    kept_claims: int = 0
 
 
 @dataclass(frozen=True)
@@ -302,10 +306,9 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
     from scripts.mac_test import mac_test
 
     try:
-        if (paths.mac_state / "run.json").exists():
-            return NatedevJobOnMac()
-        live = tuple(claim for claim in mac_test.read_claims(mac_test.StatePaths(paths.mac_state))
-                     if mac_test.run_is_live(claim.record))
+        claims = tuple(mac_test.read_claims(mac_test.StatePaths(paths.mac_state)))
+        live = tuple(claim for claim in claims
+                     if mac_test.run_holds_work(claim.record))
         block = mac_test.read_block(paths.mac_state / "block.json")
         if (any("work_idle_since" not in claim.record for claim in live)
                 or isinstance(block, mac_test.PendingMacBlock)
@@ -330,9 +333,30 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
             config = mac_test.read_config()
             if config.ci_repo and isinstance(mac_test.ci_activity(config), mac_test.CiMacJobRunning):
                 return NatedevJobOnMac()
-        return FreeMac()
+        return FreeMac(sum(mac_test.run_is_kept(claim.record) for claim in claims))
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))
+
+
+def live_state_agrees(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    """Compare the saved state and cause with the live Mac state.
+
+    The saved reading can be one sample old. In that time a block can end or a claim can start work.
+    The live read uses only local files and never contacts the Mac.
+    """
+    live = mac_work(watch_paths(), now)
+    if saved["state"] == "unreachable":
+        return isinstance(live, MacUnreachable)
+    if saved["cause"] in ("blocked", "claim_idle"):
+        return isinstance(live, IdleReservation) and live.cause == saved["cause"]
+    return isinstance(live, FreeMac)
+
+
+def view_alert_line(now: float, zone: ZoneInfo,
+                    *, block: mac_idle_alert.BlockText = mac_idle_alert.BlockText.SHOWN) -> str | None:
+    """The saved alert line for a view; a Mac condition that the live state does not agree with is hidden."""
+    return mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", now, zone, block=block,
+                                     live_agrees=lambda saved: live_state_agrees(saved, now))
 
 
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,
@@ -371,6 +395,21 @@ def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
         reason = str(error)
     print(f"Mac idle watch: phone push failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
     return False
+
+
+def mac_off_on_purpose() -> bool:
+    """Tell whether the user turned the Mac off: a Mac block, offload=off or enabled.mac=off."""
+    from scripts.mac_test import mac_test
+
+    return isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
+
+
+def push_retired(saved: mac_idle_alert.SavedAlert, off: bool) -> bool:
+    """Tell whether a sent unreachable push is over. The clear check uses this rule.
+
+    The push is over when the user turned the Mac off, when the Mac is not unreachable, or when no step waits.
+    """
+    return off or saved["state"] != "unreachable" or saved["waiting"] == 0
 
 
 def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float) -> None:
@@ -458,6 +497,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
                 saved["state"] = "idle"
                 if isinstance(reading, FreeMac):
                     saved["cause"] = "free"
+                    saved["kept_claims"] = reading.kept_claims
                     write_record(idle_file, {"since": since})
                 else:
                     saved["cause"], saved["detail"] = reading.cause, reading.detail
@@ -482,6 +522,11 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
                                 if (kept["cause"], kept["holder"]) == (saved["cause"], saved["holder"]) else now)
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
+        off = mac_off_on_purpose()
+        if saved["pushed"] and off:
+            # Only a Mac that the user turned off ends a sent push here, so it goes again when the Mac is in use.
+            # Other ends stay with the clear check: one outage sends one push.
+            saved["pushed"] = False
         write_record(paths.state / "alert.json", saved)
         if (not isinstance(reading, IdleMac | MacUnreachable)
                 or now - saved["since"] < settings.alert_seconds or not calls):
@@ -498,8 +543,9 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
             write_record(paths.state / "alert.json", saved)
-        if (isinstance(reading, MacUnreachable)
-                and now - saved["since"] >= settings.push_seconds and not saved["pushed"]):
+        # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
+        if (isinstance(reading, MacUnreachable) and now - saved["since"] >= settings.push_seconds
+                and not off and not saved["pushed"]):
             saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
@@ -541,14 +587,16 @@ def main(args: list[str]) -> int:
             return 1
         if not math.isfinite(since):
             return 1
+        # With no fresh saved alert, only a Mac that the user turned off ends the push.
+        off = mac_off_on_purpose()
         saved = mac_idle_alert.read_alert(paths.state / "alert.json")
         try:
             freshness = mac_idle_alert.read_idle_config().stale_seconds
         except mac_idle_alert.MacIdleConfigError:
-            return 1
+            return int(not off)
         if not isinstance(saved, dict) or time.time() - saved["written"] > freshness:
-            return 1
-        return int(saved["state"] == "unreachable" and int(saved["since"]) == int(since) and saved["waiting"] > 0)
+            return int(not off)
+        return int(int(saved["since"]) == int(since) and not push_retired(saved, off))
     elif args == ["watch"]:
         watch_once(paths, time.time())
     else:

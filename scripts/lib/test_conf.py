@@ -10,12 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 
 from scripts.lib import conf, conf_reads
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -30,6 +31,15 @@ class ConfTests(unittest.TestCase):
         self.directory = self.root / "config"
         self.directory.mkdir()
         self.path = self.directory / "example.conf"
+        repository = self.root / "repository-config"
+        _ = write_config_fixture(repository / "accounts.conf",
+                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
+        original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return repository / "accounts.conf" if stem == "accounts" else original(stem)
+
+        _ = self.enterContext(mock.patch.object(conf, "_repository_path", side_effect=repository_path))
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.directory), "HOME": str(self.root / "home"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -206,6 +216,16 @@ conf_reads.record('disabled')
                 self.fail("The valid live setting must retain its origin")
             self.assertEqual(origin.value, Decimal("2.5"))
             self.assertEqual(conf.read("example").values(), {"label": "changed", "amount": "9"})
+
+    def test_values_combines_requested_keys_with_host_only_prefix(self) -> None:
+        self.write("label=base\nlabel.testhost=local\nmodel.active.testhost=blue\n"
+                   + "model.other.anotherhost=green\naccount.active.testhost=red\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"):
+            settings = conf.read("example")
+            self.assertEqual(settings.values("label", "missing"), {"label": "local"})
+            self.assertEqual(settings.values(host_only_prefix="model."), settings.values() | {"model.active": "blue"})
+            self.assertEqual(settings.values("label", "missing", host_only_prefix="model."),
+                             {"label": "local", "model.active": "blue"})
 
     def test_each_reader_returns_its_type_and_preserves_text_after_the_first_equals(self) -> None:
         self.write("# range: ..\nfraction=2.5\n# whole: ..\ncount=-2\nlabel= a=b c # note\nnames= alpha  beta\tempty\n")
@@ -473,7 +493,7 @@ conf_reads.record('disabled')
         self.commit("# whole: 1..10\namount=3\n")
         self.commit("# whole: 1..10\namount=8\n")
         self.commit("# whole: 1..4\namount=9\n")
-        self.write("# whole: 1..2\namount=broken\n")
+        self.write("# whole: 1..10\namount=broken\n")
         warning = io.StringIO()
         with redirect_stderr(warning):
             self.assertEqual(conf.read("example").whole("amount"), 8)
@@ -481,6 +501,50 @@ conf_reads.record('disabled')
         self.assertIn("broken", warning.getvalue())
         self.assertIn("amount", warning.getvalue())
         self.assertIn(str(self.path), warning.getvalue())
+
+    def test_recovery_skips_values_outside_the_current_limits(self) -> None:
+        self.history()
+        self.commit("# whole: 1..\ncount=2\n# range: 0..\namount=2.5\n# one of: off, on\nmode=on\n")
+        self.commit("# whole: 1..\ncount=1\n# range: 0..\namount=9\n# one of: off, on\nmode=off\n")
+        self.write("# whole: 1..\ncount=3\n# whole: 2..\ncount.testhost=broken\n"
+                   + "# range: 0..4\namount=broken\n# one of: on\nmode=broken\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()):
+            settings = conf.read("example")
+            self.assertEqual(settings.whole("count"), 2)
+            self.assertEqual(settings.number("amount"), 2.5)
+            self.assertEqual(settings.text("mode"), "on")
+
+    def test_recovery_uses_committed_limits_when_no_value_passes_the_current_limit(self) -> None:
+        self.history()
+        self.commit("# whole: -1000..1000\namount=500\n# one of: on, off\nmode=on\n")
+        self.commit("# whole: -1000..1000\namount=1001\n# one of: on, off\nmode=broken\n")
+        for limit, reason in (("# whole: -1000.1000", "invalid limit"),
+                              ("# whole: -1000..400.5", "expected a whole number"),
+                              ("# whole: 1000..-1000", "outside range 1000..-1000"),
+                              ("# whole: 0..100", "outside range 0..100")):
+            with self.subTest(limit=limit), redirect_stderr(io.StringIO()) as warning:
+                self.write(f"{limit}\namount=400\n")
+                self.assertEqual(conf.read("example").whole("amount"), 500)
+                self.assertEqual(len(warning.getvalue().splitlines()), 1)
+                self.assertIn(reason, warning.getvalue())
+
+        self.write("# one of:\nmode=off\n")
+        with redirect_stderr(io.StringIO()) as warning:
+            self.assertEqual(conf.read("example").text("mode"), "on")
+        self.assertEqual(len(warning.getvalue().splitlines()), 1)
+        self.assertIn("mode='off': expected one of", warning.getvalue())
+
+    def test_recovery_reads_each_revision_once_when_the_current_limit_rejects_all_values(self) -> None:
+        self.history()
+        self.commit("# whole: 1..1000\namount=400\n")
+        self.commit("# whole: 1..1000\namount=500\n")
+        self.commit("# whole: 1..1000\namount=1001\n")
+        self.write("# whole: 1..100\namount=600\n")
+        git = cast(Callable[..., subprocess.CompletedProcess[str]], getattr(conf, "_git"))
+        with mock.patch.object(conf, "_git", wraps=git) as history_reads, redirect_stderr(io.StringIO()):
+            self.assertEqual(conf.read("example").whole("amount"), 500)
+        # Git reads the checkout, the history, and each of the three revisions.
+        self.assertEqual(history_reads.call_count, 5)
 
     def test_missing_current_key_recovers_from_history_and_host_override_is_validated(self) -> None:
         self.history()
@@ -630,6 +694,27 @@ conf_reads.record('disabled')
                 _ = conf.editable_line("example", "count")
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_editable_line_refuses_overrides_for_keys_outside_model_colors(self) -> None:
+        for stem, key in (("example", "model.provider"), ("example", "model.gpt-6.2-sol"),
+                          ("statusline", "model.provider")):
+            with self.subTest(stem=stem, key=key):
+                source = self.directory / f"{stem}.conf"
+                _ = source.write_text(f"{key}=3\n{key}.remote=4\n", encoding="utf-8")
+                with mock.patch("socket.gethostname", return_value="remote"):
+                    self.assertEqual(conf.effective_line(stem, key), (1, "4"))
+                with mock.patch("socket.gethostname", return_value="local"):
+                    with self.assertRaisesRegex(conf.Unusable, "has host override"):
+                        _ = conf.editable_line(stem, key)
+
+    def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
+        source = self.directory / "statusline.conf"
+        keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
+        for order in (keys, keys[::-1]):
+            with self.subTest(order=order):
+                _ = source.write_text("".join(f"{key}=#123456\n" for key in order), encoding="utf-8")
+                for line, key in enumerate(order):
+                    self.assertEqual(conf.editable_line("statusline", key), (line, "#123456"))
+
     def test_installed_script_refuses_conf_dir_override(self) -> None:
         from scripts.build_hold import override_guard
 
@@ -682,6 +767,24 @@ conf_reads.record('disabled')
         if not isinstance(live, conf.UsableLiveValue):
             self.fail("A repaired live limit must replace the recovered state")
         self.assertEqual(live.value, Decimal("7.25"))
+
+
+class HanaConfigurationTests(unittest.TestCase):
+    source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
+
+    def test_render_configuration_has_no_host_suffixes(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        self.assertTrue(settings)
+        for key in settings:
+            with self.subTest(key=key):
+                self.assertNotIn('.', key)
+
+    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
+            self.assertNotIn(key, settings)
+        self.assertEqual(sum(line.startswith('free_floor_gib=')
+            for line in self.source.read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":

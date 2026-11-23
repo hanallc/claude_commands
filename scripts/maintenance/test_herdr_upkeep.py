@@ -8,18 +8,18 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from typing import Literal, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.agents import pane_record, remote, test_stop_resume, worker_lifecycle
+from scripts.agents import pane_record, remote, restart, shutdown, shutdown_record, stop_resume, test_stop_resume, worker_lifecycle
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
-from scripts.production import staff
+from scripts.production import gate, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.whoami import account
 
@@ -49,6 +49,7 @@ class UpkeepTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
             "GATE_STATE_DIR": str(self.root / "merge-gate"),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
         _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
 
@@ -93,6 +94,55 @@ class UpkeepTests(unittest.TestCase):
             job.upkeep()
         layout.assert_called_once_with({"shared"})
         rules.assert_called_once_with({"shared"}, herdr.reload_agent_rules)
+
+    def test_upkeep_skips_rows_during_live_restart(self) -> None:
+        with (shutdown_record.active_operation(), patch.object(herdr, "restore_server") as restore,
+              patch.object(accounts, "producer_upkeep_members") as members,
+              patch.object(stop_resume, "resume") as resume):
+            job.upkeep()
+        restore.assert_not_called()
+        members.assert_not_called()
+        resume.assert_not_called()
+
+    def test_operator_stop_blocks_upkeep_until_restart(self) -> None:
+        case = test_stop_resume.StopResumeTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=60\n")
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("natedev", case.root))
+        case.client.rows.clear()
+        pane_record.save("agents", {})
+        resumed = stop_resume.ClaudeUp(str(row.current_session), "fixture-pane", "claude3")
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(remote, "other_machine", return_value="mac"),
+              patch.object(gate, "check_nightly_assignments"),
+              patch.object(herdr, "restore_server"), patch.object(herdr, "live_sessions", return_value=[]),
+              patch.object(herdr, "save_shared_layout"), patch.object(detection_rules, "refresh"),
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped(str(row.current_session), 123)),
+              patch.object(stop_resume, "_resume_once", return_value=resumed) as recover,
+              patch.object(restart, "start_row", return_value=resumed.pane_id) as start,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            job.upkeep()
+            recover.assert_not_called()
+            start.assert_not_called()
+            notice = "herdr-upkeep: alpha: stopped on purpose; agents resume brings it back"
+            self.assertEqual(errors.getvalue().splitlines().count(notice), 1)
+
+            self.assertEqual(shutdown.main(["restart"]), 0)
+            start.assert_called_once()
+            self.assertEqual(shutdown_record.read(), [])
+            job.upkeep()
+            recover.assert_called_once()
+            self.assertEqual(errors.getvalue().splitlines().count(notice), 1)
+
+            self.assertEqual(shutdown.main(["stop", row.name]), 0)
+            job.upkeep()
+            recover.assert_called_once()
+            self.assertEqual(errors.getvalue().splitlines().count(notice), 2)
 
     def test_producer_restore_retries_failures_and_keeps_live_sessions(self) -> None:
         case = test_stop_resume.StopResumeTests()
@@ -190,7 +240,10 @@ class UpkeepTests(unittest.TestCase):
                     else accounts.NamedAccount("claude3", case.root / ".claude3"))
 
         def live(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return sessions.LiveSessionProcess(456) if identity in launches else sessions.SessionNotLive()
+            launch = launches.get(identity)
+            if launch is not None and launch[0] == "claude":
+                return sessions.LiveSessionProcess(456)
+            return sessions.SessionNotLive()
 
         with (patch.object(job, "time", clock),
               patch.object(operation_deadline, "time", clock),
@@ -200,17 +253,25 @@ class UpkeepTests(unittest.TestCase):
               patch.object(herdr, "prepare_session_environment", side_effect=prepare),
               patch.object(herdr, "launch_prepared_agent", side_effect=launch),
               patch.object(herdr, "read_conversation", side_effect=conversation),
+              patch.object(pane_record, "save", test_stop_resume.SAVE_PANE_RECORD),
               patch.object(accounts, "role_account", side_effect=select),
               patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(case.root / ".codex1")),
               patch.object(accounts, "codex_home_label", return_value="codex1"),
               patch.object(case, "live", side_effect=live),
               patch.object(case.client, "save_layout"), patch.object(detection_rules, "refresh"),
               redirect_stderr(io.StringIO()) as errors):
+            with shutdown_record.active_operation():
+                shutdown_record.save([str(rows["alpha"].id)])
+            self.assertEqual(shutdown_record.read(), [str(rows["alpha"].id)])
             job.upkeep()
+            self.assertEqual(shutdown_record.read(), [])
             self.assertEqual(set(launches), {rows[name].current_session for name in ("alpha", "own-codex")})
             self.assertEqual(attempts.count("failed"), 1)
             self.assertEqual(errors.getvalue().count("fixture start failed"), 1)
-            self.assertEqual(errors.getvalue().count("invalid:"), 1)
+            self.assertEqual(errors.getvalue().splitlines().count(
+                "herdr-upkeep: exited: stopped on purpose; agents resume brings it back"), 1)
+            self.assertEqual([line.startswith("accounts: anomaly: invalid: ")
+                              for line in errors.getvalue().splitlines() if "invalid:" in line], [True])
             self.assertEqual(launches[rows["alpha"].current_session][2]["CLAUDE_CONFIG_DIR"], str(case.root / ".claude3"))
             self.assertEqual(launches[rows["own-codex"].current_session][2]["CODEX_HOME"], str(case.root / ".codex1"))
             before = dict(launches)
@@ -222,7 +283,8 @@ class UpkeepTests(unittest.TestCase):
             self.assertEqual(attempts.count("alpha"), 1)
             self.assertEqual(attempts.count("own-codex"), 1)
             self.assertEqual(set(launches), {*before, rows["failed"].current_session})
-            self.assertEqual(errors.getvalue().count("invalid:"), 1)
+            self.assertEqual([line.startswith("accounts: anomaly: invalid: ")
+                              for line in errors.getvalue().splitlines() if "invalid:" in line], [True])
             _ = errors.truncate(0)
             _ = errors.seek(0)
             with patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("fixture account is unreadable")):
@@ -233,7 +295,7 @@ class UpkeepTests(unittest.TestCase):
 
             with self.subTest(case="held producer row"):
                 with accounts.settings_report_scope():
-                    busy = accounts.producer_upkeep_members()[0]
+                    busy = next(row for row in accounts.producer_upkeep_members() if row.name != "exited")
                 launches.clear()
                 attempts.clear()
                 case.client.rows.clear()

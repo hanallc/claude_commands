@@ -9,16 +9,18 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
+from enum import Enum
+from functools import partial
 from importlib import import_module
 import fcntl
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -29,14 +31,18 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final, override
 from urllib.parse import quote
 
 
+from scripts.build_queue import execution_identity
+from scripts.aws_target import hana_protocol
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
+from scripts.mac_test.claim_state import WAIT_CLAIM_CHECK_PREFIX, WaitClaimCheck, claim_worktree_path
+from scripts.mac_test.claim_state import pending_start_key as pending_start_key
 if TYPE_CHECKING:
-    from scripts.build_queue import placement
+    from scripts.build_queue import admission_records as records, placement
 else:
     class _DeferredPlacement:
         """Load placement types when an offload operation uses them."""
@@ -45,6 +51,7 @@ else:
             return cast(object, getattr(import_module("scripts.build_queue.placement"), name))
 
     placement = _DeferredPlacement()
+from scripts.lib import process_group
 from scripts.lib import process_start as process_identity
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.mac_test import fix_return
@@ -62,9 +69,10 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
 from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
-from scripts.buildlog import sync as buildlog_sync
+from scripts.buildlog import repository as buildlog_repository
+from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -80,6 +88,7 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+MAC_NEXTTEST_SETUP_FAILURE = "mac_nextest_setup=failed"
 # The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
 MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
@@ -212,18 +221,70 @@ class LostMacRun:
 
 
 @dataclass(frozen=True)
+class MacCleanupUnconfirmed(LostMacRun):
+    """The runner cannot confirm that the Mac claim can end."""
+
+
+@dataclass(frozen=True)
+class HanaGuestEndedRun(LostMacRun):
+    """The guest ended the attempt without an accepted compiler result."""
+
+
+@dataclass(frozen=True)
+class HanaCommandAdmissionRefused:
+    """The Hana admission check refused the command."""
+    reason: str
+    seconds: float
+
+
+def _no_refusal_settings() -> records.NoRefusalSettings:
+    from scripts.build_queue import admission_records
+
+    return admission_records.NoRefusalSettings()
+
+
+@dataclass(frozen=True)
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
     reason: NonBusyMacDeclineReason
     seconds: float
     detail: str = ""
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(default_factory=_no_refusal_settings)
+
+
+@dataclass(frozen=True)
+class WaitClaimAdoptionDeclined(DeclinedMacRun):
+    """The claim child declined adoption and supplied a diagnostic."""
+
+    reason: Literal["state"] = field(default="state", init=False)
+    diagnostic: str = field(kw_only=True)
 
 
 @dataclass(frozen=True)
 class KnownMacJob:
     """The text identifies the job that holds the Mac."""
     what: str
+
+
+class MirrorBusyCheck(Enum):
+    """The mirror check that reported a busy refusal."""
+
+    LEASE = "mirror lease"
+    PROCESS = "mirror process check"
+    UNREPORTED = ""
+
+    @property
+    def suffix(self) -> str:
+        return f" ({self.value})" if self.value else ""
+
+
+@dataclass(frozen=True)
+class RecordedMirrorSession:
+    """The last session recorded in the mirror."""
+
+    session: str
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
 
 @dataclass(frozen=True)
@@ -235,13 +296,16 @@ class LostRunLeftovers:
 class UnreadableMacHolder:
     """The Mac holder cannot be read."""
 
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
-MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
+
+MacHolder = KnownMacJob | RecordedMirrorSession | LostRunLeftovers | UnreadableMacHolder
 
 
 @dataclass(frozen=True)
 class BusyMacDecline:
-    """The decline holds the Mac holder and elapsed time."""
+    """The result records the Mac holder and any reported mirror check."""
+
     holder: MacHolder
     seconds: float
 
@@ -255,10 +319,38 @@ def claim_holder(stdout: str) -> MacHolder:
     return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
 
 
+_MIRROR_SESSION_PREFIX = "last recorded mirror session "
+_LEFTOVERS_HOLDER_VALUE = "leftovers"
+_UNREADABLE_HOLDER_VALUE = "unreadable"
+
+
 def holder_value(holder: MacHolder) -> str:
-    if isinstance(holder, KnownMacJob):
-        return holder.what
-    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+    match holder:
+        case KnownMacJob(what=what):
+            return what
+        case RecordedMirrorSession(session=session, mirror_check=check):
+            return f"{_MIRROR_SESSION_PREFIX}{session}{check.suffix}"
+        case LostRunLeftovers():
+            return _LEFTOVERS_HOLDER_VALUE
+        case UnreadableMacHolder(mirror_check=check):
+            return _UNREADABLE_HOLDER_VALUE + check.suffix
+        case _:
+            assert_never(holder)
+
+
+def holder_from_value(value: str) -> MacHolder:
+    if value == _LEFTOVERS_HOLDER_VALUE:
+        return LostRunLeftovers()
+    for check in MirrorBusyCheck:
+        suffix = check.suffix
+        if suffix and not value.endswith(suffix):
+            continue
+        text = value.removesuffix(suffix)
+        if text == _UNREADABLE_HOLDER_VALUE:
+            return UnreadableMacHolder(check)
+        if text.startswith(_MIRROR_SESSION_PREFIX) and (session := text.removeprefix(_MIRROR_SESSION_PREFIX)):
+            return RecordedMirrorSession(session, check)
+    return KnownMacJob(value)
 
 
 @dataclass(frozen=True)
@@ -294,6 +386,13 @@ class UnresolvedLeftoverCount:
     """Process evidence cannot establish the number of remaining processes."""
 
 
+class ReadAttemptRepository:
+    """Read the repository key when recording the attempt."""
+
+
+READ_ATTEMPT_REPOSITORY = ReadAttemptRepository()
+
+
 @dataclass
 class AttemptEvidence:
     """Observed completion and ownership for one SSH attempt."""
@@ -303,14 +402,16 @@ class AttemptEvidence:
     cleanup: Literal["confirmed", "unconfirmed"] = "unconfirmed"
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
-    traffic: buildlog_sync.TransferLedger = field(default_factory=buildlog_sync.TransferLedger)
-    execution: placement.ExecutionEvidence = field(default_factory=lambda: placement.ExecutionNotStarted())
+    repository_key: str | ReadAttemptRepository = READ_ATTEMPT_REPOSITORY
+    traffic: transfer_bytes.TransferLedger = field(default_factory=transfer_bytes.TransferLedger)
+    execution: execution_identity.ExecutionEvidence = field(default_factory=lambda: execution_identity.ExecutionNotStarted())
     launch_authorized: bool = False
     provider: placement.ProviderClaimReference | placement.NoProviderClaim = field(default_factory=lambda: placement.NoProviderClaim())
 
 
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
+    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    | BusyMacDecline | HanaCommandAdmissionRefused
 )
 
 
@@ -395,11 +496,25 @@ class PendingHanaOperation:
     """The Hana lifecycle or command still owns its exact provider claim."""
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable(
         'The Hana dispatch or cleanup remains unresolved'))
+    reason: str = 'The Hana claim remains retained'
 
 
 @dataclass(frozen=True)
 class NoHanaSettlement:
     """This controller has no settled Hana outcome."""
+
+
+@dataclass(frozen=True)
+class HanaCommandOutput:
+    stdout: bytes = b''
+    stderr: bytes = b''
+
+
+@dataclass(frozen=True)
+class OffloadRecordWrite:
+    """One record write and the name to print if it fails."""
+    name: str
+    write: Callable[[], object]
 
 
 @dataclass(frozen=True)
@@ -426,19 +541,15 @@ class StartUnsettled:
     leftovers: LeftoverCheckResult
 
 
-def pending_start_key(identity: claim_state.ClaimIdentity) -> str:
-    """Name the fence for one exact provider claim."""
-    return hashlib.sha256(json.dumps([identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
-
-
-def pending_start_path(target: str, identity: claim_state.ClaimIdentity) -> Path:
-    return claim_state.state_paths(target).directory / "pending-starts" / pending_start_key(identity)
+def pending_start_path(target: str, identity: claim_state.ClaimIdentity, *, scope_key: str = "run") -> Path:
+    return claim_state.pending_start_path(claim_state.state_paths(target), identity, scope_key=scope_key)
 
 
 def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
     state = (Path(".local/state/mac-test") if target in ("", "mac")
              else Path(".local/state/build-targets") / target)
-    return state / "dispatch-fences" / scope_key / pending_start_key(identity)
+    scope, _, _ = scope_key.partition("/")
+    return state / "dispatch-fences" / scope / claim_state.start_fence_name(identity, scope_key)
 
 
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
@@ -617,6 +728,10 @@ class FreshMacClaim:
     slot: int = 1
 
 
+class LegacyWaitClaimReleased:
+    """The claim child retired a reservation whose assigned repository changed."""
+
+
 @dataclass(frozen=True)
 class TakenOverMacClaim:
     """Capacity inherited from a lost job on the host in the claim's reply."""
@@ -639,7 +754,18 @@ class MacClaimNotConfirmed:
     stderr: str
 
 
-MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
+class NoWaitClaimCheck:
+    """The claim child reported no known adoption check."""
+
+
+@dataclass(frozen=True)
+class MacClaimChildRefusal(MacClaimNotConfirmed):
+    reason: Literal["state", "busy"]
+    status: int
+    check: WaitClaimCheck | NoWaitClaimCheck
+
+
+MacClaimAnswer = FreshMacClaim | LegacyWaitClaimReleased | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
 
 
 class IgnoredPathListingFailed:
@@ -657,11 +783,21 @@ class CommandTimeLimit:
     seconds: float
 
 
+@dataclass(frozen=True)
+class ClaimReleaseDeadline:
+    """The monotonic deadline for the release helper and its SSH work."""
+
+    expires_at: float
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - time.monotonic())
+
+
 class NoCommandTimeLimit:
     """A child command allowed to run until it completes."""
 
 
-CommandDeadline = CommandTimeLimit | NoCommandTimeLimit
+CommandDeadline = CommandTimeLimit | ClaimReleaseDeadline | NoCommandTimeLimit
 NO_COMMAND_TIME_LIMIT = NoCommandTimeLimit()
 
 
@@ -674,6 +810,18 @@ class RunningProcess:
     """The child process currently owned by the runner."""
 
     process: subprocess.Popen[str] | subprocess.Popen[bytes]
+
+    def kill(self) -> None:
+        self.process.kill()
+
+
+class RunningReleaseGroup(RunningProcess):
+    """The release helper leads a process group that includes its SSH child."""
+
+    @override
+    def kill(self) -> None:
+        with suppress(ProcessLookupError):
+            process_group.send_process_group(self.process.pid, signal.SIGKILL)
 
 
 class NoClaimInterrupt:
@@ -743,16 +891,34 @@ class CleanupUnconfirmed:
     """The remote command did not report a usable cleanup status."""
 
 
-CleanupOutcome = CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
+@dataclass(frozen=True)
+class CleanupStreamTimedOut:
+    """The SSH stream remained open past the cleanup deadline."""
+
+    seconds: float
+
+    def detail(self) -> str:
+        return f"cleanup timed out after {self.seconds:g} s"
+
+
+CleanupOutcome = (CleanupDone | CleanupRemovedWithoutFacts | CleanupFailed | CleanupSkipped | CleanupKept
+                  | CleanupUnconfirmed | CleanupStreamTimedOut)
 
 
 @dataclass(frozen=True)
 class ReportedMacStatus:
-    """The test status printed by the remote command."""
+    """The exit status reported by the remote command."""
 
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
     build_target_directory: str = ""
+
+
+@dataclass(frozen=True)
+class MacNextestSetupFailed:
+    """The remote command reported a nextest setup failure."""
+
+    cleanup: CleanupOutcome = CleanupUnconfirmed()
 
 
 @dataclass(frozen=True)
@@ -763,14 +929,22 @@ class ToolVersionMismatch:
 
 @dataclass(frozen=True)
 class MissingMacStatus:
-    """The remote command ended without a usable test status."""
+    """The remote command ended without a usable exit status."""
 
     detail: str = 'runner sent no final status'
+    cleanup: CleanupUnconfirmed | CleanupStreamTimedOut = CleanupUnconfirmed()
 
 
 @dataclass(frozen=True)
-class MirrorUseBusy:
-    """The mirror lease refused the command before the runner started."""
+class MirrorBusyRefusal:
+    """A receiver or runner could not acquire the mirror."""
+
+    holder: RecordedMirrorSession | UnreadableMacHolder
+
+
+@dataclass(frozen=True)
+class NoMirrorBusyRefusal:
+    """The diagnostic does not report a busy mirror."""
 
 
 @dataclass(frozen=True)
@@ -778,7 +952,22 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy
+@dataclass(frozen=True)
+class CleanupAfterVerdict:
+    """Start the cleanup deadline when the command sends its verdict."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CleanupOnly:
+    """Start the cleanup deadline before starting SSH."""
+
+    seconds: float
+
+
+RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -846,6 +1035,32 @@ class CliArguments(argparse.Namespace):
         self.fetch: str | None = None
 
 
+def bounded_output_lines(output: BinaryIO | TextIO, remaining: Callable[[], float | None]) -> Generator[bytes]:
+    """Read complete lines without letting a partial line block the cleanup deadline."""
+    descriptor = output.fileno()
+    partial_line = bytearray()
+    with selectors.DefaultSelector() as reader:
+        _ = reader.register(descriptor, selectors.EVENT_READ)
+        while True:
+            timeout = remaining()
+            if (timeout is not None and timeout <= 0) or not reader.select(timeout):
+                raise TimeoutError
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                if partial_line:
+                    yield bytes(partial_line)
+                return
+            *lines, tail = chunk.split(b"\n")
+            if not lines:
+                partial_line.extend(tail)
+                continue
+            partial_line.extend(lines[0])
+            yield bytes(partial_line) + b"\n"
+            for line in lines[1:]:
+                yield line + b"\n"
+            partial_line = bytearray(tail)
+
+
 class ProcessController:
     """Starts one child at a time and exposes it to signal cleanup."""
 
@@ -855,12 +1070,15 @@ class ProcessController:
         self.copy_failure_detail: str = ""
         self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
         self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation | PendingHanaOperation = SettledDispatchOperations()
+        self.hana_output: HanaCommandOutput = HanaCommandOutput()
+        self.hana_record_writes: list[OffloadRecordWrite] = []
         self.hana_settlement: hana_execution.HanaSettled | NoHanaSettlement = NoHanaSettlement()
         self.expected_claim: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_settings: Path | DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
+        self.mac_repository: claim_state.SavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY
 
     def stop(self) -> None:
         active = self.active
@@ -869,17 +1087,16 @@ class ProcessController:
         if not isinstance(active, RunningProcess):
             return
         process = active.process
-        if process.poll() is not None:
-            self.active = IDLE_PROCESS
-            if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
-                self.pending = SettledDispatchOperations()
-            return
-        process.terminate()
-        try:
-            _ = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        if isinstance(active, RunningReleaseGroup):
+            active.kill()
             _ = process.wait()
+        elif process.poll() is None:
+            process.terminate()
+            try:
+                _ = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _ = process.wait()
         self.active = IDLE_PROCESS
         if not isinstance(self.pending, (PendingStartOperation, PendingHanaOperation)):
             self.pending = SettledDispatchOperations()
@@ -914,9 +1131,8 @@ class ProcessController:
                 attempt.answer = read_claim_answer(answer, expected=expected,
                     assigned_slot=self.placement.assignment.destination.slot
                         if isinstance(self.placement, AssignedOffloadRequest) else 0)
-                if answer.status in (0, 13):
-                    self.claim_identity = claim_state.reply_claim_identity(stdout)
-                elif isinstance(self.placement, AssignedOffloadRequest):
+                if not self.accept_claim_reply(answer) and answer.status not in (
+                        10, 11, 12, claim_state.LEGACY_WAIT_CLAIM_RELEASED):
                     self.inspect_claim(attempt, expected)
         finally:
             if isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
@@ -930,6 +1146,21 @@ class ProcessController:
             self.active = IDLE_PROCESS
             self.pending = SettledDispatchOperations()
 
+    def accept_claim_reply(self, answer: CommandOutput) -> bool:
+        """Keep the identity, fence and Mac repository of a granted claim reply."""
+        identity = claim_state.reply_claim_identity(answer.stdout)
+        if answer.status not in (0, 13) or not isinstance(identity, claim_state.ClaimIdentity):
+            return False
+        self.claim_identity = identity
+        for line in answer.stdout.splitlines():
+            if line.startswith("claim_fence="):
+                self.claim_scope_key = line.removeprefix("claim_fence=")
+            if line.startswith("mac_repository="):
+                self.mac_repository = claim_state.mac_repository_record(
+                    cast(object, json.loads(line.removeprefix("mac_repository="))))
+                self.claim_scope_key = self.mac_repository.fence_scope_key()
+        return True
+
     def inspect_claim(self, attempt: LocalClaimAttempt,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity) -> None:
         """Inspect an uncertain response without another acquisition."""
@@ -938,20 +1169,36 @@ class ProcessController:
         assigned = self.placement.assignment
         paths = claim_state.state_paths(assigned.destination.target)
         with claim_state.locked(paths.lock):
-            for held in claim_state.read_claims(paths):
+            claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
+            for held in claims:
                 record = held.record
-                if (claim_state.claim_identity(record) != expected or held.scope != assigned.destination.scope
-                        or record["pid"] != os.getpid()
+                if "remote_host" not in record or "replaced_reservation" in record:
+                    continue
+                identity = claim_state.claim_identity(record)
+                cleanup = record.get("cleanup_pending") is True
+                if identity != expected and not (cleanup and record.get("cleanup_request_id") == expected.claim_id):
+                    continue
+                scope = assigned.destination.scope
+                matches = (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
+                if paths.platform == "macos" and cleanup and not record.get("repo_key"):
+                    matches = True
+                if (not matches or record["pid"] != os.getpid()
                         or record["submitting_session"] != claim_state.session_id(assigned.session)):
                     continue
                 start = process_identity.process_start(os.getpid())
                 if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
                     continue
-                self.claim_identity = expected
-                if "remote_host" in record and record.get("cleanup_pending"):
-                    attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
-                elif "remote_host" in record:
-                    attempt.answer = FreshMacClaim(record.get("slot", 1))
+                if (paths.platform == "macos" and not cleanup
+                        and claim_state.claim_pending_start(paths, held.path, record).exists()):
+                    continue
+                self.claim_identity = identity
+                self.claim_scope_key = claim_state.claim_fence_scope_key(held.path, record)
+                self.mac_repository = claim_state.saved_mac_repository(record)
+                slot = record.get("slot", 1)
+                if cleanup:
+                    attempt.answer = TakenOverMacClaim(record["remote_host"], slot)
+                else:
+                    attempt.answer = FreshMacClaim(slot)
                 return
 
     def capture(
@@ -961,27 +1208,32 @@ class ProcessController:
     ) -> CapturedCommandResult:
         if arguments[0] == "rsync":
             arguments = [*arguments[:2], "--stats", *arguments[2:]]
+        if isinstance(deadline, ClaimReleaseDeadline) and deadline.remaining() <= 0:
+            return COMMAND_TIMED_OUT
         try:
             process = subprocess.Popen(
                 arguments,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=isinstance(deadline, ClaimReleaseDeadline),
             )
         except OSError:
             return COMMAND_COULD_NOT_START
-        self.active = RunningProcess(process)
+        active = RunningReleaseGroup(process) if isinstance(deadline, ClaimReleaseDeadline) else RunningProcess(process)
+        self.active = active
         try:
             try:
-                timeout = (
-                    deadline.seconds
-                    if isinstance(deadline, CommandTimeLimit)
-                    else None
-                )
+                timeout = (deadline.remaining() if isinstance(deadline, ClaimReleaseDeadline)
+                           else deadline.seconds if isinstance(deadline, CommandTimeLimit) else None)
                 stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-                self.observe_command(arguments, stdout, stderr)
+            except subprocess.TimeoutExpired as error:
+                active.kill()
+                # A descendant may still hold a pipe open after the command ends.
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                _ = process.wait()
+                self.observe_command(arguments, error.stdout or b"", error.stderr or b"")
                 if arguments[0] in ("ssh", "rsync"):
                     self.attempt_evidence.traffic.transfers[-1]["complete"] = False
                 return COMMAND_TIMED_OUT
@@ -1019,7 +1271,15 @@ class ProcessController:
             self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
         return result
 
-    def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
+    def stream_mac_run(
+        self, arguments: Sequence[str],
+        cleanup_limit: CleanupAfterVerdict | CleanupOnly | NoCommandTimeLimit = NO_COMMAND_TIME_LIMIT,
+    ) -> RemoteRunStatus:
+        deadline = time.monotonic() + cleanup_limit.seconds if isinstance(cleanup_limit, CleanupOnly) else math.inf
+
+        def remaining() -> float | None:
+            return None if deadline == math.inf else max(0.0, deadline - time.monotonic())
+
         self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
@@ -1030,7 +1290,7 @@ class ProcessController:
         except OSError:
             self.pending = SettledDispatchOperations()
             return MISSING_MAC_STATUS
-        self.attempt_evidence.execution = placement.ExecutionEvidenceUnavailable(
+        self.attempt_evidence.execution = execution_identity.ExecutionEvidenceUnavailable(
             "the remote start has no final observation", time.time())
         raw_output = process.stdout
         if raw_output is None:
@@ -1043,15 +1303,18 @@ class ProcessController:
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
-        mirror_refused = False
+        mirror_refusal: MirrorBusyRefusal | NoMirrorBusyRefusal = NoMirrorBusyRefusal()
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
+        exit_status = 0
         try:
-            for raw_line in output:
+            lines = (output if isinstance(cleanup_limit, NoCommandTimeLimit)
+                     else bounded_output_lines(output, remaining))
+            for raw_line in lines:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
-                    line = raw_line.decode()
+                    line = raw_line.decode("utf-8", errors="replace")
                 else:
                     received_bytes += len(raw_line.encode("utf-8"))
                     line = raw_line
@@ -1061,16 +1324,17 @@ class ProcessController:
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
                     self.pending = SettledDispatchOperations()
-                    pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
+                    pending_start_path(self.claim_target, identity, scope_key=self.claim_scope_key).unlink(missing_ok=True)
                     if not isinstance(status, ReportedMacStatus):
-                        self.attempt_evidence.execution = placement.ExecutionNotStarted()
+                        self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
                     continue
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_pending=" + pending_start_key(identity)):
                     self.pending = PendingStartOperation()
                     continue
-                if mirror_busy_refusal(marker):
-                    mirror_refused = True
+                refusal = mirror_busy_refusal(marker)
+                if isinstance(refusal, MirrorBusyRefusal):
+                    mirror_refusal = refusal
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
                     continue
@@ -1084,15 +1348,20 @@ class ProcessController:
                     cleanup = CleanupUnconfirmed()
                     continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
-                if status_match is not None:
+                if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
                     if held_status_line:
                         print(held_status_line, end="", flush=True)
-                    status_digits = status_match.group(1).lstrip("0") or "0"
-                    mac_status = int(status_digits) if len(status_digits) <= 3 else 256
-                    status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
-                    if isinstance(status, ReportedMacStatus):
+                    if status_match is None:
+                        status = MacNextestSetupFailed()
+                    else:
+                        status_digits = status_match.group(1).lstrip("0") or "0"
+                        mac_status = int(status_digits) if len(status_digits) <= 3 else 256
+                        status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
                         held_status_line = line
+                        if isinstance(cleanup_limit, CleanupAfterVerdict) and deadline == math.inf:
+                            deadline = time.monotonic() + cleanup_limit.seconds
                     else:
                         held_status_line = ""
                         print(line, end="", flush=True)
@@ -1110,28 +1379,41 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
+            timeout = remaining()
+            exit_status = process.wait() if timeout is None else process.wait(timeout=timeout)
             finished_output = True
-            exit_status = process.wait()
+        except (TimeoutError, subprocess.TimeoutExpired):
+            if isinstance(cleanup_limit, NoCommandTimeLimit):
+                raise
+            with suppress(ProcessLookupError):
+                process.kill()
+            _ = process.wait()
+            cleanup = CleanupStreamTimedOut(cleanup_limit.seconds)
         finally:
             if process.poll() is None:
                 self.stop()
             self.active = IDLE_PROCESS
             startup_refused = isinstance(status, UnresolvedSlotStartup)
+            mirror_refused = isinstance(mirror_refusal, MirrorBusyRefusal)
             if isinstance(self.pending, AcknowledgedStartOperation) or mirror_refused or mismatch or startup_refused:
                 self.pending = SettledDispatchOperations()
             if (mirror_refused or mismatch or startup_refused) and not isinstance(status, ReportedMacStatus):
-                self.attempt_evidence.execution = placement.ExecutionNotStarted()
+                self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
             output.close()
             if arguments[0] == "ssh":
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if mismatch and not isinstance(status, (ReportedMacStatus)):
+        if isinstance(cleanup, CleanupStreamTimedOut) and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
+            return MissingMacStatus(cleanup.detail(), cleanup)
+        if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
-        if mirror_refused:
-            return MirrorUseBusy()
+        if isinstance(status, MacNextestSetupFailed):
+            return MacNextestSetupFailed(cleanup)
+        if isinstance(mirror_refusal, MirrorBusyRefusal):
+            return mirror_refusal
         if isinstance(status, UnresolvedSlotStartup):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -1171,6 +1453,8 @@ def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floo
         print(f"{label} build output kept: the run used another target dir", flush=True)
     elif isinstance(cleanup, CleanupUnconfirmed):
         print(f"{label} build output cleanup unconfirmed", flush=True)
+    elif isinstance(cleanup, CleanupStreamTimedOut):
+        print(f"{label} build output {cleanup.detail()}", flush=True)
 
 
 def result_destination(path: str | None) -> ResultDestination:
@@ -1189,6 +1473,10 @@ def decline_already_shown(reason: MacDeclineReason, last_decline: LastMacDecline
     return isinstance(last_decline, PriorMacDecline) and reason == last_decline.reason
 
 
+def fetch_result(result: MacOffloadResult) -> FetchResult:
+    return result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
+
+
 def write_result(
     result: MacOffloadResult,
     destination: ResultDestination,
@@ -1200,6 +1488,8 @@ def write_result(
 ) -> int:
     """Write the wire form and return the exit status for one outcome."""
     label = target or "Mac"
+    linux = (isinstance(destination, ResultFile) and bool(target)
+             and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform))
     if isinstance(result, (PassedOnMac, PassedOnTarget)):
         mac = "passed"
         reason = ""
@@ -1223,28 +1513,51 @@ def write_result(
             print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
+    elif isinstance(result, HanaCommandAdmissionRefused):
+        mac = "hana_command_admission_refused"
+        reason = result.reason
+        status = 75
+        if not isinstance(destination, ResultFile) or os.environ.get('BUILDLOG_PINNED_TARGET') != target:
+            from scripts.build_queue.admission_client import first_hana_image_notice
+
+            if reason != placement.HANA_IMAGE_STALE or first_hana_image_notice():
+                print(f"mac_test: The Hana command did not start on {label}. {reason}")
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = result.detail if target else ""
         status = 75
-        print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
+        if (isinstance(destination, ResultFile) and not linux
+                and (isinstance(result, MacCleanupUnconfirmed)
+                     or evidence is not None and evidence.launch_authorized and evidence.cleanup == "unconfirmed")):
+            reason = "cleanup_unconfirmed"
+            print(f"mac_test: the {label} {result.detail}. Cleanup remains unconfirmed.")
+        elif (not isinstance(result, HanaGuestEndedRun) or not isinstance(destination, ResultFile)
+                or os.environ.get('BUILDLOG_PINNED_TARGET') != target):
+            print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
+    elif isinstance(result, DeclinedMacRun) and result.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        mac = "prelaunch_failed"
+        reason = result.reason
+        status = claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS
+        print(f"mac_test: {reason} (the checkout has no readable history key)", file=sys.stderr)
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
         description = reason
-        if isinstance(result, DeclinedMacRun) and result.reason == "disk":
+        if isinstance(result, WaitClaimAdoptionDeclined):
+            description = result.diagnostic
+        elif isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
-        elif isinstance(result, DeclinedMacRun) and result.reason == "source_changed":
-            reason = "source_changed"
+        elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
+            reason = result.reason
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
-    fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
     fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
     if isinstance(destination, ResultFile):
-        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
-        linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
+        holder_line = ""
+        if isinstance(result, BusyMacDecline):
+            holder_line = f"holder={holder_value(result.holder)}\n"
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
         if linux:
@@ -1256,14 +1569,10 @@ def write_result(
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
-            + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else "")
+            + (f"fetch={fetch_word(fetch_result(result))}\n" if isinstance(fetch, FetchFolder) else "")
             + (f"fix={fix_return.fix_word(fixed)}\n" if verb == "mend-fix" else ""),
             encoding="utf-8",
         )
-    if isinstance(fetch, FetchFolder):
-        report_fetch(fetch, fetched)
-    if verb == "mend-fix" and isinstance(result, PassedOnMac):
-        report_fix(fixed)
     return status
 
 
@@ -1273,47 +1582,55 @@ def write_mirror_busy(config: OffloadConfig, repository: str, target: str) -> No
     write_text_atomic(path, f"{time.time() + config.mirror_busy_backoff_s:.6f}\n")
 
 
-def mirror_busy_refusal(detail: str) -> bool:
-    return re.search(r"\bcopies: [^\n]+: busy; held by session ", detail) is not None
+def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
+    """Read the receiver or runner diagnostic, including older receivers."""
+    match = re.search(
+        r"(?:^copy: rsync: |^|; )copies: [^\r\n]+?: busy; held by session"
+        + r"(?: (?P<session>[^;\r\n]*?))?(?: \((?P<check>mirror (?:lease|process check))\))?(?=; |$)",
+        detail.rstrip(),
+    )
+    if match is None:
+        return NoMirrorBusyRefusal()
+    session = (match["session"] or "").strip()
+    check = MirrorBusyCheck(match["check"] or "")
+    holder = RecordedMirrorSession(session, check) if session and session != "unreadable" else UnreadableMacHolder(check)
+    return MirrorBusyRefusal(holder)
 
 
-def write_backoff(until: float, target: str = "mac") -> None:
+PROBE_RESULT_LOCK_NAME = "probe-result.lock"
+
+
+def write_backoff(until: float, target: str = "mac", *, wait: bool = True, strict: bool = False) -> None:
+    """Write the backoff record. A strict write reports file errors."""
     path = eligibility.backoff_path(target)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as output:
-            temporary_path = Path(output.name)
-            try:
-                _ = output.write(f"{until:.6f}\n")
-                output.flush()
-                os.replace(temporary_path, path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+        with claim_state.locked(path.parent / PROBE_RESULT_LOCK_NAME, wait=wait):
+            write_text_atomic(path, f"{until:.6f}\n", new_file_mode=0o600)
     except OSError:
-        return
+        if strict:
+            raise
 
 
-def ssh_options(config: SshConnectionSettings) -> list[str]:
+SERVER_ALIVE_INTERVAL_SECONDS = 15
+
+
+def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
+    # SSH ends a session after this count of unanswered keepalive checks: a lost run ends after the unreachable wait.
+    alive_count = math.ceil(config.unreachable_wait_s / SERVER_ALIVE_INTERVAL_SECONDS)
     return [
         "-o",
         "BatchMode=yes",
         "-o",
         f"ConnectTimeout={config.connect_timeout_s:g}",
         "-o",
-        "ServerAliveInterval=15",
+        f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}",
         "-o",
-        "ServerAliveCountMax=3",
+        f"ServerAliveCountMax={alive_count}",
     ]
 
 
-def ssh_prefix(config: OffloadConfig) -> list[str]:
-    return ["ssh", *ssh_options(config.connection), config.host]
+def ssh_prefix(config: OffloadConfig | eligibility.SshProbeSettings) -> list[str]:
+    return ["ssh", *ssh_options(config), config.host]
 
 
 def linux_mirror_root() -> Path:
@@ -1322,7 +1639,7 @@ def linux_mirror_root() -> Path:
 
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    return MacMirrorRoot.read(conf.read("mac_test"))
+    return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1373,14 +1690,17 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = (), *,
+                    retire_wait: bool = False,
+                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
+                    = claim_state.NO_SAVED_MAC_REPOSITORY) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
     identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
                 if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
     if isinstance(request.placement, AssignedOffloadRequest):
         assignment = request.placement.assignment
         if isinstance(request.admission, UnclaimedMacRun):
-            identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+            identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
                                                  assignment.episode, assignment.attempt)
         leased_slots = (assignment.destination.slot,) if assignment.destination.slot else ()
     session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
@@ -1409,16 +1729,25 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--identity", "--session", session,
         *selection,
         *handoff,
+        *(["--retire-wait", request.call_id] if retire_wait else []),
+        *(["--mac-repository", json.dumps(mac_repository.record())]
+          if (retire_wait or isinstance(request.admission, UnclaimedMacRun))
+          and isinstance(mac_repository, claim_state.MacRepositoryIdentity) else []),
         *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
     ]
 
 
-def release_claim(controller: ProcessController, target: str = "") -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
+def release_claim(
+    controller: ProcessController, target: str = "", *,
+    deadline: CommandTimeLimit | NoCommandTimeLimit = NO_COMMAND_TIME_LIMIT,
+) -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
     if not isinstance(controller.pending, SettledDispatchOperations):
         return ClaimReleaseUnconfirmed("a claim or start operation remains pending")
     identity = controller.claim_identity
     if isinstance(identity, claim_state.NoClaimIdentity):
         return ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
+    release_deadline = (ClaimReleaseDeadline(time.monotonic() + deadline.seconds)
+                        if isinstance(deadline, CommandTimeLimit) else deadline)
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1431,18 +1760,21 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
             "--attempt", identity.attempt,
             *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
             *(["--target", target] if target else []),
-        ]
+            *(["--deadline-monotonic", str(release_deadline.expires_at)]
+              if isinstance(release_deadline, ClaimReleaseDeadline) else []),
+        ],
+        release_deadline,
     )
     if isinstance(result, CommandOutput):
         if result.status == 0:
             controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
         for line in result.stdout.splitlines():
             if line.startswith("copy_bytes="):
-                transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
+                transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
 
     if isinstance(result, CommandOutput) and result.status == 0:
-        pending_start_path(target, identity).unlink(missing_ok=True)
+        pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return ClaimReleaseConfirmed()
     return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
 
@@ -1455,11 +1787,31 @@ def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
     return ["--assignment", wire.encode_reply(wire.Assignment(request.placement.assignment)).strip()]
 
 
+def read_claim_refusal(result: CommandOutput) -> MacClaimChildRefusal:
+    check: WaitClaimCheck | NoWaitClaimCheck = NoWaitClaimCheck()
+    error_lines = result.stderr.splitlines(keepends=True)
+    for index, line in enumerate(error_lines):
+        if not line.startswith(WAIT_CLAIM_CHECK_PREFIX):
+            continue
+        try:
+            check = WaitClaimCheck(line.removeprefix(WAIT_CLAIM_CHECK_PREFIX).rstrip("\r\n"))
+        except ValueError:
+            continue
+        del error_lines[index]
+        break
+    reason = "busy" if result.status == 11 else "state"
+    return MacClaimChildRefusal(reason, result.stdout, "".join(error_lines), result.status, check)
+
+
 def read_claim_answer(result: CapturedCommandResult, *,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                       assigned_slot: int = 0) -> MacClaimAnswer:
     if not isinstance(result, CommandOutput):
         return MacClaimNotConfirmed("state", "", "")
+    if result.status == claim_state.LEGACY_WAIT_CLAIM_RELEASED:
+        return LegacyWaitClaimReleased()
+    if result.status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        return MacClaimNotConfirmed(claim_state.MAC_HISTORY_KEY_UNAVAILABLE, result.stdout, result.stderr)
     slots = [line.removeprefix("slot: ") for line in result.stdout.splitlines() if line.startswith("slot: ")]
     if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
@@ -1478,15 +1830,14 @@ def read_claim_answer(result: CapturedCommandResult, *,
         if len(hosts) == 1 and hosts[0]:
             return TakenOverMacClaim(hosts[0], slot)
         return TakeoverHostUnreadable()
-    reason: MacDeclineReason = (
-        "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
-    )
-    return MacClaimNotConfirmed(reason, result.stdout, result.stderr)
+    if result.status == 10:
+        return MacClaimNotConfirmed("blocked", result.stdout, result.stderr)
+    return read_claim_refusal(result)
 
 
 def probe_reachability(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
 ) -> HostReachability:
     """Check SSH reachability without creating or inspecting a repository."""
     result = controller.capture(
@@ -1628,21 +1979,31 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     return isinstance(stamp, CommandOutput) and stamp.status == 0
 
 
-def record_reachable(target: str = "mac") -> None:
-    """Clear the failed probe mark and the retry backoff after the target answered."""
-    mark = eligibility.state_directory(target) / "failed_probe"
-    with claim_state.locked(mark.parent / "probe-result.lock"):
-        changed = mark.exists()
-        mark.unlink(missing_ok=True)
-        eligibility.backoff_path(target).unlink(missing_ok=True)
-        if changed:
-            label = "Mac" if target in ("", "mac") else target
-            print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
+def record_reachable(target: str, *, probe_started_ns: int) -> None:
+    """Clear a failure only if it predates the successful probe."""
+    backoff = eligibility.backoff_path(target)
+    mark = backoff.parent / "failed_probe"
+    try:
+        with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+            for path in (mark, backoff):
+                try:
+                    if path.stat().st_mtime_ns >= probe_started_ns:
+                        return
+                except FileNotFoundError:
+                    continue
+            changed = mark.exists()
+            mark.unlink(missing_ok=True)
+            backoff.unlink(missing_ok=True)
+    except BlockingIOError:
+        return
+    if changed:
+        label = "Mac" if target in ("", "mac") else target
+        print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
 
 
 def probe_mac(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
@@ -1651,20 +2012,26 @@ def probe_mac(
     mark = eligibility.state_directory(target) / "failed_probe"
 
     def failed(reason: str) -> UnavailableProbe:
-        with claim_state.locked(mark.parent / "probe-result.lock"):
-            changed = not mark.exists()
-            write_text_atomic(mark, "failed\n")
-            if changed:
-                label = "Mac" if target in ("", "mac") else target
-                print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
+        try:
+            with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+                changed = not mark.exists()
+                write_text_atomic(mark, "failed\n")
+        except BlockingIOError:
+            return UNAVAILABLE_PROBE
+        if changed:
+            label = "Mac" if target in ("", "mac") else target
+            print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
         return UNAVAILABLE_PROBE
 
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
-        record_reachable(target)
+        record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
 
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
+    probe_started_ns = time.time_ns()
     if linux:
+        if not isinstance(config, OffloadConfig):
+            raise ValueError("The Linux shell probe requires execution settings")
         from scripts.mac_test import linux_runner
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
@@ -1676,7 +2043,7 @@ def probe_mac(
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
-        path = pending_start_path(target, identity)
+        path = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, pending_start_key(identity))
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
@@ -1700,7 +2067,7 @@ def probe_mac(
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
-            if not linux:
+            if not linux or not isinstance(config, OffloadConfig):
                 return succeeded(probe)
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -1729,6 +2096,21 @@ class MacDiskReady:
 
 
 @dataclass(frozen=True)
+class MacDiskShort:
+    """The probe reports less free space than the floor."""
+
+    free_gib: float
+    floor_gib: float
+
+
+def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDiskReady | MacDiskShort:
+    """Compare the probe reading with the floor."""
+    if probe.free_gib >= free_floor_gib:
+        return MacDiskReady(probe.free_gib)
+    return MacDiskShort(probe.free_gib, free_floor_gib)
+
+
+@dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
 
@@ -1743,12 +2125,15 @@ class SweepFailed:
 
 
 def ensure_mac_disk_floor(
-    controller: ProcessController, config: OffloadConfig, repository: KnownRepository,
+    controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    if probe.free_gib >= config.free_floor_gib:
-        return MacDiskReady(probe.free_gib)
+    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
+             else config.configuration.number("free_floor_gib"))
+    disk = check_mac_disk_floor(probe, floor)
+    if isinstance(disk, MacDiskReady):
+        return disk
     try:
         directory = eligibility.state_directory()
         directory.mkdir(parents=True, exist_ok=True)
@@ -1764,8 +2149,11 @@ def ensure_mac_disk_floor(
                 _ = lock.truncate()
                 _ = lock.write("floor sweep was interrupted")
                 lock.flush()
-                settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
-                timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                if isinstance(config, OffloadConfig):
+                    settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+                    timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                else:
+                    timeout = config.configuration.number("floor_sweep_timeout_s")
                 result = controller.capture(
                     [*ssh_prefix(config),
                      "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
@@ -1791,10 +2179,13 @@ def ensure_mac_disk_floor(
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
-            if after.free_gib < config.free_floor_gib:
-                return SweepShort(after.free_gib)
-            return MacDiskReady(after.free_gib)
+            disk = check_mac_disk_floor(after, floor)
+            if isinstance(disk, MacDiskShort):
+                return SweepShort(disk.free_gib)
+            return disk
     except (OSError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
+            raise
         return SweepFailed(f"floor sweep unavailable: {error}")
 
 
@@ -1902,7 +2293,10 @@ def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
 
 
 def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
-    """Trim the mirror budget before the run releases its lease."""
+    """Trim the mirror budget before the run releases its lease.
+
+    The cleanup runs after the verdict line. It writes only markers: any other line would clear the verdict.
+    """
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
         return "echo mac_cleanup=skipped"
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
@@ -1915,7 +2309,7 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
     floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
-        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        f'{{ if cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))}; then '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
         + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
@@ -1937,7 +2331,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
         + f'if rm -rf -- "$HOME"/{target}; then '
         + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; "
+        + "else echo mac_cleanup=$?; fi; } 2>/dev/null"
     )
 
 
@@ -1946,6 +2341,7 @@ def remote_test_command(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
+    *, history_key: str = store.UNKNOWN_IDENTITY,
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -1970,7 +2366,8 @@ def remote_test_command(
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
-    repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
+    repo_identity = (f"BUILDLOG_REPO_IDENTITY={shlex.quote(history_key)} "
+                     if history_key and history_key != store.UNKNOWN_IDENTITY else "")
     target = shlex.quote(mirror_target(repository, request.target, request.slot))
     custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
@@ -1989,9 +2386,17 @@ def remote_test_command(
         "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
+    capture = ""
+    report_status = "; echo mac_exit=$?"
+    if request.verb == "nextest":
+        limits = nextest_log.output_limits(config.settings)
+        capture = nextest_log.capture_function(limits) + " && "
+        # The writer reports the child status. A failed launch takes the setup path.
+        report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
+    runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
@@ -2004,7 +2409,7 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
+        f"{runner}~/.claude/scripts/lint/lint {invocation}{report_status}; {cleanup_command}"
     )
 
 
@@ -2209,7 +2614,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     root = mac_mirror_root().relative
     mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
-        mirror += "/" + extended_regex_literal(scope.legacy_mirror_name)
+        mirror += "/" + extended_regex_literal(scope.name)
         command_pattern = f"{mirror}([/'\"[:space:]]|$)"
         cwd_pattern = f"^n.*/{mirror}(/|$)"
     else:
@@ -2233,7 +2638,13 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     )
 
 
-def leftover_check_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1) -> str:
+    if isinstance(repository, AllMirrors):
+        return mirror_selector_script(repository, target, slot) + r'''
+leftover_pids=$(select_leftovers) || exit "$?"
+leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
     return mirror_selector_script(repository, target, slot) + r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
@@ -2271,8 +2682,14 @@ class LeftoverObservation:
 
 
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
-                   target: str) -> LeftoverObservation:
+                   target: str, *,
+                   release_deadline: ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                   ) -> LeftoverObservation:
     """End and count one mirror's work without exposing the check to a second signal."""
+    timeout = (release_deadline.remaining() if isinstance(release_deadline, ClaimReleaseDeadline)
+               else config.leftover_timeout_s)
+    if timeout <= 0:
+        return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "")
     try:
         arguments = ["ssh", *ssh_options(config), host, script]
         result = subprocess.run(
@@ -2282,14 +2699,14 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=config.leftover_timeout_s,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s"), "")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
     except OSError:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)"), "")
-    ledger = buildlog_sync.active_transfers.get()
-    if isinstance(ledger, buildlog_sync.TransferLedger):
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
+    ledger = transfer_bytes.active_transfers.get()
+    if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
@@ -2305,14 +2722,14 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
     return LeftoverObservation(answer, result.stdout)
 
 
-def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
+def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
                    target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
     return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
-                         repository: KnownRepository, target: str = "mac", slot: int = 1
+                         repository: MirrorScope, target: str = "mac", slot: int = 1
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
     identity = controller.claim_identity
@@ -2328,7 +2745,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
         controller.pending = SettledDispatchOperations()
-        pending_start_path(target, identity).unlink(missing_ok=True)
+        pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return StartSettled(observed.result)
     return StartUnsettled("the original remote start has not settled", observed.result)
 
@@ -2348,7 +2765,7 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_current_leftovers(
-    config: OffloadConfig, host: str, repository: KnownRepository, target: str = "mac", slot: int = 1,
+    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1,
 ) -> LeftoverCheckResult:
     """Read the current connection settings before checking retained work."""
     try:
@@ -2359,29 +2776,62 @@ def check_current_leftovers(
 
 
 def check_taken_over_claim(
-    controller: ProcessController, config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository,
+    controller: ProcessController, config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable,
+    repository: eligibility.RepositoryIdentity,
     target: str = "mac",
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
+        if eligibility.configured_ssh_target(target or "mac").platform == "macos":
+            scope = mac_cleanup_scope(controller.mac_repository)
+        elif isinstance(repository, KnownRepository):
+            scope = repository
+        else:
+            return LeftoverCheckFailed("the kept claim's repository is unavailable")
         if isinstance(controller.pending, PendingStartOperation):
-            return settle_pending_start(controller, config, claim.host, repository, target, claim.slot).leftovers
-        return check_current_leftovers(config, claim.host, repository, target, claim.slot)
+            return settle_pending_start(controller, config, claim.host, scope, target, claim.slot).leftovers
+        return check_current_leftovers(config, claim.host, scope, target, claim.slot)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
+def mac_cleanup_scope(saved: claim_state.SavedMacRepository) -> MirrorScope:
+    if isinstance(saved, claim_state.MacMirrorIdentity):
+        return KnownRepository(saved.mirror_name, saved.key)
+    return ALL_MIRRORS
+
+
+@contextmanager
+def mac_cleanup_lease(saved: claim_state.SavedMacRepository,
+                      host: str, target: str) -> Generator[None, None, None]:
+    """Protect the saved mirror or all mirrors on the recorded host during cleanup."""
+    from scripts.copies import copies
+
+    scope = mac_cleanup_scope(saved)
+    lease = (copies.remote_host_lease(host, exclusive=True) if isinstance(scope, AllMirrors) else
+             copies.remote_lease(copies.RemoteMirror("", copies.SelectedRepository(scope.name), host,
+                                                      remote_mirror(scope, target), "")))
+    with lease:
+        yield
+
+
 def claim_for_run(
-    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository,
-    leased_slots: tuple[int, ...] = (),
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: eligibility.RepositoryIdentity,
+    leased_slots: tuple[int, ...] = (), *,
+    retire_wait: bool = False,
+    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY,
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     controller.placement = request.placement
     controller.claim_settings = config.source
     controller.claim_target = request.target
-    if isinstance(request.admission, MacClaimFromWait):
+    controller.claim_scope_key = "run"
+    controller.mac_repository = claim_state.NO_SAVED_MAC_REPOSITORY
+    controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
+    controller.expected_claim = claim_state.NO_CLAIM_IDENTITY
+    if isinstance(request.admission, MacClaimFromWait) and not retire_wait:
         controller.expected_claim = request.admission.identity
     elif isinstance(request.placement, AssignedOffloadRequest):
         assigned = request.placement.assignment
-        controller.expected_claim = claim_state.ClaimIdentity(placement.assigned_claim_id(assigned.episode, assigned.attempt),
+        controller.expected_claim = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assigned.episode, assigned.attempt),
                                                               assigned.episode, assigned.attempt)
     if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.expected_claim, claim_state.ClaimIdentity):
         assigned = request.placement.assignment
@@ -2390,26 +2840,17 @@ def claim_for_run(
             assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
             identity.claim_id, identity.episode, identity.attempt)
     try:
-        controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
-        if isinstance(attempt.answer, (FreshMacClaim, TakenOverMacClaim)):
-            claim_path = cast(Callable[[claim_state.StatePaths, claim_state.ClaimScope], Path],
-                              getattr(import_module("scripts.mac_test.mac_test"), "claim_path"))
-
-            paths = claim_state.state_paths(request.target)
-            scope = (request.placement.assignment.destination.scope
-                     if isinstance(request.placement, AssignedOffloadRequest)
-                     else claim_state.target_claim_scope(paths, str(request.repo_root)))
-            if isinstance(scope, claim_state.RepositoryScope) and not target_config.uses_legacy_mac_layout(paths.platform):
-                scope = replace(scope, slot=attempt.answer.slot)
-            controller.claim_scope_key = claim_path(paths, scope).stem
+        controller.complete_claim(claim_arguments(request, config, leased_slots, retire_wait=retire_wait,
+                                                  mac_repository=mac_repository), attempt)
+        if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+            if pending_start_path(request.target, controller.claim_identity, scope_key=controller.claim_scope_key).exists():
+                controller.pending = PendingStartOperation()
         if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             assigned = request.placement.assignment
             identity = controller.claim_identity
             controller.attempt_evidence.provider = placement.ProviderClaimReference(
                 assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
                 identity.claim_id, identity.episode, identity.attempt)
-            if pending_start_path(request.target, identity).exists():
-                controller.pending = PendingStartOperation()
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
         return attempt.answer
@@ -2417,7 +2858,9 @@ def claim_for_run(
         claim = attempt.answer
         if isinstance(claim, FreshMacClaim):
             _ = release_claim(controller, request.target)
-        elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+        # A retained Mac claim can be recovered under its cleanup lease.
+        elif (isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable))
+              and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)):
             checked = check_taken_over_claim(controller, config, claim, repository, request.target)
             report_leftover_check(checked, request)
             if isinstance(checked, LeftoversEnded):
@@ -2442,7 +2885,8 @@ def claimed_run(
     from scripts.aws_target.hana_placement import HanaControlTransport
 
     if isinstance(config, HanaControlTransport):
-        return hana_claimed_run(controller, config, request, repository, started)
+        with ExitStack() as staging:
+            return hana_claimed_run(controller, config, request, repository, started, staging=staging)
     from scripts.copies import copies
 
     release_allowed = True
@@ -2484,7 +2928,7 @@ def claimed_run(
                     return DeclinedMacRun("state", elapsed_seconds(started), probe.detail)
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            if probe.free_gib < config.free_floor_gib:
+            if isinstance(check_mac_disk_floor(probe, config.free_floor_gib), MacDiskShort):
                 checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
@@ -2505,6 +2949,13 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        try:
+            history_key = evidence.repository_key
+            step_command = remote_test_command(config, request, repository, copied.tree_key,
+                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY)
+        except ValueError as error:
+            evidence.execution = execution_identity.ExecutionNotStarted()
+            return DeclinedMacRun("state", elapsed_seconds(started), str(error))
         eligibility.mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
@@ -2515,12 +2966,13 @@ def claimed_run(
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
+        routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
             assignment = request.placement.assignment
             source = assignment.source_key
-            if isinstance(source, placement.SourceKeyKnown) and (
+            if isinstance(source, execution_identity.SourceKeyKnown) and (
                     not isinstance(copied.tree_key, KnownTreeKey) or copied.tree_key.value != source.key):
                 release_allowed = True
                 return DeclinedMacRun("source_changed", elapsed_seconds(started), "the copied source differs from the assignment")
@@ -2537,9 +2989,14 @@ def claimed_run(
                     permission = admission_client.consume_permission(wire.ConsumePermission(
                         uuid.uuid4().hex, assignment, reference, holder))
                 except wire.AdmissionUnavailable:
-                    evidence.execution = placement.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
+                    if routed_mac_command:
+                        break
+                    evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
                     return declined("state", started)
                 if isinstance(permission, wire.FirstAuthorization):
+                    evidence.launch_authorized = True
+                    break
+                if routed_mac_command and isinstance(permission.permission, placement.PermissionConsumed):
                     break
                 if (not isinstance(permission.state, placement.CurrentAssignment)
                         or not isinstance(permission.permission, placement.PermissionAvailable)):
@@ -2547,24 +3004,29 @@ def claimed_run(
                 from scripts.build_queue import admission_records as records
 
                 time.sleep(records.read_memory_config().waiting_pass_seconds)
-            evidence.launch_authorized = True
+            if not evidence.launch_authorized:
+                evidence.execution = execution_identity.ExecutionNotStarted()
+                released = release_claim(controller, request.target,
+                                         deadline=CommandTimeLimit(config.leftover_timeout_s))
+                release_allowed = isinstance(released, ClaimReleaseConfirmed)
+                if release_allowed:
+                    return declined("state", started)
+                return MacCleanupUnconfirmed(elapsed_seconds(started), "launch authorization has no confirmed reply")
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository),
-                                           remote_test_command(config, request, repository, copied.tree_key))
+        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
-        remote_status = controller.stream_mac_run(
-            [
-                *ssh_prefix(config),
-                command,
-            ]
-        )
-        if isinstance(remote_status, MirrorUseBusy):
+        arguments = [*ssh_prefix(config), command]
+        remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
+                         if routed_mac_command else controller.stream_mac_run(arguments))
+        if isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut):
+            return MacCleanupUnconfirmed(elapsed_seconds(started), remote_status.detail)
+        if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if not isinstance(remote_status, ReportedMacStatus):
+            return BusyMacDecline(remote_status.holder, elapsed_seconds(started))
+        if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
                 if isinstance(settlement, StartUnsettled):
@@ -2589,15 +3051,19 @@ def claimed_run(
             return LostMacRun(elapsed_seconds(started), detail)
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
-        fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
-        if not linux and isinstance(request.fetch, FetchFolder):
-            cleanup = controller.stream_mac_run([
-                *ssh_prefix(config),
+        setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
+                        or (linux and remote_status.status == os.EX_TEMPFAIL))
+        fetched = (fetch_folder(controller, config, request, repository)
+                   if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
+        if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
+                and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
+            arguments = [*ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
-                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
-            ])
-            remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
-                                                          else CleanupUnconfirmed()))
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
+            cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
+                       if routed_mac_command else controller.stream_mac_run(arguments))
+            remote_status = replace(remote_status, cleanup=(
+                cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
@@ -2607,11 +3073,16 @@ def claimed_run(
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
-        else:
+        elif not isinstance(remote_status.cleanup, CleanupStreamTimedOut):
             release_allowed = True
         sync_after_release = linux
         seconds = elapsed_seconds(started)
-        if linux and remote_status.status == 75:
+        if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
+            if not linux:
+                evidence.execution = execution_identity.ExecutionNotStarted()
+            if routed_mac_command and not release_allowed:
+                # A retry would run beside the Mac claim that this run still holds.
+                return MacCleanupUnconfirmed(seconds, "nextest setup failed and its cleanup did not end")
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)
@@ -2634,49 +3105,54 @@ def claimed_run(
         if release_allowed:
             evidence.unresolved_count = 0
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            _ = release_claim(controller, request.target)
+            if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+                _ = release_claim(controller, request.target)
             if sync_after_release:
-                with buildlog_sync.measure_transfers(evidence.traffic):
+                from scripts.buildlog import sync as buildlog_sync
+
+                with transfer_bytes.measure_transfers(evidence.traffic):
                     buildlog_sync.sync_target(request.target)
 
 
-def hana_source_key(request: OffloadRequest) -> placement.SourceIdentity:
+def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
     """Read the caller's current source without installing a remote snapshot."""
-    key = read_tree_key(request.source_root)
-    return (placement.SourceKeyKnown(key.value) if isinstance(key, KnownTreeKey)
-            else placement.SourceKeyUnavailable('The caller source key is unavailable'))
+    key = read_tree_key(source_root)
+    return (execution_identity.SourceKeyKnown(key.value) if isinstance(key, KnownTreeKey)
+            else execution_identity.SourceKeyUnavailable('The caller source key is unavailable'))
 
 
 class MeasuredHanaObjects:
     """Measure application bytes without changing execution or spending authority."""
-    def __init__(self, objects: hana_execution.ExecutionObjects, traffic: buildlog_sync.TransferLedger):
+    def __init__(self, objects: hana_execution.ExecutionObjects, traffic: transfer_bytes.TransferLedger):
         self.objects: hana_execution.ExecutionObjects = objects
-        self.traffic: buildlog_sync.TransferLedger = traffic
+        self.traffic: transfer_bytes.TransferLedger = traffic
 
-    def execution_access(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaExecutionAccess:
+    def boot_control_deadline(self, key: hana_result.HanaAttemptKey) -> int:
+        return self.objects.boot_control_deadline(key)
+
+    def execution_access(self, key: hana_result.HanaAttemptKey) -> hana_protocol.HanaExecutionAccess:
         return self.objects.execution_access(key)
 
-    def publish_execution(self, envelope: hana_execution.HanaExecutionEnvelope) -> None:
-        from scripts.aws_target.hana_execution import encode_envelope
-
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(encode_envelope(envelope)),
+    def publish_execution(self, content: bytes) -> None:
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(content),
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
-        self.objects.publish_execution(envelope)
+        self.objects.publish_execution(content)
         row['complete'] = True
 
-    def observe_execution(self, key: hana_result.HanaAttemptKey) -> hana_execution.HanaCommandObservation:
-        from scripts.aws_target.hana_execution import encode_observation
+    def observe_execution(self, key: hana_result.HanaAttemptKey, *,
+                          timeout_s: float | None = None) -> hana_protocol.HanaExecutionObservation:
+        from scripts.aws_target.hana_protocol import encode_observation
 
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-observation-get', 'sent_bytes': 0,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-observation-get', 'sent_bytes': 0,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
-        observation = self.objects.observe_execution(key)
+        observation = self.objects.observe_execution(key, timeout_s=timeout_s)
         row.update(received_bytes=len(encode_observation(observation)), complete=True)
         return observation
 
     def execution_result(self, key: hana_result.HanaAttemptKey) -> bytes:
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-result-get', 'sent_bytes': 0,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-result-get', 'sent_bytes': 0,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         content = self.objects.execution_result(key)
@@ -2686,12 +3162,12 @@ class MeasuredHanaObjects:
 
 class MeasuredHanaSource:
     """Measure the immutable source body offered to the scoped source store."""
-    def __init__(self, objects: hana_transport.SourceObjects, traffic: buildlog_sync.TransferLedger):
+    def __init__(self, objects: hana_transport.SourceObjects, traffic: transfer_bytes.TransferLedger):
         self.objects: hana_transport.SourceObjects = objects
-        self.traffic: buildlog_sync.TransferLedger = traffic
+        self.traffic: transfer_bytes.TransferLedger = traffic
 
     def put_if_absent(self, sha256: str, source: Path) -> None:
-        row: buildlog_sync.TransferBytes = {'operation': 'hana-source-put', 'sent_bytes': source.stat().st_size,
+        row: transfer_bytes.TransferBytes = {'operation': 'hana-source-put', 'sent_bytes': source.stat().st_size,
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
         self.objects.put_if_absent(sha256, source)
@@ -2705,14 +3181,26 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
                      request: OffloadRequest, started: float) -> MacOffloadResult:
     """Select Hana policy before any SSH probe, process scan, or mirror transfer."""
     from scripts.aws_target import hana_placement as hana
+    from scripts.build_queue import admission_records, admission_wire
 
     repository = eligibility.repository_identity(request.repo_root)
     if not isinstance(repository, KnownRepository):
         return declined('repo', started)
     kind = request.kind or eligibility.verb_kind(request.verb)
-    policy = hana.fixed_policy(transport, repository.key, kind)
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = admission_records.NoRefusalSettings()
+    if isinstance(request.placement, AssignedOffloadRequest):
+        try:
+            # A settings edit between reads permits one retry if the new settings stay current.
+            refusal_settings = admission_records.RefusalSettings(admission_wire.placement_configuration_digest(
+                request.placement.assignment.destination.target, placement.ExplicitProviderSettings(transport.settings),
+                targets=target_config.read_targets(selected=request.placement.assignment.destination.target,
+                                                   purpose=target_config.RegistryRead.PLACEMENT),
+                transport_for=target_config.read_execution_transport, read_bytes=Path.read_bytes))
+        except (OSError, ValueError):
+            pass
+    policy = hana.fixed_policy(transport, str(request.repo_root), kind)
     if isinstance(policy, hana.HanaStepRefused):
-        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason)
+        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason, refusal_settings)
     command = ('cargo', request.verb, *request.nextest_words)
     step = hana.classify_command(request.verb, kind, command)
     if (isinstance(step, hana.HanaStepRefused) or request.copy or isinstance(request.fetch, FetchFolder)
@@ -2722,12 +3210,14 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
 
 
 def hana_claimed_run(controller: ProcessController, transport: hana_placement.HanaControlTransport,
-                     request: OffloadRequest, repository: KnownRepository, started: float) -> MacOffloadResult:
+                     request: OffloadRequest, repository: KnownRepository, started: float, *,
+                     staging: ExitStack) -> MacOffloadResult:
     """Keep the checked remote waiter until exact command and lifecycle settlement."""
     from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana
     from scripts.aws_target import hana_result, hana_transport
     from scripts.build_queue import admission_client
     from scripts.buildlog import record
+    from scripts.copies import copies
 
     if not isinstance(request.placement, AssignedOffloadRequest):
         return declined('state', started)
@@ -2746,42 +3236,73 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     controller.placement = request.placement
-    controller.pending = PendingHanaOperation()
+
+    def release() -> hana.HanaClaimRelease:
+        return hana.release_assigned(assignment, holder, lifecycle)
+
+    def remember_pending_refusal(reference: placement.ProviderClaimReference, reason: str
+                                 ) -> execution_identity.HanaCommandAdmissionRefused | hana_protocol.NoCommandAdmissionRefusal:
+        refusal = execution.read_claim_admission_refusal(lifecycle.directory, reference, require_release=False)
+        if isinstance(refusal, execution_identity.HanaCommandAdmissionRefused):
+            controller.pending = PendingHanaOperation(refusal, reason)
+            evidence.provider = reference
+            evidence.execution = execution_identity.ExecutionNotStarted()
+        return refusal
 
     def close_prelaunch(reason: str) -> MacOffloadResult:
-        reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
-            assignment.destination.scope, placement.assigned_claim_id(assignment.episode, assignment.attempt),
-            assignment.episode, assignment.attempt)
-        closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
-            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=reason)
-        if isinstance(closed, execution.HanaSettled):
+        staging.close()
+        reference = placement.assigned_claim_reference(assignment)
+        refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
+        closed = execution.settle_unpublished_claim(lifecycle.directory, reference, release_claim=release, reason=refusal)
+        if isinstance(closed, execution.HanaAdmissionRefusalSettled):
             controller.hana_settlement = closed
             controller.pending = SettledDispatchOperations()
+            evidence.provider = reference
             evidence.execution = closed.evidence
             evidence.cleanup = 'confirmed'
             evidence.unresolved_count = 0
-        elif execution.execution_command_settled(lifecycle.directory, reference.claim_id):
-            controller.pending = PendingHanaOperation(placement.PrelaunchRefused(reason))
-            evidence.execution = placement.ExecutionNotStarted()
-        return DeclinedMacRun('state', elapsed_seconds(started), reason)
+            return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
+        if isinstance(closed, execution.HanaSettlementPending):
+            pending = remember_pending_refusal(reference, closed.reason)
+            if isinstance(pending, execution_identity.HanaCommandAdmissionRefused):
+                return HanaCommandAdmissionRefused(pending.reason, elapsed_seconds(started))
+        return DeclinedMacRun('state', elapsed_seconds(started), refusal.reason)
 
+    try:
+        hana_transport.check_inputs(request.source_root, configuration)
+    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError,
+            copies.CopyError) as error:
+        if not lifecycle.execution_bound(placement.assigned_claim_reference(assignment).claim_id):
+            label = ('The Hana source capture failed'
+                     if isinstance(error, subprocess.SubprocessError) or isinstance(error.__cause__, subprocess.SubprocessError)
+                     else 'The Hana payload could not be prepared')
+            reason = f'{label}: {error}'
+            refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
+            controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
+                refusal, execution_identity.ExecutionNotStarted())
+            evidence.execution = controller.hana_settlement.evidence
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+            return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
+
+    controller.pending = PendingHanaOperation()
     claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
         evidence.provider = claim.reference
-        evidence.execution = placement.ExecutionEvidenceUnavailable('The Hana lifecycle start remains pending', time.time())
+        evidence.execution = execution_identity.ExecutionEvidenceUnavailable('The Hana lifecycle start remains pending', time.time())
         time.sleep(configuration.whole('control_poll_seconds'))
         claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     if isinstance(claim, (hana.HanaClaimPending, hana.HanaClaimRetained)):
         evidence.provider = claim.reference
         return close_prelaunch('The Hana startup wait ended before command dispatch')
+    if isinstance(claim, hana.HanaClaimResourcesHeld):
+        controller.pending = SettledDispatchOperations()
+        controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
+            execution_identity.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY), execution_identity.ExecutionNotStarted())
+        return HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY, elapsed_seconds(started))
     if isinstance(claim, hana.HanaClaimRefused):
         return close_prelaunch(claim.reason)
     evidence.provider = claim.reserved.claim.reference
-    # SourceSender owns source policy, snapshot creation, and immutable bundle publication.
-    sender = hana_transport.SourceSender(MeasuredHanaSource(hana_transport.AwsSourceObjects(
-        cast('hana_provider.AwsHanaProvider', lifecycle.provider), configuration,
-        claim.generation.deployment, clock=time.time), evidence.traffic),
-        lifecycle.directory / 'hana' / 'source', configuration)
     command = ('cargo', request.verb, *request.nextest_words)
     features: list[str] = []
     for index, word in enumerate(request.nextest_words):
@@ -2790,30 +3311,36 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         elif word == '--features' and index + 1 < len(request.nextest_words):
             features.extend(request.nextest_words[index + 1].replace(',', ' ').split())
     try:
+        sender = hana_transport.SourceSender(MeasuredHanaSource(hana_transport.AwsSourceObjects(
+            cast('hana_provider.AwsHanaProvider', lifecycle.provider), configuration,
+            claim.generation.deployment, clock=time.time), evidence.traffic),
+            lifecycle.directory / 'hana' / 'source', configuration)
         prepared = execution.prepare_execution(claim, sender, request.source_root, command,
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
-            current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
-            features=tuple(dict.fromkeys(features)))
-    except (OSError, ValueError, RuntimeError, ConnectionError):
-        prepared = execution.ExecutionPreparationRefused('The Hana source capture failed')
-    if isinstance(prepared, execution.ExecutionPreparationRefused):
-        closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
-            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=prepared.reason)
-        if isinstance(closed, execution.HanaSettled):
-            controller.hana_settlement = closed
-            controller.pending = SettledDispatchOperations()
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
-        return DeclinedMacRun('source_changed', elapsed_seconds(started), prepared.reason)
+            current_source_key=lambda: hana_source_key(request.source_root), environment=dict(request.environment),
+            staging=staging, features=tuple(dict.fromkeys(features)))
+    except copies.SourceChangedDuringCapture as error:
+        return close_prelaunch(str(error))
+    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError,
+            copies.CopyError) as error:
+        label = ('The Hana source capture failed'
+                 if isinstance(error, subprocess.SubprocessError) or isinstance(error.__cause__, subprocess.SubprocessError)
+                 else 'The Hana payload could not be prepared')
+        return close_prelaunch(f'{label}: {error}')
+    if isinstance(prepared, (execution_identity.HanaCommandAdmissionRefused, execution.ExecutionPreparationRefused)):
+        return close_prelaunch(prepared.reason)
+    prepared, upload_source = prepared
+
+    admission_refusal: execution_identity.HanaCommandAdmissionRefused | hana_protocol.NoCommandAdmissionRefusal = (
+        hana_protocol.NoCommandAdmissionRefusal())
 
     def permission() -> box.CommandPermission | box.ClaimRefused:
         snapshot = lifecycle.inspect()
+        if isinstance(snapshot, box.HanaResourcesHeld):
+            return box.ClaimRefused(box.HANA_CLAIM_BUSY)
         if not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
             return box.ClaimRefused('The Hana acknowledged permit is unavailable')
         return lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
-
-    def release() -> bool:
-        return hana.release_assigned(assignment, holder, lifecycle)
 
     cancelled = False
     reason = 'The Hana execution result is unavailable'
@@ -2821,23 +3348,63 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     settlement: execution.HanaSettlement = execution.HanaSettlementPending(reason)
     remote_started_at = time.time()
     source_update_sent = False
+    result_transfer_lost = False
+    control_timeout = configuration.whole('aws_timeout_s')
+    control_poll = configuration.whole('control_poll_seconds')
+    result_timeout = configuration.whole('result_transfer_timeout_s')
+    settlement_seconds = hana_protocol.fence_settlement_seconds(control_timeout, control_poll)
+    short_window_reason = (f'HanaResultDownloadWindowExpired: The control window cannot fit a result download of '
+                           + f'{result_timeout} s and {settlement_seconds} s for settlement')
     try:
-        state = execution.dispatch_execution(lifecycle.directory, prepared, claim, objects,
-            consume=admission_client.consume_permission, current_permission=permission,
-            current_source_key=lambda: hana_source_key(request))
-        evidence.execution = state.evidence
-        if isinstance(state, execution.DispatchSettled):
-            accepted = execution.replay_accepted_result(lifecycle.directory, prepared, transport.host,
-                                                        lambda: hana_source_key(request))
-        deadline = time.monotonic() + configuration.whole('control_url_seconds')
-        while (not isinstance(state, (execution.DispatchFenced, execution.DispatchSettled))
-                and execution.dispatch_publication_attempted(lifecycle.directory, prepared) and time.monotonic() < deadline):
+        boot_deadline = objects.boot_control_deadline(prepared.key)
+        deadline = time.monotonic() + min(configuration.whole('control_url_seconds'), boot_deadline - time.time())
+    except (OSError, RuntimeError, ValueError):
+        deadline = time.monotonic()
+        short_window_reason = 'HanaResultDownloadWindowExpired: The Hana boot control deadline is unavailable'
+    if (time.monotonic() + 2 * control_timeout + settlement_seconds >= deadline
+            and not execution.execution_path(lifecycle.directory, prepared.key.claim_id).exists()):
+        return close_prelaunch(short_window_reason)
+    unpublished_refusal = False
+    try:
+        try:
+            state = execution.dispatch_execution(lifecycle.directory, prepared, claim, objects,
+                upload_source=upload_source, consume=admission_client.consume_permission,
+                current_permission=permission, current_source_key=lambda: hana_source_key(request.source_root))
+        finally:
+            staging.close()
+        if isinstance(state, execution_identity.HanaCommandAdmissionRefused):
+            if not execution.execution_path(lifecycle.directory, prepared.key.claim_id).exists():
+                unpublished_refusal = True
+                return close_prelaunch(state.reason)
+            admission_refusal = state
+        else:
+            evidence.execution = state.evidence
+        if isinstance(state, (execution.DispatchFenced, execution.DispatchSettled)):
+            accepted = execution.replay_accepted_result(lifecycle.directory, prepared)
+        while (not isinstance(state, (execution.DispatchFenced, execution.DispatchSettled,
+                                     execution_identity.HanaCommandAdmissionRefused))
+                and execution.dispatch_publication_attempted(lifecycle.directory, prepared)):
             evidence.launch_authorized = True
+            if time.monotonic() + control_timeout + settlement_seconds >= deadline:
+                reason = short_window_reason
+                result_transfer_lost = True
+                break
             evidence.execution = execution.observe_execution(lifecycle.directory, prepared, objects)
             observation = execution.read_dispatch_observation(lifecycle.directory, prepared)
-            if isinstance(observation, execution.HanaCommandObservation) and observation.terminated and observation.lease_free:
+            if (isinstance(observation, hana_protocol.HanaExecutionObservation)
+                    and isinstance(hana_protocol.command_admission_refusal(observation),
+                                   execution_identity.HanaCommandAdmissionRefused)):
+                break
+            if isinstance(observation, hana_protocol.HanaCommandObservation) and observation.terminated and observation.lease_free:
+                if (observation.accepted and not observation.fenced
+                        and isinstance(observation.evidence, execution_identity.ExecutionEvidenceUnavailable)
+                        and observation.evidence.reason.startswith((
+                            hana_result.RESULT_UPLOAD_TIMEOUT + ': ', hana_result.RESULT_UPLOAD_FAILED + ': '))):
+                    reason = observation.evidence.reason
+                    result_transfer_lost = True
+                    break
                 if observation.source_updated:
-                    from scripts.aws_target.hana_source import SourceIdentity
+                    from scripts.aws_target.hana_protocol import SourceIdentity
 
                     sender.acknowledge(SourceIdentity(prepared.manifest.repository, prepared.manifest.commit,
                                                      prepared.manifest.toolchain))
@@ -2847,72 +3414,118 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                 if isinstance(basis, execution.NoMissingBasis):
                     pass
                 elif source_update_sent:
-                    time.sleep(configuration.whole('control_poll_seconds'))
+                    time.sleep(control_poll)
                     continue
                 else:
                     reason = 'The captured Hana source needs a complete bundle'
-                    complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                     source_update_sent = True
                     try:
-                        _ = execution.publish_source_update(lifecycle.directory, prepared, complete, objects)
-                    except (OSError, ValueError, RuntimeError, ConnectionError):
-                        reason = 'The Hana source update publication is unresolved'
+                        with ExitStack() as repair:
+                            complete, upload = sender.retry_complete(request.source_root, prepared.manifest, basis,
+                                                                     staging=repair)
+                            if not execution.publish_source_update(lifecycle.directory, prepared, complete, objects,
+                                                                  upload_source=upload):
+                                raise hana_protocol.SourceRefused('The Hana source update was not published')
+                    except (OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError,
+                            copies.CopyError) as error:
+                        label = ('The Hana source update publication is unresolved'
+                                 if isinstance(error, subprocess.SubprocessError)
+                                 or isinstance(error.__cause__, subprocess.SubprocessError)
+                                 else 'The Hana full-payload repair failed')
+                        cause = ' '.join(str(error).splitlines())
+                        admission_refusal = execution_identity.HanaCommandAdmissionRefused(f'{label}: {cause}')
                         break
-                    time.sleep(configuration.whole('control_poll_seconds'))
+                    time.sleep(control_poll)
                     continue
+                if time.monotonic() + result_timeout + settlement_seconds >= deadline:
+                    reason = short_window_reason
+                    result_transfer_lost = True
+                    break
                 try:
                     decision = execution.accept_result(lifecycle.directory, prepared, objects.execution_result(prepared.key),
-                        transport.host, lambda: hana_source_key(request))
+                        transport.host, lambda: hana_source_key(request.source_root))
                     accepted = decision
                     reason = decision.reason if isinstance(decision, hana_result.RejectedHanaResult) else 'The Hana command completed'
+                except hana_result.HanaResultDownloadTimedOut as error:
+                    reason = str(error)
+                    result_transfer_lost = True
                 except (OSError, ValueError, RuntimeError, ConnectionError):
                     reason = 'The Hana terminal result transfer failed'
                 break
-            time.sleep(configuration.whole('control_poll_seconds'))
+            time.sleep(control_poll)
     except OffloadInterrupted:
         cancelled = True
         reason = 'The user cancelled the Hana command'
         controller.stop()
         raise
     finally:
-        settlement = execution.settle_execution(lifecycle.directory, prepared, objects, release_claim=release,
-                                                reason=reason, cancelled=cancelled)
-        evidence.evidence_at = time.time()
-        if isinstance(settlement, execution.HanaSettled):
-            controller.hana_settlement = settlement
-            controller.pending = SettledDispatchOperations()
-            evidence.execution = settlement.evidence
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
-        else:
-            controller.pending = PendingHanaOperation()
-    if not isinstance(settlement, execution.HanaSettled):
-        return LostMacRun(elapsed_seconds(started), settlement.reason)
-    execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
-                                    remote_started_at, time.time())
-    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
-    if isinstance(accepted, hana_result.AcceptedHanaResult):
-        if hana_source_key(request) != prepared.source_key:
-            reason = 'The caller source changed before result publication'
-        else:
-            evidence.completion = 'confirmed'
-            result = accepted.result
-            _ = record.publish_hana_result(accepted, prepared.link, context)
-            _ = sys.stdout.buffer.write(result.stdout)
-            _ = sys.stderr.buffer.write(result.stderr)
-            return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
-    rejected = execution.reject_settled_result(lifecycle.directory, prepared, reason)
-    if isinstance(rejected, execution.HanaSettlementPending):
-        controller.hana_settlement = NoHanaSettlement()
-        controller.pending = PendingHanaOperation()
-        return LostMacRun(elapsed_seconds(started), rejected.reason)
-    controller.hana_settlement = rejected
+        if not unpublished_refusal:
+            if cancelled and not execution.execution_path(lifecycle.directory, prepared.key.claim_id).exists():
+                settlement = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
+                    release_claim=release, reason=reason, cancelled=True)
+            else:
+                fence_window = execution.FenceAcknowledgementWindow(
+                    min(deadline, time.monotonic() + settlement_seconds), control_poll)
+                settlement = execution.settle_execution(lifecycle.directory, prepared, objects, release_claim=release,
+                    reason=reason, fence_window=fence_window, cancelled=cancelled, result_transfer_lost=result_transfer_lost,
+                    admission_refusal=admission_refusal)
+            evidence.evidence_at = time.time()
+            if isinstance(settlement, execution.HanaSettled):
+                controller.hana_settlement = settlement
+                controller.pending = SettledDispatchOperations()
+                evidence.execution = settlement.evidence
+                evidence.cleanup = 'confirmed'
+                evidence.unresolved_count = 0
+            elif isinstance(settlement, execution.HanaCleanupPending) and isinstance(settlement.command.outcome,
+                    (placement.AttemptCompleted, execution_identity.HanaCommandAdmissionRefused)):
+                controller.pending = PendingHanaOperation(settlement.command.outcome, settlement.reason)
+                evidence.execution = settlement.command.evidence
+            elif isinstance(remember_pending_refusal(claim.reserved.claim.reference, settlement.reason),
+                            hana_protocol.NoCommandAdmissionRefusal):
+                controller.pending = (PendingHanaOperation(placement.AttemptOutcomeUnavailable(reason), settlement.reason)
+                                      if result_transfer_lost else PendingHanaOperation(reason=settlement.reason))
+    terminal = settlement.command if isinstance(settlement, execution.HanaCleanupPending) else settlement
+    completed = isinstance(terminal, execution.HanaSettled) and isinstance(terminal.outcome, placement.AttemptCompleted)
+    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '',
+                                     dict(request.environment))
+    charge = OffloadRecordWrite('the Hana attempt charge', partial(
+        execution.record_attempt_charge, lifecycle.directory, prepared, evidence.traffic.transfers,
+        remote_started_at, time.time()))
+    if completed and isinstance(accepted, hana_result.AcceptedHanaResult):
+        controller.hana_record_writes.extend((
+            OffloadRecordWrite('the Hana result', partial(record.publish_hana_result, accepted, prepared.link, context)),
+            charge,
+        ))
+        evidence.completion = 'confirmed'
+        result = accepted.result
+        controller.hana_output = HanaCommandOutput(result.stdout, result.stderr)
+        return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
+    if isinstance(settlement, execution.HanaSettled):
+        controller.hana_record_writes.append(charge)
+    if isinstance(settlement, execution.HanaSettlementPending):
+        if isinstance(terminal, execution.HanaGuestEndedWithoutResult):
+            return HanaGuestEndedRun(elapsed_seconds(started), terminal.outcome.reason)
+        if (isinstance(controller.pending, PendingHanaOperation)
+                and isinstance(refusal := controller.pending.outcome, execution_identity.HanaCommandAdmissionRefused)):
+            return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
+        if isinstance(state, execution_identity.HanaCommandAdmissionRefused):
+            return HanaCommandAdmissionRefused(state.reason, elapsed_seconds(started))
+        detail = f'{reason}. {settlement.reason}' if result_transfer_lost else settlement.reason
+        return LostMacRun(elapsed_seconds(started), detail)
+    if isinstance(settlement, (execution.HanaAdmissionRefusalSettled, execution.HanaGuestEndedWithoutResult)):
+        reason = settlement.outcome.reason
     if evidence.launch_authorized:
         placement_file = os.environ.get('BUILDLOG_PLACEMENT_FILE', '')
         if placement_file:
-            record.save_hana_fallback_link(Path(placement_file), prepared.key, prepared.link)
-        _ = record.publish_hana_loss(prepared.key, prepared.link, context, transport.host,
-                                    remote_started_at, time.time(), reason)
+            controller.hana_record_writes.append(OffloadRecordWrite('the Hana fallback link', partial(
+                record.save_hana_fallback_link, Path(placement_file), prepared.key, prepared.link)))
+        controller.hana_record_writes.append(OffloadRecordWrite('the Hana loss', partial(
+            record.publish_hana_loss, prepared.key, prepared.link, context, transport.host,
+            remote_started_at, time.time(), reason)))
+    if isinstance(settlement.outcome, execution_identity.HanaCommandAdmissionRefused):
+        return HanaCommandAdmissionRefused(reason, elapsed_seconds(started))
+    if isinstance(settlement, execution.HanaGuestEndedWithoutResult):
+        return HanaGuestEndedRun(elapsed_seconds(started), reason)
     return LostMacRun(elapsed_seconds(started), reason)
 
 
@@ -2921,6 +3534,8 @@ def run_offload(
     config: OffloadConfig | hana_placement.HanaControlTransport,
     request: OffloadRequest,
     started: float,
+    *,
+    cleanup_takeover: bool = True,
 ) -> MacOffloadResult:
     from scripts.aws_target.hana_placement import HanaControlTransport
 
@@ -2928,14 +3543,57 @@ def run_offload(
         return run_hana_offload(controller, config, request, started)
     from scripts.copies import copies
 
-    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
+    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
+    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY
+    policy_repository: claim_state.MacRepositoryIdentity | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
+    retire_wait = False
+    if not linux:
+        history_key = buildlog_repository.repository_key(str(request.repo_root))
+        controller.attempt_evidence.repository_key = history_key
+        if isinstance(request.admission, MacClaimFromWait):
+            admission = request.admission
+            try:
+                paths = claim_state.state_paths(request.target)
+                claims = claim_state.read_claims(paths)
+            except claim_state.StateReadError:
+                return declined("state", started)
+            held = next((claim for claim in claims
+                if claim_state.claim_identity(claim.record) == admission.identity
+                and ("replaced_reservation" not in claim.record
+                     or claim_state.claim_uses_legacy_fence(claim.record))), None)
+            if held is None:
+                retire_wait = True
+            else:
+                saved = claim_state.saved_mac_repository(held.record)
+                if isinstance(saved, claim_state.MacRepositoryIdentity) and "remote_host" not in held.record:
+                    policy_repository = saved
+                elif "remote_host" not in held.record:
+                    retire_wait = True
+                else:
+                    cleanup = adopt_wait_for_cleanup(controller, config, request, saved, held.record["remote_host"], started)
+                    if not isinstance(cleanup, ClaimReleaseConfirmed):
+                        return cleanup
+                    if isinstance(request.placement, AssignedOffloadRequest):
+                        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+                    cleanup_takeover = False
+                    request = replace(request, admission=UnclaimedMacRun())
+        if retire_wait or isinstance(request.admission, UnclaimedMacRun):
+            resolved = claim_state.mac_repository_identity(str(request.repo_root))
+            if isinstance(resolved, claim_state.WholeMacScope):
+                return declined("repo" if config.enabled else "off", started)
+            executable = resolved.claim_repository(history_key=claim_state.mac_history_key(history_key))
+            if not isinstance(executable, claim_state.MacRepositoryIdentity):
+                return declined(claim_state.MAC_HISTORY_KEY_UNAVAILABLE if config.enabled else "off", started)
+            mac_repository = policy_repository = executable
+    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
+                                               request.target, kind=request.kind, mac_repository=policy_repository)
     if isinstance(decision, IneligibleMacStep):
         return declined(decision.reason, started)
     repository = decision
-    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
     if linux:
+        controller.attempt_evidence.repository_key = repository.key or store.UNKNOWN_IDENTITY
         detail = recorded_linux_version_mismatch(controller, config, request.target)
         decline_path = eligibility.linux_version_decline_path(request.target, repository.name)
         if detail:
@@ -2954,13 +3612,27 @@ def run_offload(
                 lease = ExitStack()
                 try:
                     lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
+                except copies.BusyRemoteHost:
+                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
-            result = leased_offload(controller, config, request, repository, started, linux, leases)
-            if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
+            result = leased_offload(controller, config, request, repository, started, linux, leases,
+                                    mac_repository=mac_repository, retire_wait=retire_wait,
+                                    cleanup_takeover=cleanup_takeover)
+        if isinstance(result, ClaimReleaseConfirmed):
+            if isinstance(request.placement, AssignedOffloadRequest):
+                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            return run_offload(controller, config, replace(request, admission=UnclaimedMacRun()), started,
+                               cleanup_takeover=False)
+        if isinstance(result, DeclinedMacRun) and result.reason == "copy":
+            refusal = mirror_busy_refusal(result.detail)
+            if isinstance(refusal, MirrorBusyRefusal):
                 write_mirror_busy(config, repository.name, request.target)
-            return result
+                return BusyMacDecline(refusal.holder, result.seconds)
+        return result
+    except copies.BusyRemoteMirror:
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
 
@@ -2976,48 +3648,125 @@ def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: K
                                request.holder_session)
 
 
+def cleanup_taken_over_claim(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
+                             claim: TakenOverMacClaim | TakeoverHostUnreadable,
+                             repository: eligibility.RepositoryIdentity, started: float
+                             ) -> ClaimReleaseConfirmed | BusyMacDecline | DeclinedMacRun:
+    controller.attempt_evidence.slot = claim.slot if isinstance(claim, TakenOverMacClaim) else 0
+    checked = check_taken_over_claim(controller, config, claim, repository, request.target)
+    observe_cleanup(controller.attempt_evidence, checked)
+    report_leftover_check(checked, request)
+    if isinstance(checked, LeftoverCheckFailed):
+        write_backoff(time.time() + config.unreachable_backoff_s, request.target)
+        return declined("unreachable", started)
+    if isinstance(checked, LeftoversRemain) or isinstance(controller.pending, PendingStartOperation):
+        controller.attempt_evidence.cleanup = "unconfirmed"
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    released = release_claim(controller, request.target)
+    if isinstance(released, ClaimReleaseUnconfirmed):
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    return released
+
+
+def adopt_wait_for_cleanup(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
+                           saved: claim_state.SavedMacRepository,
+                           host: str, started: float,
+                           ) -> ClaimReleaseConfirmed | BusyMacDecline | DeclinedMacRun:
+    from scripts.copies import copies
+
+    repository = eligibility.UNKNOWN_REPOSITORY
+    try:
+        with mac_cleanup_lease(saved, host, request.target):
+            claim = claim_for_run(controller, config, request, repository)
+            if isinstance(claim, MacClaimNotConfirmed):
+                return claim_refusal(controller, request, claim, started, claim_from_wait=True)
+            if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+                if isinstance(claim, TakenOverMacClaim) and (claim.host != host or controller.mac_repository != saved):
+                    return declined("state", started)
+                return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+            return declined("state", started)
+    except copies.BusyRemoteMirror:
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    except copies.CopyError as error:
+        return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
+
+
+def claim_refusal(controller: ProcessController, request: OffloadRequest, claim: MacClaimNotConfirmed,
+                  started: float, *, claim_from_wait: bool) -> BusyMacDecline | DeclinedMacRun:
+    if claim.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        return declined(claim.reason, started)
+    if claim.reason in ("busy", "blocked"):
+        controller.attempt_evidence.provider = placement.NoProviderClaim()
+    if not decline_already_shown(claim.reason, request.last_decline):
+        if claim.stdout:
+            print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        if claim.stderr:
+            print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        if (isinstance(claim, MacClaimChildRefusal) and not isinstance(claim.check, NoWaitClaimCheck)
+                and (claim.reason == "busy" or not claim_from_wait)):
+            print(claim.check.diagnostic, file=sys.stderr, flush=True)
+    if claim.reason == "busy":
+        return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
+    if claim_from_wait and isinstance(claim, MacClaimChildRefusal):
+        diagnostic = f"state: claim child exited {claim.status}"
+        if not isinstance(claim.check, NoWaitClaimCheck):
+            diagnostic += f": {claim.check.diagnostic}"
+        return WaitClaimAdoptionDeclined(elapsed_seconds(started), diagnostic=diagnostic)
+    return declined(claim.reason, started)
+
+
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   leases: dict[int, ExitStack]) -> MacOffloadResult:
+                   leases: dict[int, ExitStack], *,
+                   mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
+                   = claim_state.NO_SAVED_MAC_REPOSITORY,
+                   retire_wait: bool = False,
+                   cleanup_takeover: bool = True) -> MacOffloadResult | ClaimReleaseConfirmed:
     if not leases:
         write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-    claim = claim_for_run(controller, config, request, repository, tuple(leases))
+    claim = claim_for_run(controller, config, request, repository, tuple(leases),
+                          mac_repository=mac_repository, retire_wait=retire_wait)
+    claim_from_wait = isinstance(request.admission, MacClaimFromWait)
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-        controller.attempt_evidence.slot = claim.slot if isinstance(claim, TakenOverMacClaim) else 0
-        checked = check_taken_over_claim(controller, config, claim, repository, request.target)
-        observe_cleanup(controller.attempt_evidence, checked)
-        report_leftover_check(checked, request)
-        if isinstance(checked, LeftoverCheckFailed):
-            write_backoff(time.time() + config.unreachable_backoff_s, request.target)
-            return declined("unreachable", started)
-        if isinstance(checked, LeftoversRemain):
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if isinstance(controller.pending, PendingStartOperation):
-            controller.attempt_evidence.cleanup = "unconfirmed"
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        _ = release_claim(controller, request.target)
+        if not linux:
+            if not cleanup_takeover:
+                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            for lease in leases.values():
+                lease.close()
+            if isinstance(claim, TakenOverMacClaim):
+                with mac_cleanup_lease(controller.mac_repository, claim.host, request.target):
+                    return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+            return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+        cleanup = cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+        if not isinstance(cleanup, ClaimReleaseConfirmed):
+            return cleanup
         if isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        claim = claim_for_run(controller, config, request, repository, tuple(leases))
+        claim_from_wait = False
+        claim = claim_for_run(controller, config, request, repository, tuple(leases), mac_repository=mac_repository)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
-        if claim.reason in ("busy", "blocked"):
-            controller.attempt_evidence.provider = placement.NoProviderClaim()
-        if not decline_already_shown(claim.reason, request.last_decline):
-            if claim.stdout:
-                print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
-            if claim.stderr:
-                print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
-        if claim.reason == "busy":
-            return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
-        return declined(claim.reason, started)
+        return claim_refusal(controller, request, claim, started, claim_from_wait=claim_from_wait)
+    if isinstance(claim, LegacyWaitClaimReleased):
+        controller.attempt_evidence.provider = placement.NoProviderClaim()
+        return DeclinedMacRun("source_changed", elapsed_seconds(started),
+                              "the current repository differs from the retired reservation's assignment")
     if claim.slot not in leases:
         _ = release_claim(controller, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    saved = controller.mac_repository
+    if not linux and not isinstance(saved, claim_state.MacRepositoryIdentity):
+        _ = release_claim(controller, request.target)
+        return declined("state", started)
+    if isinstance(saved, claim_state.MacRepositoryIdentity):
+        if repository.legacy_mirror_name != saved.mirror_name:
+            _ = release_claim(controller, request.target)
+            return DeclinedMacRun("state", elapsed_seconds(started), "The claim has a different mirror than the lease")
+        repository = KnownRepository(saved.mirror_name, saved.key)
     for slot, lease in leases.items():
         if slot != claim.slot:
             lease.close()
@@ -3116,7 +3865,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
             arguments.target = saved.assignment.destination.target
     return OffloadRequest(
         placement=assigned,
-        repo_root=Path(arguments.repo_root).resolve(),
+        repo_root=claim_worktree_path(arguments.repo_root),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         owner=copies.source_owner(Path(arguments.repo_root)),
         holder_session=holder_session(),
@@ -3153,13 +3902,17 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     from scripts.buildlog import record
 
     class MeasuredSshAttempt(record.SshAttempt):
-        transfers: list[buildlog_sync.TransferBytes]
+        transfers: list[transfer_bytes.TransferBytes]
         sent_bytes: int
         received_bytes: int
 
     if not request.target:
         return
-    repository = eligibility.repository_identity(request.repo_root)
+    repository_key = evidence.repository_key
+    if isinstance(repository_key, ReadAttemptRepository):
+        repository = eligibility.repository_identity(request.repo_root)
+        repository_key = (repository.key or store.UNKNOWN_IDENTITY
+                          if isinstance(repository, KnownRepository) else store.UNKNOWN_IDENTITY)
     queued = os.environ.get("BUILDLOG_MEM_WAIT_SINCE", "")
     first = os.environ.get("BUILDLOG_MEM_WAIT_FIRST_FILE", "")
     if first and Path(first).is_file():
@@ -3170,8 +3923,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
-        "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
-                          else store.UNKNOWN_IDENTITY),
+        "repo_identity": repository_key,
         "queued_at": float(queued) if queued else time.time() - elapsed_seconds(started),
         "departed_at": time.time() - elapsed_seconds(started), "slot": evidence.slot,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,
@@ -3183,6 +3935,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     }
     if isinstance(result, LostMacRun):
         attempt["reason"] = result.detail
+    if isinstance(result, HanaCommandAdmissionRefused):
+        attempt["reason"] = result.reason
     if isinstance(result, (DeclinedMacRun, BusyMacDecline)):
         attempt["reason"] = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
     record.ssh_attempt(attempt)
@@ -3193,7 +3947,7 @@ class DirectPlacementConstraintBuilder(Protocol):
 
     def __call__(self, repo_root: Path, package: str,
                  kind: Literal["check", "lint", "doc", "test", "build", "example", "final"],
-                 command: tuple[str, ...], session: claim_state.SubmittingSession, source_key: placement.SourceIdentity,
+                 command: tuple[str, ...], session: claim_state.SubmittingSession, source_key: execution_identity.SourceIdentity,
                  *, selection: Pinned, provider_settings: placement.ProviderSettings) -> placement.PlacementConstraints: ...
 
 
@@ -3206,8 +3960,8 @@ def submit_direct_placement(request: OffloadRequest, since: float,
     if not isinstance(start, process_identity.Started):
         raise wire.AdmissionUnavailable("the submitting process is unavailable")
     measured_key = treekey.tree_key(str(request.source_root))
-    source_key = (placement.SourceKeyKnown(measured_key) if measured_key is not None
-                  else placement.SourceKeyUnavailable("the source tree key is unavailable"))
+    source_key = (execution_identity.SourceKeyKnown(measured_key) if measured_key is not None
+                  else execution_identity.SourceKeyUnavailable("the source tree key is unavailable"))
     session = claim_state.submitting_session(claim_state.CALLING_SESSION)
     command = ("cargo", request.verb, *(("run",) if request.verb == "nextest" else ()), *request.nextest_words)
     episode = uuid.uuid4().hex
@@ -3238,11 +3992,14 @@ def submit_direct_placement(request: OffloadRequest, since: float,
 
 def report_placement_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> None:
     """Report a settled adapter path without inventing a remote process identity."""
-    from scripts.build_queue import admission_client, admission_protocol as wire
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_records
 
     if not isinstance(request.placement, AssignedOffloadRequest):
         return
     assigned = request.placement.assignment
+    if isinstance(result, DeclinedMacRun) and result.reason == claim_state.MAC_HISTORY_KEY_UNAVAILABLE:
+        _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assigned.episode, assigned.owner, result.reason))
+        return
     evidence = controller.attempt_evidence
     provider = evidence.provider
     if (isinstance(provider, placement.ProviderClaimReference)
@@ -3251,19 +4008,23 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
             reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "cleanup completed"
             _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason, provider))
         return
-    if isinstance(provider, placement.NoProviderClaim):
-        reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
-        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason))
-        return
     if not isinstance(controller.hana_settlement, NoHanaSettlement):
         settled = controller.hana_settlement
-        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
+        reference = (placement.assigned_claim_reference(assigned) if isinstance(provider, placement.NoProviderClaim)
+                     else provider)
+        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, reference,
             settled.evidence, settled.outcome, placement.DispatchPathSettled()))
+        return
+    if isinstance(provider, placement.NoProviderClaim):
+        reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
+        refusal_settings = result.refusal_settings if isinstance(result, DeclinedMacRun) else admission_records.NoRefusalSettings()
+        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason,
+            refusal_settings=refusal_settings))
         return
     if isinstance(controller.pending, PendingHanaOperation):
         _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
             evidence.execution, controller.pending.outcome,
-            placement.DispatchPathPending('The Hana claim remains retained')))
+            placement.DispatchPathPending(controller.pending.reason)))
         return
     outcome: placement.AttemptOutcome
     if isinstance(result, (PassedOnMac, PassedOnTarget)):
@@ -3275,10 +4036,10 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
     elif (isinstance(result, LostMacRun) and evidence.cleanup == "confirmed"
           and isinstance(controller.pending, SettledDispatchOperations)):
         outcome = (placement.PrelaunchRefused("lost")
-                   if not evidence.launch_authorized and isinstance(evidence.execution, placement.ExecutionNotStarted)
+                   if not evidence.launch_authorized and isinstance(evidence.execution, execution_identity.ExecutionNotStarted)
                    else placement.AttemptDeclined("lost"))
     elif (isinstance(result, (DeclinedMacRun, BusyMacDecline))
-          and isinstance(evidence.execution, placement.ExecutionNotStarted)):
+          and isinstance(evidence.execution, execution_identity.ExecutionNotStarted)):
         outcome = placement.PrelaunchRefused(result.reason)
     elif isinstance(result, (DeclinedMacRun, BusyMacDecline)) and evidence.completion == "confirmed":
         outcome = placement.AttemptDeclined(result.reason)
@@ -3288,6 +4049,59 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
             else placement.DispatchPathPending("a claim or start child remains active"))
     _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
                                                                evidence.execution, outcome, path))
+
+
+def write_attempt_records(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult, started: float,
+                          hana_writes: Sequence[OffloadRecordWrite] = ()) -> None:
+    writes = (
+        *hana_writes,
+        OffloadRecordWrite('the placement report', partial(report_placement_result, controller, request, result)),
+        OffloadRecordWrite('the attempt', partial(persist_attempt, request, result, controller.attempt_evidence, started)),
+    )
+    for entry in writes:
+        try:
+            _ = entry.write()
+        except Exception as error:
+            with suppress(Exception):
+                if entry in hana_writes:
+                    store.note_error(f'Could not record {entry.name}: {error}')
+                if sys.stderr is not None:
+                    print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
+
+
+def publish_offload_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> int:
+    """Deliver the command output and publish the caller's result."""
+    output = controller.hana_output
+    if output.stdout:
+        _ = sys.stdout.buffer.write(output.stdout)
+        _ = sys.stdout.buffer.flush()
+    if output.stderr:
+        _ = sys.stderr.buffer.write(output.stderr)
+        _ = sys.stderr.buffer.flush()
+    return write_result(result, request.result, request.last_decline, request.verb, request.target,
+                        controller.attempt_evidence, request.fetch)
+
+
+def report_result_details(request: OffloadRequest, result: MacOffloadResult) -> None:
+    """Print the Mac fetch or fix summary after publication."""
+    if sys.stdout is None:
+        return
+    if isinstance(request.fetch, FetchFolder):
+        report_fetch(request.fetch, fetch_result(result))
+    if request.verb == "mend-fix" and isinstance(result, PassedOnMac):
+        report_fix(result.fix)
+
+
+def report_offload_completion(controller: ProcessController, request: OffloadRequest,
+                              result: MacOffloadResult, started: float) -> None:
+    """Report completion after the caller has the verdict."""
+    with suppress(Exception):
+        try:
+            report_result_details(request, result)
+            if sys.stderr is not None and isinstance(controller.pending, PendingHanaOperation):
+                print(f'offload: Hana cleanup pending. {controller.pending.reason}', file=sys.stderr)
+        finally:
+            write_attempt_records(controller, request, result, started, controller.hana_record_writes)
 
 
 def main() -> int:
@@ -3336,7 +4150,7 @@ def main() -> int:
         if direct:
             request = submit_direct_placement(request, since, config)
         while True:
-            with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
+            with interrupt_handlers(controller), transfer_bytes.measure_transfers(controller.attempt_evidence.traffic):
                 result = run_offload(controller, config, request, started)
             if (not direct or not isinstance(result, DeclinedMacRun) or result.reason != "source_changed"
                     or isinstance(controller.pending, PendingHanaOperation)):
@@ -3354,30 +4168,42 @@ def main() -> int:
             started = time.monotonic()
             result = LostMacRun(0, "replacement placement did not complete")
             request = submit_direct_placement(request, since, config)
-        status = write_result(result, request.result, request.last_decline, request.verb, request.target,
-                              controller.attempt_evidence, request.fetch)
-        return status
+        status = publish_offload_result(controller, request, result)
     except OffloadInterrupted as interrupted:
         result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
-        return 128 + interrupted.signal_number
+        status = 128 + interrupted.signal_number
     except Exception:
-        traceback.print_exc()
+        if sys.stderr is not None:
+            traceback.print_exc()
         if isinstance(request.result, ResultFile):
             try:
                 request.result.path.unlink(missing_ok=True)
             except OSError:
                 pass
-        return 75
-    finally:
+        status = 75
+    else:
+        report_offload_completion(controller, request, result, started)
+        return status
+    write_attempt_records(controller, request, result, started)
+    return status
+
+
+def flush_cli_output() -> None:
+    """Prevent failed output from changing the exit status at Python shutdown."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
         try:
-            report_placement_result(controller, request, result)
-        except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
-            print(f"offload: cannot report placement: {error}", file=sys.stderr)
-        try:
-            persist_attempt(request, result, controller.attempt_evidence, started)
-        except (OSError, ValueError) as error:
-            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
+            _ = stream.flush()
+        except OSError:
+            # Python can retry the failed flush at shutdown.
+            with suppress(OSError, ValueError), open(os.devnull, "wb") as sink:
+                _ = os.dup2(sink.fileno(), stream.fileno())
+        except ValueError:
+            pass
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_status = main()
+    flush_cli_output()
+    raise SystemExit(exit_status)

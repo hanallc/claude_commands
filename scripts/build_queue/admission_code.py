@@ -1,6 +1,7 @@
 """Hash the admission sources without importing admission code."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 import hashlib
 from pathlib import Path
 import sys
@@ -10,8 +11,10 @@ ADMISSION_CODE_PATHS = (
     "direct/verify.sh", "lint/invoke.sh", "hooks/pre-tool-use-brp-launch-gate.sh",
     "production/gate.py", "production/merge_gate.py", "production/targeted_test.py", "lint/memory_gate.sh", "lint/memory_admit.py",
     "build_queue/admission_code.py", "build_queue/admission_client.py", "build_queue/admission_protocol.py", "build_queue/admission_wire.py",
+    "build_queue/admission_jobs.py",
     "build_queue/system_clock.py", "build_queue/admission_records.py", "build_queue/step_estimator.py",
     "build_queue/admission_service.py", "build_queue/queue_place.py", "build_queue/placement.py",
+    "build_queue/execution_identity.py",
     "aws_target/hana_placement.py", "aws_target/hana_placement_adapter.py", "aws_target/hana_box.py", "aws_target/hana_spend.py",
     "aws_target/hana_execution.py", "build_targets/target_config.py", "build_targets/build_targets.py",
     "build_targets/execution_transport.py",
@@ -21,10 +24,23 @@ ADMISSION_CODE_PATHS = (
 )
 
 
+RELOAD_SOURCE_SUFFIX = ".py"
+
+
 def admission_code_version(scripts: Path | None = None) -> str:
     root = scripts if scripts is not None else Path(__file__).resolve().parents[1]
+    return _source_hash(root, ADMISSION_CODE_PATHS)
+
+
+def reload_source_version(root: Path) -> str:
+    """Hash the Python source files that the watch can see."""
+    paths = sorted(str(path.relative_to(root)) for path in root.rglob(f"*{RELOAD_SOURCE_SUFFIX}") if path.is_file())
+    return _source_hash(root, paths)
+
+
+def _source_hash(root: Path, paths: Iterable[str]) -> str:
     digest = hashlib.sha256()
-    for relative in ADMISSION_CODE_PATHS:
+    for relative in paths:
         try:
             content = (root / relative).read_bytes()
         except OSError:

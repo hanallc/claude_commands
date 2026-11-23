@@ -12,8 +12,8 @@ import json
 import os
 import re
 import shutil
-import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Generator, Mapping
@@ -21,12 +21,11 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.lib import build_folders
-from types import FrameType, MappingProxyType
-from typing import Literal, cast
+from scripts.lib import build_folders, process_group
+from types import MappingProxyType
+from typing import Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.lib import process_group
 
 from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
@@ -51,15 +50,12 @@ TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
 LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
 OWNER_FILE = "owner.json"
-# Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
+# The verifier records its group before it starts verify.sh.
 VERIFIER_FILE = "verifier.pgid"
 # Publishes its group, then runs verify.sh only while the owner lives: a sweep that found the owner dead
 # either reads the group (and keeps the dir) or this check stops the wrapper before verify.sh starts.
 VERIFIER_WRAPPER = ('printf %s "$$" > "$1.part" && mv "$1.part" "$1" && kill -0 "$2" 2>/dev/null'
                     ' && shift 2 && exec "$@"')
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
-# Held everywhere in a run except its work, so no signal lands between the dir, its record and its cleanup.
-HELD_SIGNALS = {*STOP_SIGNALS, signal.SIGINT}
 CHILD_STOP_SECONDS = 5.0
 # send.py's QUEUED (exit 1) keeps the notice for the parent's session, so it arrives later.
 HandoffDelivery = Literal["sent", "queued"]
@@ -94,13 +90,14 @@ class NoDirectRoute:
 
 def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
     """Find style configurations in this repository's worktrees."""
-    trees = tuple(Path(line.removeprefix("worktree ")) for line in
+    trees = tuple(Path(line.removeprefix("worktree ")).resolve() for line in
                   git(repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
     productions: list[ConfiguredStyleProduction] = []
     for row in staff.snapshot().find(kind="showrunner"):
         if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
             continue
-        if not any(row.doc.path.is_relative_to(tree) for tree in trees):
+        document = row.doc.path.resolve()
+        if not any(document.is_relative_to(tree) for tree in trees):
             continue
         lines = row.doc.path.read_text().splitlines()
         if not style_config.has_style_units(lines):
@@ -140,7 +137,7 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
     sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
-        "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
+        "--text", f"branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
@@ -219,7 +216,8 @@ def lint_records(output: str, checkout: Path) -> tuple[ToolLintRecord, ...]:
 
 
 def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
+    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False,
+                            pass_fds=copies.COMMAND_LOCKS.get())
     if result.returncode:
         raise Refusal(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.strip()
@@ -232,19 +230,20 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
     comparison_branch = sync.branch.name if isinstance(sync, DirectUnitSync) else style_branch
     if isinstance(sync, DirectUnitSync):
         style_branch = sync.route.receiving_branch
-        with style_ledger.publication_lock(sync.worktree), style_ledger.open_ledger(repo) as ledger:
-            _ = style_plan.recover_publication(sync.worktree, ledger)
+        worktree = sync.worktree.resolve()
+        with style_ledger.publication_lock(worktree), style_ledger.open_ledger(repo) as ledger:
+            _ = style_plan.recover_publication(worktree, ledger)
             opened = ledger.ticket_open(str(sync.unit))
-            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(sync.worktree):
+            if any(ticket["state"] == "assigned" for ticket in opened) or changed_files(worktree):
                 ledger.wait_for_sync(str(sync.unit))
                 return 4
-            _ = git(sync.worktree, "merge", "--no-edit", tip)
+            _ = git(worktree, "merge", "--no-edit", tip)
             for ticket in opened:
                 ledger.check_ticket_pipeline(ticket["id"])
-            pending = style_ledger.publication_path(sync.worktree, "pending-sync")
+            pending = style_ledger.publication_path(worktree, "pending-sync")
             if pending.exists():
                 target = pending.read_text().strip()
-                if subprocess.run(["git", "-C", str(sync.worktree), "merge-base", "--is-ancestor", target, "HEAD"],
+                if subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", target, "HEAD"],
                                   capture_output=True, check=False).returncode == 0:
                     pending.unlink()
             ledger.clear_sync_wait(str(sync.unit))
@@ -258,39 +257,6 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
         ledger.tip_done(tip, "own hand-off")
     print("seen (own hand-off: synced with no lint run)")
     return 0
-
-
-class LintStopped(BaseException):
-    """SIGTERM or SIGHUP reached a lint run; like KeyboardInterrupt, no `except Exception` catches it."""
-
-    def __init__(self, signum: int) -> None:
-        super().__init__(f"lint stopped by {signal.Signals(signum).name}")
-        self.signum: int = signum
-
-
-@contextmanager
-def stop_signals_raise() -> Generator[None]:
-    """SIGTERM and SIGHUP raise LintStopped, as SIGINT raises KeyboardInterrupt, so `finally` runs."""
-    def stop(signum: int, _frame: FrameType | None) -> None:
-        raise LintStopped(signum)
-
-    previous = {signum: signal.signal(signum, stop) for signum in STOP_SIGNALS}
-    try:
-        yield
-    finally:
-        for signum, handler in previous.items():
-            _ = signal.signal(signum, handler)
-
-
-@contextmanager
-def signal_mask(how: int) -> Generator[None]:
-    """Block or unblock HELD_SIGNALS for the enclosed code; a held signal raises once it is unblocked."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        _ = signal.pthread_sigmask(how, HELD_SIGNALS)
-        yield
-    finally:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def probe(send: Callable[[int, int], None], target: int) -> bool:
@@ -342,41 +308,61 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     return probe(process_group.send_process_group, group)
 
 
-def stop_lint_child(child: subprocess.Popen[str]) -> None:
-    """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(child.pid, signal.SIGTERM)
-    with suppress(subprocess.TimeoutExpired):
-        _ = child.wait(CHILD_STOP_SECONDS)
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(child.pid, signal.SIGKILL)
-    _ = child.wait()
-
-
-def unblock_held_signals() -> None:
-    """The child starts with the parent's held mask; preexec_fn is safe here, a lint run starts no threads."""
-    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, HELD_SIGNALS)
-
-
-def verifier_command(directory: Path, owner: int) -> list[str]:
+def verifier_command(directory: Path, owner: int, *, verify: Path) -> list[str]:
     return ["sh", "-c", VERIFIER_WRAPPER, "sh", str(directory / VERIFIER_FILE), str(owner),
-            "bash", str(VERIFY), "lint", "--check", "--no-cache"]
+            "bash", str(verify), "lint", "--check", "--no-cache"]
 
 
-def verify_lint(directory: Path) -> tuple[int, str]:
-    # Held from Popen until the child stop below is in force; start_new_session makes `$$` the group id.
-    with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
-            "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
+@dataclass(frozen=True)
+class LintSession:
+    start: Callable[[], None]
+    read: Callable[[], str]
+
+
+class LintCompleted(TypedDict):
+    status: int
+    output: str
+    rewritten: bool
+    checkout: str
+
+
+class LintPreparationFailed(TypedDict):
+    error: str
+
+
+@contextmanager
+def lint_session(common_dir: Path, checkout: Path, tip: str, owner: str) -> Generator[LintSession]:
+    locks = copies.COMMAND_LOCKS.get()
+    command = [sys.executable, "-m", "scripts.style.lint_keeper", str(os.getpid()), str(common_dir),
+               str(lint_temp_parent()), str(checkout), tip, owner, str(VERIFY), str(CHILD_STOP_SECONDS),
+               *map(str, locks)]
+    with subprocess.Popen(command, cwd=SCRIPTS.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True, start_new_session=True, pass_fds=locks) as keeper:
+        writer, reader = keeper.stdin, keeper.stdout
+        assert writer is not None and reader is not None
+
+        def start() -> None:
+            _ = writer.write("\n")
+            writer.flush()
+
         try:
-            with signal_mask(signal.SIG_UNBLOCK):
-                output, _ = child.communicate()
-        except BaseException:
-            stop_lint_child(child)
-            raise
-    return child.returncode, output
+            yield LintSession(start, reader.readline)
+        finally:
+            with suppress(BrokenPipeError):
+                writer.close()
+
+
+def verify_lint(session: LintSession) -> LintCompleted:
+    reply = session.read()
+    if reply == "ready\n":
+        session.start()
+        reply = session.read()
+    if not reply:
+        raise Refusal("lint keeper exited before it returned a result")
+    result = cast(LintCompleted | LintPreparationFailed, json.loads(reply))
+    if "error" in result:
+        raise Refusal(result["error"])
+    return result
 
 
 def remove_lint_dir(repo: Path, directory: Path) -> bool:
@@ -429,8 +415,13 @@ def remove_if_stale(directory: Path) -> None:
             return
     except (OSError, ValueError):
         return
-    if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
-        print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
+    try:
+        if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
+            print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
+    except FileNotFoundError:
+        # The keeper may finish cleanup while the sweep waits for the lock.
+        if directory.exists():
+            raise
 
 
 def sweep_stale_lint_dirs() -> None:
@@ -442,7 +433,6 @@ def sweep_stale_lint_dirs() -> None:
     for directory in sorted(lint_temp_parent().glob(f"{lint_prefix()}*")):
         try:
             remove_if_stale(directory)
-        # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
         except Exception as error:
             print(f"style_sync: sweep {directory}: " + " ".join(str(error).splitlines()))
 
@@ -458,46 +448,35 @@ def gate_owner(repo: Path) -> str:
     return str(row.id) if row is not None else copies.fallback_owner("style")
 
 
+def target_identity(path: Path) -> tuple[int, int]:
+    """Identify a real target directory by device and inode."""
+    status = path.lstat()
+    if not stat.S_ISDIR(status.st_mode):
+        raise Refusal(f"{path}: expected a real target directory")
+    return status.st_dev, status.st_ino
+
+
 def lint(repo: Path, checkout: Path, tip: str) -> int:
     """Judge the requested commit, never a style branch with additional fixes."""
     tip = git(checkout, "rev-parse", "--verify", f"{tip}^{{commit}}")
-    common_dir = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if common_dir != git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+    common_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    if common_dir != Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve():
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
-    # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with (stop_signals_raise(),
-          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip), step="lint") as snapshot,
-          signal_mask(signal.SIG_BLOCK),
-          build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-              lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):
-        OwnerRecord(os.getpid(), Path(common_dir)).write(directory)
-        with signal_mask(signal.SIG_UNBLOCK):
-            (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
-            intermediates = snapshot / "target/intermediates"
-            retained_target = (snapshot / "target").resolve()
-            scratch.mark_cargo_cache(intermediates)
-            saved = subprocess.run(
-                [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
-                env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
-            if saved.returncode:
-                raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
-            returncode, output = verify_lint(directory)
-            print(output, end="")
-            # Build outputs are retained; only source changes invalidate coverage.
-            rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-            rewritten = rewritten or (snapshot / "target").resolve() != retained_target
-            records = lint_records(output, snapshot)
-            if records:
-                with style_ledger.open_ledger(repo) as ledger:
-                    for record in records:
-                        passed = record.passed and not rewritten
-                        ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))
-            if rewritten:
-                print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
-            return int(returncode != 0 or rewritten
-                       or not all(record.passed and not record.diagnostics for record in records))
+    with lint_session(common_dir, checkout.resolve(), tip, gate_owner(repo)) as session:
+        result = verify_lint(session)
+    print(result["output"], end="")
+    rewritten = result["rewritten"]
+    records = lint_records(result["output"], Path(result["checkout"]))
+    if records:
+        with style_ledger.open_ledger(repo) as ledger:
+            for record in records:
+                passed = record.passed and not rewritten
+                ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))
+    if rewritten:
+        print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
+    return int(result["status"] != 0 or rewritten
+               or not all(record.passed and not record.diagnostics for record in records))
 
 
 def runner_value(action: str, name: str) -> str:
@@ -515,7 +494,7 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-        "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
+        "--text", f"hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
@@ -601,7 +580,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 name = next(production.name for production in productions
                             if unit in {assignment.unit for assignment in production.config.assignments})
                 result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-                    "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
+                    "--text", f"ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
                 ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
@@ -716,9 +695,6 @@ def main(argv: list[str] | None = None) -> int:
         if cast(str, args.command) == "send-handoff":
             return send_handoff(cast(Path, args.repo), cast(str, args.production), cast(str, args.checkpoint))
         return lint(cast(Path, args.repo), cast(Path, args.checkout), cast(str, args.tip))
-    except LintStopped as stopped:
-        print(f"style_sync: {stopped}", file=sys.stderr)
-        return 128 + stopped.signum
     except (copies.CopyError, Refusal, style_ledger.LedgerError, rule_catalog.RuleValidationError,
             scratch.ScratchError, OSError, sqlite3.Error, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)

@@ -23,12 +23,13 @@ from typing import NamedTuple, TypedDict, cast, override
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
+from scripts.lib.showrunner_state import state_root
 from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
-SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+SHOWRUNNER_STATE_DIR = state_root()
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or session_send.SEND_SCRIPT)
@@ -59,7 +60,6 @@ class Showrunner(TypedDict):
 
 class ShowrunnerSettings(TypedDict):
     threshold_percent: float
-    repeat_minutes: float
     stall_minutes: float
     faults_to: str
     always: list[str]
@@ -192,9 +192,8 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
     settings = tunables.read(path)
     return ShowrunnerSettings(
         threshold_percent=settings.number("threshold_percent"),
-        repeat_minutes=settings.number("repeat_minutes"),
         stall_minutes=settings.number("stall_minutes"),
-        faults_to=settings.text("faults_to"), always=settings.values()["always"].split())
+        faults_to=settings.text("faults_to"), always=settings.values("always")["always"].split())
 
 
 def socket_for(target: str, *, deadline: float = math.inf) -> str | None:

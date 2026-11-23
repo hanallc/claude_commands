@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import runpy
+import secrets
 import shlex
 import shutil
 import signal
@@ -20,6 +21,7 @@ import time
 import traceback
 import unittest
 from collections.abc import Generator
+from contextvars import ContextVar
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
@@ -38,9 +40,11 @@ from scripts.production import staff
 from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
+from scripts.lint.memory_test_support import write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
+_PRIVATE_STAFF_FILE: ContextVar[Path | None] = ContextVar("private_staff_file", default=None)
 
 
 @contextmanager
@@ -83,6 +87,7 @@ FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
+STAFF_OWNER_PARENT_CHECK_SECONDS = 1.0
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
@@ -104,6 +109,15 @@ def production_staff_record() -> Generator[None, None, None]:
 def fixture_runtime_id(label: str) -> str:
     """A fake backend returns one repeatable native id for this fixture label."""
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
+
+
+def build_fixture_sessions(fallback: str) -> dict[str, str]:
+    """Keep the runner's session in children that build or test."""
+    return {
+        "CLAUDE_CODE_SESSION_ID": (os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+                                   if staff.caller_identity() else fallback),
+        "CODEX_THREAD_ID": os.environ.get("CODEX_THREAD_ID", ""),
+    }
 
 
 def _claude_home() -> Path:
@@ -247,6 +261,24 @@ with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.curr
 '''
 
 
+def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Seed an old unit name in the private staff file."""
+    configured = os.environ.get("STAFF_FILE") or os.environ.get("STAFF_TEST_OWNER_FILE")
+    if row.kind != "unit" or not configured:
+        raise AssertionError("A saved unit name requires a private staff fixture.")
+    path = Path(configured).resolve()
+    temporary_roots = (Path(tempfile.gettempdir()), Path("/tmp"))
+    if path != _PRIVATE_STAFF_FILE.get() and not any(path.is_relative_to(root.resolve()) for root in temporary_roots):
+        raise AssertionError("The staff fixture must be in a temporary directory.")
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        fields = next(value for value in cast(list[dict[str, object]], document["rows"]) if value["id"] == row.id)
+        fields["name"] = name
+        write_text_atomic(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    return replace(row, name=name)
+
+
 def fixture_member(kind: staff.Kind, *, name: str,
                    parent: staff.StaffId | staff.ReportsTo | staff.StaffRoot | None = None,
                    worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,
@@ -267,6 +299,14 @@ def fixture_member(kind: staff.Kind, *, name: str,
         row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
         return staff.by_id(row.id) or row
+    if kind == "unit" and not existing:
+        try:
+            staff.validate_unit_name_for_write(name)
+        except staff.StaffRefused:
+            # Keep legacy test inputs while the real writer refuses new rows with these names.
+            row = staff.ensure(kind, name=f"fixture-{identity}", parent=relationship,
+                               worktree=worktree, doc=doc, runtime_id=identity)
+            return fixture_unit_saved_name(row, name)
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -377,13 +417,14 @@ class ClaudeBackendFixture:
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
     """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    if "XDG_CONFIG_HOME" not in environment or environment["XDG_CONFIG_HOME"] == os.environ.get("XDG_CONFIG_HOME"):
+        environment["XDG_CONFIG_HOME"] = str(path.parent / "config")
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
     for key, folder in (
         ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
-        ("XDG_CONFIG_HOME", "config"),
         # Session folders belong to staff members; a fixture member never makes one in the live root.
         ("SESSION_TEMP_ROOT", "session"),
     ):
@@ -392,6 +433,10 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
+        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
@@ -403,7 +448,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
             "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+            "STAFF_CONFIG": environment["STAFF_CONFIG"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
@@ -416,6 +461,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
                 _ = contexts.enter_context(mock.patch.object(
                     module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
                 ))
+        _ = contexts.callback(_PRIVATE_STAFF_FILE.reset, _PRIVATE_STAFF_FILE.set(path.resolve()))
         yield
 
 
@@ -688,36 +734,94 @@ def run_staff_owner_request(connection: socket.socket, request: StaffOwnerReques
 STAFF_OWNER_SERVER = r'''
 import json
 import os
+import select
+import signal
 import socket
 import sys
+from contextlib import suppress
 from pathlib import Path
 
+parent_pid = int(sys.argv[1])
+if os.getppid() != parent_pid:
+    raise SystemExit
+close_token = os.environ.pop('STAFF_TEST_OWNER_CLOSE_TOKEN')
 with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
-children = []
-with socket.socket() as listener:
-    listener.bind(('127.0.0.1', 0))
-    listener.listen()
-    print(listener.getsockname()[1], flush=True)
-    while True:
-        with listener.accept()[0] as connection:
-            with connection.makefile('rb') as channel:
-                request = json.loads(channel.readline())
-            if request is None:
-                break
-            from scripts.production.staff_test_support import run_staff_owner_request
-            from scripts.production import staff_sources
-            pid = os.fork()
-            if pid == 0:
-                listener.close()
+from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
+from scripts.production import staff_sources
+
+# Report a matching close request through the request child's exit status.
+STOP_REQUEST_EXIT_STATUS = 75
+
+def fork_request(listener, connection, notices, wake):
+    pid = os.fork()
+    if pid:
+        return pid
+    status = 0
+    try:
+        signal.set_wakeup_fd(-1)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        notices.close()
+        wake.close()
+        listener.close()
+        connection.setblocking(True)
+        with connection.makefile('rb') as channel:
+            line = channel.readline()
+        if line:
+            request = json.loads(line)
+            if request == {'close': close_token}:
+                status = STOP_REQUEST_EXIT_STATUS
+            elif isinstance(request, dict) and 'close' not in request:
+                run_staff_owner_request(connection, request)
+    finally:
+        connection.close()
+        os._exit(status)
+
+children = set()
+notices, wake = socket.socketpair()
+closing = False
+with notices, wake:
+    # Wake select when a request exits, including during a normal close.
+    wake.setblocking(False)
+    signal.signal(signal.SIGCHLD, lambda *_: None)
+    signal.set_wakeup_fd(wake.fileno(), warn_on_full_buffer=False)
+    try:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            listener.setblocking(False)
+            print(listener.getsockname()[1], flush=True)
+            while os.getppid() == parent_pid:
+                for pid in tuple(children):
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if not finished:
+                        continue
+                    children.remove(pid)
+                    if os.waitstatus_to_exitcode(status) == STOP_REQUEST_EXIT_STATUS:
+                        listener.close()
+                        closing = True
+                if closing and not children:
+                    break
+                readers = [notices] if closing else [listener, notices]
+                ready, _, _ = select.select(readers, [], [], STAFF_OWNER_PARENT_CHECK_SECONDS)
+                if notices in ready:
+                    notices.recv(4096)
+                    continue
+                if listener not in ready or os.getppid() != parent_pid:
+                    continue
                 try:
-                    run_staff_owner_request(connection, request)
-                finally:
-                    connection.close()
-                    os._exit(0)
-            children.append(pid)
-for pid in children:
-    os.waitpid(pid, 0)
+                    connection, _ = listener.accept()
+                except BlockingIOError:
+                    continue
+                with connection:
+                    children.add(fork_request(listener, connection, notices, wake))
+    finally:
+        signal.set_wakeup_fd(-1)
+        for pid in children:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in children:
+            os.waitpid(pid, 0)
 '''
 
 
@@ -727,25 +831,30 @@ class SharedStaffOwner:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.lifetime: ExitStack = ExitStack()
+        self.pid: int | None = None
 
     @cached_property
     def port(self) -> str:
+        close_token = secrets.token_hex()
         script = self.root / "fake-staff-owner.py"
         write_text_atomic(script, STAFF_OWNER_SERVER)
         errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
         process = self.lifetime.enter_context(start_staff_owner(
-            [sys.executable, str(script)], cwd=self.root,
-            env={**os.environ, "TMPDIR": str(self.root)},
+            [sys.executable, str(script), str(os.getpid())], cwd=self.root,
+            env={**os.environ, "TMPDIR": str(self.root), "STAFF_TEST_OWNER_CLOSE_TOKEN": close_token},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,
         ))
-        port = cast(TextIO, process.stdout).readline().strip()
+        self.pid = process.pid
+        port = ""
 
         def stop() -> None:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             try:
-                with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
-                    connection.sendall(b"null\n")
+                if port:
+                    with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
+                        connection.settimeout(max(0, deadline - time.monotonic()))
+                        connection.sendall(json.dumps({"close": close_token}).encode() + b"\n")
                 _ = process.wait(timeout=max(0, deadline - time.monotonic()))
             except (OSError, subprocess.TimeoutExpired):
                 try:
@@ -755,6 +864,9 @@ class SharedStaffOwner:
                 _ = process.wait()
 
         _ = self.lifetime.callback(stop)
+        port = cast(TextIO, process.stdout).readline().strip()
+        if not port:
+            raise RuntimeError(f"The staff owner did not report its port. See {errors.name}.")
         return port
 
     def close(self) -> None:

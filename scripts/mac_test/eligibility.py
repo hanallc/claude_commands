@@ -15,7 +15,10 @@ from urllib.parse import quote
 from scripts.build_targets import target_config
 from scripts.buildlog import repository, store
 from scripts.lib import conf
-from scripts.mac_test import cargo_manifest
+from scripts.mac_test import cargo_manifest, claim_state
+
+
+MAC_LINUX_TARGET = "mac-linux"
 
 
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"]
@@ -29,6 +32,7 @@ def step_kind(verb: str) -> str:
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
+    "history_key_unavailable",
     "linux_only",
     "backoff",
     "blocked",
@@ -39,6 +43,7 @@ NonBusyMacDeclineReason = Literal[
     "disk",
     "copy",
     "source_changed",
+    "runner",
 ]
 
 
@@ -90,10 +95,11 @@ DEFAULT_MAC_SETTINGS = DefaultMacSettings()
 
 @dataclass(frozen=True)
 class SshConnectionSettings:
-    """The connection settings hold the SSH host and connection and cleanup timeouts."""
+    """The connection settings hold the SSH host, the connection and cleanup timeouts and the unreachable wait."""
     host: str
     connect_timeout_s: float
     leftover_timeout_s: float
+    unreachable_wait_s: int
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,7 @@ class OffloadConfig:
     default_target_budget_gib: str
     values: dict[str, str]
     source: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
+    settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
 
     @property
     def host(self) -> str:
@@ -120,6 +127,10 @@ class OffloadConfig:
     @property
     def leftover_timeout_s(self) -> float:
         return self.connection.leftover_timeout_s
+
+    @property
+    def unreachable_wait_s(self) -> int:
+        return self.connection.unreachable_wait_s
 
     @property
     def fetch_limit_mib(self) -> float:
@@ -136,6 +147,26 @@ class OffloadConfig:
     @property
     def fetch_retention_days(self) -> float:
         return float(self.values["fetch_retention_days"])
+
+
+@dataclass(frozen=True)
+class SshProbeSettings:
+    """Read only the settings needed by an SSH evidence probe."""
+
+    configuration: conf.ConfigRead
+    unreachable_wait_s: int
+
+    @property
+    def host(self) -> str:
+        return self.configuration.text("host")
+
+    @property
+    def connect_timeout_s(self) -> float:
+        return self.configuration.number("connect_timeout_s")
+
+    @property
+    def probe_timeout_s(self) -> float:
+        return self.configuration.number("probe_timeout_s")
 
 
 class NoBackoff:
@@ -170,13 +201,45 @@ NO_BACKOFF = NoBackoff()
 ACTIVE_BACKOFF = ActiveBackoff()
 
 
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+
+
 def config_path() -> Path:
     return conf.path("mac_test")
 
 
+def unreachable_wait_seconds(registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
+    """Read how long a machine can stay silent before its run ends as unreachable."""
+    if isinstance(registry, conf.UseConfiguredValue):
+        registry = conf.read_or_repository("build_targets")
+    return registry.whole(UNREACHABLE_WAIT_KEY)
+
+
+def probe_settings(configuration: conf.ConfigRead,
+                   registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> SshProbeSettings:
+    """Build SSH probe settings from target settings and the build target registry."""
+    return SshProbeSettings(configuration, unreachable_wait_seconds(registry))
+
+
 def configured_ssh_target(target: str) -> target_config.SshTarget:
     """Resolve an SSH target before access to its coordination state."""
+    if target == MAC_LINUX_TARGET:
+        return mac_linux_target(conf.read("build_targets"))
     return target_config.configured_ssh_target(target)
+
+
+def mac_linux_target(registry: conf.ConfigRead) -> target_config.SshTarget:
+    """Read the guest registration for the gate."""
+    target = MAC_LINUX_TARGET
+    if (registry.text(f"kind.{target}", recover_invalid=False) != "ssh"
+            or registry.text(f"platform.{target}", recover_invalid=False) != "linux"):
+        raise conf.Unusable(f"{target} must use SSH and the Linux platform")
+    settings = Path(registry.text(f"settings.{target}", recover_invalid=False)).expanduser()
+    return target_config.SshTarget(target, "linux", registry.source.parent / settings)
+
+
+def mac_linux_enabled(registry: conf.ConfigRead) -> bool:
+    return registry.value(f"enabled.{MAC_LINUX_TARGET}", conf.on_off, recover_invalid=False)
 
 
 def ssh_target_state_directory(target: str) -> Path:
@@ -191,19 +254,22 @@ def state_directory(target: str = "mac") -> Path:
     return ssh_target_state_directory(target)
 
 
+def read_target_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> conf.ConfigRead:
+    """Read only the target settings file. A policy check uses this read; it needs no registry and no wait."""
+    return conf.read(config_path() if isinstance(path, DefaultMacSettings) else path.expanduser())
+
+
 def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    return connection_settings(conf.read(settings))
+    return connection_settings(read_target_settings(path))
 
 
 def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
     return SshConnectionSettings(config.text("host"), config.number("connect_timeout_s"),
-                                 config.number("leftover_timeout_s"))
+                                 config.number("leftover_timeout_s"), unreachable_wait_seconds())
 
 
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    config = conf.read(settings)
+    config = read_target_settings(path)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
@@ -215,7 +281,8 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
         free_floor_gib=config.number("free_floor_gib"),
         default_target_budget_gib=config.text("target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
         values=values,
-        source=settings,
+        source=config.source,
+        settings=config,
     )
 
 
@@ -236,7 +303,8 @@ def comma_values(value: str) -> set[str]:
 
 
 def backoff_path(target: str = "mac") -> Path:
-    return state_directory(target) / "unreachable_until"
+    directory = ssh_target_state_directory(target) if target == MAC_LINUX_TARGET else state_directory(target)
+    return directory / "unreachable_until"
 
 
 def read_backoff(now: float, target: str = "mac", *, strict: bool = False) -> BackoffState:
@@ -364,26 +432,48 @@ def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     return workspace_has_linux_only(repo_root, excluded)
 
 
-def linux_only_policy(config: OffloadConfig, repository: KnownRepository, repo_root: Path,
+def linux_only_policy(config: OffloadConfig | conf.ConfigRead, repository: KnownRepository, repo_root: Path,
                       package: str, kind: str) -> KnownRepository | IneligibleMacStep:
     """Apply the repository's linux_only setting; an unset or unreadable setting refuses the step."""
     key = f"linux_only.{repository.name}"
-    if key not in config.values:
-        return IneligibleMacStep("repo")
+    missing = IneligibleMacStep("repo")
+    values = (config.values.get(key, missing) if isinstance(config, OffloadConfig)
+              else config.value(key, str, default=missing, allow_blank=True))
+    if isinstance(values, IneligibleMacStep):
+        return values
     if not linux_only_applies(kind):
         return repository
     try:
-        if has_linux_only(repo_root, package, comma_values(config.values[key])):
+        if has_linux_only(repo_root, package, comma_values(values)):
             return IneligibleMacStep("linux_only")
     except (OSError, UnicodeError, ValueError):
         return IneligibleMacStep("repo")
     return repository
 
 
-def linux_kind_permitted(values: dict[str, str], kind: str) -> bool:
-    return all(step in ('test', 'check', 'doc', 'lint', 'example', 'build')
-               and step in comma_values(values.get('kinds', '')) for step in remote_step_kinds(kind))
+_LINUX_STEP_KINDS = frozenset({'test', 'check', 'doc', 'lint', 'example', 'build'})
 
+
+def configured_step_policy(config: OffloadConfig | conf.ConfigRead, platform: target_config.Platform,
+                           repository: RepositoryIdentity, repo_root: Path, package: str,
+                           kind: str) -> KnownRepository | IneligibleMacStep:
+    """Read the repository policy for a fixed candidate or a live probe."""
+    if isinstance(repository, UnknownRepository):
+        return IneligibleMacStep("repo")
+    if target_config.uses_legacy_mac_layout(platform):
+        return linux_only_policy(config, repository, repo_root, package, kind)
+    kinds = (comma_values(config.values.get("kinds", "")) if isinstance(config, OffloadConfig)
+             else config.value("kinds", _configured_linux_kinds, default=set(), allow_blank=True))
+    if not all(step in _LINUX_STEP_KINDS and step in kinds for step in remote_step_kinds(kind)):
+        return IneligibleMacStep("target does not permit this command")
+    return repository
+
+
+def _configured_linux_kinds(value: str) -> set[str]:
+    kinds = comma_values(value)
+    if kinds - _LINUX_STEP_KINDS:
+        raise ValueError("expected Linux step kinds")
+    return kinds
 
 def remote_step_kinds(kind: str) -> tuple[str, ...]:
     """Return the kinds that a command must run on its pinned target."""
@@ -399,23 +489,29 @@ def recorded_step_kind(step: str) -> str:
     return verb_kind(cast(MacVerb, "mend-check" if step == "mend" else step))
 
 
-def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
+def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
-                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF,
+                         mac_repository: claim_state.MacMirrorIdentity | claim_state.WholeMacScope
+                         | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
+                         ) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
-    if not config.enabled:
+    enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
+    if not enabled:
         return IneligibleMacStep("off")
-    repository = repository_identity(repo_root)
-    if isinstance(repository, UnknownRepository):
-        return IneligibleMacStep("repo")
-    if target and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform):
-        if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
-            return IneligibleMacStep("target does not permit this command")
-        return backoff_eligibility(repository, target, backoff)
-    policy = linux_only_policy(config, repository, repo_root, package, kind or verb_kind(verb))
+    platform = configured_ssh_target(target).platform if target else "macos"
+    if platform == "macos":
+        if isinstance(mac_repository, claim_state.ResolveMacRepository):
+            mac_repository = claim_state.mac_repository_identity(str(repo_root))
+        if isinstance(mac_repository, claim_state.WholeMacScope):
+            return IneligibleMacStep("repo")
+        repository = KnownRepository(mac_repository.mirror_name, mac_repository.key)
+    else:
+        repository = repository_identity(repo_root)
+    policy = configured_step_policy(config, platform, repository, repo_root, package, kind or verb_kind(verb))
     if isinstance(policy, IneligibleMacStep):
         return policy
-    return backoff_eligibility(repository, target, backoff)
+    return backoff_eligibility(policy, target, backoff)
 
 
 def backoff_eligibility(repository: KnownRepository, target: str,

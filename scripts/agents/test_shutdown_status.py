@@ -11,9 +11,12 @@ from scripts.whoami.note_file import note_name
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Thread, current_thread
 from typing import cast, final, override
 from collections.abc import Generator
 from zoneinfo import ZoneInfo
@@ -21,7 +24,8 @@ from unittest.mock import patch
 
 from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
 from scripts.production.staff_test_support import fixture_member, fixture_worker
-from scripts.agents import shutdown, restart, shutdown_record, stop_resume, inventory
+from scripts.agents import shutdown, restart, shutdown_record, stop_resume, inventory, remote, status_entry
+from scripts.accounts import role_map
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, session_staff, completion_receipt, unit_config, worker
 from scripts.production.production_doc import Production
@@ -194,7 +198,7 @@ class ShutdownStatusTests(ShutdownTestCase):
 
     def test_retired_resume_clears_only_a_proven_native_session(self) -> None:
         owner = fixture_member("showrunner", name="recovery-owner")
-        row = fixture_member("unit", name="recovery-unit", parent=owner.id,
+        row = fixture_member("unit", name="recovery", parent=owner.id,
                              worktree=staff.PresentWorktree("natedev", self.root / "unit"))
         production = Production(self.root / "production.md", owner.name, "production", self.root,
                                 self.root / "log.md", ZoneInfo("UTC"), owner)
@@ -312,9 +316,9 @@ else:
         if as_json:
             arguments.append("--json")
         with (
-            patch.object(shutdown, "inventory", return_value=empty_inventory()),
-            patch.object(shutdown, "run_remote", return_value=(status, output)),
-            patch.object(shutdown, "other_machine", return_value="Mac"),
+            patch.object(status_entry, "inventory", return_value=empty_inventory()),
+            patch.object(remote, "run_remote", return_value=(status, output)),
+            patch.object(remote, "other_machine", return_value="Mac"),
             redirect_stdout(standard_output),
             redirect_stderr(standard_error),
         ):
@@ -326,8 +330,8 @@ else:
         standard_output = io.StringIO()
         standard_error = io.StringIO()
         with (
-            patch.object(shutdown, "inventory", return_value=empty_inventory()),
-            patch.object(shutdown, "other_machine", return_value="Mac"),
+            patch.object(status_entry, "inventory", return_value=empty_inventory()),
+            patch.object(remote, "other_machine", return_value="Mac"),
             redirect_stdout(standard_output),
             redirect_stderr(standard_error),
         ):
@@ -337,13 +341,98 @@ else:
     def test_empty_inventory_renders_no_sessions_for_the_account(self) -> None:
         standard_output = io.StringIO()
         with (
-            patch.object(shutdown, "inventory", return_value=empty_inventory()),
+            patch.object(status_entry, "inventory", return_value=empty_inventory()),
             redirect_stdout(standard_output),
         ):
             result = shutdown.main(["status", LOGIN, "--here"])
 
         self.assertEqual(result, 0)
         self.assertIn("natedev:\n  no sessions on claude2\n", standard_output.getvalue())
+
+    def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
+        authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))
+        self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
+        run_remote = remote.run_remote
+        popen = subprocess.Popen[str]
+        for local_error in (False, True):
+            with self.subTest(local_error=local_error):
+                started = Event()
+                release_peer = Event()
+                peer_finished = Event()
+                peer_threads: list[Thread] = []
+                children: list[subprocess.Popen[str]] = []
+
+                def start_child(
+                    command: list[str], *, stdin: int, stdout: int, stderr: int, text: bool,
+                ) -> subprocess.Popen[str]:
+                    if local_error:
+                        command = [sys.executable, "-c", "import time; time.sleep(60)"]
+                    child = popen(command, stdin=stdin, stdout=stdout, stderr=stderr, text=text)
+                    children.append(child)
+                    started.set()
+                    return child
+
+                def peer(
+                    arguments: list[str], *, stdin: str,
+                    cancellation: remote.RemoteCallCancellation | None = None,
+                ) -> tuple[int, str]:
+                    self.assertEqual(arguments, ["status", LOGIN, "--json", "--here"])
+                    self.assertEqual(staff.decode_peer_status_authority(stdin), authority)
+                    peer_threads.append(current_thread())
+                    with patch.object(subprocess, "Popen", new=start_child):
+                        result = run_remote(arguments, stdin=stdin, cancellation=cancellation)
+                    if local_error:
+                        _ = release_peer.wait()
+                    peer_finished.set()
+                    return result
+
+                def local(login: str) -> Inventory:
+                    if not started.wait(timeout=5):
+                        self.fail("the peer must start before local inventory can finish")
+                    self.assertIs(staff.snapshot(), authority.membership)
+                    self.assertEqual(role_map.read_role_map(), authority.accounts)
+                    if local_error:
+                        raise OSError("local inventory failed")
+                    report = empty_inventory()
+                    report["login"] = login
+                    return report
+
+                with (patch.object(staff, "peer_status_authority", side_effect=lambda: authority),
+                      patch.object(status_entry, "inventory", side_effect=local),
+                      patch.object(remote, "run_remote", side_effect=peer),
+                      patch.object(remote, "other_machine", return_value="Mac"),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
+                      ThreadPoolExecutor(max_workers=1) as commands):
+                    returned = Event()
+
+                    def status() -> int:
+                        try:
+                            return shutdown.main(["status", LOGIN, "--json"])
+                        finally:
+                            returned.set()
+
+                    command = commands.submit(status)
+                    try:
+                        if local_error:
+                            if not returned.wait(timeout=5):
+                                self.fail("status must return before the peer can finish")
+                            self.assertEqual(command.result(), 2)
+                            self.assertFalse(peer_finished.is_set())
+                            self.assertTrue(peer_threads[0].daemon)
+                            self.assertIsNotNone(children[0].poll(), "the SSH child must exit before status returns")
+                            self.assertEqual(errors.getvalue(), "shutdown: local inventory failed\n")
+                            self.assertEqual(output.getvalue(), "")
+                        else:
+                            self.assertEqual(command.result(), 0)
+                            self.assertEqual(json.loads(output.getvalue()), [empty_inventory(), empty_inventory("Mac")])
+                    finally:
+                        for child in children:
+                            if child.poll() is None:
+                                child.kill()
+                                _ = child.wait()
+                        release_peer.set()
+                        if started.is_set() and not peer_finished.wait(timeout=5):
+                            self.fail("the peer did not finish after release")
 
     def test_account_label_resolution_accepts_only_claude_notes(self) -> None:
         self.write_note("claude2", LOGIN)
@@ -354,7 +443,7 @@ else:
             return empty_inventory()
 
         with (
-            patch.object(shutdown, "inventory", side_effect=inventory_for),
+            patch.object(status_entry, "inventory", side_effect=inventory_for),
             redirect_stdout(io.StringIO()),
         ):
             result = shutdown.main(["status", "claude2", "--json", "--here"])
@@ -364,7 +453,7 @@ else:
         with (
             redirect_stderr(errors),
             patch.object(
-                shutdown,
+                status_entry,
                 "inventory",
                 side_effect=AssertionError("inventory must not run"),
             ),
@@ -379,7 +468,7 @@ else:
             return empty_inventory()
 
         with (
-            patch.object(shutdown, "inventory", side_effect=inventory_for),
+            patch.object(status_entry, "inventory", side_effect=inventory_for),
             redirect_stdout(io.StringIO()),
         ):
             result = shutdown.main(
@@ -392,7 +481,7 @@ else:
         with (
             redirect_stderr(errors),
             patch.object(
-                shutdown,
+                status_entry,
                 "inventory",
                 side_effect=AssertionError("inventory must not run"),
             ),
@@ -411,14 +500,14 @@ else:
             patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "current-session"}),
             redirect_stderr(errors),
             patch.object(
-                shutdown,
+                status_entry,
                 "own_claude_account",
                 side_effect=UnreadableAccount(
                     "this process's Claude account is unreadable"
                 ),
             ),
             patch.object(
-                shutdown,
+                status_entry,
                 "inventory",
                 side_effect=AssertionError("inventory must not run"),
             ),
@@ -489,7 +578,7 @@ else:
         ]
         output = io.StringIO()
         with (
-            patch.object(shutdown, "inventory", return_value=report),
+            patch.object(status_entry, "inventory", return_value=report),
             redirect_stdout(output),
         ):
             result = shutdown.main(["status", LOGIN, "--here"])

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.buildlog import cli, disk, filesystem, report
 from scripts.buildlog import store
 from scripts.lint import sweep
@@ -27,7 +29,7 @@ from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.user_zone import user_zone
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import linux_runner
 
 
@@ -41,10 +43,14 @@ class DiskTests(unittest.TestCase):
         root = self.base()
         test_index.point_root_at(self, root / "log")
         self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
+        _ = write_config_fixture(root / "build_folders.conf",
+                                 f"roots.build={root / 'build'}\nroots.build.natedev={root / 'build'}")
         self.enterContext(mock.patch.dict(os.environ, {
             "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
             copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
+        # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
+        _ = os.environ.pop("SCCACHE_DIR", None)
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
 
@@ -92,11 +98,32 @@ class DiskTests(unittest.TestCase):
     def test_scanned_folders_add_the_scratch_root_only_outside_the_folders(self) -> None:
         base = self.base()
         folders = [("tmp", str(base / "tmp"))]
-        for scratch, expected in ((base / "build" / "scratch", [*folders, ("scratch", str(base / "build" / "scratch"))]),
-                                  (base / "tmp" / "scratch", folders)):
+        ci = Path(os.environ["CONF_DIR"]) / "build/hana/ci"
+        for name in ("10", "2", "01"):
+            (ci / name).mkdir(parents=True)
+        rows = [*folders, ("CI runner 2", str(ci / "2")), ("CI runner 10", str(ci / "10"))]
+        separate_scratch = base / "build/scratch"
+        for scratch, expected in ((separate_scratch, [*rows, ("scratch", str(separate_scratch))]),
+                                  (base / "tmp/scratch", rows)):
             with (self.subTest(scratch=scratch), mock.patch.object(disk, "FOLDERS", folders),
                   mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch)})):
                 self.assertEqual(disk.scanned_folders(), expected)
+
+    def test_scanned_folders_keep_fixed_rows_when_ci_cannot_be_listed(self) -> None:
+        root = Path(os.environ["CONF_DIR"])
+        ci = root / "build/hana/ci"
+        (ci / "1").mkdir(parents=True)
+        folders = [("tmp", str(root / "tmp"))]
+        scandir = os.scandir
+
+        def list_directory(path: Path) -> Iterator[os.DirEntry[str]]:
+            if path == ci:
+                raise PermissionError(path)
+            return scandir(path)
+
+        with (mock.patch.object(disk, "FOLDERS", folders),
+              mock.patch.object(os, "scandir", side_effect=list_directory)):
+            self.assertEqual(disk.scanned_folders(), folders)
 
     def test_linux_capacity_checks_the_external_output_device(self) -> None:
         base = self.base()
@@ -113,8 +140,7 @@ class DiskTests(unittest.TestCase):
         checkout.mkdir()
         _ = (checkout / "Cargo.toml").write_text('[workspace]\n')
         installed = base / ".claude"
-        installed.mkdir()
-        (installed / "scripts").symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        _ = copy_helpers(base, *COPY_HELPERS)
         _ = (installed / ".build-target-script-commit").write_text("fixture\n")
         support = base / "support"
         support.mkdir()

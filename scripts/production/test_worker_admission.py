@@ -7,6 +7,7 @@ import fcntl
 import io
 import subprocess
 import sys
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import partial
@@ -80,7 +81,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
             "production": production.name, "unit": unit.name, "owner_staff_id": unit.id,
         }))
-        renamed = staff.rename(unit.id, "renamed-unit")
+        renamed = staff.rename(unit.id, "renamed")
         self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), renamed)
 
     def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:
@@ -338,6 +339,36 @@ class FamilyHandoffTests(StaffTestCase):
                     self.assertEqual(len(errors.getvalue().splitlines()), int(malformed), errors.getvalue())
                     if malformed:
                         self.assertIn(allowed.name, errors.getvalue())
+
+    def test_codex_patch_with_escaped_backticks_compiles_without_warnings(self) -> None:
+        source = Path(worker_admission.__file__)
+        patch = "*** Begin Patch\n*** Update File: part`one.py\n*** End Patch"
+        literal = json.dumps(patch).replace("`", r"\`").replace("one", r"\one")
+        changed: set[str] = set()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            _ = compile(source.read_bytes(), str(source), "exec")
+            _ = worker_admission.transcript_entry({"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "input": f"await tools.apply_patch({literal});"}}, changed)
+        self.assertEqual(changed, {"part`one.py"})
+
+    def test_codex_patch_paths_with_surrogates_keep_the_handoff_readable(self) -> None:
+        allowed, source, _ = self.source("codex")
+        assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+        with source.open("a", encoding="utf-8") as transcript:
+            for name in (r"paired\uD83D\uDE00.py", r"lone-high\uD83D.py", r"lone-low\uDE00.py"):
+                patch = f"*** Begin Patch\\n*** Update File: {name}\\n*** End Patch"
+                _ = transcript.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "custom_tool_call", "name": "exec", "input": f"await tools.apply_patch(`{patch}`);"}}) + "\n")
+        with warnings.catch_warnings(), redirect_stderr(io.StringIO()) as errors:
+            warnings.simplefilter("error", SyntaxWarning)
+            handoff = worker_admission.extract_transcript(allowed.slot.row, allowed.run,
+                staff.CodexBackend(self.root / "codex"))
+        assert isinstance(handoff, worker_admission.TranscriptHandoff)
+        text = handoff.extract.read_text(encoding="utf-8")
+        self.assertIn("paired😀.py", text)
+        self.assertNotIn("lone-", text)
+        self.assertEqual(errors.getvalue(), "")
 
     def test_codex_source_uses_the_newest_saved_transcript_mtime(self) -> None:
         identity = fixture_runtime_id("archived-source")

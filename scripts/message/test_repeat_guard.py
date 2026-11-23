@@ -24,7 +24,6 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 from scripts.message import send
 from scripts.message import repeat_guard as guard
-from scripts.message import repeats
 from scripts.message.repeat_guard_test_support import (
     NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
     wait_for_notice_exit, wait_for_notice_readiness,
@@ -84,7 +83,7 @@ else:
         return send.Result('sent','fake sink')
     def transport(command,stdin,timeout):
         options=send.parse(command[2:])._replace(shown_sender=send.ShownSender(g.NOTICE_SENDER))
-        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'codex_session',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
+        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'deliver_codex',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
             result=send.send(options)
         return send_result.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
     sys.stdin=io.StringIO(json.dumps(request))
@@ -235,7 +234,7 @@ print(json.dumps(held))
                 _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(child.returncode, -signal.SIGKILL)
 
-    def test_child_test_budget_preserves_the_system_sitecustomize(self) -> None:
+    def test_site_hooks_apply_to_callers_and_stay_out_of_guard_workers(self) -> None:
         site = self.home / "nix-site"
         site.mkdir()
         _ = (site / "guard_site_probe.py").write_text("ready = True\n")
@@ -251,6 +250,16 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual(json.loads(child.stdout), [True, False, TEST_HANG_GUARD_SECS])
         self.assertEqual(child.stderr, "")
+
+        loaded = site / "worker-loaded-sitecustomize"
+        _ = (site / "sitecustomize.py").write_text(
+            f"with open({str(loaded)!r}, 'w') as marker: marker.write('loaded')\n")
+        with patch.dict(os.environ, {"PYTHONPATH": str(site), "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}):
+            held = [guard.check(self.root, self.attempt(at=at)).held for at in range(3)]
+            guard.transport_result("watchdog", "session:morty", "stopped", "delivered")
+        self.assertEqual(held, [False, False, True])
+        self.assertEqual(len((self.root.parent / "transports.jsonl").read_text().splitlines()), 1)
+        self.assertFalse(loaded.exists())
 
     def test_unknown_prose_compares_exactly_even_when_values_look_volatile(self) -> None:
         for values in (("10:00", "11:00", "12:00"),
@@ -560,18 +569,6 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             guard.drain(self.root, lambda state, notice, limits: "delivered", self.limits.window_seconds + 6)
         self.assertEqual(list(self.root.glob("*.json")), [])
 
-    def test_replay_is_pure_and_counts_no_distinct_or_protected_holds(self) -> None:
-        rows: list[dict[str, object]] = [{"from": "watchdog", "to": "morty", "text": text,
-            "time": f"2026-10-31T01:00:0{index}+00:00", "machine": "fixture-host",
-            "safety": "distinct" if text == "recovered" else "repeat"}
-            for index, text in enumerate(("stopped", "stopped", "stopped", "recovered"))]
-        rows += [{**rows[0], "from": "user"}, {**rows[0], "to": "user"}]
-        result = repeats.replay(rows, self.limits)
-        self.assertEqual(result["watchdog"].held, 1)
-        self.assertEqual(sum(item.distinct_held for item in result.values()), 0)
-        self.assertEqual(sum(item.protected_held for item in result.values()), 0)
-        self.assertFalse(self.root.exists())
-
     def prime_outbox(self) -> None:
         self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(3)],
                          [False, False, True])
@@ -792,7 +789,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 finally:
                     self.owned.finish()
 
-    def test_direct_events_report_observed_outcomes_and_replay_uses_independent_labels(self) -> None:
+    def test_direct_events_record_observed_outcomes(self) -> None:
         receiver = guard.recipient_identity("", thread_id="thread-1")
         for text in ["stopped"] * 3:
             decision = guard.transport_check("direct", receiver, text)
@@ -801,15 +798,8 @@ os.kill(os.getpid(), signal.SIGSTOP)
         rows = [cast(dict[str, object], json.loads(line))
                 for line in (self.home / "state/message/transports.jsonl").read_text().splitlines()]
         self.assertEqual([row["outcome"] for row in rows], ["queued", "queued", "held"])
-        totals = repeats.replay(rows, self.limits, simulate=False)["direct"]
-        self.assertEqual((totals.count, totals.held, totals.receivers), (3, 1, {receiver}))
-        labelled = [{**rows[0], "text": f"process {name} stopped", "safety": "distinct"}
-                    for name in ("Ada", "Abe", "Bea")]
-        result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (0, 0))
-        with patch.object(guard, "normalize", return_value="broken collision"):
-            result = repeats.replay(labelled, self.limits)["direct"]
-        self.assertEqual((result.held, result.distinct_held), (1, 1))
+        self.assertEqual({row["from"] for row in rows}, {"direct"})
+        self.assertEqual({row["to"] for row in rows}, {receiver})
 
     def test_digit_prefixed_names_dates_durations_and_meaningful_paths_stay_distinct(self) -> None:
         for texts in (

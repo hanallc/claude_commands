@@ -23,6 +23,9 @@ fi
 [[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
+source "${BASH_SOURCE[0]%/*}/../build_hold/override_guard.sh" || return 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || return 2
+
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
 # Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
 # wrapping a macOS framework — makes SwiftPM call sandbox-exec, which fails
@@ -33,7 +36,7 @@ SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
 
 # Lint policy. Missing reader means every check runs — a caller must never be
 # silently under-verified because a config script moved.
-LINT_CONFIG_READER="${LINT_CONFIG_READER:-$HOME/.claude/scripts/lint/lint_config.sh}"
+LINT_CONFIG_READER="${LINT_CONFIG_READER:-$BUILD_HELPER_ROOT/lint/lint_config.sh}"
 if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
@@ -106,10 +109,26 @@ fi
 # charges that compiler to the step that names its scope. sccache hashes CARGO_*
 # variables and the variables that rustc dependency data names. No crate reads
 # BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
-BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
+BUILDLOG_SCOPE_SH='
+exec 2>&3 3>&-
+{ : > "$0"; } 2>/dev/null || exit 125
+cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+if [ "${BUILDLOG_DEFER_SCOPE_SIDECAR:-0}" = 1 ]; then
+    export BUILDLOG_SCOPE_SIDECAR="$0.cgroup"
+else
+    printf "%s\n" "$cgroup" > "$0.cgroup"
+fi
+{ echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true
+export BUILDLOG_STEP_SCOPE="$cgroup"
+"$@"
+s=$?
+cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true
+cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true
+cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null
+exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
-source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
+source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2
 }
@@ -125,7 +144,7 @@ buildlog_now() {
 
 buildlog_read_context() {
     local context known_folder="${BUILD_TARGET_DIR:-${BUILDLOG_TEST_TARGET_DIR:-}}"
-    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$HOME/.claude/scripts/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
+    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$BUILD_HELPER_ROOT/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
     BUILDLOG_TREE="${context%%$'\n'*}"
     BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
 }
@@ -138,7 +157,7 @@ buildlog_begin() {
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
-    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
+    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
     fi
@@ -162,8 +181,12 @@ buildlog_step_compiles() {
 buildlog_exec() {
     local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
-            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        local socket_path="${ADMISSION_SOCKET:-}" step_directory
+        if [[ -n "$socket_path" && "$socket_path" != /* ]] && step_directory=$(pwd -P); then
+            socket_path="$step_directory/$socket_path"
+        fi
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}" "$socket_path"
         export BUILDLOG_RESERVED_STEP
     fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
@@ -171,7 +194,8 @@ buildlog_exec() {
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
@@ -180,10 +204,17 @@ buildlog_exec() {
     "$@"
 }
 
+close_verify_exit_stderr() {
+    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+    fi
+    unset VERIFY_EXIT_STDERR_FD
+}
+
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
         BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
-        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
+        "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
 # buildlog_end STATUS LOG TTY ARGV...
@@ -200,8 +231,11 @@ buildlog_end() {
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
         buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
-        ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+        (
+            trap '' HUP
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} &
+        )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
@@ -472,7 +506,7 @@ run_step_attempt() {
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -569,6 +603,18 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        local fd
+        local -a copy_lease_fds=()
+        IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
+        for fd in ${copy_lease_fds[@]+"${copy_lease_fds[@]}"} \
+            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}"; do
+            if [[ "$fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
+                eval "exec $fd>&-"
+            fi
+        done
+        unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
+        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
@@ -583,15 +629,16 @@ sweep_after_step() {
 # Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
     local error
-    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+    if ! error=$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo nextest --version 2>&1 >/dev/null
+    ); then
         echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
 }
 
-# The nextest width mode: trial alternates physical and logical by block, and
-# physical or logical fixes the width. The trial block length must stay in sync
-# with BLOCK_S in scripts/buildlog/width_trial.py.
+# Use the logical or physical core count for the nextest width.
 LINT_TEST_WIDTH=logical
 
 nextest_physical_cores() {
@@ -633,24 +680,14 @@ nextest_logical_cores() {
     return 0
 }
 
-nextest_width_arm() {
-    local epoch="$1"
-    if (( (epoch / 6000) % 2 == 0 )); then
-        LINT_TEST_WIDTH_ARM=physical
-    else
-        LINT_TEST_WIDTH_ARM=logical
-    fi
-}
-
 # On a host whose CARGO_MAKEFLAGS names a jobserver pool (natedev's
 # /dev/steve), a test run holds one pool token for each test thread, so test
 # threads and compile jobs share the one CPU pool. run_once runs the step
 # through nextest_tokens.py, inside the step's scope: it builds with --no-run
 # while it holds no test token, takes the tokens, and runs the tests at one
 # thread for each token. It writes that width to LINT_NEXTEST_WIDTH_FILE, and
-# run_once records the step at that width. The trial mode takes no tokens,
-# since width_trial.py names its arm by width. A host with no pool (the Mac)
-# runs at the mode's width.
+# run_once records the step at that width.
+# A host without a pool runs at the selected width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
 LINT_TEST_TOKENS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_tokens.py"
 
@@ -728,7 +765,7 @@ run_nextest() {
         build_hold_wait_local || return $?
     fi
 
-    local arg arm="" width="" LINT_NEXTEST_POOL=""
+    local arg width="" LINT_NEXTEST_POOL=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
         for arg in "$@"; do
             case "$arg" in
@@ -743,15 +780,6 @@ run_nextest() {
         done
 
         case "$LINT_TEST_WIDTH" in
-            trial)
-                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
-                arm="$LINT_TEST_WIDTH_ARM"
-                ;;
-            physical|logical)
-                arm="$LINT_TEST_WIDTH"
-                ;;
-        esac
-        case "$arm" in
             physical)
                 nextest_physical_cores
                 width="${LINT_PHYSICAL_CORES:-}"
@@ -762,7 +790,7 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            [[ "$LINT_TEST_WIDTH" == trial ]] || nextest_token_pool
+            nextest_token_pool
             run cargo nextest run --test-threads "$width" "$@"
             return
         fi
@@ -781,13 +809,19 @@ fmt_cargo() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
-            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                cargo +nightly fmt --version
+            ) > "$version_file" 2>/dev/null || : > "$version_file"
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
             exit 2
         fi
-    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    elif ! (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo +nightly fmt --version
+    ) >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi
@@ -885,5 +919,5 @@ invoke_sweep() {
         lint_config_skip_notice sweep "lint sweep"
         return 0
     fi
-    run "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" "$@"
+    run "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/sweep.py" "$@"
 }

@@ -14,10 +14,6 @@ ALLOW_LIST: dict[tuple[str, str], str] = {
         "Reads the current CODEX_THREAD_ID session.",
     ("scripts/direct/pass_record.py", "_main_identity_from_claude"):
         "Reads the current CLAUDE_CODE_SESSION_ID session.",
-    ("scripts/herdr/herdr.py", "TranscriptCursor.skip_existing_turns"):
-        "Records byte offsets for a running worker.",
-    ("scripts/herdr/herdr.py", "TranscriptCursor.read_turns"):
-        "Reads new turns from a running worker by byte offset.",
     ("scripts/accounts/refusal_watch.py", "session_refusals"):
         "Lists project folders; transcript_paths finds the transcript files.",
 }

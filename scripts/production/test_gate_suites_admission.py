@@ -73,7 +73,7 @@ class ServiceGateFixture(GateSuitesFixture):
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
     @gate_suites("lib", "hooks")
-    def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
+    def test_suite_progress_counts_test_modules_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
         counters: list[progress.ProgressCounter] = []
         sidecars: list[Path] = []
@@ -101,7 +101,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(gate, "start_gate_job", side_effect=start_job):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        initial_total = self.module_count + 1
+        initial_total = self.module_count
         self.assertEqual([counter for counter in counters if counter.phase == "suites:1"],
             [progress.ProgressCounter("suites:1", done, initial_total) for done in range(initial_total + 1)])
         self.assertEqual([counter for counter in counters if counter.phase != "suites:1"], [])
@@ -125,21 +125,23 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assert_gate_released()
 
     def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:
+        gate_root = self.root
         access = os.access
 
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
-            return False if Path(path) == build_folders.tmpfs_temporary_parent() else access(path, mode)
+            return False if Path(path) == gate_root else access(path, mode)
 
         with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(build_folders, "configured_gate_root", return_value=gate_root), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        f"requires writable tmpfs at {build_folders.tmpfs_temporary_parent()}"):
+                                        f"requires a writable gate folder at {gate_root}"):
                 _ = gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()
 
-    def test_suites_remove_free_gate_folders_before_admission_and_keep_held_ones(self) -> None:
+    def test_suites_report_old_gate_folders_and_keep_their_records(self) -> None:
         tmpfs = self.root / "gate-tmpfs"
         parent = gate.gate_test_parent(tmpfs)
         parent.mkdir(parents=True)
@@ -150,19 +152,24 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             "merge-gate-", build_folders.ExplicitBuildParent(parent)))
         release(free)
-        # Another program's folder in the shared tmpfs, with a free lock file beside it, is kept.
+        # The shared parent also holds a folder from another program.
         foreign = tmpfs / "foreign"
         foreign.mkdir()
         (tmpfs / "foreign.lock").touch()
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs), \
-             mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")):
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(build_folders, "configured_gate_root", return_value=tmpfs),
+              mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
+              redirect_stderr(io.StringIO()) as report):
             with self.assertRaisesRegex(GateRefused, "stopped at admission"):
                 _ = gate.run_suites(self.checkout)
-        self.assertFalse(free.exists())
-        self.assertFalse(free.with_name(free.name + ".lease.json").exists())
+        self.assertTrue(free.is_dir())
+        self.assertTrue(free.with_name(free.name + ".lease.json").is_file())
         self.assertTrue(held.is_dir())
         self.assertTrue(foreign.is_dir())
+        self.assertCountEqual(report.getvalue().splitlines(), [
+            f"kept for a manual removal list: {folder} (gate, an earlier test fixture created this folder)"
+            for folder in (held, free)
+        ])
         self.assert_gate_released()
 
     def test_gate_reservation_refuses_unusable_config_before_default_sizing_admission(self) -> None:
@@ -198,18 +205,34 @@ class SharedGateAdmissionTests(ServiceGateFixture):
     def test_gate_reservation_uses_the_shared_place_with_first_peak_and_hold(self) -> None:
         self.configure_gate("program_first_peak_gib.gate=0.5")
         hold = gate.BuildHoldWait()
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(gate, "queue_place", wraps=queue.queue_place) as acquire, \
-             mock.patch.object(hold, "wait_until_free", wraps=hold.wait_until_free) as before_check:
+        calls: list[str] = []
+        admits = hold.admits
+        connect = client.AcquisitionSockets.open
+
+        def check_hold() -> bool:
+            calls.append("hold check")
+            return admits()
+
+        def open_connection(sockets: client.AcquisitionSockets, request: client.AdmissionRequest,
+                            deadline: client.CheckDeadline) -> client.DeadlineStop | None:
+            calls.append("connection attempt")
+            return connect(sockets, request, deadline)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "queue_place", wraps=queue.queue_place) as acquire,
+              mock.patch.object(hold, "wait_until_free", wraps=hold.wait_until_free) as before_check,
+              mock.patch.object(hold, "admits", check_hold),
+              mock.patch.object(client.AcquisitionSockets, "open", open_connection)):
             with gate.gate_reservation(self.checkout, self.state, hold) as place:
                 path, row = self.reservation()
                 self.assertEqual(place.path, path)
                 self.assertEqual((row["step"], row["need"]), ("gate", 512 * 1024 * 1024))
                 place.observe(123 * 1024 * 1024, 123 * 1024 * 1024)
                 place.status = 0
+            self.assertEqual(calls, ["hold check", "connection attempt", "hold check"])
             acquire.assert_called_once_with("gate", self.checkout,
                 before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits))
-            before_check.assert_called_once_with()
+            before_check.assert_not_called()
         self.assert_gate_released()
         row, = self.gate_history()
         self.assertEqual(row["anon_peak_bytes"], 123 * 1024 * 1024)
@@ -258,32 +281,35 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         handle_request = fixture.server.handle_request
         first_gate_request = threading.Event()
 
-        def fit_older(request: wire.Request,
-                      connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        def keep_older_waiting(request: wire.Request,
+                               connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             with fixture.loop_turn():
                 if isinstance(request, wire.AdmitRequest) and request.owner != older.owner and not first_gate_request.is_set():
                     first_gate_request.set()
                     self.assertIn(older.episode, fixture.server.waiters)
-                    fixture.free(23 * admission_records.GIB // 2)
+                    fixture.free(11 * admission_records.GIB)
                 return handle_request(request, connection)
 
         admit = client.admit
         output = io.StringIO()
+        waits: list[wire.Wait] = []
 
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,
                     _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | client.LeftQueue:
             def held(reply: wire.Wait) -> None:
+                waits.append(reply)
                 on_wait(reply)
                 fixture.proc.kill(older.owner)
                 fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
         with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(fixture.server, "handle_request", side_effect=fit_older), \
+             mock.patch.object(fixture.server, "handle_request", side_effect=keep_older_waiting), \
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
                 pass
         self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
 
@@ -475,8 +501,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
-        self.assertEqual(kinds.count(gate.GateJobKind.TEST_MODULE), len(self.module_events()) // 2)
-        self.assertEqual(kinds.count(gate.GateJobKind.TYPE_CHECK), 1)
+        self.assertEqual(kinds, [gate.GateJobKind.TEST_MODULE] * (len(self.module_events()) // 2))
         self.assertEqual(len(paths), len(kinds) + 1)
         self.assertEqual(len(set(paths)), 1)
         self.assert_gate_released()
@@ -537,7 +562,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
 
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
-            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:

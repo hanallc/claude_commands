@@ -6,27 +6,42 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 import fcntl
-import inspect
 import json
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import time
-from typing import cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
-from scripts.lib import conf
+if TYPE_CHECKING:
+    from scripts.lib import conf
 
 
 CONTROL = Path('/var/lib/hana-aws')
+IMAGE_RUNTIME = Path('/var/lib/hana-runtime')
 DATA = Path('/var/lib/hana')
-PERMIT = Path('/run/hana-aws/work-permit.json')
-GENERATION = Path('/run/hana-aws/generation')
+RUNNER_HOME = DATA / 'runner'
+PERMIT = Path('/run/hana-aws/active-work-permit.json')
 BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 WORK_SLICE = 'hana-work.slice'
 # NixOS gives a raw unit no system PATH; the guest programs run systemctl and systemd-run from here.
 SYSTEM_BIN = '/run/current-system/sw/bin'
+
+
+@dataclass(frozen=True)
+class PermitWindow:
+    enabled: bool
+    permit_max_seconds: int
+
+
+def read_permit_window(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> PermitWindow:
+    from scripts.lib import conf
+
+    return PermitWindow(configuration.value('enabled', conf.on_off, recover_invalid=recover_invalid),
+                        configuration.value('permit_max_seconds', conf.positive_whole, recover_invalid=recover_invalid))
 
 
 @dataclass(frozen=True)
@@ -55,15 +70,15 @@ def decode_settings(values: Mapping[str, object]) -> SafetySettings:
     return SafetySettings(enabled, **numbers)
 
 
-def read_settings(configuration: conf.ConfigRead) -> SafetySettings:
+def read_settings(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> SafetySettings:
     """Read Hana settings without reading deployment or credential files."""
-    enabled = configuration.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    values: dict[str, object] = {'enabled': enabled == 'on'}
-    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds', 'step_cpu_limit',
+    from scripts.lib import conf
+
+    permit = read_permit_window(configuration, recover_invalid=recover_invalid)
+    values: dict[str, object] = {'enabled': permit.enabled, 'permit_max_seconds': permit.permit_max_seconds}
+    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'step_cpu_limit',
                 'step_memory_gib', 'mount_timeout_seconds'):
-        values[key] = configuration.whole(key)
+        values[key] = configuration.value(key, conf.positive_whole, recover_invalid=recover_invalid)
     return decode_settings(values)
 
 
@@ -76,41 +91,75 @@ class WorkPermit:
     boot_id: str
 
 
+class PermitRefusal(StrEnum):
+    NOT_INSTALLED = 'no permit record is installed'
+    UNREADABLE = 'no valid permit record is readable'
+    BOOT_MISMATCH = 'the permit does not match the current boot'
+    INVALID_EXPIRY = 'the permit expiry is invalid'
+    WALL_CLOCK_EXPIRED = 'the wall-clock expiry has passed'
+    OUTSIDE_WINDOW = 'the expiry exceeds the permit renewal window'
+    DEADLINE_UNREADABLE = 'the saved boot-clock deadline is unreadable'
+    BOOT_CLOCK_EXPIRED = 'the boot-clock deadline has passed'
+
+
 @dataclass(frozen=True)
 class NoWorkPermit:
-    """The guest has no readable, valid permit record."""
+    """The guest cannot use the permit record."""
+    reason: PermitRefusal = PermitRefusal.UNREADABLE
 
 
 Permit = WorkPermit | NoWorkPermit
 
 
+def _generation_number(generation: str) -> int:
+    if generation.isascii() and generation.isdecimal():
+        number = int(generation)
+        if number > 0:
+            return number
+    raise ValueError('The Hana permit generation is invalid')
+
+
 def read_permit(path: Path) -> Permit:
-    """Treat missing, unreadable, and malformed records as absent permission."""
+    """Read the permit and record the reason if the guest cannot use it."""
     try:
         raw = cast(object, json.loads(path.read_text()))
         if not isinstance(raw, dict):
             return NoWorkPermit()
         row = cast(dict[str, object], raw)
-        expires, generation, boot_id = row['expires_at'], row['generation'], row['boot_id']
-        if (isinstance(expires, bool) or not isinstance(expires, (int, float))
-                or not math.isfinite(expires) or expires <= 0):
+        generation, boot_id = row['generation'], row['boot_id']
+        if not isinstance(generation, str):
             return NoWorkPermit()
-        if not isinstance(generation, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', generation):
-            return NoWorkPermit()
+        _ = _generation_number(generation)
         if not isinstance(boot_id, str) or not boot_id.strip():
             return NoWorkPermit()
+        expires = row.get('expires_at')
+        if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+                or not math.isfinite(expires) or expires <= 0):
+            return NoWorkPermit(PermitRefusal.INVALID_EXPIRY)
         return WorkPermit(float(expires), generation, boot_id)
-    except (OSError, UnicodeError, ValueError, KeyError, OverflowError):
+    except FileNotFoundError:
+        return NoWorkPermit(PermitRefusal.NOT_INSTALLED)
+    except OverflowError:
+        return NoWorkPermit(PermitRefusal.INVALID_EXPIRY)
+    except (OSError, UnicodeError, ValueError, KeyError):
         return NoWorkPermit()
 
 
-def fresh_permit(settings: SafetySettings, permit: Permit, generation: str, boot_id: str,
-                 clock: Callable[[], float]) -> bool:
-    """Require current identity and an expiry within one configured renewal window."""
-    return (isinstance(permit, WorkPermit) and bool(generation) and bool(boot_id)
-            and permit.generation == generation and permit.boot_id == boot_id
-            and math.isfinite(permit.expires_at)
-            and 0 < permit.expires_at - clock() <= settings.permit_max_seconds)
+def check_permit(settings: SafetySettings, permit: Permit, boot_id: str,
+                 now: float) -> WorkPermit | PermitRefusal:
+    """Require the current identity and a bounded wall-clock expiry."""
+    if isinstance(permit, NoWorkPermit):
+        return permit.reason
+    if not boot_id or permit.boot_id != boot_id:
+        return PermitRefusal.BOOT_MISMATCH
+    if not math.isfinite(permit.expires_at) or permit.expires_at <= 0:
+        return PermitRefusal.INVALID_EXPIRY
+    remaining = permit.expires_at - now
+    if remaining <= 0:
+        return PermitRefusal.WALL_CLOCK_EXPIRED
+    if not remaining <= settings.permit_max_seconds:
+        return PermitRefusal.OUTSIDE_WINDOW
+    return permit
 
 
 @dataclass(frozen=True)
@@ -122,11 +171,7 @@ class GuestPaths:
 
     @property
     def permit(self) -> Path:
-        return self.directory / 'work-permit.json'
-
-    @property
-    def generation(self) -> Path:
-        return self.directory / 'generation'
+        return self.directory / PERMIT.name
 
     @property
     def lock(self) -> Path:
@@ -189,7 +234,7 @@ class PermitDeadlineUnreadable:
     """A damaged deadline cannot grant another renewal window."""
 
 
-BoundPermit = PermitDeadline | NoWorkPermit
+BoundPermit = PermitDeadline | PermitRefusal
 PreviousDeadline = PermitDeadline | FirstPermitRead | PermitDeadlineUnreadable
 
 
@@ -213,16 +258,19 @@ def read_deadline(path: Path) -> PreviousDeadline:
 
 
 def observe_permit(settings: SafetySettings, permit: Permit, previous: PreviousDeadline,
-                   generation: str, boot_id: str, *, clock: Callable[[], float],
+                   boot_id: str, *, clock: Callable[[], float],
                    uptime: Callable[[], float]) -> BoundPermit:
     """Bound each new permit read without extending an unchanged permit's boot-clock deadline."""
-    if (isinstance(previous, PermitDeadlineUnreadable)
-            or not fresh_permit(settings, permit, generation, boot_id, clock)):
-        return NoWorkPermit()
-    assert isinstance(permit, WorkPermit)
-    if isinstance(previous, PermitDeadline) and previous.permit == permit:
-        return previous if uptime() < previous.monotonic_deadline else NoWorkPermit()
-    return PermitDeadline(permit, uptime() + min(settings.permit_max_seconds, permit.expires_at - clock()))
+    if isinstance(previous, PermitDeadlineUnreadable):
+        return PermitRefusal.DEADLINE_UNREADABLE
+    boot_time = uptime()
+    now = clock()
+    checked = check_permit(settings, permit, boot_id, now)
+    if isinstance(checked, PermitRefusal):
+        return checked
+    if isinstance(previous, PermitDeadline) and previous.permit == checked:
+        return previous if boot_time < previous.monotonic_deadline else PermitRefusal.BOOT_CLOCK_EXPIRED
+    return PermitDeadline(checked, boot_time + (checked.expires_at - now))
 
 
 def bound_permit(settings: SafetySettings, paths: GuestPaths, *, clock: Callable[[], float],
@@ -230,20 +278,38 @@ def bound_permit(settings: SafetySettings, paths: GuestPaths, *, clock: Callable
     """Read and record permission while the caller holds the guest lock."""
     previous = read_deadline(paths.deadline)
     permit = observe_permit(settings, read_permit(paths.permit), previous,
-        read_identity(paths.generation), read_identity(paths.boot_id), clock=clock, uptime=uptime)
+        read_identity(paths.boot_id), clock=clock, uptime=uptime)
     if isinstance(permit, PermitDeadline) and permit != previous:
         atomic_record(paths.deadline, {**asdict(permit.permit), 'monotonic_deadline': permit.monotonic_deadline})
     return permit
 
 
-def write_permit(settings: SafetySettings, permit: WorkPermit, *, paths: GuestPaths = GUEST_PATHS,
+def write_permit(settings: SafetySettings, permit: WorkPermit, *, expected_generation: int,
+                 paths: GuestPaths = GUEST_PATHS,
                  clock: Callable[[], float] = time.time) -> None:
-    """Renew permission atomically unless the guest has fenced shutdown."""
+    """Install a permit or confirm an exact replay under the guest lock."""
+    generation = _generation_number(permit.generation)
     with guest_lock(paths):
         if paths.fence.exists():
-            raise ValueError('Shutdown is fenced; permit renewal is refused')
-        if not fresh_permit(settings, permit, read_identity(paths.generation), read_identity(paths.boot_id), clock):
-            raise ValueError('The permit identity or renewal window is invalid')
+            raise ValueError('Hana shutdown is fenced')
+        boot = read_identity(paths.boot_id)
+        current = read_permit(paths.permit)
+        if isinstance(check_permit(settings, permit, boot, clock()), PermitRefusal):
+            raise ValueError('The Hana permit identity or renewal window is invalid')
+        if current == permit:
+            return
+        if isinstance(current, WorkPermit):
+            if current.boot_id != boot:
+                raise ValueError('The installed Hana permit belongs to another boot')
+            previous = int(current.generation)
+        elif current.reason is PermitRefusal.NOT_INSTALLED:
+            previous = 0
+        else:
+            raise ValueError('The installed Hana permit is unreadable')
+        if type(expected_generation) is not int or expected_generation != previous:
+            raise ValueError('The Hana permit generation changed')
+        if generation <= previous:
+            raise ValueError('The Hana permit generation did not increase')
         atomic_record(paths.permit, asdict(permit))
 
 
@@ -269,9 +335,19 @@ class WatchdogAction(StrEnum):
 def watchdog_action(settings: SafetySettings, permit: BoundPermit, *, clock: Callable[[], float],
                     uptime: Callable[[], float]) -> WatchdogAction:
     """Decide without reading controller or command state."""
-    return (WatchdogAction.KEEP if isinstance(permit, PermitDeadline)
-            and fresh_permit(settings, permit.permit, permit.permit.generation, permit.permit.boot_id, clock)
-            and uptime() < permit.monotonic_deadline else WatchdogAction.STOP)
+    checked = check_deadline(settings, permit, clock=clock, uptime=uptime)
+    return WatchdogAction.KEEP if isinstance(checked, PermitDeadline) else WatchdogAction.STOP
+
+
+def check_deadline(settings: SafetySettings, permit: BoundPermit, *, clock: Callable[[], float],
+                   uptime: Callable[[], float]) -> BoundPermit:
+    if isinstance(permit, PermitRefusal):
+        return permit
+    work = permit.permit
+    checked = check_permit(settings, work, work.boot_id, clock())
+    if isinstance(checked, PermitRefusal):
+        return checked
+    return permit if uptime() < permit.monotonic_deadline else PermitRefusal.BOOT_CLOCK_EXPIRED
 
 
 def stop_work(run: Callable[[list[str]], None]) -> None:
@@ -296,6 +372,43 @@ def _command_arguments(settings: SafetySettings, generation: str,
             '--property=KillMode=control-group', '--working-directory=' + str(directory), '--', *command]
 
 
+class CommandAdmissionRefusalCode(StrEnum):
+    ADMISSION_DISABLED = 'admission-disabled'
+    DATA_NOT_MOUNTED = 'data-not-mounted'
+    PERMIT_REJECTED = 'permit-rejected'
+    RUNTIME_ABI_MISMATCH = 'runtime-abi-mismatch'
+    PRE_COMMAND_FAILED = 'pre-command-failed'
+
+
+class GuestAdmissionDisabled(ValueError):
+    code: ClassVar[CommandAdmissionRefusalCode] = CommandAdmissionRefusalCode.ADMISSION_DISABLED
+
+    def __init__(self) -> None:
+        super().__init__('Hana command admission is disabled on the guest')
+
+
+class GuestDataNotMounted(ValueError):
+    code: ClassVar[CommandAdmissionRefusalCode] = CommandAdmissionRefusalCode.DATA_NOT_MOUNTED
+
+    def __init__(self) -> None:
+        super().__init__('The Hana data directory is not mounted')
+
+
+class GuestPermitRefused(ValueError):
+    code: ClassVar[CommandAdmissionRefusalCode] = CommandAdmissionRefusalCode.PERMIT_REJECTED
+
+    def __init__(self, reason: PermitRefusal) -> None:
+        super().__init__(f'The Hana permit is not fresh: {reason}')
+        self.reason: PermitRefusal = reason
+
+
+class GuestRuntimeAbiMismatch(ValueError):
+    code: ClassVar[CommandAdmissionRefusalCode] = CommandAdmissionRefusalCode.RUNTIME_ABI_MISMATCH
+
+    def __init__(self, requested: int, installed: int) -> None:
+        super().__init__(f'The Hana runtime ABI {requested} differs from the image ABI {installed}')
+
+
 def admit_command[StartedCommand](settings: SafetySettings, command: tuple[str, ...], directory: Path,
                                   *, mounted: bool, start: Callable[[list[str]], StartedCommand],
                                   paths: GuestPaths = GUEST_PATHS, clock: Callable[[], float] = time.time,
@@ -308,11 +421,14 @@ def admit_command[StartedCommand](settings: SafetySettings, command: tuple[str, 
     with guest_lock(paths):
         if paths.fence.exists():
             raise ValueError('Shutdown is fenced; command admission is refused')
-        permit = bound_permit(settings, paths, clock=clock, uptime=uptime)
-        if (not settings.enabled or not mounted
-                or watchdog_action(settings, permit, clock=clock, uptime=uptime) != WatchdogAction.KEEP):
-            raise ValueError('The data mount and a fresh permit are required')
-        assert isinstance(permit, PermitDeadline)
+        if not settings.enabled:
+            raise GuestAdmissionDisabled()
+        if not mounted:
+            raise GuestDataNotMounted()
+        permit = check_deadline(settings, bound_permit(settings, paths, clock=clock, uptime=uptime),
+                               clock=clock, uptime=uptime)
+        if isinstance(permit, PermitRefusal):
+            raise GuestPermitRefused(permit)
         return start(_command_arguments(settings, permit.permit.generation, command, directory))
 
 
@@ -333,7 +449,7 @@ def run_safety(mode: str, settings: SafetySettings, *, clock: Callable[[], float
         raise ValueError('Expected guard or watchdog')
     while True:
         delay = 0.0
-        permit: BoundPermit = NoWorkPermit()
+        permit: BoundPermit = PermitRefusal.UNREADABLE
         with guest_lock(paths):
             if paths.fence.exists():
                 stopping = True
@@ -368,39 +484,25 @@ class GuestFile:
 
 
 def guest_program() -> str:
-    """Use the gate guest's source-rendering idiom without copying decision logic."""
-    definitions = (SafetySettings, decode_settings, WorkPermit, NoWorkPermit, read_permit, fresh_permit,
-                   GuestPaths, guest_lock, atomic_record, PermitDeadline, FirstPermitRead, PermitDeadlineUnreadable,
-                   read_deadline, observe_permit, bound_permit, write_permit, GuardAction, guard_action,
-                   WatchdogAction, watchdog_action, stop_work, _command_arguments, admit_command, read_identity, run_safety)
-    header = ('from __future__ import annotations\n'
-              'from collections.abc import Callable, Generator, Mapping\nfrom contextlib import contextmanager\n'
-              'from dataclasses import asdict, dataclass\n'
-              'from enum import StrEnum\nfrom pathlib import Path\nfrom typing import cast\n'
-              'import fcntl, json, math, os, re, subprocess, sys, tempfile, time\n')
-    constants = ''.join(f'{name} = Path({str(value)!r})\n' for name, value in (
-        ('CONTROL', CONTROL), ('DATA', DATA), ('PERMIT', PERMIT), ('GENERATION', GENERATION), ('BOOT_ID', BOOT_ID)))
-    program = header + constants + f'WORK_SLICE = {WORK_SLICE!r}\n'
-    for definition in definitions:
-        program += inspect.getsource(definition) + '\n'
-        if definition is GuestPaths:
-            program += 'GUEST_PATHS = GuestPaths(PERMIT.parent, BOOT_ID)\n'
-    program += '''
-Permit = WorkPermit | NoWorkPermit
-BoundPermit = PermitDeadline | NoWorkPermit
-PreviousDeadline = PermitDeadline | FirstPermitRead | PermitDeadlineUnreadable
-
-def main():
-    values = json.loads((CONTROL / 'safety.json').read_text())
-    settings = decode_settings(values)
-    def run(command):
-        subprocess.run(command, check=True, timeout=settings.watchdog_check_seconds)
-    run_safety(sys.argv[1], settings, run=run)
-
+    """Load safety from the installed image closure."""
+    return f'''import sys
+sys.path.insert(0, {str(IMAGE_RUNTIME)!r})
+from scripts.aws_target.hana_guest import installed_main
 if __name__ == '__main__':
-    main()
+    installed_main(sys.argv[1])
 '''
-    return program
+
+
+def installed_main(mode: str) -> None:
+    raw = cast(object, json.loads((CONTROL / 'safety.json').read_text()))
+    if not isinstance(raw, dict):
+        raise ValueError('Hana safety settings must be an object')
+    settings = decode_settings(cast(dict[str, object], raw))
+
+    def run(command: list[str]) -> None:
+        _ = subprocess.run(command, check=True, timeout=settings.watchdog_check_seconds)
+
+    run_safety(mode, settings, run=run)
 
 
 def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path | None = None) -> tuple[GuestFile, ...]:
@@ -410,7 +512,7 @@ def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path | N
             continue
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('Expected an absolute device or setup path')
-    prefix = f'{SYSTEM_BIN}/python3 {CONTROL}/safety.py'
+    prefix = f'{SYSTEM_BIN}/python3 -I {CONTROL}/safety.py'
     guard = f'''[Unit]
 Description=Hana boot permit guard
 DefaultDependencies=no

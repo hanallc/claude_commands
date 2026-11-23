@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
+from scripts.build_queue.admission_test_support import (
+    PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
+)
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
 from scripts.lib.berth_test_support import write_unconfigured_berth
-from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
+from scripts.lib.checkout_test_support import python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
+                                              write_pressure_reading)
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
@@ -29,9 +34,10 @@ import unittest
 import contextlib
 from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from secrets import token_hex
 from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
@@ -44,6 +50,30 @@ from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+
+
+_REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+
+
+def drop_released_mac_claim(reader: service.HostEvidenceReader, claim: placement.ProviderClaimReference) -> None:
+    worker, key = reader.worker, reader.key
+    with worker.lock:
+        cached = worker.observations.get(key)
+        if isinstance(cached, placement.FreshHostEvidence):
+            updated = replace(cached,
+                claims=tuple(held for held in cached.claims if held.reference != claim),
+                cleanup_claims=tuple(held for held in cached.cleanup_claims if held.reference != claim),
+                executions=tuple(execution for execution in cached.executions if execution[0] != claim))
+            if isinstance(updated, PrivateHostEvidence) and updated.holder_claim == claim:
+                updated = replace(updated, holder=placement.ResourceHolderUnknown(),
+                    holder_claim=placement.NoProviderClaim(), provider_diagnostic=placement.NO_PROVIDER_DIAGNOSTIC)
+            if updated != cached:
+                worker.observations[key] = updated
+        if key in worker.subscriptions:
+            # Discard probes that started before the claim release.
+            worker.subscriptions[key] = object()
+            worker.due[key] = float("-inf")
+            worker.requested.set()
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -186,10 +216,15 @@ def hold_recorder_exits(timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None
     launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
     start = threading.Thread.start
 
-    def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
-        process = launch(*arguments, **options)
-        children.append(process)
-        return process
+    def launch_owned(args: object, *arguments: object, **options: object) -> subprocess.Popen[bytes]:
+        if isinstance(args, list) and cast(Sequence[object], args)[2:3] == ["hold-event"]:
+            environment = verify_test_environment()
+            environment["BUILDLOG_DIR"] = os.environ["BUILDLOG_DIR"]
+            options["env"] = environment
+            process = launch(args, *arguments, **options)
+            children.append(process)
+            return process
+        return launch(args, *arguments, **options)
 
     def start_owned(thread: threading.Thread) -> None:
         if thread.name != "hold-event-recorder":
@@ -477,6 +512,8 @@ if has "$@"; then
     if ! has "$@"; then printf 'Cargo.toml\0'; fi
     exit 0
 fi
+wanted=--max-parents=0
+if has "$@"; then printf '%s\n' "${TEST_ROOT_COMMIT:?}"; exit 0; fi
 for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
@@ -493,7 +530,7 @@ fi
 '''
 
 
-ASSIGNED_RUNNER_SETUP = r'''
+ASSIGNED_RUNNER_SETUP = rf'''
 if "--assignment-file" in arguments:
     import atexit
     import io
@@ -501,8 +538,8 @@ if "--assignment-file" in arguments:
     from contextlib import redirect_stdout
 
     with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
-        exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+        exec(package_root.read(), {{"__file__": package_root.name}})
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
     from scripts.mac_test import mac_test as assigned_mac_test, claim_state
     from scripts.lib import process_start
 
@@ -521,6 +558,16 @@ if "--assignment-file" in arguments:
     with redirect_stdout(io.StringIO()):
         claim_status = assigned_mac_test.command_claim(claim_args, paths, watch_claim=False,
             session=assignment.session, assignment=assignment)
+    if claim_status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        from scripts.mac_test import offload
+
+        reason = claim_state.MAC_HISTORY_KEY_UNAVAILABLE
+        status = offload.write_result(offload.DeclinedMacRun(reason, 0), offload.ResultFile(result))
+        try:
+            _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assignment.episode, assignment.owner, reason))
+        except wire.AdmissionUnavailable as error:
+            print(f"fixture cancellation failed: {{error}}", file=sys.stderr, flush=True)
+        raise SystemExit(status)
     if claim_status != 0:
         raise SystemExit(75)
     held, = [held for held in claim_state.read_claims(paths) if held.record["pid"] == os.getpid()]
@@ -530,7 +577,7 @@ if "--assignment-file" in arguments:
     start = process_start.process_start(os.getpid())
     assert isinstance(start, process_start.Started)
     holder = placement.ClaimHolderIdentity(assignment.owner.host, os.getpid(), start.start)
-    permission_deadline = time.monotonic() + 10
+    permission_deadline = time.monotonic() + {TEST_HANG_GUARD_SECS}
     while True:
         permission = admission_client.consume_permission(wire.ConsumePermission(uuid.uuid4().hex, assignment, reference, holder))
         if isinstance(permission, wire.FirstAuthorization):
@@ -546,7 +593,7 @@ if "--assignment-file" in arguments:
         output.write(assignment.attempt + "\n")
 
     fixture_outcome = placement.AttemptOutcomeUnavailable("the execution has not settled")
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
     fixture_cleanup_confirmed = False
 
     def finish_assigned() -> None:
@@ -586,7 +633,7 @@ result = Path(arguments[arguments.index("--result") + 1])
 ''' + ASSIGNED_RUNNER_SETUP + r'''
 if "--assignment-file" in arguments:
     fixture_outcome = placement.PrelaunchRefused("runner")
-    fixture_evidence = placement.ExecutionNotStarted()
+    fixture_evidence = execution_identity.ExecutionNotStarted()
     fixture_cleanup_confirmed = True
 if "--copy" in arguments:
     # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
@@ -636,7 +683,7 @@ if "--copy" in arguments:
         wait_for_file(root / "copy-release")
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_COPY_STATUS", "1")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
                       + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
     release_copy_claim()
@@ -665,7 +712,7 @@ def decline(reason: str, seconds: str) -> None:
     if "--assignment-file" in arguments:
         fixture_outcome = (placement.AttemptDeclined(reason) if reason in ("no_tests", "lost")
                            else placement.PrelaunchRefused(reason))
-        fixture_evidence = placement.ExecutionNotStarted()
+        fixture_evidence = execution_identity.ExecutionNotStarted()
     refusal = root / "placement-refusal.json"
     ready = refusal.with_suffix(".ready")
     ready.write_text(json.dumps({"reason": reason or "runner", "attempt": attempt,
@@ -720,10 +767,10 @@ if verb_answer.exists():
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     elif mode == "lost":
         fixture_outcome = placement.AttemptDeclined("lost")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
 if mode in ("passed", "failed", "lost"):
     print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
 if mode == "none":
@@ -810,15 +857,20 @@ if __name__ == "__main__":
 SLEEP_STUB = r'''#!/bin/sh
 # Record the requested interval; only explicit routing gates block this fixture.
 root=$TEST_RUNNER_STATE
+count_events() {
+    count=0
+    if [ -s "$1" ]; then
+        while IFS= read -r line; do count=$((count + 1)); done < "$1"
+    fi
+}
 if [ "${TEST_PROVIDER_ROUTE_POLL_GATES:-0}" = 1 ]; then
     if [ "$1" != "${BUILD_TARGETS_POLL_S:-15}" ]; then
         exec "$TEST_REAL_SLEEP" "$@"
     fi
-    attempts=0
-    previous=0
-    if [ -s "$root/runner-events.jsonl" ]; then attempts=$(wc -l < "$root/runner-events.jsonl"); fi
-    if [ -s "$root/sleep-events" ]; then previous=$(wc -l < "$root/sleep-events"); fi
-    if [ "$attempts" -le "$previous" ]; then exit 0; fi
+    count_events "$root/runner-events.jsonl"
+    attempts=$count
+    count_events "$root/sleep-events"
+    if [ "$attempts" -le "$count" ]; then exit 0; fi
 fi
 if [ "${TEST_ROUTE_SLEEP_AFTER_RUNNER:-0}" = 1 ] && [ ! -s "$root/runner-events.jsonl" ]; then
     exit 0
@@ -826,8 +878,8 @@ fi
 printf '%s\n' "$1" >> "$root/sleep-events"
 gate=""
 if [ "${TEST_STEP_ROUTING_SLEEP:-0}" = 1 ]; then
-    step=$(wc -l < "$root/sleep-events")
-    step=$((step + 0))
+    count_events "$root/sleep-events"
+    step=$count
     printf 'sleeping\n' > "$root/routing-sleep"
     printf 'sleeping\n' > "$root/routing-sleep-$step"
     gate="$root/continue-sleep-$step"
@@ -994,13 +1046,14 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.fixture_paths()
             self.environment = self.fixture_environment.copy()
+            self.environment["TEST_ROOT_COMMIT"] = token_hex(20)
         else:
             # Standalone consumers own their fixture through doCleanups().
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
         admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.05)
+        admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             self.provider_observations.append(key)
@@ -1068,17 +1121,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     reason = (reason_file.read_text().strip() if reason_file.exists()
                               else self.placement_policy.get("TEST_RUNNER_BUSY_REASON", "busy"))
                     eligibility = placement.TemporaryExclusion(reason)
-                else:
-                    try:
-                        probe = subprocess.run(
-                            [str(self.bin_directory / "ssh"), values.get("host", destination.host), "true"],
-                            env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
-                            check=False, timeout=1)
-                        unreachable = probe.returncode != 0
-                    except (OSError, subprocess.TimeoutExpired):
-                        unreachable = True
-                    if unreachable:
-                        eligibility = placement.TemporaryExclusion("unreachable")
+                elif not self.ssh_probe_reaches(values.get("host", destination.host)):
+                    eligibility = placement.TemporaryExclusion("unreachable")
             directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
                          self.home / ".local/state/build-targets" / destination.target)
             controller = directory / "controller.json"
@@ -1092,9 +1136,44 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
         _ = caller_provider_controls(self, admission)
+        handle_request = admission.server.handle_request
+
+        def refresh_after_release(request: wire.Request,
+                                  connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                                  ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            if (isinstance(request, wire.ExecutionReport)
+                    and request.assignment.destination.provider == "mac"
+                    and isinstance(request.claim, placement.ProviderClaimReference)
+                    and (request.claim.episode, request.claim.attempt) == (request.assignment.episode, request.assignment.attempt)
+                    and isinstance(request.path, placement.DispatchPathSettled)
+                    and isinstance(request.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))):
+                assignment = request.assignment
+                key = admission.server.placement_host_keys.get((assignment.episode, assignment.destination))
+                reader = admission.server.host_readers.get(key) if key is not None else None
+                if reader is not None:
+                    drop_released_mac_claim(reader, request.claim)
+            return replies
+
+        admission.server.handle_request = refresh_after_release
+
+    def ssh_probe_reaches(self, host: str) -> bool:
+        ssh = self.bin_directory / "ssh"
+        try:
+            if ssh.read_bytes() == _REACHABLE_SSH_STUB and os.access(ssh, os.X_OK):
+                return True
+        except OSError:
+            pass
+        try:
+            probe = subprocess.run([str(ssh), host, "true"], env=self.environment,
+                                   stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return probe.returncode == 0
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
+        self.verify_script = self.home / ".claude/scripts/direct/verify.sh"
         self.bin_directory = self.root / "bin"
         self.board = self.root / "board"
         self.runner_state = self.root / "runner-state"
@@ -1107,14 +1186,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         claude = self.home / ".claude"
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
-        (claude / "config").symlink_to(VERIFY.parent.parent.parent / "config", target_is_directory=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "buildlog":
-                (scripts / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(self.home, *VERIFY_HELPERS)
+        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
         log = scripts / "buildlog"
-        log.mkdir()
-        self.write_executable(log / "record.py", RECORD_WRAPPER)
-        copy_runtime(claude, configuration=False)
+        # Keep the recorder's import interface while the command records fixture observations.
+        record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()
+        record_library = record_source.partition('\nif __name__ == "__main__":')[0]
+        self.write_executable(log / "record.py", record_library + RECORD_WRAPPER)
         self.bin_directory.mkdir()
         self.runner_state.mkdir()
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
@@ -1127,7 +1205,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
-        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
+        self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB.decode("utf-8"))
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1163,7 +1241,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
         config = self.root / "build_targets.conf"
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
-                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
@@ -1186,24 +1264,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             ],
         }
         self.environment = {
+            **verify_test_environment(),
             **config_environment(self.root),
-            **{
-                name: value
-                for name, value in os.environ.items()
-                if name
-                not in {
-                    "CODEX_THREAD_ID",
-                    "CODEX_SESSION_ID",
-                    "BUILDLOG_MAC",
-                    "BUILDLOG_MAC_REASON",
-                    "BUILDLOG_LOCAL_REASON",
-                    "BUILDLOG_MAC_S",
-                    "BASH_ENV",
-                    "ENV",
-                }
-                # Fixture calls must not update the outer run or use its folders.
-                and not name.startswith(("BASH_FUNC_", "UNIT_"))
-            },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
             "RUSTUP_HOME": str(self.root / "rustup"),
@@ -1239,7 +1301,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
-            "BUILD_TARGETS_POLL_S": "0.05",
+            "BUILD_TARGETS_POLL_S": "0.25",
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
             "UNIT_RUN_DIR": str(self.board),
@@ -1254,17 +1316,22 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "holder_pid"),
             "TEST_METADATA": json.dumps(metadata),
+            "TEST_ROOT_COMMIT": token_hex(20),
             "TEST_RUNNER_SECONDS": "3.25",
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
         private = copies_environment(self.root)
         configuration = Path(self.environment["CONF_DIR"])
-        if configuration != Path(private["CONF_DIR"]):
-            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        settings_source = Path(private["CONF_DIR"]) / "build_folders.conf"
+        settings_lines = [
+            line for line in settings_source.read_text(encoding="utf-8").splitlines()
+            if (key := line.partition("=")[0].strip()) != "patterns.tool" and not key.startswith("patterns.tool.")
+        ]
+        settings_lines.append("patterns.tool={purpose}{suffix}")
+        _ = (configuration / settings_source.name).write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
-        _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def write_executable(self, path: Path, source: str) -> None:
         # Private tools may start as links; replacing one must never edit its target.
@@ -1283,7 +1350,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         path = self.runner_state / f"direct-{target}-{verb}.assignment"
         settings = self.root / ("linux.conf" if target == "peer" else "mac settings.conf")
-        with mock.patch.dict(os.environ, self.environment):
+        with mock.patch.dict(os.environ, self.environment, clear=True):
             args = offload.parser().parse_args(["run", "--repo-root", str(self.root),
                 "--package", "sample", "--settings", str(settings), "--target", target,
                 "--verb", verb, "--kind", kind, "--call-id", f"fixture-{os.getpid()}-{target}-{verb}",
@@ -1308,11 +1375,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
-            "collect_child", "verify_helper",
+            "collect_child", "remove_tool_folder", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
-            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
+            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "remove_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
@@ -1329,6 +1396,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         setup = r'''
 set -euo pipefail
 PY=$TEST_REAL_DIRECT/../lib/py
+VERIFY_START_DIR=$TEST_REAL_DIRECT
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
@@ -1358,10 +1426,11 @@ MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB=""
 PINNED_TARGET="" STEP_FORCE_MAC=0
-PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
+PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_ATTEMPT="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
-LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$TEST_REAL_DIRECT/local_release_wait.py}
+admit_verify_run() { :; }
+LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scripts/direct/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
@@ -1494,7 +1563,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             holders = Path(self.environment["BUILD_HOLD_DIR"])
             _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
             return self.root / "release" / cycle["id"] / "cycle.json"
 
     def control_routing_clock(self) -> Path:
@@ -1506,7 +1575,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         direct.mkdir(parents=True)
         for sibling in VERIFY.parent.parent.iterdir():
             if sibling.name != "direct":
-                (scripts / sibling.name).symlink_to(sibling, target_is_directory=sibling.is_dir())
+                selected = self.home / ".claude/scripts" / sibling.name if sibling.name == "buildlog" else sibling
+                (scripts / sibling.name).symlink_to(selected, target_is_directory=selected.is_dir())
         for helper in VERIFY.parent.iterdir():
             if helper.name != "verify.sh":
                 (direct / helper.name).symlink_to(helper, target_is_directory=helper.is_dir())
@@ -1619,6 +1689,9 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                         return
                     for process in processes:
                         if process.poll() is not None:
+                            # A process can exit after the first condition check.
+                            if condition():
+                                return
                             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                             self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
                     remaining = deadline - time.monotonic()
@@ -1731,13 +1804,13 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                     *, repeat_decline: bool = True) -> None:
         clock = self.control_routing_clock()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        admission = caller_admission(self, self.root, self.environment)
         if wait_kind == "routing":
             _ = self.routing_fixture()
         elif wait_kind == "first_hold":
             _ = self.routing_fixture()
             record = self.root / "hold-after-routing.json"
             _ = (Path(self.environment["BUILD_HOLD_DIR"]) / "hana").replace(record)
-            admission = caller_admission(self, self.root, self.environment)
             previous = admission.server.handle_request
             published = False
 
@@ -1753,10 +1826,20 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 
         else:
             meminfo = self.hold_memory()
+        notice = self.runner_state / "mac-retry-notice"
+        reply_filter = admission.server.reply_filter
+
+        def observe_retry(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and any(item.target == "mac" for item in reply.retry_notices):
+                notice.touch()
+            return reply_filter(reply)
+
+        admission.server.reply_filter = observe_retry
         self.set_mac_answer(mode, reason, 75)
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(notice, (process,))
         self.wait_for_retry_probe(100, process)
         self.assertEqual(len(self.runner_events()), 1)
 
@@ -1769,7 +1852,6 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                     build_hold.HolderIdentity("hana", "hana"), "render checks",
                     build_hold.NoReleaseEta(), datetime.now().astimezone())
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-        admission = caller_admission(self, self.root, self.environment)
         episode = self.runner_episode()
         if wait_kind in ("hold", "first_hold"):
             self.wait_until(lambda: any(candidate.destination.provider == "local"

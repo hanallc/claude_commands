@@ -1,18 +1,15 @@
-"""Write the status line's counts row for one production: its `For you: …` line, as its footer counts it.
+"""Write session review counts.
 
 Usage: counts_row.py <notifier instance dir>
        counts_row.py --unit <staff id>
 
-statusline.sh runs this when a source file changes or a cached deadline passes.
-The cache is `<showrunner state>/counts/<staff id>`:
-
-  line 1  the counts line, empty when nothing is counted;
-  line 2  the epoch second for a deferred question or a failed read retry, empty when neither applies;
-  then    each file the counts were read from, one per line. A file that does not exist yet is
-          named by its folder, which changes when the file appears.
-  last    `source=unit:<staff id>` for a unit cache.
-
-The cache's time is when the reading began, so a file changed while it ran is newer than it.
+assignment.py updates review counts when a source changes or a deadline passes.
+The review cache is `<showrunner state>/counts/<staff id>`.
+Its first line contains the review counts.
+Its second line contains the next deadline, or an empty value.
+The remaining lines contain watched paths and optional unit details.
+The final unit detail uses `source=unit:<staff id>`.
+The cache time records when the read began.
 """
 from __future__ import annotations
 try:
@@ -31,18 +28,17 @@ from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
 from scripts.review_links import review_items, review_later
 from scripts.production.update_registration import QuestionStaff
+from scripts.statusline.rebuild_row import write_status_cache as write_cache
 from scripts.lib.user_zone import user_zone
+
+try:
+    from scripts.review_links import for_you
+except Exception:
+    for_you = None
 
 
 def cache_path(name: str) -> Path:
     return showrunner_footer.state_root() / "counts" / name
-
-
-def watched(path: Path) -> Path:
-    """The path itself, or for one that does not exist yet its nearest folder that does."""
-    while not path.exists() and path.parent != path:
-        path = path.parent
-    return path
 
 
 def retry_due(sources: list[Path]) -> str:
@@ -71,7 +67,8 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
         identities = identities if identities is not None else QuestionStaff.for_record(record)
         questions, deadline = question_counts(member, user_zone(), identities, sources)
         count = review_items.ready_investigations(member.id, sources=sources)
-        return footer_counts.counts_line(footer_counts.FooterCounts(questions=questions, investigations=count)) or "", deadline
+        counts = footer_counts.FooterCounts(questions=questions, investigations=count)
+        return footer_counts.counts_line(counts) or "", deadline
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
@@ -168,17 +165,10 @@ def write_unit(identity: str) -> Path:
     return cache
 
 
-def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
-    """Replace the cache with the answer, deadline, source paths, and optional result details."""
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
-    named = dict.fromkeys(str(watched(path)) for path in sources)
-    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
-    os.utime(scratch, ns=(began, began))
-    _ = scratch.replace(cache)
-
-
 def main(argv: list[str]) -> int:
+    if argv in (["--for-you"], ["--for-you-console"]):
+        print(for_you.action_count(argv[0]) if for_you is not None else "unavailable")
+        return 0
     if len(argv) == 2 and argv[0] == "--unit":
         _ = write_unit(argv[1])
         return 0

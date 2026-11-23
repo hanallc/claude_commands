@@ -421,7 +421,7 @@ def mark_reviewed(unit: str, commits: list[str], review_pass: str) -> None:
 
 
 def check_command(command: list[str], repo: Path, environment: dict[str, str], deadline: float,
-                  *, types: bool = False, empty_suite: bool = False) -> None:
+                  *, empty_suite: bool = False) -> None:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise Refused("over the fast-track time limit; use the normal path")
@@ -437,8 +437,7 @@ def check_command(command: list[str], repo: Path, environment: dict[str, str], d
         _ = output.seek(0)
         text = output.read().decode(errors="replace")
     print(text, end="" if text.endswith("\n") else "\n")
-    passed = (bool(re.search(r"(?m)^0 errors, 0 warnings, 0 notes\s*$", text)) if types else
-              process.returncode == 0 or empty_suite and process.returncode == 5 and "Ran 0 tests" in text)
+    passed = process.returncode == 0 or empty_suite and process.returncode == 5 and "Ran 0 tests" in text
     if not passed:
         raise Refused(f"fast check failed: {' '.join(command)}")
 
@@ -473,9 +472,6 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             if not all(part.isidentifier() for part in module.split(".")):
                 raise Refused(f"not a Python package module: {path}")
             check_command([sys.executable, "-c", f"import {module}"], repo, environment, deadline)
-        if python_files:
-            check_command([os.environ.get("GATE_BASEDPYRIGHT", "basedpyright"),
-                           *map(str, python_files)], repo, environment, deadline, types=True)
 
 
 def drop_recovery_refs(runner: GitRunner, repo: Path, prefix: str) -> None:
@@ -734,7 +730,7 @@ def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: s
     try:
         promotion = production_doc.promotion_from_doc(production_doc.read_production(production).doc.read_text().splitlines())
         if isinstance(promotion, production_doc.PromoteTo) and not promotion.checkouts and isinstance(promotion.mac, production_doc.MacCheckout):
-            # The pull helper needs a local main ref at the published commit.
+            # Promotion uses this checkout only to supply a Git ref.
             with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource(commit), step="promote") as source:
                 _ = runner.git(source, "update-ref", "refs/heads/main", commit)
                 merge_checkpoint.promote_targets(promotion, "main", commit, source=source, label=f"fast-track {unit}")
@@ -765,6 +761,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.tool_folder("fast-track") as temporary:
         fetch_main(runner, repo, settings_read)
+        # Git edits and direct Python checks precede publication.
         with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main"), step="fast-track") as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
             identity = commit_identity(runner, repo)

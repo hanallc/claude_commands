@@ -7,12 +7,17 @@ from functools import cache
 from pathlib import Path
 import shutil
 import shlex
+import subprocess
 import sys
 
-from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, inherited_paths
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, startup_pythonpath
 
 
 SOURCE = Path(__file__).resolve().parents[2]
+# Child fixtures can model a direct launch inside an outer gate module.
+STANDALONE_TEST_STARTUP = """import sys
+sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: False
+"""
 
 
 @cache
@@ -21,12 +26,15 @@ def runtime_files() -> tuple[Path, ...]:
     helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
     return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
                  for path in sorted((SOURCE / folder).rglob("*"))
-                 if path.is_file() and "__pycache__" not in path.parts
+                 if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
                  and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
 
 def copy_with_bytecode(source: Path, destination: Path) -> None:
     """Copy a source file and its cached Python bytecode when present."""
+    if source.is_symlink() and source.is_dir():
+        destination.symlink_to(source.readlink(), target_is_directory=True)
+        return
     _ = shutil.copy2(source, destination)
     if source.suffix == ".py":
         bytecode = Path(importlib.util.cache_from_source(str(source)))
@@ -64,7 +72,7 @@ def copy_test_runner(checkout: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
             destination.unlink()
-        _ = shutil.copy2(SOURCE / relative, destination)
+        copy_with_bytecode(SOURCE / relative, destination)
 
 
 def python_tool_source(source: str) -> str:
@@ -108,5 +116,44 @@ def fixture_shim_source() -> str:
 
 def restore_startup_environment() -> None:
     """Keep startup active when a fixture interpreter replaces itself."""
-    startup = SOURCE / "scripts/lib/python_startup"
-    os.environ["PYTHONPATH"] = os.pathsep.join((str(startup), *inherited_paths(os.environ.get("PYTHONPATH", ""))))
+    os.environ["PYTHONPATH"] = startup_pythonpath(os.environ.get("PYTHONPATH", ""))
+
+
+def direct_test_fixture_environment(root: Path, *, seconds: int | None = None) -> dict[str, str]:
+    """Give the direct test a private folder and an explicit limit."""
+    from scripts.lib.testing_folders import RUN_FOLDER_ENV
+    from scripts.lint.memory_test_support import write_config_fixture
+
+    config = root / "config"
+    _ = write_config_fixture(config / "build_folders.conf",
+                             f"roots.build={root / 'build'}\nroots.build.natedev={root / 'build'}\n")
+    if seconds is not None:
+        _ = write_config_fixture(config / "test_times.conf",
+                                 f"# whole: 1..\ndirect_test.time_limit_seconds={seconds}\n")
+    environment = {**os.environ, "TMPDIR": str(root), "CONF_DIR": str(config),
+                   "XDG_CACHE_HOME": str(root / "cache"), "CLAUDE_PYTHON": sys.executable}
+    for name in ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID", "DEVTOOLS_GATE_PARENT_SOURCE_FD",
+                 "TEST_TIMES_OUT", RUN_FOLDER_ENV):
+        _ = environment.pop(name, None)
+    return environment
+
+
+def without_user_test_manager(root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """Give the child a user bus address that has no listener."""
+    return {**environment, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={root / 'absent-bus'}",
+            "XDG_RUNTIME_DIR": str(root / "absent-runtime")}
+
+
+def run_gate_test_fixture(case: Path, arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Run a fixture through the same launcher as a gate module."""
+    from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+    from scripts.production import gate
+
+    log = case.parent / "gate.log"
+    job = gate.start_gate_job("lib", case, arguments, SOURCE, environment, log)
+    try:
+        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+    finally:
+        gate.kill_job_group(job)
+        job.output.close()
+    return subprocess.CompletedProcess(arguments, status, log.read_text(), "")

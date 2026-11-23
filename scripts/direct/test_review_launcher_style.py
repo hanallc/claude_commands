@@ -53,7 +53,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
         prompt = (session / "agent_prompt_received.txt").read_text()
         self.assertEqual(prompt.count("## Phase style review"), 1)
         self.assertNotIn("$diff", prompt)
-        self.assertIn("Skip every write step", prompt)
+        self.assertIn("Make no edits.", prompt)
         self.assertIn("+new content", (session / "prepared_at_dispatch.diff").read_text())
         self.assertIn("Style review: Findings", Path(str(state["report"])).read_text())
         self.assertIn("sample finding", (session / "phases/3/review_findings_1_contract.txt").read_text())

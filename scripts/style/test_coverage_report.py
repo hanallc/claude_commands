@@ -207,6 +207,16 @@ class CoverageReportTests(unittest.TestCase):
             _ = unit_membership("sample-style", unit)
 
 
+    def test_report_skips_both_style_branch_names_without_a_registration(self) -> None:
+        _ = self.git("branch", "style/main")
+        _ = self.git("branch", "sample-style-worktree")
+        self.sync(style_branch="sample-style-worktree")
+
+        self.assertIn(f"synced main {self.tip[:7]}", self.report().stdout)
+
+        _ = self.git("branch", "-m", "main", "z-parent")
+        self.assertIn(f"synced z-parent {self.tip[:7]}", self.report().stdout)
+
     def test_report_reads_configured_units_without_a_family_suffix(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
@@ -475,13 +485,13 @@ class CoverageReportTests(unittest.TestCase):
             for number, rule in enumerate((selected, selected, selected, other), start=1):
                 unit = units[number - 1]
                 ticket = str(number)
-                ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+                path = self.sources[number - 1]
+                ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", path.split("/src/")[0], [path], [rule])
                 if number != 3:
                     ledger.ticket_assign(ticket, "main")
                 if number == 2:
                     definition = next(row for row in rules.load_rules(self.repo) if row.rule_id == rule)
-                    for path in self.sources[:2]:
-                        ledger.record(rule, path, self.tip, definition.blob, "clean", ticket=ticket, worker="test")
+                    ledger.record(rule, path, self.tip, definition.blob, "clean", ticket=ticket, worker="test")
                     ledger.ticket_checkpoint(ticket, self.tip)
         output = self.report("--rule", "selected").stdout
         self.assertEqual(set(self.rows(output)), {"selected"})
@@ -501,8 +511,8 @@ class CoverageReportTests(unittest.TestCase):
                 with mock.patch.object(style_ledger, "_now", return_value=(
                     "2026-10-01T12:00:00+00:00" if unit == "names" else "2026-10-02T12:00:00+00:00"
                 )):
-                    ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate,
-                                      [f"crates/{crate}/src/lib.rs"], [read])
+                    path = self.sources[1] if identity == "2" else f"crates/{crate}/src/lib.rs"
+                    ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate, [path], [read])
                 ledger.ticket_assign(identity, "main")
         output = self.report("--crate", "crates/alpha").stdout
         row = self.rows(output)["read"]

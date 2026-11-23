@@ -22,6 +22,7 @@ from unittest import mock
 from collections.abc import Callable
 from typing import TypedDict, cast, final, override
 
+from scripts.build_queue import execution_identity
 from scripts.lib import process_start as process_identity
 
 
@@ -120,7 +121,7 @@ attempt = len(events.read_text().splitlines())
 modes = os.environ["TEST_COPY_MODES"].split(",")
 mode = modes[min(attempt, len(modes)) - 1]
 fixture_cleanup_confirmed = True
-fixture_evidence = placement.ExecutionEvidenceUnavailable("the private copy has ended", time.time())
+fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private copy has ended", time.time())
 fixture_outcome = placement.AttemptDeclined("busy")
 if mode.endswith("+busy"):
     mode = mode.removesuffix("+busy")
@@ -277,6 +278,14 @@ class StepProgressTests(unittest.TestCase):
 
 
 class CopyResultTests(unittest.TestCase):
+    def test_only_the_exact_mac_history_refusal_ends_the_copy(self) -> None:
+        for reason, status in (("busy", 1), ("busy", 11), ("busy", 15), ("history_key_unavailable", 1)):
+            with self.subTest(reason=reason, status=status):
+                words = copy_watch.MacWords("prelaunch_failed", reason, "0")
+                self.assertEqual(copy_watch.copy_result(words, status), copy_watch.CopyEnded("lost", final=False))
+        words = copy_watch.MacWords("prelaunch_failed", "history_key_unavailable", "0")
+        self.assertEqual(copy_watch.copy_result(words, 15), copy_watch.CopyEnded("declined", final=True))
+
     def test_each_runner_ending_maps_to_one_outcome(self) -> None:
         words = copy_watch.MacWords
         failed, passed = words("failed", "", "1.0"), words("passed", "", "1.0")
@@ -350,7 +359,7 @@ class StoppedCopyReleaseTests(unittest.TestCase):
             repository = eligibility.KnownRepository("repo")
             destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
             assignment = placement.PlacementAssignment("v-call-copy-1", "attempt-1", destination,
-                placement.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+                execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
                 NoOwningSession(), 1.0)
             assignment_file = root / "copy.assignment.json"
             admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
@@ -367,7 +376,7 @@ class StoppedCopyReleaseTests(unittest.TestCase):
                                                           release.call_args.args)
                     self.assertEqual((paths.directory, pid, settings), (Path(directory), process.pid, str(request.settings)))
                     self.assertEqual(identity, claim_state.ClaimIdentity(
-                        placement.assigned_claim_id("v-call-copy-1", "attempt-1"), "v-call-copy-1", "attempt-1"))
+                        execution_identity.assigned_claim_id("v-call-copy-1", "attempt-1"), "v-call-copy-1", "attempt-1"))
                     self.assertEqual(release.call_args.kwargs, {"remote_work": mac_test.EndStoppedWork(repository)})
                     self.assertEqual(report.call_count, reports)
                     if reports:
@@ -400,6 +409,10 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.repository)], check=True, capture_output=True)
         _ = (self.repository / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
         _ = subprocess.run(["git", "-C", str(self.repository), "add", "Cargo.toml"], check=True, capture_output=True)
+        # A Mac claim needs a history key; a repository without an origin takes it from its root commit.
+        _ = subprocess.run(["git", "-C", str(self.repository), "-c", "user.name=fixture",
+                            "-c", "user.email=fixture@example.invalid", "commit", "-q", "--no-gpg-sign", "-m", "root"],
+                           check=True, capture_output=True)
         self.state = self.root / "state"
         self.info = self.root / "step-info"
         self.result = self.root / "watch-result"
@@ -685,7 +698,11 @@ class CopyWatchProcessTests(unittest.TestCase):
                 admission = caller_admission(self, self.root, self.environment)
                 with admission.loop_turn():
                     newer = placement_request(admission)
-                    destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+                    # The newer copy competes only for the exact destination of the call, repository key included.
+                    mirror = claim_state.mac_repository_identity(str(self.repository))
+                    assert isinstance(mirror, claim_state.ResolvedMacMirror)
+                    scope = claim_state.RepositoryScope(mirror.mirror_name, mirror.key)
+                    destination = placement.PlacementDestination("mac", "mac", "mac", scope)
                     newer = replace(newer, episode=f"v-newer-{poll_s}", purpose=placement.SpeculativeCopy("newer-parent", 2000.0),
                         constraints=replace(newer.constraints, candidates=(placement.PlacementCandidate(destination),)))
                     _ = admission.server.handle_request(newer)

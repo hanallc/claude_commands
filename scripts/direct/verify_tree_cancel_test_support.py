@@ -1,13 +1,14 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
 )
 from scripts.build_queue import placement
 from scripts.mac_test import claim_state
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 import json
 import os
@@ -22,6 +23,7 @@ from typing import cast, override
 
 from scripts.agents.detached_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
+from scripts.direct.verify_lint_scope_test_support import CARGO_MEND_DISPATCH_SOURCE, write_fixture_cargo_mend
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -44,8 +46,11 @@ import subprocess
 import sys
 import signal
 from pathlib import Path
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 args = sys.argv[1:]
+if args == ["mend", "--build-info"]:
+    exec_fixture_cargo_mend(args[-1])
 root = Path(os.environ["TEST_CONTROL"])
 if "--version" in args:
     print("cargo fixture 1.0")
@@ -117,7 +122,7 @@ def cancel(signum, _frame):
     child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCancelled("the source tree changed")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private child has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private child has ended", time.time())
         fixture_cleanup_confirmed = True
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
@@ -155,6 +160,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         (stubs / "git").unlink()
         (stubs / "git").symlink_to(git)
         self.write_tool(stubs / "cargo", CARGO)
+        write_fixture_cargo_mend(stubs / "cargo-mend")
         self.write_shell_tool(stubs / "taplo", 'if [ "$1" = --version ]; then printf "taplo fixture 1.0\\n"; fi\n')
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
@@ -298,6 +304,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 
@@ -331,7 +338,8 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
-                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n"
+                               + UNREACHABLE_WAIT_FIXTURE)
         state = self.root / "mac-state"
         self.environment.update({"MAC_TEST_STATE_DIR": str(state), "CONF_DIR": str(settings.parent),
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),

@@ -1,8 +1,10 @@
 """Test Hana guest safety without a controller, systemd manager, or AWS calls."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from dataclasses import asdict, replace
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -23,13 +25,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class HanaGuestTests(unittest.TestCase):
+    settings: guest.SafetySettings = guest.SafetySettings(False, 1, 1, 1, 1, 1, 1)
+
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
         self.root: Path = Path()
-        self.config_path: Path = ROOT / 'config/hana_aws.conf'
-        self.settings: guest.SafetySettings = guest.read_settings(conf.read(self.config_path))
+        self.config_path: Path = Path()
         self.now: float = 1000.0
-        self.generation: str = 'fixture_generation'
+        self.generation: str = '1'
         self.boot_id: str = 'fixture-boot'
         self.permit: Path = Path()
         self.monotonic: float = 0.0
@@ -39,11 +42,23 @@ class HanaGuestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config_path = self.root / 'hana_aws.conf'
-        _ = self.config_path.write_text((ROOT / 'config/hana_aws.conf').read_text())
+        _ = self.config_path.write_text('''enabled=off
+# whole: 1..
+guard_grace_seconds=60
+# whole: 1..
+permit_max_seconds=120
+# whole: 1..
+watchdog_check_seconds=10
+# whole: 1..
+step_cpu_limit=4
+# whole: 1..
+step_memory_gib=24
+# whole: 1..
+mount_timeout_seconds=15
+''')
         self.settings = guest.read_settings(conf.read(self.config_path))
         self.paths = guest.GuestPaths(self.root / 'state', self.root / 'boot-id')
         self.paths.directory.mkdir()
-        _ = self.paths.generation.write_text(self.generation)
         _ = self.paths.boot_id.write_text(self.boot_id)
         self.permit = self.paths.permit
 
@@ -55,7 +70,7 @@ class HanaGuestTests(unittest.TestCase):
 
     def observe(self, permit: guest.Permit) -> guest.BoundPermit:
         return guest.observe_permit(self.settings, permit, guest.FirstPermitRead(),
-            self.generation, self.boot_id, clock=self.clock, uptime=self.uptime)
+            self.boot_id, clock=self.clock, uptime=self.uptime)
 
     def watchdog(self, permit: guest.Permit) -> guest.WatchdogAction:
         return guest.watchdog_action(self.settings, self.observe(permit), clock=self.clock, uptime=self.uptime)
@@ -70,6 +85,17 @@ class HanaGuestTests(unittest.TestCase):
     def guard(self, permit: guest.Permit, elapsed: float) -> guest.GuardAction:
         return guest.guard_action(self.settings, self.observe(permit),
                                   boot_elapsed=elapsed, clock=self.clock, uptime=self.uptime)
+
+    def test_guard_grace_recovers_the_committed_value_after_a_zero_override(self) -> None:
+        committed = self.config_path.read_text()
+        _ = self.config_path.write_text(committed + '# whole: 0..\nguard_grace_seconds.testhost=0\n')
+        with (mock.patch('socket.gethostname', return_value='testhost'),
+              mock.patch.object(conf, '_committed_files', return_value=iter((committed,))),
+              redirect_stderr(io.StringIO()) as warnings):
+            settings = guest.read_settings(conf.read(self.config_path))
+
+        self.assertEqual(settings.guard_grace_seconds, self.settings.guard_grace_seconds)
+        self.assertIn(f"{self.config_path}: guard_grace_seconds='0'", warnings.getvalue())
 
     def test_guard_releases_only_a_fresh_permit(self) -> None:
         _ = self.permit.write_text(json.dumps(asdict(self.fresh())))
@@ -87,7 +113,7 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_permit_decoder_rejects_invalid_fields(self) -> None:
         for field, invalid in (('expires_at', True), ('expires_at', float('nan')),
-                               ('expires_at', float('inf')), ('generation', ''),
+                               ('expires_at', float('inf')), ('generation', ''), ('generation', '0'),
                                ('generation', '../other'), ('boot_id', ''), ('expires_at', 'later')):
             with self.subTest(field=field, value=invalid):
                 _ = self.permit.write_text(json.dumps({**asdict(self.fresh()), field: invalid}))
@@ -96,11 +122,10 @@ class HanaGuestTests(unittest.TestCase):
             _ = self.permit.write_text(text)
             self.assertIsInstance(guest.read_permit(self.permit), guest.NoWorkPermit)
 
-    def test_prior_boot_and_generation_cannot_authorize_work(self) -> None:
-        for permit in (replace(self.fresh(), boot_id='prior-boot'),
-                       replace(self.fresh(), generation='prior_generation')):
-            self.assertEqual(self.guard(permit, self.settings.guard_grace_seconds), guest.GuardAction.STOP)
-            self.assertEqual(self.watchdog(permit), guest.WatchdogAction.STOP)
+    def test_prior_boot_cannot_authorize_work(self) -> None:
+        permit = replace(self.fresh(), boot_id='prior-boot')
+        self.assertEqual(self.guard(permit, self.settings.guard_grace_seconds), guest.GuardAction.STOP)
+        self.assertEqual(self.watchdog(permit), guest.WatchdogAction.STOP)
 
     def test_watchdog_stops_at_expiry_with_or_without_a_live_controller(self) -> None:
         permit = self.fresh()
@@ -122,7 +147,7 @@ class HanaGuestTests(unittest.TestCase):
         self.paths.deadline.unlink(missing_ok=True)
         self.monotonic = 0
         if isinstance(permit, guest.WorkPermit):
-            guest.write_permit(self.settings, permit, paths=self.paths, clock=self.clock)
+            guest.write_permit(self.settings, permit, expected_generation=0, paths=self.paths, clock=self.clock)
         else:
             self.permit.unlink(missing_ok=True)
 
@@ -169,9 +194,10 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_command_uses_its_own_slice_and_configured_resource_limits(self) -> None:
         settings = replace(self.settings, enabled=True)
-        guest.write_permit(settings, self.fresh(), paths=self.paths, clock=self.clock)
+        guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
         arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
             mounted=True, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
+        self.assertIn('--collect', arguments[:arguments.index('--')])
         self.assertIn('--slice=hana-work-' + self.generation + '.slice', arguments)
         self.assertIn('--uid=hana-runner', arguments)
         self.assertIn('--property=CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', arguments)
@@ -181,13 +207,23 @@ class HanaGuestTests(unittest.TestCase):
         self.assertIn('CPUQuota=' + str(settings.step_cpu_limit * 100) + '%', parent)
         self.assertIn('MemoryMax=' + str(settings.step_memory_gib * 1024**3), parent)
 
-    def test_command_refuses_missing_disk_disabled_mode_and_stale_permission(self) -> None:
+    def test_command_refuses_missing_disk_disabled_mode_and_invalid_permits(self) -> None:
         enabled = replace(self.settings, enabled=True)
-        for settings, mounted, permit in ((enabled, False, self.fresh()),
-                                          (replace(enabled, enabled=False), True, self.fresh()),
-                                          (enabled, True, replace(self.fresh(), expires_at=self.now))):
-            _ = self.permit.write_text(json.dumps(asdict(permit)))
-            with self.assertRaises(ValueError):
+        for settings, mounted, permit, refusal, reason in (
+            (enabled, False, self.fresh(), guest.GuestDataNotMounted, 'The Hana data directory is not mounted'),
+            (replace(enabled, enabled=False), True, self.fresh(), guest.GuestAdmissionDisabled,
+             'Hana command admission is disabled on the guest'),
+            (enabled, True, replace(self.fresh(), expires_at=self.now), guest.GuestPermitRefused,
+             'the wall-clock expiry has passed'),
+            (enabled, True, replace(self.fresh(), expires_at=float('nan')), guest.GuestPermitRefused,
+             'the permit expiry is invalid'),
+            (enabled, True, replace(self.fresh(), boot_id='other-boot'), guest.GuestPermitRefused,
+             'the permit does not match the current boot'),
+            (enabled, True, replace(self.fresh(), generation='invalid'), guest.GuestPermitRefused,
+             'no valid permit record is readable'),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(refusal, reason):
+                _ = self.permit.write_text(json.dumps(asdict(permit)))
                 _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
                     mounted=mounted, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
 
@@ -206,7 +242,7 @@ class HanaGuestTests(unittest.TestCase):
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
-        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1))[-1].content
+        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23))[-1].content
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
 
@@ -223,8 +259,12 @@ class HanaGuestTests(unittest.TestCase):
         settings = control / 'safety.json'
         _ = settings.write_text(json.dumps(asdict(self.settings)))
         program = self.root / 'safety.py'
-        _ = program.write_text(guest.guest_program().replace(str(guest.CONTROL), str(control))
-                               .replace(str(guest.PERMIT), str(self.permit)))
+        image = self.root / 'image'
+        module = image / 'scripts/aws_target/hana_guest.py'
+        module.parent.mkdir(parents=True)
+        _ = module.write_text(Path(guest.__file__).read_text().replace(str(guest.CONTROL), str(control))
+                              .replace(str(guest.PERMIT), str(self.permit)))
+        _ = program.write_text(guest.guest_program().replace(str(guest.IMAGE_RUNTIME), str(image)))
         binary = self.root / 'bin'
         binary.mkdir()
         systemctl = binary / 'systemctl'
@@ -255,12 +295,10 @@ class HanaGuestTests(unittest.TestCase):
     def test_config_values_drive_the_rendered_settings(self) -> None:
         files = self.files()
         self.assertEqual(json.loads(files['safety.json'].content), asdict(self.settings))
-        changed = self.config_path.read_text().replace(
-            f'watchdog_check_seconds={self.settings.watchdog_check_seconds}',
-            f'watchdog_check_seconds={self.settings.watchdog_check_seconds + 1}')
-        _ = self.config_path.write_text(changed)
+        _ = self.config_path.write_text(self.config_path.read_text().replace('watchdog_check_seconds=10',
+                                                                            'watchdog_check_seconds=11'))
         settings = guest.read_settings(conf.read(self.config_path))
-        self.assertEqual(settings.watchdog_check_seconds, self.settings.watchdog_check_seconds + 1)
+        self.assertEqual(settings.watchdog_check_seconds, 11)
 
     def test_far_future_expiry_grants_no_permission(self) -> None:
         permit = replace(self.fresh(), expires_at=self.now + self.settings.permit_max_seconds
@@ -269,12 +307,12 @@ class HanaGuestTests(unittest.TestCase):
         self.assertEqual(self.guard(permit, self.settings.guard_grace_seconds), guest.GuardAction.STOP)
         self.assertEqual(self.watchdog(permit), guest.WatchdogAction.STOP)
         with self.assertRaises(ValueError):
-            guest.write_permit(self.settings, permit, paths=self.paths, clock=self.clock)
+            guest.write_permit(self.settings, permit, expected_generation=0, paths=self.paths, clock=self.clock)
         self.assertFalse(self.permit.exists())
 
     def test_backward_clock_stops_at_persisted_monotonic_deadline(self) -> None:
         permit = self.fresh()
-        guest.write_permit(self.settings, permit, paths=self.paths, clock=self.clock)
+        guest.write_permit(self.settings, permit, expected_generation=0, paths=self.paths, clock=self.clock)
         with guest.guest_lock(self.paths):
             first = guest.bound_permit(self.settings, self.paths, clock=self.clock, uptime=self.uptime)
         self.assertIsInstance(first, guest.PermitDeadline)
@@ -282,6 +320,10 @@ class HanaGuestTests(unittest.TestCase):
         self.assertLessEqual(first.monotonic_deadline - self.monotonic, self.settings.permit_max_seconds)
         # A restarted reader must retain the first reader's deadline after a clock change.
         self.now -= self.settings.watchdog_check_seconds
+        with guest.guest_lock(self.paths):
+            refusal = guest.bound_permit(self.settings, self.paths, clock=self.clock,
+                                         uptime=lambda: first.monotonic_deadline)
+        self.assertIs(refusal, guest.PermitRefusal.BOOT_CLOCK_EXPIRED)
         commands: list[list[str]] = []
 
         def pause(seconds: float) -> None:
@@ -296,7 +338,7 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_renewal_before_the_read_keeps_work_alive_until_the_new_deadline(self) -> None:
         permit = self.fresh()
-        guest.write_permit(self.settings, permit, paths=self.paths, clock=self.clock)
+        guest.write_permit(self.settings, permit, expected_generation=0, paths=self.paths, clock=self.clock)
         renewed = False
         commands: list[list[str]] = []
         next_expiry = permit.expires_at + self.settings.guard_grace_seconds
@@ -307,8 +349,8 @@ class HanaGuestTests(unittest.TestCase):
             self.monotonic += seconds
             if not renewed and self.now >= permit.expires_at:
                 self.assertFalse(self.paths.fence.exists())
-                guest.write_permit(self.settings, replace(permit, expires_at=next_expiry),
-                                   paths=self.paths, clock=self.clock)
+                guest.write_permit(self.settings, replace(permit, expires_at=next_expiry, generation='2'),
+                                   expected_generation=1, paths=self.paths, clock=self.clock)
                 renewed = True
 
         guest.run_safety('watchdog', self.settings, clock=self.clock, uptime=self.uptime,
@@ -322,8 +364,8 @@ class HanaGuestTests(unittest.TestCase):
 
         def run(command: list[str]) -> None:
             self.assertTrue(self.paths.fence.exists())
-            with self.assertRaisesRegex(ValueError, 'Shutdown is fenced'):
-                guest.write_permit(self.settings, self.fresh(), paths=self.paths, clock=self.clock)
+            with self.assertRaisesRegex(ValueError, 'shutdown is fenced'):
+                guest.write_permit(self.settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
             commands.append(command)
 
         guest.run_safety('watchdog', self.settings, clock=self.clock, uptime=self.uptime,
@@ -333,7 +375,7 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_admission_after_shutdown_fence_refuses_a_fresh_permit(self) -> None:
         settings = replace(self.settings, enabled=True)
-        guest.write_permit(settings, self.fresh(), paths=self.paths, clock=self.clock)
+        guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
         with guest.guest_lock(self.paths):
             guest.atomic_record(self.paths.fence, {'state': 'shutdown'})
         started: list[list[str]] = []
@@ -344,7 +386,7 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_permit_read_and_command_start_hold_the_guest_lock(self) -> None:
         settings = replace(self.settings, enabled=True)
-        guest.write_permit(settings, self.fresh(), paths=self.paths, clock=self.clock)
+        guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
         read_permit = guest.read_permit
 
         def assert_locked() -> None:

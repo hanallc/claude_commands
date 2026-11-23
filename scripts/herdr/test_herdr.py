@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 
+import fcntl
 import json
 from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import os
+import select
 import signal
 import subprocess
 import shutil
@@ -21,10 +24,11 @@ import tempfile
 import time
 import unittest.mock
 from pathlib import Path
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, cast, final, override
+from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
@@ -35,7 +39,7 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import session_folder
+from scripts.lib import operation_deadline, session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -45,6 +49,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 
 GIT_BINARY = shutil.which("git") or "git"
 BASH_BINARY = shutil.which("bash") or "bash"
+PANE_STARTUP = str(Path(__file__).resolve().parents[1] / "lib/session_python_startup")
 NATIVE_PROCESS_START = "Tue Nov  3 08:00:00 2026"
 NATIVE_PROCESS_MICROSECONDS = 1793692800123456
 DARWIN_BSD_INFO = herdr._DarwinProcessBSDInfo  # pyright: ignore[reportPrivateUsage]
@@ -91,6 +96,51 @@ def native_process_commands(pid: int, *, generations: tuple[herdr.AgentProcessId
           patch.object(sessions, "process_start", side_effect=process_start),
           patch.object(session_records, "process_start", side_effect=process_start)):
         yield
+
+
+class ClaudeForegroundSocket(NamedTuple):
+    """A fixture socket response that identifies one foreground Claude process."""
+
+    session: str
+    pane: str
+    pid: int
+
+    def request(self, session: str, method: str, *, pane_id: str) -> dict[str, object]:
+        if (session, method, pane_id) != (self.session, "pane.process_info", self.pane):
+            raise AssertionError(f"unexpected session socket request: {(session, method, pane_id)}")
+        return {"process_info": {"foreground_processes": [{"pid": self.pid, "argv": ["claude"]}]}}
+
+
+class CodexForegroundCase(NamedTuple):
+    name: str
+    info: dict[str, object]
+    owner_proved: bool
+
+
+@contextmanager
+def codex_foreground_cases(folder: Path) -> Generator[tuple[CodexForegroundCase, ...]]:
+    """Supply foreground observations and private parent reads."""
+    codex = {"pid": 456, "name": "codex", "argv": ["codex"], "cwd": str(folder)}
+    claude = {"pid": 457, "name": "claude", "argv": ["claude"], "cwd": str(folder)}
+    cases = tuple(CodexForegroundCase(name, {"shell_pid": 455, "foreground_process_group_id": 456,
+                                            "foreground_processes": processes}, proved)
+                  for name, processes, proved in (
+        ("Codex first", [codex, claude], True),
+        ("Claude first", [claude, codex], True),
+        ("missing Codex arguments", [claude, {"pid": 456, "name": "codex"}], False),
+        ("unrelated foreground process", [codex, claude, {"pid": 458, "name": "editor", "argv": ["editor"]}], False),
+        ("two Codex processes", [codex, claude, {**codex, "pid": 458}], False),
+    ))
+    read_stat = herdr._linux_process_stat  # pyright: ignore[reportPrivateUsage]
+
+    def process_stat(pid: int) -> list[str]:
+        if pid in (457, 458):
+            return ["S", "456" if pid == 457 else "1"]
+        return read_stat(pid)
+
+    with (patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+          patch.object(herdr, "_linux_process_stat", side_effect=process_stat)):
+        yield cases
 
 
 @contextmanager
@@ -217,15 +267,27 @@ class NativePaneSessionTests(StaffTestCase):
                                          on_submission=lambda: events.append("callback"))
                 self.assertEqual(events, ["check", "callback", "send"] if allowed else ["check"])
 
+    def test_native_codex_refuses_unproved_placement_in_and_outside_the_snapshot(self) -> None:
+        for report in (nullcontext(), herdr.observation_snapshot()):
+            with (report, patch.object(herdr, "herdr_places", return_value={}),
+                  patch.object(herdr, "_platform", return_value="linux"),
+                  patch.object(herdr, "process_environment", side_effect=PermissionError("environment denied")),
+                  patch.object(herdr, "_process_environment", side_effect=PermissionError("environment denied")),
+                  patch.object(herdr, "_process_birth", return_value="1") as birth):
+                self.assertIsInstance(herdr.herdr_place_of(998077), herdr.UnprovedHerdrPlacement)
+                with self.assertRaisesRegex(ValueError, "cannot read the placement"):
+                    _ = herdr.native_process(998077, "codex")
+                birth.assert_not_called()
+
     def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
         identity = fixture_runtime_id("unheld-thread")
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
         for arguments, refusal, cause in ((["codex"], herdr.CodexPaneStarting, "pane is starting"),
-                          (["codex", "app-server", "--managed-daemon"], ValueError, "subcommand app-server"),
-                          (["codex", "exec", "resume", identity], ValueError, "subcommand exec"),
-                          (["codex", "-c", "resume", identity], ValueError, "option -c has no =")):
+                          (["codex", "app-server", "--managed-daemon"], ValueError, "unsupported subcommand"),
+                          (["codex", "exec", "resume", identity], ValueError, "unsupported subcommand"),
+                          (["codex", "-c", "resume", identity], ValueError, "invalid configuration value")):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             with (self.subTest(arguments=arguments),
                   patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
@@ -271,14 +333,145 @@ class NativePaneSessionTests(StaffTestCase):
             with self.assertRaisesRegex(ValueError, "native process start changed"):
                 _ = client.codex_launch("w1:p1", arguments)
 
+    def test_codex_launch_reuses_the_foreground_proof(self) -> None:
+        identity = fixture_runtime_id("launch-single-proof")
+        client = herdr.Herdr("agents")
+        with codex_foreground_cases(self.root) as cases:
+            for case in cases:
+                with (self.subTest(case=case.name),
+                      codex_launch_evidence(self.root, ["codex", "resume", identity]) as evidence,
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "Herdr", return_value=client),
+                      patch.object(client, "result", return_value=evidence) as result,
+                      patch.object(herdr, "_linux_process_stat", side_effect={
+                          998071: ["S", "998070"], 998072: ["S", "1"]}.__getitem__) as stat_read):
+                    processes: list[dict[str, object]] = []
+                    for value in herdr.json_items(case.info["foreground_processes"], "fixture processes"):
+                        process = herdr.json_object(value, "fixture foreground process")
+                        processes.append({**process, "pid": cast(int, process["pid"]) + 997614})
+                    evidence["process_info"] = {"foreground_processes": processes}
+                    if case.owner_proved:
+                        entry = client.codex_launch("w1:p1")
+                        self.assertEqual((entry["session_id"], entry.get("pid")), (identity, 998070))
+                        stat_read.assert_called_once_with(998071)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "no unique foreground process"):
+                            _ = client.codex_launch("w1:p1")
+                    result.assert_called_once_with("pane", "process-info", "--pane", "w1:p1")
+
+    def test_failed_linux_state_read_is_shared_until_a_fresh_proof(self) -> None:
+        info: dict[str, object] = {"foreground_processes": [
+            {"pid": 456, "argv": ["codex"]}, {"pid": 457, "argv": ["sleep"]},
+        ]}
+        with (herdr.observation_snapshot(), patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_linux_process_stat", side_effect=PermissionError("state denied")) as read):
+            with self.assertRaises(PermissionError):
+                _ = herdr.linux_process_parent(457)
+            self.assertIsInstance(herdr.foreground_pane_owner(info), herdr.UnprovedForegroundOwner)
+            read.assert_called_once_with(457)
+            self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.UnprovedForegroundOwner)
+            self.assertEqual(read.call_args_list, [call(457), call(457)])
+
+    def test_codex_target_refreshes_once_when_a_foreground_process_exits(self) -> None:
+        identity = fixture_runtime_id("codex-child-exits")
+        client = herdr.Herdr("agents")
+        place = herdr.HerdrPlace(client.session, "w1:p1")
+        row: herdr.PaneIdentity = {"pane_id": place.pane, "terminal_id": "fixture-terminal",
+                                  "workspace_id": "w1", "session_id": identity}
+        native = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "fixture-start", {})
+        codex = {"pid": 456, "argv": ["codex"]}
+        child = {"pid": 457, "argv": ["exe"]}
+        request = ("pane", "process-info", "--pane", place.pane)
+        for refreshed, outcome, reason in (
+            ([codex], True, ""),
+            ([codex, child], False, "foreground process ancestry is unavailable"),
+            ([codex, {"pid": 458, "argv": ["editor"]}], False, "outside the Codex process tree"),
+        ):
+            with self.subTest(refreshed=refreshed):
+                replies = [json.dumps({"result": {"process_info": {"shell_pid": 455,
+                    "foreground_process_group_id": 456, "foreground_processes": processes}}})
+                    for processes in ([codex, child], refreshed)]
+                def state(pid: int) -> list[str]:
+                    if pid == 458:
+                        return ["S", "1"]
+                    raise FileNotFoundError("fixture process exited")
+
+                with (herdr.observation_snapshot(), patch.object(client, "_process_info_batch"),
+                      patch.object(client, "run", side_effect=replies) as read,
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "_linux_process_stat", side_effect=state) as stat_read,
+                      patch.object(herdr, "native_process", return_value=native) as native_read,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(herdr.check_target(identity, action="signal", place=place,
+                                                        pane_info=row, client=client), outcome)
+                self.assertEqual(read.call_args_list, [call(*request), call(*request)])
+                if outcome:
+                    self.assertEqual(errors.getvalue(), "")
+                    stat_read.assert_called_once_with(457)
+                    native_read.assert_called_once_with(456, "codex", identity)
+                else:
+                    self.assertIn(reason, errors.getvalue())
+                    self.assertEqual(stat_read.call_args_list, [call(457), call(refreshed[1]["pid"])])
+                    native_read.assert_not_called()
+
+    def test_codex_target_refuses_live_unrelated_foreground_without_refresh(self) -> None:
+        identity = fixture_runtime_id("codex-unrelated-foreground")
+        client = herdr.Herdr("agents")
+        place = herdr.HerdrPlace(client.session, "w1:p1")
+        row: herdr.PaneIdentity = {"pane_id": place.pane, "terminal_id": "fixture-terminal",
+                                  "workspace_id": "w1", "session_id": identity}
+        reply = json.dumps({"result": {"process_info": {"shell_pid": 455, "foreground_process_group_id": 456,
+            "foreground_processes": [{"pid": 456, "argv": ["codex"]}, {"pid": 457, "argv": ["exe"]}]}}})
+        with (patch.object(client, "run", return_value=reply) as read,
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "1"]) as stat_read,
+              patch.object(herdr, "native_process") as native_read, redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(herdr.check_target(identity, action="signal", place=place, pane_info=row, client=client))
+        self.assertIn("outside the Codex process tree", errors.getvalue())
+        read.assert_called_once_with("pane", "process-info", "--pane", place.pane)
+        stat_read.assert_called_once_with(457)
+        native_read.assert_not_called()
+
+    def test_codex_launch_refreshes_process_state_inside_an_observation(self) -> None:
+        identity = fixture_runtime_id("launch-fresh-proof")
+        client = herdr.Herdr("agents")
+        with (codex_launch_evidence(self.root, ["codex", "resume", identity]) as evidence,
+              herdr.observation_snapshot(), patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(client, "result", return_value=evidence),
+              patch.object(herdr, "_linux_process_stat", side_effect=[["S", "998070"], ["S", "1"]]) as read):
+            info = herdr.json_object(evidence["process_info"], "fixture process info")
+            info["foreground_processes"] = [
+                {"pid": 998070, "argv": ["codex", "resume", identity], "cwd": str(self.root)},
+                {"pid": 998071, "argv": ["sleep"]},
+            ]
+            self.assertEqual(herdr.linux_process_parent(998071), 998070)
+            with self.assertRaisesRegex(ValueError, "outside the Codex process tree"):
+                _ = client.codex_launch("w1:p1")
+            self.assertEqual(read.call_args_list, [call(998071), call(998071)])
+
+    def test_invalid_codex_arguments_keep_tokens_out_of_the_full_pane_anomaly(self) -> None:
+        for arguments, cause in ((["codex", "--model"], "missing or invalid option value"),
+                                 (["codex", "exec"], "unsupported subcommand"),
+                                 (["codex", "-c", "invalid"], "invalid configuration value")):
+            with (self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence):
+                pane = herdr.json_object(evidence["pane"], "fixture pane")
+                pane.update(session_id=None, tab_id="w1:t1")
+                info = herdr.json_object(evidence["process_info"], "fixture process info")
+                info.update(shell_pid=998069, foreground_process_group_id=998070)
+                with redirect_stderr(io.StringIO()) as notes:
+                    scan = herdr.Herdr("agents").scan_row_panes(staff.initial_snapshot(), [pane])
+                reason = f"pid 998070: Codex launch identity is unavailable: {cause}. Foreground programs are codex"
+                self.assertEqual(scan.unknown, [herdr.UnknownPane("w1:p1", "w1:t1", reason)])
+                self.assertEqual(notes.getvalue(),
+                    f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
+
     def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "producer", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
         with (codex_launch_evidence(self.root, ["codex"]) as info,
-              patch.object(client, "panes", return_value=[
-                  {"pane_id": "w1:p1", "session_id": None, "workspace_id": "w1"}]),
+              patch.object(client, "panes", side_effect=lambda: [info["pane"]]),
               patch.object(client, "pane_tab", return_value=("workspace", 1, {"name": owner.id})),
               patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))),
               patch.object(client, "result", return_value=info)):
@@ -330,7 +523,7 @@ class NativePaneSessionTests(StaffTestCase):
                         pane["tab_id"] = "w1:t1"
                         with redirect_stderr(io.StringIO()) as later_errors:
                             scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
-                        reason = "pid 998070: Codex launch identity is unavailable"
+                        reason = "pid 998070: Codex launch identity is unavailable. Foreground programs are codex"
                         self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
                         self.assertEqual(later_errors.getvalue(),
                             f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
@@ -355,7 +548,7 @@ class NativePaneSessionTests(StaffTestCase):
               redirect_stderr(io.StringIO()) as notes):
             outcome = client.start_agent("worker", "w1:p1", "codex", [], herdr.OpeningPrompt("continue"), 1_000)
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
-        self.assertTrue(cast(herdr.PromptNotSubmitted, outcome).never_typed)
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).state, "not_sent")
         self.assertEqual(notes.getvalue(), "herdr worker:w1:p1: pane is starting; pane retained\n")
         submit.assert_not_called()
         publish.assert_not_called()
@@ -370,6 +563,18 @@ class NativePaneSessionTests(StaffTestCase):
             entry = herdr.Herdr("agents").codex_launch("w1:p1", ["resume", identity])
         self.assertEqual(entry["environment"], {})
 
+    def test_empty_pane_requires_a_foreground_shell(self) -> None:
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        shell = 998070
+        info = {"shell_pid": shell, "foreground_process_group_id": shell}
+        process = {"pid": shell, "argv": ["zsh"]}
+        self.assertEqual(herdr.pane_foreground(place, {**info, "foreground_processes": [process]}),
+                         herdr.ObservedEmpty(place, shell))
+        for processes in ([], [{**process, "argv": ["vim"]}], [{**process, "pid": shell + 1}]):
+            with self.subTest(processes=processes):
+                evidence = herdr.pane_foreground(place, {**info, "foreground_processes": processes})
+                self.assertIsInstance(evidence, herdr.UnknownPaneOwner)
+
     def test_foreground_process_without_argv_does_not_hide_the_agent(self) -> None:
         identity = fixture_runtime_id("foreground-agent")
         observation = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "same-start", {"CODEX_HOME": str(self.root / ".codex2")})
@@ -379,6 +584,8 @@ class NativePaneSessionTests(StaffTestCase):
         completed = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
         client = herdr.Herdr("agents")
         with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]),
+              patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "native_process", return_value=observation) as native,
               native_process_commands(998075),
               patch.object(client, "panes", return_value=[
@@ -389,9 +596,9 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(startup.activity, herdr.AgentProcessPresent)
             launch = client.codex_launch("w1:p1")
             self.assertEqual(launch["session_id"], identity)
-        self.assertEqual(native.call_args_list, [call(998075, "codex", ""), call(998075, "codex")])
+        self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
 
-    def test_codex_report_ignores_the_hook_process_in_the_foreground_group(self) -> None:
+    def test_codex_report_accepts_its_hook_in_the_foreground_group(self) -> None:
         identity = fixture_runtime_id("codex-with-hook")
         row = {"pane_id": "w1:p1", "session_id": identity}
         info: dict[str, object] = {"foreground_processes": [
@@ -401,6 +608,8 @@ class NativePaneSessionTests(StaffTestCase):
         result = subprocess.CompletedProcess[str]([], 0, json.dumps({"result": {"process_info": info}}), "")
         client = herdr.Herdr("agents")
         with patch.object(herdr, "run_program", return_value=result), \
+                patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]), \
+                patch.object(herdr, "_PLATFORM", "linux"), \
                 patch.object(herdr, "native_process", return_value=observation) as native, \
                 patch.object(client, "result", return_value={"process_info": info}), \
                 patch.object(client, "pane_row", return_value=row), \
@@ -412,6 +621,128 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertFalse(herdr.codex_without_session({"foreground_processes": [
             {"pid": 998075, "argv": ["codex"]}, {"pid": 998077, "argv": ["codex"]}]}))
 
+    def test_unknown_codex_option_does_not_appear_in_the_pane_anomaly(self) -> None:
+        arguments = ["codex", "--fixture-private-option=private-value"]
+        with codex_launch_evidence(self.root, arguments) as evidence:
+            pane = herdr.json_object(evidence["pane"], "fixture pane")
+            pane.update(session_id=None, tab_id="w1:t1")
+            info = herdr.json_object(evidence["process_info"], "fixture process info")
+            info.update(shell_pid=998069, foreground_process_group_id=998070)
+            with redirect_stderr(io.StringIO()) as errors:
+                scan = herdr.Herdr("agents").scan_row_panes(staff.initial_snapshot(), [pane])
+        reason = "pid 998070: Codex launch identity is unavailable: unknown option. Foreground programs are codex"
+        self.assertEqual(scan.unknown, [herdr.UnknownPane("w1:p1", "w1:t1", reason)])
+        self.assertEqual(errors.getvalue(),
+            f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
+
+    def test_darwin_codex_prompt_uses_the_device_of_stdin(self) -> None:
+        identity = fixture_runtime_id("darwin-foreground-child")
+        client = herdr.Herdr("agents")
+        pane = "w1:p1"
+        row = {"pane_id": pane, "terminal_id": "fixture-terminal", "session_id": identity}
+        shell, codex, child = 998069, 998070, 998071
+        info = {"process_info": {"shell_pid": shell, "foreground_process_group_id": codex,
+            "foreground_processes": [{"pid": codex, "argv": ["codex"]},
+                                     {"pid": child, "name": "editor", "argv": ["editor", "private-argument"]}]}}
+        parent = DARWIN_BSD_INFO()
+        parent.pbi_ppid = codex
+        terminal = DARWIN_BSD_INFO()
+        terminal.e_tdev = 0x1000001
+        observed = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "fixture-start", {})
+        def bsd_info(pid: int, *, include_zombies: bool = False) -> herdr._DarwinProcessBSDInfo:  # pyright: ignore[reportPrivateUsage]
+            if pid == child:
+                self.assertTrue(include_zombies)
+                return parent
+            self.assertEqual(pid, shell)
+            return terminal
+
+        for fields, error, state in (("r0x1000001\ntCHR\n", "terminal held by editor", 2),
+                                     ("tPIPE\n", "", 2), ("tCHR\n", "terminal may be held by editor", 2),
+                                     ("", "", 5)):
+            parent.pbi_status = state
+            with (self.subTest(fields=fields, state=state), patch.dict(os.environ, {"HERDR_PLATFORM": "darwin"}),
+                  patch.object(client, "pane_row", return_value=row),
+                  patch.object(client, "result", return_value=info),
+                  patch.object(client, "composer", return_value=herdr.NoComposer()),
+                  patch.object(client, "run") as command,
+                  patch.object(herdr, "_darwin_process_bsd_info", side_effect=bsd_info),
+                  patch.object(herdr, "native_process", return_value=observed),
+                  patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess[str](
+                      [], 0, f"p{child}\nf0\n{fields}", "")) as lsof):
+                if error:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, f"anomaly: {error}"):
+                        client.prompt(pane, "fixture result", target=identity)
+                    command.assert_not_called()
+                else:
+                    client.prompt(pane, "fixture result", target=identity)
+                    command.assert_called_once_with("agent", "prompt", pane, script_prompt("fixture result"))
+                if state == 5:
+                    lsof.assert_not_called()
+                else:
+                    lsof.assert_called_once_with([os.environ.get("HERDR_LSOF", "lsof"), "-nP", "-a",
+                                                  "-p", str(child), "-d", "0", "-Fftr"])
+
+    def test_placement_and_owner_proof_share_process_state_until_input(self) -> None:
+        info: dict[str, object] = {"shell_pid": 455, "foreground_process_group_id": 456,
+            "foreground_processes": [{"pid": 456, "argv": ["codex"]}, {"pid": 457, "argv": ["hook"]}]}
+        with (patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "456"]) as read,
+              patch.object(herdr, "_stdin_device", return_value=herdr.NonTerminalStdin.PROVED),
+              herdr.observation_snapshot()):
+            self.assertEqual(herdr.linux_process_parent(457), 456)
+            self.assertIsInstance(herdr.foreground_pane_owner(info), herdr.ProvedCodexForeground)
+            read.assert_called_once_with(457)
+            self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.ProvedCodexForeground)
+            self.assertEqual(read.call_args_list, [call(457), call(457)])
+
+    def test_foreground_evidence_when_argv_is_unavailable(self) -> None:
+        node = {"pid": 457, "name": "node"}
+        codex = {"pid": 456, "argv": ["codex"]}
+        with (patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "456"])):
+            for processes in ([codex, node], [node, codex]):
+                with self.subTest(processes=processes):
+                    owner = herdr.foreground_pane_owner({"foreground_processes": processes})
+                    self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
+
+        place = herdr.HerdrPlace("fixture", "w1:p1")
+        reason = "agent argv is unavailable"
+        claude = {"pid": 458, "name": "claude"}
+        shell = {"pid": 459, "name": "sh", "argv": ["sh"]}
+        for processes, foreground, pane in (
+                ([claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([shell, claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([claude, {"pid": 460, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([claude, {**shell, "pid": 458}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([{"pid": True, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason))):
+            with self.subTest(processes=processes):
+                info: dict[str, object] = {"foreground_processes": processes}
+                self.assertEqual(herdr.foreground_pane_owner(info), foreground)
+                self.assertEqual(herdr.pane_foreground(place, info), pane)
+
+    def test_foreground_input_reads_each_ancestor_and_descendant_once(self) -> None:
+        codex, ancestor, child = 456, 457, 458
+        processes = [{"pid": ancestor, "argv": ["claude"]}, {"pid": child, "argv": ["hook"]}]
+        stats = {ancestor: ["Z", str(codex)], child: ["S", str(ancestor)]}
+        for descendants in (processes, processes[::-1]):
+            with (self.subTest(descendants=descendants), patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(herdr, "_linux_process_stat", side_effect=stats.__getitem__) as read,
+                  patch.object(herdr, "_stdin_device", return_value=herdr.NonTerminalStdin.PROVED) as stdin):
+                owner = herdr.foreground_pane_owner({
+                    "shell_pid": 455, "foreground_process_group_id": codex,
+                    "foreground_processes": [{"pid": codex, "argv": ["codex"]}, *descendants],
+                }, for_input=True)
+                self.assertIsInstance(owner, herdr.ProvedCodexForeground)
+                assert isinstance(owner, herdr.ProvedCodexForeground)
+                self.assertEqual(owner.terminal_input, herdr.CodexTerminalInput.AVAILABLE)
+                self.assertCountEqual(read.call_args_list, [call(ancestor), call(child)])
+                stdin.assert_called_once_with(child, darwin=False)
+
     def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
         current = fixture_runtime_id("pane-current-thread")
         launch = fixture_runtime_id("pane-launch-thread")
@@ -421,8 +752,10 @@ class NativePaneSessionTests(StaffTestCase):
             {"pid": 998074, "argv": ["zsh"]}, {"pid": 998075, "argv": ["codex", "resume", launch]}]}}}
         completed = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
         with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "998075"]),
+              patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "native_process", return_value=observation) as native):
-            observed = herdr.Herdr("agents").native_pane_process("w1:p1", "codex", 1)
+            observed = herdr.Herdr("agents").native_pane_process("w1:p1", "codex", 1, pane_row={})
         self.assertEqual(observed, observation)
         native.assert_called_once_with(998075, "codex", "")
 
@@ -489,16 +822,16 @@ class NativePaneSessionTests(StaffTestCase):
             (["codex", "Explain this repository"], True, ""),
             (["codex", "--", "Explain this repository"], True, ""),
             (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
-            (["codex", "--config=resume"], False, "option --config has no ="),
-            (["codex", "-cresume"], False, "option -c has no ="),
+            (["codex", "--config=resume"], False, "invalid configuration value"),
+            (["codex", "-cresume"], False, "invalid configuration value"),
             (["codex", '-cmodel="test-model"'], True, ""),
             (["node", "/opt/@openai/codex/bin/codex.js"], True, ""),
             (["codex", "resume", "--last"], False, "bad resume id"),
-            (["codex", "exec"], False, "subcommand exec"),
-            (["codex", "--future-option"], False, "unknown option --future-option"),
-            (["codex", "--future-option=private-value"], False, "unknown option --future-option"),
-            (["codex", "--model"], False, "option --model has a missing or dash value"),
-            (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
+            (["codex", "exec"], False, "unsupported subcommand"),
+            (["codex", "--future-option"], False, "unknown option"),
+            (["codex", "--future-option=private-value"], False, "unknown option"),
+            (["codex", "--model"], False, "missing or invalid option value"),
+            (["codex", "--model", "--no-alt-screen"], False, "missing or invalid option value"),
         )
         for arguments, starting, cause in pending_launches:
             with (self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence,
@@ -692,6 +1025,7 @@ class CodexAnomalyNameTests(StaffTestCase):
               patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(sessions, "process_start", return_value="fixture-start"),
               patch.object(herdr, "herdr_place_of") as placement,
+              patch.object(herdr, "codex_pane_process", side_effect=ValueError("thread unavailable")),
               patch.object(herdr.Herdr, "result") as result,
               patch.object(sessions, "running_sessions", return_value=records) as registry,
               redirect_stderr(output)):
@@ -702,7 +1036,7 @@ class CodexAnomalyNameTests(StaffTestCase):
                               {"tab_id": "w1:t1", "label": "morty", "workspace_id": "w1"}]},
                     {"workspaces": [{"workspace_id": "w1", "label": "agents"}]}]
             else:
-                placement.side_effect = herdr_types.HerdrFailure("placement is unavailable")
+                placement.return_value = herdr.UnprovedHerdrPlacement("placement is unavailable")
             if source == "pid":
                 registry.side_effect = OSError("registry is unavailable")
             with self.assertRaisesRegex(herdr.CodexPaneStarting, "Codex launch identity is unavailable"):
@@ -777,6 +1111,7 @@ SCOPE_PROBE = ["--user", "--scope", "--quiet", "--collect", "--slice=app-agents.
 PROCESS_SESSIONS = herdr._process_sessions  # pyright: ignore[reportPrivateUsage]
 STARTUP_PROCESSES = herdr._startup_processes  # pyright: ignore[reportPrivateUsage]
 STARTUP_PROCESS_READER = herdr._startup_process_reader  # pyright: ignore[reportPrivateUsage]
+PROMPT_RECIPIENT_PROCESS = herdr.prompt_recipient_process
 
 
 @final
@@ -914,12 +1249,13 @@ class PromptSubmissionTests(unittest.TestCase):
         failures: list[float] = []
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and from_second <= self.elapsed < until_second:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch transcript temporarily unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
         with patch.object(Path, "open", open_transcript):
             yield failures
@@ -996,13 +1332,954 @@ class PromptSubmissionTests(unittest.TestCase):
                         [("destination:p1", script_prompt("resume the saved work"))])
                     self.assertEqual(errors.getvalue(), "")
                 else:
-                    self.assertEqual(outcome, herdr.PromptNotSubmitted("native session is unavailable; pane retained"))
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted("native session is unavailable; pane retained",
+                                                                     state="not_sent"))
                     target.assert_not_called()
                     self.assertEqual(self.typed, [])
                     self.assertIn("native session is unavailable", errors.getvalue())
                     self.assertAlmostEqual(self.elapsed, 1.0)
                     self.assertEqual(native.call_count, 5)
                     self.assertEqual(errors.getvalue().count("native session is unavailable"), 1)
+
+    def test_start_retries_target_evidence_after_the_composer_becomes_ready(self) -> None:
+        for missing in ("registry identity", "argv"):
+            with self.subTest(missing=missing):
+                self.elapsed = 0
+                self.typed.clear()
+                self.ready_panes.clear()
+                self.submit_on_type = True
+                _ = self.path.write_bytes(b"")
+                result = self.client.result
+                native_process = herdr.native_process
+
+                def process_info(*arguments: str) -> dict[str, object]:
+                    if missing == "argv" and self.ready_panes and self.elapsed < 0.3:
+                        return {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                                                "foreground_processes": [{"pid": 23456, "name": "claude"}]}}
+                    return result(*arguments)
+
+                def registry(pid: int, kind: str) -> herdr.NativeAgentProcess:
+                    if missing == "registry identity" and self.ready_panes and self.elapsed < 0.3:
+                        raise herdr.NativeRegistryChanging("pid 23456: native registry identity is unavailable")
+                    return native_process(pid, kind)
+
+                with (patch.object(self.client, "result", side_effect=process_info),
+                      patch.object(herdr, "native_process", side_effect=registry),
+                      redirect_stderr(io.StringIO()) as errors):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", self.transcript.session_id],
+                        herdr.OpeningPrompt("resume the saved work", self.transcript), 1000)
+
+                self.assertIn(f"{missing} is unavailable", errors.getvalue())
+                self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                                 [("destination:p1", script_prompt("resume the saved work"))])
+                self.assertGreaterEqual(self.typed[0][2], 0.3)
+                self.assertEqual(self.enters, [])
+
+    def test_target_unknown_at_deadline_reports_no_typing(self) -> None:
+        with patch.object(herdr, "check_target", return_value=False):
+            outcome = self.submit(timeout_ms=1000)
+        self.assertEqual(outcome, herdr.PromptNotSubmitted(
+            "prompt target is unknown; session retained", self.screen, state="not_sent"))
+        self.assertEqual(self.elapsed, 1)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_matching_turn_during_started_target_retry_confirms_submission(self) -> None:
+        self.events.append((0.3, lambda: self.write_turn("resume the saved work")))
+        with patch.object(herdr, "check_target", return_value=False):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", self.transcript.session_id],
+                herdr.OpeningPrompt("resume the saved work", self.transcript), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_started_target_checks_the_discovered_transcript_and_publishes_before_success(self) -> None:
+        for matching_id in ("discovered", "requested"):
+            with self.subTest(matching_id=matching_id):
+                self.elapsed = 0
+                self.path.unlink(missing_ok=True)
+                requested = herdr.SessionTranscript(self.transcript.config_dir, "requested")
+                requested_path = self.path.with_name("requested.jsonl")
+                requested_path.unlink(missing_ok=True)
+                publications: list[herdr.SessionTranscript] = []
+
+                def turn() -> None:
+                    self.write_turn("resume the saved work", seconds_after_launch=1)
+                    if matching_id == "requested":
+                        _ = self.path.rename(requested_path)
+
+                self.events.append((0.3, turn))
+                with patch.object(herdr, "check_target", return_value=False):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", requested.session_id],
+                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 1000)
+                self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                self.assertEqual(publications, [self.transcript])
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_started_target_refusal_reports_unsent_resume_and_manual_step(self) -> None:
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(self.client, "open_tab", return_value="destination:p1"),
+              patch.object(self.client, "run_in_pane"),
+              patch.object(self.client, "native_session", side_effect=herdr_types.HerdrFailure("agent argv is unavailable")),
+              redirect_stderr(io.StringIO())):
+            result = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "unit"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "claude", ["--resume", self.transcript.session_id],
+                herdr.OpeningPrompt("resume the saved work", self.transcript), 1000, agent="unit", client=self.client)
+        self.assertIsInstance(result.outcome, herdr.PromptNotSubmitted)
+        failure = cast(herdr.PromptNotSubmitted, result.outcome)
+        self.assertEqual(failure.state, "not_sent")
+        self.assertIn("The resume prompt was not sent.", failure.reason)
+        self.assertIn("Check the retained pane and send the resume prompt by hand.", failure.reason)
+        self.assertEqual(herdr.decode_prompt_outcome(herdr.encode_prompt_outcome(failure)), failure)
+
+    def test_started_target_checks_the_first_of_two_discovered_ids(self) -> None:
+        requested = herdr.SessionTranscript(self.transcript.config_dir, "requested")
+        self.events.append((0.1, lambda: self.write_turn("resume the saved work")))
+        publications: list[herdr.SessionTranscript] = []
+        with (patch.object(self.client, "native_session", side_effect=[self.transcript.session_id, "later", "later"]),
+              patch.object(herdr, "check_target", return_value=False)):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id],
+                herdr.OpeningPrompt("resume the saved work", requested, publications.append), 300)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(publications, [herdr.SessionTranscript(self.transcript.config_dir, "later")])
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_ready_second_id_does_not_send_after_a_turn_under_the_first_id(self) -> None:
+        requested = herdr.SessionTranscript(self.transcript.config_dir, "requested")
+        text = "resume the saved work"
+        self.events.append((0.1, lambda: self.write_turn(text)))
+        self.submit_on_type = True
+        with (patch.object(self.client, "native_session", side_effect=[self.transcript.session_id, "later"]),
+              patch.object(herdr, "check_target", side_effect=[False, True, True])):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id], herdr.OpeningPrompt(text, requested), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_missing_transcript_cannot_prove_the_prompt_unsent(self) -> None:
+        opening = herdr.OpeningPrompt("resume the saved work", may_type=False)
+        outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 1000)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_new_launch_without_transcript_or_transport_is_not_sent(self) -> None:
+        opening = herdr.OpeningPrompt("resume the saved work")
+        outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 1000)
+        self.assertEqual(outcome.state, "not_sent")
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_started_transport_without_matching_turn_is_unknown(self) -> None:
+        self.drop_all = True
+        outcome = self.submit(timeout_ms=1000)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_unreadable_first_native_transcript_blocks_a_send_to_the_ready_second_id(self) -> None:
+        requested = herdr.SessionTranscript(self.transcript.config_dir, "requested")
+        self.path.mkdir()
+        _ = self.path.with_name("later.jsonl").write_text("")
+
+        def ready(_session: str, *, action: object, **_options: object) -> bool:
+            return self.elapsed > 0 or action != "keys"
+
+        with (patch.object(self.client, "native_session", side_effect=[self.transcript.session_id, "later"]),
+              patch.object(herdr, "check_target", side_effect=ready)):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id], herdr.OpeningPrompt("continue", requested), 1000)
+        assert isinstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(outcome.state, "not_sent")
+        self.assertIn("transcript unreadable", outcome.reason)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_gate_confirms_a_turn_under_the_native_id_seen_after_publication(self) -> None:
+        late = herdr.SessionTranscript(self.transcript.config_dir, "late-native")
+        text = "resume the saved work"
+        for turn_before_publication in (False, True):
+            with self.subTest(turn_before_publication=turn_before_publication):
+                publications: list[herdr.SessionTranscript] = []
+                late_path = self.path.with_name(late.session_id + ".jsonl")
+                late_path.unlink(missing_ok=True)
+
+                def write_late_turn() -> None:
+                    self.write_turn(text)
+                    _ = self.path.rename(late_path)
+
+                def publish(transcript: herdr.SessionTranscript) -> None:
+                    publications.append(transcript)
+                    if not turn_before_publication:
+                        write_late_turn()
+
+                def native(_pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                    if turn_before_publication and not late_path.exists():
+                        write_late_turn()
+                    session = late if late_path.exists() else self.transcript
+                    return herdr.NativeAgentProcess(herdr.PaneSessionReport(session.session_id), "fixture-prompt-recipient", {})
+
+                with patch.object(herdr, "native_process", side_effect=native):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", self.transcript.session_id], herdr.OpeningPrompt(text, self.transcript, publish), 1000)
+                self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                self.assertEqual(publications, [late if turn_before_publication else self.transcript])
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_inaccessible_projects_directory_blocks_an_opening_send(self) -> None:
+        self.submit_on_type = True
+        iterdir = Path.iterdir
+
+        def list_projects(path: Path) -> Iterable[Path]:
+            if path == self.transcript.config_dir / "projects":
+                raise PermissionError("fixture projects directory denied")
+            return iterdir(path)
+
+        with patch.object(Path, "iterdir", list_projects):
+            outcome = self.submit(timeout_ms=1000)
+        assert isinstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("transcript unreadable", outcome.reason)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_cursor_distinguishes_missing_projects_from_an_invalid_session_id(self) -> None:
+        cases = (
+            (herdr.SessionTranscript(self.root / "missing", self.transcript.session_id), herdr.TranscriptReadable),
+            (herdr.SessionTranscript(self.transcript.config_dir, "invalid/id"), herdr.TranscriptUnreadable),
+        )
+        for transcript, expected in cases:
+            with self.subTest(transcript=transcript):
+                cursor = herdr.TranscriptCursor(transcript, self.launched_at)
+                self.assertEqual(cursor.read_turns(), [])
+                self.assertIsInstance(cursor.readability, expected)
+
+    def test_staff_publication_inherits_the_remaining_launch_deadline(self) -> None:
+        from scripts.lib import operation_deadline
+
+        budgets: list[float] = []
+        self.submit_on_type = True
+
+        def target(*_args: object, **_kwargs: object) -> bool:
+            self.elapsed = max(self.elapsed, 0.25)
+            return True
+
+        def publish(_transcript: herdr.SessionTranscript) -> None:
+            budgets.append(operation_deadline.remaining())
+
+        with patch.object(herdr, "check_target", side_effect=target):
+            opening = herdr.OpeningPrompt("resume the saved work", self.transcript, publish)
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", self.transcript.session_id], opening, 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(budgets, [0.75])
+
+    def test_failed_staff_publication_preserves_the_matching_turn_on_both_paths(self) -> None:
+        text = "resume the saved work"
+
+        def refuse(_transcript: herdr.SessionTranscript) -> None:
+            self.write_turn(text)
+            raise OSError("publication refused")
+
+        for ready in (True, False):
+            with self.subTest(ready=ready):
+                self.elapsed = 0
+                self.path.unlink(missing_ok=True)
+                if not ready:
+                    self.events.append((0.1, lambda: self.write_turn(text)))
+                with (patch.object(herdr, "check_target", return_value=ready), redirect_stderr(io.StringIO())):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", self.transcript.session_id], herdr.OpeningPrompt(text, self.transcript, refuse), 100)
+                assert isinstance(outcome, herdr.PromptSubmitted)
+                self.assertEqual(outcome.state, "confirmed")
+                self.assertEqual(outcome.publication_error, "publication refused")
+                decoded = herdr.decode_prompt_outcome(herdr.encode_prompt_outcome(outcome))
+                self.assertEqual(decoded.state, "confirmed")
+                self.assertEqual(decoded.publication_error, outcome.publication_error)
+                self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_existing_resume_refusals_give_the_manual_step(self) -> None:
+        for error in (herdr_types.HerdrFailure("different terminal", "wrong_target"),
+                      herdr_types.HerdrFailure("start failed")):
+            with (self.subTest(code=error.code), patch.object(herdr, "trust_claude_launch"),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(self.client, "run_in_pane", side_effect=error if error.code else None),
+                  patch.object(self.client, "start_command", side_effect=error),
+                  redirect_stderr(io.StringIO())):
+                result = herdr.launch_prepared_agent("agents", herdr.ExistingPane("destination:p1", "destination-terminal"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "claude", ["--resume", self.transcript.session_id],
+                    herdr.OpeningPrompt("resume the saved work", self.transcript), 1000, agent="unit", client=self.client)
+            self.assertIsInstance(result.outcome, herdr.PromptNotSubmitted)
+            failure = cast(herdr.PromptNotSubmitted, result.outcome)
+            self.assertEqual(failure.state, "not_sent")
+            self.assertIn("The resume prompt was not sent. Check the retained pane and send the resume prompt by hand.",
+                          failure.reason)
+            self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_enter_retry_waits_for_target_evidence_without_retyping(self) -> None:
+        self.submit_on_enter = 1
+        original_check_target = herdr.check_target
+
+        def check_target(*_args: object, **_kwargs: object) -> object:
+            if 5 <= self.elapsed < 6:
+                return False
+            return cast(object, unittest.mock.DEFAULT)
+
+        with patch.object(herdr, "check_target", side_effect=check_target, wraps=original_check_target):
+            outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+        self.assertGreaterEqual(self.elapsed, 6)
+
+    def test_prompt_selects_the_registered_claude_among_foreground_candidates(self) -> None:
+        agent = {"pid": 1466578, "name": "claude", "argv": ["claude"]}
+        helper = {"pid": 1471981, "name": "claude", "argv": ["claude"]}
+        native_process = herdr.native_process
+        self.submit_on_type = True
+
+        def registry(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            if pid == 1471981:
+                raise herdr.NativeRegistryChanging("helper has no registry identity")
+            return native_process(pid, kind)
+
+        for foreground in ([helper, agent], [agent, helper]):
+            with self.subTest(foreground=foreground):
+                self.typed.clear()
+                _ = self.path.write_bytes(b"")
+                with (patch.object(herdr, "native_process", side_effect=registry),
+                      patch.object(herdr, "prompt_recipient_process",
+                                   return_value=herdr.PromptRecipientProcess(1466578, "fixture-prompt-recipient")),
+                      patch.object(self.client, "result", return_value={"process_info": {
+                          "shell_pid": 23455, "foreground_process_group_id": 1466578,
+                          "foreground_processes": foreground}}),
+                      redirect_stderr(io.StringIO())):
+                    self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptSubmitted)
+                self.assertEqual(len(self.typed), 1)
+                self.assertEqual(self.elapsed, 0)
+
+    def test_opening_prompt_checks_the_foreground_group_leader_and_recipient(self) -> None:
+        leader, agent = 23457, 23456
+        script = Path(herdr.__file__).resolve().parents[1] / "lib/relaunch.py"
+        other_script = self.root / "other/scripts/lib/relaunch.py"
+        other_script.parent.mkdir(parents=True)
+        other_script.touch()
+        proc = self.root / "proc"
+        child_process = proc / str(agent)
+        child_process.mkdir(parents=True)
+        parent_process = proc / str(leader)
+        parent_process.mkdir()
+        parent_exe = parent_process / "exe"
+        parent_cmdline = parent_process / "cmdline"
+        parent_stat = parent_process / "stat"
+        read_bytes = Path.read_bytes
+        self.submit_on_enter = 1
+
+        def stat_line(pid: int, program: str, parent: int, start: int) -> str:
+            return f"{pid} ({program}) S {parent} {leader} 23455 0 {leader} " + "0 " * 13 + f"{start}\n"
+
+        for label, program, script_path, command, parent, recipient, accepted in (
+            ("approved script", "python3", script, "run", leader, agent, True),
+            ("other script", "python3", other_script, "run", leader, agent, False),
+            ("parent generation changes", "python3", script, "run", leader, agent, False),
+            ("child generation changes", "python3", script, "run", leader, agent, False),
+            ("direct parent changes", "python3", script, "run", leader, agent, False),
+            ("parent execs", "python3", script, "run", leader, agent, False),
+            ("other program", "editor", script, "run", leader, agent, False),
+            ("other command", "python3", script, "help", leader, agent, False),
+            ("other parent", "python3", script, "run", 23458, agent, False),
+            ("leader as recipient", "python3", script, "run", leader, leader, False),
+        ):
+            with self.subTest(label=label):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                _ = self.path.write_bytes(b"")
+                child_stat = child_process / "stat"
+                initial_child_stat = stat_line(agent, "claude", parent, 200)
+                _ = child_stat.write_text(initial_child_stat)
+                _ = parent_stat.write_text(stat_line(leader, program, 23455, 100))
+                parent_exe.unlink(missing_ok=True)
+                parent_exe.symlink_to(self.root / "bin" / program)
+                _ = parent_cmdline.write_bytes(os.fsencode(f"{program}\0{script_path}\0{command}\0"))
+                command_reads = 0
+
+                def read_command(path: Path) -> bytes:
+                    nonlocal command_reads
+                    raw = read_bytes(path)
+                    if path != parent_cmdline:
+                        return raw
+                    command_reads += 1
+                    if label == "parent generation changes":
+                        _ = parent_stat.write_text(stat_line(leader, program, 23455, 100 + command_reads))
+                    if label == "child generation changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", parent, 200 + command_reads))
+                    if label == "direct parent changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", 23458, 200))
+                    if label == "parent execs" and command_reads % 2 == 0:
+                        return raw + b"changed-argument\0"
+                    return raw
+
+                # The pane report still shows the original supervisor command.
+                info = {"process_info": {"shell_pid": 23455, "foreground_process_group_id": leader,
+                    "foreground_processes": [{"pid": leader, "name": "python3", "argv": ["python3", str(script), "run"]},
+                                             {"pid": agent, "argv": ["claude"]}]}}
+                with (patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                      patch.object(herdr, "proc_root", return_value=proc),
+                      patch.object(Path, "read_bytes", read_command),
+                      patch.object(self.client, "result", return_value=info),
+                      patch.object(herdr, "prompt_recipient_process",
+                                   return_value=herdr.PromptRecipientProcess(recipient, "fixture-prompt-recipient")),
+                      redirect_stderr(io.StringIO())):
+                    outcome = self.submit(timeout_ms=6000 if accepted else 1000)
+                if accepted:
+                    self.assertEqual(command_reads, 4)
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(len(self.typed), 1)
+                    self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+                else:
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted(
+                        "prompt target is unknown; session retained", self.screen, state="not_sent"))
+                    self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_reports_each_retained_reason_once_across_polls(self) -> None:
+        def retained_process_info(*_arguments: str) -> dict[str, object]:
+            foreground = [] if self.elapsed < 0.3 else [{"pid": 23456, "name": "claude"}]
+            return {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                                     "foreground_processes": foreground}}
+
+        with (patch.object(self.client, "result", side_effect=retained_process_info) as result,
+              redirect_stderr(io.StringIO()) as errors):
+            outcome = self.submit(timeout_ms=10_000)
+
+        self.assertGreater(result.call_count, 8)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "herdr agents:destination:p1: native session is unknown; target retained",
+            "herdr agents:destination:p1: target evidence is unknown: agent argv is unavailable; target retained",
+        ])
+        self.assertEqual(outcome, herdr.PromptNotSubmitted(
+            "prompt target is unknown; session retained", self.screen, state="not_sent"))
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_requires_a_fresh_empty_composer(self) -> None:
+        empty = self.screen
+        text = "resume the saved work"
+        self.submit_on_type = True
+        original_check = herdr.check_target
+        for screen in ("loading", f"────────\n❯ {script_prompt(text)}\n────────"):
+            with self.subTest(screen=screen):
+                self.screen = empty
+                self.elapsed = 0
+                self.typed.clear()
+                _ = self.path.write_bytes(b"")
+
+                def check(*_args: object, **_kwargs: object) -> object:
+                    if self.elapsed == 0:
+                        self.screen = screen
+                        return False
+                    return cast(object, unittest.mock.DEFAULT)
+
+                with patch.object(herdr, "check_target", side_effect=check, wraps=original_check):
+                    outcome = self.submit(timeout_ms=1000, text=text)
+                self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_requires_a_fresh_matching_draft_before_enter(self) -> None:
+        self.submit_on_enter = 1
+        composer = self.client.composer
+
+        def cleared(pane: str) -> herdr.ComposerInput | herdr.NoComposer:
+            if self.elapsed >= 5:
+                self.screen = "────────\n❯ \n────────"
+            return composer(pane)
+
+        with patch.object(self.client, "composer", side_effect=cleared):
+            self.assertIsInstance(self.submit(timeout_ms=6000), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_empty_composer_in_gate_prevents_enter_on_a_later_matching_draft(self) -> None:
+        composer = self.client.composer
+
+        def gate_composer(pane: str) -> herdr.ComposerInput | herdr.NoComposer:
+            if 5 <= self.elapsed < 6:
+                return herdr.ComposerInput("")
+            return composer(pane)
+
+        with patch.object(self.client, "composer", side_effect=gate_composer):
+            self.assertIsInstance(self.submit(timeout_ms=16_000), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_composer_read_precedes_terminal_recipient_and_idle_checks(self) -> None:
+        events: list[str] = []
+        composer = self.client.composer
+        row = self.client.pane_row
+
+        def observed_composer(pane: str) -> herdr.ComposerInput | herdr.NoComposer:
+            events.clear()
+            events.append("composer")
+            return composer(pane)
+
+        def observed_row(pane: str) -> herdr.PaneIdentity | herdr.NoPane:
+            events.append("terminal")
+            return row(pane)
+
+        def recipient(_session: str) -> herdr.PromptRecipientProcess:
+            events.append("recipient")
+            return herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient")
+
+        def readiness(pane: str) -> herdr.WorkerReadiness:
+            events.append("idle")
+            return self.readiness(pane)
+
+        def transport(pane: str, text: str) -> None:
+            self.assertEqual(events, ["composer", "terminal", "recipient", "idle"])
+            self.type_prompt(pane, text)
+
+        self.submit_on_type = True
+        with (patch.object(self.client, "composer", side_effect=observed_composer),
+              patch.object(self.client, "pane_row", side_effect=observed_row),
+              patch.object(herdr, "prompt_recipient_process", side_effect=recipient),
+              patch.object(self.client, "readiness", side_effect=readiness),
+              patch.object(self.client, "_prompt", side_effect=transport)):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+
+    def test_first_prompt_retry_refuses_a_new_recipient_or_terminal(self) -> None:
+        original = herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient")
+        replacement = herdr.PromptRecipientProcess(23457, "replacement")
+        process_info = self.client.result
+        for changed in ("recipient", "terminal"):
+            with self.subTest(changed=changed):
+                self.elapsed = 0
+                self.typed.clear()
+                _ = self.path.write_bytes(b"")
+                self.submit_on_type = True
+
+                def recipient(_session: str) -> herdr.PromptRecipientProcess:
+                    return replacement if changed == "recipient" and self.elapsed else original
+
+                def panes() -> list[herdr.PaneIdentity]:
+                    terminal = "replacement" if changed == "terminal" and self.elapsed else "destination-terminal"
+                    return [{"pane_id": "destination:p1", "terminal_id": terminal, "label": None,
+                             "session_id": self.transcript.session_id, "workspace_id": "destination"}]
+
+                def result(*arguments: str) -> dict[str, object]:
+                    if self.elapsed == 0:
+                        raise herdr_types.HerdrFailure("foreground temporarily unavailable")
+                    return process_info(*arguments)
+
+                with (patch.object(herdr, "prompt_recipient_process", side_effect=recipient),
+                      patch.object(self.client, "panes", side_effect=panes),
+                      patch.object(self.client, "result", side_effect=result),
+                      redirect_stderr(io.StringIO())):
+                    outcome = self.submit(timeout_ms=1000)
+                self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+                reason = "recipient changed" if changed == "recipient" else "terminal identity changed"
+                self.assertIn(reason, cast(herdr.PromptNotSubmitted, outcome).reason)
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_failed_opening_command_record_starts_no_transport_attempt(self) -> None:
+        from scripts.lib import script_prompts
+
+        transport = type(self.client)._prompt.__get__(self.client)  # pyright: ignore[reportPrivateUsage]
+        with (patch.object(self.client, "_prompt", wraps=transport),
+              patch.object(script_prompts, "prepare_record", side_effect=OSError("record failed"))):
+            outcome = self.submit(text="/resume")
+        self.assertEqual(outcome, herdr.PromptNotSubmitted("record failed", self.screen, state="not_sent"))
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_target_query_uses_the_remaining_launch_time(self) -> None:
+        self.submit_on_type = True
+        commands: list[float] = []
+
+        def run(*arguments: str) -> str:
+            if arguments[:2] == ("pane", "process-info"):
+                self.elapsed = 0.95
+                return type(self.client).run(self.client, *arguments)
+            return self.read_screen(*arguments)
+
+        def program(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            commands.append(timeout)
+            payload = {"result": {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                "foreground_processes": [{"pid": 23456, "name": "claude", "argv": ["claude"]}]}}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        with (patch.object(self.client, "result", wraps=type(self.client).result.__get__(self.client)),
+              patch.object(self.client, "run", side_effect=run),
+              patch.object(herdr, "run_program", side_effect=program)):
+            self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptSubmitted)
+        self.assertEqual(len(commands), 1)
+        self.assertAlmostEqual(commands[0], 0.05)
+
+    def test_opening_prompt_refuses_an_unregistered_foreground_group_leader(self) -> None:
+        expected = herdr.native_process
+        self.submit_on_type = True
+
+        def registry(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            if pid != 23456:
+                raise herdr.NativeRegistryChanging("unregistered")
+            return expected(pid, kind)
+
+        with (patch.object(herdr, "native_process", side_effect=registry),
+              patch.object(self.client, "result", return_value={"process_info": {
+                  "shell_pid": 23455, "foreground_process_group_id": 23457,
+                  "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}
+                                           for pid in (23456, 23457)]}}),
+              redirect_stderr(io.StringIO())):
+            self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptNotSubmitted)
+        self.assertEqual(self.typed, [])
+
+    def test_opening_prompt_accepts_a_registered_leader_with_an_unregistered_helper(self) -> None:
+        self.submit_on_type = True
+        expected = herdr.native_process
+
+        def registry(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            if pid != 23456:
+                raise herdr.NativeRegistryChanging("unregistered helper")
+            return expected(pid, kind)
+
+        with (patch.object(herdr, "native_process", side_effect=registry),
+              patch.object(self.client, "result", return_value={"process_info": {
+                  "shell_pid": 23455, "foreground_process_group_id": 23456,
+                  "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}
+                                           for pid in (23456, 23457)]}})):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+
+    def test_opening_prompt_respects_a_codex_childs_terminal_input(self) -> None:
+        self.submit_on_type = True
+        info = {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                                 "foreground_processes": [
+                                     {"pid": 23456, "argv": ["codex"]},
+                                     {"pid": 23457, "argv": ["hook"]},
+                                 ]}}
+        native = herdr.NativeAgentProcess(herdr.PaneSessionReport(self.transcript.session_id), "fixture-start", {})
+        for holds_terminal in (True, False):
+            with self.subTest(holds_terminal=holds_terminal):
+                self.elapsed = 0
+                self.typed.clear()
+                device = herdr.StdinCharacterDevice(3) if holds_terminal else herdr.NonTerminalStdin.PROVED
+                with (patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "_linux_process_stat", return_value=["S", "23456", "0", "0", "3"]),
+                      patch.object(herdr, "_stdin_device", return_value=device) as stdin,
+                      patch.object(herdr, "native_process", return_value=native),
+                      patch.object(self.client, "result", return_value=info)):
+                    outcome = self.submit()
+                stdin.assert_called_once_with(23457, darwin=False)
+                if holds_terminal:
+                    assert isinstance(outcome, herdr.PromptNotSubmitted)
+                    self.assertIn("terminal held by hook", outcome.reason)
+                    self.assertEqual(self.typed, [])
+                else:
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(len(self.typed), 1)
+
+    def test_opening_prompt_refuses_two_registered_candidates(self) -> None:
+        self.submit_on_type = True
+        candidates = [{"pid": pid, "name": "claude", "argv": ["claude"]} for pid in (23456, 23457)]
+        records = [{"pid": pid, "procStart": str(pid), "sessionId": self.transcript.session_id}
+                   for pid in (23456, 23457)]
+        for ambiguous_registry in (False, True):
+            with self.subTest(ambiguous_registry=ambiguous_registry):
+                self.elapsed = 0
+                recipient_lookup = (patch.object(herdr, "prompt_recipient_process", wraps=PROMPT_RECIPIENT_PROCESS)
+                                    if ambiguous_registry else nullcontext())
+                with (patch.object(self.client, "result", return_value={"process_info": {
+                          "shell_pid": 23455, "foreground_process_group_id": 23456,
+                          "foreground_processes": candidates}}),
+                      patch.object(sessions, "running_sessions", return_value=records),
+                      recipient_lookup,
+                      redirect_stderr(io.StringIO())):
+                    self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptNotSubmitted)
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_transcript_read_cannot_use_stale_terminal_idle_or_composer_evidence(self) -> None:
+        real_read = herdr.TranscriptCursor.read_turns
+        real_check = herdr.check_target
+        for change in ("terminal", "idle", "composer"):
+            with self.subTest(change=change):
+                self.elapsed = 0
+                self.working_until = 0
+                self.screen = "────────\n❯ \n────────"
+                terminal = "destination-terminal"
+
+                def read(cursor: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+                    nonlocal terminal
+                    if self.elapsed > 0:
+                        if change == "terminal":
+                            terminal = "replacement"
+                        elif change == "idle":
+                            self.working_until = 10
+                        else:
+                            self.screen = "────────\n❯ operator draft\n────────"
+                    return real_read(cursor)
+
+                def panes() -> list[dict[str, str]]:
+                    return [{"pane_id": "destination:p1", "terminal_id": terminal}]
+
+                def check(*_args: object, **_kwargs: object) -> object:
+                    return False if self.elapsed == 0 else cast(object, unittest.mock.DEFAULT)
+
+                with (patch.object(self.client, "panes", side_effect=panes),
+                      patch.object(herdr.TranscriptCursor, "read_turns", read),
+                      patch.object(herdr, "check_target", wraps=real_check, side_effect=check),
+                      redirect_stderr(io.StringIO())):
+                    outcome = self.submit(timeout_ms=1000)
+                self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).state, "not_sent")
+                self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_rechecks_idle_after_target_retry(self) -> None:
+        original_check = herdr.check_target
+
+        def check(*_args: object, **_kwargs: object) -> object:
+            if self.typed and self.working_until == 0:
+                self.working_until = 30
+                return False
+            return cast(object, unittest.mock.DEFAULT)
+
+        with patch.object(herdr, "check_target", side_effect=check, wraps=original_check):
+            self.assertIsInstance(self.submit(timeout_ms=16_000), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_opening_prompt_checks_composer_after_command_preparation(self) -> None:
+        from scripts.lib import script_prompts
+
+        prepare_record = script_prompts.prepare_record
+
+        def prepare(pane: str, text: str, *, deadline: float) -> script_prompts.PreparedRecord:
+            self.assertEqual(deadline, 1)
+            self.screen = "────────\n❯ /resume\n────────"
+            return prepare_record(pane, text, deadline=deadline)
+
+        self.submit_on_type = True
+        with patch.object(script_prompts, "prepare_record", side_effect=prepare):
+            self.assertIsInstance(self.submit(timeout_ms=1000, text="/resume"), herdr.PromptNotSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_turn_during_opening_record_preparation_stops_the_send(self) -> None:
+        from scripts.lib import script_prompts
+
+        prepare_record = script_prompts.prepare_record
+
+        def prepare(pane: str, text: str, *, deadline: float) -> script_prompts.PreparedRecord:
+            self.write_turn(text)
+            return prepare_record(pane, text, deadline=deadline)
+
+        with patch.object(script_prompts, "prepare_record", side_effect=prepare):
+            self.assertIsInstance(self.submit(text="/resume"), herdr.PromptSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertFalse(script_prompts.typed_by_script("destination:p1", "/resume"))
+
+    def test_opening_record_lock_stops_with_fifty_milliseconds_left(self) -> None:
+        from scripts.lib import script_prompts
+
+        def ready(pane: str) -> herdr.WorkerReadiness:
+            self.elapsed = 0.95
+            return self.readiness(pane)
+
+        def wait_for_lock(_read: object, _write: object, _errors: object, seconds: float) -> tuple[list[int], list[int], list[int]]:
+            self.advance(seconds)
+            return [], [], []
+
+        with (script_prompts.locked(), patch.object(self.client, "readiness", side_effect=ready),
+              patch.object(select, "select", side_effect=wait_for_lock)):
+            outcome = self.submit(timeout_ms=1000, text="/resume")
+        self.assertEqual(outcome, herdr.PromptNotSubmitted("script prompt record lock deadline elapsed",
+                                                          self.screen, state="not_sent"))
+        self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertAlmostEqual(self.elapsed, 1)
+
+    def test_declined_opening_command_removes_only_its_unsent_record(self) -> None:
+        from scripts.lib import script_prompts
+
+        script_prompts.record("sibling:p1", "/resume")
+        with patch.object(herdr, "check_target", return_value=False):
+            outcome = self.submit(timeout_ms=1000, text="/resume")
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).state, "not_sent")
+        self.assertFalse(script_prompts.typed_by_script("destination:p1", "/resume"))
+        self.assertTrue(script_prompts.typed_by_script("sibling:p1", "/resume"))
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_slash_record_exists_at_transport_entry_and_is_removed_if_no_process_starts(self) -> None:
+        from scripts.lib import script_prompts
+
+        run = type(self.client).run
+        prompt = type(self.client)._prompt.__get__(self.client)  # pyright: ignore[reportPrivateUsage]
+        for refusal in ("deadline", "executable"):
+            with self.subTest(refusal=refusal):
+                self.elapsed = 0
+
+                def read_or_transport(*args: str) -> str:
+                    if args[:2] != ("agent", "prompt"):
+                        return self.read_screen(*args)
+                    self.assertTrue(script_prompts.typed_by_script("destination:p1", "/resume"))
+                    if refusal == "deadline":
+                        self.elapsed = 1
+                    return run(self.client, *args)
+
+                def idle(pane: str) -> herdr.WorkerReadiness:
+                    self.assertFalse(script_prompts.typed_by_script(pane, "/resume"))
+                    return self.readiness(pane)
+
+                with (patch.object(self.client, "readiness", side_effect=idle),
+                      patch.object(self.client, "run", side_effect=read_or_transport),
+                      patch.object(self.client, "_prompt", wraps=prompt)):
+                    outcome = self.submit(timeout_ms=1000, text="/resume")
+                self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).state, "not_sent")
+                self.assertNotIn("prompt transport attempts", cast(herdr.PromptNotSubmitted, outcome).reason)
+                self.assertFalse(script_prompts.typed_by_script("destination:p1", "/resume"))
+
+    def test_nul_byte_opening_prompt_leaves_no_record(self) -> None:
+        from scripts.lib import conf, script_prompts
+
+        prompt = type(self.client)._prompt  # pyright: ignore[reportPrivateUsage]
+        run = type(self.client).run
+
+        def read_or_transport(*args: str) -> str:
+            return run(self.client, *args) if args[:2] == ("agent", "prompt") else self.read_screen(*args)
+
+        text = "/resume with\x00nul"
+        for at_capacity in (False, True):
+            with self.subTest(at_capacity=at_capacity):
+                with (patch.object(self.client, "_prompt", wraps=prompt.__get__(self.client)),
+                      patch.object(self.client, "run", side_effect=read_or_transport),
+                      patch.object(conf.ConfigRead, "whole", return_value=1)):
+                    if at_capacity:
+                        script_prompts.record("sibling:p1", "/resume")
+                    outcome = self.submit(text=text)
+                assert isinstance(outcome, herdr.PromptNotSubmitted)
+                self.assertEqual(outcome.state, "not_sent")
+                self.assertIn("embedded null byte", outcome.reason)
+                self.assertFalse(script_prompts.typed_by_script("destination:p1", text))
+                self.assertEqual(script_prompts.typed_by_script("sibling:p1", "/resume"), at_capacity)
+
+    def test_declined_send_leaves_all_slash_records_at_capacity(self) -> None:
+        from scripts.lib import conf, script_prompts
+
+        with patch.object(conf.ConfigRead, "whole", return_value=1):
+            script_prompts.record("sibling:p1", "/resume")
+            with patch.object(herdr, "check_target", return_value=False):
+                self.assertIsInstance(self.submit(timeout_ms=100, text="/resume"), herdr.PromptNotSubmitted)
+        self.assertTrue(script_prompts.typed_by_script("sibling:p1", "/resume"))
+        self.assertFalse(script_prompts.typed_by_script("destination:p1", "/resume"))
+
+    def test_slash_record_checks_deadline_after_lock_acquisition(self) -> None:
+        from scripts.lib import script_prompts
+
+        locked = script_prompts.locked
+
+        @contextmanager
+        def slow_lock(deadline: float) -> Generator[None]:
+            with locked(deadline):
+                self.elapsed = deadline
+                yield
+
+        with (patch.object(script_prompts, "locked", side_effect=slow_lock),
+              self.assertRaisesRegex(TimeoutError, "script prompt record deadline elapsed")):
+            script_prompts.prepare_record("destination:p1", "/resume", deadline=0.05).publish()
+        self.assertFalse(script_prompts.typed_by_script("destination:p1", "/resume"))
+
+    def test_agent_not_ready_screen_read_uses_remaining_deadline(self) -> None:
+        from scripts.lib import operation_deadline
+
+        def start(*_args: object) -> subprocess.CompletedProcess[str]:
+            self.elapsed = 0.99
+            return subprocess.CompletedProcess([], 1, json.dumps({"error": {
+                "code": "agent_not_ready", "message": "dialog"}}), "")
+
+        def read(*_args: str) -> str:
+            self.assertAlmostEqual(operation_deadline.remaining(), 0.01)
+            return "Trust dialog"
+
+        with (patch.object(self.client, "start_command", side_effect=start),
+              patch.object(self.client, "run", side_effect=read) as diagnostic,
+              redirect_stderr(io.StringIO())):
+            outcome = self.client.start_agent("unit", "destination:p1", "claude", [], herdr.NoOpeningPrompt(), 1000)
+        self.assertIsInstance(outcome, herdr.AgentNotStarted)
+        diagnostic.assert_called_once_with("pane", "read", "destination:p1", "--source", "visible")
+
+    def test_matching_turn_during_first_target_retry_stops_submission(self) -> None:
+        self.events.append((0.3, lambda: self.write_turn("resume the saved work")))
+        with patch.object(herdr, "check_target", return_value=False):
+            self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertLess(self.elapsed, 1)
+
+    def test_both_opening_transports_use_the_remaining_launch_time(self) -> None:
+        for send in ("typing", "enter"):
+            with self.subTest(send=send):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                self.screen = "────────\n❯ \n────────"
+                self.submit_on_type = send == "typing"
+                _ = self.path.write_bytes(b"")
+                timeouts: list[float] = []
+                timeout_ms = 1000 if send == "typing" else 5050
+
+                def program(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+                    timeouts.append(timeout)
+                    if send == "typing":
+                        self.type_prompt(argv[-2], argv[-1])
+                    else:
+                        self.write_turn("resume the saved work")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                def run(*arguments: str) -> str:
+                    if arguments[:2] in (("agent", "prompt"), ("pane", "send-keys")):
+                        return type(self.client).run(self.client, *arguments)
+                    if send == "typing" and arguments[:2] == ("pane", "read"):
+                        self.elapsed = 0.95
+                    return self.read_screen(*arguments)
+
+                transport, method = (("_prompt", type(self.client)._prompt) if send == "typing"  # pyright: ignore[reportPrivateUsage]
+                                     else ("_send_keys", type(self.client)._send_keys))  # pyright: ignore[reportPrivateUsage]
+                with (patch.object(self.client, transport, wraps=method.__get__(self.client)),
+                      patch.object(self.client, "run", side_effect=run),
+                      patch.object(herdr, "run_program", side_effect=program)):
+                    self.assertIsInstance(self.submit(timeout_ms=timeout_ms), herdr.PromptSubmitted)
+                self.assertEqual(len(timeouts), 1)
+                self.assertAlmostEqual(timeouts[0], 0.05)
+
+    def test_prompt_transport_wait_uses_the_time_left_after_process_start(self) -> None:
+        from scripts.lib import operation_deadline
+
+        for pause, started_at in ((0.0, 0.03), (0.03, 0.031)):
+            with self.subTest(pause=pause):
+                self.elapsed = 0.0
+                timeouts: list[float] = []
+
+                def monotonic() -> float:
+                    now = self.elapsed
+                    if now == 0.0:
+                        self.elapsed = pause
+                    return now
+
+                def communicate(*, timeout: float) -> tuple[str, str]:
+                    timeouts.append(timeout)
+                    return "", ""
+
+                process = unittest.mock.MagicMock(returncode=0, communicate=communicate)
+
+                def spawn(*_args: object, **_kwargs: object) -> object:
+                    self.elapsed = started_at
+                    return process
+
+                with (operation_deadline.within(0.05), patch.object(time, "monotonic", side_effect=monotonic),
+                      patch.object(subprocess, "Popen", side_effect=spawn)):
+                    _ = herdr.run_program(["herdr", "--session", "agents", "agent", "prompt", "w1:p1", "continue"])
+                self.assertEqual(len(timeouts), 1)
+                self.assertAlmostEqual(timeouts[0], 0.05 - started_at)
+
+    def test_signal_and_close_refuse_an_opening_composer_option(self) -> None:
+        check = cast(Callable[..., bool], herdr.check_target)
+        composer = herdr._OpeningComposer.EMPTY  # pyright: ignore[reportPrivateUsage]
+        for action in ("signal", "close"):
+            with self.subTest(action=action):
+                with self.assertRaises(TypeError):
+                    _ = check(self.transcript.session_id, action=action, opening_composer=composer)
 
     def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
         text = "/showrunner:produce /x/doc.md resume"
@@ -1124,15 +2401,15 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
-    def test_lost_prompt_is_typed_again_after_loading_finishes(self) -> None:
+    def test_lost_prompt_is_sent_once_even_after_loading_finishes(self) -> None:
         self.drop_before = 7
         self.submit_on_type = True
         outcome = self.submit(timeout_ms=90_000)
-        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         self.assertEqual([(pane, text) for pane, text, _at in self.typed],
-                         [("destination:p1", script_prompt("resume the saved work"))] * 2)
+                         [("destination:p1", script_prompt("resume the saved work"))])
         self.assertEqual(self.typed[0][2], 0)
-        self.assertGreaterEqual(self.typed[1][2], 10)
+        self.assertEqual(self.elapsed, 90)
         self.assertEqual(self.enters, [])
 
     def test_unreadable_accepted_turn_blocks_retyping_until_the_deadline(self) -> None:
@@ -1142,7 +2419,7 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         failure = cast(herdr.PromptNotSubmitted, outcome)
         self.assertIn("transcript unreadable", failure.reason)
-        self.assertIn("prompt typed 1 times", failure.reason)
+        self.assertIn("prompt transport attempts: 1", failure.reason)
         self.assertEqual(failure.screen, self.screen)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
@@ -1150,6 +2427,36 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertTrue(any(at >= 10 for at in failures))
         self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
                               herdr.PromptSubmitted)
+
+        with self.subTest(transcript="malformed Codex line"):
+            from scripts.agents.stop_resume import CodexProducerPromptCursor
+
+            self.typed.clear()
+            self.turn_delay = 0
+            self.path = self.transcript.config_dir / "sessions" / f"rollout-{self.transcript.session_id}.jsonl"
+            self.path.parent.mkdir()
+            cursor = CodexProducerPromptCursor(self.transcript, self.launched_at)
+
+            def type_with_malformed_record(pane: str, text: str) -> None:
+                self.type_prompt(pane, text)
+                _ = self.path.write_text('{"type":broken}\n')
+                self.screen = "────────\n❯ \n────────"
+
+            opening = herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 1)
+            self.assertEqual(self.enters, [])
+            self.assertIsInstance(cursor.readability, herdr.TranscriptUnreadable)
+            retry = herdr.OpeningPrompt(opening.text, self.transcript, cursor=cursor, resend_once=True)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", retry, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 2)
+            self.assertEqual(self.enters, [])
+            self.write_turn(opening.text)
+            self.assertIsInstance(cursor.submitted_prompt(script_prompt(opening.text)), herdr.PromptSubmitted)
 
     def test_unreadable_accepted_turn_is_found_after_reads_recover_without_retyping(self) -> None:
         self.turn_delay = 8
@@ -1162,36 +2469,29 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertGreaterEqual(self.elapsed, 13)
         self.assertLess(self.elapsed, 30)
 
-    def test_transcript_becoming_unreadable_at_the_final_check_blocks_retyping(self) -> None:
-        self.drop_all = True
+    def test_transcript_becoming_unreadable_at_the_final_check_blocks_enter(self) -> None:
         self.write_turn("older context", kind="assistant", seconds_after_launch=-1)
-        recipient = herdr.PromptRecipientProcess(23456, "same-recipient")
+        self.events.append((1, lambda: setattr(self, "working_until", 9)))
 
-        def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
-            if self.elapsed >= 10:
-                self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)
-            return recipient
-
-        # Read errors start only after the recipient check at the retry boundary.
         original_open = Path.open
         failures: list[float] = []
         blocked = False
 
-        def recipient_and_block_reads(session: str) -> herdr.PromptRecipientProcess:
+        def show_draft(*arguments: str) -> str:
             nonlocal blocked
-            result = observe_recipient(session)
             blocked = self.elapsed >= 10
-            return result
+            return self.read_screen(*arguments)
 
         @contextmanager
-        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+        def open_transcript(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None) -> Generator[BinaryIO | TextIO]:
             if path == self.path and mode == "rb" and blocked:
                 failures.append(self.elapsed)
                 raise PermissionError("scratch final transcript check unreadable")
-            with original_open(path, mode) as stream:
-                yield cast(BinaryIO, stream)
+            with original_open(path, mode, buffering, encoding, errors, newline) as stream:
+                yield cast(BinaryIO | TextIO, stream)
 
-        with (patch.object(herdr, "prompt_recipient_process", side_effect=recipient_and_block_reads),
+        with (patch.object(self.client, "run", side_effect=show_draft),
               patch.object(Path, "open", open_transcript)):
             outcome = self.submit(timeout_ms=16_000)
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
@@ -1202,16 +2502,23 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(failures[0], 10)
         self.assertEqual(self.elapsed, 16)
 
-    def test_missing_composer_during_loading_recovers_and_retypes_the_lost_prompt(self) -> None:
+    def test_missing_composer_during_loading_recovers_without_retyping_the_lost_prompt(self) -> None:
         self.drop_before = 7
         self.submit_on_type = True
         self.events.append((1, lambda: setattr(self, "screen", "Restoring conversation")))
         self.events.append((7, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
         outcome = self.submit(timeout_ms=90_000)
-        self.assertIsInstance(outcome, herdr.PromptSubmitted)
-        self.assertEqual(len(self.typed), 2)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.typed[0][2], 0)
-        self.assertGreaterEqual(self.typed[1][2], 10)
+        self.assertEqual(self.elapsed, 90)
+        self.assertEqual(self.enters, [])
+
+    def test_turn_after_the_previous_settle_interval_confirms_one_typing(self) -> None:
+        self.turn_delay = 12
+        self.assertIsInstance(self.submit(timeout_ms=16_000), herdr.PromptSubmitted)
+        self.assertGreaterEqual(self.elapsed, 12)
+        self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
     def test_accepted_prompt_with_a_turn_eight_seconds_late_is_never_typed_again(self) -> None:
@@ -1247,11 +2554,24 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_working_session_with_a_queued_prompt_waits_for_its_twenty_second_turn(self) -> None:
         self.turn_delay = 20
-        self.working_until = 25
+        self.events.append((1, lambda: setattr(self, "working_until", 25)))
         outcome = self.submit(timeout_ms=90_000)
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
         self.assertEqual(len(self.typed), 1)
         self.assertGreaterEqual(self.elapsed, 20)
+        self.assertEqual(self.enters, [])
+
+    def test_agent_busy_at_launch_receives_no_input_until_idle(self) -> None:
+        self.working_until = 3
+        self.submit_on_type = True
+
+        def still_busy() -> None:
+            self.assertEqual((self.typed, self.enters), ([], []))
+
+        self.events.append((2, still_busy))
+        self.assertIsInstance(self.submit(timeout_ms=6000), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertGreaterEqual(self.typed[0][2], 3)
         self.assertEqual(self.enters, [])
 
     def test_visible_empty_composer_is_required_even_when_herdr_reports_ready(self) -> None:
@@ -1280,8 +2600,8 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
-    def test_changed_recipient_blocks_retyping_a_lost_prompt(self) -> None:
-        self.drop_all = True
+    def test_changed_recipient_blocks_enter_on_the_draft(self) -> None:
+        self.events.append((1, lambda: setattr(self, "working_until", 7)))
         original = herdr.PromptRecipientProcess(23456, "first-recipient")
         replacement = herdr.PromptRecipientProcess(34567, "replacement-process")
         def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
@@ -1327,8 +2647,8 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
         self.assertGreaterEqual(self.typed[0][2], 2)
 
-    def test_late_turn_during_the_final_recipient_check_prevents_retyping(self) -> None:
-        self.drop_all = True
+    def test_late_turn_during_a_blocked_enter_gate_confirms_submission(self) -> None:
+        self.events.append((1, lambda: setattr(self, "working_until", 11)))
         recipient = herdr.PromptRecipientProcess(23456, "same-recipient")
 
         def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
@@ -1452,7 +2772,12 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(publications, [self.transcript])
         self.assertTrue(seen)
         self.assertTrue(all(reader is seen[0] for reader in seen))
-        if supplied:
+        if supplied and native_identity_changes:
+            assert isinstance(cursor, herdr.TranscriptCursor)
+            self.assertIsNot(seen[0], cursor)
+            self.assertEqual(cursor.transcript, requested)
+            self.assertEqual(cursor.offsets, {source: historical_size})
+        elif supplied:
             self.assertIs(seen[0], cursor)
         self.assertEqual(seen[0].transcript, self.transcript)
         self.assertEqual(positions[0], {} if native_identity_changes else {self.path: historical_size})
@@ -1569,8 +2894,9 @@ class PromptSubmissionTests(unittest.TestCase):
         for screen, empty, contains in cases:
             with self.subTest(screen=screen):
                 self.screen = screen
-                self.assertEqual(self.client.prompt_input_empty("destination:p1"), empty)
-                self.assertEqual(self.client.prompt_in_input("destination:p1", "resume the saved work"), contains)
+                composer = self.client.composer("destination:p1")
+                self.assertEqual(isinstance(composer, herdr.ComposerInput) and not composer.text.strip(), empty)
+                self.assertEqual(isinstance(composer, herdr.ComposerInput) and composer.contains("resume the saved work"), contains)
                 state = self.client.prompt_input_state("destination:p1")
                 self.assertEqual(isinstance(state, herdr.PromptInputReady), empty)
 
@@ -1631,7 +2957,8 @@ class PromptSubmissionTests(unittest.TestCase):
     def test_assistant_output_with_a_footer_prefix_does_not_make_scrollback_live_input(self) -> None:
         self.screen = ("────────\n❯ resume the saved work\n────────\n"
                        "ctrl+c cancels the operation described above")
-        self.assertFalse(self.client.prompt_in_input("destination:p1", "resume the saved work"))
+        composer = self.client.composer("destination:p1")
+        self.assertFalse(isinstance(composer, herdr.ComposerInput) and composer.contains("resume the saved work"))
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
         self.assertEqual(self.typed, [])
         self.assertEqual(self.enters, [])
@@ -1751,9 +3078,12 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_real_composer_retry_still_rechecks_its_recipient_before_enter(self) -> None:
         self.typed_screen = self.real_composer_screen("──────────────────────── two-accounts ─")
-        with patch.object(herdr, "prompt_recipient_process", side_effect=[
-                herdr.PromptRecipientProcess(23456, "first-recipient"),
-                herdr.PromptRecipientProcess(34567, "replacement-process")]):
+
+        def recipient(_session: str) -> herdr.PromptRecipientProcess:
+            return (herdr.PromptRecipientProcess(34567, "replacement-process") if self.typed
+                    else herdr.PromptRecipientProcess(23456, "first-recipient"))
+
+        with patch.object(herdr, "prompt_recipient_process", side_effect=recipient):
             outcome = self.submit()
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         self.assertIn("recipient changed", cast(herdr.PromptNotSubmitted, outcome).reason)
@@ -1761,13 +3091,14 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(self.enters, [])
 
 
-    def test_done_recipient_can_retype_a_lost_prompt(self) -> None:
+    def test_done_recipient_does_not_retype_a_lost_prompt(self) -> None:
         self.drop_before = 7
         self.submit_on_type = True
         with patch.object(self.client, "readiness", return_value={"agent_status": herdr.AgentStatus.DONE, "interactive_ready": True}):
-            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
-        self.assertEqual(len(self.typed), 2)
-        self.assertGreaterEqual(self.typed[1][2], herdr.PROMPT_SETTLE_SECONDS)
+            outcome = self.submit()
+        self.assertIn("sent once, not confirmed", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.elapsed, 30)
 
     def test_remote_control_turn_does_not_make_a_loading_destination_ready(self) -> None:
         self.ready_at = 60
@@ -1788,31 +3119,31 @@ class PromptSubmissionTests(unittest.TestCase):
         self.drop_all = True
         outcome = self.submit(timeout_ms=90_000)
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 3)
+        self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
         self.assertLessEqual(self.elapsed, 90)
         self.assertTrue(all(at < 90 for _pane, _text, at in self.typed))
-        self.assertGreaterEqual(self.typed[1][2] - self.typed[0][2], 10)
-        self.assertGreaterEqual(self.typed[2][2] - self.typed[1][2], 10)
-        self.assertIn("prompt typed 3 times", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertEqual(self.elapsed, 90)
+        self.assertIn("sent once, not confirmed", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertIn("prompt transport attempts: 1", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).screen, self.screen)
 
 
-    def test_an_unknown_command_is_typed_once_more_after_its_list_settles(self) -> None:
+    def test_an_unknown_command_is_not_typed_again_after_its_list_settles(self) -> None:
         outcome = self.submit_command(lambda _text, typing: typing == 2)
-        self.assertIsInstance(outcome, herdr.PromptSubmitted)
-        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
-        self.assertGreaterEqual(self.typed[1][2] - self.typed[0][2], herdr.PROMPT_SETTLE_SECONDS)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE])
+        self.assertIn("Unknown command", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(self.enters, [])
 
 
-    def test_a_command_unknown_twice_with_no_file_reports_the_refusal(self) -> None:
+    def test_an_unknown_command_with_no_file_reports_the_refusal(self) -> None:
         outcome = self.submit_command(lambda _text, _typing: False)
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         reason = cast(herdr.PromptNotSubmitted, outcome).reason
-        self.assertIn("Claude answered Unknown command: /showrunner:produce; prompt typed 2 times", reason)
-        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
-        self.assertFalse(cast(herdr.PromptNotSubmitted, outcome).never_typed)
+        self.assertIn("Claude answered Unknown command: /showrunner:produce; prompt transport attempts: 1", reason)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE])
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).state, "unknown")
 
 
     def test_rejections_count_only_this_prompts_command(self) -> None:
@@ -1848,19 +3179,27 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_a_replacement_process_cannot_inherit_the_turn_written_during_submission(self) -> None:
         self.submit_on_type = True
-        observations = 0
 
         def recipient(_session: str) -> herdr.PromptRecipientProcess:
-            nonlocal observations
-            observations += 1
-            return (herdr.PromptRecipientProcess(23456, "first-recipient") if observations == 1
-                    else herdr.PromptRecipientProcess(34567, "replacement-process"))
+            return (herdr.PromptRecipientProcess(34567, "replacement-process") if self.typed
+                    else herdr.PromptRecipientProcess(23456, "first-recipient"))
 
         with patch.object(herdr, "prompt_recipient_process", side_effect=recipient):
             outcome = self.submit()
-        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertIsInstance(cast(herdr.PromptSubmitted, outcome).process, herdr.PromptRecipientUnavailable)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
+
+    def test_matching_turn_before_typing_confirms_submission_with_changed_recipient(self) -> None:
+        self.write_turn("resume the saved work")
+        first = herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient")
+        replacement = herdr.PromptRecipientProcess(23457, "replacement-process")
+        with patch.object(herdr, "prompt_recipient_process", side_effect=[first, replacement]):
+            outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertIsInstance(cast(herdr.PromptSubmitted, outcome).process, herdr.PromptRecipientUnavailable)
+        self.assertEqual((self.typed, self.enters), ([], []))
 
 
     def test_an_unsubmitted_input_gets_at_most_three_enter_retries(self) -> None:
@@ -1911,9 +3250,74 @@ class LaunchDestinationTests(StaffTestCase):
         super().setUp()
         proc = self.root / "proc"
         proc.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr",
+            "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
+        })))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
+
+    def test_worker_launch_refuses_before_creating_a_pane_during_reboot(self) -> None:
+        from scripts.herdr import test_worker_panes, worker_panes
+
+        launch = herdr.launch_prepared_agent
+        case = test_worker_panes.WorkerPaneTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with (lock.open("a") as external,
+              patch.object(herdr, "launch_prepared_agent", side_effect=launch) as attempted,
+              patch.object(herdr, "start_agent", side_effect=AssertionError("Started during reboot")) as started):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = case.start()
+        attempted.assert_called_once()
+        started.assert_not_called()
+        self.assertIsInstance(result, worker_panes.UncertainWorker)
+        assert isinstance(result, worker_panes.UncertainWorker)
+        self.assertTrue(result.reason.endswith("A reboot is running; wait for it to end."), result.reason)
+        self.assertEqual(case.world.commands, [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=case.parent_id), [])
+
+    def test_the_same_server_uses_one_lock_across_state_homes(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        with herdr.reboot_lock(exclusive=True):
+            self.assertTrue(path.is_file())
+            with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "other-state")}),
+                  patch.object(os, "getpid", return_value=os.getpid() + 1),
+                  self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock()):
+                self.fail("A different state folder passed the server lock")
+        self.assertFalse((self.root / "other-state").exists())
+
+    def test_nested_shared_lock_reuses_the_process_descriptor(self) -> None:
+        def nested() -> None:
+            with herdr.reboot_lock():
+                pass
+
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            with herdr.reboot_lock(), ThreadPoolExecutor(max_workers=1) as pool:
+                nested()
+                pool.submit(nested).result(timeout=5)
+                with self.assertRaises(herdr.RebootLockBusy), herdr.reboot_lock(exclusive=True):
+                    self.fail("A shared lock must not become exclusive")
+            flock.assert_called_once()
+        with herdr.reboot_lock(exclusive=True):
+            pass
+
+    def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
+        prepared = herdr.PreparedAgentEnvironment(self.root, {})
+        client = cast(herdr.Herdr, Mock())
+        outcome = herdr.PromptNotSubmitted("prompt target is unknown", state="not_sent")
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(herdr, "start_agent", return_value=outcome),
+              patch.object(herdr, "open_tab", return_value="retained-pane")):
+            result = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "unit"), prepared,
+                "claude", ["--resume", fixture_runtime_id("retained-resume")],
+                herdr.OpeningPrompt("continue"), 1000, agent="unit", client=client)
+        assert isinstance(result.outcome, herdr.PromptNotSubmitted)
+        self.assertIn("resume prompt was not sent", result.outcome.reason)
+        self.assertIn("Check the retained pane and send the resume prompt by hand.", result.outcome.reason)
 
     def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):
@@ -2113,7 +3517,8 @@ class LaunchDestinationTests(StaffTestCase):
                 started.assert_called_once_with("agents", "worker-pane", "codex", ["resume", "conversation"],
                     herdr.NoOpeningPrompt(), 5000, agent="worker")
                 if isinstance(destination, herdr.NewTab):
-                    opened.assert_called_once_with("agents", "workers", "worker", "/tmp", prepared.env)
+                    opened.assert_called_once_with("agents", "workers", "worker", "/tmp",
+                                                   {**prepared.env, "PYTHONPATH": PANE_STARTUP})
                     self.assertEqual(events, ["process-info", "start"])
                 else:
                     opened.assert_not_called()
@@ -2558,6 +3963,10 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.pane_activity).return_value = herdr.PaneRunning(("claude",))
         cast(Mock, self.client.native_session).return_value = self.row.current_session
         cast(Mock, self.client.run).return_value = ""
+        visible_screen = herdr.Herdr._visible_screen  # pyright: ignore[reportPrivateUsage]
+        def read_visible_screen(pane: str) -> str:
+            return visible_screen(cast(herdr.Herdr, self.client), pane)
+        self.client.configure_mock(**{"_visible_screen.side_effect": read_visible_screen})
         cast(Mock, self.client.result).return_value = {"process_info": {
             "shell_pid": 998042, "foreground_process_group_id": 998043,
             "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}
@@ -2701,6 +4110,53 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([entry.args for entry in checks.call_args_list], [(session,)] * 3)
         self.assertTrue(all(entry.kwargs["action"] == "keys" for entry in checks.call_args_list))
 
+    def test_answer_question_records_the_text_before_typing(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session, text = "w1:p1", "fixture-question", "Use JSON."
+        record = script_prompts.record
+        with self.question_box(client, pane, session) as commands:
+            def record_before_send(pane: str, text: str) -> None:
+                self.assertNotIn(("pane", "send-text", pane, text), commands)
+                record(pane, text)
+
+            with patch.object(script_prompts, "record", side_effect=record_before_send) as evidence:
+                client.answer_question(pane, text, target=session)
+            evidence.assert_called_once_with(pane, text)
+        self.assertIn(("pane", "send-text", pane, text), commands)
+        self.assertTrue(script_prompts.typed_by_script(pane, text))
+
+    def test_send_keys_records_printable_text_before_transport(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        keys = ("y", "e", "s", "enter", "shift+g", "o", "space", "n", "o", "w", "period", "return")
+
+        def send(*arguments: str) -> str:
+            self.assertEqual(arguments, ("pane", "send-keys", pane, *keys))
+            self.assertTrue(script_prompts.keys_since(pane, before_send))
+            self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
+            self.assertTrue(script_prompts.typed_by_script(pane, "Go now."))
+            return ""
+
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", side_effect=send) as transport):
+            client.send_keys(pane, *keys, target=session)
+        transport.assert_called_once()
+
+    def test_send_keys_leaves_no_mark_for_control_keys(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-keys"
+        before_send = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with (self.prompt_target(client, pane, session), patch.object(client, "run", return_value="") as transport):
+            client.send_keys(pane, "ctrl-c", "BackSpace", "Enter", target=session)
+        transport.assert_called_once_with("pane", "send-keys", pane, "ctrl-c", "BackSpace", "Enter")
+        self.assertFalse(script_prompts.keys_since(pane, before_send))
+
     def test_answer_question_sends_all_keys_with_the_real_codex_box_composer(self) -> None:
         client = self.herdr
         pane, session, text = "w1:p1", "fixture-question", "Use JSON."
@@ -2734,6 +4190,65 @@ class HerdrTests(unittest.TestCase):
                 client.prompt("w1:p1", "/resume", target="fixture-submission")
         submit.assert_not_called()
 
+    def test_idle_command_checks_the_destination_before_the_final_composer_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        for draft in ("", "typed text", " "):
+            screen = f"Earlier output\n  › {draft}\n\n  gpt-6.1-sol medium"
+            responses = [screen, screen, ""]
+            with (self.subTest(draft=draft),
+                  patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+                  patch.object(client, "readiness",
+                               return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+                  patch.object(client, "native_session", return_value=session) as native,
+                  patch.object(client, "command_terminal", return_value=terminal) as destination,
+                  patch.object(client, "run", side_effect=responses) as run):
+                transport = Mock()
+                transport.attach_mock(native, "conversation")
+                transport.attach_mock(destination, "terminal")
+                transport.attach_mock(run, "run")
+                reads = [
+                    call("pane", "read", pane, "--source", "recent-unwrapped", "--lines", "60", deadline=math.inf),
+                    call("pane", "read", pane, "--source", "visible", "--format", "ansi"),
+                ]
+                if draft:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, "^has unsent text$"):
+                        _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+                    self.assertEqual(run.call_args_list, reads)
+                else:
+                    self.assertEqual(client.idle_command(pane, terminal, text, target=session, codex=True),
+                                     ("Earlier output",))
+                    self.assertEqual(run.call_args_list, [*reads, call("agent", "prompt", pane, text)])
+                self.assertEqual([step[0] for step in transport.mock_calls],
+                                 ["run", "conversation", "terminal", "run"] + ([] if draft else ["run"]))
+
+    def test_idle_command_refuses_a_conversation_that_changes_during_the_history_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        conversation = session
+
+        def read_history(pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
+            nonlocal conversation
+            del pane, lines, joined, ansi, deadline
+            conversation = "replacement"
+            return "Earlier output\n  › \n\n  gpt-6.1-sol medium"
+
+        def read_conversation(_pane: str, _kind: str, _timeout: float) -> str:
+            return conversation
+
+        with (patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+              patch.object(client, "readiness",
+                           return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+              patch.object(client, "native_session", side_effect=read_conversation),
+              patch.object(client, "command_terminal", return_value=terminal),
+              patch.object(client, "read", side_effect=read_history),
+              patch.object(client, "run") as run):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "the conversation changed"):
+                _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+        run.assert_not_called()
+
     def test_timed_out_prose_keeps_its_source_in_the_delayed_hook(self) -> None:
         from scripts.hooks import conversation_pause
         from scripts.lib import script_prompts
@@ -2749,11 +4264,27 @@ class HerdrTests(unittest.TestCase):
                     client.prompt("w1:p1", "Continue", target="fixture-submission")
                 text = cast(str, submit.call_args.args[-1])
                 self.assertTrue(text.startswith('<system-reminder source="script">'))
-                self.assertFalse(script_prompts.root().exists())
+                self.assertFalse(script_prompts.typed_by_script("w1:p1", text))
                 with patch.object(script_prompts, "typed_here", side_effect=AssertionError("store read")):
                     source = conversation_pause.prompt_source(text, lambda: frozenset(), lambda: (),
                                                               typed_by_script=script_prompts.typed_here)
                 self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
+
+    def test_enveloped_prompt_keeps_plain_text_evidence_at_the_record_limit(self) -> None:
+        from scripts.lib import script_prompts
+
+        client = self.herdr
+        pane, session = "w1:p1", "fixture-submission"
+        configuration = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(configuration / "script_prompts.conf", "# whole: 1..\nmax_records=1\n")
+        script_prompts.record(pane, "yes")
+        with (self.prompt_target(client, pane, session),
+              patch.object(client, "run", return_value="") as transport):
+            client.prompt(pane, "Continue", target=session)
+        text = script_prompt("Continue")
+        transport.assert_called_once_with("agent", "prompt", pane, text)
+        self.assertFalse(script_prompts.typed_by_script(pane, text))
+        self.assertTrue(script_prompts.typed_by_script(pane, "yes"))
 
     def test_timed_out_slash_command_keeps_its_source_record(self) -> None:
         from scripts.lib import script_prompts
@@ -2806,7 +4337,11 @@ class HerdrTests(unittest.TestCase):
         self.proc = self.root / "proc"
         self.proc.mkdir()
         (self.root / "home/.claude/sessions").mkdir(parents=True)
+        configuration = self.root / "fixture-config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "codex_daemon.conf", "agents_slice=app-agents.slice\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **environment,
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path), "PATH": str(self.root / "no-tools"),
@@ -2922,6 +4457,30 @@ class HerdrTests(unittest.TestCase):
                                                 "^expected one foreground codex process, found 0$"):
                         _ = self.herdr.native_session("w1:p1", "codex", 1, pane_row=pane)
 
+    def test_ambiguous_codex_foreground_reports_only_program_names(self) -> None:
+        current = fixture_runtime_id("uncertain-foreground")
+        row = staff.StaffRow(staff.native_id(fixture_runtime_id("uncertain-fixed")), "producer", "probe",
+                             staff.StaffRoot(), current_session=staff.native_id(current))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+                                   "agent_session": {"value": current}}
+        command = ["codex", "resume", current]
+        fake_unit_host.process(os.environ, 998075, 998070, command, {})
+        for name, parent in (("codex", 998075), ("git", 998070)):
+            with self.subTest(name=name):
+                args = [name, "private-argument"]
+                fake_unit_host.process(os.environ, 998076, parent, args, {})
+                self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"], json.dumps({
+                    "result": {"process_info": {"shell_pid": 998070, "foreground_process_group_id": 998075,
+                    "foreground_processes": [{"pid": 998075, "name": "codex", "argv": command},
+                                             {"pid": 998076, "name": name, "argv": args}]}}}))
+                with fake_unit_host.private_process_registry(), redirect_stderr(io.StringIO()) as errors:
+                    scan = self.herdr.scan_row_panes(staff.StaffSnapshot((row,)), [pane])
+                self.assertEqual(scan.found, {})
+                self.assertEqual(len(scan.unknown), 1)
+                self.assertIn(f"Foreground programs are codex, {name}", errors.getvalue())
+                self.assertNotIn("private-argument", errors.getvalue())
+                self.assertNotIn(current, errors.getvalue())
+
     def test_pane_report_and_resume_accept_an_empty_or_matching_identity(self) -> None:
         current = fixture_runtime_id("herdr-codex-launch")
         other = fixture_runtime_id("stale-report-loser")
@@ -2981,22 +4540,25 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(scan, expected)
             self.assertEqual(errors.getvalue(), notice if printed else "")
 
-    def test_claude_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
+    def test_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
         client = self.herdr
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("changing-owner")), "unit", "changing",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("changing-session")))
         pane: dict[str, object] = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
-        info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
-                                "foreground_processes": [{"pid": 992001, "argv": ["claude"]}]}}
         registry = self.root / "changing-sessions"
         registry.mkdir()
         unavailable = "pid 992001: native registry identity is unavailable"
-        for case, births, record, notice in (
-                ("starting", ["birth", "birth"], False, ""),
-                ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
-                ("steady", ["birth", "birth"], True,
+        for agent, case, births, record, notice in (
+                ("claude", "starting", ["birth", "birth"], False, ""),
+                ("claude", "exits during the check",
+                 ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("claude", "exits before the read", [herdr.NativeRegistryChanging(herdr.process_exit_reason(992001))], True, ""),
+                ("codex", "exits before the read", [herdr.NativeRegistryChanging(herdr.process_exit_reason(992001))], False, ""),
+                ("claude", "steady", ["birth", "birth"], True,
                  f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
-            with (self.subTest(case=case),
+            info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
+                                    "foreground_processes": [{"pid": 992001, "argv": [agent]}]}}
+            with (self.subTest(agent=agent, case=case),
                   patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
                   patch.object(client, "result", return_value=info),
                   patch.object(herdr, "_process_birth", side_effect=births),
@@ -3010,6 +4572,17 @@ class HerdrTests(unittest.TestCase):
             reason = unavailable if notice else "starting or exiting"
             self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
             self.assertEqual(errors.getvalue(), notice)
+
+    def test_process_birth_names_an_exited_process_as_changing(self) -> None:
+        for case, present, expected in (("exited", False, herdr.NativeRegistryChanging),
+                                        ("unreadable", True, ValueError)):
+            with (self.subTest(case=case), patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                  patch.object(sessions, "process_start", return_value=None),
+                  patch.object(Path, "exists", autospec=True, return_value=present) as exists,
+                  self.assertRaises(ValueError) as raised):
+                _ = herdr._process_birth(992001)  # pyright: ignore[reportPrivateUsage]
+            self.assertIs(type(raised.exception), expected)
+            exists.assert_called_once_with(Path("/proc/992001"))
 
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{
@@ -3124,14 +4697,19 @@ class HerdrTests(unittest.TestCase):
     def darwin_sockets(self, text: str) -> None:
         self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
 
-    def darwin_process_table(self, text: str) -> None:
+    def darwin_process_table(self, text: str, *, terminals: Mapping[int, str] | None = None) -> None:
         executables: list[str] = []
+        terminals_and_executables: list[str] = []
         commands: list[str] = []
         for line in text.splitlines():
             pid, parent, uid, command = line.split(maxsplit=3)
             executables.append(f"{pid} {parent} {uid} {command.split()[0]}")
+            terminal = "??" if terminals is None else terminals.get(int(pid), "??")
+            terminals_and_executables.append(f"{pid} {parent} {uid} {terminal} {command.split()[0]}")
             commands.append(f"{pid} {command}")
         self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="], "\n".join(executables))
+        self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,tdev=,comm="],
+                       "\n".join(terminals_and_executables))
         self.configure(["-U", str(os.getuid()), "-o", "pid=,command="], "\n".join(commands))
 
     def darwin_startup_table(self, text: str, *, started: str = "Tue Nov  3 08:00:00 2026") -> None:
@@ -3346,7 +4924,6 @@ class HerdrTests(unittest.TestCase):
         with (native_process_commands(11, generations=(weak,)),
               patch.object(herdr, "Herdr", return_value=client),
               patch.object(os, "kill") as signalled,
-              patch.object(herdr, "os", SimpleNamespace(environ=os.environ, getuid=os.getuid, kill=signalled)),
               patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start failed"))):
             _ = herdr.launch_prepared_agent("fixture", herdr.SplitPane("parent", "right", 0.5, "worker"),
                 herdr.PreparedAgentEnvironment(self.root, {}), "claude", [],
@@ -3746,7 +5323,9 @@ class HerdrTests(unittest.TestCase):
         self.darwin_process_table(
             f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
             f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
-            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n")
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n" +
+            f"78 1 {uid} holder\n79 1 {uid} holder\n",
+            terminals={71: "16/0", 72: "16/0", 78: "16/0", 79: "unreadable"})
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
@@ -3765,6 +5344,13 @@ class HerdrTests(unittest.TestCase):
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
         self.assertEqual([command for command in self.commands() if "cwd" in command], [cwd_command])
+        ancestry = next(row.ancestry for row in rows if row.pid == 72)
+        self.assertEqual(ancestry.relative_to_shell(72, 71), herdr.PaneShellAncestry.DESCENDANT)
+        self.assertEqual(ancestry.relative_to_shell(77, 71), herdr.PaneShellAncestry.OUTSIDE)
+        self.assertEqual(ancestry.relative_to_shell(73, 71), herdr.PaneShellAncestry.UNKNOWN)
+        self.assertTrue(ancestry.is_detached_from_shell(77, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(78, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(79, 71))
         self.configure(cwd_command, "p72\nfcwd\nn/second folder\np71\nfcwd\nn/first folder\np76\nfcwd\nn/third folder\n")
         self.assertEqual({row.pid: row.working_directory for row in herdr.herdr_processes()},
                          {71: "/first folder", 72: "/second folder", 76: "/third folder"})
@@ -4105,6 +5691,19 @@ class HerdrTests(unittest.TestCase):
         self.configure(["--session", "default", "session", "list", "--json"], json.dumps({"sessions": rows}))
         self.assertEqual(herdr.live_sessions(), rows[:1])
 
+    def test_reboot_blocks_both_server_start_functions(self) -> None:
+        path = self.root / "config/herdr/sessions/agents/reboot.lock"
+        path.parent.mkdir(parents=True)
+        with (path.open("a") as external, patch.object(herdr, "run_program") as command,
+              patch("scripts.lib.detached.start_detached") as detach):
+            fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(herdr.RebootLockBusy):
+                _ = herdr.start_server("agents", 1_000)
+            with (patch.object(herdr, "_PLATFORM", "darwin"), self.assertRaises(herdr.RebootLockBusy)):
+                _ = herdr.restore_server("agents", 1_000, session_kind=herdr.NonDesktopSession())
+        command.assert_not_called()
+        detach.assert_not_called()
+
     def test_server_start_skips_running_server(self) -> None:
         self.configure_herdr(["status", "server"], "server:\nstatus: running\n")
         self.configure_herdr(["workspace", "list"], json.dumps({
@@ -4290,7 +5889,7 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.herdr.open_tab("workers", "parent", str(self.root), environment), "w1:p1")
         split = ["pane", "split", "w1:p1", "--direction", "right", "--ratio", "0.3",
                  "--cwd", str(self.root), "--no-focus", "--env", "KEPT_SETTING=kept",
-                 "--env", "HERDR_AGENT_PANE=1"]
+                 "--env", f"PYTHONPATH={PANE_STARTUP}", "--env", "HERDR_AGENT_PANE=1"]
         self.configure_herdr(split, json.dumps({"result": {"pane": {"pane_id": "w1:p2"}}}))
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p2", "terminal_id": "terminal-one", "workspace_id": "w1"}]}}))
@@ -4485,7 +6084,8 @@ class HerdrTests(unittest.TestCase):
 
     def test_attached_clients_count_only_interactive_clients_for_the_session(self) -> None:
         clients = [["herdr", "session", "attach", "fixture"], ["herdr", "--session", "fixture"],
-                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"]]
+                   ["herdr", "--session=fixture"], ["herdr", "--session", "other", "session", "attach", "fixture"],
+                   ["herdr", "--session", "fixture", "client"]]
         excluded = [["herdr", "--session", "fixture", *command] for command in (
             ["server"], ["pane", "read", "p1"], ["agent", "list"], ["status"],
             ["status", "server"], ["workspace", "create"], ["session", "list"], ["--help"], ["--version"],
@@ -4494,7 +6094,7 @@ class HerdrTests(unittest.TestCase):
                          ["echo", "herdr", "session", "attach", "fixture"]])
         for pid, argv in enumerate(clients + excluded, 100):
             _ = self.process(pid, 1, argv, {})
-        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(4))
+        self.assertEqual(herdr.attached_clients("fixture"), herdr.ClientsAttached(5))
         self.assertEqual(herdr.attached_clients("missing"), herdr.NoClientAttached())
 
     def test_attached_clients_handle_default_unreadable_and_vanished_processes(self) -> None:
@@ -4569,6 +6169,8 @@ class HerdrTests(unittest.TestCase):
         self.assertNotIn(server / "environ", opened)
 
     def test_handoff_survivors_keep_their_unit_after_reparenting(self) -> None:
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "p1"}]}}))
         identity = fixture_runtime_id("handoff-director")
         server = self.process(30, 1, ["herdr", "server", "--handoff-import", "/fixture/import", "token"], {})
         self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
@@ -4591,7 +6193,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"CLAUDE_CODE_SESSION_ID": identity})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "p1"))
-                    self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
+                    self.assertEqual(herdr.herdr_places().placements, {row.pid: row.place for row in rows})
 
     def test_shared_scope_handoff_uses_preserved_shells_without_reading_unrelated_environments(self) -> None:
         identity = fixture_runtime_id("handoff-director")
@@ -4632,7 +6234,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"CLAUDE_CODE_SESSION_ID": identity})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
-                    self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
+                    self.assertEqual(herdr.herdr_places().placements, {row.pid: row.place for row in rows})
 
     def test_handoff_survivors_in_pane_scopes_keep_their_unit_server(self) -> None:
         server = self.process(30, 1, ["herdr", "server", "--handoff-import", "/fixture/import", "token"], {})
@@ -4661,13 +6263,13 @@ class HerdrTests(unittest.TestCase):
                     rows = herdr.herdr_processes()
                     self.assertEqual({row.pid: row.place for row in rows}, expected)
                     self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("writing", "w1:p1"))
-                    self.assertEqual(herdr.herdr_places(), expected)
+                    self.assertEqual(herdr.herdr_places().placements, expected)
             # Without a handoff the parent walk explains the scope; one live read verifies its pane.
             _ = (shell / "stat").write_text("11 (zsh) S 30 0 0\n")
             _ = (unrelated / "cgroup").write_text(f"{membership}/user.slice/session-7.scope\n")
             self.log.unlink(missing_ok=True)
             with self.subTest(handoff=False, membership=membership):
-                self.assertEqual(herdr.herdr_places(), expected)
+                self.assertEqual(herdr.herdr_places().placements, expected)
                 self.assertEqual([command for command in self.commands() if command[2:4] == ["pane", "list"]],
                                  [["--session", "writing", "pane", "list"]])
 
@@ -4997,7 +6599,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_startup_shell(pane)
         prepared = herdr.PreparedAgentEnvironment(self.root, {})
         self.configure_herdr(["pane", "split", "w1:p1", "--direction", "right", "--ratio", "0.3",
-            "--cwd", str(self.root), "--no-focus", "--env", "HERDR_AGENT_PANE=1"],
+            "--cwd", str(self.root), "--no-focus", "--env", f"PYTHONPATH={PANE_STARTUP}", "--env", "HERDR_AGENT_PANE=1"],
             json.dumps({"result": {"pane": {"pane_id": pane}}}))
         for server_name, expected in (("unit-impl", "unit-impl"), ("second-unit-impl", "second-unit-impl"),
                                      ("claude-build-followups-verify-impl", "claude-build-followups--e05490da")):
@@ -5022,7 +6624,7 @@ class HerdrTests(unittest.TestCase):
                 self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
                     {"pane_id": pane, "workspace_id": "w1", "terminal_id": "terminal-one"}]}}))
                 self.configure_herdr(["pane", "split", "w1:p1", "--direction", "right", "--ratio", "0.3",
-                    "--cwd", str(self.root), "--no-focus", "--env", "HERDR_AGENT_PANE=1"],
+                    "--cwd", str(self.root), "--no-focus", "--env", f"PYTHONPATH={PANE_STARTUP}", "--env", "HERDR_AGENT_PANE=1"],
                     json.dumps({"result": {"pane": {"pane_id": pane}}}))
                 self.configure_herdr(["agent", "start", "worker", "--kind", "claude", "--pane", pane,
                     "--timeout", "10000", "--"], code=8,
@@ -5173,13 +6775,19 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(self.herdr.agents(deadline=deadline), [])
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
             program.reset_mock()
-            with self.assertRaisesRegex(herdr_types.HerdrFailure, "deadline passed"):
+            with self.assertRaisesRegex(herdr.HerdrLaunchRefused, "deadline passed"):
                 _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=99.0)
             program.assert_not_called()
             _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
             self.assertEqual(self.herdr.agents(), [])
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+
+    def test_run_program_refuses_launch_after_the_operation_deadline(self) -> None:
+        with (operation_deadline.within(0.0), patch.object(subprocess, "run") as launch,
+              self.assertRaisesRegex(herdr.HerdrLaunchRefused, "deadline passed")):
+            _ = herdr.run_program(["fixture", "agent", "prompt"])
+        launch.assert_not_called()
 
     def test_moved_pane_resolves_single_and_batched_process_places_from_retained_shell(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})
@@ -5197,7 +6805,7 @@ class HerdrTests(unittest.TestCase):
             with self.subTest(pane=pane):
                 self.assertEqual(herdr.herdr_place_of(12), expected[12])
                 self.log.unlink()
-                self.assertEqual(herdr.herdr_places(), expected)
+                self.assertEqual(herdr.herdr_places().placements, expected)
                 self.assertEqual(self.commands().count(["--session", "fixture", "pane", "list"]), 1)
                 self.assertEqual(self.commands().count(
                     ["--session", "fixture", "pane", "process-info", "--pane", pane]), 1)
@@ -5222,7 +6830,7 @@ class HerdrTests(unittest.TestCase):
         _ = self.process(11, 10, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": []}}))
         self.assertEqual(herdr.herdr_place_of(11), herdr.NotInHerdr())
-        self.assertEqual(herdr.herdr_places(), {})
+        self.assertEqual(herdr.herdr_places().placements, {11: herdr.NotInHerdr()})
         self.assertEqual(herdr.herdr_processes(), [])
 
     def test_process_scan_keeps_launch_places_when_live_panes_are_unreadable(self) -> None:
@@ -5286,9 +6894,10 @@ class HerdrTests(unittest.TestCase):
         self.socket_fd(server, 100)
         _ = self.process(11, 10, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
         place = herdr.HerdrPlace("fixture", "w1:p1")
+        unknown = herdr.UnprovedHerdrPlacement("cannot read panes for herdr session fixture")
         readers: tuple[tuple[Callable[[], object], object], ...] = (
-            (lambda: herdr.herdr_place_of(11), place),
-            (herdr.herdr_places, {11: place}),
+            (lambda: herdr.herdr_place_of(11), unknown),
+            (lambda: herdr.herdr_places().placements, {11: unknown}),
             (lambda: [(row.pid, row.place) for row in herdr.herdr_processes()], [(11, place)]))
         for reply in ("not JSON", json.dumps({"result": {"panes": None}})):
             self.configure_herdr(["pane", "list"], reply)
@@ -5308,9 +6917,10 @@ class HerdrTests(unittest.TestCase):
         self.darwin_environment(71, "claude", "HERDR_PANE_ID=w1:p1")
         self.configure(["--session", "writing", "pane", "list"], "not JSON")
         place = herdr.HerdrPlace("writing", "w1:p1")
+        unknown = herdr.UnprovedHerdrPlacement("cannot read panes for herdr session writing")
         readers: tuple[tuple[Callable[[], object], object], ...] = (
-            (lambda: herdr.herdr_place_of(71), place),
-            (herdr.herdr_places, {71: place}),
+            (lambda: herdr.herdr_place_of(71), unknown),
+            (lambda: herdr.herdr_places().placements, {71: unknown}),
             (lambda: [(row.pid, row.place) for row in herdr.herdr_processes()], [(71, place)]))
         for read, expected in readers:
             with self.subTest(reader=read):
@@ -5330,12 +6940,14 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-a", "-p", "71,72", "-d", "cwd", "-Fpn"],
                        "".join(f"p{pid}\nfcwd\nn{self.root}\n" for pid in (71, 72)))
         expected = {pid: herdr.HerdrPlace("writing", "w2:p9") for pid in (71, 72)}
-        self.assertEqual(herdr.herdr_places(), expected)
+        self.assertEqual(herdr.herdr_places().placements, expected)
         self.assertEqual(self.commands().count(["--session", "writing", "pane", "list"]), 1)
         self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
         self.assertEqual(herdr.herdr_place_of(72), expected[72])
 
     def test_linux_user_tmux_is_never_attributed_to_its_outer_herdr_pane(self) -> None:
+        self.configure(["--session", "fixture", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "native"}]}}))
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
@@ -5361,6 +6973,10 @@ class HerdrTests(unittest.TestCase):
         self.assertIsInstance(rows[0].working_directory, herdr.UnreadableCwd)
 
     def test_process_place_named_default_and_nonherdr(self) -> None:
+        self.configure(["--session", "fixture", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "pane-1"}]}}))
+        self.configure(["--session", "default", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "pane-default"}]}}))
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
@@ -5373,9 +6989,9 @@ class HerdrTests(unittest.TestCase):
         _ = self.process(21, 20, ["/bin/sleep"], {"HERDR_PANE_ID": "pane-default"})
         self.assertEqual(herdr.herdr_place_of(21), herdr.HerdrPlace("default", "pane-default"))
         _ = self.process(30, 1, ["/bin/program", "server"], {"HERDR_PANE_ID": "pane-foreign"})
-        self.assertEqual(herdr.herdr_place_of(30), herdr.NotInHerdr())
+        self.assertIsInstance(herdr.herdr_place_of(30), herdr.UnprovedHerdrPlacement)
         self.assertEqual(herdr.herdr_place_of(11), herdr.NotInHerdr())
-        self.assertEqual(herdr.herdr_place_of(99), herdr.NotInHerdr())
+        self.assertIsInstance(herdr.herdr_place_of(99), herdr.UnprovedHerdrPlacement)
 
     def test_server_environment_finds_attach_and_handoff_servers_by_socket(self) -> None:
         commands = (["/fixture/herdr", "server"], ["/fixture/herdr", "--handoff", "replacement"])
@@ -5443,22 +7059,39 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
         from scripts.production import unit_lookup as lookup
-        live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
+        from scripts.message import sessions
+
+        live = sessions.SessionRecord(pid=12, name="Unit", sessionId=unit.current_session,
+                                      procStart="1", updatedAt=1, messagingSocketPath="", tmux="", formerNames=[])
+        def pane_result(*arguments: str) -> dict[str, object]:
+            if arguments == ("pane", "list"):
+                return {"panes": [{"pane_id": pane} for pane in ("pane", "pane-codex")]}
+            is_codex = arguments[-1] == "pane-codex"
+            return {"process_info": {"foreground_processes": [
+                {"pid": 13 if is_codex else 12, "argv": ["codex" if is_codex else "claude"]}]}}
+
+        def native_process(pid: int, _kind: str, *_arguments: object) -> herdr.NativeAgentProcess:
+            identity = unit.current_session if pid == 12 else codex.current_session
+            return herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "1", {})
+
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
                   "agent": "codex", "pane_id": "pane-codex", "agent_status": herdr.AgentStatus.IDLE,
                   "agent_session": herdr.ReportedAgentSession(str(codex.current_session)),
               }]),
               patch.object(lookup, "_claudes", return_value=(
-                  {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
+                  {herdr.HerdrPlace("fixture", "pane"): {12: [live]}},
+                  lookup.ClaudeRegistryEvidence({}, lookup.RecordsRead()))),
+              patch.object(herdr.Herdr, "result", side_effect=pane_result),
+              patch.object(herdr, "native_process", side_effect=native_process),
+              patch.object(roster, "_codex_home_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
                 return (roster._every_labeled_session(), inventory._unit_sessions(staff.snapshot()),  # pyright: ignore[reportPrivateUsage]
                         roster._herdr_codex_panes("fixture"))  # pyright: ignore[reportPrivateUsage]
 
             expected = read_callers()
-            self.assertEqual(scans.call_count, 3)
+            self.assertEqual(scans.call_count, 2)
             scans.reset_mock()
             with herdr.process_snapshot():
                 observed = read_callers()
@@ -5556,6 +7189,42 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(copied.run(herdr.herdr_processes), [])
             self.assertEqual(scans.call_count, 2)
 
+    def test_process_action_refreshes_pane_evidence_inside_a_report(self) -> None:
+        from scripts.production import unit_lookup
+
+        self.configure(["--session", "default", "session", "list", "--json"],
+                       json.dumps({"result": {"sessions": [{"name": "fixture", "running": True, "default": False,
+                           "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": []}}))
+        with herdr.observation_snapshot():
+            self.assertEqual(unit_lookup.observed_session_labels(running=[]).unreadable_pane_lists, ())
+            self.configure_herdr(["pane", "list"], "pane list denied", code=1)
+            with herdr.process_action():
+                reports = unit_lookup.observed_session_labels(running=[]).unreadable_pane_lists
+            self.assertEqual([report.session for report in reports], ["fixture"])
+
+    def test_report_reads_the_new_pane_reply_after_an_action(self) -> None:
+        command = ["pane", "list"]
+        self.configure_herdr(command, json.dumps({"result": {"panes": [{"pane_id": "before"}]}}))
+        with herdr.observation_snapshot(), herdr.pane_snapshot() as panes:
+            self.assertEqual([pane["pane_id"] for pane in panes("fixture")], ["before"])
+            with herdr.process_action():
+                self.configure_herdr(command, json.dumps({"result": {"panes": [{"pane_id": "after"}]}}))
+            self.assertEqual([pane["pane_id"] for pane in panes("fixture")], ["after"])
+
+    def test_darwin_shared_listener_is_a_placement_scan_failure(self) -> None:
+        processes = [herdr._UserProcess(pid, 1, "herdr", herdr.ReadProcessArguments(("herdr",)))  # pyright: ignore[reportPrivateUsage]
+                     for pid in (10, 20)]
+        path = self.root / "config/herdr/herdr.sock"
+        listeners = [herdr._BoundUnixSocket(pid, path) for pid in (10, 20)]  # pyright: ignore[reportPrivateUsage]
+        for visible in (processes, processes[:1]):
+            with (self.subTest(visible=len(visible)), patch.object(herdr, "_PLATFORM", "darwin"),
+                  patch.object(herdr, "_darwin_processes", return_value=visible),
+                  patch.object(herdr, "_darwin_bound_sockets", return_value=listeners)):
+                observed = herdr.herdr_places()
+                self.assertEqual(observed.placements, {})
+                self.assertEqual(observed.scan_failures, ("cannot establish a socket owner for herdr session default",))
+
     def test_process_snapshot_is_released_on_error_and_not_shared_with_another_thread(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -5580,11 +7249,13 @@ class HerdrTests(unittest.TestCase):
         unreadable.joinpath("environ").unlink()
         unreadable.joinpath("environ").mkdir()
         self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"CODEX_THREAD_ID": "unit"}, "claude", str(self.root))])
+        placements = herdr.herdr_places()
+        self.assertIsInstance(placements.get(13), herdr.UnprovedHerdrPlacement)
 
     def test_ancestry_loop_is_skipped_and_vanished_cwd_keeps_placement(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
         _ = self.process(11, 10, ["/bin/sh"], {})
-        self.assertEqual(herdr.herdr_place_of(10), herdr.NotInHerdr())
+        self.assertIsInstance(herdr.herdr_place_of(10), herdr.UnprovedHerdrPlacement)
         server = self.process(20, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/herdr.sock", 100)
         self.socket_fd(server, 100)
@@ -5625,6 +7296,8 @@ class HerdrTests(unittest.TestCase):
                          {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
 
     def test_herdr_clients_and_their_children_keep_the_owning_session(self) -> None:
+        self.configure(["--session", "owner", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "pane-owner"}]}}))
         server = self.process(10, 1, ["/fixture/herdr", "--session", "owner", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/owner/herdr.sock", 100)
         self.socket_fd(server, 100)
@@ -5650,6 +7323,8 @@ class HerdrTests(unittest.TestCase):
                          [{"CODEX_THREAD_ID": "unit"}] * len(commands))
 
     def test_socket_ownership_decides_place_despite_conflicting_argv(self) -> None:
+        self.configure(["--session", "owner", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "pane-owner"}]}}))
         server = self.process(10, 1, ["/fixture/herdr", "--handoff", "--session=other", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/owner/herdr.sock", 100)
         self.socket_fd(server, 100)
@@ -5852,6 +7527,20 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="process vanished")
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "process vanished"):
             _ = herdr.darwin_process_identity(42)
+
+    def test_darwin_process_birth_names_an_exited_process_as_changing(self) -> None:
+        self.darwin()
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1)
+        with self.assertRaises(herdr.NativeRegistryChanging) as raised:
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
+        reason = str(raised.exception)
+        self.assertEqual(reason, "pid 42: process exited")
+        self.assertEqual(herdr.exited_process_pid(reason), 42)
+        self.assertIsNone(herdr.exited_process_pid(f"read failed: {reason}"))
+        self.assertIsNone(herdr.exited_process_pid(herdr.process_exit_reason(0)))
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="ps refused")
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "ps refused"):
+            _ = herdr._process_birth(42)  # pyright: ignore[reportPrivateUsage]
 
 
     def test_darwin_environment_refuses_a_changed_command_or_failed_ps(self) -> None:
@@ -6593,6 +8282,67 @@ class RowTabTests(StaffTestCase):
                 self.assertEqual(any(item.pane == "p1" for item in latest.unknown), not resolved)
                 self.assertEqual(sum("p1 tab t0" in line for line in errors.getvalue().splitlines()), 1)
 
+    def test_layout_scan_refreshes_the_pane_list_after_pane_not_found(self) -> None:
+        for disappeared in (True, False):
+            with self.subTest(disappeared=disappeared):
+                pane = self.client.tabs[0]
+                now = time.time()
+                old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+                saved = herdr.SavedSpace(name="remembered", seen=old, tabs=[
+                    herdr.SavedMemberTab(staff_id=self.rows["unit"].id, seen=old)])
+                path = herdr.layout_path("fixture")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps(herdr.SavedLayout(at=old, workspaces=[saved])))
+                process_queries: list[str] = []
+                pane_lists: list[list[str]] = []
+                original = self.client.result
+
+                def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments[:2] == ("pane", "list"):
+                        pane_lists.append([tab["pane_id"] for tab in self.client.tabs])
+                    if arguments[:2] == ("pane", "process-info"):
+                        process_queries.append(arguments[-1])
+                        if arguments[-1] == pane["pane_id"]:
+                            if disappeared:
+                                self.client.tabs.remove(pane)
+                            raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
+                    return original(*arguments, deadline=deadline)
+
+                with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+                    self.client.record_layout()
+                if disappeared:
+                    self.client.tabs.insert(0, pane)
+
+                self.assertEqual(process_queries, ["p0", "p1", "p2"])
+                self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
+                self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+                self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
+                if disappeared:
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+
+    def test_layout_scan_refreshes_once_after_several_panes_close(self) -> None:
+        queries: list[tuple[str, ...]] = []
+        original = self.client.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[0] == "pane":
+                queries.append(arguments)
+            if arguments[:3] == ("pane", "process-info", "--pane") and arguments[-1] in {"p0", "p1"}:
+                self.client.tabs = [pane for pane in self.client.tabs if pane["pane_id"] != arguments[-1]]
+                raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
+            return original(*arguments, deadline=deadline)
+
+        with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        self.assertEqual(queries, [("pane", "list"), ("pane", "process-info", "--pane", "p0"),
+                                   ("pane", "process-info", "--pane", "p1"), ("pane", "process-info", "--pane", "p2"),
+                                   ("pane", "list")])
+        self.assertEqual(set(self.client.scans[-1].found), {self.rows["worker"].id})
+        self.assertEqual(errors.getvalue(), "")
+
     def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
         self.client.unknown.add("p2")
         self.client.tabs[1]["pane_label"] = "old-worker-label"
@@ -6606,6 +8356,56 @@ class RowTabTests(StaffTestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         for text in ("p2", "t1", "private process facts are unavailable"):
             self.assertIn(text, errors.getvalue())
+
+    def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
+        configuration = self.root / "configuration"
+        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        proc = self.root / "proc"
+        uptime = proc / "uptime"
+        ticks = os.sysconf("SC_CLK_TCK")
+        process = proc / "991000"
+        process.mkdir()
+        # The relaunch supervisor leads the foreground group.
+        _ = (process / "stat").write_text("991000 (claude) S 990500 990500 990000 0 990500 "
+                                          + "0 " * 13 + str(100 * ticks))
+        pane: dict[str, object] = dict(self.client.tabs[0])
+        record = staff.snapshot()
+        result = self.client.result
+
+        def supervised(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            payload = result(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "process-info"):
+                herdr.json_object(payload["process_info"], "test process info")["foreground_process_group_id"] = 990500
+            return payload
+
+        for arguments_arrive in (True, False):
+            with (self.subTest(arguments_arrive=arguments_arrive),
+                  patch.dict(os.environ, config_environment(configuration)),
+                  patch.object(self.client, "result", side_effect=supervised),
+                  herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors):
+                self.client.missing_argv = {"p0"}
+                _ = uptime.write_text("101.0 0.0\n")
+                starting = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(starting.found, {})
+                self.assertEqual(starting.unknown, [herdr.UnknownPane("p0", "t0", "starting")])
+                self.assertEqual(errors.getvalue(), "")
+
+                if arguments_arrive:
+                    self.client.missing_argv.clear()
+                else:
+                    _ = uptime.write_text("120.0 0.0\n")
+                observed = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(self.client.scan_row_panes(record, [pane]), observed)
+                if arguments_arrive:
+                    self.assertEqual(observed.found, {self.rows["unit"].id: [pane]})
+                    self.assertEqual(observed.unknown, [])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(observed.found, {})
+                    self.assertEqual(observed.unknown, [
+                        herdr.UnknownPane("p0", "t0", "agent argv is unavailable")])
+                    self.assertEqual(errors.getvalue(),
+                        "herdr fixture:p0 tab t0: pane evidence is unknown: agent argv is unavailable; row placement retained\n")
 
     def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
         unknown = dict(self.client.tabs[2])
@@ -7096,7 +8896,7 @@ class SavedLayoutTests(unittest.TestCase):
             cached = client.scan_row_panes(record, panes)
             self.assertEqual(cached, herdr.RowPaneScan({}, []))
             tab["session_id"] = owner.current_session
-            with (patch.object(herdr, "pane_native_process",
+            with (patch.object(herdr, "read_foreground_pane_owner",
                                side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
                   patch.object(client, "run_in_pane"),
                   patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
@@ -7217,16 +9017,17 @@ class SavedLayoutTests(unittest.TestCase):
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert isinstance(old_child.parent, staff.ReportsTo)
         _ = staff.set_doc(old_child.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
-        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
-                                       {"STAFF_ID": retired.id}, "claude", "/missing")]
-        classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())
-        self.assertIsInstance(classifier.classify(["w1:p1"]), herdr.OtherTab)
-        self.assertIsInstance(classifier.classify([]), herdr.OtherTab)
         active = unit_membership("current", "live-unit")
-        for title in (active.name, "another-title"):
-            with self.subTest(title=title):
-                classifier = herdr.UnitTabClassifier("fixture", [], staff.snapshot())
-                self.assertIsInstance(classifier.classify(["unowned-pane"]), herdr.OtherTab)
+        classifier = herdr.UnitTabClassifier(staff.snapshot())
+        for identity in (retired.current_session, old_child.current_session, fixture_runtime_id("unowned-pane")):
+            with self.subTest(identity=identity):
+                conversation = pane_launch.ProvedPaneConversation(identity, "claude", 1)
+                self.assertIsInstance(classifier.classify(conversation), herdr.OtherTab)
+        conversation = pane_launch.ProvedPaneConversation(active.current_session, "claude", 1)
+        selected = classifier.classify(conversation)
+        self.assertIsInstance(selected, herdr.UnitTab)
+        assert isinstance(selected, herdr.UnitTab)
+        self.assertEqual(selected.row.id, active.id)
 
     def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
         old = LayoutHerdr()
@@ -7599,15 +9400,17 @@ class PaneSessionsTests(unittest.TestCase):
     LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
     EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
 
-    def sessions(self, *processes: dict[str, object]) -> set[str]:
+    def session(self, *processes: dict[str, object]) -> herdr.ClaudePaneSession:
         observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
         with patch.object(herdr, "native_process", return_value=observed):
-            return herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+            session = herdr._pane_session({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(session, herdr.ClaudePaneSession)
+        return session
 
     def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
-        self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})
-        self.assertEqual(self.sessions(self.EXITED, self.LIVE), {"recorded-id"})
+        self.assertEqual(self.session(self.LIVE, self.EXITED), herdr.ClaudePaneSession("recorded-id", 101))
+        self.assertEqual(self.session(self.EXITED, self.LIVE), herdr.ClaudePaneSession("recorded-id", 101))
 
     def test_an_agent_without_an_argv_and_no_live_agent_is_unknown(self) -> None:
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent argv is unavailable"):
-            _ = self.sessions(self.EXITED)
+            _ = self.session(self.EXITED)

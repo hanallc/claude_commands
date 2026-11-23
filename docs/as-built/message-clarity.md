@@ -41,11 +41,87 @@ The prefix also applies after leading spaces. Generated stamp lines keep their o
 Queue records and logs keep the raw caller text.
 These fields do not change the recipient, reply name, or message key.
 
+### Messages during an ad hoc review
+
+`review_hold=off` in `config/send.conf` disables message holding for all sessions.
+The next prompt or session start delivers any messages still held.
+Use `/tune` to set `review_hold=on` when message holding can resume.
+
+`send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
+Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
+Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
+The session then gets one short notice: `N held messages from the review in <path>, under "Released at HH:MM:SS <zone>". Read them at your own pace.` (`Read it` for one message.)
+A send that ends a hold puts the notice above the new message.
+A failed append keeps the messages held. A send that carries a new message fails; other paths print one stderr line.
+When an urgent message replaces every held message by its key, nothing is filed and the urgent message goes plain.
+An unconfirmed delivery cuts the file back to its size before the append and keeps the messages held.
+If the file changed after the append, the file stays as it is and stderr gets one line.
+No code deletes the file; the agent reads it.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a unique name match, it gives a `session:` address.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
+
 ### Replies to relay sockets
 
-The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
+The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
+On Linux, it also records the boot ID. The launcher saves the sender name in `message/relay_senders/<pid>`.
+Claude runs with the same PID and owns `cc-socks/<pid>.sock`.
 
-`send.py drain-sockets` recovers old raw `uds__*.sock.jsonl` queues. It delivers each message in a file whose newest entry is under 24 hours old to the named live session, marked `Stuck message from <original time>:`. Recovery uses the relay record, then queued recipient metadata (`to_name`, `to-name`, `recipient_name`, or a named `to`). Each stable recovery ID gets a flushed and fsynced attempt in `message/socket-recovery-attempts.jsonl` before delivery, followed by its durable result in `message/log.jsonl`. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends. An attempt without a result is archived without resending: `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent` (exit 3); a later run has nothing to repeat. Known failed sends remain for retry, without another queued copy. Unresolved or unreadable files stay in place and are reported by path (exit 3); other files still run. Older files move intact to `message/socket-queue-archive/`; one line gives the file count and oldest and newest message times. Archive names never overwrite another item, and a retry reuses an identical uncertain entry's archive. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report, without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move.
+A native session or registered socket selects one conversation from the routing registry read.
+The sender uses the same owner check as the unit report.
+A staff name or `staff:<id>` selects a staff recipient.
+Only a staff recipient can select a successor when the sender prepares another attempt.
+A reply to an active relay selects its process generation.
+After confirmed absence, the relay's saved sender can supply a fallback conversation.
+A retry to a native conversation can use a new process generation for that conversation.
+
+The sender checks the owner before connecting.
+The private proxy checks the peer PID, process start, registry conversation, and socket immediately before forwarding on the same connection.
+A pre-tool hook permits one `SendMessage` call with the private address and expected message.
+The proxy buffers the request until the relay closes its write side.
+Before it writes any bytes, the proxy compares the decoded body with the exact encoding of the approved text.
+The encoder matches the two tag escape passes in Claude Code 2.1.319.
+The sender uses the tool ID from the completed proxy write to find the approved call and its result.
+The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
+Claude's socket protocol has no expected conversation field.
+The race window extends from the final registry check until the receiver accepts the request.
+The sender closes its cleanup pipe on exit. The cleanup process removes the private directory.
+
+A queue entry stores the native conversation or staff ID and the process generation when available.
+The queue reader checks the current native owner before it prints the message.
+An explicit staff queue request reads the queue for that staff ID.
+The reader preserves the original bytes of entries with invalid, ambiguous, or conflicting recipient fields.
+An unknown owner or a peer mismatch fails the send.
+An offline staff queue requires proof of absence.
+SSH forwards native session addresses as conversations and staff addresses as staff IDs.
+
+Registered Claude delivery uses the checked relay. The Python postmaster records include the recipient PID and process start.
+New postmaster receipts must match that recipient. Postmaster stays disabled for registered sends until its mod validates the generation.
+Existing receipts without recipient evidence can settle earlier claims that also lack that evidence.
+A staff retry checks legacy reservations under its current or original conversation.
+The retry stays pending until a definite result resolves the legacy reservation.
+
+`send.py drain-sockets` can recover a raw socket queue when its entry proves the recipient.
+An entry with conflicting recipient fields stays in the file for inspection.
+A proved reply expires after 24 hours and moves to `message/socket-queue-archive/`.
+The drain moves the file intact when all of its replies qualify.
+The drain retains entries that need inspection in the original file.
+The drain records each attempt in `message/socket-recovery-attempts.jsonl` before delivery. It records the result in `message/log.jsonl` before removing the entry.
+An interrupted or unconfirmed attempt moves to the archive. A confirmed failure keeps the entry for retry.
+The drain prints and flushes each completed result before it removes the entry.
 
 ### The message guide
 
@@ -140,7 +216,8 @@ The gate permits only an exact match. A missing template id or failed gate check
 | --- | --- |
 | `check --title T (--action A \| --no-action) --text B [--priority N]` | Dry full review (including the second check). Prints the outcome and logs `dry`. Exits 0. A `Session:` line at the start of `--text` is kept. |
 | `replay [--limit N]` | Reviews sent pushes again from `pushover.jsonl`, newest first. Logs `replay`. Posts nothing. |
-| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Dry-reviews every catalog example. Exits 1 if any fails. See the catalog section. |
+| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Reviews each selected example. Uses any current user approval when `--approve` has no `--user-spec`. Exits 1 if any review fails. |
+| `texts --ask --id X` | Prints each example and saves an approval request for the current herdr pane and Claude session. |
 | `sample <transcripts…> [--limit 20] [--since ISO]` | Dry-reviews recent replies. See the nightly section. |
 | `release --identity I -- SOURCE` | Prints one `ReleaseOutcome` word. |
 | `due` | Posts expired holds (legacy, see below). |
@@ -279,7 +356,8 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
@@ -308,7 +386,16 @@ New escalate holds retain their registered template and values.
 - `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
-  - `texts --approve` writes passing examples only.
+  - `texts --approve` writes approvals for examples that pass review or have a current user approval.
+  - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
+    The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
+  - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
+    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
+    The function deletes the request before it saves the user's exact words under `text-approvals`.
+    The prompt hook still needs to call this function before it can record live approvals.
+  - A matching text ID and fingerprint let `texts --approve --id X` skip the reviewer.
+    The command records `user-prompt: <words> (<session>, <time>)` and an empty list of objections for each example.
   - `--approve --user-spec SOURCE` writes every example whatever the verdict. The `reviewer` field is `user-spec: <source>; reviewer: <model>` and `objections` lists `{rule, quote}`. The command still exits 1 when there are objections.
   - Approving an id keeps records only for its current examples.
   - Hand-written user-spec entries use `push_texts.fingerprint(entry)`.
@@ -324,7 +411,16 @@ New escalate holds retain their registered template and values.
 
 `repeat_guard` counts a resolved recipient once across send.py and detached result routes. A director fallback counts at the director boundary. The first two exact copies pass. Later exact copies to the same receiver are held. Arbitrary prose compares literally, including times, timestamps, PIDs, socket paths, message IDs and placeholders: these may be meaningful. Counter identity version 2 retires the old masked counters without dropping unfinished notices. Exact-text replay retained all 746 historical watchdog holds, so no producer-specific repeat key is needed.
 
-`config/send_repeat_guard.conf` owns holding policy and notice deadlines. The caller has a fixed I/O-free 250 ms safety ceiling; it reads no configuration at import. Policy reads, state I/O, nonblocking locks and publication run inside an isolated checker. Errors, busy locks, corrupt state and timeout admit the message and print a diagnostic. Person and phone exemptions precede worker launch. Lock identity is independent of reloadable capacity; records and previews are bounded.
+`config/send_repeat_guard.conf` owns holding policy and notice deadlines.
+The caller uses a fixed 750 ms deadline for checks and events.
+The caller reads no configuration file.
+The check and event workers use Python `-I -S` to skip site hooks.
+They load local modules from the checkout that contains the worker.
+The worker reads policy and state, takes nonblocking locks, and publishes state.
+Errors, busy locks, corrupt state, and timeouts admit the message and print a diagnostic.
+Person and phone exemptions precede worker launch.
+Lock identity is independent of reloadable capacity.
+The guard limits record and preview sizes.
 
 Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy.
 The sender record holds one owner notice per literal-repeat flood across receivers.
@@ -357,8 +453,6 @@ Literal counters and owner notices keep their existing rules.
 The notifier detaches one supervised notice job with explicit HOME, XDG, configuration and repeat-state paths. The supervisor owns its process group, including delivery children, and kills descendants at its configured deadline or normal completion on Linux and macOS. Delivery subprocesses inherit this group. There is no nested drain worker or alarm. The nonblocking drain lock prevents overlap. Scheduling progress records admitted attempts, never inspection: insufficient budget leaves the sender cursor and notice order unchanged. An admitted attempt persists its claim and rotation to the tail of the sender’s notice list, then advances the sender cursor before discovery or delivery. Discovery and delivery share one bounded child attempt. A new attempt starts only when the supervisor deadline leaves its full configured budget plus subprocess cleanup; otherwise it stays pending for the next job. No synchronous launcher fallback runs.
 
 With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
-
-`scripts/lib/py scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
 
 ### Permission root cause: `scripts/message/rca.py`
 
@@ -517,8 +611,8 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 **Reviewer behaviour:**
 - Without explicit instruction the reviewer repeats the action line at the top of the body. `validate` removes it, along with an `Action: ` prefix on the action.
-- The reviewer is not deterministic and not always stable on its own rewrite. Approve a catalog text only after three passing runs. Example values decide the verdict as much as templates do: names that are unrealistic or contradict each other fail review.
-- Changing a template or an example value invalidates its approval. Rerun `review.py texts --id <id>`, then `--approve`.
+- Reviewer results can vary between runs. For reviewer approval, wait for three passing runs. Use realistic and consistent example values.
+- A change to a template or example value invalidates its approval. Get a new approval for the new fingerprint.
 - `--user-spec` without `--approve`, or with an empty source, is a usage error. The reviewer objects to the user's four-line holdout text on every run, and those objections are recorded, never applied.
 
 **Holds and the gate:**

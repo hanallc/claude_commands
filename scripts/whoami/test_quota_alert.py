@@ -24,18 +24,43 @@ from scripts.whoami.agent_accounts import Quota, Report
 from scripts.whoami import usage_store
 from scripts.whoami.agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
-from scripts.notify.user_action import ActionRequired
+from scripts.message import send_budget
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
+from scripts.notify import review
+from scripts.notify.push_texts import RenderedPush
+from scripts.notify.user_action import NoActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 setUpModule = support.setUpModule
 
 
+class RecipientFailureTests(unittest.TestCase):
+    def test_relay_reports_an_absent_or_closed_recipient(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "accounts.conf").write_text(
+            "# whole: 1..\nquota_relay_timeout_seconds=10\n", encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
+              mock.patch.object(send_budget, "seconds", return_value=10.0)):
+            for code, header in ((SEND_ABSENT_EXIT, "ABSENT"), (SEND_CLOSED_EXIT, "CLOSED")):
+                reply = subprocess.CompletedProcess([], code, f"{header}: fixture unavailable", "")
+                with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=reply):
+                    self.assertEqual(quota_alert.relay("fixture", "message", None), f"stdout: {reply.stdout}")
+
+    def test_user_push_reports_an_absent_or_closed_recipient(self) -> None:
+        push = RenderedPush("fixture", "fixture", "note", "Fixture", NoActionRequired(), "Fixture", {})
+        with (mock.patch.object(review, "user_send_seconds", return_value=5.0),
+              mock.patch.object(send_budget, "user_seconds", return_value=5.0)):
+            for code, header in ((SEND_ABSENT_EXIT, "ABSENT"), (SEND_CLOSED_EXIT, "CLOSED")):
+                reply = subprocess.CompletedProcess([], code, f"{header}: fixture unavailable", "")
+                with self.subTest(header=header), mock.patch.object(subprocess, "run", return_value=reply):
+                    self.assertEqual(quota_alert.tell_user(push), quota_alert.PushFailed(f"stdout: {reply.stdout}"))
+
+
 def write_settings(config: quota_alert.Config) -> None:
-    """Write the five settings with their configured types."""
+    """Write the four settings with their configured types."""
     _ = quota_alert.CONFIG.write_text(
         f"# range: 0..\nthreshold_percent={config['threshold_percent']}\n"
-        + f"# range: 0..\nrepeat_minutes={config['repeat_minutes']}\n"
         + f"# range: 0..\nstall_minutes={config['stall_minutes']}\n"
         + f"faults_to={config['faults_to']}\nalways={' '.join(config['always'])}\n")
 
@@ -108,8 +133,6 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = named_config.write_text(("""# range: 0..
 threshold_percent=7
 # range: 0..
-repeat_minutes=45
-# range: 0..
 stall_minutes=9
 faults_to=fault-handler
 always=always-there
@@ -132,11 +155,9 @@ always=always-there
             self.assertEqual(len(self.noted), 0 if minute == 0 else 1)
         push = self.noted[0]
         self.assertEqual(push.id, "quota.codex_next_move")
-        self.assertEqual(push.title, "codex1 Codex workers will use paid credits")
-        self.assertEqual(push.body,
-            "codex1 has 2% of its weekly usage left, and no move is set up for its workers. When it runs out, they spend its paid credits, then move to Claude. Nothing is needed.")
-        self.assertEqual(push.action, ActionRequired(
-            "Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to Claude"))
+        self.assertEqual(push.title, "codex1 has 2% left; paid credits next")
+        self.assertEqual(push.body, "")
+        self.assertEqual(push.action, NoActionRequired())
         self.assertEqual(self.sent, [])
         _ = self.alert([self.note("codex1.md", "active", "80")], self.now + timedelta(minutes=34))
         self.sent.clear()  # Restoration notices remain in Phase54.
@@ -327,6 +348,10 @@ always=always-there
         past = local_reset(self.now - timedelta(hours=1))
         notes: Notes = [self.note("codex2.md", "inactive", "0"), self.note("claude1.md", "active", "2"),
                         self.note("claude2.md", "active", "null"), self.note("codex1.md", "active", "0", past)]
+        with quota_alert.CONFIG.open("a", encoding="utf-8") as settings:
+            _ = settings.write("token_expiry.lead_days=30 7\n"
+                               + "token_expiry.hana_linux_runners.ends=2099-01-01\n"
+                               + "token_expiry.hana_macos_runner_query.ends=2099-01-01\n")
         self.assertEqual(self.alert(notes, self.now), [])
         self.assertEqual(self.sent, [])
 
@@ -495,10 +520,13 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
     def test_old_workers_requests_share_one_role_read_per_pass(self) -> None:
         stamp = self.now.isoformat()
         head = next_moves.add_next_move("workers", 1, "codex1")
-        for index in range(3):
-            moves.append_move(moves.RequestedMove(kind="requested", at=stamp, tool="codex", subject="workers",
-                move_id=f"old-{index}", cause="auto", why=f"auto: entry-{index}",
-                **{"from": "codex2", "to": "codex3"}, window="weekly"))
+        journal = moves.store_file()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        with journal.open("a", encoding="utf-8") as output:
+            for index in range(3):
+                _ = output.write(json.dumps({"kind": "requested", "at": stamp, "tool": "codex",
+                    "subject": "workers", "move_id": f"old-{index}", "cause": "auto", "why": f"auto: entry-{index}",
+                    "from": "codex2", "to": "codex3", "window": "weekly"}) + "\n")
         with mock.patch.object(accounts, "read_role_map", wraps=accounts.read_role_map) as read_role:
             _ = quota_alert.run_workers_next_moves(self.readings(self.now), self.now)
         self.assertEqual(read_role.call_count, 1)
@@ -630,6 +658,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
                     requested = [row for row in moves.read_moves() if row["kind"] == "requested"
                                  and row["why"] == f"auto: {head.id}"]
                     self.assertEqual(len(requested), 1)
+                    self.assertEqual(requested[0].get("scope"), "group")
                     original_move_id = requested[0]["move_id"]
                     if stopped_at == "historical target":
                         configuration = accounts.accounts_config_file()

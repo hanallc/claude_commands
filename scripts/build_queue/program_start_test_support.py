@@ -30,4 +30,3 @@ def private_scope_start() -> None:
     with mock.patch.object(Path, "read_text", new=kernel_path), \
          mock.patch.object(atomic_file, "atomic_sample", side_effect=publish_actual_path):
         program_start.scope_start(Path(sidecar), int(holder), start, argv, record=Path(record))
-

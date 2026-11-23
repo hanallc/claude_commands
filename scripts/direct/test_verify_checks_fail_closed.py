@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
-import unittest
+import textwrap
 from typing import cast, override
+import unittest
+from unittest import mock
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import placement
 from scripts.build_queue import admission_protocol as wire
 
 from scripts.direct import test_verify_mac_offload as offload_tests
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -59,10 +66,30 @@ source = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2]
 if command == "constraints" and os.environ.get("TEST_ELIGIBLE_MAC"):
     Path(os.environ["CONF_DIR"], "build_targets.conf").write_text(
         "targets=mac,natedev\\nkind.natedev=local\\nplatform.natedev=linux\\n"
-        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n")
+        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n"
+        + "# whole: 1..86400\\nunreachable_wait_seconds=45\\n")
 runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
 '''
 
+
+
+class FixtureSetupTests(unittest.TestCase):
+    def test_failed_setup_releases_the_root_for_the_next_test(self) -> None:
+        class RouteCheck(VerifyStepRoutesFixture):
+            def check_root(self) -> None:
+                self.assertTrue(self.fixture.root.is_dir())
+
+        first = RouteCheck("check_root")
+        second = RouteCheck("check_root")
+        result = unittest.TestResult()
+        with mock.patch.object(first.fixture, "fixture_paths", side_effect=RuntimeError("fixture setup failed")):
+            _ = unittest.TestSuite([first, second]).run(result)
+
+        self.assertEqual(result.testsRun, 2)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIs(result.errors[0][0], first)
+        self.assertIn("RuntimeError: fixture setup failed", result.errors[0][1])
 
 
 class VerifyChecksFailClosedTests(unittest.TestCase):
@@ -76,28 +103,19 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
-        self.addCleanup(self.clean_fixture)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         scripts = self.fixture.home / ".claude/scripts"
         lint = scripts / "lint"
-        lint.unlink()
-        lint.mkdir()
-        source = offload_tests.VERIFY.parent.parent / "lint"
-        for path in source.iterdir():
-            target = lint / path.name
-            if path.name in {"invoke.sh", "memory_gate.sh"}:
-                _ = shutil.copyfile(path, target)
-            else:
-                target.symlink_to(path, target_is_directory=path.is_dir())
+        _ = copy_helpers(self.fixture.home, *VERIFY_HELPERS)
         queue = scripts / "build_queue"
-        queue.unlink()
-        queue.mkdir()
-        for path in (source.parent / "build_queue").iterdir():
-            if path.name != "queue_place.py":
-                (queue / path.name).symlink_to(path, target_is_directory=path.is_dir())
         self.memory = queue / "queue_place.py"
         self.restore_client()
         self.invoke = lint / "invoke.sh"
+        # Keep the early temporary-folder setup outside the library failure under test.
+        prepare = 'source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp'
+        copied = self.fixture.verify_script.read_text()
+        original = offload_tests.VERIFY.parent.parent / "lint/invoke.sh"
+        _ = self.fixture.verify_script.write_text(copied.replace(prepare, f'source "{original}" --prepare-temp'))
         self.targets = self.fixture.root / "check.py"
         _ = self.targets.write_text(CHECK_STUB)
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
@@ -136,9 +154,6 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         return {"empty": "\n", "invalid": "admit\n", "unknown": '{"kind":"deny"}\n',
                 "numeric": '{"kind":"admitted","need":"bad"}\n',
                 "untracked": '{"kind":"admitted"}\n'}.get(mode, line)
-
-    def clean_fixture(self) -> None:
-        self.assertTrue(self.fixture.doCleanups(), "fixture cleanup failed")
 
     def reset_observations(self) -> None:
         self.fixture.cargo_events_path.unlink(missing_ok=True)
@@ -205,6 +220,37 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         result = self.run_step()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([event["args"] for event in self.fixture.cargo_events()], [["check"]])
+
+    def test_installed_hold_helper_and_explicit_override_both_route_the_step(self) -> None:
+        directory = self.fixture.home / ".claude/scripts/build_targets"
+        _ = copy_helpers(self.fixture.home, *VERIFY_HELPERS)
+        installed = directory / "build_targets.py"
+        calls = self.fixture.root / "helper-calls.jsonl"
+        recording = ("import json, sys\nfrom pathlib import Path\n"
+                     + f"with Path({str(calls)!r}).open('a') as output: "
+                     + "output.write(json.dumps([__file__, *sys.argv[1:]]) + '\\n')\n")
+        for entry, override in (("invoke", False), ("invoke", True), ("verify", False), ("verify", True)):
+            with self.subTest(entry=entry, override=override):
+                self.reset_observations()
+                calls.unlink(missing_ok=True)
+                library = (offload_tests.VERIFY.parent.parent / "build_targets/build_targets.py").read_text()
+                library = library.partition('\nif __name__ == "__main__":')[0]
+                command = "\ndef main():\n" + textwrap.indent(recording + CHECK_STUB, "    ")
+                command += '\nif __name__ == "__main__":\n    main()\n'
+                _ = installed.write_text(library + command)
+                _ = self.targets.write_text(recording + CHECK_STUB)
+                if override:
+                    self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.targets)
+                else:
+                    _ = self.fixture.environment.pop("BUILD_TARGETS_SCRIPT", None)
+                result = (self.run_step() if entry == "invoke" else
+                          self.fixture.verify("check", "sample", "--no-cache"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                observed = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()]
+                self.assertTrue(observed)
+                self.assertEqual({call[0] for call in observed}, {str(self.targets if override else installed)})
+                self.assertTrue({"check-local", "register-local"}.intersection(call[1] for call in observed))
+                self.assertTrue(any(event["args"][:1] == ["check"] for event in self.fixture.cargo_events()))
 
     def test_verify_wait_check_error_and_missing_path_refuse_before_cargo(self) -> None:
         for failure in ("usage", "crash", "missing"):

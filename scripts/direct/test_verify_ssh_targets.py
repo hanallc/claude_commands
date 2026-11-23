@@ -10,13 +10,14 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import mac_test, claim_state
 
 from scripts.lib import process_start as process_identity
@@ -72,8 +73,7 @@ class SshReservationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\nslots=1\nslots.hana=1\n")
 
     def reserve(self, pid: int) -> tuple[int, Path]:
@@ -169,8 +169,7 @@ class SshResultBoundaryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
 
     def test_linux_result_keeps_completion_separate_from_unconfirmed_cleanup(self) -> None:
         offload = eligibility_support.offload
@@ -222,7 +221,8 @@ class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
         self.environment["TEST_SOURCE_REPO"] = str(Path(__file__).resolve().parents[2])
-        targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
+        targets = self.root / "bin/build-targets.py"
+        self.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
         self.executable(targets, r'''
 import os
 from pathlib import Path
@@ -247,7 +247,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
 ''')
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-                              + "kind.natedev=local\nplatform.natedev=linux\n")
+                              + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")

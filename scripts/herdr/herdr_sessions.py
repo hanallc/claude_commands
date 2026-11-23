@@ -14,6 +14,7 @@ except FileNotFoundError:
 import argparse
 import itertools
 import os
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -23,16 +24,19 @@ from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions as native_sessions
 from scripts.herdr import herdr_types
 
-from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
+from scripts.message.sessions import UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
 from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.lib import names as display_names  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
+SERVER_RESTORE_TIMEOUT_MS = 90_000
+REMOTE_FOCUS_TIMEOUT = SERVER_RESTORE_TIMEOUT_MS // 1000 + REMOTE_LIST_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -65,20 +69,27 @@ def _remote_list(host: RemoteHost) -> int:
 
 
 def _attach_remote(host: RemoteHost, name: str) -> int:
-    """Show tab `name` on the host, then attach to the host's shared session."""
-    result = subprocess.run(
-        ["ssh", host.target, "~/.claude/scripts/lib/py", "~/.claude/scripts/herdr/herdr_sessions.py", "focus", name],
-        capture_output=True, text=True, check=False, timeout=REMOTE_LIST_TIMEOUT,
-    )
+    """Restore the server if needed, focus the tab, and attach with the local client."""
+    try:
+        result = subprocess.run(
+            ["ssh", host.target, "~/.claude/scripts/lib/py",
+             "~/.claude/scripts/herdr/herdr_sessions.py", "focus", shlex.quote(name)],
+            capture_output=True, text=True, check=False, timeout=REMOTE_FOCUS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"herdr_sessions: {host.target}: remote focus timed out after {REMOTE_FOCUS_TIMEOUT} seconds",
+              file=sys.stderr)
+        return 1
     if result.returncode:
         reason = " ".join(result.stderr.split()) or "no error message"
         print(f"herdr_sessions: {host.target}: {reason}", file=sys.stderr)
         return 1
-    if not result.stdout.strip():
+    shared = result.stdout.strip()
+    if not shared:
         print(f"herdr_sessions: {host.target}: remote session is unknown", file=sys.stderr)
         return 1
     binary = herdr.herdr_binary()
-    os.execvp(binary, [binary, "--remote", host.target, "--session", result.stdout.strip()])
+    os.execvp(binary, [binary, "--remote", host.target, "--session", shared, "--remote-keybindings", "local"])
 
 
 class LaunchOptions(argparse.Namespace):
@@ -106,13 +117,12 @@ def _tab_pane(name: str) -> str:
 
 
 def _attach(pane: str) -> None:
-    shared = herdr.shared_session()
+    client = herdr.Herdr(herdr.shared_session())
     try:
-        herdr.Herdr(shared).focus_tab_of(pane)
+        client.focus_tab_of(pane)
     except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
-    binary = herdr.herdr_binary()
-    os.execvp(binary, [binary, "session", "attach", shared])
+    os.execvp(client.binary, client.argv("client"))
 
 
 def _launch(verb: str, arguments: list[str]) -> int:
@@ -155,7 +165,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         except OSError as error:
             print(f"herdr_sessions: {options.name}: prompt file is unreadable: {error}", file=sys.stderr)
     shared = herdr.shared_session()
-    _ = herdr.restore_server(shared, 90_000, session_kind=session_kind)
+    _ = herdr.restore_server(shared, SERVER_RESTORE_TIMEOUT_MS, session_kind=session_kind)
     panes = herdr.Herdr(shared).panes()
     record = staff.initial_snapshot()
     entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
@@ -184,41 +194,42 @@ def _launch(verb: str, arguments: list[str]) -> int:
     return 0
 
 
-def claude_sessions() -> dict[str, SessionRecord]:
-    """Return the newest live Claude record for each pane in the shared session."""
-    shared = herdr.shared_session()
-    newest: dict[str, SessionRecord] = {}
-    directory = sessions_dir()
-    if not directory.exists():
-        return {}
-    places = herdr.herdr_places()
-    for path in sorted(directory.iterdir()):
-        if path.suffix != ".json":
-            continue
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord) or not live_session(record):
-            continue
-        place = places.get(record["pid"])
-        if not isinstance(place, herdr.HerdrPlace) or place.session != shared:
-            continue
-        if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
-            newest[place.pane] = record
-    return newest
+def _claude_name(owner: pane_launch.ProvedPaneConversation) -> str:
+    if owner.kind != "claude":
+        return ""
+    record = read_session(sessions_dir() / f"{owner.pid}.json")
+    if (isinstance(record, UnreadableSessionRecord) or record["pid"] != owner.pid
+            or record["sessionId"] != owner.identity or not live_session(record)):
+        return ""
+    return record["name"]
 
 
-def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
-               record: staff.StaffSnapshot) -> dict[str, str]:
-    """Classify live unit panes using the same staff join as tab ordering."""
-    from scripts.production.session_labels import StaffLabels
-
-    classifier = herdr.UnitTabClassifier(
-        client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
-    roles: dict[str, str] = {}
-    for pane in panes:
-        unit = classifier.classify([pane["pane_id"]])
-        if isinstance(unit, herdr.UnitTab):
-            roles[pane["pane_id"]] = f"unit {unit.parent.name}/{unit.row.name}"
-    return roles
+def _list_panes(client: herdr.Herdr, membership: staff.StaffSnapshot) -> None:
+    classifier = herdr.UnitTabClassifier(membership)
+    loaded = display_names.runtime_names()
+    showrunner_name = loaded.job("showrunner") if isinstance(loaded, display_names.Names) else "unknown"
+    documents = {runner["doc"] for runner in require_complete(registered_showrunners(membership=membership))}
+    showrunner_ids = {row.id for row in membership.find(kind="showrunner")
+                      if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and str(row.doc.path) in documents}
+    for row in client.panes():
+        pane = row["pane_id"]
+        title = row.get("label") or pane
+        try:
+            info = client.result("pane", "process-info", "--pane", pane).get("process_info")
+            owner = herdr.foreground_pane_conversation(info, row)
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            print(f"{title}\tunknown\t")
+            continue
+        role, name = "standalone", ""
+        if isinstance(owner, pane_launch.ProvedPaneConversation):
+            unit = classifier.classify(owner)
+            member = membership.by_current_session(owner.identity)
+            if isinstance(unit, herdr.UnitTab):
+                role = f"unit {unit.parent.name}/{unit.row.name}"
+            elif member is not None and member.id in showrunner_ids:
+                role = showrunner_name
+            name = _claude_name(owner)
+        print(f"{title}\t{role}\t{name}")
 
 
 def _main(argv: list[str]) -> int:
@@ -239,12 +250,15 @@ def _main(argv: list[str]) -> int:
             return _remote_list(host)
         try:
             return _attach_remote(host, argv[3])
-        except (herdr_types.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
+        except OSError as error:
             print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
             return 1
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
+        except herdr.RebootLockBusy as error:
+            print(error, file=sys.stderr)
+            return 1
         except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
@@ -256,7 +270,7 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
+            _ = herdr.restore_server(shared, SERVER_RESTORE_TIMEOUT_MS, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")
@@ -275,22 +289,12 @@ def _main(argv: list[str]) -> int:
                 print(shared)
                 return 0
             _attach(pane)
-        with herdr.pane_snapshot() as read_panes:
-            panes = read_panes(shared)
-            sessions = claude_sessions()
-            membership = staff.initial_snapshot()
-            roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
-            documents = {runner["doc"] for runner in require_complete(registered_showrunners(membership=membership))}
-            showrunner_ids = {row.id for row in membership.find(kind="showrunner")
-                              if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and str(row.doc.path) in documents}
-            for row in panes:
-                pane = row["pane_id"]
-                current = sessions.get(pane)
-                claude = current["name"] if current is not None else ""
-                owner = membership.by_current_session(current["sessionId"]) if current is not None else None
-                role = roles.get(pane, "showrunner" if owner is not None and owner.id in showrunner_ids else "standalone")
-                print(f"{row.get("label") or pane}\t{role}\t{claude}")
-            return 0
+        with herdr.observation_snapshot():
+            _list_panes(herdr.Herdr(shared), staff.initial_snapshot())
+        return 0
+    except herdr.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except (herdr_types.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3

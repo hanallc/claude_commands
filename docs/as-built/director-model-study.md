@@ -1,23 +1,14 @@
 # Director model study
 
-## What it is
+## Archived study
 
-`scripts/model_study/` is a read-only Python 3.13 standard-library tool that measures unit directors' turns before and after the 2026-10-06 switch from Opus 5.5 xhigh to Sonnet 5.5 xhigh. It answers one question: which model should unit directors run by default. The default itself is `production.director` in `config/models.conf` `[production.claude]` (`opus:xhigh`, set by the user). It reads Claude Code transcripts and the run history, writes working files under `~/.local/state/model-study/`, and generates the results in `docs/as-built/director-model-study-results.md` (readable report) and `docs/as-built/director-model-study-results.json` (numbers only). Both results files are generated; the next `results` run replaces a hand edit.
+The study compared director turns before and after the October 6, 2026 switch from Opus 5.5 xhigh to Sonnet 5.5 xhigh.
+Phase 405 removed the study tools.
+The results remain in `docs/as-built/director-model-study-results.md` and `docs/as-built/director-model-study-results.json`.
 
-## How it works
+## Method
 
-The stages pass data through files in the state directory, so each command can run on its own: `extract` -> `compare` and `phases` -> `report` / `results`. Imports are flat (`from compare import ...`); `pyrightconfig.json` has an `executionEnvironments` entry rooted at `scripts/model_study`.
-
-| Module | Holds |
-| --- | --- |
-| `turns.py` | `RosterEntry`, `Turn`, `Compaction`, `Dropped`, `SessionRead`, `load_roster`, `session_ids`, `director_boundary`, `prompt_kind`, `read_session`, `director_turns`, `recompute_switch_turns` |
-| `model_study.py` | the hub: argument parser, `extract` (carry-forward, migration), `atomic_text`, dispatch of every subcommand |
-| `stats.py` | `PRICES`, `percentile`, `bootstrap_diff`, `bootstrap_net`, `request_cost`, `label_difference` |
-| `compare.py` | filters, arms, classes, baseline, `control`, `net_seconds`, compactions, `compare()`, `markdown()`; the `ComparisonReport` TypedDicts |
-| `phases.py` | run-history join, `PhaseRow`, per-metric comparisons, `phases()`, `markdown()` |
-| `report.py` | `render`, `message`, `verdict`, `recommendation_line`, `ready`, history (`record_history`, `since_lines`) |
-| `results.py` | `render` of the results markdown, `compact_json`, `document_paths`, `MAX_JSON_BYTES`, `METHOD` |
-| `roster.json` | the twelve directors: `name`, `session_ids`, `switched_by_pdt`, `production`, `director_from_pdt` |
+This section records how the study ran.
 
 ### Extraction
 
@@ -38,7 +29,7 @@ The stages pass data through files in the state directory, so each command can r
 - Director statuses: `switched` (both arms), `control candidate` (Opus only), `Sonnet-only`, `no eligible requests`; the pooled row (`Pooled switched`, switched directors only) sits in `ComparisonReport["pooled"]`.
 - Classes: `continuation/tool_use`, `continuation/end_turn`, `prompt`; `continuation` is the first two pooled and is the headline. Per (director, arm, class): `n`, `timed_n`, seconds median/p25/p75/p90, median output, thinking, fresh input (`input + write_5m + write_1h`), cache read and context tokens, median output tokens per second (requests of at least 0.5 s), mean `request_cost`. `prompt` (every other request) reports tokens only.
 - Baseline: a switched director's Opus arm is its last `BASELINE_REQUESTS = 300` filtered Opus requests before its first Sonnet request; `opus_all` sits beside it.
-- `compare.json` consumers read the status strings exactly as spelled, `counts`, `drops`, `classes.<arm>.<class>`, `differences` (`seconds`, `output`, `cost`, `net_seconds`), `control`, `compactions` and `pooled`; renaming any of them breaks `report.py` and `results.py`. No pooled compaction row exists.
+- `compare.json` consumers read the status strings exactly as spelled, `counts`, `drops`, `classes.<arm>.<class>`, `differences` (`seconds`, `output`, `cost`, `net_seconds`), `control`, `compactions` and `pooled`. No pooled compaction row exists.
 - Differences are Sonnet minus Opus: median continuation `seconds`, median `output`, mean `cost`, each a `DifferenceEstimate {value, low, high, label, opus_n, sonnet_n}` from `bootstrap_diff(a, b, stat, resamples=2000, seed=1)` (95% percentile interval). `label_difference` returns `too few` below 30 requests in either arm, else `faster`/`slower` (seconds) or `lower`/`higher` (tokens, cost) when the interval lies below/above zero, else `no measurable difference`.
 - Cost: `request_cost(turn)` at `PRICES` (USD per million tokens, standard speed): Opus input 4, output 20, write 5 min 5, write 1 h 8, read 0.20; Sonnet 2, 10, 2.50, 4, 0.20. Thinking tokens are a subset of output and never added. An unpriced model costs 0.
 - Control: a director qualifies only when its status is `control candidate` and its transcripts hold no Sonnet request at all (the effort and speed filters do not rescue it). The boundary T is the median of the switched directors' first Sonnet request times, taken from the rows. Its before side is the continuation requests among its last 300 filtered Opus requests before T; its after side is its filtered Opus continuation requests from T on; each side needs 30 timed requests. `control.directors` lists each (`difference` before to after); `control.pooled` (`PooledControl`) holds `before_n`, `after_n`, `before_median`, `after_median`, `change_seconds` (counts 0 and nulls when no director qualifies).
@@ -54,28 +45,16 @@ The stages pass data through files in the state directory, so each command can r
 
 ### Report and verdict
 
-- `report.py` renders from `compare.json`, `phases.json` and `extract.json`. `render(comparison, phases, extracted, now, final=False, history=NO_HISTORY)` writes, in order: the user's measure, "Since the last run" (only when history is recorded), Verdict, per-director table, pooled turn classes, control, compactions, work per phase, Limits. The title says `INTERIM` or `FINAL` with the PDT time.
+- The report used `compare.json`, `phases.json`, and `extract.json`. Its title included the report status and the sample time.
 - The user's measure is one line per switched director plus `Pooled switched`: median continuation seconds Opus A -> Sonnet B with the raw percent (from the two `continuation` medians, never `differences.seconds.value`), then `net of the clock <±x.xx> s (<±y.y%> of the Opus median), 95% interval [low, high] s — <label>`, or `net of the clock n/a (...)`.
 - `verdict(comparison, phases)` reads four pooled labels: `net_seconds`, `cost`, phase `requests_per_1000_words` and `repair_rounds`. Rule: `opus` when net time reads `slower` or requests or repair rounds read `more`; else `sonnet` when cost reads `lower` or net time reads `faster`; else `sonnet stays (no measurable difference; evidence thin)`. `too few`, `too few phases` and `no control` are no evidence. Raw seconds, output tokens and compactions (the pooled rate, `compaction_rate`, weighted by active hours) are printed in the verdict block and do not enter the rule. `recommendation_line` repeats the rule as a sentence; the block's last line begins `Default for enh-showrunner` and ends `opus` or `sonnet`.
-- `message(...)` is the short message: first line `From model-study: <INTERIM|FINAL> director model study — <verdict>.`, then the measure lines, the pooled "Since the last run" line, the verdict block, the director table, a Limits line and the report path. It stays at 60 lines or fewer: director table rows are cut first, then per-director measure lines (the pooled line stays), ending `… N more directors in report.md`.
+- The first line of `message(...)` is `<INTERIM|FINAL> director model study — <verdict>.`
+  The measure lines, pooled "Since the last run" line, verdict block, director table, Limits line and report path follow.
+  To keep the message within 60 lines, `message(...)` removes director table rows first, then per-director measure lines.
+  The message keeps the pooled measure line and shows `… N more directors in report.md` when it removes rows or lines.
 - `ready(comparison, now=None) -> (bool, lines)`: the gate holds when at least 4 `switched` directors have `classes.sonnet.continuation.n >= 150`, or `now >= SAMPLE_DEADLINE_PDT` (2026-10-07 10:30 PDT).
 - History: each `report` and `results` run writes one `HistoryRun` line to `history.jsonl`: `{at (UTC ISO), mode, recommendation, pooled, directors[]}` where each measure holds the Sonnet continuation n, the two medians, `change_percent` and `net_change_percent` (net seconds over the Opus median; null when not netted; older lines without the key read as not netted). Types: `NotRecorded`, `FirstRun(current)`, `FollowingRun(current, previous)`; `record_history(path, current, save=True)` compares with the latest line whose `at` differs.
-- `results.py`: `render` writes `Sample as of <PDT>`, Question, Data, Method (`METHOD`), the user's measure, per-director comparison, Verdict, Sample gate (from `ready`), Learning (one line per measure; the time line gives net label, raw and net values), Limits, Since the last run, How to re-run. `compact_json` writes `{compare, phases, history}` with `separators=(",", ":")`, `sort_keys=True`, the latest 20 history lines, no per-request rows.
-
-### Commands
-
-`scripts/lib/py scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
-
-| Subcommand | Flags | Does |
-| --- | --- | --- |
-| `extract` | `--state-dir --projects-dir --registry-dir --roster --now` | writes `turns.jsonl`, `compactions.jsonl`, `extract.json`; prints one table row per roster name (requests by model and effort, first Sonnet PDT beside `switched_by_pdt`, drop counts, `carried N`) |
-| `compare` | `--state-dir` | writes `compare.json`; prints the comparison markdown |
-| `phases` | `--state-dir --runs-dir --registry-dir --roster` | writes `phases.json`; prints the phase markdown |
-| `report` | `--interim` (default) or `--final`, `--message`, `--no-extract`, `--no-history`, `--now`, and the five path flags | extract (unless `--no-extract`, which needs an existing `extract.json`), compare, phases, history line, then `report.md`; prints the path, or the short message with `--message` |
-| `results` | `--message`, `--no-extract`, `--no-history`, `--now`, `--docs-dir` (default `docs/as-built` of the repository holding the tool), and the five path flags | one final run, then the two results documents; exits 4 and writes neither when the compact JSON reaches `MAX_JSON_BYTES = 300_000` (`history.jsonl` and `report.md` are already written) |
-| `ready` | `--now`, `--state-dir --projects-dir --registry-dir --roster` | runs extract and compare, prints the deadline, each switched director's filtered Sonnet continuation count and `G1: ready\|waiting (...)`; exits 0 when the gate holds, else 3 |
-
-State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `compare.json`, `phases.json`, `report.md`, `history.jsonl`. Every output is written whole through a temporary file and `os.replace`.
+- The study saved comparisons, phase measurements, and the last 20 history entries in the results JSON.
 
 ## Invariants
 
@@ -86,18 +65,16 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 - Floors: 30 requests per arm for any `faster`/`slower`/`lower`/`higher` label; 30 timed continuation requests on each side of T for a control; 8 phases per arm for a phase label; a smaller arm reads `too few` or `too few phases`.
 - Control membership: no Sonnet request in the transcripts at all; one pooled control serves every row, with one boundary T.
 - Determinism: one input and one `--now` give byte-identical output files from every command, `history.jsonl` included. The bootstrap is seeded; history lines are keyed by `at`.
-- Privacy: no prompt text, tool argument, tool result or file path from a transcript reaches an output file or the screen; rows hold numbers and allowlisted fields. Tests assert it (`test_turns.py`, `test_rerun.py`).
+- The study tests checked that reports excluded prompt text, tool arguments, tool results, and transcript paths.
 - Recommendation: harm evidence (net time `slower`, or requests per 1,000 words or repair rounds `more`) gives `opus`; else `lower` cost per request or `faster` net time gives `sonnet`; else `sonnet stays`.
 - Gate G1: at least 4 switched directors with 150 filtered Sonnet continuation requests each, or `SAMPLE_DEADLINE_PDT`, whichever comes first; `ready` exits 0 or 3. It is advisory: no command refuses to run before it holds.
-- Every time in an output is in the user's zone (`config/user_zone.conf`, read through `scripts/lib/user_zone.py`), with the zone's own label; transcripts and run history are UTC. The roster's `switched_by_pdt` and `director_from_pdt` columns stay Pacific wall times, as they were recorded (`RECORDED_ZONE` in `turns.py`). Costs are API-equivalent at `PRICES`, not subscription weights.
+- Reports used the user's zone from `config/user_zone.conf`. Source records used UTC. The roster stored Pacific wall times.
 - Python is typed throughout with no `Any` and no file-level type ignores; every JSON record is a `TypedDict` or dataclass. Unavailable values are `None` and JSON null (rendered `—`), not named variants.
 - Tests build synthetic transcripts in temporary directories; they never read a real transcript or write the real state directory.
 - The study covers natedev's directors only.
 
 ## Calibration and gotchas
 
-- The constants are literals in several places. 30: `stats.label_difference` and the control floor in `compare.py`. 150 and 4: `report.ready` and again in the clause logic of `results.render`. 300: `BASELINE_REQUESTS`, plus the text of `METHOD` and `report.limits`. 2,000 and seed 1: the bootstrap defaults plus `METHOD`. Also literal: the 900 s active-hour gap, the 0.5 s output-rate floor, 60 message lines, 20 history lines in the `.json`. A change edits every spot and its text.
-- The baseline window rule is written three times in `compare.py`: `director_result`, the pooled baseline in `compare`, and the per-director input to `net_seconds`. Change all three together. The control's before side is a fourth, windowed at T; without the 300-request window it holds weeks of drift.
 - The recommendation rule is written twice, in `verdict` and `recommendation_line`.
 - A same-`--now` repeat replaces its own history line (same `at`); a different `--now`, or the wall clock, appends one. `history.jsonl` keeps every line; the `.json` keeps 20.
 - `--no-extract` makes `report` and `results` reuse the extract outputs already in the state directory. Live transcripts grow between runs, so a repeat is byte-identical only with `--no-extract`; on fixtures both are. `ready` always extracts.
@@ -108,7 +85,6 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 - `trunk` and `organon` drop many requests as `before_director` because their start is found through `/unit:delegate` in a human prompt.
 - `results` at 300,000 JSON bytes exits 4; compact encoding keeps `compare` plus `phases` near 150 KB (default indentation is about 207 KB). Any line added to `message` counts toward its 60.
 - A legacy migration attributes residual drop counts to the first carried id; with several carried ids the split is an attribution, not a measurement. `extract` never reads `<id>/subagents/*.jsonl`.
-- `basedpyright scripts/model_study` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
 
@@ -120,16 +96,9 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 - Reruns rebuild everything whole from live files, with a fixed Opus window, carried rows for deleted transcripts and a history line per run, because the sample grows after the first answer and a later run must show what moved.
 - Ruled out: reading `extract.json` in `compare` (not an input, goes stale); a pooled compaction row in `compare.json` (derived from the switched directors' rows); every earlier Opus request as the control's before side (measures drift); netting each director against its own concurrent Opus window (too few requests); filtering phase requests by effort, speed or `switch_turn`; counting started-but-unfinished phases; a length cap on `report.md` (only `message` is capped); named variants for unavailable values in place of `None`; changing the cost and compaction lines (they do not depend on the clock); joining ledger holds (a unit's phase ids repeat across its documents); measuring the Mac; editing `config/models.conf` (the study reports; the user sets `production.director`).
 
-## How to re-run
-
-- `scripts/lib/py scripts/model_study/model_study.py results` extracts the live transcripts, compares, joins the phase table, adds a history line, and replaces `docs/as-built/director-model-study-results.md` and `.json` plus `~/.local/state/model-study/report.md`. Add `--message` for the short message, `--no-extract` to reuse extracted rows, `--now 2026-10-07T10:30` to pin the clock, `--no-history` to skip the history line.
-- `scripts/lib/py scripts/model_study/model_study.py report --interim` writes only `report.md` and a history line; `ready` prints the gate state and exits 0 or 3.
-- `~/.claude/scripts/lib/py -m unittest discover -s scripts/model_study -p 'test_*.py'` from the repository root runs the tests (`test_turns`, `test_stats`, `test_compare`, `test_phases`, `test_report`, `test_rerun`); it prints a pass count and touches no real transcript or state.
-- `basedpyright scripts/model_study` type-checks the tool; read its closing counts, not its exit status.
-
 ## Result at the time of writing
 
 - Sample of 2026-10-06 20:44 PDT: pooled median continuation seconds Opus 5.41, Sonnet 4.59, raw -15.2%; the never-switched control moved -13.6% over the same hours.
 - Net of the clock -0.11 s with 95% interval [-0.53, 0.46] s, so time reads no measurable difference.
 - Recommendation `sonnet`, because cost per request is lower.
-- Later runs supersede this; the generated `docs/as-built/director-model-study-results.md` holds the current numbers.
+- The final sample is in `docs/as-built/director-model-study-results.md`.

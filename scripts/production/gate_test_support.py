@@ -1,6 +1,8 @@
-"""Independent scratch repositories and real runner jobs for merge-gate tests."""
+"""Independent scratch repositories and real runner jobs for gate tests."""
 
 from __future__ import annotations
+
+from scripts.production.change_review_test_support import registered_fixture_image
 
 from scripts.lib.checkout_test_support import copy_runtime, copy_test_runner
 
@@ -16,11 +18,13 @@ import json
 import contextlib
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
@@ -29,14 +33,15 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
 from scripts.lint import memory_admit, sweep
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import gate, staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
+from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -46,6 +51,17 @@ SCRIPT = Path(__file__).with_name("gate.py")
 # Fixture data, independent of the checkout's test folders.
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
+
+GATE_TEST_SETTINGS = """# range: 1..
+GATE_TIME_LIMIT_FACTOR=100
+# whole: 0..
+memory_stop_reruns=1
+"""
+# The fixture has no Mac placement. The client refuses it without contacting the queue.
+MAC_GATE_TEST_SETTINGS = (
+    "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
+    + "\n# range: 5e-324..\nterminate_grace_seconds=3\n"
+)
 
 
 def install_test_runner(checkout: Path) -> Path:
@@ -125,6 +141,7 @@ from pathlib import Path
 import signal
 import sys
 import time
+import tempfile
 import unittest
 
 TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
@@ -143,7 +160,7 @@ class FixtureTest(unittest.TestCase):
     def test_gate_fixture(self):
         tmp = Path(os.environ["TMPDIR"])
         self.assertTrue(tmp.is_dir())
-        self.assertTrue(str(tmp).startswith("/dev/shm/"), tmp)
+        self.assertTrue(tmp.is_relative_to(Path(os.environ["GATE_FIXTURE_TMP"])), tmp)
         buildlog = Path(os.environ["BUILDLOG_DIR"])
         self.assertTrue(buildlog.is_dir())
         self.assertTrue(buildlog.is_relative_to(tmp), buildlog)
@@ -272,6 +289,11 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
     return cast(tuple[str, ...], getattr(method, "gate_test_suites", ("hooks",)))
 
 
+def pin_gate_root(configuration: Path, root: Path) -> None:
+    """Keep the fixture gate in its private folder."""
+    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
+
+
 def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent, timeout=TEST_HANG_GUARD_SECS)
 
@@ -311,14 +333,27 @@ class MergeGateFixture(unittest.TestCase):
     fixture_seeds: ClassVar[dict[tuple[str, ...], GateFixtureSeed]]
 
     @classmethod
+    def fixture_configuration(cls, directory: Path) -> dict[str, str]:
+        environment = config_environment(directory)
+        pin_gate_root(directory / "build_folders.conf", Path("/tmp").resolve())
+        return environment
+
+    @classmethod
     @override
     def setUpClass(cls) -> None:
-        # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
-        parent = gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
-        parent.mkdir(mode=0o700, exist_ok=True)
-        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
+        environment = fixture_git_environment(configuration)
+        for key in ("BASH_ENV", "STAFF_CONFIG"):
+            _ = environment.pop(key, None)
+        environment.update(cls.fixture_configuration(configuration))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
+        tmpfs = build_folders.tmpfs_temporary_parent()
+        private = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mg-", dir=tmpfs)))
+        parent = gate.gate_test_parent(private)
+        parent.mkdir(mode=0o700)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
-            build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))
+            build_folders.BuildFolderSpec(kind="legacy-unique", parent=parent,
+                                          purpose="gate-test-", suffix_length=8)))
         cls.fixture_root = directory / "case"
         cls.fixture_snapshot = directory / "snapshot"
         cls.fixture_snapshot.mkdir()
@@ -333,7 +368,6 @@ class MergeGateFixture(unittest.TestCase):
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -355,11 +389,16 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", self.fixture_root.parent)
+        pin_gate_root(self.root / "build_folders.conf", self.fixture_root.parent)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
+                                 f"roots.gate={self.fixture_root.parent}\nroots.build={self.fixture_root / 'build'}\n"
+                                 + f"roots.build.natedev={self.fixture_root / 'build'}\n")
+        self.configure_gate("program_first_peak_gib.gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
-            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -422,27 +461,34 @@ class MergeGateFixture(unittest.TestCase):
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
             **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
-            "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "GATE_TEST_STATE": str(self.state),
+            "GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "GATE_PYTHON": str(self.bin / "suite-python"),
             "GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
             "GATE_UV": str(self.bin / "uv"),
             "GATE_STATE_DIR": str(self.state / "runner"),
             "GATE_PASSED_DIR": str(self.state / "passes"),
+            "BUILD_TARGETS_STATE_DIR": str(self.state / "build-targets"),
+            "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
+            # A gate that runs as a detached run has its own slice; the fixture gate never has one.
+            "DETACHED_RUN_SLICE": "",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
-            "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
+            "NOTIFIER_STATE_DIR": str(home / "notifier"), **build_fixture_sessions("fixture-showrunner"),
         }
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = self.environment.pop(key, None)
         self.environment["GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
@@ -539,13 +585,18 @@ class MergeGateFixture(unittest.TestCase):
         finally:
             server.reply_filter = previous
 
+    def install_fixture_runner(self) -> None:
+        _ = install_test_runner(self.checkout)
+
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
         copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
         _ = write_config_fixture(self.root / "config/buildlog.conf")
-        _ = write_config_fixture(self.root / "config/gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        for configuration in (self.root, Path(self.environment["CONF_DIR"])):
+            _ = write_config_fixture(configuration / "gate.conf", GATE_TEST_SETTINGS)
+            self.write(configuration / "mac_gate.conf", MAC_GATE_TEST_SETTINGS)
         # These tests prove gate behavior without a near deadline from their short jobs.
         history = Path(self.environment["BUILDLOG_DIR"])
         history.mkdir(parents=True, exist_ok=True)
@@ -572,7 +623,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
-        _ = install_test_runner(self.checkout)
+        self.install_fixture_runner()
         shim = self.checkout / "scripts/lib/py"
         shim.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
@@ -639,22 +690,19 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False, preamble: str = "",
-                 type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
+                 own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
              "--unit", "fixture", "--phase", "phase-2",
              "--body", "Fixture checkpoint gate.",
-             *(["--type-dirs", *type_dirs] if type_dirs else []),
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
         if self.suite_mode is gate.SuiteMode.TARGETED:
-            arguments = ["--affected", "--repo", str(self.checkout),
-                         *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+            arguments = ["--affected", "--repo", str(self.checkout), *extra]
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
@@ -735,6 +783,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def checkpoint_commit(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        _ = registered_fixture_image(Path(self.environment["REVIEW_LINKS_ROOT"]), "012345abcdef")
         self.write(self.unit / "visible.txt", message)
         _ = self.git(self.unit, "add", ".")
         self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"
@@ -755,7 +804,7 @@ class MergeGateFixture(unittest.TestCase):
                    + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
                    + "- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc(remote.local_machine(), doc))
         return review, doc
 
     def publish_for_promotion(self) -> gate.GateArguments:

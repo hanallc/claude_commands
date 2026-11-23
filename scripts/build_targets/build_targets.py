@@ -28,11 +28,16 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
-from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+from scripts.lib import conf
+from scripts.build_queue.placement import (
+    MAC_RUN_KINDS, CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings,
+)
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
 
@@ -79,6 +84,8 @@ class CliArguments(argparse.Namespace):
         self.episode: str = ""
         self.attempt: str = ""
         self.assignment_file: str = ""
+        self.result_file: str = ""
+        self.argv: list[str] = []
 
 
 def positive_pid(value: str) -> int:
@@ -102,6 +109,14 @@ def parser() -> argparse.ArgumentParser:
     _ = reserve.add_argument("--target", default="")
     _ = reserve.add_argument("--recover-only", action="store_true")
     _ = reserve.add_argument("--new-step", action="store_true")
+    gpu = commands.add_parser("run-hana-gpu")
+    _ = gpu.add_argument("--assignment-file", required=True)
+    _ = gpu.add_argument("--repo-root", required=True)
+    _ = gpu.add_argument("--package", required=True)
+    _ = gpu.add_argument("--result-file", required=True)
+    _ = gpu.add_argument("argv", nargs=argparse.REMAINDER)
+    stop_gpu = commands.add_parser("stop-hana-gpu")
+    _ = stop_gpu.add_argument("--assignment-file", required=True)
     info = commands.add_parser("assigned-info")
     _ = info.add_argument("--assignment-file", required=True)
     recovery = commands.add_parser("recover-probe", help=argparse.SUPPRESS)
@@ -163,6 +178,7 @@ from scripts.build_targets.target_config import (
     LocalTarget,
     LocalRequired,
     Routing,
+    RegistryRead,
     SshTarget,
     WRITES_TREE,
     read_targets,
@@ -183,14 +199,25 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
     if isinstance(target, SshTarget):
         from scripts.aws_target import hana_placement
         transport = hana_placement.read_execution_transport(target)
+        if isinstance(transport, HanaGpuNextestTransport):
+            from scripts.build_targets.targets import Unreachable
+
+            setup = hana_placement.gpu_setup(transport)
+            if isinstance(setup, hana_placement.HanaStepRefused):
+                return Unreachable(setup.reason)
         if isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.build_targets.targets import Free, StateUnreadable, Unreachable
             from scripts.aws_target import hana_box
-            snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+            controller = hana_placement.controller_for(transport, read_only=True)
+            snapshot = controller.inspect()
             if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
                 return StateUnreadable(snapshot.reason)
             if isinstance(snapshot, hana_placement.HanaUnprovisioned):
                 return Unreachable('Hana is unprovisioned')
+            if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+                return Unreachable('Hana is busy or recovering')
+            if not controller.image_is_current(snapshot.deployment):
+                return Unreachable(hana_box.HANA_IMAGE_STALE)
             if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
                 return Unreachable('Hana is busy or recovering')
             return Free()
@@ -239,7 +266,10 @@ def format_state(name: str, state: TargetState,
 
     name = display_field(name)
     if isinstance(state, Free):
-        return f"{name}: free"
+        from scripts.buildlog.mac_idle_alert import kept_claims_text
+
+        suffix = f" · {kept_claims_text(state.kept_claims)}" if state.kept_claims else ""
+        return f"{name}: free{suffix}"
     if isinstance(state, Running):
         return f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
     if isinstance(state, Unreachable):
@@ -261,12 +291,11 @@ def format_state(name: str, state: TargetState,
 
 def probe_target(target: SshTarget) -> TargetState:
     from scripts.build_targets.targets import Unreachable
-    from scripts.mac_test import eligibility, offload
+    from scripts.mac_test import offload
 
-    from scripts.aws_target import hana_placement
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    config = ssh_target_config(target)
+    if isinstance(config, ExcludedTarget):
         return target_state(target)
-    config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
         return Unreachable(result.reason)
@@ -276,7 +305,7 @@ def probe_target(target: SshTarget) -> TargetState:
 def command_status(probe: bool = False) -> int:
 
 
-    from scripts.buildlog import mac_idle_alert
+    from scripts.buildlog import mac_idle
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
     from scripts.build_targets.targets import Held, HolderSession, Running
@@ -304,7 +333,7 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
-    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    alert = mac_idle.view_alert_line(time.time(), user_zone())
     if alert is not None:
         print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
@@ -364,9 +393,18 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
     return AnyTarget()
 
 
+# The command kind of a hand made run. The Mac takes it as a Mac run, and the guest line takes it as a gate step.
+HAND_MADE_KIND: CommandKind = "run"
+
+
+def mac_run_bypasses_repository_policy(target: LocalTarget | SshTarget, kind: str) -> bool:
+    """A Mac run has no repository step policy."""
+    return isinstance(target, SshTarget) and target.platform == "macos" and kind in MAC_RUN_KINDS
+
+
 def fixed_placement_constraints(
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
-    session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
+    session: SubmittingSession, source_key: str | execution_identity.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
     provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
 ) -> placement.PlacementConstraints:
@@ -374,69 +412,145 @@ def fixed_placement_constraints(
     from scripts.build_queue import placement
     from scripts.buildlog import store
     from scripts.mac_test import eligibility
-    from scripts.build_targets import target_config
 
     rule = step_routing_rule(kind, routing, selection, writes_tree=writes_tree)
     if writes_tree:
         selection = ROUTED
     repository = eligibility.repository_identity(repo_root)
     candidates: list[placement.PlacementCandidate] = []
-    for target in read_targets():
-        host_eligibility: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
-        if isinstance(target, LocalTarget):
-            destination = placement.PlacementDestination("local", target.name, store.host_name(), claim_state.WHOLE_MAC)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility))
-            continue
-        selected_settings: ProviderSettings = ConfiguredProviderSettings()
-        if isinstance(provider_settings, ExplicitProviderSettings) and isinstance(selection, Pinned) and target.name == selection.target:
-            target = replace(target, settings=provider_settings.path)
-            selected_settings = provider_settings
-        from scripts.aws_target import hana_placement
-        transport = target_config.read_execution_transport(target)
-        if isinstance(transport, hana_placement.HanaControlTransport):
-            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
-                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
-            policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
-            if isinstance(rule, NatedevOnly):
-                host_eligibility = placement.FixedExclusion(rule.reason)
-            elif isinstance(policy, hana_placement.HanaStepRefused):
-                host_eligibility = placement.FixedExclusion(policy.reason)
-            elif command:
-                judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
-                if isinstance(judgment, hana_placement.HanaStepRefused):
-                    host_eligibility = placement.FixedExclusion('command')
-            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
-            continue
-        config = eligibility.read_config(target.settings)
-        scope = claim_state.target_claim_scope(claim_state.state_paths(target.name), str(repo_root))
-        if isinstance(rule, NatedevOnly):
-            host_eligibility = placement.FixedExclusion(rule.reason)
-        elif isinstance(repository, eligibility.UnknownRepository):
-            host_eligibility = placement.FixedExclusion("repo")
-        elif target_config.uses_legacy_mac_layout(target.platform):
-            key = f"linux_only.{repository.name}"
-            if key not in config.values:
-                host_eligibility = placement.FixedExclusion("repo")
-            else:
-                excluded = eligibility.comma_values(config.values[key])
-                if eligibility.linux_only_applies(kind) and eligibility.has_linux_only(repo_root, package, excluded):
-                    host_eligibility = placement.FixedExclusion("linux_only")
-        elif not eligibility.linux_kind_permitted(config.values, kind):
-            host_eligibility = placement.FixedExclusion("target does not permit this command")
-        slots = (target_config.slot_capacity(config.values, repository.name,
-                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
-                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
-        for slot in range(1, slots + 1):
-            selected_scope = (claim_state.RepositoryScope(scope.name, scope.key, slot)
-                              if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope)
-            destination = placement.PlacementDestination("mac" if target.platform == "macos" else "ssh",
-                target.name, config.host, selected_scope, slot if target.platform == "linux" else 0)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
-    source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
+    selected = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
+    with conf.report_key_changes():
+        for target in read_targets(selected=selected, purpose=RegistryRead.PLACEMENT):
+            if isinstance(target, LocalTarget):
+                destination = placement.PlacementDestination("local", target.name, store.host_name(), claim_state.WHOLE_MAC)
+                candidates.append(placement.PlacementCandidate(destination))
+                continue
+            settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS
+            if isinstance(provider_settings, ExplicitProviderSettings) and isinstance(selection, Pinned) and target.name == selection.target:
+                target = replace(target, settings=provider_settings.path)
+                settings = provider_settings
+            candidates.extend(fixed_remote_candidates(
+                target, settings, repository, repo_root, package, kind, command, rule, selection=selection))
+    source = execution_identity.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
         placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
         command_kind=kind)
+
+
+def fixed_remote_candidates(
+    target: SshTarget, settings: ProviderSettings, repository: eligibility.RepositoryIdentity,
+    repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...], rule: AnyTarget | NatedevOnly,
+    *, selection: TargetSelection,
+) -> tuple[placement.PlacementCandidate, ...]:
+    """Read the remote keys that determine the fixed candidate set."""
+    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.build_queue import placement
+    from scripts.build_targets import target_config
+    from scripts.mac_test import eligibility
+
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        return (fixed_mac_linux_candidate(target, settings, repo_root, kind, command, rule),)
+
+    provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
+    policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
+    try:
+        configuration = conf.read(target.settings)
+        transport = target_config.read_execution_transport(target, configuration=configuration)
+        if isinstance(transport, HanaGpuNextestTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            if isinstance(rule, NatedevOnly):
+                policy = placement.FixedExclusion(rule.reason)
+            elif not isinstance(selection, Pinned) or selection.target != target.name:
+                policy = placement.FixedExclusion('This target requires --target hana-gpu')
+            else:
+                policy = hana_placement_adapter.gpu_step(transport,
+                    repository.key if isinstance(repository, eligibility.KnownRepository) else '',
+                    package, kind, command, configuration=configuration)
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            return (placement.PlacementCandidate(destination, policy, settings),)
+        if isinstance(transport, hana_placement.HanaControlTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            route = hana_placement_adapter.configured_route(configuration, str(repo_root), kind)
+            if isinstance(rule, NatedevOnly):
+                policy = placement.FixedExclusion(rule.reason)
+            elif isinstance(route, hana_placement.HanaStepRefused):
+                policy = placement.FixedExclusion(route.reason)
+            elif command:
+                judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
+                if isinstance(judgment, hana_placement.HanaStepRefused):
+                    policy = placement.FixedExclusion('command')
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            return (placement.PlacementCandidate(destination, policy, settings),)
+
+        paths = claim_state.state_paths(target.name)
+        if paths.platform == "macos":
+            identity = claim_state.mac_repository_identity(str(repo_root))
+            if isinstance(identity, claim_state.MacMirrorIdentity):
+                scope = claim_state.RepositoryScope(identity.mirror_name, identity.key)
+                repository = eligibility.KnownRepository(identity.mirror_name, identity.key)
+            else:
+                scope = claim_state.WHOLE_MAC
+                repository = eligibility.UNKNOWN_REPOSITORY
+        else:
+            scope = claim_state.target_claim_scope(paths, str(repo_root))
+        host = configuration.text("host")
+        if isinstance(rule, NatedevOnly):
+            policy = placement.FixedExclusion(rule.reason)
+        elif (selection == ROUTED and target_config.uses_legacy_mac_layout(target.platform)
+                and isinstance(repository, eligibility.KnownRepository)
+                and kind in configuration.value(f"offload_exclude.{repository.name}",
+                                                eligibility.comma_values, default=set(), allow_blank=True)):
+            policy = placement.FixedExclusion("offload_exclude")
+        elif not mac_run_bypasses_repository_policy(target, kind):
+            answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
+            if isinstance(answer, eligibility.IneligibleMacStep):
+                policy = placement.FixedExclusion(answer.reason)
+        slots = (target_config.slot_capacity(configuration, repository.name,
+                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
+                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
+    except conf.Unusable:
+        destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
+        return (placement.PlacementCandidate(destination, placement.FixedExclusion("state unreadable"), settings),)
+
+    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target.name, host,
+        claim_state.RepositoryScope(scope.name, scope.key, slot)
+            if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
+        slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
+
+
+def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path, kind: CommandKind,
+                               command: tuple[str, ...], rule: AnyTarget | NatedevOnly
+                               ) -> placement.PlacementCandidate:
+    """Name the single guest slot for a supported gate or a hand made run (kind HAND_MADE_KIND)."""
+    from scripts.build_queue import placement
+    from scripts.build_queue.admission_jobs import StepJob
+    from scripts.build_targets import mac_linux
+    from scripts.lib import build_folders
+    from scripts.lib.build_steps import gate_job_for_command
+
+    host = target.name
+    policy: placement.AllowedHost | placement.FixedExclusion
+    job = gate_job_for_command(command)
+    if isinstance(rule, NatedevOnly):
+        policy = placement.FixedExclusion(rule.reason)
+    elif kind != HAND_MADE_KIND and (not isinstance(job, StepJob) or job.step not in (
+            "test-affected", "test-all", "test-modules", "test-nightly", "integrate")):
+        policy = placement.FixedExclusion("command")
+    else:
+        try:
+            if build_folders.repo_word(repo_root) == "claude":
+                host = mac_linux.read_settings(conf.read("build_targets")).ssh_hops[1]
+                policy = placement.AllowedHost()
+            else:
+                policy = placement.FixedExclusion("repo")
+        except build_folders.InvalidFolderForm:
+            policy = placement.FixedExclusion("repo")
+        except (conf.Unusable, mac_linux.GuestUnavailable):
+            policy = placement.FixedExclusion("mac_linux_settings_unreadable")
+    destination = placement.PlacementDestination("ssh", target.name, host, claim_state.RepositoryScope("claude", slot=1), 1)
+    return placement.PlacementCandidate(destination, policy, settings)
 
 
 def command_constraints(args: CliArguments) -> int:
@@ -448,7 +562,8 @@ def command_constraints(args: CliArguments) -> int:
 
     if args.target and args.target != "natedev":
         try:
-            _ = target_config.configured_ssh_target(args.target)
+            with conf.report_key_changes():
+                _ = target_config.configured_ssh_target(args.target)
         except ConfigError as error:
             print(f"build targets: {error}", file=sys.stderr)
             return 2
@@ -458,15 +573,21 @@ def command_constraints(args: CliArguments) -> int:
     selection = Pinned(args.target or "mac") if args.target or args.mac_only else ROUTED
     rule = step_routing_rule(cast(StepKind, args.kind), routing, selection)
     constraints = fixed_placement_constraints(Path(args.repo_root).resolve(), args.package,
-        cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
+        cast(StepKind, args.kind), (), session, execution_identity.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
     print("any_target" if isinstance(rule, AnyTarget) else f"natedev_only {rule.reason}")
+    selected_name = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
     shown: set[str] = set()
+    with conf.report_key_changes():
+        targets = {target.name: target for target in read_targets(
+            selected=selected_name, purpose=RegistryRead.PLACEMENT)}
     for candidate in constraints.candidates:
         destination = candidate.destination
         if destination.target in shown:
             continue
         shown.add(destination.target)
-        target = next(target for target in read_targets() if target.name == destination.target)
+        target = targets.get(destination.target)
+        if target is None:
+            continue
         if args.mac_only and (not isinstance(target, SshTarget) or target.platform != "macos"):
             continue
         reason = (candidate.eligibility.reason if isinstance(candidate.eligibility, placement.FixedExclusion)
@@ -504,11 +625,13 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
                 backoff: eligibility.BackoffState | eligibility.ReadBackoff,
+                configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
 
-    config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
+    config = (configuration if isinstance(configuration, conf.ConfigRead)
+              else eligibility.read_target_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_target_settings())
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
@@ -560,11 +683,22 @@ def command_recover_probe(args: CliArguments) -> int:
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             return 0
-        repository = eligibility.repository_identity(Path(args.repo_root))
+        mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC
+        if target.platform == "macos":
+            mirror = claim_state.mac_repository_identity(args.repo_root)
+            if isinstance(mirror, claim_state.WholeMacScope):
+                return 0
+            saved = mirror.claim_repository()
+            if not isinstance(saved, claim_state.MacRepositoryIdentity):
+                return 0
+            mac_repository = saved
+            repository = eligibility.KnownRepository(mac_repository.mirror_name, mac_repository.key)
+        else:
+            repository = eligibility.repository_identity(Path(args.repo_root))
         if isinstance(repository, eligibility.UnknownRepository):
             return 0
         paths = mac_test.state_paths(target.name)
-        if mac_test.free_now(paths, target.settings, Path(args.repo_root)) != "bad":
+        if mac_test.free_now(paths, target.settings, Path(args.repo_root), mac_repository=mac_repository) != "bad":
             return 0
         request = offload.OffloadRequest(
             Path(args.repo_root), args.package, f"probe-{os.getpid()}", offload.NoResultFile(), (),
@@ -586,10 +720,19 @@ def command_recover_probe(args: CliArguments) -> int:
                         slots.append(slot)
                     if not slots:
                         return 0
-                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots))
+                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots),
+                        mac_repository=(mac_repository if isinstance(mac_repository, claim_state.MacRepositoryIdentity)
+                                        else claim_state.NO_SAVED_MAC_REPOSITORY))
                     if not isinstance(claim, offload.FreshMacClaim):
                         return 0
                     try:
+                        saved = controller.mac_repository
+                        if target.platform == "macos" and not isinstance(saved, claim_state.MacRepositoryIdentity):
+                            return 0
+                        if isinstance(saved, claim_state.MacRepositoryIdentity):
+                            if saved.mirror_name != repository.name:
+                                return 0
+                            repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
                         if not offload.copy_tracked_scripts(controller, config):
                             return 0
                         selected = replace(request, slot=claim.slot)
@@ -615,11 +758,15 @@ def command_probe_backoff(name: str, *, probe: bool) -> int:
         return 0
     if not probe:
         return 1
-    config = eligibility.read_config(target_config.configured_ssh_target(name).settings)
+    config = ssh_target_config(target_config.configured_ssh_target(name))
+    # A target without an offload probe keeps its backoff until its own route clears it.
+    if isinstance(config, ExcludedTarget):
+        return 1
+    probe_started_ns = time.time_ns()
     if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
         return 1
-    offload.record_reachable(name)
-    return 0
+    offload.record_reachable(name, probe_started_ns=probe_started_ns)
+    return int(isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff))
 
 
 @dataclass(frozen=True)
@@ -633,7 +780,10 @@ CAPACITY_NOT_READ = CapacityNotRead()
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
+                           configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+                           recover_mac_backoff: bool = False,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -642,18 +792,26 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
         name = target.name if isinstance(target, SshTarget) else "mac"
-        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF)
+        backoff = eligibility.NO_BACKOFF if recover_mac_backoff else eligibility.READ_BACKOFF
+        repository = step_policy(target, repo_root, package, kind, backoff=backoff, configuration=configuration)
         if isinstance(repository, ExcludedTarget):
             return repository
+        # An excluded step reads no probe settings.
+        config = (eligibility.probe_settings(configuration) if isinstance(configuration, conf.ConfigRead)
+                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         if isinstance(answer, CapacityNotRead):
-            answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root, session=session)
+            settings = config.source if isinstance(config, eligibility.OffloadConfig) else config.configuration.source
+            answer = mac_test.free_now(mac_test.state_paths(name), settings, repo_root, session=session,
+                                      configuration=configuration, mac_scope=mac_scope,
+                                      recover_mac_backoff=recover_mac_backoff)
     except (OSError, UnicodeError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+            raise
         return ExcludedTarget(target, f"state unreadable: {error}")
     if answer in ("blocked", "backoff"):
         return ExcludedTarget(target, answer)
-    if answer == "bad":
+    if answer == "bad" and not recover_mac_backoff:
         return EligibleTarget(target)
     # Only an eligible step pays for the offload runner's import.
     from scripts.mac_test import offload
@@ -663,9 +821,12 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         probe = offload.probe_mac(controller, config, repository, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
             return ExcludedTarget(target, "busy")
+        if isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+            return ExcludedTarget(target, "backoff")
         if isinstance(probe, offload.UnavailableProbe):
-            with claim_state.locked(eligibility.state_directory(name) / "probe-result.lock"):
-                offload.write_backoff(time.time() + config.unreachable_backoff_s, name)
+            delay = (config.unreachable_backoff_s if isinstance(config, eligibility.OffloadConfig)
+                     else config.configuration.number("unreachable_backoff_s"))
+            offload.write_backoff(time.time() + delay, name, wait=not recover_mac_backoff)
             return ExcludedTarget(target, "unreachable")
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
@@ -678,46 +839,75 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     except offload.OffloadInterrupted as interrupted:
         raise SystemExit(128 + interrupted.signal_number) from None
     except (OSError, UnicodeError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+            raise
         return ExcludedTarget(target, f"state unreadable: {error}")
     return EligibleTarget(target)
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
+                           configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+                           recover_mac_backoff: bool = False,
                            ) -> EligibleTarget | ExcludedTarget:
-    """Read Linux policy and capacity without evaluating a development shell."""
+    """Read SSH target policy and capacity without evaluating a Linux development shell."""
 
     from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
-    from scripts.aws_target import hana_placement
-    transport = hana_placement.read_execution_transport(target)
+    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.build_targets import target_config
+
+    settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
+    transport = target_config.read_execution_transport(target, configuration=settings)
+    if isinstance(transport, HanaGpuNextestTransport):
+        from scripts.build_queue.placement import FixedExclusion
+
+        if isinstance(routing, LocalRequired):
+            return ExcludedTarget(target, routing.reason)
+        if not isinstance(selection, Pinned) or selection.target != target.name:
+            return ExcludedTarget(target, 'This target requires --target hana-gpu')
+        identity = eligibility.repository_identity(repo_root)
+        policy = hana_placement_adapter.gpu_step(transport,
+            identity.key if isinstance(identity, eligibility.KnownRepository) else '',
+            package, kind, (), configuration=settings)
+        return ExcludedTarget(target, policy.reason) if isinstance(policy, FixedExclusion) else EligibleTarget(target)
     if isinstance(transport, hana_placement.HanaControlTransport):
         if isinstance(routing, LocalRequired):
             return ExcludedTarget(target, routing.reason)
         policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
         if isinstance(policy, hana_placement.HanaStepRefused):
             return ExcludedTarget(target, policy.reason)
-        snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+        controller = hana_placement.controller_for(transport, read_only=True)
+        snapshot = controller.inspect()
         if isinstance(snapshot, hana_placement.HanaUnprovisioned):
             return ExcludedTarget(target, 'unprovisioned')
         if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
             return ExcludedTarget(target, 'state unreadable')
+        if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+            return ExcludedTarget(target, 'busy')
         from scripts.aws_target import hana_box
+        if not controller.image_is_current(snapshot.deployment):
+            return ExcludedTarget(target, hana_box.HANA_IMAGE_STALE)
         if snapshot.claims:
             return ExcludedTarget(target, 'busy')
         if snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
             return ExcludedTarget(target, 'starting' if snapshot.state == hana_box.Lifecycle.STARTING else 'recovery')
         return EligibleTarget(target)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
-        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session)
-        if new_step and not isinstance(selection, Pinned) and answer == "bad":
+        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
+                                 configuration=configuration, mac_scope=mac_scope,
+                                 recover_mac_backoff=recover_mac_backoff)
+        if new_step and not recover_mac_backoff and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
-            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer, session=session)
+            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
+                                          configuration=configuration, session=session, mac_scope=mac_scope,
+                                          recover_mac_backoff=recover_mac_backoff)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
-    config = ssh_target_config(target)
+    config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
         return config
     for step in eligibility.remote_step_kinds(kind):
@@ -726,7 +916,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
-    answer = mac_test.free_now(paths, target.settings, repo_root, session=session)
+    answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
+                                 configuration=configuration)
     if new_step and not isinstance(selection, Pinned) and answer == "bad":
         start_probe_recovery(target, repo_root, package, kind)
     if answer not in ("free", "bad"):
@@ -735,7 +926,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     from scripts.mac_test import offload
 
-    if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
+    probe_settings = eligibility.probe_settings(config) if isinstance(config, conf.ConfigRead) else config
+    if isinstance(offload.probe_reachability(offload.ProcessController(), probe_settings), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)
 
@@ -745,7 +937,9 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     from scripts.mac_test import eligibility
     from scripts.aws_target import hana_placement
 
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        return ExcludedTarget(target, 'The Mac Linux guest requires an exact queue assignment')
+    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
     return eligibility.read_config(target.settings)
@@ -776,8 +970,12 @@ def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
         return 2
 
 
-def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
-                    *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
+                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                        expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                        mac_scope: claim_state.ClaimScope = claim_state.WHOLE_MAC,
+                        cleanup_only: bool = False,
+                        ) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
     """Find the exact reservation for this process and session."""
     from scripts.lib import process_start as process_identity
     from scripts.mac_test import mac_test
@@ -787,36 +985,65 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
     if not isinstance(start, process_identity.Started):
         return claim_state.NO_CLAIM_IDENTITY
     try:
-        scope = mac_test.target_claim_scope(paths, repo_root)
+        worktree = claim_state.claim_worktree_path(repo_root)
         block = mac_test.blocking_claim_block(paths, session)
-        return next((claim_state.claim_identity(claim.record) for claim in mac_test.read_claims(paths)
-                     if mac_test.scopes_overlap(claim.scope, scope)
-                     and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                     and claim.record["submitting_session"] == claim_state.session_id(session)
-                     and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-                     and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)),
-                    claim_state.NO_CLAIM_IDENTITY)
+        claims = [claim for claim in mac_test.read_claims(paths)
+                  if claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                  and "wait_released" not in claim.record
+                  and claim.record["submitting_session"] == claim_state.session_id(session)
+                  and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                  and (not cleanup_only or claim.record.get("cleanup_pending"))
+                  and (not claim.record.get("cleanup_pending") or claim_state.cleanup_scope_is_known(paths, claim))
+                  and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)]
+        if paths.platform == "macos":
+            claims = [claim for claim in claims
+                      if (isinstance(expected, claim_state.NoClaimIdentity)
+                          or claim_state.claim_identity(claim.record) == expected)
+                      and (isinstance(mac_scope, claim_state.WholeMacScope)
+                           or claim.matches_mac_assignment_scope(mac_scope))
+                      and (claim_state.recorded_worktree_matches(claim.record["worktree"], worktree)
+                           or (claim.record.get("cleanup_pending")
+                               and (isinstance(expected, claim_state.ClaimIdentity)
+                                    or not claim.record.get("repo_key"))))]
+            return claim_state.claim_identity(claims[0].record) if len(claims) == 1 else claim_state.NO_CLAIM_IDENTITY
+        scope = mac_test.target_claim_scope(paths, str(worktree))
+        return next((claim_state.claim_identity(claim.record) for claim in claims
+                     if mac_test.wait_claim_matches(paths, claim, scope, worktree)), claim_state.NO_CLAIM_IDENTITY)
     except (OSError, mac_test.StateReadError):
         return claim_state.NO_CLAIM_IDENTITY
+
+
+def published_wait_identity(path: str, session: SubmittingSession) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+    if not path:
+        return claim_state.NO_CLAIM_IDENTITY
+    try:
+        claim_id, episode, attempt, saved_session = Path(path).read_text().removesuffix("\n").split("\t")
+    except FileNotFoundError:
+        return claim_state.NO_CLAIM_IDENTITY
+    if not claim_id or not episode or not attempt or saved_session != claim_state.session_id(session):
+        raise ValueError("the saved reservation identity does not match the wait")
+    return claim_state.ClaimIdentity(claim_id, episode, attempt)
 
 
 def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: SubmittingSession) -> None:
     """Recover retained cleanup ownership without granting permission to execute."""
 
+    from scripts.copies import copies
     from scripts.lib import conf, process_start as process_identity
     from scripts.mac_test import eligibility, mac_test, offload
 
     paths = mac_test.state_paths(target.name)
     scope = mac_test.target_claim_scope(paths, args.repo_root)
-    if not isinstance(scope, mac_test.RepositoryScope):
+    if paths.platform == "linux" and not isinstance(scope, mac_test.RepositoryScope):
         return
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
         return
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
-                       if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
-                       and (mac_test.run_is_kept(claim.record)
+                       if mac_test.cleanup_claim_matches(paths, claim, scope)
+                       and "remote_host" in claim.record
+                       and (mac_test.recoverable_kept_claim(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
     if not claims:
@@ -829,28 +1056,48 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     owner = mac_test.CliArguments()
     owner.pid = args.pid
     for claim in claims:
-        with mac_test.locked(paths.lock):
-            if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
-                continue
-            with redirect_stdout(io.StringIO()):
-                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
-            if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
-                continue
-        try:
-            checked = offload.check_leftovers(config, claim.record["remote_host"],
-                                              eligibility.KnownRepository(scope.name, scope.key), target.name,
-                                              claim.record.get("slot", 1))
-        except conf.Unusable as error:
-            print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
+        record = claim.record
+        if "remote_host" not in record:
             continue
-        if isinstance(checked, offload.LeftoversEnded):
-            release = mac_test.CliArguments()
-            release.pid = args.pid
-            release.claim_id = claim.record["claim_id"]
-            release.episode = claim.record["episode"]
-            release.attempt = claim.record["attempt"]
-            release.settings = str(target.settings)
-            _ = mac_test.command_release(release, paths)
+        if paths.platform == "macos":
+            saved = claim_state.saved_mac_repository(record)
+            lease = offload.mac_cleanup_lease(saved, record["remote_host"], target.name)
+            mirror = offload.mac_cleanup_scope(saved)
+        else:
+            cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
+            if not isinstance(cleanup_scope, claim_state.RepositoryScope):
+                continue
+            lease = nullcontext()
+            mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
+        with ExitStack() as cleanup:
+            try:
+                cleanup.enter_context(lease)
+            except copies.BusyRemoteMirror:
+                continue
+            except (OSError, conf.Unusable, copies.CopyError) as error:
+                print(f"build targets: {target.name}: cleanup lease unavailable: {error}", file=sys.stderr)
+                continue
+            try:
+                with mac_test.locked(paths.lock):
+                    if mac_test.read_run(claim.path) != record:
+                        continue
+                    attempt = mac_test.take_over_kept_claim(owner, claim, record, session=session)
+                    if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
+                        continue
+                checked = offload.check_leftovers(config, record["remote_host"], mirror, target.name,
+                                                  record.get("slot", 1))
+                if isinstance(checked, offload.LeftoversEnded):
+                    release = mac_test.CliArguments()
+                    release.pid = args.pid
+                    release.claim_id = record["claim_id"]
+                    release.episode = record["episode"]
+                    release.attempt = record["attempt"]
+                    release.settings = str(target.settings)
+                    _ = mac_test.command_release(release, paths)
+            except copies.BusyRemoteMirror:
+                continue
+            except (conf.Unusable, copies.CopyError) as error:
+                print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
 
 
 def publish_wait_reservation(args: CliArguments, target: SshTarget,
@@ -889,37 +1136,49 @@ def reserve_assigned(args: CliArguments) -> int:
         if isinstance(checked, hana_placement.HanaClaimRefused):
             return 1
         # F1 commits lifecycle demand after this process-bound reservation handoff.
-        identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
             assignment.episode, assignment.attempt)
         publish_wait_reservation(args, target, identity, assignment.session)
         return 0
     paths = mac_test.state_paths(target.name)
-    if args.recover_only:
+    expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                        assignment.episode, assignment.attempt)
+    published = (published_wait_identity(args.claim_identity_file, assignment.session)
+                 if paths.platform == "macos" and not args.recover_only and Path(args.reservation_file).is_file()
+                 else claim_state.NO_CLAIM_IDENTITY)
+    if args.recover_only or (isinstance(published, claim_state.ClaimIdentity) and published != expected):
         from scripts.lib import process_start
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
-                                                     assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78
+                scope = assignment.destination.scope
                 matches = [held for held in mac_test.read_claims(paths)
-                    if held.scope == assignment.destination.scope and held.record["pid"] == args.pid
+                    if ((held.matches_mac_assignment_scope(scope) or (held.record.get("cleanup_pending")
+                            and mac_test.cleanup_claim_matches(paths, held, scope)))
+                        if paths.platform == "macos" else held.scope == scope)
+                    and held.record["pid"] == args.pid
+                    and "wait_released" not in held.record
+                    and (not held.record.get("cleanup_pending") or claim_state.cleanup_scope_is_known(paths, held))
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
-                    and (claim_state.claim_identity(held.record) == expected
-                         or "remote_host" in held.record and held.record.get("cleanup_pending"))]
-                if not matches:
+                    and ((args.recover_only and claim_state.claim_identity(held.record) == expected)
+                         or ("remote_host" in held.record and held.record.get("cleanup_pending")
+                             and (args.recover_only or claim_state.claim_identity(held.record) == published)))]
+                if not matches and args.recover_only:
                     return 1
-                if len(matches) != 1:
+                if len(matches) > 1:
                     return 78
-                held = matches[0]
-                publish_wait_reservation(args, target, claim_state.claim_identity(held.record), assignment.session)
-                return 13 if "remote_host" in held.record else 0
+                if matches:
+                    held = matches[0]
+                    publish_wait_reservation(args, target, claim_state.claim_identity(held.record), assignment.session)
+                    return 13 if "remote_host" in held.record else 0
         except (OSError, ValueError, mac_test.StateReadError):
             return 78
-    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=assignment.session)
+    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=assignment.session,
+                                   expected=expected, mac_scope=assignment.destination.scope)
     if (isinstance(identity, claim_state.ClaimIdentity)
             and (identity.episode, identity.attempt) == (assignment.episode, assignment.attempt)):
         publish_wait_reservation(args, target, identity, assignment.session)
@@ -960,7 +1219,9 @@ def command_reserve(args: CliArguments) -> int:
                     from scripts.mac_test import mac_test
 
                     paths = mac_test.state_paths(name)
-                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+                    expected = (published_wait_identity(args.claim_identity_file, session) if paths.platform == "macos"
+                                else claim_state.NO_CLAIM_IDENTITY)
+                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session, expected=expected)
                     if isinstance(identity, claim_state.ClaimIdentity):
                         publish_wait_reservation(args, target, identity, session)
                         return 0
@@ -982,7 +1243,14 @@ def command_reserve(args: CliArguments) -> int:
         if not config.enabled:
             continue
         paths = mac_test.state_paths(target.name)
-        identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+        mac_in_backoff = (paths.platform == "macos"
+                          and isinstance(eligibility.read_backoff(time.time(), target.name), eligibility.ActiveBackoff))
+        identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session, cleanup_only=mac_in_backoff)
+        if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
+            publish_wait_reservation(args, target, identity, session)
+            return 0
+        if mac_in_backoff:
+            continue
         if isinstance(identity, claim_state.NoClaimIdentity):
             answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
             if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
@@ -996,8 +1264,8 @@ def command_reserve(args: CliArguments) -> int:
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
             with mac_test.locked(paths.lock):
-                retained = any(mac_test.scopes_overlap(claim.scope, scope)
-                               and mac_test.run_is_kept(claim.record)
+                retained = any(mac_test.cleanup_claim_matches(paths, claim, scope)
+                               and mac_test.recoverable_kept_claim(claim.record)
                                for claim in mac_test.read_claims(paths))
             if not retained:
                 busy_mac = busy_mac or target.platform == "macos"
@@ -1027,13 +1295,16 @@ def command_reserve(args: CliArguments) -> int:
 def command_release_wait(pid: int, *,
                          identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
                          session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
-    """Release only process-bound reservations; remote claims retain ownership."""
+    """Release the process-bound reservation and revoke its retry permission."""
     from scripts.lib import process_start as process_identity
 
-    session = claim_state.submitting_session(session)
-    start = process_identity.process_start(pid)
-    if not isinstance(start, process_identity.Started):
+    if isinstance(identity, claim_state.NoClaimIdentity) or not all((identity.claim_id, identity.episode, identity.attempt)):
         return 0
+    session = claim_state.submitting_session(session)
+    session_id = claim_state.session_id(session)
+    start = process_identity.process_start(pid)
+    located = False
+    unreadable: claim_state.UnlocatedWaitReservation | None = None
     for target in read_targets():
         if not isinstance(target, SshTarget):
             continue
@@ -1042,30 +1313,89 @@ def command_release_wait(pid: int, *,
         if not target_config.ssh_target_state_directory(target.name).exists():
             continue
         paths = claim_state.state_paths(target.name)
-        fenced: list[claim_state.HeldClaim] = []
+        fenced: list[claim_state.ProcessBoundClaim] = []
+        removable: list[Path] = []
         with claim_state.locked(paths.lock):
-            for claim in claim_state.read_claims(paths):
-                if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                        and claim.record["submitting_session"] == claim_state.session_id(session)
-                        and claim_state.claim_identity(claim.record) == identity
-                        and "remote_host" not in claim.record):
-                    from scripts.mac_test import offload
-
-                    exact = claim_state.ClaimIdentity(claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])
-                    if offload.pending_start_path(target.name, exact).exists():
-                        fenced.append(claim)
+            release_start = start.start if isinstance(start, process_identity.Started) else None
+            permission: claim_state.RetiredMacReservation | claim_state.NoSavedRetryPermission
+            permission = claim_state.NO_SAVED_RETRY_PERMISSION
+            reservation: Path | claim_state.UnrecordedReservationPath = claim_state.UnrecordedReservationPath()
+            matched = False
+            try:
+                removal = claim_state.read_wait_removal(claim_state.released_wait_path(paths, identity))
+                if isinstance(removal, claim_state.StateFileReadFailed):
+                    print(removal.diagnostic, file=sys.stderr)
+                    return 1
+                if isinstance(removal, claim_state.WaiterProcessIdentity):
+                    located = True
+                    continue
+                if paths.platform == "macos":
+                    retired = claim_state.read_retired_mac_reservation(paths, identity)
+                    if (isinstance(retired, claim_state.RetiredMacReservation)
+                            and retired.pid == pid and retired.submitting_session == session_id
+                            and (release_start is None or retired.proc_start == release_start)):
+                        permission = retired
+                        # An interrupted retirement can leave both the proof and the original reservation.
+                        release_start = retired.proc_start
+                        reservation = retired.reservation
+                if release_start is not None or (paths.platform == "macos" and isinstance(start, process_identity.Unreadable)):
+                    if isinstance(reservation, claim_state.UnrecordedReservationPath):
+                        location = claim_state.read_wait_location(paths, identity)
+                        if isinstance(location, claim_state.WaitReservationLocation):
+                            if (location.pid != pid or location.submitting_session != session_id
+                                    or (release_start is not None and location.proc_start != release_start)):
+                                located = True
+                                continue
+                            reservation = location.path
+                    if isinstance(reservation, Path):
+                        located = True
+                    for saved in claim_state.read_wait_reservations(paths, identity, reservation):
+                        path, record = saved.path, saved.record
+                        if record["pid"] != pid or record["submitting_session"] != session_id:
+                            continue
+                        if release_start is not None and record["proc_start"] != release_start:
+                            continue
+                        located = True
+                        matched = True
+                        if (isinstance(reservation, claim_state.UnrecordedReservationPath)
+                                or isinstance(permission, claim_state.RetiredMacReservation)):
+                            claim_state.save_wait_location(paths, identity, claim_state.WaitReservationLocation.for_claim(path, record))
+                        # A sweep must not restore permission after release removes it.
+                        if ((release_start is None or isinstance(permission, claim_state.RetiredMacReservation))
+                                and "wait_released" not in record):
+                            claim_state.mark_wait_released(path, saved.original_fields)
+                        if release_start is None:
+                            continue
+                        if claim_state.claim_pending_start(paths, path, record).exists():
+                            fenced.append(record)
+                        else:
+                            removable.append(path)
+                if isinstance(permission, claim_state.RetiredMacReservation):
+                    if matched:
+                        permission.path.unlink(missing_ok=True)
                     else:
-                        claim.path.unlink(missing_ok=True)
-        for claim in fenced:
+                        claim_state.record_wait_removal(paths, identity, permission.path)
+                for path in removable:
+                    claim_state.record_wait_removal(paths, identity, path)
+            except claim_state.UnlocatedWaitReservation as error:
+                if unreadable is None:
+                    unreadable = error
+            except (claim_state.StateReadError, OSError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+        for record in fenced:
             from scripts.mac_test import mac_test
 
             release = mac_test.CliArguments()
             release.pid, release.target, release.settings = pid, target.name, str(target.settings)
-            release.claim_id = claim.record["claim_id"]
-            release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
-            status = mac_test.command_release(release, paths)
+            release.claim_id = record["claim_id"]
+            release.episode, release.attempt = record["episode"], record["attempt"]
+            status = mac_test.command_release(release, paths, finish_wait=True)
             if status != 0:
                 return status
+    if not located and unreadable is not None:
+        print(str(unreadable), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1213,14 +1543,24 @@ def hold_waited_on(holds: build_hold.NatedevHolds,
                    owner: OwningSession | NoOwningSession,
                    directory: Path, caller_lineage: CallerLineage) -> build_hold.Holder | NoBlockingHold:
     """Choose the oldest hold that applies to the caller and belongs to another session."""
+    return blocking_hold(holds, own_hold_key(owner, directory), caller_lineage)
+
+
+def own_hold_key(owner: OwningSession | NoOwningSession, directory: Path) -> str:
+    """Name the hold file of the owner's session, or give an empty name."""
     from scripts.build_hold import build_hold
 
-    own_key = ""
     if isinstance(owner, OwningSession):
         try:
-            own_key = build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
+            return build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
         except ValueError:
             pass
+    return ""
+
+
+def blocking_hold(holds: build_hold.NatedevHolds, own_key: str,
+                  caller_lineage: CallerLineage) -> build_hold.Holder | NoBlockingHold:
+    """Choose the oldest hold that applies to the caller, other than the hold of its own session."""
     for holder in holds.in_force:
         kept = (isinstance(caller_lineage, ConfirmedCallerLineage)
                 and bool(caller_lineage.processes.intersection(holder.keep)))
@@ -1462,55 +1802,78 @@ def command_eligibility(args: CliArguments) -> int:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
-    from scripts.build_targets import target_config
-
-    args = parser().parse_args(namespace=CliArguments())
-    if args.command == "recover-probe":
-        return command_recover_probe(args)
-    if args.command == "probe-backoff":
-        return command_probe_backoff(args.target, probe=not args.no_probe)
-    if args.command == "source-key":
-        from scripts.buildlog import treekey
-
-        print(treekey.tree_key(args.repo_root) or "")
-        return 0
-    if args.command == "submitting-session":
-        print(claim_state.session_id(claim_state.submitting_session(args.session)))
-        return 0
-    if args.command == "assigned-info":
-        from scripts.build_queue import admission_protocol as wire
-
-        saved = wire.parse_reply(Path(args.assignment_file).read_text())
-        if not isinstance(saved, (wire.Assignment, wire.LocalPlacementGranted)):
-            raise wire.AdmissionUnavailable("file contains no assigned attempt")
-        destination = saved.assignment.destination
-        if destination.provider == "local":
-            print("-\tlinux\t" + claim_state.session_id(saved.assignment.session))
-        else:
-            target = target_config.configured_ssh_target(destination.target)
-            print(f"{target.settings}\t{target.platform}\t{claim_state.session_id(saved.assignment.session)}")
-        return 0
-    if args.command in ("reserve", "recover-reservation"):
-        if args.command == "recover-reservation":
-            args.recover_only = True
-        return command_reserve(args)
-    if args.command in ("release-wait", "eligible", "constraints"):
+    try:
         from scripts.build_targets import target_config
 
-        with target_config.command_configuration():
-            if args.command == "release-wait":
-                return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
-                    args.claim_id, args.episode, args.attempt), session=args.session)
-            return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
-    if args.command == "register-local":
-        return command_register_local(args.call_id, pid=args.pid, session=args.session)
-    if args.command == "wait-local":
-        return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook, caller=args.caller, session=args.session)
-    if args.command == "check-local":
-        return command_check_local(args.caller, session=args.session)
-    if args.command == "interrupt-local":
-        return command_interrupt_local(args.call_id, args.signal_name)
-    return command_status(args.probe)
+        args = parser().parse_args(namespace=CliArguments())
+        if args.command == "recover-probe":
+            return command_recover_probe(args)
+        if args.command == "probe-backoff":
+            return command_probe_backoff(args.target, probe=not args.no_probe)
+        if args.command == "source-key":
+            from scripts.buildlog import treekey
+
+            print(treekey.tree_key(args.repo_root) or "")
+            return 0
+        if args.command == "submitting-session":
+            print(claim_state.session_id(claim_state.submitting_session(args.session)))
+            return 0
+        if args.command == "stop-hana-gpu":
+            from importlib import import_module
+            from scripts.build_queue import admission_wire as wire
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or saved.assignment.destination.target != "hana-gpu":
+                raise ValueError("A Hana GPU assignment is required to stop its service")
+            stop_service = cast(Callable[[str], int], getattr(
+                import_module("scripts.aws_target.gpu_size_trial"), "stop_assigned_gpu_service"))
+            return stop_service(execution_identity.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt))
+        if args.command == "run-hana-gpu":
+            from scripts.aws_target import hana_placement
+            from scripts.build_queue import admission_wire as wire
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or args.argv[:1] != ["--"]:
+                raise ValueError("The Hana GPU runner requires a remote assignment and a command")
+            return hana_placement.run_gpu_assignment(saved.assignment, Path(args.repo_root), args.package,
+                                      tuple(args.argv[1:]), Path(args.result_file))
+        if args.command == "assigned-info":
+            from scripts.build_queue import admission_protocol as wire
+
+            saved = wire.parse_reply(Path(args.assignment_file).read_text())
+            if not isinstance(saved, (wire.Assignment, wire.LocalPlacementGranted)):
+                raise wire.AdmissionUnavailable("file contains no assigned attempt")
+            destination = saved.assignment.destination
+            if destination.provider == "local":
+                print("-\tlinux\t" + claim_state.session_id(saved.assignment.session))
+            else:
+                target = target_config.configured_ssh_target(destination.target)
+                print(f"{target.settings}\t{target.platform}\t{claim_state.session_id(saved.assignment.session)}")
+            return 0
+        if args.command in ("reserve", "recover-reservation"):
+            if args.command == "recover-reservation":
+                args.recover_only = True
+            return command_reserve(args)
+        if args.command in ("release-wait", "eligible", "constraints"):
+            from scripts.build_targets import target_config
+
+            with target_config.command_configuration():
+                if args.command == "release-wait":
+                    return command_release_wait(args.pid, identity=claim_state.ClaimIdentity(
+                        args.claim_id, args.episode, args.attempt), session=args.session)
+                return command_constraints(args) if args.command == "constraints" else command_eligibility(args)
+        if args.command == "register-local":
+            return command_register_local(args.call_id, pid=args.pid, session=args.session)
+        if args.command == "wait-local":
+            return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook, caller=args.caller, session=args.session)
+        if args.command == "check-local":
+            return command_check_local(args.caller, session=args.session)
+        if args.command == "interrupt-local":
+            return command_interrupt_local(args.call_id, args.signal_name)
+        return command_status(args.probe)
+    except override_guard.SharedStateWriteRefused as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

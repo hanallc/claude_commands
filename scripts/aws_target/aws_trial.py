@@ -13,8 +13,10 @@ from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
+import os
 import re
 import sys
+from multiprocessing.connection import wait
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 import signal
@@ -34,11 +36,14 @@ from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as p
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+from scripts.build_queue import snapshot_codec
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
+from scripts.build_queue.admission_records import process_start_time
+from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate import SuiteMode
 
 
 NIXOS_LOCK = Path('/etc/nixos/flake.lock')
@@ -54,6 +59,7 @@ def host_nixpkgs_revision() -> str:
 
 
 TRIAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+PAIRED_TRIAL_JOB = StepJob('test-modules', modules=1)
 
 
 def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -86,7 +92,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+    """Bound network Git calls and stop unreaped Git groups on failure."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -94,11 +100,13 @@ def network_git(repo: Path, *arguments: str) -> str:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
-            try:
-                send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = process.communicate()
+            if process.returncode is None:
+                with cancellation.defer_cleanup_signals():
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.wait()
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
@@ -168,9 +176,10 @@ def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> N
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:
     return {'task': 'paired', 'attempt': attempt, 'base': asdict(trial.base), 'changed': asdict(trial.changed),
             'commit': trial.changed.commit, 'tree': trial.changed.tree, 'head': trial.changed.commit,
-            'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'test-affected',
+            'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
-            'expires': expires, 'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
+            'expires': expires, 'gate_job': snapshot_codec.snapshot_value(PAIRED_TRIAL_JOB),
+            'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
             'delivery_s': cloud_gate.settings().number('termination_timeout_s') + 2 * cloud_gate.settings().number('api_timeout_s')}
 
 
@@ -196,10 +205,14 @@ def module_summary(module: str, rounds: int, runs: Sequence[dict[str, object]]) 
 
 
 def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, object]],
-                  record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
+                  record_query: Callable[[Decimal], None] = lambda _fee: None, *,
+                  check_workers: Callable[[], None] = lambda: None) -> None:
     """Reserve every box before the coordinator permits any launch."""
+    check_workers()
     worker.reconcile()
+    check_workers()
     worker.charges(record_query)
+    check_workers()
     fallback = Decimal(str(cloud_gate.settings().number('spot_max_usd_per_hour')))
     readings = worker.book.read_bills()
     day = datetime.fromtimestamp(worker.clock(), UTC).date().isoformat()
@@ -219,6 +232,7 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
     reserved: list[str] = []
     try:
         for request in requests:
+            check_workers()
             attempt = ledger.text(request, 'attempt')
             # Use the highest rate until AWS confirms the actual type.
             reply = worker.book.reserve_gate(worker.settings_path, ledger.GateReservation(
@@ -227,6 +241,7 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
             if isinstance(reply, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                 raise GateRefused(reply.reason)
             reserved.append(attempt)
+        check_workers()
     except BaseException:
         for attempt in reserved:
             worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())))
@@ -288,22 +303,29 @@ class LaunchBarrier(Protocol):
     def close(self) -> None: ...
 
 
-def paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier) -> None:
+def paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier, *,
+                  group: CloudGroup) -> None:
     """Keep one queue slot while the shared worker owns its box."""
     policy = conf.read(settings_path)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path, folder / 'reservation.cgroup', clock=time.time)
     try:
-        with redirect_stdout(sys.stderr), cloud_gate.cloud_reservation(folder, worker.sidecar, SuiteMode.TARGETED_TEST) as slot:
+        with redirect_stdout(sys.stderr), cloud_gate.cloud_reservation(
+                folder, worker.sidecar, PAIRED_TRIAL_JOB, group=group) as slot:
             try:
                 connection.send('ready')
-                if connection.recv() != 'launch':
+                try:
+                    decision = connection.recv()
+                except EOFError:
+                    return
+                if decision != 'launch':
                     return
                 if (folder / 'outcome.json').exists():
                     return
                 # The coordinator sets the box expiry at launch, so read the request now.
                 request = cloud_gate.read(folder / 'request.json')
-                outcome = worker.execute(folder, request, cloud_gate.read(folder / 'deployment.json'))
+                deployment = cloud_gate.read(folder / 'deployment.json')
+                outcome = worker.execute(folder, request, deployment)
                 cloud_gate.save(folder / 'outcome.json', outcome)
                 slot.status = int(outcome.get('status') != 'complete')
             finally:
@@ -316,15 +338,28 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
         connection.close()
 
 
+def _start_paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier, *,
+                         group: CloudGroup, coordinator_ends: tuple[LaunchBarrier, ...]) -> None:
+    # Only the coordinator keeps these ends so its exit sends EOF to each worker.
+    for end in coordinator_ends:
+        end.close()
+    paired_module(folder, directory, settings_path, connection, group=group)
+
+
 def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
     """Launch all modules after every slot and cost reservation succeeds."""
     from scripts.aws_target.aws_target import control_lock
+    started_at = time.time()
     policy = conf.read(settings_path)
     book = ledger.CostLedger(directory)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), book, settings_path, folder / 'reservation.cgroup', clock=time.time)
     requests = [cloud_gate.read(path) for path in sorted(folder.glob('*/request.json'))]
     children: list[tuple[BaseProcess, LaunchBarrier]] = []
+    workers: dict[int, tuple[str, LaunchBarrier]] = {}
+    waiting: set[int] = set()
+    launched_count = 0
+    abort_sent = False
     failed = False
     fee_path = folder / 'query-cost.json'
     query_fee = Decimal(str(cloud_gate.read(fee_path)['usd'])) if fee_path.exists() else Decimal(0)
@@ -332,20 +367,77 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         nonlocal query_fee
         query_fee += fee
         cloud_gate.save(fee_path, {'usd': str(query_fee)})
+
+    def check_workers() -> None:
+        # A worker sends no more messages after it reports ready.
+        for descriptor in wait(list(workers), timeout=0):
+            assert isinstance(descriptor, int)
+            attempt, _connection = workers[descriptor]
+            raise GateRefused(f'{attempt}: The module ended before launch')
+
+    def abort_unlaunched() -> None:
+        nonlocal abort_sent
+        if abort_sent or launched_count == len(children):
+            return
+        abort_sent = True
+        pending = children[launched_count:]
+        for process, connection in pending:
+            if process.is_alive():
+                try:
+                    connection.send('abort')
+                except (OSError, ValueError, EOFError):
+                    pass
+        if not waiting:
+            deadline = (time.monotonic() + cloud_gate.settings().number('termination_timeout_s')
+                        + 2 * cloud_gate.settings().number('api_timeout_s'))
+            for process, _connection in pending:
+                process.join(timeout=max(0, deadline - time.monotonic()))
+        for process, _connection in pending:
+            if process.is_alive():
+                process.terminate()
+
     try:
         sweep_trial_resources(folder, worker)
+        pid = os.getpid()
+        start = process_start_time(pid)
+        if start is None:
+            raise GateRefused('The trial coordinator has no live process identity')
+        context = multiprocessing.get_context('fork')
+        for request in requests:
+            attempt = ledger.text(request, 'attempt')
+            parent, child = context.Pipe()
+            coordinator_ends = tuple(connection for _, connection in children) + (parent,)
+            process = context.Process(target=_start_paired_module,
+                args=(folder / attempt, directory, settings_path, child),
+                kwargs={'group': CloudGroup(folder.name, len(requests), started_at, Owner(pid, start)),
+                        'coordinator_ends': coordinator_ends})
+            try:
+                with child:
+                    process.start()
+            except BaseException:
+                parent.close()
+                raise
+            children.append((process, parent))
+            descriptor = parent.fileno()
+            workers[descriptor] = (attempt, parent)
+            waiting.add(descriptor)
+        while waiting:
+            for descriptor in wait(list(workers)):
+                assert isinstance(descriptor, int)
+                attempt, connection = workers[descriptor]
+                if descriptor not in waiting:
+                    raise GateRefused(f'{attempt}: The module ended before launch')
+                try:
+                    if connection.recv() == 'ready':
+                        waiting.remove(descriptor)
+                        continue
+                except EOFError:
+                    pass
+                outcome = folder / attempt / 'outcome.json'
+                reason = cloud_gate.read(outcome).get('reason') if outcome.exists() else None
+                raise GateRefused(f'{attempt}: {reason or "The module exited before cloud admission"}')
+        # The lock protects the batch of cost reservations across trials.
         with control_lock(directory / 'paired-trial-slots'):
-            context = multiprocessing.get_context('fork')
-            for request in requests:
-                parent, child = context.Pipe()
-                process = context.Process(target=paired_module,
-                    args=(folder / ledger.text(request, 'attempt'), directory, settings_path, child))
-                process.start()
-                child.close()
-                children.append((process, parent))
-            for _process, connection in children:
-                if connection.recv() != 'ready':
-                    raise GateRefused('The module has no cloud slot')
             pending = [request for request in requests
                        if not (folder / ledger.text(request, 'attempt') / 'outcome.json').exists()]
             # The box lifetime starts at launch, so a queue wait does not shorten the run budget.
@@ -353,10 +445,18 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
             for request in pending:
                 request['expires'] = expires
                 cloud_gate.save(folder / ledger.text(request, 'attempt') / 'request.json', request)
-            reserve_trial(worker, pending, record_query)
+            reserve_trial(worker, pending, record_query, check_workers=check_workers)
+        check_workers()
+        try:
             for _process, connection in children:
                 connection.send('launch')
-        for process, _connection in children:
+                launched_count += 1
+        except (OSError, ValueError, EOFError) as error:
+            print('paired trial: ' + str(error), file=sys.stderr)
+            failed = True
+            with cancellation.defer_cleanup_signals():
+                abort_unlaunched()
+        for process, _connection in children[:launched_count]:
             process.join()
     except (OSError, ValueError, EOFError, GateRefused, AwsUnavailable, subprocess.SubprocessError,
             KeyboardInterrupt) as error:
@@ -364,6 +464,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         failed = True
     finally:
         with cancellation.defer_cleanup_signals():
+            abort_unlaunched()
             for process, connection in children:
                 if process.is_alive():
                     process.terminate()

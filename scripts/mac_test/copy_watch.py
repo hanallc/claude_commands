@@ -31,12 +31,13 @@ from types import FrameType
 from typing import Literal
 
 
+from scripts.build_queue import execution_identity
 from scripts.lib import process_group
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
-from scripts.direct import step_record
+from scripts.direct import runner_result, step_record
 from scripts.build_queue import placement, admission_protocol as wire
 
 
@@ -255,7 +256,7 @@ def read_mac_words(path: Path) -> MacWords | None:
     except (OSError, UnicodeDecodeError):
         return None
     macs = [line.removeprefix("mac=") for line in lines if line.startswith("mac=")]
-    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined"):
+    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined", "prelaunch_failed"):
         return None
     reason = seconds = ""
     for line in lines:
@@ -277,6 +278,8 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
         return CopyWin(words, status)
     if words.mac == "declined":
         return CopyEnded("declined", final=words.reason in FINAL_DECLINE_REASONS)
+    if words.mac == "prelaunch_failed" and runner_result.is_mac_history_refusal(status, words.reason):
+        return CopyEnded("declined", final=True)
     return CopyEnded("lost", final=False)
 
 
@@ -330,7 +333,7 @@ def release_stopped_copy(copy: RunningCopy, request: WatchRequest, repository: e
     if not isinstance(reply, wire.Assignment):
         return
     assignment = reply.assignment
-    identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+    identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
                                          assignment.episode, assignment.attempt)
     try:
         released = mac_test.release_exact_claims(claim_state.state_paths(), copy.process.pid, identity,
@@ -348,7 +351,7 @@ def release_stopped_copy(copy: RunningCopy, request: WatchRequest, repository: e
                                                  identity.claim_id, identity.episode, identity.attempt)
     try:
         _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), assignment, reference,
-            placement.ExecutionEvidenceUnavailable("the copy was stopped before its final status", time.time()),
+            execution_identity.ExecutionEvidenceUnavailable("the copy was stopped before its final status", time.time()),
             placement.AttemptDeclined("lost"), placement.DispatchPathSettled()))
     except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
         print(f"copy_watch: cannot report the stopped copy: {error}", file=sys.stderr)
@@ -556,8 +559,8 @@ class Watch:
             measured_key = treekey.tree_key(str(self.request.repo_root))
             if not isinstance(identity, process_identity.Started):
                 return False
-            source_key = (placement.SourceKeyKnown(measured_key)
-                          if measured_key is not None else placement.SourceKeyUnavailable(f"the source tree key for {self.repository.name} is unavailable"))
+            source_key = (execution_identity.SourceKeyKnown(measured_key)
+                          if measured_key is not None else execution_identity.SourceKeyUnavailable(f"the source tree key for {self.repository.name} is unavailable"))
             self.episode_number += 1
             episode = f"{self.request.call_id}-copy-{os.getpid()}-{self.episode_number}"
             argv = ("cargo", "nextest", "run", *self.request.nextest_words)

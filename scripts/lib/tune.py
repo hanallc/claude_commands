@@ -11,15 +11,13 @@ import os
 from pathlib import Path
 import platform
 import re
-import shlex
 import sys
 
-from scripts.lib import conf, conf_reads, live_settings, main_publish
-from scripts.lib.conf import Unusable, check
+from scripts.lib import conf, live_settings, main_publish
+from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
 SUBJECT = "tune("
-FORWARD_LIMIT = main_publish.CommandTimeLimit(55)
 
 
 class RequestedValueChange(argparse.Namespace):
@@ -35,35 +33,29 @@ def _one_line(name: str, value: str) -> None:
         raise main_publish.Refusal(f"{name} must be one nonempty line")
 
 
-def _forward(arguments: list[str], ssh_program: str) -> int:
-    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/tune.py" '
-               + shlex.join(arguments))
-    done = main_publish.ssh(command, ssh_program=ssh_program, host="natedev", time_limit=FORWARD_LIMIT)
-    if isinstance(done, str):
-        print(f"tune: natedev: {done}", file=sys.stderr)
-        return 1
-    print(done.stdout, end="")
-    print(done.stderr, end="", file=sys.stderr)
-    return done.returncode
-
-
 def change(args: RequestedValueChange) -> int:
     """Make the value live here and on the Mac at once; main and the Mac pull follow."""
     source = conf.path(args.file).resolve()
-    _, old = conf.editable_line(args.file, args.key)
-    check(args.file, args.key, args.value)
     checkout = main_publish.checkout_of(source)
-    if old == args.value:
+
+    def describe(old: str) -> str:
+        return (f"{SUBJECT}{args.file}): {args.key} {old} -> {args.value}\n\n"
+                + f"{args.why}\n\nUser-Approved: {args.user_words}")
+
+    saved = live_settings.stage_save(live_settings.WaitingChange(args.file, args.key, args.value, ""),
+                                     describe=describe)
+    if isinstance(saved, live_settings.UnchangedSave):
         print(f"already {args.key}={args.value}")
     else:
-        conf_reads.record(source.stem)
-        message = (f"{SUBJECT}{args.file}): {args.key} {old} -> {args.value}\n\n"
-                   + f"{args.why}\n\nUser-Approved: {args.user_words}")
-        _ = live_settings.stage(live_settings.WaitingChange(args.file, args.key, args.value, message))
         print(f"live now: {args.key}={args.value}")
+        if args.file in ("hana_aws", "build_targets", "build_folders"):
+            from scripts.aws_target import hana_render
+
+            if hana_render.affects_guest_config(args.key, source):
+                print("The Hana image is now stale. Build and register a current Hana image.")
         for line in live_settings.start_readers(args.file):
             print(line)
-        print(live_settings.write_mac(args.file, args.key, args.value))
+        print(live_settings.write_mac(args.file, args.key, args.value, order=saved.order))
     try:
         lines = live_settings.publish(checkout, wait=True) or []
     except (main_publish.Refusal, OSError) as error:
@@ -72,7 +64,7 @@ def change(args: RequestedValueChange) -> int:
               file=sys.stderr)
         return 2
     for line in lines:
-        if old != args.value or line.startswith("mac: queued"):
+        if isinstance(saved, live_settings.StagedSave) or line.startswith("mac: queued"):
             print(line)
     return 0
 
@@ -96,7 +88,7 @@ def main(arguments: list[str] | None = None) -> int:
         if re.search(r"\s#", args.value) or args.value != args.value.strip():
             raise main_publish.Refusal("value must have no whitespace comment marker or outer whitespace")
         if platform.system() == "Darwin":
-            return _forward(argv, os.environ.get("ZONE_SSH") or "ssh")
+            return main_publish.forward("lib/tune.py", argv, label="tune", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
         return change(args)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2

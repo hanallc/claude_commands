@@ -603,7 +603,7 @@ A step row has the Cargo output pair from its record, or `unknown` in both folde
 #### As-built
 
 `buildlog vault` syncs the Mac's `~/rust/hanadocs` with GitHub each hour, from natedev. A stop files one question on natedev's open-questions list and sends no phone push (user, 2026-11-05).
-- natedev pushes its `refs/remotes/origin/main` to the Mac. The Mac script (`REMOTE_PULL`) stops with `branch` off main, and stops with the conflict outcome on an open merge (`MERGE_HEAD`: the unmerged files, else the files that differ from HEAD; no abort, add or commit; the user chose this check, 2026-11-05). It then runs `git add -A`, commits once (`vault: Mac edits`) and runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main`. A conflict prints the `--diff-filter=U` files and runs `git merge --abort`. The commit and the merge retry a busy `index.lock` (`vault.lock_retries`, `vault.lock_retry_delay_s`). The `VAULT_OUTCOME=` marker gives the outcome, because Mac login can hide the exit status.
+- natedev pushes its `refs/remotes/origin/main` to the Mac. The Mac script (`REMOTE_PULL`) stops with `branch` off main, and stops with the conflict outcome on an open merge (`MERGE_HEAD`: the unmerged files, else the files that differ from HEAD; no abort, add or commit; the user chose this check, 2026-11-05). It then runs `git add -A`, commits once (`vault: Mac edits`) and runs `git merge --ff --no-edit --no-overwrite-ignore refs/remotes/origin/main` (`--ff` overrides the machines' `merge.ff=only`, so diverged branches get a merge commit). A conflict prints the `--diff-filter=U` files and runs `git merge --abort`. The commit and the merge retry a busy `index.lock` (`vault.lock_retries`, `vault.lock_retry_delay_s`). The `VAULT_OUTCOME=` marker gives the outcome, because Mac login can hide the exit status.
 - natedev fetches the Mac's main into `refs/remotes/mac/main`, then `origin main` after `ci.warm()`. It pushes a fast-forward, or a `git merge-tree --write-tree` plus `git commit-tree` merge made in the object store, to GitHub `main`. A natedev merge-tree conflict, cold credentials and a rejected push (`git push --porcelain`) are deferrals: one printed line, exit 0. The next hour's Mac merge files the conflict question.
 - `mac_git` alone applies the Mac ssh options. A nonzero exit 255, or connection text on a nonzero exit, is `MacUnreachable`; a timeout is too.
 - `PullOutcome = Pulled | Current | DeferredSync | PullStop`; `PullStop = VaultConflict | NotOnMain | MacUnreachable | VaultLocked | VaultCommandFailed`; `StopCause` is the `Literal` of `conflict`, `not_on_main`, `mac_unreachable`, `vault_locked`, `command_failed`.
@@ -1747,7 +1747,7 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 
 - `scripts/disks/disks.html`:
   - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
-  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until `measured_at` changes.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until the data's `generation` reaches the measure's target. (Phase 45 of `docs/plans/sdlc-phases.md` changed the end test from a `measured_at` change and added the refresh button.)
   - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
   - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
   - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."
@@ -1799,7 +1799,7 @@ Builds asked for verify's folder layout phase 4 (10c25b033) in this branch befor
 - `scripts/disks/sessions.py`:
   - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
   - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
-  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a bind of `/home/natepiano/session`, so the size comes from the system disk tree.
   - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
   - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
   - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.

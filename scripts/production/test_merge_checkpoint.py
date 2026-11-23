@@ -28,21 +28,32 @@ from scripts.worktree import worktrees
 from scripts.production import showrunners
 from scripts.production import production_doc
 
-from scripts.lib import main_publish, scratch
+from scripts.lib import build_folders, main_publish, scratch
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import (
+    DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
+)
+
+MAC_RECOVERY = ("{ [ ! -f scripts/lib/waiting_rows.py ] || "
+                + "scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; }")
 
 
 def setUpModule() -> None:
+    state = Path(tempfile.mkdtemp(prefix="checkpoint-zone-fixture-")).resolve()
+    unittest.addModuleCleanup(shutil.rmtree, state)
+    environment = fixture_git_environment(state)
+    for key in ("BASH_ENV", "STAFF_CONFIG"):
+        _ = environment.pop(key, None)
+    environment["ZONE_STATE"] = str(state)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     configure_test_environment()
-    state = tempfile.TemporaryDirectory()
-    unittest.addModuleCleanup(state.cleanup)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
 
 
 class CheckpointTestFolderTests(unittest.TestCase):
     def test_package_step_uses_the_manifest_name_and_package_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             checkout = Path(temporary)
             package = checkout / "scripts/aws_target/proof_crate"
             package.mkdir(parents=True)
@@ -56,7 +67,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[0].folder, package)
 
     def test_example_step_uses_the_manifest_name_and_checkout_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             checkout = Path(temporary)
             package = checkout / "crates/proof_crate"
             package.mkdir(parents=True)
@@ -72,7 +83,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
-                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory() as temporary:
+                with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
                     checkout = Path(temporary)
                     relative = ("crates/proof_crate/examples/demo.rs" if workspace
                                 else "scripts/aws_target/proof_crate/src/lib.rs")
@@ -109,22 +120,28 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
+    def test_successful_push_lists_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
-        library = Path(self.env["HOME"]) / ".claude/scripts/lib"
-        library.symlink_to(checkout / "scripts/lib", target_is_directory=True)
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
-        trees = {"landed-work": self.root / "landed-work", "dirty-work": self.root / "dirty-work"}
-        for branch, tree in trees.items():
-            made = subprocess.run(
-                ["bash", str(checkout / "scripts/worktree/make_worktree.sh"), str(tree), branch],
-                cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=20)
-            self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        workspace = self.root / "workspace"
+        build = self.root / "build"
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 f"roots.workspace={workspace}\nroots.build={build}\nroots.build.natedev={build}\n"
+                                 + "locks.probe_wait_seconds=0.05\nlocks.probe_retry_seconds=0.005\n")
+        trees = {f"{unit}-work": workspace / "origin" / unit / "work" for unit in ("landed", "dirty")}
+        for unit in ("landed", "dirty"):
+            branch = f"{unit}-work"
+            tree = trees[branch]
+            with mock.patch.dict(os.environ, self.env):
+                made = worktrees.create_checkout(
+                    tree, self.checkout, build_folders.NewWorktreeBranch(branch, "HEAD"),
+                    worktrees.output_record("origin", unit, "work"), owner=unit, merge_branch="production")
+            self.assertEqual(made, tree)
             _ = self.git("merge", "--ff-only", checkpoint, cwd=tree)
             _ = self.git("push", "-u", "origin", branch, cwd=tree)
         self.write(trees["dirty-work"], "src/alpha.txt", "uncommitted work\n")
@@ -139,23 +156,24 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("push: ok", result.stdout)
         self.assertEqual(self.git("rev-parse", "refs/remotes/origin/other-production"), retained)
-        self.assertIn("worktrees: ended", result.stdout)
-        self.assertIn(str(trees["landed-work"]), result.stdout)
         self.assertIn("worktrees: kept", result.stdout)
+        self.assertIn(f"{trees['landed-work']}: the checkout landed and requires manual review", result.stdout)
         self.assertIn(str(trees["dirty-work"]), result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"),
                          self.git("rev-parse", "refs/heads/production", cwd=self.origin))
         tree_listing = self.git("worktree", "list", "--porcelain")
-        self.assertNotIn(f"worktree {trees['landed-work']}\n", tree_listing + "\n")
-        self.assertNotIn(trees["landed-work"].name, [path.name for path in self.root.iterdir()])
+        self.assertIn(f"worktree {trees['landed-work']}\n", tree_listing + "\n")
+        self.assertTrue(trees["landed-work"].is_dir())
+        self.assertTrue((build / "origin/landed/work").is_dir())
+        self.assertTrue((build / "origin/dirty/work").is_dir())
         for folder in (self.checkout, self.origin):
             branches = self.git("for-each-ref", "--format=%(refname)", "refs/heads", cwd=folder).splitlines()
-            self.assertNotIn("refs/heads/landed-work", branches)
+            self.assertIn("refs/heads/landed-work", branches)
             self.assertIn("refs/heads/dirty-work", branches)
         remaining = [cast(dict[str, object], json.loads(path.read_text()))
                      for path in (records / "made").glob("*.json")]
-        self.assertEqual([(row["path"], row["branch"]) for row in remaining],
-                         [(str(trees["dirty-work"]), "dirty-work")])
+        self.assertEqual({(row["path"], row["branch"]) for row in remaining},
+                         {(str(tree), branch) for branch, tree in trees.items()})
         self.assertEqual((trees["dirty-work"] / "src/alpha.txt").read_text(), "uncommitted work\n")
 
     def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
@@ -167,10 +185,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
     def test_checkpoint_refuses_another_staff_parent_without_changes_on_retry(self) -> None:
         checkpoint = self.checkpoint()
+        receiving_checkout = self.root / "receiving"
+        _ = self.git("init", "-b", "main", str(receiving_checkout), cwd=self.root)
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             parent = recorded_showrunner("receiving", self.root / "receiving-production.md")
             unit = unit_membership("example", "alpha")
-            _ = staff.move(unit.id, staff.ReportsTo(parent.id))
+            moved = staff.move(unit.id, staff.ReportsTo(parent.id))
+            _ = staff.set_worktree(moved.id, staff.PresentWorktree(local_machine(), receiving_checkout),
+                                   expected=moved.worktree)
         before = self.git("show-ref"), self.git("status", "--porcelain")
         origin = self.git("show-ref", cwd=self.origin)
         document = self.doc.read_bytes()
@@ -179,8 +201,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             with self.subTest(attempt=attempt):
                 result = self.run_checkpoint(checkpoint).process
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("alpha: staff parent is", result.stdout)
-                self.assertIn("receiving", result.stdout)
+                self.assertIn("alpha: staff parent is receiving; use that production", result.stdout)
                 self.assertEqual((self.git("show-ref"), self.git("status", "--porcelain")), before)
                 self.assertEqual(self.git("show-ref", cwd=self.origin), origin)
                 self.assertEqual(self.doc.read_bytes(), document)
@@ -257,7 +278,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             for outcome in ("green", "red", "conflict", "resume", "moving-green", "moving-red"):
@@ -362,12 +383,163 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), origin_tip)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_staff_parent_authorizes_a_checkpoint_in_the_units_repository(self) -> None:
+        for outcome in ("parent commit", "wrong branch", "test policy", "push", "promotion", "overlap", "batch"):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                parent = self.root / "cargo-liner"
+                parent_origin = self.root / "cargo-liner.git"
+                parent_doc = self.root / "cargo-liner-production.md"
+                parent.mkdir()
+                _ = self.git("init", "--bare", str(parent_origin), cwd=self.root)
+                _ = self.git("init", "-b", "production", cwd=parent)
+                _ = self.git("commit", "--allow-empty", "-m", "Parent repository", cwd=parent)
+                _ = self.git("remote", "add", "origin", str(parent_origin), cwd=parent)
+                _ = self.git("push", "origin", "production", "production:main", cwd=parent)
+                foreign_commit = self.git("rev-parse", "HEAD", cwd=parent)
+                destination = self.root / "sdlc-checkout"
+                repo_branch = "sdlc-merge"
+                _ = self.git("worktree", "add", "-b", repo_branch, str(destination), "production")
+                _ = self.git("push", "-u", "origin", repo_branch, cwd=destination)
+                destination_before = self.git("rev-parse", "HEAD", cwd=destination)
+                doc = self.doc.read_text()
+                repo_text = doc.replace(f"Showrunner checkout:** `{self.checkout}`",
+                                        f"Showrunner checkout:** `{destination}`")
+                repo_text = repo_text.replace("Merge branch:** `production`", f"Merge branch:** `{repo_branch}`")
+                parent_text = doc.replace(str(self.checkout), str(parent))
+                if outcome == "wrong branch":
+                    _ = self.git("checkout", "-b", "wrong-branch", cwd=destination)
+                if outcome == "test policy":
+                    parent_text = parent_text.replace("`checkpoint-test`", "`checkpoint-test parent-policy`")
+                    repo_text = repo_text.replace("`checkpoint-test`", "`checkpoint-test repo-policy`")
+                    repo_text += "- **Known flakes:** `proof`\n- **Known flaky tests:** `fixture_flake`\n"
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+if "-E" not in args:
+    print("    FAIL [  0.1s] (1/1) proof fixture_flake")
+    raise SystemExit(1)
+''')
+                    _ = (self.state / "fail-once-test-proof").touch()
+                    checkpoint = self.checkpoint("crates/proof/Cargo.toml",
+                                                 '[package]\nname = "proof"\nversion = "0.1.0"\n')
+                elif outcome in ("promotion", "batch"):
+                    checkpoint = self.checkpoint(subject="alpha work\n\n"
+                                                 + "Change-Review: Alpha result | Read | Proof | image 012345abcdef")
+                else:
+                    checkpoint = self.checkpoint()
+                if outcome == "push":
+                    parent_text = parent_text.replace("Push:** git", "Push:** validate_and_push")
+                if outcome in ("promotion", "batch"):
+                    parent_install = self.root / "parent-installed"
+                    _ = self.git("clone", "-b", "main", str(parent_origin), str(parent_install), cwd=self.root)
+                    parent_text += f"- **Promote:** {parent_install}\n"
+                    repo_text += f"- **Promote:** {self.promote}\n"
+                    review_dir = Path(self.env["HOME"]) / "rust/hanadocs/change-review"
+                    parent_text += f"- **Change review:** `{review_dir / 'change-review - cargo-liner.md'}`\n"
+                    if outcome == "promotion":
+                        repo_text += f"- **Change review:** `{review_dir / 'change-review - sdlc.md'}`\n"
+                _ = self.doc.write_text(repo_text)
+                _ = parent_doc.write_text(parent_text)
+                parent_row = recorded_showrunner("cargo-liner", parent_doc)
+                _ = staff.rename(showrunners.owner_for("example").id, "sdlc")
+                alpha = unit_membership("sdlc", "alpha")
+                _ = staff.move(alpha.id, staff.ReportsTo(parent_row.id))
+                if outcome == "overlap":
+                    foreign_worktree = self.root / "foreign-beta"
+                    _ = self.git("worktree", "add", "-b", "beta-branch", str(foreign_worktree), cwd=parent)
+                    self.write(foreign_worktree, ".unit.toml",
+                               'plan = "docs/plans/beta.md"\nresponsibilities = []\n')
+                    self.write(foreign_worktree, "src/alpha.txt", "an unrelated change\n")
+                    beta = unit_membership("sdlc", "beta")
+                    _ = staff.set_worktree(beta.id, staff.PresentWorktree(local_machine(), foreign_worktree),
+                                           expected=beta.worktree)
+                    same_repo = unit_membership("sdlc", "same-repo")
+                    _ = staff.set_worktree(same_repo.id, staff.PresentWorktree(local_machine(), self.other),
+                                           expected=same_repo.worktree)
+                    self.write(self.other, "src/alpha.txt", "a change in the destination repo\n")
+
+                if outcome == "parent commit":
+                    result = self.run_checkpoint(foreign_commit, "--production", "sdlc")
+                    self.assert_stopped_before_merge(result, "failed", f"commit {foreign_commit} is absent")
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=destination), destination_before)
+                    continue
+                if outcome == "batch":
+                    self.write(self.other, "src/beta.txt", "local batch item\n")
+                    _ = self.git("add", "src/beta.txt", cwd=self.other)
+                    _ = self.git("commit", "-m", "beta work", cwd=self.other)
+                    _ = self.git("push", "origin", "beta-branch", cwd=self.other)
+                    beta_tip = self.git("rev-parse", "HEAD", cwd=self.other)
+                    flags = ("--started", STARTED, "--review-trial", TRIAL, "--delivers", DELIVERS)
+                    batch = self.root / "batch.txt"
+                    _ = batch.write_text(shlex.join(["beta", "2", beta_tip, *flags]) + "\n"
+                                         + shlex.join(["alpha", "2", checkpoint, *flags]) + "\n")
+                    result = self.invoke(["--production", "sdlc", "--batch", str(batch)])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    landed = self.git("rev-parse", repo_branch, cwd=self.origin)
+                    self.assertEqual(self.git("rev-parse", f"{landed}^2", cwd=self.origin), checkpoint)
+                    self.assertEqual(self.git("rev-parse", f"{landed}^1^2", cwd=self.origin), beta_tip)
+                    self.assertIn("beta phase 2", (destination / "production.log").read_text())
+                    self.assertIn("alpha phase 2", (parent / "production.log").read_text())
+                    review_dir = Path(self.env["HOME"]) / "rust/hanadocs/change-review"
+                    self.assertIn("Alpha result", (review_dir / "change-review - cargo-liner.md").read_text())
+                    continue
+                result = self.run_checkpoint(checkpoint, "--production", "sdlc")
+                if outcome == "wrong branch":
+                    self.assert_stopped_before_merge(result, "failed", f"on wrong-branch, expected {repo_branch}")
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=destination), destination_before)
+                    continue
+                self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                if outcome == "push":
+                    self.assertEqual(self.events("validate_and_push.sh"), [])
+                landed = self.git("rev-parse", repo_branch, cwd=self.origin)
+                self.assertEqual(self.git("rev-parse", f"{landed}^2", cwd=self.origin), checkpoint)
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=destination), landed)
+                self.assertEqual(self.git("rev-parse", "HEAD"), destination_before)
+                self.assertEqual(self.git("rev-parse", "production", cwd=parent_origin), foreign_commit)
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=parent), foreign_commit)
+                parent_log = (parent / "production.log").read_text()
+                self.assertIn(landed, parent_log)
+                self.assertFalse((destination / "production.log").exists())
+                if outcome == "test policy":
+                    self.assertEqual(self.events("checkpoint-test"),
+                                     [["repo-policy"], ["repo-policy", "-E", "test(=fixture_flake)"]])
+                    self.assertIn("known flake proof", parent_log)
+                    self.assertIn("known flaky tests fixture_flake", parent_log)
+                if outcome == "promotion":
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.promote), landed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), landed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=parent_origin), foreign_commit)
+                    review_dir = Path(self.env["HOME"]) / "rust/hanadocs/change-review"
+                    self.assertIn("Alpha result", (review_dir / "change-review - cargo-liner.md").read_text())
+                    self.assertFalse((review_dir / "change-review - sdlc.md").exists())
+                if outcome == "overlap":
+                    self.assertNotIn("beta:", result.process.stdout)
+                    self.assertIn("other units: ok — same-repo: src/alpha.txt", result.process.stdout)
+
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
-        for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref"):
+        rust_file = "src/alpha.rs"
+        validation_failures = {
+            "validation": ("rustfmt", f"error: expected a closing delimiter\n --> {rust_file}:2:5"),
+            "validation rollback": ("rustfmt", f"error: formatter failed\n --> {rust_file}:2:5"),
+            "long diagnostic": ("rustfmt", "error: " + "unexpected closing delimiter in this block; " * 12
+                                + f"\n --> {rust_file}:2:5"),
+            "rustfmt missing module": ("rustfmt", "Error writing files: failed to resolve mod `alpha`: "
+                                       + f"{self.checkout / rust_file} does not exist"),
+            "cargo-mend warning": ("cargo-mend", f"warning: unused variable\n --> {rust_file}:2:5"),
+            "git fatal": ("direct push to production", "fatal: the remote end hung up unexpectedly"),
+            "branch moved": ("direct push to production", "merge branch moved during validation"),
+        }
+        for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref", *validation_failures):
             with self.subTest(failure=failure):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
+                if failure == "rustfmt missing module":
+                    self.write(self.checkout, rust_file, "fn work() {}\n")
+                    _ = self.git("add", rust_file)
+                    _ = self.git("commit", "-m", "Add alpha module")
+                    _ = self.git("merge", "--ff-only", self.git("rev-parse", "HEAD"), cwd=self.unit)
                 self.write(self.checkout, "local-only.txt", "local commit must survive\n")
                 _ = self.git("add", "local-only.txt")
                 _ = self.git("commit", "-m", "local merge branch work not on origin")
@@ -375,7 +547,16 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                 remote = self.git("rev-parse", "origin/production")
                 self.assertNotEqual(before, remote)
                 main = self.push_main_change("main-only.txt", "independent main work\n")
-                checkpoint = self.checkpoint()
+                step, diagnostic = validation_failures.get(failure, ("", ""))
+                validation = f"!!! VALIDATION FAILED at step: {step} !!!" if step and not step.startswith("direct push") else ""
+                progress = "still waiting for memory (47 min): place 8 in line"
+                if failure == "rustfmt missing module":
+                    _ = self.git("rm", rust_file, cwd=self.unit)
+                    _ = self.git("commit", "-m", "Remove alpha module", cwd=self.unit)
+                    checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
+                    _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                else:
+                    checkpoint = self.checkpoint(rust_file if step else "src/alpha.txt")
                 if failure in ("rollback-fetch", "rollback-ref"):
                     _ = self.git("merge", "--no-ff", "-m", "Merge checkpoint", checkpoint)
                     self.assertNotEqual(self.git("rev-parse", "HEAD"), before)
@@ -408,6 +589,18 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                     hook = self.origin / "hooks/pre-receive"
                     _ = hook.write_text("#!/bin/sh\nexit 1\n")
                     hook.chmod(0o755)
+                elif step:
+                    self.push = "validate_and_push"
+                    self.production_doc()
+                    formatter_edit = (f"Path({rust_file!r}).write_text('partial formatter edit\\n')\n"
+                                      if failure == "validation rollback" else "")
+                    self.executable(self.bin / "validate_and_push.sh", STUB + f"""
+print("=== STEP: {step} ===", flush=True)
+{formatter_edit}print({diagnostic!r}, flush=True)
+print({validation!r}, flush=True)
+print({progress!r}, file=sys.stderr, flush=True)
+raise SystemExit(1)
+""")
                 else:
                     real_git = shutil.which("git")
                     self.executable(self.bin / "checkpoint-test", STUB + '''
@@ -428,13 +621,41 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 result = self.run_checkpoint(checkpoint)
                 self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
                 self.assertIn("push: failed", result.process.stdout)
+                if step:
+                    push_log = self.root / "scratch" / f"merge_{checkpoint[:7]}_push.log"
+                    summary = (f"Error writing files: failed to resolve mod `alpha`: {rust_file} does not exist"
+                               if failure == "rustfmt missing module" else diagnostic.splitlines()[0])
+                    cause = " ".join(part for part in (validation, summary) if part)
+                    if failure == "long diagnostic":
+                        stop = result.process.stdout[result.process.stdout.index("push: failed — "):].splitlines()[0]
+                        self.assertTrue(stop.startswith(f"push: failed — {validation} error: unexpected closing"), stop)
+                        self.assertTrue(stop.endswith(f" — log {push_log}"), stop)
+                        self.assertNotIn(summary, stop)
+                    else:
+                        self.assertIn(f"push: failed — {cause} — log {push_log}",
+                                      result.process.stdout)
+                    self.assertNotIn(progress, result.process.stdout)
+                    notices = [line for line in result.process.stdout.splitlines() if line.startswith("send ")]
+                    if failure in ("validation rollback", "git fatal", "branch moved"):
+                        self.assertEqual(notices, ["send alpha: the showrunner will inspect the failed command"])
+                    else:
+                        self.assertEqual(notices, [f"send alpha: repair the push failure in {rust_file} "
+                                                   + "and send a new checkpoint"])
+                    self.assertIn(f"=== STEP: {step} ===\n{diagnostic}\n{validation}\n{progress}\n",
+                                  push_log.read_text())
+                    if failure == "validation rollback":
+                        self.assertIn("rollback failed", result.process.stdout)
+                        self.assertIn("not uptodate", result.process.stdout)
+                        self.assertEqual((self.checkout / rust_file).read_text(), "partial formatter edit\n")
+                        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, "HEAD"), "")
                 if failure == "final-fetch":
                     self.assertIn("test: ok", result.process.stdout)
                     self.assertIn("fixture final fetch failed", result.process.stdout)
                     tested_tip = (self.state / "tested-tip").read_text()
                     self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tested_tip), "")
                     self.assertEqual(self.git("merge-base", "--is-ancestor", main, tested_tip), "")
-                self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                if failure != "validation rollback":
+                    self.assertEqual(self.git("rev-parse", "HEAD"), before)
                 self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
                 self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
                 self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
@@ -454,14 +675,35 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         return doc
 
     def test_scope_leaves_out_another_productions_paths(self) -> None:
-        doc = self.import_production_paths()
-        sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
-        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            accepted = self.run_checkpoint(sha)
-        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
-        self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
+        for outcome in ("clean", "validation fails in imported file"):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                doc = self.import_production_paths()
+                sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
+                if outcome != "clean":
+                    self.push = "validate_and_push"
+                    self.production_doc()
+                    self.executable(self.bin / "validate_and_push.sh", STUB + """
+print("=== STEP: taplo ===")
+print("error: invalid TOML")
+print("  ┌─ outside/imported.txt:2:5")
+print("!!! VALIDATION FAILED at step: taplo !!!")
+raise SystemExit(1)
+""")
+                with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+                    result = self.run_checkpoint(sha).process
+                self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", result.stdout)
+                if outcome == "clean":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+                    self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("error: invalid TOML", result.stdout)
+                    notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                    self.assertEqual(notices, ["send alpha: the showrunner will inspect the failed command"])
 
     def test_scope_keeps_imported_path_changed_by_unit(self) -> None:
         doc = self.import_production_paths()
@@ -550,6 +792,21 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         unpushed = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(unpushed, "held", "origin")
         self.assertIn("push", unpushed.process.stdout)
+
+        with self.subTest(checkpoint="stale unit clone"):
+            clone = self.root / "stale-alpha"
+            _ = self.git("clone", "--no-local", "-b", "alpha-branch", str(self.origin), str(clone))
+            _ = shutil.copyfile(self.unit / ".unit.toml", clone / ".unit.toml")
+            _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+            self.assertNotEqual(merge_checkpoint.git(clone, "cat-file", "-e", f"{sha}^{{commit}}").returncode, 0)
+            self.assertEqual(self.git("rev-parse", "--verify", f"{sha}^{{commit}}"), sha)
+            unit = unit_membership("example", "alpha")
+            _ = staff.set_worktree(unit.id, staff.PresentWorktree(local_machine(), clone), expected=unit.worktree)
+            landed = self.run_checkpoint(sha).process
+            self.assertEqual(landed.returncode, 0, landed.stdout + landed.stderr)
+            self.assertIn("is on origin/alpha-branch", landed.stdout)
+            self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), sha)
+
     def test_never_pushed_unit_branch_is_held_like_an_unpushed_checkpoint(self) -> None:
         sha = self.checkpoint(push=False)
         unpushed = self.run_checkpoint(sha)
@@ -690,7 +947,7 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
         self.assertIn("send alpha: the showrunner will inspect the failed command", result.process.stdout)
-    def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
+    def test_a_code_checkpoint_keeps_its_phases_scratch_folders(self) -> None:
         plan = self.root / "scratch-plan.md"
         _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
         with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
@@ -698,8 +955,9 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
             later = scratch.new("phase:alpha/3")
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha/2: ", result.process.stdout)
-        self.assertFalse(any(path.exists() for path in done))
+        for path in done:
+            self.assertIn(f"kept for a manual removal list: {path} (scratch, task phase:alpha/2 ended)", result.process.stderr)
+            self.assertTrue(path.is_dir())
         self.assertTrue(later.is_dir())
 
     def test_a_code_checkpoint_reports_retained_scratch_folders(self) -> None:
@@ -711,8 +969,7 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         _ = (folder / "work").write_text("keep this work")
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn(f"kept {folder}:", result.process.stdout)
-        self.assertIn("uncommitted changes", result.process.stdout)
+        self.assertIn(f"kept for a manual removal list: {folder} (scratch, task phase:alpha/2 ended)", result.process.stderr)
         self.assertEqual((folder / "work").read_text(), "keep this work")
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
         self.production_doc(merge_tests_line=REAL_MERGE_TESTS)
@@ -800,6 +1057,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         review = self.events("review_regime.py")
         self.assertEqual(len(review), 1)
+        self.assertIn("--checkpoint", review[0])
+        self.assertEqual(review[0][review[0].index("--checkpoint") + 1], sha)
         for flag, value in (("--ux-findings", "2"), ("--code-findings", "3"),
                             ("--review-minutes", "14"), ("--ux-check-minutes", "4"),
                             ("--ux-repair-minutes", "1")):
@@ -807,6 +1066,25 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertNotIn("--simplify-findings", review[0])
         self.assertNotIn("--simplify-minutes", review[0])
         self.assertNotIn("--note", review[0])
+
+    def test_a_checkpoint_merge_adds_a_review_row_beside_an_older_row(self) -> None:
+        self.env["MERGE_CHECKPOINT_REVIEW_REGIME"] = str(Path(__file__).with_name("review_regime.py"))
+        ledger = Path(self.env["HOME"]) / ".claude/data/review_regime.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        old = {"unit": "alpha", "plan": "docs/plans/alpha.md", "phase": "2", "regime": "after",
+               "started": STARTED, "merged": STARTED, "holds": 0, "merge_defects": 0}
+        before = json.dumps(old) + "\n"
+        _ = ledger.write_text(before)
+
+        sha = self.checkpoint()
+        result = self.run_checkpoint(sha)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("record: ok — review ledger and production log updated\n", result.process.stdout)
+        saved = ledger.read_text()
+        self.assertTrue(saved.startswith(before))
+        added = cast(dict[str, object], json.loads(saved[len(before):]))
+        self.assertEqual(added["checkpoint"], sha)
 
     def test_a_failed_repair_review_add_keeps_the_first_log_until_a_retry_succeeds(self) -> None:
         first = self.run_checkpoint(self.checkpoint())
@@ -874,12 +1152,12 @@ class MacPromotionPathTests(unittest.TestCase):
 
     def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
         remote = self.remote_command("mac `~/.claude`")
-        self.assertTrue(remote.startswith('cd "$HOME"/.claude && tip=$(git ls-remote'), remote)
+        self.assertTrue(remote.startswith(f'cd "$HOME"/.claude && {MAC_RECOVERY} && tip=$(git ls-remote'), remote)
         self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
 
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
-        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && tip=$(git ls-remote"), remote)
+        self.assertTrue(remote.startswith(f"cd '/Users/someone/my repo' && {MAC_RECOVERY} && tip=$(git ls-remote"), remote)
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
@@ -889,7 +1167,7 @@ class MacPromotionPathTests(unittest.TestCase):
                  ("pulled with zone", 0, "rc=0\n", "Zone changed", main_publish.MacPulled),
                  ("offline with zone", 255, "", "Zone changed", main_publish.MacPullPending))
         for label, code, output, text, expected in cases:
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as folder:
                 state = Path(folder)
                 ssh = state / "ssh"
                 _ = ssh.write_text(f"#!{sys.executable}\nimport sys\n"
@@ -930,7 +1208,7 @@ class MacPromotionPathTests(unittest.TestCase):
         from scripts.lib import zone
 
         for text in ("", "Zone changed"):
-            with self.subTest(custom_checkout=True, text=text), tempfile.TemporaryDirectory() as folder:
+            with self.subTest(custom_checkout=True, text=text), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as folder:
                 state = Path(folder)
                 ssh = state / "ssh"
                 _ = ssh.write_text(f"#!{sys.executable}\n" + '''import json
@@ -967,7 +1245,7 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
                     commands = [cast(list[str], json.loads(line))[-1]
                                 for line in (state / "ssh.log").read_text().splitlines()[before_drain:]]
                     for mac, source in targets:
-                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && tip=$(git ls-remote" in command
+                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && {MAC_RECOVERY} && tip=$(git ls-remote" in command
                                             and f"natedev:{source} main" in command for command in commands), commands)
                     if text:
                         self.assertTrue(any("broadcast.py" in command and text in command for command in commands), commands)

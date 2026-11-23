@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from scripts.lib.transcripts import open_transcript, transcript_paths
@@ -419,10 +420,11 @@ def _newest_unit_plans() -> dict[str, str]:
         return {}
     for path in paths:
         try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[0]
+            with path.open("rb") as log:
+                first_line = log.readline().decode("utf-8")
             value = cast(object, json.loads(first_line))
             modified = path.stat().st_mtime
-        except (OSError, UnicodeError, ValueError, TypeError, IndexError):
+        except (OSError, ValueError):
             continue
         if not isinstance(value, dict):
             continue
@@ -570,6 +572,8 @@ def _host(
         clients = herdr.attached_clients(place.session)
         return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
                 "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        return {"kind": "unknown"}
     desktop: Desktop = {"kind": "not in snapshot"}
     return _terminal_host(session.get("pid", 0), desktop)
 
@@ -588,15 +592,27 @@ def _git(cwd: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def _checkout(cwd: str) -> CheckoutState:
-    if not cwd:
-        return {"kind": "not a checkout"}
-    root = _git(cwd, "rev-parse", "--show-toplevel")
+@dataclass(frozen=True)
+class _CheckoutIdentity:
+    work_tree: str
+    git_dir: str
+
+
+def _checkout_identity(cwd: str) -> _CheckoutIdentity | NotACheckout:
+    if cwd:
+        result = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir")
+        if result is not None and result.returncode == 0:
+            work_tree, separator, git_dir = result.stdout.removesuffix("\n").partition("\n/")
+            if separator and work_tree:
+                return _CheckoutIdentity(work_tree, "/" + git_dir)
+    return {"kind": "not a checkout"}
+
+
+def _checkout(cwd: str, identity: _CheckoutIdentity) -> CheckoutState:
     branch = _git(cwd, "branch", "--show-current")
     head = _git(cwd, "rev-parse", "HEAD")
-    if any(result is None or result.returncode != 0 for result in (root, branch, head)):
+    if branch is None or branch.returncode or head is None or head.returncode:
         return {"kind": "not a checkout"}
-    assert root is not None and branch is not None and head is not None
     ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
@@ -612,7 +628,7 @@ def _checkout(cwd: str) -> CheckoutState:
     ]
     return {
         "kind": "git",
-        "path": root.stdout.strip(),
+        "path": identity.work_tree,
         "head": (
             {"kind": "branch", "name": branch.stdout.strip()}
             if branch.stdout.strip()
@@ -621,6 +637,30 @@ def _checkout(cwd: str) -> CheckoutState:
         "upstream": upstream,
         "dirty": dirty,
     }
+
+
+def _checkouts(folders: Sequence[str]) -> dict[str, CheckoutState]:
+    if not folders:
+        return {}
+    from_session_folder = any(name in os.environ for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE",
+    ))
+    if len(folders) == 1:
+        folder = folders[0]
+        identity = _checkout_identity(folder)
+        return {folder: _checkout(folder if from_session_folder else identity.work_tree, identity)
+                if isinstance(identity, _CheckoutIdentity) else identity}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        identities = dict(zip(folders, pool.map(_checkout_identity, folders), strict=True))
+        read_folders: dict[_CheckoutIdentity, str] = {}
+        for folder, identity in identities.items():
+            if isinstance(identity, _CheckoutIdentity):
+                _ = read_folders.setdefault(identity, folder if from_session_folder else identity.work_tree)
+        checkouts = dict(zip(read_folders, pool.map(_checkout, read_folders.values(), read_folders), strict=True))
+    return {folder: checkouts[identity] if isinstance(identity, _CheckoutIdentity) else identity
+            for folder, identity in identities.items()}
 
 
 _LAST_STEP_BYTES = 262_144
@@ -845,8 +885,6 @@ def listing(login: str | None = None) -> list[ListedSession]:
 
 def all_live_accounts() -> list[Inventory]:
     """Read current restore details for every locally attributed Claude login."""
-    from concurrent.futures import ThreadPoolExecutor
-
     logins = sorted({item.login for item in listing()})
     if not logins:
         return []
@@ -865,7 +903,6 @@ def inventory(
     home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     membership = staff.snapshot()
-    units = _unit_sessions(membership)
     retired = frozenset(str(identity) for row in membership.rows if isinstance(row.worktree, staff.RemovedWorktree)
                         for identity in (row.id, row.current_session))
     session_ids = {
@@ -888,6 +925,7 @@ def inventory(
         isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
         for _, entry in candidates
     )
+    units = _unit_sessions(membership) if has_sessions else {}
     plans = _newest_unit_plans() if has_sessions else {}
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []
@@ -903,6 +941,13 @@ def inventory(
         found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
             host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
             environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
+
+    folders = list(dict.fromkeys(session["cwd"] for session in found if isinstance(session["cwd"], str)))
+    checkouts = _checkouts(folders)
+    for session in found:
+        folder = session["cwd"]
+        if isinstance(folder, str):
+            session["checkout"] = checkouts[folder]
 
     return {
         "machine": _machine(),
@@ -930,7 +975,4 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         common.update(production=entry.production, doc=entry.doc)
     elif entry.kind == "worker":
         common["owner"] = worker_owner
-    session = parse_session(common, "observed session")
-    folder = session["cwd"]
-    session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
-    return session
+    return parse_session(common, "observed session")

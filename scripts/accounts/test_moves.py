@@ -17,6 +17,7 @@ from typing import Literal, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, moves, pane_moves, role_map, worker_names
 from scripts.herdr import herdr, worker_panes
 from scripts.lib.atomic_file import write_text_atomic
@@ -123,7 +124,7 @@ class MoveJournalTests(unittest.TestCase):
             tool="claude" if tool == "claude" else "codex", subject=subject, move_id="transition-1")
 
     def requested(self) -> moves.RequestedMove:
-        return {**self.common(), "kind": "requested", "from": "codex1", "to": "codex2",
+        return {**self.common(), "kind": "requested", "scope": "group", "from": "codex1", "to": "codex2",
             "why": "quota refusal", "window": "unknown", "cause": "refusal"}
 
     def test_replay_evidence_excludes_failed_requests_and_includes_scheduled_claude_routes(self) -> None:
@@ -239,7 +240,7 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(route["why"], "refusal")
 
     def test_every_transition_kind_round_trips_without_losing_its_semantics(self) -> None:
-        entries: list[moves.MoveEntry] = [
+        entries: list[moves.MoveWriteEntry] = [
             self.requested(),
             moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", worker="worker-a"),
             moves.ConfirmedMove(**self.common(tool="claude", subject="conversation: unit"),
@@ -720,6 +721,7 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
         create_claude_account("claude1", "claude@example.invalid")
+        write_claude_move_credentials(accounts.account_dir("claude1"))
         notes = note_file.notes_dir()
         _ = (notes / note_file.note_name("codex1")).write_text("---\nlogin: codex@example.invalid\n---\n")
         binary = self.root / "bin"

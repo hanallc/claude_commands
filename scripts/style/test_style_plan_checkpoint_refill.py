@@ -18,8 +18,10 @@ from unittest import mock
 
 
 from scripts.style import style_plan
+from scripts.agents import detached_runs
 from scripts.direct import progress_history
 from scripts.direct.assign_launcher_test_support import AssignLauncherFixture, invoke_assignment
+from scripts.herdr import pass_notices
 from scripts.style import style_ledger
 from scripts.whoami import quota_state
 
@@ -65,10 +67,8 @@ class StylePlanTests(StylePlanFixture):
                         ticket, proposal_ledger.pinned_rule_texts(ticket_id), case.plan, case.plan_header())
                 need = ("Record each reserved, unmerged or dirty file that the finding needs outside this ticket. Use "
                         + "`style_ledger.py held need --repo . --finding <finding id> --path <file>`.")
-                yielded = ("When a finding's file, or a file its change edits, is reserved, unmerged or dirty, "
-                           + "yield the finding's file with "
-                           + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: "
-                           + "its findings stay filed for a later ticket, and the gate skips them.")
+                yielded = ("Yield each finding that needs a reserved, unmerged or dirty file. Use "
+                           + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --finding <finding id>`.")
                 self.assertIn(need, prompt)
                 self.assertIn(yielded, prompt)
                 self.assertLess(prompt.index(need), prompt.index(yielded))
@@ -334,6 +334,57 @@ class TicketWorkerTests(AssignLauncherFixture):
             "Write your summary after the last result arrives.",
         ):
             self.assertIn(sentence, prompt.read_text())
+
+    def test_restore_starts_a_new_turn_after_a_failed_notice(self) -> None:
+        plan = self.project / "plan.md"
+        _ = plan.write_text("# Standing plan\n\n## Phases\n\n"
+                            + "### Phase 7 — 7 · status: todo\nEdit the assigned source.\n\n"
+                            + "### Phase 8 — 8 · status: todo\nEdit the other source.\n")
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "8")
+        original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        record_file = self.session_dir / "progress_history_state.json"
+        slot = "style-ticket-7"
+
+        def ticket_pass() -> dict[str, object]:
+            state = cast(dict[str, dict[str, dict[str, object]]], json.loads(record_file.read_text()))
+            return state["pass"][slot]
+
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["bash", str(style_plan.SCRIPTS / "direct/assign.sh")]:
+                return invoke_assignment(args[2:], os.environ.copy())
+            return original(args, **kwargs)
+
+        def restore(ticket: str) -> None:
+            style_plan.restore_ticket_worker(self.session_dir, self.project, plan, ticket, ("src/worker.py",))
+
+        with mock.patch.object(subprocess, "run", side_effect=command):
+            restore("7")
+            restore("8")
+            self.assertEqual(self.turn_starts, 2)
+            instance = str(ticket_pass()["instance_id"])
+            progress_history.complete_dispatch(self.session_dir, slot, instance, status="error")
+            self.native.agent.notice_failures = 1
+            restore("7")
+            self.assertEqual(self.native.agent.notice_failures, 1)
+            self.assertEqual(self.turn_starts, 3)
+            self.assertEqual(self.native.agent.notices, [])
+            successor = ticket_pass()
+            self.assertNotEqual(successor["instance_id"], instance)
+            self.assertEqual(successor["status"], "active")
+            self.assertIn(f"DONE {successor['instance_id']}", self.turn_inputs[-1])
+
+            _ = detached_runs.reap_orphans(str(self.session_dir))
+            self.assertEqual(self.native.agent.notice_failures, 0)
+            self.assertFalse(pass_notices.is_settled(self.session_dir, instance, "done"))
+            _ = detached_runs.reap_orphans(str(self.session_dir))
+            notice, = self.native.agent.notices
+            self.assertIn(f"; pass {instance}", notice)
+            self.assertTrue(pass_notices.is_settled(self.session_dir, instance, "done"))
+
+            restore("7")
+            self.assertEqual(self.turn_starts, 3)
+            self.assertEqual(ticket_pass()["instance_id"], successor["instance_id"])
+            self.assertEqual(self.native.agent.notices, [notice])
 
     def test_refill_in_no_worker_mode_starts_no_worker(self) -> None:
         plan = self.project / "plan.md"

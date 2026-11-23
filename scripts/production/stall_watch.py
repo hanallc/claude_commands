@@ -35,6 +35,10 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
+from scripts.build_targets.target_config import pinned_target_names
+from scripts.build_targets.targets import (
+    ConfigError, Held, LocalTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
+)
 from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
@@ -62,9 +66,15 @@ PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / 
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
+WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
+BUILD_HOLD_WAIT = re.compile(
+    r"\bwait(?:s|ing)?\s+(?:for|on)\s+(?:\w+(?:[.-]\w+)*\s+){0,3}"
+    + r"hold\s+(?:releases?|ends|to\s+(?:end|lift))\b",
+    re.IGNORECASE,
+)
 TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*)$",
                       re.MULTILINE)
 # A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
@@ -136,6 +146,7 @@ class PaneInspection(NamedTuple):
     peers: tuple[str, ...]
     name: str
     unit: unit_lookup.LabeledSession
+    claude: unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning
     row: staff.StaffRow
 
 
@@ -330,7 +341,8 @@ def process_session(pid: int) -> str:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return ""
-        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment
+                      if item.startswith((b"CODEX_THREAD_ID=", b"CLAUDE_CODE_SESSION_ID=")))
     return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
@@ -645,7 +657,7 @@ def prompt_alert_seconds() -> float:
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
-    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    defaults = WATCH_DEFAULTS
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}
@@ -693,6 +705,46 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
         raise ValueError("external_wait_pattern must capture a nonempty owner")
     owner = owner.strip()
     return names_outside(owner, fields["external_owner_pattern"].strip(), peers, own_names, at_start=True)
+
+
+class BuildHolds(NamedTuple):
+    configured_targets: frozenset[str]
+    held_targets: frozenset[str]
+    local_hold_live: bool = False
+
+    def status_waits_on_hold(self, status: str) -> bool:
+        any_hold = self.local_hold_live or bool(self.held_targets)
+        if not any_hold or BUILD_HOLD_WAIT.search(status) is None:
+            return False
+        named = {target for target in self.configured_targets if name_spans(status, target)}
+        return not named or bool(named & self.held_targets)
+
+
+def read_build_holds() -> BuildHolds:
+    local_hold_live = False
+    for state in local_hold_states():
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: local build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            local_hold_live = True
+    try:
+        configuration = tunables.read("build_targets")
+        targets = read_targets(configuration=configuration)
+        pinned = pinned_target_names(configuration)
+    except ConfigError as error:
+        print(f"stall-watch: build targets unreadable: {error}", file=sys.stderr)
+        return BuildHolds(frozenset(), frozenset(), local_hold_live)
+    held_targets = {target.name for target in targets if isinstance(target, LocalTarget) and local_hold_live}
+    for target in targets:
+        if isinstance(target, LocalTarget) or target.platform != "macos":
+            continue
+        state = ssh_target_state(target)
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: {target.name}: build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            held_targets.add(target.name)
+    known_targets = frozenset(target.name for target in targets).union(pinned)
+    return BuildHolds(known_targets, frozenset(held_targets), local_hold_live)
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
@@ -1361,8 +1413,20 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             try:
                 production_name = configured["name"]
-                marked = sessions.status_units(production_name)
-                for name, unit in marked.items():
+                for name in sessions.status_units(production_name):
+                    match sessions.checked_unit(production_name, name):
+                        case unit_lookup.UnknownUnit(reason=reason):
+                            print(f"stall-watch: {name}: {reason}", file=sys.stderr)
+                            continue
+                        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                                claude=unit_lookup.LiveClaude() as claude) as unit):
+                            pass
+                        case unit_lookup.ProvedAbsentUnit(pane=unit_lookup.LabeledSession(
+                                claude=unit_lookup.ClaudeNotRunning() as claude,
+                                empty=herdr.ObservedEmpty()) as unit):
+                            pass
+                        case _:
+                            continue
                     if isinstance(unit.identity, session_staff.NoSession):
                         raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
                     row = unit_lookup.unit_row(name, record, reference=unit.identity)
@@ -1374,7 +1438,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                     peers = (*showrunner_names,
                              *(sibling_name for sibling_id, sibling_name in sibling_names_by_parent[row.parent].items()
                                if sibling_id != row.id), configured["session"], production_name)
-                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, row))
+                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, claude, row))
             except (OSError, UnicodeError, ValueError) as error:
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
@@ -1383,7 +1447,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    for production_name, configured, zone, peers, name, unit, row in inspection_order(work):
+    build_holds = read_build_holds() if work else BuildHolds(frozenset(), frozenset())
+    for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
@@ -1403,12 +1468,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if (retire := forget(watch)) is not None:
                 pending.append(retire)
             continue
-        claude = unit.claude
         if not isinstance(claude, unit_lookup.LiveClaude):
-            if isinstance(claude, unit_lookup.ClaudeUnknown):
-                print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
-            # A prompt is not on screen without its Claude.
-            elif (retire := end_prompt(watch)) is not None:
+            if (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             continue
         observed_at = time.time()
@@ -1512,7 +1573,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
             try:
                 deferred = bool(turn) and status_defers_bump(last, peers, own_names)
-                holding = turn is not None and turn.group("kind") == HOLDING_KIND and holding_names_outside(last, peers, own_names)
+                holding = (turn is not None and turn.group("kind") == HOLDING_KIND
+                           and (holding_names_outside(last, peers, own_names)
+                                or build_holds.status_waits_on_hold(last)))
             except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
                 print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
                 continue
@@ -1549,12 +1612,13 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
             report.decision = "holding" if holding else "idle already bumped"
-            if not holding and not stretch["bump_sent"]:
+            if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
-                        "Continue your run; if you are waiting on someone, say on whom in one line.")
+                        + "Continue your run. If you wait for someone, name that person in your status line. "
+                        + "Do not reply to stall-watch.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not holding and not stretch["tell_sent"] and showrunner_socket:
+            if not holding and socket and not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)

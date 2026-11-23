@@ -42,14 +42,6 @@
       ]
     },
     {
-      "root": "scripts/model_study",
-      "extraPaths": [
-        ".",
-        "scripts/model_study",
-        "scripts/lib"
-      ]
-    },
-    {
       "root": "scripts/hooks",
       "extraPaths": [
         ".",
@@ -105,14 +97,6 @@
         "scripts/agents",
         "scripts/lib",
         "scripts/herdr"
-      ]
-    },
-    {
-      "root": "scripts/banned_word_analysis",
-      "extraPaths": [
-        ".",
-        "scripts/banned_word_analysis",
-        "scripts/hooks"
       ]
     },
     {

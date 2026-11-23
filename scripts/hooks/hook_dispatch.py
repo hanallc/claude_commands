@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an event's Python hooks in registration order in one interpreter.
+"""Run an event's Python hooks in registration order in forked children.
 
 Claude runs separate matching hooks in parallel without a documented order.
 This dispatcher deliberately uses settings order. Exit 2 wins, discards stdout,
@@ -23,14 +23,13 @@ Error messages retain the hook's whole stripped stderr (including traceback),
 or "exit N" when stderr is blank. A timeout discards all output and decisions.
 With no JSON and no errors, stdout stays empty.
 
-Execution uses importlib's bytecode cache with a fresh __main__ module because
-compiling the largest hooks exceeds 2 ms. Streams (including stdin.buffer), file
-descriptors, argv, environment, cwd and signal handlers are isolated.
-Alarm calls inside a hook are multiplexed with its outer deadline, so a hook's
-own SIGALRM handler and shorter budget work without cancelling our timeout.
-The outer timeout in settings.json covers the largest sum of matching hook budgets
-plus 30 seconds of overhead, preserving every sequential hook's full budget.
-Imported library modules remain cached, which is the intended startup saving.
+Each child inherits the dispatcher's imports. The copy policy child uses its
+loaded entry point. Other children load their hooks as fresh __main__ modules
+through importlib's bytecode cache. Each child's streams, file descriptors,
+argv, environment, cwd and signals are isolated from later hooks.
+The parent enforces the hook deadline independently of alarms in the child.
+The settings.json timeout covers the largest sum of matching hook budgets
+plus 30 seconds of overhead.
 """
 from __future__ import annotations
 try:
@@ -38,25 +37,27 @@ try:
 except FileNotFoundError:
     pass
 
+import gc
 import importlib.util
 import io
 import json
-import math
 import os
 import re
+import selectors
 import signal
+import socket
 import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Iterable, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
-from typing import NoReturn, TypedDict, cast
+from typing import BinaryIO, NoReturn, TextIO, TypedDict, cast
 
 DISPATCH_OVERHEAD_SECONDS = 30
+HOOK_SETUP_SECONDS = DISPATCH_OVERHEAD_SECONDS / 3
 
 
 @dataclass(frozen=True)
@@ -107,19 +108,18 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-context-usage.py", None),
-    HookSpec("post-tool-use-banned-words.py", None),
     HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
     HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
     HookSpec("compaction-marker-clear.py", None, 10),
     HookSpec("stop-conversation-pause.py", None),
-    HookSpec("stop-assistant-prose-banned-words.py", None),
     HookSpec("stop-context-deferral.py", None, 10),
     HookSpec("herdr_tab_title.py", None),
 )
 EVENTS = {"pre_tool_use": PRE_TOOL_USE, "post_tool_use": POST_TOOL_USE, "stop": STOP}
 HOOKS = Path(__file__).resolve().parent
+COPY_POLICY_PATH = (HOOKS / CopyPolicyHook.filename).resolve()
 
 
 class ToolEventPayload(TypedDict, total=False):
@@ -151,91 +151,15 @@ HookOutput = TypedDict("HookOutput", {
 }, total=False)
 
 
-class HookTimedOut(BaseException):
-    """An outer deadline must bypass a hook's fail-open Exception handlers."""
-
-
-AlarmHandler = Callable[[int, FrameType | None], object] | int | None
-
-
-@contextmanager
-def _alarm_budget(timeout: float) -> Generator[None]:
-    """Virtualize hook alarms while retaining a non-cancellable outer deadline."""
-    real_signal, real_getsignal = signal.signal, signal.getsignal
-    real_setitimer, real_getitimer, real_alarm = signal.setitimer, signal.getitimer, signal.alarm
-    saved_handler = real_getsignal(signal.SIGALRM)
-    saved_timer = real_setitimer(signal.ITIMER_REAL, 0)
-    started = time.monotonic()
-    deadline = started + timeout
-    hook_handler: AlarmHandler = signal.SIG_DFL
-    hook_alarm = 0.0
-    hook_interval = 0.0
-
-    def remaining() -> tuple[float, float]:
-        return (max(0.0, hook_alarm - time.monotonic()) if hook_alarm else 0.0, hook_interval)
-
-    def arm() -> None:
-        next_alarm = min(deadline, hook_alarm) if hook_alarm else deadline
-        _ = real_setitimer(signal.ITIMER_REAL, max(0.000001, next_alarm - time.monotonic()))
-
-    def delivered(signum: int, frame: FrameType | None) -> None:
-        nonlocal hook_alarm
-        if time.monotonic() >= deadline:
-            raise HookTimedOut()
-        hook_alarm = time.monotonic() + hook_interval if hook_interval else 0.0
-        arm()
-        if callable(hook_handler):
-            _ = hook_handler(signum, frame)
-        elif hook_handler == signal.SIG_DFL:
-            raise SystemExit(128 + signum)
-
-    def install(signum: int, handler: AlarmHandler) -> AlarmHandler:
-        nonlocal hook_handler
-        if signum != signal.SIGALRM:
-            return real_signal(signum, handler)
-        previous, hook_handler = hook_handler, handler
-        return previous
-
-    def handler_for(signum: int) -> AlarmHandler:
-        return hook_handler if signum == signal.SIGALRM else real_getsignal(signum)
-
-    def set_timer(which: int, seconds: float, interval: float = 0.0) -> tuple[float, float]:
-        nonlocal hook_alarm, hook_interval
-        if which != signal.ITIMER_REAL:
-            return real_setitimer(which, seconds, interval)
-        if seconds < 0 or interval < 0:
-            return real_setitimer(which, seconds, interval)
-        previous = remaining()
-        hook_alarm = time.monotonic() + seconds if seconds else 0.0
-        hook_interval = interval
-        arm()
-        return previous
-
-    def get_timer(which: int) -> tuple[float, float]:
-        return remaining() if which == signal.ITIMER_REAL else real_getitimer(which)
-
-    def alarm(seconds: int) -> int:
-        if seconds < 0:
-            raise ValueError("alarm length must be non-negative")
-        return math.ceil(set_timer(signal.ITIMER_REAL, seconds)[0])
-
-    _ = real_signal(signal.SIGALRM, delivered)
-    signal.signal, signal.getsignal = install, handler_for
-    signal.setitimer, signal.getitimer, signal.alarm = set_timer, get_timer, alarm
-    try:
-        arm()
-        yield
-    finally:
-        _ = real_setitimer(signal.ITIMER_REAL, 0)
-        signal.signal, signal.getsignal = real_signal, real_getsignal
-        signal.setitimer, signal.getitimer, signal.alarm = real_setitimer, real_getitimer, real_alarm
-        _ = real_signal(signal.SIGALRM, saved_handler)
-        if saved_timer[0]:
-            _ = real_setitimer(signal.ITIMER_REAL,
-                              max(0.000001, saved_timer[0] - (time.monotonic() - started)), saved_timer[1])
+class HookDeadlineExpired(Exception):
+    """The parent did not receive the hook result within its budget."""
 
 
 def _execute(path: Path) -> None:
+    if path == COPY_POLICY_PATH:
+        from scripts.copies.copy_guard import main as copy_policy_main
+        copy_policy_main()
+        return
     specification = importlib.util.spec_from_file_location("__main__", path)
     if specification is None or specification.loader is None:
         raise ImportError(f"cannot load hook: {path}")
@@ -248,103 +172,120 @@ def _execute(path: Path) -> None:
         sys.modules["__main__"] = previous
 
 
-def _try_cleanup(action: Callable[[], object]) -> None:
-    """A broken hook resource must not prevent restoration of other resources."""
-    try:
-        _ = action()
-    except Exception:
-        pass
+def _exception_status(error: BaseException, stderr: TextIO) -> int:
+    if isinstance(error, SystemExit):
+        if error.code is None:
+            return 0
+        if isinstance(error.code, int):
+            return error.code
+        print(error.code, file=stderr)
+    else:
+        traceback.print_exc(file=stderr)
+    return 1
 
 
-def _signal_handlers() -> dict[int, AlarmHandler]:
-    handlers: dict[int, AlarmHandler] = {}
-    for signum in signal.valid_signals():
-        if signum in (signal.SIGKILL, signal.SIGSTOP):
-            continue
-        try:
-            handlers[signum] = signal.getsignal(signum)
-        except (OSError, ValueError):
-            continue
-    return handlers
-
-
-def _restore_handlers(handlers: dict[int, AlarmHandler]) -> None:
-    for signum, handler in handlers.items():
-        try:
-            _ = signal.signal(signum, handler)
-        except (OSError, ValueError, TypeError):
-            continue
-
-
-def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 600) -> HookResult:
-    """Execute a script, retaining output only if it completes within budget."""
-    path = path.resolve()
-    streams = sys.stdin, sys.stdout, sys.stderr
-    argv, environment = sys.argv, os.environ
-    original_environment = dict(environment)
-    handlers = _signal_handlers()
-    cwd = os.open(".", os.O_RDONLY)
+def _capture_hook(path: Path, payload: str, prepare: Callable[[], None]) -> HookResult:
     exit_code = 0
-    timed_out = False
-    _try_cleanup(streams[1].flush)
-    _try_cleanup(streams[2].flush)
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr, \
             io.TextIOWrapper(io.BytesIO(payload.encode("utf-8")), encoding="utf-8") as stdin:
-        descriptors = os.dup(1), os.dup(2)
-        # Hooks own these duplicate streams. Closing one flushes its output but
-        # leaves our capture file open for traceback reporting and reading.
+        # A hook can close its streams. Keep the capture files open to read the result.
         hook_stdout = os.fdopen(os.dup(stdout.fileno()), "w", encoding="utf-8", errors="replace")
         hook_stderr = os.fdopen(os.dup(stderr.fileno()), "w", encoding="utf-8", errors="replace")
+        _ = os.dup2(stdout.fileno(), 1)
+        _ = os.dup2(stderr.fileno(), 2)
+        sys.stdin, sys.stdout, sys.stderr = stdin, hook_stdout, hook_stderr
+        sys.argv = [str(path)]
         try:
-            _ = os.dup2(stdout.fileno(), 1)
-            _ = os.dup2(stderr.fileno(), 2)
-            sys.stdin, sys.stdout, sys.stderr = stdin, hook_stdout, hook_stderr
-            sys.argv = [str(path)]
-            try:
-                with _alarm_budget(timeout() if callable(timeout) else timeout):
-                    _execute(path)
-            except HookTimedOut:
-                timed_out = True
-            except SystemExit as error:
-                if error.code is None:
-                    exit_code = 0
-                elif isinstance(error.code, int):
-                    exit_code = error.code
-                else:
-                    exit_code = 1
-                    print(error.code, file=stderr)
-            except BaseException:
-                exit_code = 1
-                traceback.print_exc(file=stderr)
+            prepare()
+            _execute(path)
+        except BaseException as error:
+            exit_code = _exception_status(error, stderr)
         finally:
-            try:
-                _try_cleanup(hook_stdout.flush)
-                _try_cleanup(hook_stderr.flush)
-                _try_cleanup(hook_stdout.close)
-                _try_cleanup(hook_stderr.close)
-                _try_cleanup(stdout.flush)
-                _try_cleanup(stderr.flush)
-                sys.argv = argv
-                os.environ = environment
-                _try_cleanup(environment.clear)
-                _try_cleanup(lambda: environment.update(original_environment))
-                _try_cleanup(lambda: os.fchdir(cwd))
-                _try_cleanup(lambda: os.close(cwd))
-                _restore_handlers(handlers)
-            finally:
-                sys.stdin, sys.stdout, sys.stderr = streams
-                for descriptor, saved in zip((1, 2), descriptors):
-                    try:
-                        _ = os.dup2(saved, descriptor)
-                    except OSError:
-                        pass
-                    finally:
-                        _try_cleanup(lambda: os.close(saved))
+            for stream in (hook_stdout, hook_stderr):
+                with suppress(Exception):
+                    stream.close()
         _ = stdout.seek(0)
         _ = stderr.seek(0)
-        return HookResult(path.name, 0, "", "") if timed_out else HookResult(
-            path.name, exit_code, stdout.read(), stderr.read())
+        return HookResult(path.name, exit_code, stdout.read(), stderr.read())
+
+
+def _write_frame(output: BinaryIO, value: object) -> None:
+    _ = output.write(json.dumps(value).encode("ascii") + b"\n")
+    output.flush()
+
+
+def _report_hook(path: Path, payload: str, output: BinaryIO,
+                 timeout: float | Callable[[], float], setup_deadline: float) -> NoReturn:
+    def prepare() -> None:
+        if callable(timeout):
+            try:
+                seconds = timeout()
+            except BaseException:
+                _write_frame(output, setup_deadline)
+                raise
+            _write_frame(output, time.monotonic() + seconds)
+
+    try:
+        result = _capture_hook(path, payload, prepare)
+        _write_frame(output, [result.exit_code, result.stdout, result.stderr])
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+
+
+def _read_hook_report(descriptor: int, deadline: float, pending: bytearray) -> bytearray:
+    end = pending.find(b"\n")
+    with selectors.DefaultSelector() as selector:
+        _ = selector.register(descriptor, selectors.EVENT_READ)
+        while end < 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise HookDeadlineExpired()
+            block = os.read(descriptor, 65536)
+            if not block:
+                return bytearray()
+            end = block.find(b"\n")
+            if end >= 0:
+                end += len(pending)
+            pending.extend(block)
+    report = pending[:end]
+    del pending[:end + 1]
+    return report
+
+
+def run_hook(path: Path, payload: str, timeout: float | Callable[[], float] = 600) -> HookResult:
+    """Execute a child and keep its report if it arrives within the budget."""
+    path = path.resolve()
+    deadline = time.monotonic() + (HOOK_SETUP_SECONDS if callable(timeout) else timeout)
+    reader, writer = os.pipe()
+    with os.fdopen(reader, "rb") as input_pipe, os.fdopen(writer, "wb") as output_pipe:
+        pid = os.fork()
+        if pid == 0:
+            input_pipe.close()
+            _report_hook(path, payload, output_pipe, timeout, deadline)
+        report = bytearray()
+        try:
+            output_pipe.close()
+            pending = bytearray()
+            if callable(timeout):
+                budget = _read_hook_report(reader, deadline, pending)
+                if budget:
+                    report = _read_hook_report(reader, cast(float, json.loads(budget)), pending)
+            else:
+                report = _read_hook_report(reader, deadline, pending)
+        except HookDeadlineExpired:
+            return HookResult(path.name, 0, "", "")
+        finally:
+            if not report:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+    if report:
+        code, stdout, stderr = cast(tuple[int, str, str], json.loads(report))
+        return HookResult(path.name, code, stdout, stderr)
+    code = os.waitstatus_to_exitcode(status)
+    return HookResult(path.name, 128 - code if code < 0 else code, "", "")
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -470,6 +411,108 @@ def combine_results(event: str, results: Sequence[HookResult]) -> DispatchResult
     return DispatchResult(0, json.dumps(merged) if merged else "", "\n".join(debug))
 
 
+def _shared_dependencies(hooks: Sequence[HookSpec | CopyPolicyHook]) -> list[str]:
+    filenames = {hook.filename for hook in hooks}
+    modules: list[str] = []
+    if CopyPolicyHook.filename in filenames:
+        modules.extend(("scripts.copies.copy_guard", "scripts.copies.copies"))
+    if filenames >= {"pre-tool-use-change-review-gate.py", "pre-tool-use-push-alone.py"}:
+        modules.append("scripts.hooks.checkpoint_gate")
+    if filenames >= {"stop-context-deferral.py", "herdr_tab_title.py"}:
+        modules.append("scripts.lib.conf")
+    if filenames >= {"stop-conversation-pause.py", "herdr_tab_title.py"}:
+        modules.extend(("scripts.lib.script_prompts", "scripts.production.staff"))
+    return modules
+
+
+def _preload_shared_dependencies(modules: Sequence[str]) -> None:
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for module in modules:
+            # The hook still handles its normal import if preloading fails.
+            with suppress(Exception):
+                _ = importlib.import_module(module)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+@contextmanager
+def _freeze_parent_heap() -> Generator[None]:
+    """Keep child garbage collection from copying pages it inherits."""
+    freeze_here = gc.get_freeze_count() == 0
+    if freeze_here:
+        gc.freeze()
+    try:
+        yield
+    finally:
+        if freeze_here:
+            gc.unfreeze()
+
+
+def _run_hooks(event: str, hooks: Iterable[HookSpec | CopyPolicyHook], payload: str) -> DispatchResult:
+    with _freeze_parent_heap():
+        results: list[HookResult] = []
+        for spec in hooks:
+            timeout = (lambda spec=spec: spec.timeout) if isinstance(spec, CopyPolicyHook) else spec.timeout
+            results.append(run_hook(HOOKS / spec.filename, payload, timeout))
+    return combine_results(event, results)
+
+
+def _approved_hooks(hooks: Sequence[HookSpec | CopyPolicyHook],
+                    control: socket.socket) -> Generator[HookSpec | CopyPolicyHook]:
+    control.setblocking(False)
+    for spec in hooks:
+        # The dispatcher sends no data after approval. EOF means it exited.
+        try:
+            _ = control.recv(1)
+        except BlockingIOError:
+            yield spec
+        else:
+            return
+
+
+def _preloaded_dispatch(event: str, hooks: Sequence[HookSpec | CopyPolicyHook],
+                        payload: str, modules: Sequence[str]) -> DispatchResult:
+    deadline = time.monotonic() + HOOK_SETUP_SECONDS
+    parent, child = socket.socketpair()
+    with parent, child, tempfile.TemporaryFile() as report:
+        pid = os.fork()
+        if pid == 0:
+            parent.close()
+            try:
+                _preload_shared_dependencies(modules)
+                child.sendall(b"1")
+                # Wait for permission before a hook can change state.
+                if child.recv(1):
+                    result = _run_hooks(event, _approved_hooks(hooks, child), payload)
+                    _write_frame(report, [result.exit_code, result.stdout, result.stderr])
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        child.close()
+        accepted = False
+        try:
+            parent.settimeout(max(0, deadline - time.monotonic()))
+            if parent.recv(1) and time.monotonic() < deadline:
+                accepted = parent.send(b"1") == 1
+        except OSError:
+            pass
+        finally:
+            if not accepted:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+        if accepted:
+            if status:
+                return DispatchResult(1, "", "hook dispatcher worker failed")
+            _ = report.seek(0)
+            code, stdout, stderr = cast(tuple[int, str, str], json.load(report))
+            return DispatchResult(code, stdout, stderr)
+    return _run_hooks(event, hooks, payload)
+
+
 def main() -> NoReturn:
     if len(sys.argv) != 2 or sys.argv[1] not in EVENTS:
         print("usage: hook_dispatch.py <pre_tool_use|post_tool_use|stop>", file=sys.stderr)
@@ -481,9 +524,9 @@ def main() -> NoReturn:
         tool_name = cast(ToolEventPayload, cast(object, parsed)).get("tool_name", "") if isinstance(parsed, dict) else ""
     except ValueError:
         tool_name = ""
-    results = [run_hook(HOOKS / spec.filename, payload, lambda: spec.timeout) for spec in EVENTS[event]
-               if spec.matcher is None or re.fullmatch(spec.matcher, tool_name)]
-    result = combine_results(event, results)
+    hooks = [spec for spec in EVENTS[event] if spec.matcher is None or re.fullmatch(spec.matcher, tool_name)]
+    modules = _shared_dependencies(hooks)
+    result = _preloaded_dispatch(event, hooks, payload, modules) if modules else _run_hooks(event, hooks, payload)
     if result.stdout:
         print(result.stdout)
     if result.stderr:

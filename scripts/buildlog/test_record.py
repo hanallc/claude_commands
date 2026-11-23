@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from dataclasses import replace
 from contextlib import closing
 import gzip
 import io
@@ -13,6 +14,7 @@ import re
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,9 +30,11 @@ from typing import BinaryIO, ClassVar, cast, override
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.shell_test_support import shell_function, shell_functions
 
+from scripts.aws_target import hana_result
+from scripts.aws_target.test_hana_result import command_result
 from scripts.buildlog import record as recorder
 from scripts.buildlog import step_context
-from scripts.buildlog import index
+from scripts.buildlog import index, parse
 from scripts.buildlog import report, sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
@@ -38,11 +42,12 @@ from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_count
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -166,7 +171,7 @@ class RecordTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
             name: value
-            for name, value in os.environ.items()
+            for name, value in memory_gate_shell_environment().items()
             if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
@@ -236,6 +241,63 @@ class RecordTests(unittest.TestCase):
         for path in sorted(self.root.glob("*/*.jsonl")):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
+
+    def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        handoff = self.base / "nextest.log"
+        _ = handoff.write_text(output)
+        local = self.step(0, "0", str(handoff), "", NEXTEST)
+        value = replace(command_result(), argv=tuple(NEXTEST), stdout=b"output with no newline", stderr=output.encode())
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        remote, = [row for row in self.records() if row.get("attempt_role") == "remote"]
+
+        with closing(sqlite3.connect(":memory:")) as database:
+            index.create_schema(database)
+            for row in (local, remote):
+                with self.subTest(host=row["host"]):
+                    self.assertEqual(row["observed_tests"], {
+                        "by_binary": {"hana::bin/hana": ["tests::fast"]}, "complete": True,
+                    })
+                    self.assertEqual(row["tests"], [])
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana::bin/hana", "tests::fast"): index.NextestGpuClass.NO_GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.NO_GPU)
+            self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
+
+    def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana tests::forged\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
+                                     (["--status-level", "none"], {}), (["--status-level=slow"], {}),
+                                     (["--show-progress=only"], {}), ([], {"NEXTEST_STATUS_LEVEL": "retry"})):
+            with self.subTest(options=options, environment=environment):
+                handoff = self.base / "nextest.log"
+                _ = handoff.write_text(output)
+                row = self.step(0, "0", str(handoff), "", [*NEXTEST, *options], environment)
+                self.assertEqual(row["observed_tests"], {"by_binary": {}, "complete": False})
+                with closing(sqlite3.connect(":memory:")) as database:
+                    index.create_schema(database)
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana", "tests::forged"): index.NextestGpuClass.GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.UNKNOWN)
+
+    def test_hana_parse_failure_still_publishes_the_step_result(self) -> None:
+        value = command_result(status=101)
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        with mock.patch.object(parse, "log_facts", side_effect=ValueError("invalid capture")):
+            self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        row, = self.records()
+        self.assertEqual(row["status"], 101)
+        self.assertNotIn("observed_tests", row)
 
     def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
         reservation = "sampled-reservation"
@@ -577,6 +639,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
 '''
         completion, refresh = command.split('export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"', 2)[1:]
         environment = self.environment(HOME=str(home), BUILDLOG_RECORD=str(SCRIPT),
+            BUILD_HELPER_ROOT=str(launcher.parent.parent),
             BUILDLOG_SCOPE="0", PY=sys.executable, HOLD_WAIT_DIR=str(hold),
             TEST_FIRST_FOLDER=str(self.repo / "first"), TEST_CHANGED_FOLDER=str(self.repo / "changed"),
             TEST_METADATA=json.dumps({"workspace_root": str(self.repo),
@@ -896,25 +959,25 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         meminfo = self.base / "meminfo-fifo"
         os.mkfifo(meminfo)
         opened = threading.Event()
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
 
-        def bounded_fifo_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def bounded_fifo_read(path: Path) -> bytes:
             if path != meminfo:
-                return read_text(path, encoding=encoding, errors=errors)
+                return read_bytes(path)
             descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 opened.set()
                 if not select.select([descriptor], [], [], 5)[0]:
                     raise TimeoutError("the meminfo FIFO received no sample within 5 seconds")
-                value = os.read(descriptor, 4096).decode()
+                value = os.read(descriptor, 4096)
                 sample_path = self.base / "fifo-sample"
-                _ = sample_path.write_text(value)
+                _ = sample_path.write_bytes(value)
                 self.admission.readings.host_path = sample_path
                 return value
             finally:
                 os.close(descriptor)
 
-        _ = self.enterContext(mock.patch.object(Path, "read_text", autospec=True, side_effect=bounded_fifo_read))
+        _ = self.enterContext(mock.patch.object(Path, "read_bytes", autospec=True, side_effect=bounded_fifo_read))
         command = 'source "$1"; SECONDS=0; printf "ready\\n"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
         process = subprocess.Popen(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
@@ -1376,11 +1439,12 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual([record[key] for key in ("repo_path", "worktree", "branch", "sha")], [None] * 4)
 
     def test_call_record_fields(self) -> None:
+        session = staff.caller_identity() or "session-1"
         board = {"UNIT_TEAM_ROLE": "impl2", "UNIT_RUN_DIR": "/x/boards/run-7/"}
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": "session-1", **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
@@ -1403,7 +1467,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             "branch": "main",
             "worker": "impl2",
             "unit_session": "run-7",
-            "session": "session-1",
+            "session": session,
             "backfilled": False,
         }
         self.assertEqual({key: record[key] for key in expected}, expected)

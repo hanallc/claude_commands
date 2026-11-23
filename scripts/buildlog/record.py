@@ -59,12 +59,13 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
+from scripts.build_queue import execution_identity
 from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
@@ -80,7 +81,7 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture, store, step_context
+from scripts.buildlog import cgroup_capture, parse, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
     MANIFEST_IDENTITY_PREFIX,
@@ -526,8 +527,6 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    from scripts.buildlog import parse
-
     words = ["rustc"]
     chosen = parse.toolchain(argv)
     if chosen:
@@ -606,8 +605,9 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
     return f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
 
 
-def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
-    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+def keep_log(source: bytes | Path, host: str, epoch: float, record_id: str) -> str:
+    """Keep a log from its bytes, or from a file that is copied in parts."""
+    return _keep_compressed(source, _log_relative_path(host, epoch, record_id))
 
 
 def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
@@ -615,8 +615,9 @@ def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
     return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
 
 
-def _keep_compressed(data: bytes, relative: str) -> str:
+def _keep_compressed(source: bytes | Path, relative: str) -> str:
     import gzip
+    import shutil
 
     target = store.root() / relative
     if target.is_file():
@@ -627,7 +628,11 @@ def _keep_compressed(data: bytes, relative: str) -> str:
     try:
         with partial.open("wb") as handle:
             with gzip.GzipFile(fileobj=handle, mode="wb") as compressed:
-                _ = compressed.write(data)
+                if isinstance(source, Path):
+                    with source.open("rb") as data:
+                        shutil.copyfileobj(data, compressed)
+                else:
+                    _ = compressed.write(source)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(partial, target)
@@ -699,8 +704,6 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    from scripts.buildlog import parse
-
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
         raise ValueError("test-phase sampling context is not an object")
@@ -939,6 +942,7 @@ class HanaStepContext:
     repo_identity: str
     cwd: str
     target_dir: str
+    environment: Mapping[str, str] = field(default_factory=dict[str, str])
 
 
 def placement_step_fields() -> dict[str, object]:
@@ -973,7 +977,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     except FileNotFoundError:
         return {}
     from scripts.aws_target import hana_result
-    from scripts.build_queue import admission_protocol as wire, admission_wire, placement
+    from scripts.build_queue import admission_protocol as wire, admission_wire
 
     row = hana_result.object_fields(cast(object, json.loads(content)))
     if type(row.get('version')) is not int or row['version'] != 1:
@@ -990,7 +994,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     return {'step_link': json.dumps([link.call_id, link.episode], separators=(',', ':')),
             'placement_episode': assignment.episode, 'placement_attempt': assignment.attempt,
             'attempt_role': 'fallback', 'is_final_result': True,
-            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, placement.SourceKeyKnown) else {})}
+            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, execution_identity.SourceKeyKnown) else {})}
 
 
 def _publish_hana_step(row: dict[str, object], output: bytes) -> PublishedStep:
@@ -1025,22 +1029,32 @@ def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalSte
             'call_id': link.call_id, **hana_result.linked_step_fields(key, link, 'remote', final)}
 
 
+def captured_log_facts(step: str, source: str, argv: Sequence[str], environment: Mapping[str, str],
+                       *streams: bytes) -> parse.LogFacts:
+    try:
+        trust = step != "nextest" or parse.nextest_status_is_trusted(argv, environment)
+        return parse.log_facts(step, *(stream.decode("utf-8", "replace") for stream in streams),
+                               trust_nextest_status=trust)
+    except Exception:  # noqa: BLE001 -- a parser failure must preserve the step result
+        store.note_error(f"parse {step} {source}")
+        return parse.no_facts()
+
+
 def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_result.LogicalStepLink,
                         context: HanaStepContext) -> PublishedStep:
     """Publish only a result accepted under the execution journal lock."""
-    from scripts.buildlog import parse
     from scripts.aws_target import hana_result
 
     result = accepted.result
-    output = result.stdout + result.stderr
     row = _hana_step_row(result.key, link, context, result.host, result.started_at, result.finished_at,
                          result.status, True)
     row.update({'argv': list(result.argv), 'source_key': result.source_key, 'source_commit': result.commit,
                 'sha': result.commit[:12], 'toolchain_identity': result.toolchain,
                 'duration_s': result.execution_seconds,
                 'peak_mem_bytes': result.memory.bytes if isinstance(result.memory, hana_result.MeasuredPeak) else None,
-                **parse.log_facts(context.step, output.decode('utf-8', 'replace'))})
-    return _publish_hana_step(row, output)
+                **captured_log_facts(context.step, str(row['id']), result.argv, context.environment,
+                                     result.stdout, result.stderr)})
+    return _publish_hana_step(row, result.stdout + result.stderr)
 
 
 def publish_hana_loss(key: hana_result.HanaAttemptKey, link: hana_result.LogicalStepLink,
@@ -1071,7 +1085,6 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 def step(args: list[str]) -> None:
     import hashlib
-    from scripts.buildlog import parse
     from scripts.buildlog import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
@@ -1125,10 +1138,7 @@ def step(args: list[str]) -> None:
         log: str | None = None
         if not tty and held and os.path.isfile(held):
             data = Path(held).read_bytes()
-            try:
-                facts = parse.log_facts(name, data.decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
-                store.note_error(f"parse {name} {held}")
+            facts = captured_log_facts(name, held, argv, os.environ, data)
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
         output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")
@@ -1433,6 +1443,81 @@ def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "folder": folder, "bytes_freed": bytes_freed, "extent": extent, "cause": cause,
     })
+
+
+class HandMadeFile(TypedDict):
+    """A file that the model check read, with its sha256 at the check and at run start."""
+    path: str
+    sha256_check: str
+    sha256_run: str | None
+
+
+class HandMadeFields(TypedDict):
+    """What hand_made.py knows about one attempt. Each time is UTC ISO 8601, or None when not reached.
+
+    The row, not the exit code, tells a refusal from a program exit: a program can exit with any code.
+    A refusal has a refusal text and no status; a program exit has a status.
+    """
+    why: str
+    argv: list[str]
+    cwd: str
+    machines: list[str]
+    machine: str | None
+    files: list[HandMadeFile]
+    verdict: Literal["yes", "no"] | None
+    reason: str | None
+    refusal: str | None
+    status: int | None
+    check_model: str
+    check_effort: str
+    check_account: str | None
+    check_started_at: str | None
+    check_ended_at: str | None
+    placed_at: str | None
+    sha_checked_at: str | None
+    run_started_at: str | None
+    run_ended_at: str | None
+    # Each machine that failed before the run, in order; the run went back to the other named machines.
+    failed_machines: list[str]
+    queue_wait_s: float | None
+    log: str | None
+    step: str
+    test_width: int | None
+    peak_mem_bytes: int | None
+
+
+def caller_account() -> str | None:
+    """The account folder name of the calling session, when it has one."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CODEX_HOME")
+    return Path(folder).name if folder else None
+
+
+def hand_made(record_id: str, started: float, fields: HandMadeFields, *, tree_start: str | None) -> None:
+    """Append one hand made attempt; this adds where, when, for whom and the checkout facts.
+
+    The checkout is not trusted, so its git facts and tree key run no program that it names. tree_start
+    must come from treekey.tree_key with checkout_programs=False.
+    """
+    from scripts.buildlog import treekey
+
+    host = store.host_name()
+    directory = fields["cwd"]
+    record: dict[str, object] = {
+        "kind": "hand_made",
+        "v": RECORD_VERSION,
+        "id": record_id,
+        "host": host,
+        "target": recorded_target(host),
+        "started_at": store.utc_iso(started),
+        "ended_at": store.utc_iso(time.time()),
+        **fields,
+        **git_facts(directory),
+        **tree_facts(tree_start, treekey.tree_key(directory, checkout_programs=False)),
+        "caller": caller(sys.stdout.isatty()),
+        "account": caller_account(),
+        **who(),
+    }
+    store.append_line(store.host_file(host, started), record)
 
 
 def hold_build(args: list[str]) -> None:

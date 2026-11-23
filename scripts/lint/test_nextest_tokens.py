@@ -3,20 +3,26 @@
 
 from __future__ import annotations
 
+import json
 import os
 import select
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import IO, cast, override
 from unittest import mock
 
 from scripts.build_hold.override_guard import require_checkout
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_start import Started, process_start
 from scripts.lint import nextest_tokens as tokens
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 require_checkout(Path(__file__))
 
@@ -30,8 +36,22 @@ PY = Path(__file__).resolve().parents[1] / "lib/py"
 # until the case stops it.
 FAKE_CARGO = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$CARGO_CALLS"
+if [[ $1 == nextest && $2 == list ]]; then
+    for argument in "${@:3}"; do
+        case "$argument" in
+            --) break ;;
+            --cargo-message-format|--cargo-message-format=*) echo '{"reason":"compiler-artifact"}' ;;
+            --rerun|--rerun=*|-R*) exit 2 ;;
+        esac
+    done
+    printf '%s\\n' "$FAKE_SELECTION"
+    exit "${FAKE_LIST_STATUS:-0}"
+fi
 [[ -z "${FAKE_QUIET:-}" ]] || exec >/dev/null
 if [[ " $* " == *" --no-run "* ]]; then
+    if [[ -n "${FAKE_BUILD_ENV:-}" ]]; then
+        printf '%s\\n' "$CARGO_MAKEFLAGS" > "$FAKE_BUILD_ENV"
+    fi
     # nextest 0.9.143 refuses these with --no-run.
     for flag in --fail-fast --no-fail-fast --max-fail --debugger --tracer; do
         if [[ " $* " == *" $flag "* ]]; then
@@ -45,9 +65,41 @@ fi
 case "${FAKE_TEST:-pass}" in
     killed) kill -KILL $$ ;;
     wait) echo "started $$"; exec sleep 60 ;;
+    inspect) python3 - "$FAKE_TOKEN_POOL" <<'PY'
+import array
+import fcntl
+import os
+import sys
+import termios
+
+with open(sys.argv[1], "r+b", buffering=0) as pool:
+    count = array.array("i", [0])
+    fcntl.ioctl(pool, termios.FIONREAD, count, True)
+    print(f"free during nextest: {count[0]}")
+if os.environ.get("FAKE_BORROW"):
+    path = os.environ["CARGO_MAKEFLAGS"].removeprefix("--jobserver-auth=fifo:")
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        try:
+            tokens = os.read(fd, 64)
+        except BlockingIOError:
+            tokens = b""
+        print(f"nested pool: {path}")
+        print(f"nested borrowed: {len(tokens)}")
+        os.write(fd, tokens)
+    finally:
+        os.close(fd)
+PY
+    ;;
 esac
 echo tested
 """
+
+
+def fake_selection(count: int) -> str:
+    cases = {f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(count)}
+    cases["ignored"] = {"filter-match": {"status": "mismatch", "reason": "ignored"}}
+    return json.dumps({"test-count": len(cases), "rust-suites": {"fixture": {"testcases": cases}}})
 
 
 class PoolCase(unittest.TestCase):
@@ -74,11 +126,19 @@ class PoolCase(unittest.TestCase):
         cargo.chmod(0o755)
         configuration = self.root / "config"
         configuration.mkdir()
-        _ = (configuration / "build_admission.conf").write_text("[memory]\n# whole: 1..\ntest_token_floor=2\n",
-                                                                encoding="utf-8")
+        self.configure_nested_tokens(0)
         self.calls = self.root / "calls"
-        self.environment = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                            "CARGO_CALLS": str(self.calls), "CONF_DIR": str(configuration)}
+        self.environment = {**memory_gate_shell_environment(),
+                            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                            "CARGO_CALLS": str(self.calls), "CONF_DIR": str(configuration),
+                            "FAKE_SELECTION": fake_selection(16), "FAKE_TOKEN_POOL": str(self.pool),
+                            "TMPDIR": str(self.root)}
+
+    def configure_nested_tokens(self, count: int, *, test_floor: int = 2) -> None:
+        _ = (self.root / "config/build_admission.conf").write_text(
+            f"[memory]\n# whole: 1..\ntest_token_floor={test_floor}\n# whole: 0..\nnested_tokens={count}\n",
+            encoding="utf-8",
+        )
 
     def fill(self, count: int) -> None:
         _ = os.write(self.keeper, bytes(range(count)))
@@ -163,6 +223,172 @@ class BuildOnlyTests(unittest.TestCase):
 
 
 class HolderTests(PoolCase):
+    def test_one_selected_test_leaves_the_other_tokens_free(self) -> None:
+        self.fill(8)
+        for nested, free in ((0, 7), (3, 4)):
+            with self.subTest(nested=nested):
+                self.configure_nested_tokens(nested)
+                options = {"FAKE_TEST": "inspect", "FAKE_SELECTION": fake_selection(1)}
+                if nested:
+                    options["FAKE_BORROW"] = "1"
+                    options["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{self.pool}"
+                child = self.holder("cargo", "nextest", "run", "--test-threads", "8", "-E", "test(one)", extra=options)
+                output, _ = child.communicate(timeout=30)
+                self.assertEqual(child.returncode, 0, output)
+                self.assertIn(f"free during nextest: {free}\n", output)
+                if nested:
+                    self.assertIn("nested borrowed: 3\n", output)
+                    self.assertNotIn(f"nested pool: {self.pool}\n", output)
+                self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "1\n")
+                self.assertEqual(self.free_tokens(), 8)
+
+    def test_full_suite_leaves_tokens_for_nested_cargo(self) -> None:
+        self.fill(8)
+        self.configure_nested_tokens(3)
+        makeflags = f"--jobserver-auth=fifo:{self.pool}"
+        build_environment = self.root / "build-environment"
+        child = self.holder(
+            "cargo", "nextest", "run", "--test-threads", "8", "--workspace",
+            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "CARGO_MAKEFLAGS": makeflags,
+                   "FAKE_BUILD_ENV": str(build_environment)},
+        )
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("nested borrowed: 3\n", output)
+        self.assertNotIn(f"nested pool: {self.pool}\n", output)
+        self.assertIn("free during nextest: 0\n", output)
+        self.assertEqual(build_environment.read_text(encoding="utf-8"), f"{makeflags}\n")
+        self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "5\n")
+        self.assertEqual(self.free_tokens(), 8)
+        self.assertEqual(list(self.root.glob("nextest-jobserver-*")), [])
+        self.assertEqual(list((self.root / f"nextest-jobservers-{os.getuid()}").iterdir()), [])
+
+    def test_empty_selection_uses_no_tokens_and_preserves_nextest_status(self) -> None:
+        self.fill(4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8", "--no-tests", "pass",
+                            extra={"FAKE_TEST": "inspect", "FAKE_SELECTION": fake_selection(0)})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("free during nextest: 4\n", output)
+        self.assertFalse((self.root / "width").exists())
+        self.assertEqual(self.cargo_calls(), ["nextest run --no-run", "nextest list --message-format json",
+                                              "nextest run --test-threads 8 --no-tests pass"])
+
+    def test_unreadable_selection_uses_the_requested_token_limit(self) -> None:
+        self.fill(8)
+        for fixture in ({"FAKE_SELECTION": "invalid JSON"}, {"FAKE_LIST_STATUS": "1"}):
+            with self.subTest(fixture=fixture):
+                child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                                    extra={"FAKE_TEST": "inspect", **fixture})
+                output, _ = child.communicate(timeout=30)
+                self.assertEqual(child.returncode, 0, output)
+                self.assertEqual(output.count("using requested width 8 as the token limit"), 1, output)
+                self.assertIn("free during nextest: 0\n", output)
+                self.assertEqual(self.free_tokens(), 8)
+
+    def test_list_counts_tests_with_run_options_that_change_listing(self) -> None:
+        self.fill(8)
+        for options in (("--cargo-message-format", "json"), ("--cargo-message-format=json",),
+                        ("--rerun", "latest"), ("--rerun=latest",), ("-R", "latest"), ("-Rlatest",)):
+            with self.subTest(options=options):
+                self.calls.unlink(missing_ok=True)
+                child = self.holder("cargo", "nextest", "run", "--test-threads", "8", *options, "--workspace",
+                                    extra={"FAKE_TEST": "inspect", "FAKE_SELECTION": fake_selection(2)})
+                output, _ = child.communicate(timeout=30)
+                self.assertEqual(child.returncode, 0, output)
+                self.assertIn("free during nextest: 6\n", output)
+                self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "2\n")
+                self.assertEqual(self.cargo_calls()[1:], ["nextest list --message-format json --workspace",
+                    " ".join(("nextest run --test-threads 2", *options, "--workspace"))])
+                self.assertEqual(self.free_tokens(), 8)
+
+    def test_start_removes_folders_for_dead_owners_and_reused_pids(self) -> None:
+        parent = self.root / f"nextest-jobservers-{os.getuid()}"
+        parent.mkdir(mode=0o700)
+        started = process_start(os.getpid())
+        assert isinstance(started, Started)
+        live = parent / f"{os.getpid()}-{started.start.encode().hex()}-live"
+        reused = parent / f"{os.getpid()}-{(started.start + '0').encode().hex()}-reused"
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as owner:
+            self.assertEqual(owner.wait(timeout=10), 0)
+            dead = parent / f"{owner.pid}-{b'0'.hex()}-dead"
+        for folder in (live, reused, dead):
+            folder.mkdir(mode=0o700)
+            os.mkfifo(folder / "pool")
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"FAKE_SELECTION": fake_selection(0)})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(sorted(path.name for path in parent.iterdir()), [live.name])
+        self.assertTrue((live / "pool").is_fifo())
+
+    @unittest.skipIf(sys.platform == "darwin", "macOS uses ps for process start times.")
+    def test_missing_process_root_keeps_a_live_owners_folder(self) -> None:
+        started = process_start(os.getpid())
+        assert isinstance(started, Started)
+        parent = self.root / f"nextest-jobservers-{os.getuid()}"
+        parent.mkdir(mode=0o700)
+        live = parent / f"{os.getpid()}-{started.start.encode().hex()}-live"
+        live.mkdir(mode=0o700)
+        os.mkfifo(live / "pool")
+        self.fill(8)
+        self.configure_nested_tokens(3)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"VERIFY_PROC_ROOT": str(self.root / "missing-proc"),
+                                   "FAKE_TEST": "inspect", "FAKE_BORROW": "1"})
+        output, _ = child.communicate(timeout=30)
+        self.assertTrue((live / "pool").is_fifo(), output)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("nested borrowed: 3\n", output)
+        self.assertEqual(sorted(parent.iterdir()), [live])
+        self.assertEqual(self.free_tokens(), 8)
+
+    def test_cleanup_error_reports_the_folder_and_the_tests_run(self) -> None:
+        started = process_start(os.getpid())
+        assert isinstance(started, Started)
+        parent = self.root / f"nextest-jobservers-{os.getuid()}"
+        parent.mkdir(mode=0o700)
+        stale = parent / f"{os.getpid()}-{(started.start + '0').encode().hex()}-stale"
+        stale.mkdir(mode=0o700)
+        self.fill(4)
+        run = tokens.test_run(["cargo", "nextest", "run", "--test-threads", "4"])
+        assert isinstance(run, tokens.SizedTestRun)
+        errors = StringIO()
+        remove = mock.Mock(side_effect=PermissionError("fixture denies removal"))
+        with (mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}),
+              mock.patch.object(tokens, "shutil", SimpleNamespace(rmtree=remove)),
+              mock.patch("sys.stderr", errors)):
+            status = tokens.run_with_tokens(run, self.pool, 2, None, lambda _: None, nested_tokens=0)
+        remove.assert_called_once_with(str(stale))
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"nextest: could not remove stale jobserver folder {stale}: fixture denies removal",
+        ])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertTrue(stale.is_dir())
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_cleanup_does_not_report_a_folder_that_another_launcher_removed(self) -> None:
+        started = process_start(os.getpid())
+        assert isinstance(started, Started)
+        parent = self.root / f"nextest-jobservers-{os.getuid()}"
+        parent.mkdir(mode=0o700)
+        stale = parent / f"{os.getpid()}-{(started.start + '0').encode().hex()}-stale"
+        stale.mkdir(mode=0o700)
+
+        def remove_first(path: str) -> None:
+            Path(path).rmdir()
+            raise FileNotFoundError(path)
+
+        errors = StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(shutil, "rmtree", side_effect=remove_first) as remove,
+              mock.patch("sys.stderr", errors)):
+            self.assertEqual(tokens.clean_jobserver_parent(started), parent)
+        remove.assert_called_once_with(str(stale))
+        self.assertFalse(stale.exists())
+        self.assertEqual(errors.getvalue(), "")
+
     def test_run_waits_for_its_floor_while_a_compile_holds_the_pool(self) -> None:
         self.fill(4)
         compile_tokens = self.take(3)
@@ -174,9 +400,77 @@ class HolderTests(PoolCase):
         self.assertEqual(read_line(child), "tested\n")
         self.assertEqual(child.wait(timeout=30), 0)
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run --workspace",
+                                              "nextest list --message-format json --workspace",
                                               "nextest run --test-threads 2 --workspace"])
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "2\n")
         self.assertEqual(self.free_tokens(), 2)
+
+    def test_thread_floor_takes_priority_over_nested_cargo_at_the_width_limit(self) -> None:
+        self.fill(8)
+        compile_tokens = self.take(1)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "4", extra={"FAKE_TEST": "inspect"})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertIn("free during nextest: 3\n", output)
+        self.assertEqual(self.free_tokens(), 7)
+        _ = os.write(self.keeper, compile_tokens)
+
+    def test_nested_cargo_cannot_borrow_shared_tokens_at_the_width_limit(self) -> None:
+        self.fill(7)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder(
+            "cargo", "nextest", "run", "--test-threads", "4",
+            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.pool}"},
+        )
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn("free during nextest: 3\n", output)
+        self.assertIn("nested borrowed: 0\n", output)
+        self.assertEqual(self.free_tokens(), 7)
+
+    def test_the_test_floor_can_use_the_entire_pool(self) -> None:
+        self.fill(4)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "inspect"})
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertNotIn("waiting for", output)
+        self.assertNotIn("tokens for nested Cargo", output)
+        self.assertIn("free during nextest: 0\n", output)
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_run_waits_for_the_test_floor_and_gives_cargo_the_surplus(self) -> None:
+        self.fill(6)
+        compile_tokens = self.take(3)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1"})
+        self.assertEqual(read_line(child), "built\n")
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
+        _ = os.write(self.keeper, compile_tokens[:2])
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 4")
+        self.assertIn("nested borrowed: 1\n", output)
+        self.assertEqual(self.free_tokens(), 5)
+
+    def test_two_selected_tests_limit_the_test_floor_to_two(self) -> None:
+        self.fill(5)
+        compile_tokens = self.take(4)
+        self.configure_nested_tokens(3, test_floor=4)
+        child = self.holder("cargo", "nextest", "run", "--test-threads", "8",
+                            extra={"FAKE_TEST": "inspect", "FAKE_BORROW": "1", "FAKE_SELECTION": fake_selection(2)})
+        self.assertEqual(read_line(child), "built\n")
+        self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
+        _ = os.write(self.keeper, compile_tokens)
+        output, _ = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, output)
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 2")
+        self.assertIn("nested borrowed: 3\n", output)
+        self.assertEqual(self.free_tokens(), 5)
 
     def test_free_tokens_up_to_the_width_and_every_token_goes_back(self) -> None:
         self.fill(12)
@@ -184,6 +478,7 @@ class HolderTests(PoolCase):
         output = output_of(child).read()
         self.assertEqual(child.wait(timeout=30), 0, output)
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run -E test(one)",
+                                              "nextest list --message-format json -E test(one) -- --nocapture",
                                               "nextest run --test-threads 8 -E test(one) -- --nocapture"])
         self.assertEqual(self.free_tokens(), 12)
 
@@ -202,14 +497,18 @@ class HolderTests(PoolCase):
         self.assertEqual(child.wait(timeout=30), 0, output)
         selection = " ".join(HANA_RUN[6:])
         self.assertEqual(self.cargo_calls(), [f"nextest run --no-run {selection}",
+                                              f"nextest list --message-format json {selection}",
                                               f"nextest run --test-threads 4 --no-fail-fast {selection}"])
         self.assertEqual(self.free_tokens(), 4)
 
     def test_killed_child_gives_every_token_back(self) -> None:
         self.fill(4)
+        self.configure_nested_tokens(3)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "killed"})
         self.assertEqual(child.wait(timeout=30), 128 + signal.SIGKILL)
         self.assertEqual(self.free_tokens(), 4)
+        self.assertEqual(list(self.root.glob("nextest-jobserver-*")), [])
+        self.assertEqual(list((self.root / f"nextest-jobservers-{os.getuid()}").iterdir()), [])
 
     def test_a_signal_to_the_step_group_ends_the_holder_and_its_tests(self) -> None:
         # A FIFO pool cannot take back the tokens of an ended process; steve does.
@@ -231,7 +530,7 @@ class HolderTests(PoolCase):
         self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
         send_process_group(child.pid, signal.SIGTERM)
         self.assertEqual(child.wait(timeout=30), -signal.SIGTERM)
-        self.assertEqual(self.cargo_calls(), ["nextest run --no-run"])
+        self.assertEqual(self.cargo_calls(), ["nextest run --no-run", "nextest list --message-format json"])
 
     def test_other_commands_run_as_given_with_no_token(self) -> None:
         self.fill(4)
@@ -255,11 +554,26 @@ class ReservationTests(PoolCase):
         with mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}), \
                 mock.patch("sys.stdout", new=open(os.devnull, "w")) as quiet:
             self.addCleanup(quiet.close)
-            status = tokens.run_with_tokens(run, self.pool, 2, self.root / "width", recorded.append)
+            status = tokens.run_with_tokens(run, self.pool, 2, self.root / "width", recorded.append, nested_tokens=0)
         self.assertEqual(status, 0)
         self.assertEqual(recorded, [3])
         self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "3\n")
         self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 3 --workspace")
+
+    def test_reservation_width_records_one_test_thread_with_one_nested_token(self) -> None:
+        self.fill(2)
+        recorded: list[int] = []
+        run = tokens.test_run(["cargo", "nextest", "run", "--test-threads", "8", "--workspace"])
+        assert isinstance(run, tokens.SizedTestRun)
+        with mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}), \
+                mock.patch("sys.stdout", new=open(os.devnull, "w")) as quiet:
+            self.addCleanup(quiet.close)
+            status = tokens.run_with_tokens(run, self.pool, 1, self.root / "width", recorded.append, nested_tokens=3)
+        self.assertEqual(status, 0)
+        self.assertEqual(recorded, [1])
+        self.assertEqual((self.root / "width").read_text(encoding="utf-8"), "1\n")
+        self.assertEqual(self.cargo_calls()[-1], "nextest run --test-threads 1 --workspace")
+        self.assertEqual(self.free_tokens(), 2)
 
     def test_full_width_needs_no_reservation_change(self) -> None:
         self.fill(8)
@@ -269,7 +583,7 @@ class ReservationTests(PoolCase):
         with mock.patch.dict(os.environ, {**self.environment, "FAKE_QUIET": "1"}), \
                 mock.patch("sys.stdout", new=open(os.devnull, "w")) as quiet:
             self.addCleanup(quiet.close)
-            self.assertEqual(tokens.run_with_tokens(run, self.pool, 2, None, recorded.append), 0)
+            self.assertEqual(tokens.run_with_tokens(run, self.pool, 2, None, recorded.append, nested_tokens=0), 0)
         self.assertEqual(recorded, [])
 
 
@@ -314,6 +628,7 @@ run_nextest "$@"
                          + r"nextest: 5 of 8 test threads; [^\n]*; one jobserver token for each thread\ntested\n"
                          + r"recorded:cargo nextest run --test-threads 5 --workspace\n\Z")
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run --workspace",
+                                              "nextest list --message-format json --workspace",
                                               "nextest run --test-threads 5 --workspace"])
         self.assertEqual(self.free_tokens(), 5)
         self.assertEqual([path.name for path in self.root.glob("nextest_tokens.*")], [])

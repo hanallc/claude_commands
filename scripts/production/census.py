@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from enum import Enum
 from typing import Literal, NamedTuple, cast
 
 from scripts.lib import conf
@@ -16,9 +17,18 @@ type RunState = Literal["running", "finished_queued", "missing"]
 RUN_STATES: tuple[RunState, ...] = ("running", "finished_queued", "missing")
 
 
+class CensusMachineReachability(Enum):
+    REACHED = "reached"
+    NOT_REACHED = "not reached"
+
+
 class CensusMachine(NamedTuple):
     name: str
-    reachable: bool
+    reachability: CensusMachineReachability
+
+
+class CensusMachineUnreported(NamedTuple):
+    """The census session has no machine field."""
 
 
 class CensusShell(NamedTuple):
@@ -28,12 +38,19 @@ class CensusShell(NamedTuple):
     started_at: float | None
 
 
+class CensusProcessUnreported(NamedTuple):
+    """The census session has no value for this process field."""
+
+
 class CensusSession(NamedTuple):
     """A session that a handler tile shows. `status` is None when the accounts command has no entry."""
 
     session: str
     status: str | None
     shells: tuple[CensusShell, ...] = ()
+    machine: str | CensusMachineUnreported = CensusMachineUnreported()
+    pid: int | CensusProcessUnreported = CensusProcessUnreported()
+    process_start: str | CensusProcessUnreported = CensusProcessUnreported()
 
 
 class CensusRun(NamedTuple):
@@ -53,6 +70,12 @@ class NoPass(NamedTuple):
     """The worker has no open pass."""
 
 
+class UnknownWorkerRuns(NamedTuple):
+    """The census could not read the worker's runs. The reason can include other unknown facts."""
+
+    reason: str
+
+
 class CensusWorker(NamedTuple):
     staff_id: staff.StaffId
     name: str
@@ -60,7 +83,13 @@ class CensusWorker(NamedTuple):
     status: str | None
     activity: str | None
     assignment: CensusPass | NoPass
-    runs: tuple[CensusRun, ...]
+    run_observation: tuple[CensusRun, ...] | UnknownWorkerRuns
+
+    @property
+    def runs(self) -> tuple[CensusRun, ...]:
+        """Return only the runs the census observed."""
+        observed = self.run_observation
+        return () if isinstance(observed, UnknownWorkerRuns) else observed
 
     @property
     def live_word(self) -> str:
@@ -140,17 +169,35 @@ def _session(value: object, where: str) -> CensusSession:
     """A census without `shells` lists no background commands."""
     fields = _object(value, where)
     shells = _list(fields, "shells", where) if "shells" in fields else []
-    return CensusSession(_text(fields, "session", where), _optional_text(fields, "status", where),
-                         tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells)))
+    name = _text(fields, "session", where)
+    status = _optional_text(fields, "status", where)
+    commands = tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells))
+    machine = _text(fields, "machine", where) if "machine" in fields else CensusMachineUnreported()
+    pid: int | CensusProcessUnreported = CensusProcessUnreported()
+    if "pid" in fields:
+        value_pid = fields["pid"]
+        if isinstance(value_pid, bool) or not isinstance(value_pid, int):
+            raise _BadField(f"{where}.pid is not an integer")
+        pid = value_pid
+    started = _text(fields, "process_start", where) if "process_start" in fields else CensusProcessUnreported()
+    if ("pid" in fields or "process_start" in fields) and isinstance(machine, str) and not machine.strip():
+        raise _BadField(f"{where}.machine is empty")
+    return CensusSession(name, status, commands, machine, pid, started)
 
 
 def _worker(value: object, where: str) -> CensusWorker:
     fields = _object(value, where)
+    runs: tuple[CensusRun, ...] | UnknownWorkerRuns
+    if "runs" in fields and fields["runs"] is None:
+        unknown_path = f"{where}.unknown"
+        reason = _text(_object(fields.get("unknown"), unknown_path), "reason", unknown_path)
+        runs = UnknownWorkerRuns(reason)
+    else:
+        runs = tuple(_run(run, f"{where}.runs[{index}]") for index, run in enumerate(_list(fields, "runs", where)))
     return CensusWorker(staff.StaffId(_text(fields, "staff_id", where)), _text(fields, "name", where),
                         staff.StaffId(_text(fields, "parent_staff_id", where)), _optional_text(fields, "status", where),
                         _optional_text(fields, "activity", where), _assignment(fields.get("pass"), f"{where}.pass"),
-                        tuple(_run(run, f"{where}.runs[{index}]")
-                              for index, run in enumerate(_list(fields, "runs", where))))
+                        runs)
 
 
 def _machine(value: object, where: str) -> CensusMachine:
@@ -158,7 +205,8 @@ def _machine(value: object, where: str) -> CensusMachine:
     reachable = fields.get("reachable")
     if not isinstance(reachable, bool):
         raise _BadField(f"{where}.reachable is not true or false")
-    return CensusMachine(_text(fields, "name", where), reachable)
+    reachability = CensusMachineReachability.REACHED if reachable else CensusMachineReachability.NOT_REACHED
+    return CensusMachine(_text(fields, "name", where), reachability)
 
 
 def parse(text: str) -> Census | CensusFailed:

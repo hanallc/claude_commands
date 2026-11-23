@@ -12,7 +12,7 @@ import subprocess
 import sys
 from typing import cast
 
-from scripts.lib import land_main, main_push_lock, waiting_rows
+from scripts.lib import conf, land_main, main_push_lock, waiting_rows
 from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -119,18 +119,19 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
         fetched = git(checkout, "fetch", "-q", "origin", "main", time_limit=fetch_limit)
         if fetched.returncode:
             raise Refusal(f"git fetch origin main: {first_line(fetched)}")
-        listed = git(checkout, "log", "--format=%H %h %s", "--reverse", "origin/main..main")
+        head = waiting_rows.git(checkout, "rev-parse", "HEAD").strip()
+        listed = git(checkout, "log", "--format=%H %h %s", "--reverse", f"origin/main..{head}")
         if listed.returncode:
             raise Refusal(f"cannot inspect unpublished commits: {first_line(listed)}")
         commits = [cast(tuple[str, str, str], tuple(line.split(" ", 2))) for line in listed.stdout.splitlines()]
         for _, short, subject in commits:
             if not subject.startswith(PUBLICATION_PREFIXES):
                 raise Refusal(f"main holds other commit {short} {subject} that origin does not have; main is unchanged")
-        if not git(checkout, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
+        if not git(checkout, "merge-base", "--is-ancestor", "origin/main", head).returncode:
             return
         target = _rebuilt(checkout, commits)
         try:
-            waiting_rows.move_to(checkout, target)
+            waiting_rows.move_to(checkout, target, fast_forward=not commits, expected_head=head)
         except (OSError, UnicodeError) as error:
             raise Refusal(f"main is unchanged: {' '.join(str(error).split())}") from error
 
@@ -217,6 +218,19 @@ def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         return str(error)
 
 
+def forward(script: str, arguments: list[str], *, label: str, ssh_program: str) -> int:
+    """Run a ~/.claude/scripts command on natedev with these arguments and pass on its output and exit."""
+    command = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/{script}" ' + shlex.join(arguments)
+    limit = CommandTimeLimit(conf.read_or_repository("live_settings").whole("natedev_forward_seconds"))
+    done = ssh(command, ssh_program=ssh_program, host="natedev", time_limit=limit)
+    if isinstance(done, str):
+        print(f"{label}: natedev: {done}", file=sys.stderr)
+        return 1
+    print(done.stdout, end="")
+    print(done.stderr, end="", file=sys.stderr)
+    return done.returncode
+
+
 def remote_path(path: PurePosixPath) -> str:
     """Quote a Mac path and let the Mac expand its home directory."""
     text = str(path)
@@ -230,7 +244,9 @@ def remote_path(path: PurePosixPath) -> str:
 def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
     """Fetch main without shared fetch state and move to its advertised tip; waiting rows stay live."""
     url = f"natedev:{shlex.quote(str(source))}"
-    return (f"cd {remote_path(mac)} && tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
+    return (f"cd {remote_path(mac)} "
+            "&& { [ ! -f scripts/lib/waiting_rows.py ] || scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; } "
+            f"&& tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
             f"&& git fetch -q --no-write-fetch-head {url} main "
             "&& if [ -f scripts/lib/waiting_rows.py ]; "
             "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward \"$tip\"; "

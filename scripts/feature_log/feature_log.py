@@ -18,7 +18,7 @@ import socket as socket
 import subprocess as subprocess
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
@@ -33,11 +33,12 @@ class ProjectSpec(NamedTuple):
     published: frozenset[str]
     checkouts: tuple[Path, ...]
     closes_by_change_review: bool = False
+    former_repos: tuple[str, ...] = ()
 
 
 PROJECTS: dict[str, ProjectSpec] = {
     "hana": ProjectSpec(
-        "natepiano/hana",
+        "hanallc/hana",
         frozenset(
             {
                 "fairy_dust",
@@ -81,9 +82,12 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         (Path.home() / "rust/hana", Path.home() / "rust/hana_catalyst"),
         closes_by_change_review=True,
+        former_repos=("natepiano/hana",),
     ),
     "natedev": ProjectSpec(
-        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),), closes_by_change_review=False,
+        "hanallc/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),),
+        closes_by_change_review=False,
+        former_repos=("natepiano/nixos",),
     ),
     "cargo-liner": ProjectSpec(
         "natepiano/cargo-liner",
@@ -133,7 +137,9 @@ PROJECTS: dict[str, ProjectSpec] = {
         closes_by_change_review=False,
     ),
     "claude": ProjectSpec(
-        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",), closes_by_change_review=True,
+        "hanallc/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",),
+        closes_by_change_review=True,
+        former_repos=("natepiano/claude_commands",),
     ),
 }
 
@@ -359,6 +365,10 @@ class FeatureLogError(ValueError):
         return message if message.startswith("feature_log: ") else f"feature_log: {message}"
 
 
+class ProposalCloseoutBlocked(FeatureLogError):
+    """The proposal conflicts with another closeout that has already finished."""
+
+
 def vault_dir() -> Path:
     """Return the feature-log vault selected by the current environment."""
     configured = os.environ.get("FEATURE_LOG_VAULT")
@@ -403,7 +413,12 @@ def _forward_review(argv: list[str]) -> list[str]:
     except (OSError, UnicodeError) as error:
         raise FeatureLogError(str(error)) from error
     if result.returncode:
-        raise FeatureLogError((result.stderr or result.stdout).strip() or "feature-log operation failed")
+        diagnostic = (result.stderr or result.stdout).strip() or "feature-log operation failed"
+        reason = diagnostic.removeprefix("feature_log: ")
+        if result.returncode == 2 and re.fullmatch(
+                r"(?:proposal .+ is already (?:dropped|landed)|old note .+ is not live)", reason):
+            raise ProposalCloseoutBlocked(diagnostic)
+        raise FeatureLogError(diagnostic)
     return result.stdout.splitlines()
 
 
@@ -824,10 +839,16 @@ def _canonical_link(project: str, value: str) -> str:
     spec = _validate_project(project)
     if SHA_RE.fullmatch(value):
         return f"https://github.com/{spec.repo}/commit/{value.lower()}"
-    prefix = f"https://github.com/{spec.repo}/commit/"
-    if not value.startswith(prefix) or not SHA_RE.fullmatch(value[len(prefix) :]):
-        raise FeatureLogError(f"link must be a 40-hex commit for {spec.repo}")
-    return prefix + value[len(prefix) :].lower()
+    for repo in (spec.repo, *spec.former_repos):
+        prefix = f"https://github.com/{repo}/commit/"
+        if value.startswith(prefix) and SHA_RE.fullmatch(value[len(prefix) :]):
+            return prefix + value[len(prefix) :].lower()
+    raise FeatureLogError(f"link must be a 40-hex commit for {spec.repo}")
+
+
+def _commit_identity(project: str, link: str) -> str:
+    """Return the current repository URL for a validated commit link."""
+    return f"https://github.com/{PROJECTS[project].repo}/commit/{link.rsplit('/', 1)[1].lower()}"
 
 
 def _commit_date(project: ProjectSpec, sha: str) -> str:
@@ -1293,11 +1314,12 @@ def _same_repeat(
     completed_date_was_defaulted: bool,
 ) -> bool:
     comparable = candidate.copy()
+    comparable["link"] = _commit_identity(candidate["project"], candidate["link"])
     comparable["date_created"] = existing["date_created"]
     comparable["date_modified"] = existing["date_modified"]
     if completed_date_was_defaulted:
         comparable["completed_date"] = existing["completed_date"]
-    return comparable == existing
+    return comparable == {**existing, "link": _commit_identity(existing["project"], existing["link"])}
 
 
 def _reject_duplicate_link(
@@ -1308,12 +1330,14 @@ def _reject_duplicate_link(
 ) -> None:
     if separate_result:
         return
-    for other_path, other in _project_notes(note["project"]):
+    project = note["project"]
+    commit = _commit_identity(project, note["link"])
+    for other_path, other in _project_notes(project):
         if (
             other_path != path
             and other["title"] not in replacing_titles
             and other["state"] == "live"
-            and other["link"] == note["link"]
+            and _commit_identity(project, other["link"]) == commit
         ):
             raise FeatureLogError(
                 f"link already belongs to live note {other['title']}; use --separate-result"
@@ -1329,9 +1353,10 @@ def _prepare_new(
 ) -> tuple[bool, Note]:
     path = _note_path(note)
     if path.exists():
+        project = note["project"]
         existing = parse_note(path)
-        validate_note(existing, note["project"])
-        if existing["link"] != note["link"]:
+        validate_note(existing, project)
+        if _commit_identity(project, existing["link"]) != _commit_identity(project, note["link"]):
             raise FeatureLogError("title already belongs to a different link; make the title more specific")
         if not _same_repeat(
             existing,
@@ -1344,7 +1369,7 @@ def _prepare_new(
     return True, note
 
 
-def _apply_add(note: Note, arguments: argparse.Namespace) -> list[str]:
+def _apply_add(note: Note, arguments: argparse.Namespace, *, check_only: bool = False) -> list[str]:
     path = _note_path(note)
     backfill = cast(bool, arguments.backfill)
     should_write, stored = _prepare_new(
@@ -1353,6 +1378,8 @@ def _apply_add(note: Note, arguments: argparse.Namespace) -> list[str]:
         completed_date_was_defaulted=cast(str | None, arguments.completed) is None,
         replacing_titles=frozenset(),
     )
+    if check_only:
+        return []
     if not should_write:
         if not _event_recorded("add", stored["project"], stored["title"]):
             _append_event(_add_event(stored, backfill))
@@ -1380,7 +1407,7 @@ def _updated_replacement(note: Note, replacement: str) -> Note:
 
 
 def _apply_supersede(
-    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy
+    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy, *, check_only: bool = False
 ) -> list[str]:
     old_titles = [normalize_title(item) for item in cast(list[str], arguments.old)]
     old_titles = list(dict.fromkeys(old_titles))
@@ -1408,11 +1435,13 @@ def _apply_supersede(
             )
         elif note["title"] not in old_note["replaced_by"]:
             if isinstance(policy, ReplaceLiveNotes):
-                raise FeatureLogError(f"old note {old_title} is not live")
+                raise ProposalCloseoutBlocked(f"old note {old_title} is not live")
             replacements.append(
                 (old_path, _updated_replacement(old_note, note["title"]), old_title)
             )
 
+    if check_only:
+        return []
     if write_new:
         _write_note(new_path, stored)
         outputs.append(f"added: {_relative(new_path)}")
@@ -1641,7 +1670,7 @@ def _validate_proposal_old_notes(note: Note, old_titles: list[str]) -> None:
         old_note = parse_note(path)
         validate_note(old_note, note["project"])
         if old_note["state"] != "live":
-            raise FeatureLogError(f"old note {old_title} is not live")
+            raise ProposalCloseoutBlocked(f"old note {old_title} is not live")
 
 
 def _run_propose(arguments: argparse.Namespace) -> int:
@@ -1683,16 +1712,18 @@ def _run_propose(arguments: argparse.Namespace) -> int:
 
 def land_review(
     row_value: str, if_proposed: bool = False, *,
-    verb: Literal["add", "supersede", "recorded"] = "recorded",
+    verb: Literal["add", "supersede", "recorded"] = "recorded", check_only: bool = False,
 ) -> list[str]:
     """Land a proposal with its recorded verb, or require the verb supplied by the CLI."""
     arguments = ["land" if verb == "recorded" else verb, "--review", row_value]
     if if_proposed:
         arguments.append("--if-proposed")
+    if check_only:
+        arguments.append("--check-only")
     if _off_host(arguments):
         return _forward_review(arguments)
     row = _review_row(row_value)
-    with locked():
+    with nullcontext() if check_only else locked():
         proposal = _read_proposal(row)
         if proposal is None:
             if if_proposed:
@@ -1705,16 +1736,18 @@ def land_review(
         if proposal["status"] == "landed":
             return [f"unchanged: [[{proposal['note']}]]"]
         if proposal["status"] == "dropped":
-            raise FeatureLogError(f"proposal {row} is already dropped")
+            raise ProposalCloseoutBlocked(f"proposal {row} is already dropped")
         saved_arguments = _proposal_namespace(proposal["args"])
         # Each review row identifies a separate result, including older proposals.
         saved_arguments.separate_result = True
         note = _new_note(saved_arguments)
         outputs = (
-            _apply_add(note, saved_arguments)
+            _apply_add(note, saved_arguments, check_only=check_only)
             if proposal["verb"] == "add"
-            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes())
+            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes(), check_only=check_only)
         )
+        if check_only:
+            return []
         landed: LandedProposal = {
             "row": row,
             "verb": proposal["verb"],
@@ -1727,18 +1760,20 @@ def land_review(
     return [*outputs, f"[[{note['title']}]]"]
 
 
-def drop_review(row_value: str, verdict: str, if_proposed: bool = False) -> list[str]:
+def drop_review(row_value: str, verdict: str, if_proposed: bool = False, *, check_only: bool = False) -> list[str]:
     """Drop a proposal with a verdict that contains one nonempty line."""
     arguments = ["drop", "--review", row_value, f"--verdict={verdict}"]
     if if_proposed:
         arguments.append("--if-proposed")
+    if check_only:
+        arguments.append("--check-only")
     if _off_host(arguments):
         return _forward_review(arguments)
     row = _review_row(row_value)
     verdict = verdict.strip()
     if not verdict or "\n" in verdict:
         raise FeatureLogError("verdict must be one non-empty line")
-    with locked():
+    with nullcontext() if check_only else locked():
         proposal = _read_proposal(row)
         if proposal is None:
             if if_proposed:
@@ -1747,7 +1782,9 @@ def drop_review(row_value: str, verdict: str, if_proposed: bool = False) -> list
         if proposal["status"] == "dropped":
             return [f"unchanged: {row}"]
         if proposal["status"] == "landed":
-            raise FeatureLogError(f"proposal {row} is already landed")
+            raise ProposalCloseoutBlocked(f"proposal {row} is already landed")
+        if check_only:
+            return []
         dropped: DroppedProposal = {
             "row": row,
             "verb": proposal["verb"],
@@ -1760,14 +1797,16 @@ def drop_review(row_value: str, verdict: str, if_proposed: bool = False) -> list
     return [f"dropped: {row}"]
 
 
-def _run_review_land(verb: Literal["add", "supersede", "recorded"], row_value: str, if_proposed: bool) -> int:
-    for line in land_review(row_value, if_proposed, verb=verb):
+def _run_review_land(verb: Literal["add", "supersede", "recorded"], row_value: str, if_proposed: bool, *,
+                     check_only: bool = False) -> int:
+    for line in land_review(row_value, if_proposed, verb=verb, check_only=check_only):
         print(line)
     return 0
 
 
 def _run_drop(arguments: argparse.Namespace) -> int:
-    for line in drop_review(cast(str, arguments.review), cast(str, arguments.verdict), cast(bool, arguments.if_proposed)):
+    for line in drop_review(cast(str, arguments.review), cast(str, arguments.verdict),
+                            cast(bool, arguments.if_proposed), check_only=cast(bool, arguments.check_only)):
         print(line)
     return 0
 
@@ -1855,7 +1894,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
             updated["kind"] = kind_argument
             changed.append("kind")
         if isinstance(provenance, CorrectAcceptingProvenance):
-            if updated["link"] != provenance.link:
+            if _commit_identity(project, note["link"]) != _commit_identity(project, provenance.link):
                 updated["link"] = provenance.link
                 changed.append("link")
             if updated["completed_date"] != provenance.completed:
@@ -1916,7 +1955,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
         validate_note(updated, project)
         event = _amend_event(note, updated, backfill, changed)
         if (
-            event["old_link"] != event["new_link"]
+            "link" in changed
             or event["old_completed"] != event["new_completed"]
             or event["releases_added"]
         ):
@@ -2332,7 +2371,10 @@ def project_of(path: str) -> str | None:
     slug = _github_slug(result.stdout)
     if slug is None:
         return None
-    return next((project for project, spec in PROJECTS.items() if spec.repo == slug), None)
+    return next(
+        (project for project, spec in PROJECTS.items() if slug in (spec.repo, *spec.former_repos)),
+        None,
+    )
 
 
 def _run_project_of(arguments: argparse.Namespace) -> int:
@@ -2419,10 +2461,12 @@ def _parser() -> FeatureLogArgumentParser:
     land = subparsers.add_parser("land")
     _ = land.add_argument("--if-proposed", action="store_true")
     _ = land.add_argument("--review", required=True)
+    _ = land.add_argument("--check-only", action="store_true")
 
     drop = subparsers.add_parser("drop")
     _ = drop.add_argument("--if-proposed", action="store_true")
     _ = drop.add_argument("--review", required=True)
+    _ = drop.add_argument("--check-only", action="store_true")
     _ = drop.add_argument("--verdict", required=True)
 
     amend = subparsers.add_parser("amend")
@@ -2519,7 +2563,8 @@ def main(
         if command == "propose":
             return _run_propose(arguments)
         if command == "land":
-            return _run_review_land("recorded", cast(str, arguments.review), cast(bool, arguments.if_proposed))
+            return _run_review_land("recorded", cast(str, arguments.review), cast(bool, arguments.if_proposed),
+                                    check_only=cast(bool, arguments.check_only))
         if command == "drop":
             return _run_drop(arguments)
         if command == "amend":

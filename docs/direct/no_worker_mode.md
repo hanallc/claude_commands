@@ -16,6 +16,8 @@ The no-capacity broadcast stops every Codex worker on the machine; you stop none
 - `Pass stays open` names a pass that it could not end, with the cause. Tell your showrunner.
 - `Detached run continues` names a run that is not stopped, with its result file and its log. Its result comes to you when the run ends; it starts no worker.
 - `Not proved stopped` names a worker that can still run. Send it no work; your showrunner gets the same fault.
+- `Pane stays open` names a stopped worker's pane that did not close, with the cause. A pane that a detached run keeps closes when that run ends. Your showrunner gets the same fault.
+- `Pane close is uncertain` names a pane close that did not finish. Your showrunner gets the same fault.
 Claude workers are not stopped. The workers-back notice starts no worker; your next assign starts it.
 `assign.sh` refuses every assignment while the mode is on. A style refill prints one line for each ticket that you do directly.
 
@@ -81,6 +83,8 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Stage the final tree and run `verify.sh doc` immediately before each Cargo checkpoint.
    Record the successful commit with `progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase "<id>" --commit "<full hash>"`.
    This command requires the open phase and commit hash, with no worker pass requirement.
+   It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
+   To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id "<event id>" --reason "<reason>"`.
    Complete reservation release and push through <CheckpointCommit/>.
 7. Finish the phase with `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --phase-id "<id>" --status completed`.
    Keep broadcast-on mode through later phases until the workers-back notice arrives.

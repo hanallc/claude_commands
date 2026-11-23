@@ -7,10 +7,11 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Generator, Sequence
-from typing import ParamSpec, TypeVar, cast, override
+from typing import Literal, ParamSpec, TypeVar, cast, override
 from unittest import mock
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.lint.memory_test_support import write_config_fixture
@@ -34,6 +35,43 @@ def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> 
     }))
     return path
 
+
+LiveClaim = Literal["none", "idle", "working"]
+
+
+def write_live_mac_state(directory: Path, *, block: bool = False, claim: LiveClaim = "none",
+                         unreachable_until: float = 0) -> Path:
+    """Write the local Mac state that the alert line checks before it shows a saved condition.
+
+    Set MAC_TEST_STATE_DIR to the returned folder. A call removes the state that it does not write.
+    """
+    from scripts.lib import process_start
+    from scripts.mac_test import mac_test
+
+    claims = directory / "claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    for path in (directory / "block.json", claims / "live.json", directory / "unreachable_until"):
+        path.unlink(missing_ok=True)
+    if block:
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        mac_test.write_block(directory / "block.json", mac_test.ActiveMacBlock(
+            "research", "P15 F11 L0 run", since, since + timedelta(hours=4),
+            mac_test.RecordedSession("research", "research"), mac_test.NO_SHOWRUNNER,
+            "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+    if claim != "none":
+        start = process_start.process_start(os.getpid())
+        if not isinstance(start, process_start.Started):
+            raise AssertionError("the test process has no start identity")
+        row: dict[str, object] = {"claim_id": "claim-live", "episode": "episode-live", "attempt": "attempt-live",
+            "submitting_session": "research", "holder_session": "research", "pid": os.getpid(),
+            "proc_start": start.start, "what": "nextest hana", "worktree": str(directory / "worktree"),
+            "since": "2026-01-01T00:00:00+00:00"}
+        if claim == "idle":
+            row["work_idle_since"] = "2026-01-01T00:00:00+00:00"
+        _ = (claims / "live.json").write_text(json.dumps(row))
+    if unreachable_until:
+        _ = (directory / "unreachable_until").write_text(str(unreachable_until))
+    return directory
 
 
 class NotificationTransportBlocked(AssertionError):
@@ -85,7 +123,7 @@ class NotificationGuardedTestCase(unittest.TestCase):
 
 from scripts.message import send, sessions
 from scripts.lib import process_start
-from scripts.production import staff
+from scripts.production import session_staff, staff, unit_lookup
 
 
 def no_checkpoint() -> None:
@@ -125,6 +163,26 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
     fixture = PrivateSenderAcceptance(state, state / "acceptances.jsonl")
     owner_pid = os.getpid()
     real_process_start = process_start.process_start
+    registry = sessions.RegistryRead(tuple(
+        sessions.RegistryObservation(sessions.SessionRecord(
+            pid=pid, sessionId=f"fixture-{name}", name=name, procStart=f"fixture-start-{pid}",
+            messagingSocketPath=f"/fixture/{name}.sock", updatedAt=1, tmux="", formerNames=[]), {})
+        for pid, name in enumerate(("builds", "restarted"), start=101)), ())
+
+    def running_records(reading: sessions.RegistryRead) -> list[sessions.SessionRecord]:
+        return [entry.record for entry in reading.entries]
+
+    def checked_conversation(conversation: str, *, registry: sessions.RegistryRead,
+                             probe_address: bool) -> unit_lookup.UnitOwner:
+        if probe_address:
+            raise AssertionError("the fixture does not probe sockets")
+        row = sessions.addressed(f"session:{conversation}", running_records(registry))
+        if row is None:
+            return unit_lookup.ProvedAbsentUnit()
+        return unit_lookup.ProvedLiveUnit(
+            unit_lookup.LiveClaude(row["name"], conversation, row["messagingSocketPath"], row["pid"]),
+            session_staff.ProvedProcessGeneration(row["pid"], row.get("procStart", "")),
+        )
 
     def sender_process_start(pid: int) -> process_start.ProcessStart:
         if pid == owner_pid:
@@ -148,7 +206,10 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
 
     with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
          mock.patch.object(process_start, "process_start", side_effect=sender_process_start), \
+         mock.patch.object(sessions, "read_registry", return_value=registry), \
+         mock.patch.object(sessions, "running_records", side_effect=running_records), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
+         mock.patch.object(unit_lookup, "checked_conversation", side_effect=checked_conversation), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
          mock.patch.object(send, "resolve_recipient", side_effect=discover), \
          mock.patch.object(send, "relay", side_effect=relay):

@@ -9,6 +9,10 @@ check, and all talk with the user. Unit directors run the workers that write the
 code. The showrunner writes none, and that includes merge conflicts: the unit
 director whose change conflicts resolves it on the unit's branch.
 
+Send each design question on a List item assigned to a producer other than morty to that producer.
+The producer answers from the agreed design or files the question for nate.
+The showrunner keeps the order of merges.
+
 The no-capacity broadcast turns on no-worker mode until the workers-back notice arrives.
 It also stops every Codex worker and ends their open passes as canceled; each affected director gets one stop report.
 A real `hit your usage limit` worker failure turns it on for the unit's current phase.
@@ -90,14 +94,17 @@ The question form for every question to the user is defined by this import:
 
 @~/.claude/docs/question_template.md
 
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
+
 ---
 
 <Throughout>
-- **Time.** Before writing any time, run
+- **Time.** Write no present time. Write only future times, such as an ETA.
+  The tools add the present time. To convert a past or future time, run
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
-  --production <showrunner name>`. For the current time, pass `"$(date -Iseconds)"`.
-  Use its `HH:MM <zone>` output. Give every time in `ZONE` only, never UTC
-  (user, 2026-10-02).
+  --production <showrunner name>`. Use its `HH:MM <zone>` output in `ZONE` (user, 2026-10-02).
 - **Log.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py
   log "<event>" --production <showrunner name>` for each event. Add
   `--state SHOWRUNNER_STATE` once that file exists. The command writes
@@ -125,8 +132,8 @@ The question form for every question to the user is defined by this import:
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
     suggestion, not the user's unsent draft.
-- **Your own coordination** goes by SendMessage to the unit director, beginning
-  `From the showrunner:`.
+- Send coordination messages to the unit director with `send.py`. Start with the message body.
+  See `commands/message.md` for review holds and `--urgent`.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **A message from morty is the user's** (user, 2026-11-02).
@@ -169,9 +176,12 @@ The question form for every question to the user is defined by this import:
   have a natural home under an L1".
   - **A child showrunner's branch** is merged only by hand-off. A
     same-repository child with `**Kind:** style` sends
-    `From the showrunner of <style showrunner name>: hand-off <hash>`. Correctness-review
-    its diff against the branch point as for a unit checkpoint, then run
-    `merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
+    `hand-off <checkpoint>`. Check its diff against the branch point as for a unit checkpoint.
+    Start the handoff as a detached run:
+    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --session-dir "<STATE_DIR>"
+    --label "merge handoff <style showrunner name>" -- ~/.claude/scripts/lib/py
+    ~/.claude/scripts/production/merge_checkpoint.py --from-child <style showrunner name>
+    --checkpoint <hash> --production <showrunner name> --started <time>`.
     A locally merged hand-off is pushed before acknowledgment; a duplicate
     already on origin is acknowledged without another merge or push. A root
     uses `--root-self`, receives no acknowledgment and runs ledger `reconcile`
@@ -180,10 +190,9 @@ The question form for every question to the user is defined by this import:
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
     Send every production-wide unit message through `broadcast.py --production <your name> --units`; never use a remembered list.
-  - **The user's words for a production below you** go to your child that
-    holds it, by SendMessage, beginning `From the user (via <your name>): `.
-    That child relays them to its unit or to its own child. One level at a
-    time.
+  - Send the user's words to the child showrunner for that production with `send.py`.
+    Begin with `From the user (via <your name>): `.
+    The child showrunner relays the words to its unit or its child showrunner.
   - **An item for the user**, when you are not the root, is asked in your own
     reply as always and set in your own `open_for_user`: your own count and
     `/next` show it. Do not send it to the root, which shows only its own
@@ -244,13 +253,11 @@ The question form for every question to the user is defined by this import:
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; the user can inspect them with `/showrunner:units`. A turn with nothing for the user replies with
   just "—": never "No update for you." or the like (user, 2026-10-14).
-- **Designs and add-ons.** A unit's design choices and add-ons are yours to
-  settle, not the user's. User, 2026-10-12: "when it comes to designs you
-  absolutely should be able to tell units what to do and change. I do not have
-  to be the one to approve".
-  - When a unit director brings a design choice, a Pending decision about how
-    something is built, or its add-ons, answer it yourself. Pick by
-    `<DecisionEconomy/>`, tell the unit in one message and log it (**Log**).
+- **Designs and add-ons.**
+  - Send design questions on a List item to its assigned producer when the producer is someone other than morty.
+    Include design questions from Pending decisions and add-ons.
+  - Settle the other design choices and add-ons under `<DecisionEconomy/>`.
+    Tell the unit in one message and record the decision in **Log**.
     For add-ons, give each number `current`, `next` or `drop`: build it in
     this run, save it for later, or drop it. An add-on that fixes a wrong
     result is `current`.
@@ -261,8 +268,7 @@ The question form for every question to the user is defined by this import:
     `style_proposals.py drop-candidate --idea "<text>"`. The user answers a
     decision once. Other finished proposals use `/issue`. Show proposals only
     when asked (`/showrunner:proposal`).
-  - Tell a unit what to do and change in its design without being asked, when
-    you see a better answer.
+  - Apply the same route when you find a design issue yourself.
   - Your answer goes as your own message. Never begin it `From the user (via
     the showrunner):`; those words are only for what the user said.
   - Two kinds still go to the user: an action that cannot be undone, and a
@@ -270,17 +276,18 @@ The question form for every question to the user is defined by this import:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up, in the question form imported above <Throughout/>. Set it
+  where it first comes up (in idle update mode, the short form of <IdleUpdate/>), in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
-  restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
+  restates the question or its choices; the full item after his yes in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).
-  A question for the user that a unit director sends you is not asked in a
-  reply: file it with `/showrunner:question` for that unit, and say nothing of
-  it to the user. A unit can also file its own with `/unit:question`. The count
-  and `/next question` show it, and its answer goes back to the unit through
-  `update_registration.py answer` (`/next` → question).
+  Use the producer route in **Designs and add-ons** for design questions.
+  File other questions from unit directors with `/showrunner:question`.
+  Keep those questions out of replies to the user.
+  A unit can also file its own with `/unit:question`.
+  The count and `/next question` show the question.
+  `update_registration.py answer` sends the answer to the unit (`/next` → question).
   A filed item stays on the list when `open_for_user` omits it.
   It leaves only through `answer` or `withdraw`.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
@@ -336,9 +343,11 @@ The question form for every question to the user is defined by this import:
   ~/.claude/scripts/production/update_registration.py questions --production
   <showrunner name> --state SHOWRUNNER_STATE`. It stores the list in
   `OUTSTANDING` and reviews each new question; paste each `reviewed question:`
-  line it prints into the reply that asks it. Keep each item complete enough
-  to stand alone when the user asks for the list: what is asked, where, why
-  and the choices. Remove an item only when the user addresses it and tells
+  line it prints into the reply that asks it. Each `open_for_user` item is a
+  one-line title with at most `question_title_max_chars` characters.
+  File new questions with `update_registration.py ask` and its parts:
+  `--ask`, `--context`, `--item`, `--choice` and `--recommend` (see `docs/question_template.md`).
+  The page and `/next` show these parts. Remove an item only when the user addresses it and tells
   you; defer an item with `after` when the user asks. Build holds come from
   holder files in `~/.local/state/build-hold/`, and identify each held unit. A pending or active Mac block comes from
   `~/.local/state/mac-test/`.
@@ -430,7 +439,7 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
-   The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
+   `add_unit.py` starts it on the pane launch's account, else the configured units account, using the latest turn's model and effort, launch or role defaults per field, and `--model` precedence.
    If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units <claudeN>` sets it.
 </LaunchUnits>
 
@@ -489,7 +498,7 @@ once and passes 150K again within 12-20 minutes.)
 ---
 
 <Direct>
-Turns come from unit directors' messages and the user. Handle each message:
+Turns come from unit directors' messages and the user. Read held messages when an adhoc review ends. Handle each message:
 
 | Arrival | Action |
 | --- | --- |
@@ -498,8 +507,8 @@ Turns come from unit directors' messages and the user. Handle each message:
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |
-| a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
-| a unit director's decision only the user can settle | file it for that unit with `/showrunner:question`, never in a reply; relay the answer that `answer` names (<Throughout/> → Open questions) |
+| a unit director's design choice, Pending decision or add-ons | Use the producer route in <Throughout/> → Designs and add-ons. Settle the other choices and tell the unit. |
+| a unit director's decision only the user can settle | Use the producer route for design questions. File other decisions for the unit with `/showrunner:question`. Relay the answer to the unit that `answer` names. |
 | the user asks for a status | `/showrunner:units` |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
@@ -565,16 +574,21 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
-   That unit is under this showrunner or under a showrunner above it. The order names this production.
-   Without a merge unit, run this command in the background:
-   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
-   <showrunner name> <unit> <phase> <hash> --started <ISO>
+4. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
+   Give the order to a merge unit that serves the destination under `commands/unit/merge.md`.
+   Use a merge unit under the destination's showrunner or one of its ancestors.
+   Without a merge unit, start a detached run:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --session-dir "<STATE_DIR>"
+   --label "merge <unit> phase <phase>" -- ~/.claude/scripts/lib/py
+   ~/.claude/scripts/production/merge_checkpoint.py --production
+   <destination production> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
    --delivers "<one line of what the phase delivers>"`.
-   When several checkpoint notices wait, land them in one batch, in arrival order.
+   Group pending notices by destination production.
+   Use one batch file per destination. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
-   Run `merge_checkpoint.py --production <showrunner name> --batch <file>` through the same Python launcher.
+   Use the same detached start for `merge_checkpoint.py --production <destination production> --batch <file>`.
+   Stop a detached merge with `detached_runs.py stop --reason "<why>" <record>`.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
@@ -595,11 +609,9 @@ notice to the unit director before any merge command runs:
    bump: merge and push the code checkpoint first, then gate the pushed tip
    in a detached clone in the background; red goes to the unit and the
    showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
-   and `--from-child`. The script checks ancestry,
-   origin, scope and conflicts, reports overlaps with other units, merges,
-   tests, reruns red packages, pushes, promotes, and records the result. Its
-   first `held` or `failed` line stops a single-item run.
-   A batch drops stopped items and retries the remaining items once.
+   and `--from-child`. The script checks ancestry, origin, scope, conflicts, and overlaps before it merges.
+   A single checkpoint reruns red packages. The first hold or failure stops a batch.
+   Return every stopped row to its requester. Proceed with the next queued item.
    Send each final `send <unit>:` message to its unit director.
    A `merge director:` line names red tests or modules that are red on the
    base without the checkpoint. It goes to the merge director, who repairs
@@ -615,13 +627,11 @@ add rows and no proposals.
 For each distinct user-visible result:
 
 1. Check the project's live log for entries it replaces.
-2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
-   names each `C<n>` row it wrote under `## To review` in the list the
-   production doc's **Change review** line names, one per `Change-Review:`
-   line in the unit's checkpoint commits. The script holds a checkpoint whose
-   commit lacks the line before it merges. On a `change review: failed` line,
-   add the rows by hand; a `change review: drift` line names an earlier merge
-   whose rows are missing, which you add the same way.
+2. Read every `change review: ok` line from `merge_checkpoint.py`.
+   Identify each `C<n>` row by the list path on its report line.
+   The script holds a checkpoint if a commit lacks a `Change-Review:` line.
+   On a `change review: failed` line, add the missing rows to the named list.
+   On a `change review: drift` line, add the missing rows for the named merge.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
    `--project hana` or `--project claude`, every owning crate (claude has none), kind, title, summary, current behavior,
@@ -693,17 +703,14 @@ returns it to its unit.
 ---
 
 <DesignAuthority>
-The showrunner makes the production's visual choices: wording, spacing,
-layout, and which of two working options looks better. The bar is the user's:
-everything users see looks as professional and polished as it can be. The UX
-guide named in the production doc holds the rules that make the bar concrete.
+Use the producer route in **Designs and add-ons** for visual choices on List items.
+The producer answers from the agreed design or files the question for the user.
+The showrunner decides other visual choices for the production.
+The UX guide in the production doc gives the user's standards for wording, spacing, and layout.
 
-- Unit directors bring visual choices to the showrunner, not to the user.
-- When the guide answers a choice, apply it. When it does not and one option
-  is clearly more polished, pick that one and state it in one line.
-- A choice only the user's taste can settle goes to the user once. Write the
-  answer into the guide as a new rule the same turn, with `source:` quoting
-  the user, so no one asks again.
+- Apply the guide to the choices you handle. If the guide has no answer, select the clearly better option. State the decision in one line.
+- For a choice under the showrunner's authority, ask the user once if only their taste can settle it.
+- Record the user's answer in the guide in the same turn, with `source:` quoting the user.
 - A flaw found in one unit's shots is a flaw to look for in every unit's
   surfaces. Send it to the unit director of each unit that has it.
 - Before a ruling says to copy a working model, check that model live with one
@@ -865,7 +872,7 @@ Use `cargo-berth sequence` for merge order.
    is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 
-   `From the showrunner: <waiting unit> waits on your <what>. Checkpoint at your next green point; if only part is needed, checkpoint that part first.`
+   `<waiting unit> waits on your <what>. Checkpoint when your checks next pass. If the unit needs only part of the work, checkpoint that part first.`
 
    It checkpoints with polish unfinished. A regression never lands: gates
    pass, and the shots are no worse than `MERGE_BRANCH`. Polish not yet done is
@@ -932,9 +939,9 @@ Use `cargo-berth sequence` for merge order.
    A longer wait needs a logged reason. In a status report, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, start the waiting unit's next phase that does not need the
-   wait (Rules: parallel by default); else work inside its current phase: its
-   fix built in a scratch copy, tests, docs or research.
+   Start the waiting unit's next independent phase in a model worktree.
+   If it has no independent phase, start tests, docs, or research in its current phase.
+   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and an approval only the user can give in a unit director's own
    session (a permission prompt, an action that cannot be undone). A unit's
@@ -1050,7 +1057,7 @@ Otherwise, read the gating unit director's pane and the findings files in its
 unit session directory. If its latest round fixes only new edge cases, as the
 landing rule in <ProductionUnit/> defines them, send:
 
-`From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`
+`<waiting unit> waits on your phase <N> (G<k>). Apply the landing rule. Finish this round. Move the new edge cases to a follow-up phase. Checkpoint.`
 
 Before the hard landing, defects users can see are never deferred. Log the call.
 
