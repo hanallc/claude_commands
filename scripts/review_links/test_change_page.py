@@ -850,7 +850,9 @@ class ChangePageTests(unittest.TestCase):
     def write_delivery_config(self, tries: int = 3, pause: int = 0) -> None:
         _ = write_config_fixture(self.temporary / "config/review_links.conf",
                                  f"delivery_tries={tries}\ndelivery_pause_seconds={pause}\nfeedback_rows=5\n"
-                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n")
+                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n"
+                                 # Undo is off, so each send saves at once; test_send_hold and test_serve check the wait.
+                                 + "undo_seconds=0\n")
 
     def fail_all_but_alerts(self, calls: list[str]) -> Callable[[str, str, str], None]:
         def send(recipient: str, sender: str, message: str, **_options: str) -> None:
@@ -3949,7 +3951,7 @@ class ChangePageTests(unittest.TestCase):
    check(current!==row && row.dataset.pending==='false','Does not work shows the next change before the server answers');
    check(!saveNotice.hidden && saveNotice.textContent==='Saving review.','the notice says the review is saving');
    const shown=current;
-   answer({ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
+   answer({headers:new Headers(),ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
    check(current===shown,'a failed save does not move the shown change');
    check(row.dataset.pending==='true' && !form.hidden,'a failed save puts the change back in the list');
    check(field.value==='Keep <these> words','failed save keeps the text');

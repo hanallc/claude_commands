@@ -874,7 +874,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + page_frame.HELD_SEND_SCRIPT + r'''
 let content=document.querySelector('[data-review-content]');
 const motion=createCardMotion(()=>content);
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
@@ -964,7 +964,9 @@ async function save(row,form,outcome){
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
  if(early) moveOn('Saving review.');
  try{
-  const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
+  // A Skip only moves the item, so it needs no Undo.
+  const send=outcome==='skip' ? fetch : heldFetch;
+  const response=await send(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
   state.textContent=reply.answer ? 'Saved: '+reply.answer :
@@ -976,13 +978,15 @@ async function save(row,form,outcome){
   if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
   else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
  }catch(error){
+  const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  row.dataset.saveState=undone ? '' : 'failed'; state.textContent=undone ? reason : 'Not saved: '+reason;
   if(early){
    row.dataset.pending='true';form.hidden=false;show();
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
+   saveNotice.replaceChildren((undone ? 'Undone: ' : 'Not saved: ')+row.dataset.shown+'. '+(undone ? '' : reason+' ')
+    +'It is back in the list. ',open);
    saveNotice.hidden=false;
   }
  }finally{

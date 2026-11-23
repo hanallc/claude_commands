@@ -57,7 +57,7 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
-# A send to one of these pages can wait for Undo. The largest held send is a New item with its images.
+# A send to one of these pages, or to a change browser, can wait for Undo. The largest is a New item with its images.
 HELD_SEND_PATHS = frozenset((review_page.PAGE_PATH, list_page.PAGE_PATH, images.PAGE_PATH, review_page.NEW_ITEM_PATH))
 HELD_SEND_LIMIT = MAX_NEW_ITEM_BODY
 SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
@@ -930,11 +930,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         root = server.root
         route = urlsplit(self.path)
         fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options:
+        held = route.path.startswith(send_hold.HOLD_PATH + "/")
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options and not held:
             self.send_error(404)
             return None
-        if route.path.startswith(send_hold.HOLD_PATH + "/"):
-            self.hold_result(route.path.removeprefix(send_hold.HOLD_PATH + "/"))
+        if held:
+            # A result read is used once by the page, so HEAD gets no answer.
+            if self.command == "GET":
+                self.hold_result(route.path.removeprefix(send_hold.HOLD_PATH + "/"))
+            else:
+                self.send_error(405)
             return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
             self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
@@ -1279,7 +1284,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
         route = urlsplit(self.path)
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
+        if (server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH
+                and not route.path.startswith(send_hold.HOLD_PATH + "/")):
             self.send_error(404)
             return
         if route.path == QUEUE_MOVE_PATH:
@@ -1294,10 +1300,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             else:
                 self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
             return
-        if route.path.startswith(send_hold.HOLD_PATH + "/") or (
-                self.headers.get(send_hold.HOLD_HEADER) == "1" and route.path in HELD_SEND_PATHS):
-            self.hold_post(route)
+        if route.path.startswith(send_hold.HOLD_PATH + "/"):
+            self.undo_post(route)
             return
+        if self.headers.get(send_hold.HOLD_HEADER) == "1" and self.held_send_path(route.path):
+            # Zero seconds turns Undo off, so the send goes to its handler at once.
+            seconds = conf.read("review_links").whole("undo_seconds")
+            if seconds:
+                self.hold_post(route, seconds)
+                return
         if route.path == review_page.NEW_ITEM_PATH:
             self._write_post(self.new_item_post)
             return
@@ -2312,30 +2323,53 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def hold_post(self, route: SplitResult) -> None:
-        """Hold a marked send for Undo, or undo a held send."""
+    def held_send_path(self, path: str) -> bool:
+        """Say whether a send to this path can wait for Undo: a console send page or a change browser."""
+        server = cast(ReviewLinksServer, self.server)
+        if path in HELD_SEND_PATHS:
+            return True
+        try:
+            _ = change_browser.page_at(server.root, path)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def undo_post(self, route: SplitResult) -> None:
+        """Undo a held send, or send it at once because its page closed."""
         server = cast(ReviewLinksServer, self.server)
         if not self.same_origin(required=True) or route.query:
             self.json_response(403, {"reason": "Send from the console page."})
             return
-        if route.path.startswith(send_hold.HOLD_PATH + "/"):
-            hold_id, _, action = route.path.removeprefix(send_hold.HOLD_PATH + "/").partition("/")
-            if action != "undo" or not send_hold.valid_hold_id(hold_id):
-                self.json_response(404, {"reason": "No such send."})
-                return
-            outcome = server.send_holds.undo(hold_id)
-            status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
-            self.json_response(status, {"outcome": outcome.value})
+        hold_id, _, action = route.path.removeprefix(send_hold.HOLD_PATH + "/").partition("/")
+        if action not in ("undo", "send") or not send_hold.valid_hold_id(hold_id):
+            self.json_response(404, {"reason": "No such send."})
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = -1
-        if not 0 < length <= HELD_SEND_LIMIT:
+        if action == "send":
+            self.json_response(200 if server.send_holds.send_now(hold_id) else 409, {})
+            return
+        outcome = server.send_holds.undo(hold_id)
+        status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
+        self.json_response(status, {"outcome": outcome.value})
+
+    def hold_post(self, route: SplitResult, seconds: int) -> None:
+        """Hold a marked send for Undo."""
+        server = cast(ReviewLinksServer, self.server)
+        if not self.same_origin(required=True) or route.query:
+            self.json_response(403, {"reason": "Send from the console page."})
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self.json_response(400, {"reason": "The send has no valid size."})
+            return
+        size = int(lengths[0])
+        if not 0 < size <= HELD_SEND_LIMIT:
             self.json_response(400, {"reason": "The send is empty or too large."})
             return
-        seconds = conf.read("review_links").whole("undo_seconds")
-        hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), self.rfile.read(length), seconds)
+        body = self.rfile.read(size)
+        if len(body) != size:
+            self.json_response(400, {"reason": "The send is incomplete."})
+            return
+        hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds)
         self.json_response(202, send_hold.held_fields(hold_id, seconds), hold="held")
 
     def hold_result(self, hold_id: str) -> None:
@@ -2785,6 +2819,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             try:
                 _ = sweep_snapshots(self.root, time.time())
                 self.page_captures.expire()
+                self.send_holds.expire()
             except OSError as error:
                 print(f"review-links sweep: {error}", file=sys.stderr)
         if now >= self.next_code_check:
@@ -2800,6 +2835,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     with self.branch_deletions_lock:
                         if self.branch_deletions:
                             return
+                    # A restart during a replay could lose its result, and recovery would then send it again.
+                    if self.send_holds.busy():
+                        return
                     raise CodeChanged(f"code changed: {path}")
             self.module_stamps.update(stamps)
             if (self.delivery_status.has_deferred_questions()

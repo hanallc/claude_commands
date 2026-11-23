@@ -819,11 +819,33 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
         self.assertIn(cast(str, fields["key"]), cache.get().records)
         self.assertEqual(len(investigation.records(other.id)), 1)
-        self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 404)
-        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/{hold_id}/undo")[:2], (404, ""))
+        # A browser that lost the answer reads the same result again; an Undo is now too late.
+        self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[::2], (200, fields))
+        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/{hold_id}/undo")[::2],
+                         (409, {"outcome": "already sent"}))
+        self.assertEqual(self.held_http("HEAD", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 405)
+
+    def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual(status, 202, fields)
+            hold = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+            self.assertEqual(self.held_http("POST", hold + "/send")[0], 200)
+            status, _, fields = self.held_http("GET", hold)
+            self.assertEqual(status, 200, fields)
+            self.assertEqual(self.held_http("POST", hold + "/send")[0], 409)
+            send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
+        self.assertEqual(len(investigation.records(other.id)), 1)
 
     def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
         case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
@@ -845,8 +867,11 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
         marked = {send_hold.HOLD_HEADER: "1"}
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
-        for path in sorted(serve.HELD_SEND_PATHS):
+        _ = self.enterContext(patch.object(change_browser, "browser_manifest", return_value=("token", "")))
+        browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
+        for path in [*sorted(serve.HELD_SEND_PATHS), browser]:
             with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
                 status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
                 self.assertEqual((status, hold), (202, "held"), fields)
@@ -854,6 +879,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"
                 self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
         status, hold, _ = self.held_http("POST", serve.QUEUE_MOVE_PATH, b"{}", headers=marked)
+        self.assertNotEqual((status, hold), (202, "held"))
+        status, hold, _ = self.held_http("POST", "/z12345/notes.html", b"{}", headers=marked)
         self.assertNotEqual((status, hold), (202, "held"))
         self.assertEqual(self.held_http("POST", review_page.PAGE_PATH + "?x=1", b"words", headers=marked)[0], 403)
         self.assertEqual(self.held_http("POST", review_page.PAGE_PATH, b"", headers=marked)[0], 400)

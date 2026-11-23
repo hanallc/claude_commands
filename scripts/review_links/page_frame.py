@@ -565,12 +565,13 @@ HELD_SEND_STYLE = '''
 [data-send-undo-stack]{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;
 display:grid;gap:8px;margin:0;width:max-content;max-width:calc(100vw - 32px)}
 [data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
-border:1px solid #fff3;border-radius:8px;background:#222;color:#fff;box-shadow:0 4px 16px #0008;
-font:500 14px/20px system-ui,sans-serif;overflow:hidden}
-[data-send-undo] button{padding:4px 10px;border:0;border-radius:4px;background:none;color:#8ab4ff;
+border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#141b28);color:var(--text,#e4eaf4);
+box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden}
+[data-send-undo] button{padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
 font:600 14px/20px system-ui,sans-serif;cursor:pointer}
 [data-send-undo] button:is(:hover,:focus-visible){background:#fff2}
-[data-send-undo-bar]{position:absolute;left:0;right:0;bottom:0;height:3px;background:#8ab4ff;transform-origin:left}
+[data-send-undo-bar]{position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--accent,#c2d4ff);
+transform-origin:left}
 '''
 
 HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
@@ -580,8 +581,9 @@ HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.
 function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
-function showSendUndo(hold,seconds,label){
- const host=sendUndoHost();
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function showSendUndo(hold,seconds){
+ const host=sendUndoHost(),view=host.defaultView || window;
  if(!host.querySelector('style[data-send-undo-style]')){
   const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
   host.head.append(style);
@@ -593,7 +595,7 @@ function showSendUndo(hold,seconds,label){
  }
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
- toast.dataset.sendUndo='';text.textContent=label;button.type='button';button.textContent='Undo';
+ toast.dataset.sendUndo='';text.textContent='Sending';button.type='button';button.textContent='Undo';
  bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
  // The Undo stays clear for the first half of the time, then fades out until the send leaves.
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
@@ -601,33 +603,51 @@ function showSendUndo(hold,seconds,label){
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
  return new Promise(resolve=>{
   let done=false;
+  const remove=()=>{
+   toast.remove();view.removeEventListener('pagehide',closed);
+   if(!stack.children.length) stack.remove();
+  };
   const finish=undone=>{
    if(done) return;
-   done=true;toast.remove();
-   if(!stack.children.length) stack.remove();
-   resolve(undone);
+   done=true;remove();resolve(undone);
   };
+  // A closed console sends at once. A card frame that goes away leaves the send to the server timer.
+  const closed=()=>{
+   if(done) return;
+   done=true;remove();
+   fetch(SEND_HOLD_PATH+'/'+hold+'/send',{method:'POST',keepalive:true}).catch(()=>{});
+  };
+  view.addEventListener('pagehide',closed);
   fade.finished.then(()=>finish(false),()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
+   let undone=false;
    try{
-    const response=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'});
-    finish(response.ok);
-   }catch{
-    finish(false);
-   }
+    undone=(await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'})).ok;
+   }catch{}
+   if(undone){finish(true);return;}
+   // The server released the send before the Undo reached it.
+   done=true;resolve(false);
+   text.textContent='Too late to undo. Sent.';button.remove();bar.remove();fade.cancel();
+   pause(3000).then(remove);
   });
  });
 }
-async function heldFetch(url,init={},label='Sending'){
+async function heldFetch(url,init={}){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const first=await fetch(url,{...init,headers});
  if(first.headers.get('X-Send-Hold')!=='held') return first;
  const {hold,seconds}=await first.json();
- if(await showSendUndo(hold,seconds,label)) throw new SendUndone();
- for(;;){
-  const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-  if(response.headers.get('X-Send-Hold')!=='pending') return response;
+ if(await showSendUndo(hold,seconds)) throw new SendUndone();
+ // A server restart drops the connection; the held send waits in its file, so read its result again.
+ for(let failures=0;;){
+  try{
+   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
+   if(response.headers.get('X-Send-Hold')!=='pending') return response;
+  }catch(error){
+   if(++failures>30) throw error;
+   await pause(1000);
+  }
  }
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;

@@ -270,7 +270,7 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
+        self.assertIn("status.textContent = undone ? error.message : 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")

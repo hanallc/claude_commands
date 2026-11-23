@@ -448,6 +448,8 @@ class ListPageTests(unittest.TestCase):
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n"
             + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
+            # Undo is off, so each send saves at once; test_send_hold and test_serve check the wait.
+            + "# whole: 0..60\nundo_seconds=0\n"
             + "# range: 0.5..60\nframe_retry_seconds=2\n"
             + "# range: 0.001..\ntailscale_check_seconds=60\n"
             + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
@@ -2741,7 +2743,7 @@ document.body.append(result);
 let countRequests=[],sendCounts;
 window.fetch=async (url,options)=>{
  countRequests.push([url,options.cache]);
- return new Promise(resolve=>{sendCounts=()=>resolve({ok:true,text:async()=>MARKUP});});
+ return new Promise(resolve=>{sendCounts=()=>resolve({headers:new Headers(),ok:true,text:async()=>MARKUP});});
 };
 </script>""".replace("MARKUP", json.dumps(response))
                 probe = """
@@ -2866,7 +2868,7 @@ AbortSignal.timeout=milliseconds=>{
 window.fetch=(url,options)=>{
  if(!String(url).includes('?counts=')) return Promise.resolve(new Response(page));
  return new Promise((resolve,reject)=>{
-  const request={url,signal:options.signal,finish:markup=>resolve({ok:true,text:()=>Promise.resolve(markup)})};
+  const request={url,signal:options.signal,finish:markup=>resolve({headers:new Headers(),ok:true,text:()=>Promise.resolve(markup)})};
   requests.push(request);
   request.signal.addEventListener('abort',()=>reject(request.signal.reason));
  });
@@ -3249,7 +3251,7 @@ const requests=[];let finishPost;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
- return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
+ return new Promise(resolve=>finishPost=result=>resolve({headers:new Headers(),ok:result.ok!==false,status:result.ok===false ? 400 : 200,
   json:async()=>({unread:'false',...result})}));
 };
 </script>'''
@@ -3283,7 +3285,7 @@ window.fetch=async(_path,options={})=>{
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
   await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
-  finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
+  finishPost({headers:new Headers(),ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
@@ -3533,7 +3535,7 @@ window.fetch=async(_path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.reason ? 400 : 200,
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -5892,7 +5894,7 @@ window.fetch=async(_url,options)=>{
  let countReads=0,lastPageQuery;
  window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
-  if(query.has('counts')){countReads++;return Promise.resolve({ok:true,text:async()=>DEFERRED_LINKS});}
+  if(query.has('counts')){countReads++;return Promise.resolve({headers:new Headers(),ok:true,text:async()=>DEFERRED_LINKS});}
   if(options?.method!=='POST') lastPageQuery=query;
   return fetchPage(url,options);
  };
@@ -6577,8 +6579,8 @@ window.fetch=async(path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  failPostBody=()=>resolve({ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
-  finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
+  failPostBody=()=>resolve({headers:new Headers(),ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -7432,7 +7434,7 @@ try{
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  check(reads.length===3,'The shared status event makes no List request during a row save.');
- finishPost({ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
+ finishPost({headers:new Headers(),ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
  holdPost=false;finishPost=undefined;
  await refused;
  check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');

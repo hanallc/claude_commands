@@ -54,22 +54,57 @@ class HoldsTests(unittest.TestCase):
         self.assertIs(holds.result(hold_id, wait=0), HoldState.MISSING)
         self.assertEqual(replays.sent, [])
 
-    def test_the_send_leaves_when_the_time_ends_and_its_result_is_read_once(self) -> None:
+    def test_the_send_leaves_when_the_time_ends_and_its_result_stays_until_the_sweep(self) -> None:
         replays = Replays()
         holds = Holds(self.folder, replays)
-        hold_id = holds.hold("/review", {"Origin": "http://host", "X-Undo-Hold": "1", "Cookie": "c"}, b"words", 0.05)
+        headers = {"origin": "http://host", "X-Undo-Hold": "1", "Cookie": "c", "Content-Type": "text/plain"}
+        hold_id = holds.hold("/review", headers, b"words", 0.05)
         self.assertEqual(holds.result(hold_id, wait=5), OK)
-        self.assertEqual(replays.sent, [("/review", {"Origin": "http://host"}, b"words")])
-        self.assertIs(holds.result(hold_id, wait=0), HoldState.MISSING)
+        self.assertEqual(replays.sent, [("/review", {"origin": "http://host", "Content-Type": "text/plain"}, b"words")])
+        # A browser that lost the answer reads it again.
+        self.assertEqual(holds.result(hold_id, wait=0), OK)
+        holds.expire()
+        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        with patch.object(send_hold, "RESULT_KEEP_SECONDS", -1.0):
+            holds.expire()
         self.assertEqual(self.held_files(), [])
+        self.assertIs(holds.result(hold_id, wait=0), HoldState.MISSING)
 
     def test_an_undo_after_the_send_left_says_already_sent(self) -> None:
         replays = Replays()
         holds = Holds(self.folder, replays)
         hold_id = holds.hold("/list", {}, b"words", 0.0)
         self.assertTrue(replays.done.wait(5))
-        self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
         self.assertEqual(holds.result(hold_id, wait=5), OK)
+        self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
+        self.assertEqual(replays.sent, [("/list", {}, b"words")])
+
+    def test_send_now_releases_a_pending_send_once(self) -> None:
+        replays = Replays()
+        holds = Holds(self.folder, replays)
+        hold_id = holds.hold("/review", {}, b"words", 60)
+        self.assertTrue(holds.send_now(hold_id))
+        self.assertEqual(holds.result(hold_id, wait=5), OK)
+        self.assertFalse(holds.send_now(hold_id))
+        self.assertIs(holds.undo(hold_id), UndoResult.ALREADY_SENT)
+        self.assertEqual(len(replays.sent), 1)
+
+    def test_the_holds_are_busy_while_a_replay_runs(self) -> None:
+        started, finish = threading.Event(), threading.Event()
+
+        def slow(_path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
+            started.set()
+            _ = finish.wait(5)
+            return OK
+
+        holds = Holds(self.folder, slow)
+        hold_id = holds.hold("/review", {}, b"words", 0.0)
+        self.assertTrue(started.wait(5))
+        self.assertTrue(holds.busy())
+        self.assertIs(holds.result(hold_id, wait=0), HoldState.PENDING)
+        finish.set()
+        self.assertEqual(holds.result(hold_id, wait=5), OK)
+        self.assertFalse(holds.busy())
 
     def test_a_failed_replay_gives_a_503_result(self) -> None:
         def refused(_path: str, _headers: Mapping[str, str], _body: bytes) -> HeldResponse:
@@ -84,16 +119,15 @@ class HoldsTests(unittest.TestCase):
     def test_a_restart_sends_each_held_send_and_deletes_old_results(self) -> None:
         before = Holds(self.folder, Replays())
         waiting = before.hold("/review", {}, b"words", 60)
-        timer = before._timers.pop(waiting)  # pyright: ignore[reportPrivateUsage]
-        timer.cancel()
-        saved = json.loads((self.folder / f"{waiting}.json").read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
-        saved["due"] = time.time()
-        _ = (self.folder / f"{waiting}.json").write_text(json.dumps(saved), encoding="utf-8")
+        _ = before.undo(waiting)
+        pending: send_hold.PendingFile = {"state": "pending", "path": "/review", "headers": {}, "body": "d29yZHM=",
+                                          "due": time.time()}
+        _ = (self.folder / f"{waiting}.json").write_text(json.dumps(pending), encoding="utf-8")
         old = "0" * 24
-        _ = (self.folder / f"{old}.json").write_text(json.dumps({
-            "id": old, "path": "/review", "headers": {}, "body": "", "due": 0.0,
-            "response": {"status": 200, "content_type": "text/plain", "body": ""},
-            "released_at": time.time() - send_hold.RESULT_KEEP_SECONDS - 1}), encoding="utf-8")
+        released: send_hold.ReleasedFile = {
+            "state": "released", "status": 200, "content_type": "text/plain", "body": "",
+            "released_at": time.time() - send_hold.RESULT_KEEP_SECONDS - 1}
+        _ = (self.folder / f"{old}.json").write_text(json.dumps(released), encoding="utf-8")
         _ = (self.folder / "not-a-hold.json").write_text("{}", encoding="utf-8")
 
         replays = Replays()
@@ -101,12 +135,13 @@ class HoldsTests(unittest.TestCase):
         after.recover()
         self.assertEqual(after.result(waiting, wait=5), OK)
         self.assertEqual(replays.sent, [("/review", {}, b"words")])
-        self.assertEqual(self.held_files(), ["not-a-hold.json"])
+        self.assertEqual(self.held_files(), [f"{waiting}.json", "not-a-hold.json"])
 
 
 HELD_SEND_PROBE = r"""<script>
 (async () => {
- const failures = [], calls = [], hold = 'a'.repeat(24), host = window.top.document;
+ const failures = [], calls = [], hold = 'a'.repeat(24), late = 'b'.repeat(24), flaky = 'c'.repeat(24);
+ const host = window.top.document;
  const check = (ok, label) => { if (!ok) failures.push(label); };
  const wait = ms => new Promise(done => setTimeout(done, ms));
  const realFetch = window.fetch.bind(window);
@@ -114,6 +149,10 @@ HELD_SEND_PROBE = r"""<script>
   url = String(url);
   calls.push([init.method || 'GET', url, new Headers(init.headers).get('X-Undo-Hold')]);
   if (url === '/send') return new Response(JSON.stringify({hold, seconds: 1.2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
+  if (url === '/late') return new Response(JSON.stringify({hold: late, seconds: 5}), {status: 202, headers: {'X-Send-Hold': 'held'}});
+  if (url === '/flaky') return new Response(JSON.stringify({hold: flaky, seconds: .2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
+  if (url === '/send-hold/' + late + '/undo') return new Response('{"outcome":"already sent"}', {status: 409});
+  if (url === '/send-hold/' + flaky && calls.filter(([, called]) => called === url).length < 2) throw new TypeError('restart');
   if (url === '/plain') return new Response('{"plain":true}', {status: 200});
   if (url.endsWith('/undo')) return new Response('{"outcome":"undone"}', {status: 200});
   if (url.startsWith('/send-hold/')) {
@@ -150,6 +189,14 @@ HELD_SEND_PROBE = r"""<script>
  check(!host.querySelector('[data-send-undo]'), 'The toast goes after the send.');
  const plain = await heldFetch('/plain', {method: 'POST', body: 'words'});
  check((await plain.json()).plain === true, 'A send that the server does not hold returns at once.');
+ const lateSend = heldFetch('/late', {method: 'POST', body: 'words'});
+ await wait(100);
+ host.querySelector('[data-send-undo] button')?.click();
+ check((await lateSend).status === 200, 'A late Undo gives the real response.');
+ check(host.querySelector('[data-send-undo]')?.textContent === 'Too late to undo. Sent.', 'A late Undo says the send left.');
+ const flakyStarted = performance.now();
+ check((await heldFetch('/flaky', {method: 'POST', body: 'words'})).status === 200, 'A lost result read is read again.');
+ check(performance.now() - flakyStarted >= 1000, 'The read waits before it tries again.');
  await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
 })().catch(error => fetch('/results', {method: 'POST', body: JSON.stringify([String(error)])}));
 </script>"""

@@ -1506,6 +1506,11 @@ SCRIPT = r'''(() => {
     pendingItem = deferredCapture = undefined;
     pendingEdited = false;
    }
+   // After an Undo, the next Send builds the item again from the edited words.
+   if (failure instanceof SendUndone) {
+    pendingItem = undefined;
+    pendingEdited = false;
+   }
    if (failure?.filedId) {
     discardCapture();
     finishDraft();

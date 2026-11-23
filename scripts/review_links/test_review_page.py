@@ -343,7 +343,7 @@ window.fetch=(url,options)=>{
  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
  const motion=copy(id)?.getAnimations()[0];
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The Response save must start the fade.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
  motion.finish();await frame();
  check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
   'The Response leaves the view after one submit.');
@@ -5677,7 +5677,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const clip=copy(panel),exit=clip.getAnimations()[0];
  halfway(exit);
  const position=top(clip);
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
  await frame();
  check(selected()===owner && !owner.hidden,'The last owner stays selected and visible during the fade.');
  check(copy(panel)===clip && near(top(clip),position) && !rows().length,
@@ -5717,7 +5717,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const clip=copy(motionKey(row));
  const motion=clip?.getAnimations()[0];
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The save must start the fade.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
  motion.finish();await frame();
  if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
   'The completed item leaves Review.');
@@ -5740,7 +5740,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const secondClip=copy(secondPanel);halfway(secondClip.getAnimations()[0]);
  const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
  const following=top(next);
- posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
+ posts.get(first.dataset.key)({headers:new Headers(),ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const restored=copy(firstPanel);
  check(restored && restored!==firstClip,'The refused card reverses its fade.');
@@ -5763,7 +5763,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  send(await openCard(second));
  const secondClip=copy(secondPanel),secondExit=secondClip.getAnimations()[0];
  halfway(secondExit);
- posts.get(firstKey)({ok:false,json:async()=>({reason:'Try again.'})});
+ posts.get(firstKey)({headers:new Headers(),ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const returning=copy(firstPanel),returnFade=returning.getAnimations()[0];
  check(returnFade!==firstExit,'The refused card starts its return fade.');
@@ -5792,7 +5792,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
  await frame();
  check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
  check(near(top(next),following),'The next card keeps its position when the save completes.');
@@ -5823,7 +5823,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
  const form=await readyReviewCard(remounted);
  check(form.dataset.sending==='true','The remounted form shows the pending save.');
- posts.get(key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
  await frame();
  check(!current(),'The completed row leaves the table.');
  const exit=copy(panel)?.getAnimations()[0];
@@ -6434,8 +6434,8 @@ window.fetch=async(_url,options={})=>{
  const shown=()=>rows().filter(row=>!row.hidden);
  const holdPost=()=>{
   let finish;nextPost=new Promise(resolve=>{finish=resolve;});
-  return {save:()=>finish({ok:true,json:async()=>({answer:'works'})}),
-   refuse:reason=>finish({ok:false,json:async()=>({reason})})};
+  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({answer:'works'})}),
+   refuse:reason=>finish({headers:new Headers(),ok:false,json:async()=>({reason})})};
  };
  const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
    .some(node=>node.textContent.includes(text) && node.getClientRects().length);
@@ -6955,7 +6955,7 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
 const nativeFetch=fetch;
 window.setInterval=()=>0;
 Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
-window.fetch=async()=>({ok:true,text:async()=>MARKUP});
+window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
 </script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
         probe = r"""<script>
 (async()=>{
