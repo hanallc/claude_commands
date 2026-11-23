@@ -23,6 +23,7 @@ if __name__ == "__main__":
 
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.mac_test import floor_claims
 
 DIRECTORY = ".local/state/mac-test/logs"
 LOG_NAME = re.compile(r"nextest\.[a-z0-9_]{8}", re.IGNORECASE)
@@ -136,8 +137,6 @@ def replay_log(log: BinaryIO, path: Path, status: int, limits: NextestOutputLimi
 
 def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: BinaryIO) -> int | None:
     """Hold the log lock through dispatch and replay."""
-    from scripts.copies import copies
-
     root = Path.home() / DIRECTORY
     with ExitStack() as files:
         try:
@@ -151,7 +150,7 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
                 log = files.enter_context(os.fdopen(descriptor, "w+b", closefd=False))
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 status = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                                        pass_fds=copies.inherited_mirror_descriptors(), check=False).returncode
+                                        pass_fds=floor_claims.inherited_mirror_descriptors(), check=False).returncode
             except (OSError, ValueError):
                 path.unlink(missing_ok=True)
                 raise

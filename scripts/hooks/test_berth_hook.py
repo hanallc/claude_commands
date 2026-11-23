@@ -26,6 +26,7 @@ from scripts.production.staff_test_support import (  # noqa: E402
     fixture_runtime_id, fixture_worker, fixture_unit_location, isolated_staff_file, showrunner_relationship, unit_membership,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
 DIRECTOR = fixture_runtime_id("sid-director")
@@ -99,7 +100,7 @@ class BerthHookTests(unittest.TestCase):
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
             "DESIGN_ROLES_HOST": "fixture-host",
             **model_worktree_environment(self.root, self.root / "config"),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
         }
         with mock.patch.dict(os.environ, self.environment, clear=True):
             self.repo = make_fixture_worktree(self.main, "design-unit", "home")
