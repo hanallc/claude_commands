@@ -391,12 +391,12 @@ STYLE = """<style>[hidden]{display:none!important}
 [data-image-form] .review-actions button{margin:0}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
-[data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
+[data-image-layout]{display:grid;grid-template-columns:max-content minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;
 top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px) + var(--page-status-height,0px) + 16px);
 max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-heading-space,0px)
 - var(--page-heading-height,0px));overflow:auto;display:grid;
-grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}
+grid-template-columns:repeat(3,max-content);font-size:14px;border:1px solid #8886;border-radius:8px;white-space:nowrap}
 [data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;cursor:pointer;
 color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a+a{border-top:1px solid #8884}
@@ -404,9 +404,9 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8883;outline:none}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
-[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
+[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content;white-space:normal}}
 @media (min-width:1108px){
-[data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
+[data-image-layout]{grid-template-columns:max-content minmax(0,1fr);column-gap:64px}
 [data-image-layout]>div{width:100%;max-width:1376px;justify-self:center}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""

@@ -198,6 +198,7 @@ Scrolling never changes the layout of the content, and at scroll zero the row st
 On a narrow page the row can wrap to more lines.
 The AWS region filter sticks directly below the heading row and any sticky status line.
 The Images group index sticks 16 px below the heading row and any sticky status line.
+Above 900 px the index is as wide as its widest row, so no name or time wraps.
 The stacking order, from lowest to highest, is as follows:
 1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
 2. The heading row (z-index 4).

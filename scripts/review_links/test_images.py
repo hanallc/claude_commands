@@ -1679,6 +1679,13 @@ class ImagePairTests(ImagesFixture):
   if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
    failures.push('The image group index must stick below the heading row.');
   }
+  groups.querySelector('a span').textContent='admin-console-reviewer';
+  await painted();
+  for(const cell of groups.querySelectorAll('a > span')){
+   const range=document.createRange();
+   range.selectNodeContents(cell);
+   if(range.getClientRects().length!==1) failures.push('The group cell "'+cell.textContent+'" must stay on one line.');
+  }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
