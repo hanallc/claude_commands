@@ -1292,7 +1292,7 @@ async function inspect(){
  submit('works');
  if(!phone){
   await changed(dialog,()=>!close.disabled,'the verdict is saved');
-  check(status()==='' && card.querySelector('[data-send-status]').hidden,'The verdict shows no status text.');
+  check(status()==='' && !card.querySelector('[data-send-status]'),'The verdict shows no status text.');
   await animationFrames(win);
   check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
@@ -5858,7 +5858,9 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  form.elements.words.value='Keep these unsent words.';
  form.elements.words.dispatchEvent(new Event('input'));
  form.elements.until.value='2026-12-03';
- submit(ACTION);losePost();await flush();
+ submit(ACTION);
+ if(ACTION==='park') await loseParkPost();
+ losePost();await flush();
  check(recordIsOpen(row) && row.dataset.waitingForAnswer==='true' &&
   detail.querySelector('[data-feedback-form]')!==original && detail.textContent.includes(text) &&
   row.dataset.detailRevision==='new-waiting-revision' &&
@@ -6514,6 +6516,7 @@ window.fetch=async(_url,options)=>{
  form.elements.words.dispatchEvent(new Event('input'));
  submit(action);
  if(action==='question') finishPost({delivery_pending:false,detail_unavailable:true});
+ else if(action==='park'){await loseParkPost();losePost();}
  else losePost();
  await flush();
  check(reads===(headerStall ? 0 : 1),'The request stalls at the selected stage.');

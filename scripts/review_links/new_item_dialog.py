@@ -1407,7 +1407,9 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
   }
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
+  // A refusal belongs to the page that sent it, so a new dialog starts without one.
   sendNotice.hidden = true;
+  sendNotice.textContent = '';
   includePage.closest('label').hidden = false;
   recipients = null;
   recipientChips.replaceChildren();

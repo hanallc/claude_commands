@@ -1832,7 +1832,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
  };
  function choose(){
   const draft=parseDateTimeDraft(field.value);
-  if(draft && (Number.isFinite(retryTime()) || dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now())){
+  if(draft && dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now()){
    selected=draft.date;time.value=dateTimeClock(draft.minutes);
   }else{
    selected=today();selected.setUTCDate(selected.getUTCDate()+1);

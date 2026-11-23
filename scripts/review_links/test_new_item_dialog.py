@@ -83,14 +83,14 @@ const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
 const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
 const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
- const status = dialog.querySelector('[data-recipients-status]');
+ const loading = dialog.querySelector('[data-recipients-loading]');
  const observer = new MutationObserver(() => {
-  if (!status.hidden) return;
+  if (!loading.hidden) return;
   observer.disconnect();
   if (kind) selectType(kind);
   resolve();
  });
- observer.observe(status, {attributes:true, attributeFilter:['hidden']});
+ observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
  launch.closest('[data-page-owner]').dataset.pageOwner = page;
  launch.click();
 });
@@ -1056,6 +1056,7 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('#review-new-item');
 const send = dialog.querySelector('[type="submit"]'), words = dialog.querySelector('textarea');
 const status = dialog.querySelector('[data-recipients-status]');
+const loading = dialog.querySelector('[data-recipients-loading]');
 const launch = document.querySelector('[data-owner-new]');
 const include = dialog.querySelector('[name="include_page"]');
 const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
@@ -1089,7 +1090,7 @@ function waitFor(test) {
 }
 async function open() {
  launch.click();
- await waitFor(() => status.textContent !== 'Loading recipients…');
+ await waitFor(() => loading.hidden);
  if (include.checked) include.click();
 }
 function checkEmpty() {

@@ -536,7 +536,7 @@ class ImagesTests(ImagesFixture):
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '</div></div><div class="review-action-group"><span>The item returns to you</span><div>'
             + '<button type="submit" name="action" value="question">Ask question</button></div></div></div>'
-            + '<span role="status" data-image-status></span></form></article>'))
+            + '<span role="status" data-image-status hidden></span></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
 
@@ -1339,7 +1339,8 @@ async (find, whenPageShows, check, controlRefresh) => {
 async (find, whenPageShows, check) => {
  const card = find('Question fixture'), form = card.querySelector('form');
  const notice = document.getElementById('image-action-failure');
- form.requestSubmit(form.querySelector('button[value="delete"]'));
+ // A post without an action is the legacy delete.
+ form.requestSubmit();
  await whenPageShows('the refresh failure', () => !notice.hidden);
  check(notice.textContent === 'Update failed: HTTP 503', 'The page notice shows the refresh error.');
  check(!card.isConnected, 'The deleted card stays out of the list.');
@@ -1349,7 +1350,7 @@ async (find, whenPageShows, check) => {
  check(!find('Question fixture'), 'The refreshed list also leaves the deleted card out.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe), fail_first_refresh=True)
-        self.assertEqual([request['action'] for request in requests], [['delete']])
+        self.assertEqual([request.get('action') for request in requests], [None])
 
     @staticmethod
     def question_probe(check_page: str) -> str:

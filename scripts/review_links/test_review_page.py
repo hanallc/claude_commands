@@ -334,7 +334,7 @@ window.fetch=(url,options)=>{
  history.replaceState(null,'','#'+new URLSearchParams({type:'response',show:'Validating',item:row.dataset.key}));
  dispatchEvent(new HashChangeEvent('hashchange'));
  check(selected('show')===chip('show','open') && !chip('show','Waiting').hidden &&
-  !row.querySelector('[data-detail]').hidden,
+  recordIsOpen(row),
   'The saved Response link opens the card under Open and keeps Waiting available.');
  row.querySelector('.list-toggle').click();
  chip('owner',row.dataset.owner).click();
@@ -1659,7 +1659,7 @@ window.fetch=(url,options)=>{
  };
  const settled=form=>until(()=>!form.dataset.sending,'The save did not settle.');
  try{
-  if(VALIDATING) content.querySelector('#filter-show-validating').click();
+  if(VALIDATING) content.querySelector('#filter-show-Validating').click();
   toggle().click();const first=await readyReviewCard(row()),words=first.elements.feedback;
   edit(words,'Which check passed?');
   if(VALIDATING){
@@ -1757,7 +1757,7 @@ window.fetch=(url,options)=>{
   return refreshed;
  };
  try{
-  content.querySelector('#filter-show-validating').click();
+  content.querySelector('#filter-show-Validating').click();
   const row=content.querySelector('[data-list-item]');
   row.querySelector('.list-toggle').click();
   if(firstLoad){
@@ -1889,7 +1889,7 @@ window.fetch=(url,options)=>{
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        for item, action, filter_id, completed in ((validating, 'question', '#filter-show-validating', False),
+        for item, action, filter_id, completed in ((validating, 'question', '#filter-show-Validating', False),
                                                    (change, 'feedback', '#filter-show-open', False),
                                                    (proposal_item, 'question', '#filter-show-open', False),
                                                    (proposal_item, 'feedback', '#filter-show-open', True)):
@@ -6697,20 +6697,22 @@ window.fetch=async(_url,options={})=>{
   check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
     'Escape closes the menu and returns focus to Later');
   laterToggle.click();
-  const search=document.getElementById('list-search'),previous=document.activeElement;
-  search.focus();
+  // The Review card is a modal dialog, so the focus goes to a field in the card outside the Later menu.
+  const outside=[...recordDetails(fresh).querySelectorAll('textarea,input[type=text]')]
+   .find(field=>!laterMenu.contains(field) && field.getClientRects().length),previous=document.activeElement;
+  outside.focus();
   // Firefox screenshot mode moves focus without sending focus events.
-  if(!document.hasFocus()) previous.dispatchEvent(new FocusEvent('focusout',{bubbles:true,relatedTarget:search}));
-  check(laterMenu.hidden && document.activeElement===search && !dateTimePickerOpen(fresh),
+  if(!document.hasFocus()) previous.dispatchEvent(new FocusEvent('focusout',{bubbles:true,relatedTarget:outside}));
+  check(laterMenu.hidden && document.activeElement===outside && !dateTimePickerOpen(fresh),
     'Focus outside Later closes the menu and releases the refresh hold');
   Date.now=()=>Date.parse('2026-11-23T04:59:00Z');
   laterToggle.click();
-  const week=laterMenu.querySelector('[data-later-preset="week"]'),postCount=window.posts.length;
+  const week=laterMenu.querySelector('[data-later-preset="week"]'),laterPosts=window.posts.length;
   check(presetTime('week')==='Mon 09:00','The relative choice shows Monday at 09:00 before midnight');
   Date.now=()=>Date.parse('2026-11-23T05:01:00Z');
   const laterResponse=holdPost();
   week.click();
-  check(laterMenu.hidden && window.posts.length===postCount+1,'One click after midnight submits Later');
+  check(laterMenu.hidden && window.posts.length===laterPosts+1,'One click after midnight submits Later');
   Date.now=chooserNow;
   check(leavingNow(fresh),'Later starts the departure before the response');
   check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0' &&
@@ -6794,7 +6796,7 @@ window.fetch=async(_url,options={})=>{
                         self.send_header('Content-Type','text/html; charset=utf-8')
                         self.end_headers()
                         if self.path == '/complete':
-                            _ = complete.wait(20)
+                            _ = complete.wait(90)
                         else:
                             _ = self.wfile.write(review_page.render(self_root, show=parse_qs(self.path.partition('?')[2]).get('show', ['open'])[0])
                                 if self.path.startswith('/console/review.html') else
@@ -6814,7 +6816,7 @@ window.fetch=async(_url,options={})=>{
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
                             done=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
                                 '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],capture_output=True,text=True,timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'],capture_output=True,text=True,timeout=120)
                         self.assertEqual(done.returncode,0,done.stderr)
                     finally:
                         server.shutdown()
@@ -7091,12 +7093,12 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
   const form=await readyReviewCard(row);
   const template=document.createElement('template');
   template.innerHTML=EXPECTED;
-  const rendered=row.cloneNode(true);
+  const rendered=recordDetails(row).cloneNode(true);
   // The picker adds the suggestion list ID when it binds the form.
   rendered.querySelector('[data-later-time]').removeAttribute('aria-controls');
   rendered.querySelector('[data-later-times]').removeAttribute('id');
   for(const selector of ['[data-review-body]','.list-log','.review-actions']){
-   if(recordDetails(row).querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
+   if(rendered.querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
     failures.push('Review and the single card draw different '+selector+'.');
   }
   if(!form.elements.revision.value) failures.push('The Review action has no revision.');

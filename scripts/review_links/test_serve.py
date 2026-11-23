@@ -3213,7 +3213,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
             for kind in ('', 'investigations', *review_page.TYPES):
-                show = 'Validating' if kind == review_items.ReviewType.RESPONSE else 'Done'
+                show = 'Validating' if kind in review_page.SHOWS_BY_TYPE else 'Closed'
                 with self.subTest(kind=kind, show=show):
                     query = urlencode({'state': show, 'type': kind})
                     reply = self.request(review_page.PAGE_PATH+'?'+query)
@@ -3876,7 +3876,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     status, body = self.post('/z12345/changes.html', urlencode({
                         'row': row, 'token': token, 'outcome': 'validate', 'feedback': ''}))
                     self.assertEqual(status, 400, body)
-                    self.assertIn(f'<p role="alert">Not saved: {reason}</p>'.encode(), body)
+                    self.assertIn(page_frame.action_failure('change-save-failure', f'Not saved: {reason}').encode(), body)
         self.assertEqual((listing.read_bytes(), claim.read_bytes(), case.fixture.messages), before)
 
     def test_review_refuses_a_verdict_while_a_change_is_validating(self) -> None:
@@ -4857,8 +4857,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         visible, chips = self.list_filter_markup("?q=parked")
         self.assertEqual(visible, ["1"])
-        self.assertEqual(chips["show", "needs-me"], ("false", "0"))
-        self.assertEqual(chips["show", "parked"], ("false", "1"))
+        self.assertEqual(chips["show", "needs-me"], ("false", "1"))
+        self.assertEqual(chips["show", "parked"], ("false", "0"))
 
     def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
         self.add_list_filter_items()

@@ -437,6 +437,11 @@ window.fetch=async(url,options={})=>{
    button.top>=bar.top && button.bottom<=bar.bottom,
    'the '+state()+' line shows the same labeled Measure now button at its right edge');
  };
+ const checkMeasureFailure=label=>{
+  const notice=document.getElementById('measure-failure');
+  check(state()==='Live' && !part('age').hidden && age()==='0 s ago' &&
+   notice?.checkVisibility() && notice.textContent==='HTTP 502',label);
+ };
  const shown=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  const requestTimer=()=>[...intervals.values()].find(timer=>timer.ms===expectedPeriod);
  const clock=()=>[...intervals.values()].find(timer=>timer.ms===1000);
@@ -445,10 +450,14 @@ window.fetch=async(url,options={})=>{
   checkMeasure();
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   await flush();
-  if(mode==='retained' || measureFails){
+  if(mode==='retained'){
    check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
     'a first failed read with shown data keeps its data time');
-   mode='good';measureFails=false;
+   mode='good';
+  }
+  if(measureFails){
+   checkMeasureFailure('a first failed measure keeps the line Live and shows its reason in the measure notice');
+   measureFails=false;
   }
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
@@ -589,8 +598,7 @@ window.fetch=async(url,options={})=>{
    check(state()==='Failed' && part('reason').textContent==='HTTP 404','a missing Disks file reports failure');
    check(document.querySelector('#drives').innerHTML===kept,'a missing Disks file keeps the shown drives');
    mode='good';measureFails=true;await read();
-   check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
-    'a failed Disks measure retains the time of the shown data');
+   checkMeasureFailure('a failed Disks measure keeps the shown data time and shows its reason in the measure notice');
   }
   statusVisibility='hidden';document.dispatchEvent(new Event('visibilitychange'));await flush();
   check(state()==='Paused','a hidden page pauses');

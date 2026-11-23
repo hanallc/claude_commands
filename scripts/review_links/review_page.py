@@ -2124,11 +2124,11 @@ function bindForm(row){
     recovering.set(key,recovery);
     const current=()=>recovering.get(key)===recovery;
     try{
-     pendingSaves.delete(key);
      await recoverReviewRevision(reason,{
       form:recordDetails(reviewRow(key))?.querySelector('[data-review-form]') || form,
       notice,current,
       reload:async()=>{
+       fail(reason);
        await settle();
        if(!current()) return;
        await pageRefresh.refresh(true);
