@@ -592,7 +592,7 @@ No package selects the whole workspace.
 
 A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
-Steps that require a checkout slot omit the identity from placement requests so a folder wait can release memory.
+Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
