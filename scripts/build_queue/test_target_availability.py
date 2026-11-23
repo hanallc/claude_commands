@@ -91,6 +91,32 @@ class AvailabilityRowTests(unittest.TestCase):
         snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
         self.assertEqual(target_availability.availability_rows(snapshots, LABELS, UTC), [])
 
+    def test_each_kept_claim_shows_a_row_with_its_owner_and_start_while_other_runs_run(self) -> None:
+        job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
+        known = targets.KeptClaim("doc workspace", "cargo-liner", SINCE, targets.HolderSession("mac-session"))
+        unknown = targets.KeptClaim("nextest", "hana", LATER, targets.HolderSession("ended-session"))
+        snapshots = (snapshot(MAC, targets.Running((job,), (known,))), snapshot(NATEDEV, targets.Free()),
+                     snapshot(SshTarget("spare", "macos", Path("/fixture/spare.conf")), targets.Free((unknown,))))
+        rows = target_availability.availability_rows(snapshots, LABELS, UTC)
+        self.assertEqual(rows, [
+            {"target": "mac", "state": "Kept", "reason": "Kept for cleanup: cargo-liner doc workspace",
+             "holder": "research-director", "unit": "research", "showrunner": "hana", "since": "since 13:50 UTC",
+             "until": ""},
+            # No session name is known, so the repository in the reason names the owner.
+            {"target": "spare", "state": "Kept", "reason": "Kept for cleanup: hana nextest", "holder": "", "unit": "",
+             "showrunner": "", "since": "since 15:10 UTC", "until": ""},
+        ])
+        self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "ended-session"])
+
+    def test_a_blocked_mac_shows_its_kept_claims_after_the_block_row(self) -> None:
+        kept = targets.KeptClaim("doc workspace", "cargo-liner", LATER, targets.HolderSession("first-session"))
+        snapshots = (snapshot(MAC, replace(MAC_BLOCK, kept_claims=(kept,))),)
+        rows = target_availability.availability_rows(snapshots, LABELS, UTC)
+        self.assertEqual([(row["state"], row["reason"], row["holder"], row["since"]) for row in rows], [
+            ("Blocked", "Mac CI restore", "research", "since 13:50 UTC"),
+            ("Kept", "Kept for cleanup: cargo-liner doc workspace", "report-director", "since 15:10 UTC")])
+        self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "first-session"])
+
     def test_unreachable_and_unreadable_targets_show_as_unavailable(self) -> None:
         snapshots = (snapshot(MAC, targets.Unreachable("retry backoff")),
                      snapshot(NATEDEV, targets.StateUnreadable("holder file: bad json")))

@@ -1392,7 +1392,7 @@ From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-
 
 #### As-built
 
-- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. Each kept claim of a blocked, free or running target gives a "Kept" row: `Kept for cleanup: <repository> <what>`, its holder session when known, and its start time. A blocked target shows its kept claims after its "Blocked" row. A free or running target with no kept claim has no row.
 - The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
 - `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
 - Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.

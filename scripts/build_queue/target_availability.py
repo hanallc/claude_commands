@@ -51,11 +51,16 @@ def read_snapshots() -> Snapshots:
 
 
 def holder_sessions(snapshots: Snapshots) -> list[str]:
-    """Return the sessions that own a hold or block, for the page's one label pass."""
+    """Return the sessions that own a hold, a block or a kept claim, for the page's one label pass."""
     if isinstance(snapshots, SnapshotsUnreadable):
         return []
-    return [state.holder_session.session_id for snapshot in snapshots for state in snapshot.states
-            if isinstance(state, targets.Held) and isinstance(state.holder_session, targets.HolderSession)]
+    owners = (owner for snapshot in snapshots for state in snapshot.states
+              for owner in ((state, *state.kept_claims) if isinstance(state, targets.Held) else kept_claims(state)))
+    return [owner.holder_session.session_id for owner in owners if isinstance(owner.holder_session, targets.HolderSession)]
+
+
+def kept_claims(state: targets.TargetState) -> tuple[targets.KeptClaim, ...]:
+    return state.kept_claims if isinstance(state, (targets.Free, targets.Running, targets.Held)) else ()
 
 
 def holder_labels(state: targets.Held, labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
@@ -67,7 +72,10 @@ def holder_labels(state: targets.Held, labels: Mapping[str, unit_labels.UnitLabe
 
 def availability_rows(snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels],
                       zone: tzinfo) -> list[TargetRow]:
-    """One row for each block, hold or unreadable target; a free or busy target has none."""
+    """One row for each block, hold, kept claim or unreadable target; a free or busy target has no other row.
+
+    The kept claims of a blocked Mac follow its block row.
+    """
     if isinstance(snapshots, SnapshotsUnreadable):
         return [unavailable_row("targets", snapshots.reason)]
     rows: list[TargetRow] = []
@@ -82,6 +90,14 @@ def availability_rows(snapshots: Snapshots, labels: Mapping[str, unit_labels.Uni
                              "since": targets.start_text(state.since, zone), "until": targets.end_text(state.end, zone)})
             elif isinstance(state, (targets.Unreachable, targets.StateUnreadable)):
                 rows.append(unavailable_row(name, state.reason))
+            for kept in kept_claims(state):
+                session = kept.holder_session
+                identity = (labels.get(session.session_id) if isinstance(session, targets.HolderSession) else None)
+                # The reason names the repository, so a claim with no known session shows no holder.
+                rows.append({"target": name, "state": "Kept", "reason": f"Kept for cleanup: {kept.repository} {kept.what}",
+                             "holder": identity.session if identity else "",
+                             "unit": identity.unit if identity else "", "showrunner": identity.showrunner if identity else "",
+                             "since": "since " + targets.clock(kept.since, zone), "until": ""})
     return rows
 
 

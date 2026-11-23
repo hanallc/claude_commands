@@ -278,6 +278,9 @@ class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
         _ = path.write_text(json.dumps(record))
 
 
+KEPT_HANA = "kept for cleanup: hana nextest hana since 13:05 PDT"
+
+
 class StatusTests(IsolatedBuildTargetTest):
     @override
     def setUp(self) -> None:
@@ -471,6 +474,25 @@ class StatusTests(IsolatedBuildTargetTest):
             0, "mac: held by hana since 13:05 PDT (showrunner hana, unit inspectors) until 15:05 PDT — render checks\n", "",
         ))
 
+    def test_blocked_mac_status_lists_each_kept_claim_with_its_owner(self) -> None:
+        self.write_block()
+        self.write_claim("claims/liner.json", "doc workspace", SINCE - timedelta(hours=1))
+        path = self.mac_state / "claims" / "liner.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update(remote_host="test-mac", cleanup_pending=True, proc_start="ended-run-start",
+                      repo_key="https://fixture.invalid/cargo-liner", repo_name="cargo-liner",
+                      holder_session="liner-session")
+        _ = path.write_text(json.dumps(record))
+        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        labels = {"hana-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
+                  "liner-session": roster.UnitLabels("liner-director", "builds", "liner")}
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
+             mock.patch.object(roster, "unit_labels_for", return_value=labels):
+            result = self.capture_status()
+        self.assertEqual(result, (0, "mac: held by hana since 13:05 PDT (showrunner hana, unit inspectors) until 15:05 PDT"
+                                  + " — render checks · kept for cleanup: liner-director doc workspace since 12:05 PDT\n", ""))
+
     def test_dead_remote_holder_is_free_without_deleting_its_cleanup_claim(self) -> None:
         self.write_claim()
         path = self.mac_state / "run.json"
@@ -484,10 +506,10 @@ class StatusTests(IsolatedBuildTargetTest):
         for start in (process_identity.Gone(), process_identity.Started("reused-pid-start")):
             with self.subTest(start=start), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
                  mock.patch.object(process_identity, "process_start", return_value=start):
-                self.assertEqual(self.capture_status(), (0, "mac: free · 1 claim kept for cleanup\nnatedev: free\n", ""))
+                self.assertEqual(self.capture_status(), (0, f"mac: free · {KEPT_HANA}\nnatedev: free\n", ""))
             self.assertEqual(path.read_bytes(), before)
 
-    def test_free_status_counts_kept_claims_without_changing_them(self) -> None:
+    def test_free_status_lists_each_kept_claim_without_changing_them(self) -> None:
         config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         before: dict[Path, bytes] = {}
         (self.mac_state / "claims").mkdir(parents=True, exist_ok=True)
@@ -501,9 +523,42 @@ class StatusTests(IsolatedBuildTargetTest):
             before[path] = path.read_bytes()
             with self.subTest(count=count), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
-                noun = "claim" if count == 1 else "claims"
-                self.assertEqual(self.capture_status(), (0, f"mac: free · {count} {noun} kept for cleanup\n", ""))
+                self.assertEqual(self.capture_status(), (0, "mac: free" + f" · {KEPT_HANA}" * count + "\n", ""))
             self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_status_names_guest_claims_under_mac_linux_and_each_kept_claim_with_its_owner(self) -> None:
+        def update(name: str, **fields: object) -> None:
+            path = self.mac_state / name
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            record.update(fields)
+            _ = path.write_text(json.dumps(record))
+
+        self.write_claim("claims/guest.json", "mac-linux test-affected")
+        update("claims/guest.json", mac_kind="guest")
+        # An old record has no mac_kind, so it is a Mac host claim.
+        self.write_claim("claims/hana.json")
+        self.write_claim("claims/liner.json", "doc workspace", SINCE - timedelta(hours=1))
+        update("claims/liner.json", remote_host="test-mac", cleanup_pending=True, proc_start="ended-run-start",
+               repo_key="https://fixture.invalid/cargo-liner", repo_name="cargo-liner", holder_session="liner-session",
+               mac_kind="mirror")
+        _ = (self.root / "mac_linux.conf").write_text("ssh.hops=test-mac linux-guest\n")
+        config = self.write_config(
+            "targets=mac,mac-linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n")
+        guest = "mac-linux: running mac-linux test-affected since 13:05 PDT\n"
+        for labels, owner in (({}, "cargo-liner"),
+                              ({"liner-session": roster.UnitLabels("liner-director", "builds", "liner")}, "liner-director")):
+            with self.subTest(owner=owner), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+                 mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
+                 mock.patch.object(roster, "unit_labels_for", return_value=labels):
+                self.assertEqual(self.capture_status(), (0, "mac: running nextest hana since 13:05 PDT"
+                    + f" · kept for cleanup: {owner} doc workspace since 12:05 PDT\n" + guest, ""))
+        for name in ("claims/guest.json", "claims/hana.json"):
+            (self.mac_state / name).unlink()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            self.assertEqual(self.capture_status(), (
+                0, "mac: free · kept for cleanup: cargo-liner doc workspace since 12:05 PDT\nmac-linux: free\n", ""))
 
     def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
         self.write_claim()

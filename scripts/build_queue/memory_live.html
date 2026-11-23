@@ -184,6 +184,8 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
+/* The guest runs on the Mac, so it takes the Mac color in light and dark. */
+.machine[data-machine="mac-linux"] { color: var(--machine-mac); }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }

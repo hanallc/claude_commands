@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 import fcntl
 from hashlib import sha256
 import json
@@ -243,6 +243,13 @@ def reply_claim_identity(output: str) -> ClaimIdentity | NoClaimIdentity:
     return ClaimIdentity(claim_id, episode, attempt)
 
 
+class MacClaimKind(Enum):
+    """The run a Mac claim holds: a native mirror run or a mac-linux guest run."""
+
+    MIRROR = "mirror"
+    GUEST = "guest"
+
+
 class ClaimOwnerRecord(TypedDict):
     """Both claim types retain the process identity and job details."""
 
@@ -264,6 +271,13 @@ class ClaimOwnerRecord(TypedDict):
     slot: NotRequired[int]
     mac_repository: NotRequired[MacRepositoryRecord]
     transfers: NotRequired[list[TransferBytes]]
+    # A MacClaimKind value. Only Mac claims record it; read it with claim_kind.
+    mac_kind: NotRequired[str]
+
+
+def claim_kind(record: ClaimOwnerRecord) -> MacClaimKind:
+    """Read the claim kind. A record written before the field reads as a mirror claim."""
+    return MacClaimKind(record.get("mac_kind", MacClaimKind.MIRROR.value))
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -835,6 +849,11 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
                 record["idle_since"] = cast(str, idle_since)
             else:
                 record["work_idle_since"] = cast(str, idle_since)
+    if "mac_kind" in values:
+        kind = values["mac_kind"]
+        if kind not in {member.value for member in MacClaimKind}:
+            raise StateReadError(f"{path} has an invalid mac_kind")
+        record["mac_kind"] = cast(str, kind)
     if "copy" in values:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")

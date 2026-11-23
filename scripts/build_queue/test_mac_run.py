@@ -149,6 +149,26 @@ class MacRunTests(unittest.TestCase):
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
         self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
 
+    def test_claim_record_keeps_its_mac_claim_kind(self) -> None:
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            guest, = claim_state.read_claims(self.paths)
+            self.assertEqual(guest.record.get("mac_kind"), "guest")
+            self.assertIs(claim_state.claim_kind(guest.record), claim_state.MacClaimKind.GUEST)
+        native = self.native_claim(self.repository("hana"))
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        mirror, = claim_state.read_claims(self.paths)
+        self.assertEqual(mirror.record.get("mac_kind"), "mirror")
+        # A record written before the field reads as a mirror claim.
+        values = cast(dict[str, object], json.loads(mirror.path.read_text()))
+        del values["mac_kind"]
+        _ = mirror.path.write_text(json.dumps(values))
+        old, = claim_state.read_claims(self.paths)
+        self.assertNotIn("mac_kind", old.record)
+        self.assertIs(claim_state.claim_kind(old.record), claim_state.MacClaimKind.MIRROR)
+        _ = mirror.path.write_text(json.dumps({**values, "mac_kind": "other"}))
+        with self.assertRaisesRegex(claim_state.ClaimStateUnreadable, "invalid mac_kind"):
+            _ = claim_state.read_claims(self.paths)
+
     def test_quoted_origin_uses_the_shared_repository_scope(self) -> None:
         config = self.checkout / ".git/config"
         origin = ORIGIN

@@ -575,10 +575,12 @@ class MemoryFeedTests(unittest.TestCase):
         now = base.explanation.now
         guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
-            pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", mac_placement="episode/placement-attempt",
+            pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
+            mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
             placement_candidates=gate_candidates(placement.AllowedHost()))
-        pending = replace(guest, pid=8201, mac_placement="pending/placement-attempt", confirmed_guest_run=None,
+        # The queue names no Mac placement for an unconfirmed guest attempt.
+        pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
@@ -593,7 +595,7 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             return memory_feed.reading()
 
-    def test_guest_gate_row_shows_only_the_confirmed_attempt(self) -> None:
+    def test_guest_gate_rows_show_on_mac_linux_with_the_confirmed_attempt_or_not_confirmed(self) -> None:
         page = self.guest_gate_page()
         row = next(row for row in page["walk"] if row["pid"] == 8200)
         self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
@@ -601,7 +603,8 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
-        self.assertEqual(unconfirmed.get("state"), "uncertain")
+        self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
+                         ("mac-linux", True, "uncertain"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
@@ -665,6 +668,12 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Guest attempt  not confirmed", text)
         self.assertNotIn("unavailable", text.splitlines()[0])
+        # The confirmation adds a pid and an attempt; the row keeps its key, so an open hover stays.
+        confirmed = cast(memory_feed.RunRow, guest.copy())
+        confirmed["pid"] = 8400
+        confirmed["guest_run"] = memory_feed.ConfirmedGuestRun(target="mac-linux", attempt="guest-attempt")
+        del confirmed["guest_unconfirmed"]
+        self.assertEqual(memory_feed.step_key(confirmed), guest.get("key"))
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()

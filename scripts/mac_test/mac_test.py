@@ -13,7 +13,6 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 import fcntl
 import json
 import math
@@ -62,6 +61,8 @@ from scripts.mac_test.claim_state import (
     StateReadError as StateReadError,
     ClaimStateUnreadable as ClaimStateUnreadable,
     ClaimOwnerRecord as ClaimOwnerRecord,
+    MacClaimKind as MacClaimKind,
+    claim_kind as claim_kind,
     ProcessBoundClaim as ProcessBoundClaim,
     RemoteJobClaim as RemoteJobClaim,
     RunRecord as RunRecord,
@@ -899,11 +900,6 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
     missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
                else target_config.MissingSlotCapacity.SINGLE_SLOT)
     return target_config.slot_capacity(settings, scope.name, missing=missing)
-
-
-class MacClaimKind(Enum):
-    MIRROR = "mirror"
-    GUEST = "guest"
 
 
 @dataclass(frozen=True)
@@ -2237,6 +2233,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         "worktree": args.worktree,
         "since": timestamp(utc_now()),
     }
+    if paths.platform == "macos":
+        claimed["mac_kind"] = mac_kind.value
     if args.copy:
         claimed["copy"] = True
     if isinstance(args.remote, str):
