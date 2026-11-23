@@ -1202,7 +1202,7 @@ def switch_back(
             return NoCodexFallbackRestoration()
         if chosen.dir != readings.workers.home:
             move_id = uuid.uuid4().hex
-            recovery_request: moves.RequestedMove = {"kind": "requested", "at": now.isoformat(),
+            recovery_request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": now.isoformat(),
                 "tool": "codex", "subject": "workers", "move_id": move_id, "from": readings.workers.label,
                 "to": chosen.label, "why": "Codex has room again", "window": "unknown"}
             if policy_fallback:
@@ -1517,9 +1517,9 @@ def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReas
 
 
 def _workers_request_replay(history: moves.RecordedAutoEntries, rows: Sequence[moves.MoveEntry]
-                            ) -> tuple[moves.RecordedAutoEntries, dict[str, moves.RequestedMove]]:
+                            ) -> tuple[moves.RecordedAutoEntries, dict[str, moves.RecordedMoveRequest]]:
     """A request without a result stays due, also when its role write is done: the move was cut."""
-    pending: dict[str, moves.RequestedMove] = {}
+    pending: dict[str, moves.RecordedMoveRequest] = {}
     completed: set[str] = set()
     for index, row in enumerate(rows):
         if (row["kind"] != "requested" or row["tool"] != "codex" or row["subject"] != "workers"
@@ -1537,7 +1537,7 @@ def _workers_request_replay(history: moves.RecordedAutoEntries, rows: Sequence[m
             {key: request for key, request in pending.items() if key not in completed})
 
 
-def _start_workers_request(entry: next_moves.WorkersMove, request: moves.RequestedMove,
+def _start_workers_request(entry: next_moves.WorkersMove, request: moves.RecordedMoveRequest,
                            label: str, now: datetime, journal: Sequence[moves.MoveEntry]) -> bool | None:
     """Write the role and start detached moves; keep the entry until the moves end.
 
@@ -1698,11 +1698,12 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                         request = pending_requests[entry.id]
                     else:
                         move_id = uuid.uuid4().hex
-                        request = moves.RequestedMove(kind="requested", at=stamp, tool="codex",
-                            subject="workers", move_id=move_id, cause="auto", why=why,
-                            **{"from": owner.label, "to": target.label}, window="weekly")
-                        moves.append_move(request)
-                        journal.append(request)
+                        new_request: moves.RequestedMove = {"kind": "requested", "scope": "group",
+                            "at": stamp, "tool": "codex", "subject": "workers", "move_id": move_id,
+                            "cause": "auto", "why": why, "from": owner.label, "to": target.label, "window": "weekly"}
+                        moves.append_move(new_request)
+                        journal.append(new_request)
+                        request = new_request
                     finished = _start_workers_request(entry, request, target.label, now, journal)
                     if finished is None:
                         return WorkersNextMovePass(readings, moves.UnreadableMoveJournal(), journal)
@@ -1929,7 +1930,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
             and isinstance(state["fallback"], NoCodexQuotaFallback)):
         move_id = uuid.uuid4().hex
-        request: moves.RequestedMove = {"kind": "requested", "at": stamp, "tool": "codex",
+        request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
             "subject": "workers", "move_id": move_id, "from": label, "to": chosen.label,
             "why": f"{label} weekly usage used; " + ("credits off" if isinstance(credits, agent_accounts.CreditsOff) else "move to room"), "window": "weekly", "reset": reset.isoformat()}
         request["cause"] = "credits off" if isinstance(credits, agent_accounts.CreditsOff) else "auto"
@@ -2689,7 +2690,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                     move_id = uuid.uuid4().hex
                     window_name: Literal["weekly", "five_hour", "unknown"] = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                     reason = f"{name} refused ({window_name} limit until {reset_display(reset)})"
-                    request: moves.RequestedMove = {"kind": "requested", "at": stamp, "tool": "codex",
+                    request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
                         "subject": "workers", "move_id": move_id, "from": readings.workers.label, "to": chosen.label,
                         "why": reason, "window": window_name}
                     if isinstance(reset, refusals.KnownReset):

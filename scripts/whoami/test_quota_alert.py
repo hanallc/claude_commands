@@ -520,10 +520,13 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
     def test_old_workers_requests_share_one_role_read_per_pass(self) -> None:
         stamp = self.now.isoformat()
         head = next_moves.add_next_move("workers", 1, "codex1")
-        for index in range(3):
-            moves.append_move(moves.RequestedMove(kind="requested", at=stamp, tool="codex", subject="workers",
-                move_id=f"old-{index}", cause="auto", why=f"auto: entry-{index}",
-                **{"from": "codex2", "to": "codex3"}, window="weekly"))
+        journal = moves.store_file()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        with journal.open("a", encoding="utf-8") as output:
+            for index in range(3):
+                _ = output.write(json.dumps({"kind": "requested", "at": stamp, "tool": "codex",
+                    "subject": "workers", "move_id": f"old-{index}", "cause": "auto", "why": f"auto: entry-{index}",
+                    "from": "codex2", "to": "codex3", "window": "weekly"}) + "\n")
         with mock.patch.object(accounts, "read_role_map", wraps=accounts.read_role_map) as read_role:
             _ = quota_alert.run_workers_next_moves(self.readings(self.now), self.now)
         self.assertEqual(read_role.call_count, 1)
@@ -655,6 +658,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
                     requested = [row for row in moves.read_moves() if row["kind"] == "requested"
                                  and row["why"] == f"auto: {head.id}"]
                     self.assertEqual(len(requested), 1)
+                    self.assertEqual(requested[0].get("scope"), "group")
                     original_move_id = requested[0]["move_id"]
                     if stopped_at == "historical target":
                         configuration = accounts.accounts_config_file()

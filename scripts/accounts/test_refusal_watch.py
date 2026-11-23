@@ -1330,6 +1330,63 @@ class RefusalWatchTests(unittest.TestCase):
             MoveCall("late", "claude2", "complete showrunners move to claude2"),
         ])
 
+    def test_completion_retries_a_group_move_that_records_after_the_next_selection(self) -> None:
+        self.assertEqual(accounts.setup("claude4"), [])
+        _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "four@example.invalid"}}))
+        self.write_refresh_expiry("claude4")
+        _ = (self.home / "notes" / note_name("claude4")).write_text("---\nlogin: four@example.invalid\n---\n")
+        self.reading("four@example.invalid", 80)
+        _ = self.owner("grouped", host="herdr", label="claude2")
+        selected_at = NOW + timedelta(seconds=1)
+        requested_at = selected_at + timedelta(seconds=1)
+
+        def select_while_locked(members: list[str]) -> None:
+            if members != ["grouped"]:
+                return
+            self.assertEqual(staff.row_activity("grouped"), staff.RowMoving("claude3"))
+            self.assertEqual(moves.read_moves(), [])
+            WatchTime.at = selected_at
+            newer = accounts.move_group("showrunners", "claude4")
+            assert isinstance(newer, accounts.GroupMoveStartFailed), newer
+            waiting, = newer.outcomes
+            self.assertIsInstance(waiting, moves.MoveWaitingForRow)
+            self.assertEqual(moves.read_moves(), [])
+            WatchTime.at = requested_at
+
+        def resume(identity: str, target: str, why: str, *_args: object) -> stop_resume.ClaudeUp:
+            self.moved(MoveCall(identity, target, why))
+            return stop_resume.ClaudeUp(identity, "w1:p1", target)
+
+        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
+              patch.object(herdr, "Herdr"),
+              patch.object(stop_resume, "datetime", WatchTime),
+              patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(pane_launch, "current_kind", return_value="claude"),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches", side_effect=select_while_locked),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning),
+              patch.object(stop_resume, "_resume_move", side_effect=resume)):
+            older = accounts.move_group("showrunners", "claude3")
+            assert isinstance(older, accounts.GroupMoveStarted), older
+            self.assertEqual(older.outcomes, (stop_resume.ClaudeUp("grouped", "w1:p1", "claude3"),))
+            _ = self.owner("manual", host="herdr", label="claude2")
+            self.assertIsInstance(accounts.move("manual", "claude3"), accounts.MoveStarted)
+
+        self.assertEqual(moves.pending_move_requests(), ())
+        self.assertEqual(accounts.current_move_account("showrunners"), "claude4")
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([(entry["at"], entry.get("cause"), entry["to"]) for entry in requests],
+                         [(requested_at.isoformat(), "by hand", "claude3")] * 2)
+
+        _ = refusal_watch.run(NOW + timedelta(minutes=1), recover_units=False)
+
+        self.assertEqual(self.moves.calls, [MoveCall("grouped", "claude4", "complete showrunners move to claude4")])
+        self.assertEqual([entry.get("scope") for entry in requests], ["group", "session"])
+
     def test_completion_reads_a_by_hand_request_after_the_run_starts(self) -> None:
         _ = self.groups(units="claude3", showrunners="claude1")
         _ = self.owner("unit", host="unit")
@@ -1341,9 +1398,9 @@ class RefusalWatchTests(unittest.TestCase):
             nonlocal reads
             reads += 1
             if reads == 2:
-                moves.append_move(moves.RequestedMove(kind="requested", tool="claude", at=NOW.isoformat(),
-                    subject="manual: owner manual", move_id="manual-move", cause="by hand", window="unknown",
-                    why="manual account choice", **{"from": "claude1", "to": "claude3"}))
+                moves.append_move({"kind": "requested", "scope": "session", "tool": "claude", "at": NOW.isoformat(),
+                    "subject": "manual: owner manual", "move_id": "manual-move", "cause": "by hand", "window": "unknown",
+                    "why": "manual account choice", "from": "claude1", "to": "claude3"})
                 self.moved(MoveCall("manual", "claude3", "manual account choice"))
             return read_members()
 
@@ -1359,9 +1416,10 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups(showrunners="claude1")
         _ = self.owner("manual", host="herdr", label="claude3")
         _ = self.owner("late", host="herdr", label="claude3")
-        moves.append_move(moves.RequestedMove(kind="requested", tool="claude", at=NOW.isoformat(),
-            subject="manual: owner manual", move_id="manual-move", cause="by hand", window="unknown",
-            why="manual account choice", **{"from": "claude1", "to": "claude3"}))
+        with moves.store_file().open("a", encoding="utf-8") as journal:
+            _ = journal.write(json.dumps({"kind": "requested", "tool": "claude", "at": NOW.isoformat(),
+                "subject": "manual: owner manual", "move_id": "manual-move", "cause": "by hand", "window": "unknown",
+                "why": "manual account choice", "from": "claude1", "to": "claude3"}) + "\n")
 
         for selection in ({"label": "claude1", "move_id": "legacy-move",
                            "cause": "by hand", "window": "unknown"},):

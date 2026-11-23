@@ -314,7 +314,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         append_move = moves.append_move
 
-        def append_or_fail(row: moves.MoveEntry) -> None:
+        def append_or_fail(row: moves.MoveWriteEntry) -> None:
             if row["kind"] == "failed":
                 raise OSError("fixture failed-row append failed")
             append_move(row)
@@ -337,7 +337,7 @@ always=director
         entry = next_moves.add_next_move("workers", 1, "codex2")
         append_move = moves.append_move
 
-        def refuse_failure_append(row: moves.MoveEntry) -> None:
+        def refuse_failure_append(row: moves.MoveWriteEntry) -> None:
             if row["kind"] == "failed":
                 raise OSError("fixture failed-row append failed")
             append_move(row)

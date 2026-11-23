@@ -774,8 +774,8 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RequestedMove]]:
-    latest: dict[str, tuple[datetime, moves.RequestedMove]] = {}
+def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RecordedMoveRequest]]:
+    latest: dict[str, tuple[datetime, moves.RecordedMoveRequest]] = {}
     for entry in entries:
         if entry["kind"] != "requested" or entry["tool"] != "claude":
             continue
@@ -787,13 +787,14 @@ def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[d
     return latest
 
 
-def _newer_by_hand_move(latest: tuple[datetime, moves.RequestedMove] | None,
+def _newer_by_hand_move(latest: tuple[datetime, moves.RecordedMoveRequest] | None,
                        target: str, selected_at: datetime | None) -> bool:
     if latest is None:
         return False
     at, request = latest
     destination = request["to"]
-    return (request.get("cause") == "by hand" and isinstance(destination, str) and destination != target
+    return (request.get("cause") == "by hand" and request.get("scope", "session") == "session"
+            and isinstance(destination, str) and destination != target
             and (selected_at is None or at > selected_at))
 
 
