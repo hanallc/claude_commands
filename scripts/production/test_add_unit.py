@@ -28,10 +28,12 @@ from zoneinfo import ZoneInfo
 
 from scripts.production import add_unit
 from scripts.production import unit_lookup
+from scripts.direct import phase_reservation, recorder_state
 from scripts.message import sessions
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
+from scripts.worktree import worktrees
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
@@ -436,6 +438,121 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--responsibility", "nightly-review")
         self.assertEqual(unit_config.read(worktree), expected)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def unrecorded_unit_home(self) -> Path:
+        worktree = self.unit_tree("alpha")
+        _ = self.git("worktree", "add", "-b", "alpha-worktree", str(worktree), "build-followups")
+        with patch.dict(os.environ, self.env):
+            self.assertIsNone(worktrees.checkout_record(worktree))
+        return worktree
+
+    def test_adopted_unit_home_can_acquire_a_phase_reservation(self) -> None:
+        main = Path(self.env["HOME"]) / "rust/origin"
+        main.parent.mkdir()
+        _ = self.checkout.rename(main)
+        self.checkout.symlink_to(main, target_is_directory=True)
+        with patch.dict(os.environ, self.env):
+            owner = read_production(self.production_name).owner
+            assert isinstance(owner.doc, staff.LiveDoc)
+            _ = staff.set_doc(owner.id, staff.LiveDoc(owner.doc.machine, self.doc.resolve()))
+        worktree = self.unrecorded_unit_home()
+
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        head = self.git("rev-parse", "HEAD", cwd=worktree)
+        facts = {"reservation_id": "r1", "coordination_run_id": "c1", "phase_start_head": head}
+        answer = {"status": "clear", "payload": {"data": {"acquisition": facts}}}
+        calls = self.root / "berth-calls"
+        berth = self.bin / "cargo-berth"
+        _ = berth.write_text("#!/bin/sh\n"
+                             + f'printf "%s\\n" "$PWD" "$CARGO_BERTH_SESSION_ID" "$@" > {shlex.quote(str(calls))}\n'
+                             + f"printf '%s\\n' {shlex.quote(json.dumps(answer))}\n")
+        berth.chmod(0o755)
+        run = self.root / "phase-run"
+        run.mkdir()
+        phase = phase_reservation.phase_directory(run, "1")
+        with patch.dict(os.environ, self.env):
+            row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+            _ = (run / recorder_state.STATE_FILENAME).write_text(json.dumps({
+                "owner_staff_id": row.id, "open_phases": [{"id": "1", "status": "active"}]}))
+            _ = phase_reservation.enroll(phase, "1", "board_ready")
+            _ = (phase / phase_reservation.FILES_FILE).write_text("docs/plans/given.md\n")
+            with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": row.current_session}),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                code = phase_reservation.main(["claim", "--session-dir", str(run), "--phase", "1",
+                                               "--repo", str(worktree)])
+
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertIn("Active, reservation r1", output.getvalue())
+        self.assertEqual(calls.read_text().splitlines(), [str(worktree), row.current_session + ".phase-1",
+                                                       "check", "docs/plans/given.md", "--json"])
+        self.assertEqual(phase_reservation.read_state(phase), {
+            "kind": phase_reservation.ACTIVE, "active_phase_reservation": {**facts, "phase": "1"}})
+
+    def test_adopting_a_unit_home_moves_a_real_target_directory_into_its_output(self) -> None:
+        worktree = self.unrecorded_unit_home()
+        target = worktree / "target"
+        target.mkdir()
+        _ = (target / "artifact").write_text("existing output\n")
+        inode = target.stat().st_ino
+
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        with patch.dict(os.environ, self.env):
+            expected = worktrees.output_record("origin", "alpha", "worktree")
+            record = worktrees.read_record(worktrees.record_file(worktree))
+        self.assertEqual((record.stage, record.layout), (worktrees.MakeStage.DONE, expected))
+        self.assertEqual(target.readlink(), expected.output)
+        # An empty output takes the earlier target by rename, so the build cache stays warm.
+        self.assertEqual(expected.output.stat().st_ino, inode)
+        self.assertEqual((expected.output / "artifact").read_text(), "existing output\n")
+        self.assertEqual(list(worktree.parent.glob(".saved-target-*")), [])
+
+    def test_adopting_a_unit_home_retries_after_output_setup_fails(self) -> None:
+        worktree = self.unrecorded_unit_home()
+        with patch.dict(os.environ, self.env):
+            layout = worktrees.output_record("origin", "alpha", "worktree")
+            record_file = worktrees.record_file(worktree)
+        layout.output.parent.mkdir(parents=True)
+        _ = layout.output.write_text("conflicting output\n")
+        head = self.git("rev-parse", "HEAD", cwd=worktree)
+
+        failed = self.cli("alpha", "--plan", "docs/plans/given.md")
+
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertIn(f"{layout.output}: expected a real output folder", failed.stderr)
+        self.assertEqual(layout.output.read_text(), "conflicting output\n")
+        self.assertFalse(record_file.exists())
+        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+
+        layout.output.unlink()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        record = worktrees.read_record(record_file)
+        self.assertEqual((record.stage, record.base, record.layout), (worktrees.MakeStage.DONE, head, layout))
+        self.assertEqual((worktree / "target").readlink(), layout.output)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), head)
+
+    def test_adopting_a_diverged_unit_home_records_and_keeps_its_base(self) -> None:
+        worktree = self.unrecorded_unit_home()
+        _ = self.git("commit", "--allow-empty", "-m", "Unit work", cwd=worktree)
+        _ = self.git("commit", "--allow-empty", "-m", "Production work")
+        head = self.git("rev-parse", "HEAD", cwd=worktree)
+        self.assertNotEqual(self.git("merge-base", "alpha-worktree", "build-followups"), head)
+
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        with patch.dict(os.environ, self.env):
+            record_file = worktrees.record_file(worktree)
+        record = worktrees.read_record(record_file)
+        self.assertEqual((record.base, record.branch, record.owner, record.merge_branch),
+                         (head, "alpha-worktree", "alpha", "build-followups"))
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), head)
+
+        _ = self.git("commit", "--allow-empty", "-m", "Later unit work", cwd=worktree)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        self.assertEqual(worktrees.read_record(record_file).base, head)
 
     def test_an_existing_config_port_conflict_refuses_before_admission_or_launch(self) -> None:
         worktree = self.unit_tree("alpha")
