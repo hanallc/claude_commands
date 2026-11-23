@@ -1,8 +1,7 @@
 """Test gate retries with a fixture queue and a local command."""
 
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-import io
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import os
 from pathlib import Path
 import sys
@@ -19,6 +18,16 @@ from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.mac_test import claim_state
+
+
+@contextmanager
+def redirect_descriptor(descriptor: int, output: int) -> Generator[None]:
+    with ExitStack() as restore:
+        original = os.dup(descriptor)
+        _ = restore.callback(os.close, original)
+        _ = restore.callback(os.dup2, original, descriptor, inheritable=os.get_inheritable(descriptor))
+        _ = os.dup2(output, descriptor)
+        yield
 
 
 @final
@@ -54,7 +63,7 @@ class CopyGateRetryTests(unittest.TestCase):
             finally:
                 copies.COMMAND_LOCKS.reset(token)
 
-    def run_gate(self, *, report_failure: bool) -> tuple[int, str, str]:
+    def run_gate(self, *, report_failure: bool) -> tuple[int, bytes, bytes]:
         script = self.root / "gate.py"
         _ = script.write_text(dedent("""\
             import os
@@ -75,8 +84,9 @@ class CopyGateRetryTests(unittest.TestCase):
             assert os.environ["BUILDLOG_PLACEMENT_EPISODE"] == assignment.episode
             with Path(sys.argv[3]).open("a") as runs:
                 runs.write(assignment.attempt + "\\n")
-            print(assignment.attempt, flush=True)
-            print("gate fixture diagnostic", file=sys.stderr)
+            attempt = assignment.attempt.encode("ascii")
+            os.write(1, attempt + b" stdout\\xff\\n")
+            os.write(2, attempt + b" stderr\\xfe\\n")
             if assignment.attempt == "guest-attempt":
                 if sys.argv[4] == "report":
                     refusal = wire.ClaimFailure("refusal", assignment, MAC_LINUX_NO_ANSWER)
@@ -106,12 +116,17 @@ class CopyGateRetryTests(unittest.TestCase):
                                       placement.PermissionConsumed(1.5), retry=placement.RetryAt(2.0))
         second_grant = wire.LocalPlacementGranted(replacement, wire.Admitted("local", 1, "gate", "", "", {}))
 
+        stdout_path = self.root / "stdout"
+        stderr_path = self.root / "stderr"
         with (mock.patch("scripts.build_queue.first_step._gate_request", return_value=request),
               mock.patch.object(queue_place, "wait_for_placement", side_effect=(wire.Assignment(guest), second_grant))
               as place,
               mock.patch.object(client, "claim_failure", return_value=settled) as settle,
               mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel,
-              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+              stdout_path.open("w", encoding="utf-8") as output,
+              stderr_path.open("w", encoding="utf-8") as errors,
+              redirect_descriptor(1, output.fileno()), redirect_descriptor(2, errors.fileno()),
+              redirect_stdout(output), redirect_stderr(errors)):
             status = copies.main(["run", "--repo", str(self.root), "--commit", "HEAD",
                                   "--targets", "natedev,mac-linux", "--", *command])
 
@@ -123,22 +138,24 @@ class CopyGateRetryTests(unittest.TestCase):
             place.assert_called_once()
         cancel.assert_called_once()
         self.assertEqual(self.lease_count, 1)
-        return status, output.getvalue(), errors.getvalue()
+        return status, stdout_path.read_bytes(), stderr_path.read_bytes()
 
     def test_gate_runs_again_on_the_replacement_assignment(self) -> None:
         status, output, errors = self.run_gate(report_failure=True)
 
         self.assertEqual(status, 7, errors)
         self.assertEqual(self.runs.read_text().splitlines(), ["guest-attempt", "local-attempt"])
-        self.assertIn("Requesting placement again.", output)
-        self.assertEqual(errors, "")
+        retry = "placement: retry — fixture-guest (mac-linux) did not answer. Requesting placement again.\n"
+        self.assertEqual(output, b"guest-attempt stdout\xff\n" + retry.encode("utf-8") + b"local-attempt stdout\xff\n")
+        self.assertEqual(errors, b"guest-attempt stderr\xfe\nlocal-attempt stderr\xfe\n")
 
     def test_gate_without_a_claim_failure_stops_after_one_run(self) -> None:
-        status, _output, errors = self.run_gate(report_failure=False)
+        status, output, errors = self.run_gate(report_failure=False)
 
         self.assertEqual(status, MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
         self.assertEqual(self.runs.read_text().splitlines(), ["guest-attempt"])
-        self.assertIn("Gate placement blocked.", errors)
+        self.assertEqual(output, b"guest-attempt stdout\xff\n")
+        self.assertTrue(errors.startswith(b"guest-attempt stderr\xfe\nGate placement blocked. "), errors)
 
     def test_non_gate_runs_once_without_admission(self) -> None:
         script = self.root / "ordinary.py"
