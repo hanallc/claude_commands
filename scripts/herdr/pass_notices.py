@@ -111,10 +111,11 @@ class PassNotices:
             if fields is None:
                 raise ValueError(f"{path}: invalid pass notice frame")
             if isinstance(key := fields.get("settled"), str):
-                # The settle frame names the text that was sent; an older frame names no text.
+                # The settle frame names the text that was sent. An older frame names no text,
+                # so it settles only a first text, never a replacement.
                 sent = fields.get("text_sha256")
                 if (record is not None and (notice := record.notices.get(key)) is not None
-                        and (sent is None or sent == _digest(notice.text))):
+                        and (sent == _digest(notice.text) if sent is not None else not notice.revision)):
                     record.notices[key] = replace(notice, settled=True)
                 continue
             route = _read_route(path, fields)
