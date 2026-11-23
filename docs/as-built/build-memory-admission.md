@@ -274,6 +274,8 @@ The adapter uses that grant without a second admission request.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
+A step that waits for placement to choose a Mac Linux guest has the reason `MachineChoiceWait`.
+Only a queue row carries it, and the Builds and Limits pages show it as `waits for a machine choice`.
 `_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
 `verify.sh` sends `--token after-grant`: it takes the token after a local grant.
 Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
@@ -393,6 +395,7 @@ An absent wait retains its run identity so it can use the run place while it exi
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
+A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
@@ -496,6 +499,9 @@ A waiting step's hover puts each field on its own line: the wait time, the reaso
 A local step shows `natedev or Mac`, `natedev only`, or `natedev only (Mac state unknown)`.
 `MacRoutes.fit()` in `target_availability.py` gives the Mac answer, and `memory_feed.local_runs_on()` makes the line.
 AWS runs only the ~/.claude test gate. A cloud gate shows `AWS (natedev only when AWS cannot start the gate)`.
+A step with a Mac Linux guest candidate names its placement candidates in `can run on`, from `memory_feed.gate_placement_notes()`.
+A candidate with a `FixedExclusion` is not named, because placement never uses it.
+When the guest has only a `FixedExclusion`, the line uses the route fit above.
 When memory holds the first step in line, its hover adds a `First in line` table.
 The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.
 It ends with free and the need.
@@ -2415,7 +2421,7 @@ Non-building calls execute the next cargo without admission.
 A direct call to a cargo executable outside this front bypasses admission.
 Calls inside the admitted child tree retain the same reservation.
 
-`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, and job.
+`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, job, and job start.
 The service reads configuration and history with its own account.
 It uses `step_estimator.step_estimate` with a recorded repository location.
 The service refreshes the estimate on each acquisition retry.
@@ -2464,6 +2470,30 @@ Acquisition uses named protocol timing without a local configuration read.
 The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
+
+`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
+`process_stat.name_and_fields` reads each process name and stat fields.
+A parent cycle in `/proc` ends the walk without a job start.
+Each building call reads its job start once, in CLOCK_BOOTTIME seconds.
+When `GITHUB_ACTIONS=true` and no `Runner.Worker` ancestor is readable, the call prints one `::warning::` line on stderr.
+
+A CI step keeps the queue place of its job start.
+GitHub counts its 6-hour limit for each job from the runner pickup, and the `Runner.Worker` start is that pickup.
+The job counts, not the workflow run.
+The front converts the job start once to the queue clock with `queue_job_start`.
+It reads the queue clock and CLOCK_BOOTTIME at the same moment and subtracts the boot age of the job start from the queue clock.
+`ServiceEstimateRequest.job_start` carries `JobStart(started_at)` or `NoJobStart`.
+An older client sends no field, and the service reads it as `NoJobStart`.
+The service copies a `JobStart` into the waiting row as `ci_job_start` and into the saved `WaiterPlace`.
+The service sets `order_since` to the earliest of the step arrival, the run place, and the job start.
+So each step of one CI job ranks at the job start, ahead of steps that arrived after the job started.
+Queue priority remains the first ordering field.
+A step with `NoJobStart` keeps its arrival place.
+`state.json` saves the job start with the waiter place, so the place survives a service restart.
+The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
+Its hover shows the same time and age under `Job start`.
+The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
