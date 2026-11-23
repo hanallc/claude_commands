@@ -1033,12 +1033,18 @@ class LifecycleTests(LifecycleFixture):
                     if real_git is None:
                         self.fail("Git is missing from the fixture PATH")
                     shim = fetch_marker.with_name("git")
+                    # Fetch the earlier commit in the checkout after each origin read: the ls-remote and any SHA fetch.
                     self.write(shim, '''#!/bin/sh
 "$FIXTURE_GIT" "$@" || exit $?
-if [ "$1" = -C ] && [ "$2" = "$FIXTURE_DESTINATION" ] && [ "$3" = fetch ]; then
-    "$FIXTURE_GIT" -C "$2" fetch --quiet origin "$FIXTURE_EARLIER" || exit $?
+[ "$1" = -C ] && [ "$2" = "$FIXTURE_DESTINATION" ] || exit 0
+shift 2
+while [ "$1" = -c ]; do shift 2; done
+case "$1" in
+ls-remote|fetch)
+    "$FIXTURE_GIT" -C "$FIXTURE_DESTINATION" fetch --quiet origin "$FIXTURE_EARLIER" || exit $?
     touch "$FIXTURE_FETCH_MARKER"
-fi
+    ;;
+esac
 ''')
                     shim.chmod(0o755)
                     retry_env = {

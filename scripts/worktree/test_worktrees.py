@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
-from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
@@ -243,7 +243,6 @@ class WorktreeLifecycleTests(unittest.TestCase):
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
-            **fixture_git_environment(self.root),
             **config_environment(self.root / "settings"),
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"), "PATH": os.environ.get("PATH", os.defpath),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
@@ -253,12 +252,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)),
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
         }
-        for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
-            _ = self.environment.pop(key, None)
         _ = self.git(self.root, "init", "--bare", "--initial-branch=main", str(self.origin))
         _ = self.git(self.root, "clone", str(self.origin), str(self.repository))
         _ = (self.repository / "code.txt").write_text("base\n")

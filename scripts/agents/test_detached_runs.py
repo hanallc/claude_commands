@@ -318,8 +318,13 @@ class DetachedRunsTests(unittest.TestCase):
         module_name = "_fixture_detached_completion"
         module = self.root / f"{module_name}.py"
         received = self.root / "completion-thread"
+        settled = self.root / "settled-worker"
         write_text_atomic(module, "from pathlib import Path\n"
-                          + f"def run_finished(thread): Path({str(received)!r}).write_text(thread)\n")
+                          + "from scripts.herdr.worker_panes import StoppedDiagnosticRecovery\n"
+                          + f"def run_finished(thread): Path({str(received)!r}).write_text(thread)\n"
+                          + "def retry_stopped_diagnostics(run, worker):\n"
+                          + f"    Path({str(settled)!r}).write_text(worker)\n"
+                          + "    return StoppedDiagnosticRecovery.SETTLED\n")
         replacement = 'raise ImportError("completion API moved")\n'
         path = self.record([sys.executable, "-c",
             f"from pathlib import Path; Path({str(module)!r}).write_text({replacement!r})"])
@@ -333,6 +338,7 @@ class DetachedRunsTests(unittest.TestCase):
             record = self.supervise(path)
         self.assertEqual(module.read_text(), replacement)
         self.assertEqual(received.read_text(), self.worker_id)
+        self.assertEqual(settled.read_text(), self.worker_id)
         self.assertIs(record.get("completion_pending"), False)
         message, = cast(list[str], self.pending()["messages"])
         self.assertIn("Result: PASS (exit 0)", message)
