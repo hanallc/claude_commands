@@ -595,13 +595,16 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
-# Run the cleanup command after $1, which names it. A failure prints one line
-# and returns 0, so the step status stays the exit status of the call.
-run_cleanup() {
-    local what=$1 status=0
-    shift
-    "$@" || status=$?
-    (( status == 0 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
+# Run build_folders.py remove for the tool folder $2. That is the one removal for these folders.
+# This function only decides what to print for the status. $1 names the removal in the line.
+# Status 1 means that another process holds the lock. The folder stays for collection.
+# Status 2 means that build_folders.py printed its error. A higher status prints one line.
+# Return 0, so the step status stays the exit status of the call.
+remove_tool_folder() {
+    local what=$1 folder=$2 status=0
+    [[ -n "$folder" ]] || return 0
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || status=$?
+    (( status <= 2 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
     return 0
 }
 
@@ -1937,7 +1940,7 @@ finish_hold_wait() {
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
-        run_cleanup "hold-wait folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
+        remove_tool_folder "hold-wait folder removal" "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
@@ -2117,15 +2120,9 @@ cancel_tree_run() {
 }
 
 remove_tree_watch() {
-    [[ -n "$TREE_WATCH_DIR" ]] || return 0
-    local folder="$TREE_WATCH_DIR" remove_status=0
+    local folder="$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || remove_status=$?
-    # Status 1 leaves the folder for collection. Status 2 already has a diagnostic.
-    if (( remove_status > 2 )); then
-        printf 'verify.sh: cleanup failed: tree-watch folder removal (status %s)\n' "$remove_status" >&2
-    fi
-    return 0
+    remove_tool_folder "tree-watch folder removal" "$folder"
 }
 
 start_tree_watch() {
@@ -3364,7 +3361,7 @@ stop_copy_watch() {
             esac
         done < "$COPY_WATCH_DIR/result"
     fi
-    run_cleanup "copy-watch folder removal" verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$COPY_WATCH_DIR"
+    remove_tool_folder "copy-watch folder removal" "$COPY_WATCH_DIR"
     COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
     if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         BUILDLOG_MAC_COPY="$COPY_WORD"
