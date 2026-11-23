@@ -68,11 +68,6 @@ HoldEnd = ExpiresAt | ReleaseEstimated | ReleaseOverdue | UntilReleased | Awaiti
 
 
 @dataclass(frozen=True)
-class Free:
-    kept_claims: int = 0
-
-
-@dataclass(frozen=True)
 class IdleSince:
     """The claim watcher has seen the Mac idle since this time."""
 
@@ -104,6 +99,21 @@ NO_HOLDER_SESSION = NoHolderSession()
 
 
 @dataclass(frozen=True)
+class KeptClaim:
+    """A remote claim kept for cleanup. Its owner process ended, and it holds no work."""
+
+    what: str
+    repository: str
+    since: datetime
+    holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
+
+
+@dataclass(frozen=True)
+class Free:
+    kept_claims: tuple[KeptClaim, ...] = ()
+
+
+@dataclass(frozen=True)
 class RunningJob:
     """One live Mac claim: a job for one repository, or for the whole Mac."""
 
@@ -115,9 +125,10 @@ class RunningJob:
 
 @dataclass(frozen=True)
 class Running:
-    """Every live Mac claim, oldest first."""
+    """Every live Mac claim that holds work, oldest first, and the claims kept for cleanup."""
 
     jobs: tuple[RunningJob, ...]
+    kept_claims: tuple[KeptClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,11 +138,14 @@ class StartNotRecorded:
 
 @dataclass(frozen=True)
 class Held:
+    """A natedev hold or a Mac block, and the Mac claims kept for cleanup while it lasts."""
+
     holder: str
     reason: str
     since: datetime | StartNotRecorded
     end: HoldEnd
     holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
+    kept_claims: tuple[KeptClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -198,12 +212,51 @@ def running_job(claim: mac_test.HeldClaim) -> RunningJob:
 
     record = claim.record
     since = mac_test.aware_timestamp(record["since"], claim.path, "since")
-    session_id = record.get("holder_session", "")
-    holder = HolderSession(session_id) if session_id else NO_HOLDER_SESSION
+    holder = holder_session(record)
     if "idle_since" not in record:
         return RunningJob(record["what"], since, NOT_SEEN_IDLE, holder)
     idle = mac_test.aware_timestamp(record["idle_since"], claim.path, "idle_since")
     return RunningJob(record["what"], since, IdleSince(idle), holder)
+
+
+def holder_session(record: mac_test.RunRecord) -> HolderSession | NoHolderSession:
+    session_id = record.get("holder_session", "")
+    return HolderSession(session_id) if session_id else NO_HOLDER_SESSION
+
+
+def kept_claim(claim: mac_test.HeldClaim) -> KeptClaim:
+    from scripts.mac_test import mac_test
+
+    record = claim.record
+    repository = claim.scope.name if isinstance(claim.scope, mac_test.RepositoryScope) else Path(record["worktree"]).name
+    return KeptClaim(record["what"], repository, mac_test.aware_timestamp(record["since"], claim.path, "since"),
+                     holder_session(record))
+
+
+def kept_claim_text(kept: KeptClaim, owner: str, zone: tzinfo) -> str:
+    """Name a kept claim with its owner and start: the holder session name when known, else the repository."""
+    return f"kept for cleanup: {owner or kept.repository} {kept.what} since {kept_since_text(kept.since, zone)}"
+
+
+def kept_since_text(since: datetime, zone: tzinfo) -> str:
+    """A kept claim can stay for days, so a start before today shows its date."""
+    from scripts.lib.user_zone import shown_time
+
+    return (clock(since, zone) if since.astimezone(zone).date() == utc_now().astimezone(zone).date()
+            else shown_time(since, zone, labeled=True))
+
+
+def status_claims(target: SshTarget, claims: tuple[mac_test.HeldClaim, ...]) -> tuple[mac_test.HeldClaim, ...]:
+    """The claims that status names under the target.
+
+    A guest claim is in the Mac claim folder (eligibility.MAC_LINUX_CLAIM_TARGET), but status names it under mac-linux.
+    """
+    from scripts.mac_test import eligibility, mac_test
+
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        guest = mac_test.read_claims(mac_test.state_paths(eligibility.MAC_LINUX_CLAIM_TARGET))
+        return (*claims, *(claim for claim in guest if mac_test.claim_kind(claim.record) is mac_test.MacClaimKind.GUEST))
+    return tuple(claim for claim in claims if mac_test.claim_kind(claim.record) is not mac_test.MacClaimKind.GUEST)
 
 
 def local_hold_state() -> TargetState:
@@ -251,22 +304,23 @@ def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
         claims = tuple(mac_test.read_claims(paths))
         block = mac_test.read_claim_block(paths)
         backoff = eligibility.read_backoff(utc_now().timestamp(), target.name, strict=True)
+        shown = status_claims(target, claims)
+        kept = tuple(kept_claim(claim) for claim in shown if mac_test.run_is_kept(claim.record))
         if not isinstance(block, mac_test.NoMacBlock):
             block_end = ExpiresAt(block.expires) if block.expires > utc_now() else AwaitingBlockRemoval(block.expires)
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
-            return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session))
+            return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session, kept))
         if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
             return snapshot(Unreachable("failed probe"))
-        jobs = tuple(running_job(claim) for claim in claims
-                     if mac_test.run_holds_work(claim.record))
+        jobs = tuple(running_job(claim) for claim in shown if mac_test.run_holds_work(claim.record))
         if jobs:
-            return snapshot(Running(jobs))
+            return snapshot(Running(jobs, kept))
         if isinstance(backoff, eligibility.UnreadableBackoff):
             return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
         if isinstance(backoff, eligibility.ActiveBackoff):
             return snapshot(Unreachable("retry backoff"))
-        return snapshot(Free(sum(mac_test.run_is_kept(claim.record) for claim in claims)))
+        return snapshot(Free(kept))
     except build_hold.ReleaseRecordReadError as error:
         return snapshot(StateUnreadable(build_hold.release_record_error_line(error)))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
