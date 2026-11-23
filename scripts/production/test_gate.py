@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, first_step
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
@@ -20,7 +20,8 @@ import subprocess
 import tempfile
 import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
+from collections.abc import Generator, Sequence
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.direct.wait_for_test_state import wait_until
@@ -36,6 +37,7 @@ from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.test_gate_default_placement import placed
 
 
 class GateModuleOwnerTests(unittest.TestCase):
@@ -115,8 +117,19 @@ class MergeGateCheckpointTests(MergeGateFixture):
             observed.append(os.environ[admission_records.BUILDLOG_UNIT])
             return gate.GateRun((), 0, 0, tests_reused=True)
 
-        with mock.patch.object(gate, "run_suites", side_effect=suites):
+        @contextmanager
+        def admit(command: Sequence[str], source: Path) -> Generator[object]:
+            self.assertEqual(command[0], 'gate.py')
+            self.assertEqual(source, self.checkout)
+            self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
+            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
+
+        assignment = placed('natedev')
+        with (mock.patch.object(gate, "run_suites", side_effect=suites),
+              mock.patch.object(first_step, 'admitted_run', side_effect=admit) as admitted,
+              mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment])):
             result = self.run_gate()
+        admitted.assert_called_once()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
 
