@@ -18,7 +18,7 @@ import subprocess
 from scripts.build_hold import cargo_folder
 from scripts.lib import conf
 from scripts.production.hand_made_route import Output, Program, in_checkout
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records
 
 # The folders of the system that the run reads. /bin and /usr hold the /bin/sh and /usr/bin/env links.
 SYSTEM_FOLDERS = tuple(Path(name) for name in ("/nix/store", "/run/current-system", "/etc", "/bin", "/usr"))
@@ -65,7 +65,7 @@ def assigned_output(checkout: Path) -> Path | None:
     """The existing build folder that the build folder model links from the checkout target, or None."""
     try:
         output = cargo_folder.assigned_output(checkout)
-    except (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused):
+    except (OSError, RuntimeError, ValueError, KeyError, worktree_records.Refused):
         return None
     if not isinstance(output, cargo_folder.LinkedOutput) or not output.path.is_dir():
         return None

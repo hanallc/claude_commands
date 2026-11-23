@@ -30,7 +30,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, isolated_staff_file
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
@@ -74,7 +74,7 @@ def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str
 
 def make_fixture_worktree(source: Path, unit: str, short_name: str) -> Path:
     """Create a linked checkout and save its record through the model."""
-    main = worktrees.main_checkout(source)
+    main = worktree_records.main_checkout(source)
     _ = subprocess.run(["git", "-C", str(main), "config", "remote.origin.url", str(main.with_suffix(".git"))],
                        check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
     return worktrees.make(main.name, unit, short_name,
@@ -300,12 +300,12 @@ class WorktreeAttributionTests(unittest.TestCase):
                             str(main.parent / "claude_commands.git")], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         source = worktrees.FrozenWorktreeSource(main, phase_reservation.commit_id(main, "HEAD"))
-        _ = (worktrees.state_folder() / "invalid.json").write_text("{")
+        _ = (worktree_records.state_folder() / "invalid.json").write_text("{")
         owned = worktrees.make("claude", "natedev-board", "owned", source)
         ownerless = worktrees.make("claude", "natedev-board", "ownerless", source)
         foreign = worktrees.make("claude", "natedev-other", "foreign", source)
         for checkout, owner in ((owned, "board"), (ownerless, ""), (foreign, "other")):
-            record = worktrees.read_record(worktrees.record_file(checkout))
+            record = worktree_records.read_record(worktree_records.record_file(checkout))
             worktrees.write_record(replace(record, owner=owner))
         record_unit(self, self.session, owned, "1", name="board")
 
@@ -390,7 +390,7 @@ class WorktreeAttributionTests(unittest.TestCase):
                 self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
 
     def test_claim_refuses_a_model_home_without_a_worktree_record(self) -> None:
-        worktrees.record_file(self.first).unlink()
+        worktree_records.record_file(self.first).unlink()
 
         errors = self.assert_claim_refused("1", self.second)
 

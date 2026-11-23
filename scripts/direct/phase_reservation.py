@@ -442,7 +442,7 @@ def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
 
 def _require_model_worktree(
     root: Path, owner_unit: str, *,
-    fix: str = "Restore the recorded branch, or run worktree_records.py make <repo word> <unit> <new short name>.",
+    fix: str = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>.",
 ) -> None:
     try:
         model = _model_worktree_path(root)

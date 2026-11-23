@@ -77,7 +77,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.agents import (
     producer_lifecycle,
     producer_transfer,
@@ -1272,9 +1272,9 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
     try:
         layout = worktrees.worktree_output(unit.worktree)
         worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
-        if isinstance(layout, worktrees.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
+        if isinstance(layout, worktree_records.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
             worktrees.retire(unit.name)
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         return [str(error)]
     if os.path.lexists(unit.worktree):
         return failed
@@ -1827,14 +1827,14 @@ def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
               if recovery_git(unit, "branch", "--list", unit.branch)
               else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
     try:
-        record = worktrees.checkout_record(unit.worktree)
-        layout = (record.layout if record is not None and record.stage is worktrees.MakeStage.MAKING
+        record = worktree_records.checkout_record(unit.worktree)
+        layout = (record.layout if record is not None and record.stage is worktree_records.MakeStage.MAKING
                   else worktrees.unit_checkout_output(
                       unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
         _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
                                       layout, owner=unit.name, merge_branch=unit.production.merge_branch,
                                       allow_existing=True)
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
     if not had_checkout:
         print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
@@ -2471,7 +2471,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktrees.Refused) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktree_records.Refused) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

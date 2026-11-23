@@ -34,7 +34,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
 from scripts.style.style_reader_test_support import oracle_reader
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 def setUpModule() -> None:
@@ -878,17 +878,17 @@ class AddStyleTests(unittest.TestCase):
         self.assertIn("output setup stopped", stopped.stderr)
         inode = self.checkout.stat().st_ino
         with mock.patch.dict(os.environ, self.env):
-            record_path = worktrees.record_file(self.checkout)
-            pending = worktrees.read_record(record_path)
-        self.assertIs(pending.stage, worktrees.MakeStage.MAKING)
+            record_path = worktree_records.record_file(self.checkout)
+            pending = worktree_records.read_record(record_path)
+        self.assertIs(pending.stage, worktree_records.MakeStage.MAKING)
         self.assertFalse((self.checkout / "target").is_symlink())
 
         _ = self.run_bootstrap()
 
-        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(worktree_records.read_record(record_path), replace(pending, stage=worktree_records.MakeStage.DONE))
         self.assertEqual(self.checkout.stat().st_ino, inode)
-        self.assertIsInstance(pending.layout, worktrees.RecordedWorktreeOutput)
-        assert isinstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        self.assertIsInstance(pending.layout, worktree_records.RecordedWorktreeOutput)
+        assert isinstance(pending.layout, worktree_records.RecordedWorktreeOutput)
         self.assertEqual((self.checkout / "target").readlink(), pending.layout.output)
 
     def test_retry_completes_worktree_left_before_production_doc_was_written(self) -> None:
