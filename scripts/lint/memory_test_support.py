@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
 from scripts.lib import conf
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -162,6 +163,9 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+        # The fixture names its own owner and drops the caller's, so a test never reads the owner around it.
+        "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "BUILDLOG_OWNER_STAFF_ID": "",
+        "CLAUDE_SESSION_NAME": FIXTURE_OWNER,
     }
 
 
