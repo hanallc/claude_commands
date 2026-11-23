@@ -372,8 +372,9 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         image_store.write_record(folder, current)
 
 
-# At 1108px and wider, the page fills the frame inside its 32px gutters, and the
-# image column keeps its full 680px. 1108 = 32 + 300 + 64 + 680 + 32.
+# The group index is as wide as its cells need above 900px, so no name or time wraps.
+# At 1108px and wider, the page fills the frame inside its 32px gutters, and the image
+# column keeps its full 680px while the index is 300px or narrower. 1108 = 32 + 300 + 64 + 680 + 32.
 # There a single card keeps 680px, and a pair card takes up to two of them: 1376 = 680 + 16 + 680.
 # A pair stacks, before on top, when its card is narrower than 600px.
 STYLE = """<style>[hidden]{display:none!important}

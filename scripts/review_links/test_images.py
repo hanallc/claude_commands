@@ -1679,13 +1679,18 @@ class ImagePairTests(ImagesFixture):
   if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
    failures.push('The image group index must stick below the heading row.');
   }
+  frameElement.style.width='1382px';
   groups.querySelector('a span').textContent='admin-console-reviewer';
   await painted();
   for(const cell of groups.querySelectorAll('a > span')){
-   const range=document.createRange();
-   range.selectNodeContents(cell);
-   if(range.getClientRects().length!==1) failures.push('The group cell "'+cell.textContent+'" must stay on one line.');
+   const tops=new Set(), text=document.createTreeWalker(cell,NodeFilter.SHOW_TEXT), range=document.createRange();
+   while(text.nextNode()){
+    range.selectNodeContents(text.currentNode);
+    for(const rect of range.getClientRects()) tops.add(Math.round(rect.top));
+   }
+   if(tops.size!==1) failures.push('The group cell "'+cell.textContent+'" must stay on one line at 1382 px.');
   }
+  if(groups.scrollWidth>groups.clientWidth) failures.push('The image group index must not scroll sideways at 1382 px.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
