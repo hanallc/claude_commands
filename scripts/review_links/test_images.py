@@ -20,8 +20,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
-from scripts.review_links.test_accounts_page import firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.process_group import run_process_group
@@ -1688,8 +1687,6 @@ class ImagePairTests(ImagesFixture):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_image_pair_stays_side_by_side_at_1024_pixels(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
-
         _ = self.register_pair()
         owner = self.owner
         assert owner is not None

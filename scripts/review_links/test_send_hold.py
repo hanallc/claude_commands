@@ -16,7 +16,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.review_links import page_frame, send_hold
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.send_hold import HeldResponse, Holds, HoldState, UndoResult
 
 OK = HeldResponse(200, "application/json; charset=utf-8", b'{"saved":true}')

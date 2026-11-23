@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
