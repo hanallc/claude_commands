@@ -202,8 +202,6 @@ class ProgressHistoryTests(unittest.TestCase):
         script.parent.mkdir(parents=True)
         _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
         script.chmod(0o755)
-        digest = cast(Callable[[], str], vars(pass_recorder)["config_digest"])
-        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
         reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
@@ -214,17 +212,16 @@ class ProgressHistoryTests(unittest.TestCase):
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
                 "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
             }):
+                # The two subtests call the digest in one process with a changed environment and file,
+                # as verify_helper.py does in two calls.
                 _ = self.models_config_file.write_text(original + "# later edit\n")
-                clear()
-                try:
-                    text = original if inherited else self.models_config_file.read_text()
-                    with conf_reads.record_reads(reads):
-                        self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
-                    self.assertIn("direct", reads.read_text().splitlines())
-                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
-                    self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
-                finally:
-                    clear()
+                text = original if inherited else self.models_config_file.read_text()
+                with conf_reads.record_reads(reads):
+                    self.assertEqual(pass_recorder.config_digest(),
+                                     hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                self.assertIn("direct", reads.read_text().splitlines())
+                self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
@@ -395,7 +392,6 @@ for number in (1, 2):
     events = [json.loads(line) for line in history.read_text().splitlines()]
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
-    assert pass_recorder.config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
@@ -8400,13 +8396,9 @@ with patch.object(fcntl, "flock", admission):
         return source
 
     def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
-        self.working_dir = self.model_phase_source()
-        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(self.working_dir)],
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(source)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
-        self.start_numbered_phase(session_dir, "57c", 40_010)
-        directory = phase_reservation.phase_directory(session_dir, "57c")
-        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
 
         def git(root: Path, *arguments: str) -> str:
             return subprocess.run(
@@ -8415,6 +8407,12 @@ with patch.object(fcntl, "flock", admission):
                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             ).stdout.strip()
 
+        _ = git(source, "commit", "--allow-empty", "-qm", "base")
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
+        self.start_numbered_phase(session_dir, "57c", 40_010)
+        directory = phase_reservation.phase_directory(session_dir, "57c")
+        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
         _ = git(self.working_dir, "add", ".")
         _ = git(self.working_dir, "commit", "-qm", "home baseline")
         with redirect_stdout(io.StringIO()):
@@ -8455,15 +8453,16 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(owners.refused, [])
 
     def test_explicit_phase_checkout_stays_selected_after_the_staff_folder_moves(self) -> None:
-        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
-        self.start_numbered_phase(run, "4a", 40_010)
-        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
-        assert isinstance(row, staff.StaffRow)
         source = self.model_phase_source()
         _ = subprocess.run(["git", "init", "-q", str(source)], capture_output=True, check=True)
         _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
                            capture_output=True, check=True)
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
+        self.start_numbered_phase(run, "4a", 40_010)
+        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
         checkout = make_fixture_worktree(source, "reservation", "p4a")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
@@ -8519,6 +8518,7 @@ with patch.object(fcntl, "flock", admission):
              "commit", "--allow-empty", "-qm", "phase baseline"],
             check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
         checkout = make_fixture_worktree(source, "reservation", "p57c")
         for name, extra in (("retry-57c", ()),
                             ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):

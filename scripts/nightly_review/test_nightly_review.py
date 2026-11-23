@@ -37,6 +37,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.notify import review
 from scripts.production.unit_lookup import LiveClaude
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 NIGHT = date(2026, 9, 29)
 SESSION = "nightly-review"
@@ -218,7 +219,7 @@ class NightlyReviewTests(unittest.TestCase):
             name="natedev", sessionId=identity, cwd="/current/folder", config_dir=str(config))))
         unrelated = path.with_name(f"{fixture_runtime_id('unrelated-transcript')}.jsonl")
         _ = unrelated.write_text(path.read_text())
-        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}),
               mock.patch.object(nightly_review, "sessions_directory", return_value=records),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])

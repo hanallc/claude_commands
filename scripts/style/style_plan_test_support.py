@@ -41,6 +41,7 @@ from scripts.style import style_rules
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 REAL_RUN = subprocess.run
@@ -237,7 +238,7 @@ class StylePlanFixture(unittest.TestCase):
             **copies_environment(self.root),
             "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
             fake_fmt.STATE: str(self.root / "fmt"),
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),

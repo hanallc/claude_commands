@@ -44,6 +44,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
@@ -334,7 +335,7 @@ class GuestTests(unittest.TestCase):
                 call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
                 self.assertEqual(call['args'], [str(suite), path.name])
                 environment = ledger.mapping(call['env'])
-                self.assertEqual(environment['HERDR_BIN'], '/nonexistent/herdr')
+                self.assertEqual(environment['HERDR_BIN'], MISSING_HERDR_BIN)
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)

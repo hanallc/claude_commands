@@ -68,6 +68,7 @@ scripts/lib/process_group.py
 scripts/lib/process_start.py
 scripts/lib/process_stat.py
 scripts/lib/python_startup/sitecustomize.py
+scripts/lib/release_waiter.py
 scripts/lib/removal_guard.py
 scripts/lib/scratch.py
 scripts/lib/session_folder.py

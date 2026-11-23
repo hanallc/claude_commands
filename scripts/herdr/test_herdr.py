@@ -46,6 +46,7 @@ from scripts.production.cli_fixture import process_boundary, process_boundary_fo
 from scripts.message import sessions, session_records
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 GIT_BINARY = shutil.which("git") or "git"
 BASH_BINARY = shutil.which("bash") or "bash"
@@ -1021,7 +1022,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             "name": "registry-name", "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
         }]
         output = io.StringIO()
-        with (patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"}),
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": MISSING_HERDR_BIN}),
               patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(sessions, "process_start", return_value="fixture-start"),
               patch.object(herdr, "herdr_place_of") as placement,
@@ -1144,7 +1145,7 @@ class PromptSubmissionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN}, clear=True)))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
@@ -3251,7 +3252,7 @@ class LaunchDestinationTests(StaffTestCase):
         proc = self.root / "proc"
         proc.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_PROC": str(proc), "HERDR_BIN": MISSING_HERDR_BIN,
             "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
         })))
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
@@ -6850,7 +6851,7 @@ class HerdrTests(unittest.TestCase):
                 self.log.unlink(missing_ok=True)
                 self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
                 self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
 
     def test_process_scan_reads_live_panes_once_per_session(self) -> None:
@@ -6906,7 +6907,7 @@ class HerdrTests(unittest.TestCase):
             for read, expected in readers:
                 with self.subTest(reply=reply, reader=read):
                     self.assertEqual(read(), expected)
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             for read, expected in readers:
                 with self.subTest(reader=read):
                     self.assertEqual(read(), expected)
@@ -8871,7 +8872,7 @@ class SavedLayoutTests(unittest.TestCase):
         _ = (proc / "42/stat").write_text("42 (shell) S 1 42 42 1 42 " + "0 " * 13 + "4200\n")
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "HERDR_PROC": str(proc),
+            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "HERDR_PROC": str(proc),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(fake_unit_host.private_process_registry())

@@ -57,6 +57,9 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
+In each test, merge, nightly or promote mode, the gate checks the assignment once when it starts, before any merge, hold wait or run.
+For a natedev assignment, `copies.py` keeps its memory reservation through the handoff, and the gate ends it after that check, before it takes its own.
+A mode that cannot route the gate (`--module`, `--nightly`, `--promote-only`) takes only a natedev assignment.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
 An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
@@ -83,7 +86,8 @@ The queue currently releases the Mac claim at this deadline. The guest run keeps
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
-The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
+The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
@@ -91,19 +95,37 @@ If the guest is the only free machine, the run waits 180 seconds and tries the g
 A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
 If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
-A failure after the guest armed the run is not placed again: the gate fails.
+A failure after the first test started is not placed again: the gate fails.
 `copies.py run` with named gate targets does not place the gate again yet.
-If the guest cannot return a result, the gate fails and reports the guest and the reason.
+If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
+Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
 When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
 If AWS refuses that unassigned run, natedev runs the selection.
 
+On natedev, a hand made run starts its program under `bwrap` with a read limit (`scripts/production/hand_made_limit.py`).
+The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
+A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
+The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
+The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
+For a `cargo` run, `hand_made_limit.start_refusal` (the natedev check at the attempt start) and `NatedevRun.run` (before the program starts) call `hand_made_limit.held_output` before the limit checks the output folder, so the limit binds the target link that the steps repair. The lock of the start check ends with that check. `held_output` runs `cargo_folder.checked_step` with the program environment, the code of the wrapper `--exec-checked` route. That code makes or checks the `target` link to the assigned build folder, holds the build folder lock until the program ends, and writes the use stamp. The lock is exclusive only while the step makes the folder and the link; then it is shared, so a parallel cargo step in the checkout runs. The program also gets the lock descriptor, as the wrapper gives it to cargo.
+`held_output` does the steps only when `cargo_folder.folder_step_due` gives true, the rule of the wrapper: a build subcommand other than `install`, no help or version word, and no `CARGO_FOLDER_CHECKED=1` or `BUILDLOG_STEP_SCOPE` in the environment of `hand_made.py`. The value option and build subcommand lists are one line each in the wrapper, and `cargo_folder.wrapper_words` reads them, so the wrapper starts no python for a word that is not a build subcommand.
+With `folders.check=report`, the live value, a path outside the build folders gives one stderr note at the run start, not at the attempt start check, and the run goes on; an unassigned checkout holds no lock. With `enforce`, it is a refusal. Each other check error, and each refusal under `enforce`, ends the attempt with no run (`FOLDER_STEP_REFUSAL`).
+The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
+natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
+The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
+When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
+When the first word is `cargo` and its first match on `PATH` is the build-hold cargo wrapper of the checker repository, outside the checkout (`hand_made.installed_wrapper`), the check and the run take the next match that is not the wrapper (`hand_made.exec_path`), as the wrapper does in the `builds.slice` scope of the run. `run_attempt` finds this start file once and gives it to the check and to the run. The run starts that file by its path, so the wrapper does not run. The wrapper stays the start file and a program file, which the model reads, when there is no next match and for the wrapper of a unit worktree. It also stays the start file for a later word `clean`, because the real `cargo clean` can remove the assigned build folder; `checked_files` then refuses the run before the model call (`CLEAN_REFUSAL`), because the wrapper clean rule needs files that the read limit hides. For a checkout that is the checker repository, the wrapper is in the checkout, so the write path refusal below ends the attempt before the model call. A later word `cargo` reads the wrapper and each later match that is a program file. The run-start check finds the start file again with `exec_path` and refuses a different one, and names the old and the new start file. A `PATH` folder, a start file from `PATH`, a start file named with a slash that is not a checkout file, or a `PATH` match of a later word, whose real path is in a path that the run writes (the checkout, the cargo registry and git folders, `SCCACHE_DIR` or the output folder), is refused (`write_refusal`; `checked_files` finds these paths once with `written_paths`). The limit does not bind the wrapper folder or its `lib` folder.
+When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
+
+The guest takes no hand made run yet: `guest_refusal` refuses each one first with "the guest has no read limit yet", because the guest has no read limit like the natedev one. The hand made guest route below stays for the time when the guest has its read limit.
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
 It holds one argv, the work name and the owner unit, in place of the test selection.
 A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
 A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
 After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
+`GuestRefusedCommand` ends the attempt as a refusal and gives nothing back, as a refused word on the Mac does.
 `GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
 Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
 The request also holds the checkout path of each file that natedev read for an argv word.
@@ -514,6 +536,12 @@ The nightly-red marker widens only a merge gate. It does not block targeted test
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
 A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
+
+The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
+Each kind comes from the newest full, non-aborted gate that recorded it.
+A changed config file selects each module that reads it in its source or in its config read record. A module with no record is selected.
+The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
+Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
 
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
 It prints module names when ten or fewer modules are selected.
@@ -1040,19 +1068,21 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 
 **`scripts/direct/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
-  - It patches `DEFAULT_CONFIG_PATH`, `DEFAULT_MODELS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
-  - It clears `_config_digest`'s cache before and after the call.
+  - It sets `CONF_DIR` and patches `models_registry.DEFAULT_PATH`, `pass_recorder.DEFAULT_MODELS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
+  - `config_digest` has no cache, so each call reads the fixture files.
   - `check=True` raises `CalledProcessError`.
   - The module imports `progress_history` and `user_zone` at load time, before any HOME swap.
 - `communicate_launcher(process, timeout=TEST_HANG_GUARD_SECS) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
 - In `test_progress_history.py`, `run_command`, `run_failing_command` and `run_unowned_command` go through `invoke_recorder`.
 
-**`scripts/direct/local_release_wait.py`**
+**`scripts/lib/release_waiter.py`**
 - `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` watches the directories and their existing parents through inotify via ctypes, re-arms replaced directories, and treats queue overflow as a change. `IntervalReleasePolling` sleeps the caller's interval; it is used where libc has no inotify (macOS) or the call returns ENOSYS/ENOTSUP.
+- `queue_place.py`, `gate.py`, `wait_for_test_state.py`, `copy_watch.py`, `build_targets.py` and `local_release_wait.py` import it.
+
+**`scripts/direct/local_release_wait.py`**
 - `wait_for_local_release(seconds, call_id)` arms the watch before reading target state.
   It returns when the hold ends or the deadline is reached.
   `verify.sh` calls its script; `VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path.
-  `build_targets.py` imports `scripts.direct.local_release_wait`.
 
 **`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
@@ -1151,7 +1181,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 - **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the app-server fixture or HOME.
 
-- **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals. Cache-holding functions (`_config_digest`) are cleared around each case.
+- **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals.
 
 - **The gate kills only what it started:** its own process groups, never by pattern.
 
@@ -1208,7 +1238,7 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
   Its result starts `killed: still running after 1800 s, the module time limit`, and the gate fails.
   This prevents a stalled module from holding every gate behind it.
 
-- **macOS has no inotify.** `local_release_wait` and `wait_until` fall back to interval polling there.
+- **macOS has no inotify.** `local_release_waiter` and `wait_until` fall back to interval polling there.
 
 - **pidfds stay readable** after the process exits; `wait_until` observes each one once and drops it.
 
