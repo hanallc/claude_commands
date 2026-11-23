@@ -116,6 +116,10 @@ class BrpCallError(Failure):
         self.message: str = message
 
 
+class HoverDeadlineExpired(Failure):
+    """The one --hover deadline passed before the help was ready."""
+
+
 class RpcError(TypedDict):
     code: int
     message: str
@@ -643,8 +647,8 @@ class HoverDeadline:
     limit: float
     expires: float
 
-    def expired(self) -> Failure:
-        return Failure(f"help for {self.selector} did not become ready to capture within {self.limit:g} s")
+    def expired(self) -> HoverDeadlineExpired:
+        return HoverDeadlineExpired(f"help for {self.selector} did not become ready to capture within {self.limit:g} s")
 
     def remaining(self) -> float:
         seconds = self.expires - time.monotonic()
@@ -1559,6 +1563,7 @@ def locate_target(session: Session, target: Target, state: CameraState, bounds: 
 
 
 def tooltip_owner(session: Session, target: Target, parents: dict[int, int]) -> TooltipOwner:
+    """The nearest entity on the target's chain with tooltip controllers, else the target with none yet."""
     entity = target.entity
     visited: set[int] = set()
     while entity not in visited:
@@ -1570,7 +1575,7 @@ def tooltip_owner(session: Session, target: Target, parents: dict[int, int]) -> 
         if entity not in parents:
             break
         entity = parents[entity]
-    raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors")
+    return TooltipOwner(target.entity, ())
 
 
 def wait_hover_frame(session: Session, deadline: HoverDeadline) -> None:
@@ -1609,19 +1614,29 @@ def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> 
     hover_session.frame_ms = session.frame_ms
     target = require_one(hover_session, hover.selector, resolve(hover_session, hover.selector))
     bounds_reads = start_bounds(hover_session)
-    owner = tooltip_owner(hover_session, target, bounds_reads[0].result())
+    parents = bounds_reads[0].result()
+    owner = tooltip_owner(hover_session, target, parents)
     bounds = finish_bounds(bounds_reads, include_outside_fit=(owner.entity,))
     location = locate_target(hover_session, target, state, bounds)
     move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
 
-    while True:
-        shown = tuple(
-            controller for controller in owner.controllers
-            if hover_session.brp.components(controller, [VISIBILITY]).get(VISIBILITY) in ("Inherited", "Visible")
-        )
-        wait_hover_frame(hover_session, deadline)
-        if shown:
-            return ShownHoverHelp(target.entity, shown)
+    try:
+        while True:
+            # Some help, such as a rear jack's, spawns only while its target is hovered.
+            if not owner.controllers:
+                owner = tooltip_owner(hover_session, target, parents)
+            shown = tuple(
+                controller for controller in owner.controllers
+                if hover_session.brp.components(controller, [VISIBILITY]).get(VISIBILITY) in ("Inherited", "Visible")
+            )
+            wait_hover_frame(hover_session, deadline)
+            if shown:
+                return ShownHoverHelp(target.entity, shown)
+    except HoverDeadlineExpired:
+        if owner.controllers:
+            raise
+        limit = f"{deadline.limit:g}"
+        raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors within {limit} s") from None
 
 
 # ---------------------------------------------------------------------------
