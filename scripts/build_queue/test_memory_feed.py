@@ -392,7 +392,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=merge gate\n"
+            + "names.gate=gate\n"
             + "owned.default={unit} {step}\n"
             + "owned.test-affected={unit} {step}\n"
             + "owned.ci-default=CI {step}\n"
@@ -553,7 +553,7 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
             job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.FixedExclusion("not enabled"))))
         reading = replace(base, view=replace(base.view, running=(step,)))
-        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
         other = replace(build, pid=8203, gate_placement="episode/other-attempt")
         mac = queue_view.MacBuildReading(now, (build, other))
@@ -589,7 +589,7 @@ class MemoryFeedTests(unittest.TestCase):
             0, 0, 0, owner=str(step.pid)) for step in running)
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "merge gate", "claude_commands",
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
         mac = queue_view.MacBuildReading(now, (native,))
         with (mock.patch.object(admission_client, "view", return_value=reading),
@@ -4456,6 +4456,17 @@ process.stdout.write(JSON.stringify({
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
+
+
+class PageTextTests(unittest.TestCase):
+    def test_the_page_and_its_fixtures_use_only_configured_job_names(self) -> None:
+        # bob, 2026-11-23 12:59: job names come from config/build_steps.conf (names.gate=gate), so no file shows the retired name.
+        retired = " ".join(("merge", "gate"))
+        folder = Path(__file__).resolve().parent
+        for name in ("memory_live.html", "builds_page_real_rows.json", "memory_page_proof.mjs",
+                     "test_memory_feed.py", "test_memory_hover.py", "test_queue_view.py"):
+            with self.subTest(file=name):
+                self.assertNotIn(retired, (folder / name).read_text(encoding="utf-8").lower())
 
 
 class BuildsPageProofTests(unittest.TestCase):

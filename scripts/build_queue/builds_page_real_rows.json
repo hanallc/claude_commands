@@ -1,5 +1,5 @@
 {
- "about": "Rows in the shape of the live Builds feed of 2026-11-23 12:30 PST, for the standing orders check in memory_page_proof.mjs. Times are set relative to the proof read time 200000. The running hana CI row is admitted, so it shows. The lfo unit has no staff entry. The waiting hana CI row has the natedev target that the feed now gives it.",
+ "about": "Rows in the shape of the live Builds feed of 2026-11-23 12:30 PST, for the standing orders check in memory_page_proof.mjs. Times are set relative to the proof read time 200000. The running hana CI row is admitted, so it shows. The lfo unit has no staff entry. The waiting hana CI rows have the natedev target that the feed gives a waiting CI row. The hana CI nextest row waits for its Cargo folder, so its waiting note is long.",
  "staff_names": {
   "admin-console": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">admin-console</span>",
   "aws": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">aws</span>",
@@ -788,6 +788,48 @@
    "key": "50224dd593b86cedbcd018b7"
   },
   {
+   "name": "hana CI: nextest",
+   "title": {
+    "unit": "",
+    "step": "hana CI · hana-linux-1 · rendering_diagnostic"
+   },
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "hana CI: nextest"
+    }
+   ],
+   "showrunner": "",
+   "unit": "",
+   "ci_label": "hana CI · hana-linux-1 · rendering_diagnostic",
+   "runner": "unknown",
+   "owner_text": "hana CI · hana-linux-1 · rendering_diagnostic",
+   "worker": "",
+   "caller": "hana CI · hana-linux-1 · rendering_diagnostic",
+   "pid": 4000839,
+   "detail": "",
+   "need": 13.515789031982422,
+   "since": 198105.92626714706,
+   "reason": "waits for the build in the same Cargo folder",
+   "fits": false,
+   "place": 10,
+   "free": 10.394727325066924,
+   "why": "the build in the same Cargo folder",
+   "call": "cargo nextest run --profile ci --all-features -p hana_diegetic --lib --run-ignored only center_dilation_bounds_corner_wing",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "mac_text": "",
+   "about": "Runs the selected tests for CI",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "ed13a373a1f34b28a1679113cd7086fe",
+    "movable": true
+   },
+   "key": "e06e72d6d6d8476dd1006c16"
+  },
+  {
    "name": "style: mend",
    "title": {
     "unit": "cargo-liner-style",
@@ -812,7 +854,7 @@
    "since": 196472.9912917614,
    "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
    "fits": true,
-   "place": 10,
+   "place": 11,
    "free": 10.394727325066924,
    "why": "its turn",
    "verify": {
@@ -868,7 +910,7 @@
    "since": 198383.9912917614,
    "reason": "waiting for mac",
    "fits": false,
-   "place": 11,
+   "place": 12,
    "free": 10.394727325066924,
    "why": "target",
    "verify": {

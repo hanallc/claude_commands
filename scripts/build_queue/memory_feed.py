@@ -1146,7 +1146,7 @@ class SwapTotals(TypedDict):
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
-    unit_color: NotRequired[str]
+    unit_open: NotRequired[str]
     ok: bool
     read_at: float
     render_seconds: float
@@ -3297,7 +3297,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = "unavailable: " + pressure.reason
     page: MemoryPage = {
         "colors": configuration.colors,
-        "staff_names": staff_display.registry(), "unit_color": staff_display.unit_color(),
+        "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
         "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,

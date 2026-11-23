@@ -115,6 +115,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
           runner:data?.runner || '', why:data?.why || '', stepEnds, nameLeft:name.getBoundingClientRect().left,
           nameRole:name.querySelector('[data-color-text]')?.dataset.colorText || '',
           memoryBox:chart.querySelector('.track')?.childElementCount > 0,
+          smallLines:[...chart.querySelectorAll('.row-label :is(.owner, .wait-note)')].filter(line => line.textContent.trim())
+            .map(line => [line.className, Math.round(line.getBoundingClientRect().height / parseFloat(getComputedStyle(line).lineHeight))]),
           movable:kind === 'wait' && data?.move?.movable !== false, title:name.textContent, titleCut:name.scrollWidth > name.clientWidth,
           grip:!!grip, gripOverlap:grip ? grip.getBoundingClientRect().right > name.getBoundingClientRect().left : false,
           owner:chart.querySelector('.owner')?.textContent || '',
@@ -141,6 +143,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
+    assert.ok(shown.rows.some(row => row.smallLines.some(([kind]) => kind === 'wait-note')),
+      `The real-shape rows show no waiting note at ${width} px.`);
     const waitLefts = new Set(shown.rows.filter(row => row.kind === 'wait').map(row => Math.round(row.nameLeft)));
     assert.equal(waitLefts.size, 1, `Order 9: the waiting row titles do not line up at ${width} px: ${[...waitLefts]}`);
     for (const row of shown.rows) {
@@ -159,6 +163,7 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
       // Form with a reason: a Mac-only waiting step has no memory box, because the chart shows natedev memory.
       if (row.why === 'target') assert.equal(row.memoryBox, false, `Form: ${where}, a Mac-only step, has a memory box.`);
       assert.equal(row.nameLines, 1, `Order 7: the title of ${where} wraps.`);
+      assert.deepEqual(row.smallLines.filter(([, lines]) => lines !== 1), [], `Order 13: a small line of ${where} wraps.`);
       if (width === 1440) assert.equal(row.titleCut, false, `Order 7: the title of ${where} is cut.`);
       assert.equal(row.grip, row.movable, `Order 9: ${where} has the wrong reorder handle state.`);
       assert.equal(row.gripOverlap, false, `Order 9: the reorder handle of ${where} covers its title.`);
@@ -2454,7 +2459,7 @@ try {
               return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.name').textContent),
                 waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.name').textContent)};
             })()`);
-            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
+            const expected = version === 'before' ? ['test affected','gate'] : ['panes test affected','showrunner gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
@@ -2774,7 +2779,7 @@ try {
           Object.assign(reading.walk[mac],{name:'hana nextest',showrunner:'hana',unit:'research',runner:'worker',worker:'impl2',
             used:9.7,started_at:reading.read_at-13*60,read_at:reading.read_at,stage:{kind:'MacTesting'},
             progress:{kind:'RowProgress',phase:'testing',done:891,total:894,percent:100*891/894,unit:'units'}});
-          Object.assign(reading.walk[local],{name:'builds merge gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
+          Object.assign(reading.walk[local],{name:'builds gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
           Object.assign(reading.waiters[0],{name:'report nextest',showrunner:'builds',unit:'report',runner:'unit director',worker:''});
           // A colon is its own cell on the after page; the before page draws it after the label.
           const identity=key=>evaluate(`(() => {

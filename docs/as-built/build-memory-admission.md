@@ -410,7 +410,7 @@ Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
 On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit.
-A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. The feed sends that color as `unit_color` (`StaffNames.unit_color`).
+A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. `StaffNames.unit_open` makes the opening tag of that span with `role_span_open`, the same code as `StaffNames.html`. The feed sends it as `unit_open`, and `staffNames.unit(text)` in the shared script adds the name.
 A row with no unit starts with its owner, the text before `: ` in its name. The text after `: ` goes in Step.
 An owner with a staff entry, such as a showrunner, shows in its staff color. Another owner, such as hana CI, shows in plain ink.
 A row with no unit has no small line, because the line would repeat the owner.
@@ -2349,6 +2349,7 @@ The table starts half the cap line and one gap past the cap, and the fit measure
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
+A small line under a title (the showrunner or repository line, or a waiting note) never wraps either. It ends in an ellipsis in the same way.
 The 12rem cap (9rem in a narrow pane) on the label column stays.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
@@ -2368,16 +2369,18 @@ It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue
 3. A running and a waiting hana CI row.
 4. A Mac build, and an AWS row.
 5. A fixed Mac-only waiting row.
+6. A waiting hana CI row with a long waiting note.
 The queue-move stub gives the page a token, so the reorder handles draw.
 At 1440 px and at 900 px, dark, it fails when one of these is false:
 1. The table has no Unit and no Slot column.
 2. A unit row starts with its unit in its unit color, with the showrunner line under it. A row with no unit starts with its owner, and its title has no `: `.
 3. A showrunner's own run starts with the showrunner in the showrunner color, and has no small line.
-4. Each row title has one line. At 1440 px no title ends in an ellipsis. No line of a Step ends in `-`.
+4. Each row title has one line, and each small line under it has one line. At 1440 px no title ends in an ellipsis. No line of a Step ends in `-`.
 5. The table text and the machine icons are in line with the first line of the row title, within 2 px.
 6. Each movable waiting row has a reorder handle, and the handle does not cover the title. A fixed row has no handle. All waiting row titles start at the same left edge.
 7. A running row shows one bright icon for its machine. A waiting row shows one dim icon for each machine that can take it. The hover names each machine.
 8. A Mac-only waiting step has no memory box, because the chart shows natedev memory.
+`test_memory_feed.PageTextTests.test_the_page_and_its_fixtures_use_only_configured_job_names` fails when `memory_live.html`, the page fixtures or the page tests show the retired job name "merge gate". Job names come from `config/build_steps.conf`.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.

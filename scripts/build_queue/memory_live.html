@@ -300,7 +300,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; line-height: var(--row-line); }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
+.row-label .owner { color: var(--ink-2); }
+/* A small line never wraps, such as the job start of a CI row. In a pane too narrow for it, it ends in an ellipsis,
+   and the row hover gives the full text. */
+.row-label :is(.owner, .wait-note) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* When the queue shows reorder handles, every waiting row keeps the handle space, so a fixed row lines up with the others. */
 #walk:has(.queue-grip) .wrow.wait .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
@@ -1154,11 +1157,9 @@ function queueRowLabels(row) {
   return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
     step: row.title?.unit ? row.title.step : "", verify};
 }
-// A unit always shows in the unit color, by its role, also when it has no staff entry.
+// A unit always shows in the unit color, by its role, also when it has no staff entry. Python makes the span.
 function unitName(text) {
-  const color = globalThis.unitColor;
-  return color ? `<span class="staff-name" data-color-text="role.unit-director" style="color:${esc(color)}">${esc(text)}</span>`
-    : staffName(text);
+  return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
 function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
@@ -1281,8 +1282,7 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
-  if (d.staff_names) globalThis.staffNames?.set(d.staff_names);
-  globalThis.unitColor = d.unit_color || "";
+  if (d.staff_names) globalThis.staffNames?.set(d.staff_names, d.unit_open);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
@@ -2064,7 +2064,7 @@ function fitWalkDetails() {
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   // The widest row title or small line sets the label column, with the reorder handle space of its row.
   // A title never wraps; in a pane too narrow for it, it ends in an ellipsis and the row hover gives the full text.
-  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner)")].map(label =>
+  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner, .wait-note)")].map(label =>
     [label, label.textContent, parseFloat(getComputedStyle(label.closest(".row-label")).paddingInlineStart)]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);

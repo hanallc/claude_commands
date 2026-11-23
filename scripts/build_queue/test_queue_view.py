@@ -33,8 +33,8 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     """Read step labels from the queue fixture."""
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.test-affected=test affected\n"
-        + "names.gate=merge gate\n"
-        + "prose.gate=merge gate\n"
+        + "names.gate=gate\n"
+        + "prose.gate=the gate\n"
         + "owned.test-affected={unit} targeted\n"
         + "owned.gate={unit} merge\n"
         + "owned.showrunner-gate=showrunner merge\n"
@@ -609,7 +609,7 @@ class CloudQueueViewTests(unittest.TestCase):
         settings["owned.test-affected"] = "targeted for {unit}"
         configured = replace(model, names=type(model.names)(settings))
         self.assertEqual(configured.names.shown("test-affected"), "test affected")
-        self.assertEqual(configured.names.prose("gate"), "merge gate")
+        self.assertEqual(configured.names.prose("gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

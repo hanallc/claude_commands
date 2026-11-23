@@ -569,7 +569,7 @@ class MemoryHoverTests(unittest.TestCase):
             ("Reading age", "<1 min"), ("In queue cap", "no"), ("Testing", "7 of 10 tests"), ("Done", "70.0%")])
 
     def test_a_queued_run_with_an_empty_part_list_shows_its_own_use(self) -> None:
-        data = {"read_at": 400, "walk": [{"name": "merge gate", "unit": "fixture", "showrunner": "fixture-production",
+        data = {"read_at": 400, "walk": [{"name": "fixture: gate", "unit": "fixture", "showrunner": "fixture-production",
             "started_at": 100, "used": 4.7, "reserved": 0.5, "counted": 5.2, "queued": True, "keep_text": "",
             "parts": list[dict[str, object]]()}]}
         rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('row:fixture-run-0', data)", data))
@@ -595,8 +595,8 @@ class MemoryHoverTests(unittest.TestCase):
         hold = room.runs[0]
         for name, counter, ordering_note in (
             ("gate", module_counter, True),
-            ("merge gate", module_counter, True),
-            ("fixture-project merge gate", module_counter, True),
+            ("test affected", module_counter, True),
+            ("fixture-project test affected", module_counter, True),
             ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
@@ -757,7 +757,7 @@ class MemoryHoverTests(unittest.TestCase):
                 running: list[dict[str, object]] = [
                     {"name": "local build", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "building"}},
-                    {"name": "merge gate", "queued": True,
+                    {"name": "gate", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
                     {"name": "Mac builds", "kind": "cloud", "machine": "mac",
                      "progress": {"kind": "NoProgress"}},
