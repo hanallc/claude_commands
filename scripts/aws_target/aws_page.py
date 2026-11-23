@@ -426,35 +426,38 @@ def launch_evidence(records: Sequence[dict[str, object]]) -> NoLaunchEvidence | 
     """
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
-    attempt_times: list[float] = []
+    latest_attempt_at: float | None = None
+    last_good_at: float | None = None
     refusals: list[tuple[float, OtherLaunchRefusal, object]] = []
-    good_launch_times: list[float] = []
     for row in reversed(sorted(records, key=lambda row: float(str(row['time'])))):
         evidence = classify_launch_row(row, requested_attempts)
         if evidence is LaunchRowEvidence.NO_ATTEMPT:
             continue
         at = float(str(row['time']))
-        attempt_times.append(at)
+        if latest_attempt_at is None:
+            latest_attempt_at = at
         if evidence is LaunchRowEvidence.LAUNCHED:
-            good_launch_times.append(at)
+            last_good_at = at
             break
         if isinstance(evidence, OtherLaunchRefusal):
             refusals.append((at, evidence, row.get('attempt')))
+    if latest_attempt_at is None:
+        return {'kind': 'no-evidence'}
     if not refusals:
-        if not good_launch_times:
+        if last_good_at is None:
             return {'kind': 'no-evidence'}
-        return {'kind': 'working', 'last_good_at': good_launch_times[0], 'latest_attempt_at': attempt_times[0]}
+        return {'kind': 'working', 'last_good_at': last_good_at, 'latest_attempt_at': latest_attempt_at}
     # One attempt with several refusal rows counts once. A row without an attempt ID counts by itself.
     named = {attempt for _, _, attempt in refusals if isinstance(attempt, str) and attempt}
     count = len(named) + sum(not (isinstance(attempt, str) and attempt) for _, _, attempt in refusals)
     code = refusals[0][1]
     refused: LaunchesRefused = {
-        'kind': 'refused', 'code': code, 'latest_attempt_at': attempt_times[0],
+        'kind': 'refused', 'code': code, 'latest_attempt_at': latest_attempt_at,
         'reason': LAUNCH_REFUSAL_REASONS.get(code, 'The launch could not proceed.'),
         'first_at': refusals[-1][0], 'count': count,
     }
-    if good_launch_times:
-        refused['last_good_at'] = good_launch_times[0]
+    if last_good_at is not None:
+        refused['last_good_at'] = last_good_at
     return refused
 
 

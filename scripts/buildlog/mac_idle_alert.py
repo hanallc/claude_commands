@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
 from scripts.lib import conf
+from scripts.lib.display_text import display_field
 
 
 @dataclass(frozen=True)
@@ -112,11 +113,6 @@ def read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert:
     if type(row.get("messaged")) is not bool:
         return UnreadableAlert("invalid messaged")
     return cast(SavedAlert, cast(object, row))
-
-
-def display_field(value: str) -> str:
-    return " ".join("".join(" " if character.isspace() else character
-                            for character in value if character.isprintable() or character.isspace()).split())
 
 
 def clock_text(at: float, zone: ZoneInfo, *, include_zone: bool = False) -> str:

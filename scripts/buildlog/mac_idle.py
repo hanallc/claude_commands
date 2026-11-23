@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from scripts.buildlog import store
+from scripts.lib.display_text import display_field
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
@@ -258,7 +259,7 @@ def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = RE
         reason = failure_detail(sent)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         reason = str(error)
-    print(f"Mac idle watch: showrunner message failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
+    print(f"Mac idle watch: showrunner message failed: {display_field(reason)}", file=sys.stderr)
     return False
 
 
@@ -370,8 +371,8 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
     waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
     text = (line or "") + "".join(
-        f"\nRepo {mac_idle_alert.display_field(call.repo)}; {call.kind} "
-        + f"{mac_idle_alert.display_field(call.package)}; pid {call.pid}; "
+        f"\nRepo {display_field(call.repo)}; {call.kind} "
+        + f"{display_field(call.package)}; pid {call.pid}; "
         + f"wait {call.local_reason or _waiting_evidence(call, live, waiters)}" for call in calls)
     return notify_showrunner(text, identity=OutageMessage(int(saved["since"]), now, outage_key(saved)))
 
@@ -525,7 +526,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         admission = admission_waiters()
         if isinstance(admission, AdmissionQueryFailed):
             saved["admission_error"] = admission.reason
-            print(f"Mac idle watch: admission query failed: {mac_idle_alert.display_field(admission.reason)}",
+            print(f"Mac idle watch: admission query failed: {display_field(admission.reason)}",
                   file=sys.stderr)
             write_record(paths.state / "alert.json", saved)
         if not saved["messaged"]:

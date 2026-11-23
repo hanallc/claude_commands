@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.display_text import display_field
 from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
@@ -238,8 +239,9 @@ def send_user_push(rendered: RenderedPush, *, sender: str, key: str, clears_when
         reason = failure_detail(sent)
     except (OSError, subprocess.SubprocessError) as error:
         reason = str(error)
-    print(f"{sender}: phone push {key} failed: {' '.join(reason.split())}", file=sys.stderr)
+    print(f"{sender}: phone push {key} failed: {display_field(reason)}", file=sys.stderr)
     return False
+
 
 def user_retire_argv(sender: str, key: str) -> list[str]:
     """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""

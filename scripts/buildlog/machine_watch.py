@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 from scripts.buildlog import mac_idle, mac_idle_alert, store
 from scripts.lib import conf
+from scripts.lib.display_text import display_field
 
 if TYPE_CHECKING:
     from scripts.build_targets.execution_transport import ExecutionTransport
@@ -218,15 +219,14 @@ def refused_credential() -> Outage | Usable:
     """Use the launch evidence of the AWS page. A credential refusal makes the GPU route unusable.
 
     The run of refusals starts at its oldest refusal after the newest good launch, so a run that is older than the
-    notice time sends its notice at once. Only a credential code counts as the newest refusal: another code, such as
-    a service error, can end by itself. The read takes every row, as the page does, because a fallback row counts
-    only when no row anywhere requested its attempt. On natedev this costs about 80 ms each minute.
+    notice time sends its notice at once. Only a credential code or BLOCKED counts as the newest refusal: another
+    code, such as a service error, can end by itself. The read takes every row, as the page does, because a fallback
+    row counts only when no row anywhere requested its attempt. On natedev this costs about 90 ms each minute.
     """
     from scripts.aws_target import aws_page, ledger
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    every_row = ledger.recent_gate_launches(ssh_target_state_directory("aws"), since=0.0)
-    evidence = aws_page.launch_evidence(every_row)
+    evidence = aws_page.launch_evidence(ledger.all_gate_launches(ssh_target_state_directory("aws")))
     if evidence["kind"] != "refused" or evidence["code"] not in aws_page.LAUNCH_REFUSAL_REASONS:
         return USABLE
     return Outage(Unusable(evidence["reason"]), evidence["first_at"])
@@ -326,7 +326,7 @@ def read_machine(target: Target, transport: ExecutionTransport | LocalMachine, p
 
 def cause_text(cause: Unusable | StepsWait) -> str:
     if isinstance(cause, Unusable):
-        text = mac_idle_alert.display_field(cause.reason)
+        text = display_field(cause.reason)
         return text if text.endswith(".") else text + "."
     return f"{mac_idle_alert.waiting_steps_text(cause.count)} for it, and nobody turned it off."
 
@@ -436,9 +436,9 @@ def watch_idle_block(machine: str, paths: WatchPaths, now: float, notice: float)
         notice_row["sent"] = previous["sent"]
     showrunner = holder_showrunner(block)
     recipients = ("bob", showrunner.name) if isinstance(showrunner, mac_test.NamedShowrunner) else ("bob",)
-    holder = mac_idle_alert.display_field(block.holder)
+    holder = display_field(block.holder)
     text = (f"Machine watch: {holder} has blocked the Mac for {int((now - since) // 60)} min, and the Mac ran no "
-            + f"work in that time. Block reason: {mac_idle_alert.display_field(block.reason)}.\n"
+            + f"work in that time. Block reason: {display_field(block.reason)}.\n"
             + f"Ask {holder} to use the Mac or to remove the block with /build:mac unblock.")
     for recipient in recipients:
         if recipient in notice_row["sent"]:
