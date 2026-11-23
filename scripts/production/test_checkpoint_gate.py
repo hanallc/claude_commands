@@ -157,6 +157,18 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertIn("placement: retry — fixture-mac (mac-linux) did not answer.", output.getvalue())
         self.assertIn("0 red", str(report.call_args_list))
 
+    def test_silent_guest_after_its_consume_requests_placement_again(self) -> None:
+        # The guest gate consumed its launch permission, then took no run.
+        fixture = GatePlacementFixture(self)
+        fixture.report_failure.return_value = admission_wire.DispatchStatus(fixture.guest,
+            placement.ClosedAssignment(REASON), placement.PermissionConsumed(12.0), retry=placement.RetryAt(13.0))
+        run = mock.Mock(side_effect=[fixture.refuse_guest(), subprocess.CompletedProcess(COMMAND, 0, "", "")])
+        with redirect_stdout(io.StringIO()):
+            detail = fixture.run_step(run)
+        self.assertEqual(detail, fixture.step.label)
+        self.assertEqual(run.call_count, 2)
+        fixture.place_again.assert_called_once_with(fixture.request)
+
     def test_silent_guest_output_does_not_select_a_flaky_test(self) -> None:
         fixture = GatePlacementFixture(self)
         run = mock.Mock(side_effect=[fixture.refuse_guest(), subprocess.CompletedProcess(COMMAND, 0, "", "")])

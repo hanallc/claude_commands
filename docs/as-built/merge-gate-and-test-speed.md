@@ -79,16 +79,22 @@ After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` 
 This one setting is for every machine. The `mac-linux` and AWS routes read it.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The route takes the Mac repository claim before the first SSH request.
+Then the gate consumes the launch permission of its assignment (`ConsumePermission`) before the first SSH request.
+The gate process is the claim holder, and the Mac claim id is the claim reference.
+The queue keeps a consumed guest assignment current while the gate process lives.
+So the queue places no other run on the busy guest, and the Builds page shows a running guest row.
+A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
 The route sends no more cleanup requests.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
-This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
 The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The queue also accepts the claim failure after the gate consumed the launch permission, when a new process read shows that the gate process ended.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
 If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
