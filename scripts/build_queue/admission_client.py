@@ -380,6 +380,12 @@ class AdmissionResources:
             raise self.abort
 
 
+class QueryWaiter(Enum):
+    """Who waits for a query answer: a program gives up soon, a person waits for a busy service."""
+    PROGRAM = auto()
+    PERSON = auto()
+
+
 def _is_placement_control(request: wire.Request) -> bool:
     return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport, wire.CancelPlacement))
 
@@ -393,7 +399,7 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
            | wire.CancelPlacement | status_wire.PlacementStatusRequest,
-           patience: status_wire.QueryPatience = status_wire.QueryPatience.SHORT) -> wire.Reply:
+           waiter: QueryWaiter = QueryWaiter.PROGRAM) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None)
@@ -405,23 +411,38 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     config = records.read_memory_config()
     started = CLOCK.monotonic()
-    # A down service refuses the connection at once; only the answer can take longer.
-    timeout = config.query_timeout_seconds if patience is status_wire.QueryPatience.SHORT else config.unreachable_limit_seconds
+    short = started + config.query_timeout_seconds
+    # A down service refuses the connection at once; only a person waits longer for the answer.
+    timeout = config.query_timeout_seconds if waiter is QueryWaiter.PROGRAM else config.person_query_timeout_seconds
     deadline = started + timeout
     try:
-        with _connect(_remaining_seconds(started + config.query_timeout_seconds)) as connection:
-            outgoing = wire.encode_request(request).encode()
-            connection.settimeout(_remaining_seconds(deadline))
-            connection.sendall(outgoing)
-            line = _line(connection, bytearray(), deadline)
-            reply = wire.parse_reply(line, request)
-            if isinstance(reply, wire.Refused):
-                raise wire.AdmissionUnavailable(reply.reason)
-            return reply
+        connection = _connect(_remaining_seconds(short))
+    except TimeoutError as error:
+        raise wire.AdmissionUnavailable(f"no connection in {config.query_timeout_seconds:g} s") from error
     except FileNotFoundError as error:
         raise wire.AdmissionUnavailable("no socket") from error
     except ConnectionRefusedError as error:
         raise wire.AdmissionUnavailable("connect refused") from error
+    except OSError as error:
+        raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
+    try:
+        with connection:
+            outgoing = wire.encode_request(request).encode()
+            connection.settimeout(_remaining_seconds(deadline))
+            connection.sendall(outgoing)
+            pending = bytearray()
+            try:
+                line = _line(connection, pending, min(short, deadline))
+            except TimeoutError:
+                if deadline <= short:
+                    raise
+                print(f"build queue: the admission service is busy; waiting up to {timeout:g} s for its answer",
+                      file=sys.stderr, flush=True)
+                line = _line(connection, pending, deadline)
+            reply = wire.parse_reply(line, request)
+            if isinstance(reply, wire.Refused):
+                raise wire.AdmissionUnavailable(reply.reason)
+            return reply
     except TimeoutError as error:
         raise wire.AdmissionUnavailable(f"no answer in {timeout:g} s") from error
     except (OSError, ValueError) as error:
@@ -642,9 +663,19 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
     return records.BuildHistoryGeneration(reply.generation)
 
 
-def view(patience: status_wire.QueryPatience = status_wire.QueryPatience.SHORT) -> records.QueueRead | wire.CloudQueueRead:
+def view() -> records.QueueRead | wire.CloudQueueRead:
+    """Read the queue for a program, which never waits past query_timeout_seconds."""
+    return _view(QueryWaiter.PROGRAM)
+
+
+def view_for_person() -> records.QueueRead | wire.CloudQueueRead:
+    """Read the queue for a person, who waits up to person_query_timeout_seconds for a busy service."""
+    return _view(QueryWaiter.PERSON)
+
+
+def _view(waiter: QueryWaiter) -> records.QueueRead | wire.CloudQueueRead:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    reply = _query(wire.ViewRequest(), patience)
+    reply = _query(wire.ViewRequest(), waiter)
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
     records.warn_configuration_diagnostics(reply.reading.diagnostics)

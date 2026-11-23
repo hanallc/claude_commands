@@ -37,7 +37,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from typing import cast, override
 from scripts.lib import conf
-from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_wire
+from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_place as shell_place
 from scripts.build_targets import target_config
 from scripts.build_hold.owning_session import NoOwningSession
@@ -2965,29 +2965,45 @@ class ClientTests(unittest.TestCase):
                     self.assertFalse(fixture.clock.sleeps)
                     self.doCleanups()
 
-    def test_a_live_view_waits_past_the_query_timeout_for_a_slow_service(self) -> None:
+    def test_a_person_waits_past_the_query_timeout_for_a_busy_service(self) -> None:
         with AdmissionFixture() as fixture:
             reply = fixture.server.handle_request(wire.ViewRequest())[0]
             assert isinstance(reply, wire.ViewReply)
             encoded = reply_bytes(reply)
-            fixture.configure(query_timeout_seconds=0.5, unreachable_limit_seconds=60)
-            for patience, answers in ((admission_wire.QueryPatience.SHORT, False), (admission_wire.QueryPatience.LIVE, True)):
-                with self.subTest(patience=patience):
+            fixture.configure(query_timeout_seconds=0.5, person_query_timeout_seconds=60)
+            for person in (False, True):
+                with self.subTest(person=person), redirect_stderr(io.StringIO()) as errors:
                     start = fixture.clock.monotonic()
-                    # The service takes the connection at once; a short read stops waiting at 0.5 s.
-                    last_chunk = TimedChunk(2.75, encoded[-1:]) if answers else TimeoutError()
-                    transport = self.use_transport(fixture, Exchange(TimedChunk(0.25, encoded[:-1]), last_chunk))
-                    if answers:
-                        self.assertEqual(client.view(patience), reply.reading)
+                    # The service takes the connection at once; a program stops waiting at 0.5 s.
+                    events = ((TimeoutError(), TimedChunk(2.5, encoded[-1:])) if person else (TimeoutError(),))
+                    transport = self.use_transport(fixture, Exchange(TimedChunk(0.25, encoded[:-1]), *events))
+                    if person:
+                        self.assertEqual(client.view_for_person(), reply.reading)
                         self.assertAlmostEqual(fixture.clock.monotonic() - start, 3)
+                        busy = "build queue: the admission service is busy; waiting up to 60 s for its answer\n"
+                        self.assertEqual(errors.getvalue(), busy)
                     else:
                         with self.assertRaises(wire.AdmissionUnavailable) as error:
-                            _ = client.view(patience)
+                            _ = client.view()
                         self.assertEqual(error.exception.reason, "no answer in 0.5 s")
                         self.assertAlmostEqual(fixture.clock.monotonic() - start, 0.5)
-                    self.assertAlmostEqual(transport.timeouts[1], 60 if answers else 0.5)
+                        self.assertEqual(errors.getvalue(), "")
+                    # The connection keeps the program limit, so a down service refuses at once.
+                    self.assertAlmostEqual(transport.timeouts[0], 0.5)
                     self.assertEqual(len(transport.attempts), 1)
                     self.assertFalse(fixture.clock.sleeps)
+                    self.doCleanups()
+
+    def test_a_connection_timeout_names_the_connection_limit_for_each_reader(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(query_timeout_seconds=0.5, person_query_timeout_seconds=60)
+            for read in (client.view, client.view_for_person):
+                with self.subTest(read=read.__name__):
+                    transport = self.use_transport(fixture, Exchange(connect_error=TimeoutError()))
+                    with self.assertRaises(wire.AdmissionUnavailable) as error:
+                        _ = read()
+                    self.assertEqual(error.exception.reason, "no connection in 0.5 s")
+                    self.assertAlmostEqual(transport.timeouts[0], 0.5)
                     self.doCleanups()
 
     def test_query_timeout_uses_configuration_for_the_complete_reply(self) -> None:

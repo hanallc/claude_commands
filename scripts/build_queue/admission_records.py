@@ -1547,6 +1547,7 @@ class MemoryConfig:
     min_pass_gap_seconds: float
     wait_reply_seconds: float
     query_timeout_seconds: float
+    person_query_timeout_seconds: float
     replay_retention_seconds: float
     ended_placement_seconds: float
     reconnect_seconds: float
@@ -1664,6 +1665,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
                 min_pass_gap_seconds=number("min_pass_gap_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
+                person_query_timeout_seconds=number("person_query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
                 ended_placement_seconds=number("ended_placement_seconds"),
                 reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),

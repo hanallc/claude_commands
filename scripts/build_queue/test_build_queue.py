@@ -223,10 +223,10 @@ class ServiceQueryFailureTests(unittest.TestCase):
     def test_a_bump_waits_for_a_silent_live_service_and_refuses_a_missing_one_at_once(self) -> None:
         for silent in (False, True):
             with self.subTest(silent=silent), AdmissionFixture() as fixture:
-                # A person waits, so a live service that took the connection gets the unreachable limit.
-                timeout = records.read_memory_config().unreachable_limit_seconds
+                # A person waits past the program limit for a busy service that took the connection.
+                timeout = records.read_memory_config().person_query_timeout_seconds
                 for arguments in (["4"], ["1"]):
-                    exchange = (Exchange(TimedChunk(timeout / 4, b"{"), TimeoutError()) if silent
+                    exchange = (Exchange(TimedChunk(0.25, b"{"), TimeoutError(), TimeoutError()) if silent
                                 else Exchange(connect_error=FileNotFoundError()))
                     transport = ScriptedTransport(fixture.clock, exchange)
                     output, errors = io.StringIO(), io.StringIO()
@@ -242,9 +242,10 @@ class ServiceQueryFailureTests(unittest.TestCase):
                     self.assertEqual(len(transport.requests), 1 if silent else 0)
                     self.assertEqual(status, 2)
                     self.assertEqual(output.getvalue(), "")
+                    busy = f"build queue: the admission service is busy; waiting up to {timeout:g} s for its answer\n"
                     reason = f"no answer in {timeout:g} s" if silent else "no socket"
                     self.assertEqual(errors.getvalue(),
-                        f"build queue: admission service unavailable: {reason}\n")
+                        (busy if silent else "") + f"build queue: admission service unavailable: {reason}\n")
 
     def test_queue_read_returns_the_private_services_exact_reading(self) -> None:
         with AdmissionFixture() as fixture:
