@@ -336,11 +336,24 @@ class SetTests(unittest.TestCase):
     def test_zone_uses_the_live_settings_time_limits(self) -> None:
         original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         observed: dict[str, list[float | None]] = {}
+        missing_tip: list[str] = []
+
+        def subcommand(command: list[str]) -> str:
+            """Skip `git -C <checkout>` and the global options before the Git command."""
+            words = command[3:]
+            while words and words[0].startswith("-"):
+                words = words[2:] if words[0] == "-c" else words[1:]
+            return words[0] if words else ""
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             timeout = cast(float | None, options.get("timeout"))
-            if command[0] == "git" and command[3] in ("fetch", "push"):
-                observed.setdefault(command[3], []).append(timeout)
+            name = subcommand(command) if command[0] == "git" else ""
+            if name in ("fetch", "ls-remote", "push"):
+                observed.setdefault(name, []).append(timeout)
+            elif name == "cat-file" and not missing_tip:
+                # The zone fetch already has the advertised tip; report it missing once so the land fetches its SHA.
+                missing_tip.append(command[-1])
+                return subprocess.CompletedProcess(command, 1, "", f"fatal: Not a valid object name {command[-1]}")
             elif command[0] == self.env["ZONE_SSH"]:
                 observed.setdefault("ssh", []).append(timeout)
             return original_run(command, **options)
@@ -350,7 +363,8 @@ class SetTests(unittest.TestCase):
                 mock.patch.object(subprocess, "run", side_effect=run):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
-        self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})
+        self.assertEqual(len(missing_tip), 1)
+        self.assertEqual(observed, {"fetch": [10, 10], "ls-remote": [10], "push": [10], "ssh": [10, 20]})
         self.assertIn("LIVE_SETTINGS_SAVE_ORDER=1 ", self.log("ssh.log")[0][-1])
 
     def test_a_checkout_off_main_is_refused(self) -> None:

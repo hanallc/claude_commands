@@ -120,9 +120,10 @@ def _exact_pattern(checkout: Path, path: str) -> str:
 def remove_exact_exclusion(checkout: Path, path: str) -> None:
     """Remove just the anchored exclusion for the former live file."""
     pattern = _exact_pattern(checkout, path)
-    exclude = _exclude_path(checkout)
+    common_dir = _common_dir(checkout)
+    exclude = common_dir / "info" / "exclude"
     try:
-        with exclude.with_name("exclude.lock").open("a", encoding="utf-8") as lock:
+        with exclude_lock_path(common_dir).open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             existing = _read_exclude(exclude)
             remaining = "".join(line for line in existing.splitlines(keepends=True) if line.rstrip("\r\n") != pattern)
