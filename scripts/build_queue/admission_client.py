@@ -380,7 +380,7 @@ class AdmissionResources:
             raise self.abort
 
 
-class QueryWaiter(Enum):
+class _QueryWaiter(Enum):
     """Who waits for a query answer: a program gives up soon, a person waits for a busy service."""
     PROGRAM = auto()
     PERSON = auto()
@@ -399,7 +399,7 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
            | wire.CancelPlacement | status_wire.PlacementStatusRequest,
-           waiter: QueryWaiter = QueryWaiter.PROGRAM) -> wire.Reply:
+           waiter: _QueryWaiter = _QueryWaiter.PROGRAM) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None)
@@ -413,7 +413,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
     started = CLOCK.monotonic()
     short = started + config.query_timeout_seconds
     # A down service refuses the connection at once; only a person waits longer for the answer.
-    timeout = config.query_timeout_seconds if waiter is QueryWaiter.PROGRAM else config.person_query_timeout_seconds
+    timeout = config.query_timeout_seconds if waiter is _QueryWaiter.PROGRAM else config.person_query_timeout_seconds
     deadline = started + timeout
     try:
         connection = _connect(_remaining_seconds(short))
@@ -424,7 +424,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
     except ConnectionRefusedError as error:
         raise wire.AdmissionUnavailable("connect refused") from error
     except OSError as error:
-        raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
+        raise wire.AdmissionUnavailable(str(error) or "connection failed") from error
     try:
         with connection:
             outgoing = wire.encode_request(request).encode()
@@ -665,15 +665,15 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
 
 def view() -> records.QueueRead | wire.CloudQueueRead:
     """Read the queue for a program, which never waits past query_timeout_seconds."""
-    return _view(QueryWaiter.PROGRAM)
+    return _view(_QueryWaiter.PROGRAM)
 
 
 def view_for_person() -> records.QueueRead | wire.CloudQueueRead:
     """Read the queue for a person, who waits up to person_query_timeout_seconds for a busy service."""
-    return _view(QueryWaiter.PERSON)
+    return _view(_QueryWaiter.PERSON)
 
 
-def _view(waiter: QueryWaiter) -> records.QueueRead | wire.CloudQueueRead:
+def _view(waiter: _QueryWaiter) -> records.QueueRead | wire.CloudQueueRead:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     reply = _query(wire.ViewRequest(), waiter)
     if not isinstance(reply, wire.ViewReply):
