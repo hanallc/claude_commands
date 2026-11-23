@@ -364,8 +364,8 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   border-top: 1px solid var(--line); pointer-events: none;
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
-/* The table never moves under the chart: a pane too narrow for both scrolls the step chart sideways. */
-.walk-scroll { overflow-x: auto; }
+/* The table never moves under the chart: a pane too narrow for both scrolls the step chart sideways, never down. */
+.walk-scroll { overflow-x: auto; overflow-y: hidden; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
 /* Narrow the column gaps to keep the chart beside the table. */
@@ -393,7 +393,8 @@ body.queue-unavailable .card { display: none; }
 .walk-sum.over-cap { color: var(--cap); font-weight: 600; }
 .track:hover .b { filter: brightness(1.12); }
 .walk-axis { font-size: 0.75rem; color: var(--ink-2); margin-top: 4px; }
-.walk-axis .ticks { position: relative; height: 16px; }
+/* The labels are absolute; the line height keeps them inside the 16px row. */
+.walk-axis .ticks { position: relative; height: 16px; line-height: 16px; }
 .walk-axis .ticks span { position: absolute; transform: translateX(-50%); }
 @media (max-width: 560px) {
   .card { padding: 14px 12px; }
@@ -1959,7 +1960,8 @@ function fitWalkDetails() {
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
   function measure(labelWidth) {
-    const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
+    // The table starts half the cap line and the gap past the cap, as the placement below sets it.
+    const neededWidth = table.getBoundingClientRect().width + 0.5 + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
     const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
     const reservedWidth = capFraction > 0

@@ -13,7 +13,7 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --queue-rows as the third argument for the dark desktop queue screenshot; a fourth argument names the before page.
+// Use --queue-rows as the third argument for the dark desktop queue screenshot and the card right edge shot; a fourth argument names the before page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -264,7 +264,7 @@ try {
       const temporary = join(profile, 'tmp');
       await mkdir(temporary);
       const chrome = spawn(chromePath, [
-        '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
+        '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
       ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
@@ -328,6 +328,8 @@ try {
           return result.result.value;
         };
         await call('Page.enable');
+        // The checks see no scrollbars; only the scrollbar check shows them.
+        await call('Emulation.setScrollbarsHidden', {hidden:true});
         await call('Page.addScriptToEvaluateOnNewDocument', {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
             + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
@@ -592,6 +594,29 @@ try {
               const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
               await writeFile(output, Buffer.from(shot.data,'base64'));
             }
+          }
+          // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
+          // scrollbars, so one more load shows them. At 1440 px the sideways scroll box has no scrollbar and no overflow.
+          await call('Emulation.setScrollbarsHidden', {hidden:false});
+          try {
+            await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            const scroll = await evaluate(`(() => {
+              const box = document.querySelector('.walk-scroll');
+              const card = box.closest('.card').getBoundingClientRect();
+              return {bars:{right:box.offsetWidth - box.clientWidth, bottom:box.offsetHeight - box.clientHeight,
+                  down:box.scrollHeight - box.clientHeight, sideways:box.scrollWidth - box.clientWidth},
+                clip:{x:card.right+scrollX-160,y:card.top+scrollY,width:160,height:card.height,scale:1}};
+            })()`);
+            // The shot comes first, so a failed check still leaves a picture of the bar.
+            if (queueRowsProof) {
+              const shot = await call('Page.captureScreenshot', {format:'png',clip:scroll.clip});
+              await writeFile(join(folder, shootBefore ? 'before-edge.png' : 'after-edge.png'), Buffer.from(shot.data,'base64'));
+            }
+            if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
+              'The Running/Queued scroll box shows a scrollbar.');
+          } finally {
+            await call('Emulation.setScrollbarsHidden', {hidden:true});
           }
           if (queueRowsProof) {
             console.log(JSON.stringify({pass:true,rows:rows.names}));

@@ -2330,6 +2330,8 @@ Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
 In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
+The card never scrolls down, and its axis labels fit their 16 px row.
+The table starts half the cap line and one gap past the cap, and the fit measures the table at that same place.
 The label column is as wide as the widest running label, the Free row, or the widest word of a queued label.
 A longer queued name wraps at a space inside that width, so a one-word unit name such as `admin-console` never breaks.
 The chart, the top bar and the axis start one even gap after the label column.
@@ -2337,6 +2339,8 @@ The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
 It also fails when a `Target` machine name has no machine color, or a `mac-linux` cell does not show the `mac` color.
 It checks the queued rows at 1440 px and in a tight pane at 900 px. It fails when a waiting unit name takes two lines, a Step cell is cut, or a waiting machine name breaks.
+The other checks hide scrollbars. One more load at 1440 px shows them, and the proof fails when the Running and Queued scroll box shows a scrollbar or can scroll.
+`--queue-rows` also saves that card's right edge as `after-edge.png`, or `before-edge.png` for a before page.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
