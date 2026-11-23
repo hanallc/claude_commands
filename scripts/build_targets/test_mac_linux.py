@@ -97,37 +97,55 @@ assert 'O_NOFOLLOW' in shell
 assert 'EPOCHREALTIME' not in shell
 outer_seconds = int(os.environ['FIXTURE_RUN_SECONDS']) + int(os.environ['FIXTURE_TRANSFER_SECONDS'])
 assert f'timeout --signal=KILL {outer_seconds} python3' in shell
-payload = sys.stdin.buffer.read()
 offset = re.search(r'^head -c ([0-9]+) [|] tar', shell, re.M)
 assert offset
 bootstrap_bytes = int(offset[1])
-bundle = payload[bootstrap_bytes:]
-assert bundle.startswith((b'# v2 git bundle\\n', b'# v3 git bundle\\n'))
-header, pack = bundle.split(b'\\n\\n', 1)
-assert pack.startswith(b'PACK')
-Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(bundle)))
-with Path(os.environ['FIXTURE_BUNDLE_FORMS']).open('a') as forms:
-    forms.write('delta\\n' if any(line.startswith(b'-') for line in header.splitlines()) else 'first\\n')
-if scenario == 'disconnect':
-    payload = payload[:-1]
-if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
+payload = Path(os.environ['FIXTURE_SOURCE_BYTES']).with_suffix('.payload')
+payload.unlink(missing_ok=True)
+
+
+def record_bundle():
+    bundle = payload.read_bytes()[bootstrap_bytes:] if payload.exists() else b''
+    if b'\\n\\n' not in bundle:
+        return
+    assert bundle.startswith((b'# v2 git bundle\\n', b'# v3 git bundle\\n'))
+    header, pack = bundle.split(b'\\n\\n', 1)
+    assert pack.startswith(b'PACK')
+    Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(bundle)))
+    with Path(os.environ['FIXTURE_BUNDLE_FORMS']).open('a') as forms:
+        forms.write('delta\\n' if any(line.startswith(b'-') for line in header.splitlines()) else 'first\\n')
+
+
+# A separate process carries the input, as the SSH hops do: the guest input ends when the natedev link ends,
+# not when this process ends. A disconnect ends the link inside the bundle.
+guest_input, link = os.pipe()
+forward = ['head', '-c', str(bootstrap_bytes + 16)] if scenario == 'disconnect' else ['tee', str(payload)]
+_ = subprocess.Popen(forward, stdout=link)
+before_copy = scenario in ('disconnect-before-copy', 'interrupted-before-copy')
+# A guest whose SSH server has not seen the end of the link keeps its input open.
+held = before_copy or 'FIXTURE_HELD_LINK' in os.environ
+guest = subprocess.Popen(['bash', '-c', shell], stdin=guest_input,
+                         stdout=subprocess.DEVNULL if before_copy else None,
+                         stderr=subprocess.PIPE if before_copy else None,
+                         env=environment, start_new_session=True, pass_fds=(link,) if held else ())
+os.close(guest_input)
+os.close(link)
+if before_copy:
     import selectors
 
-    guest = subprocess.Popen(['bash', '-c', shell], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.PIPE, env=environment, start_new_session=True)
-    guest.stdin.write(payload)
-    guest.stdin.close()
     with selectors.DefaultSelector() as ready:
         ready.register(guest.stderr, selectors.EVENT_READ)
         assert ready.select(3), 'The guest did not take the run lock.'
     assert guest.stderr.readline().startswith(b'mac-linux run locked ')
     assert guest.stderr.readline() == b'fixture pause before take_copy\\n'
+    record_bundle()
     if scenario == 'interrupted-before-copy':
         print('fixture local SSH is still active', file=sys.stderr, flush=True)
         signal.pause()
     os._exit(255)
-sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment,
-                        start_new_session=True).returncode)
+status = guest.wait()
+record_bundle()
+sys.exit(status)
 '''
 
 
@@ -889,7 +907,7 @@ fi
     def test_local_timeout_kills_the_recorded_group_and_proves_end(self) -> None:
         configuration = self.registry.with_name('mac_linux.conf')
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=30'))
-        with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30'}),
+        with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30', 'FIXTURE_HELD_LINK': '1'}),
               patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6)):
             result = self.route('hang')
         self.assertIsInstance(result, str)
@@ -902,6 +920,69 @@ fi
 
     def run_lock(self) -> Path:
         return self.guest_home / '.claude' / mac_linux.RUN_LOCK_PATH
+
+    @staticmethod
+    def process_sessions() -> dict[int, tuple[int, int, int]]:
+        """The parent, process group and session of each live process."""
+        found: dict[int, tuple[int, int, int]] = {}
+        for entry in Path('/proc').iterdir():
+            if entry.name.isdigit():
+                with suppress(OSError):
+                    state, parent, group, session = entry.joinpath('stat').read_text().rpartition(')')[2].split()[:4]
+                    if state != 'Z':
+                        found[int(entry.name)] = (int(parent), int(group), int(session))
+        return found
+
+    def assert_run_ends(self, deadline: float, group: int, *sessions: int) -> None:
+        """Before the deadline, the run group and the given sessions have no live process, and the run lock is free."""
+        while True:
+            live = [pid for pid, (_, process_group, session) in self.process_sessions().items()
+                    if process_group == group or session in sessions]
+            free = subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']) == 0
+            if not live and free:
+                return
+            self.assertLess(time.monotonic(), deadline, f'live processes {live}, run lock free: {free}')
+            time.sleep(0.05)
+
+    def test_a_stopped_natedev_side_ends_the_guest_run_with_no_cleanup(self) -> None:
+        program = '\n'.join((
+            'from pathlib import Path',
+            'import sys',
+            'from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED',
+            'from scripts.build_targets import mac_linux',
+            'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
+            'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
+            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)'))
+        environment = {**os.environ, 'FIXTURE_GUEST_RESULT': 'hang',
+                       'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}
+        group_record = self.root / 'run.group'
+        with (self.root / 'natedev.log').open('wb') as log, subprocess.Popen(
+                [sys.executable, '-c', program, str(self.repo)], cwd=Path(__file__).resolve().parents[2],
+                env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log) as natedev:
+            try:
+                started = time.monotonic() + 30
+                while not group_record.is_file() or not group_record.read_text():
+                    self.assertIsNone(natedev.poll(), (self.root / 'natedev.log').read_text())
+                    self.assertLess(time.monotonic(), started, 'The guest run did not start.')
+                    time.sleep(0.05)
+                stream, = (pid for pid, (parent, _, session) in self.process_sessions().items()
+                           if parent == natedev.pid and session == pid)
+            finally:
+                natedev.kill()
+        # SIGKILL runs no code in the natedev process, so only the end of its link can stop the guest run.
+        deadline = time.monotonic() + mac_linux.GUEST_KILL_GRACE_SECONDS
+        self.assert_run_ends(deadline, int(group_record.read_text()), stream)
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run'])
+
+    def test_the_link_watcher_ends_with_the_run_and_leaves_no_process(self) -> None:
+        # The guest keeps its input open after the run, so a watcher that outlives the run stays live.
+        with patch.dict(os.environ, {'FIXTURE_HELD_LINK': '1'}):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        group = int(self.run_lock().read_text().split()[0])
+        self.assert_run_ends(time.monotonic() + mac_linux.GUEST_KILL_GRACE_SECONDS, group)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_cleanup_cancels_an_attempt_before_it_takes_the_lock(self) -> None:
         git = self.run_lock().parent
@@ -1297,7 +1378,8 @@ fi
         with (patch.object(Path, 'read_text', read_with_delay),
               patch.object(mac_linux, 'monotonic', lambda: now)):
             result = self.route()
-        self.assertEqual(now, 1.25)
+        # The run command and the cleanup command each read the helper once; the cleanup read passes the deadline.
+        self.assertEqual(now, 2.5)
         self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assert_guest_clean('probe', 'arm', 'run')
 
@@ -1443,9 +1525,9 @@ fi
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('released')
 
-        def fail_stream(repo: Path, command: list[str], bootstrap: bytes,
-                        timeout: int) -> subprocess.CompletedProcess[bytes]:
-            stream = stream_guest_bundle(repo, command, bootstrap, timeout)
+        def fail_stream(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int) -> subprocess.CompletedProcess[bytes]:
+            stream = stream_guest_bundle(repo, command, bootstrap, timeout, link)
             self.assertEqual(stream.returncode, 255)
             events.append('SSH failed')
             raise mac_linux.GuestUnavailable('fixture SSH failed')
