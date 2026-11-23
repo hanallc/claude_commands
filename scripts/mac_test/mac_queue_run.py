@@ -38,6 +38,7 @@ from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test.caller_watch import CALLER_EXITED
 from scripts.mac_test.mac_transport import (MacPlacement, RemoteRun, RemoteState, remote_command, stop_command,
                                             stop_remote, stream_remote)
 
@@ -441,28 +442,6 @@ def run_attempt(
     return status
 
 
-CALLER_EXITED = 3
-
-
-def watch_caller(caller: int, queue: int) -> int:
-    """Report readiness and wait for a caller or queue exit."""
-    watch = select.poll()
-    try:
-        watch.register(queue, select.POLLIN)
-        watch.register(caller, select.POLLIN)
-        if watch.poll(0):
-            return 2
-        print("ready", flush=True)
-        events = dict(watch.poll())
-        if queue in events:
-            return 0
-        if events.get(caller, 0) & (select.POLLIN | select.POLLHUP):
-            return CALLER_EXITED
-    except OSError as error:
-        print(f"mac queue: caller watch failed: {error}", file=sys.stderr)
-    return 2
-
-
 @contextlib.contextmanager
 def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
@@ -474,8 +453,9 @@ def caller_watch(caller: int) -> Generator[None]:
     failed = threading.Event()
     try:
         try:
-            watcher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
-                                        str(caller), str(reader)],
+            # -I -S skips site and the user path; the watcher imports only the standard library.
+            watch_script = Path(__file__).resolve().with_name("caller_watch.py")
+            watcher = subprocess.Popen([sys.executable, "-I", "-S", str(watch_script), str(caller), str(reader)],
                                        pass_fds=(caller, reader), start_new_session=True,
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         finally:
@@ -528,9 +508,6 @@ def caller_watch(caller: int) -> Generator[None]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    words = sys.argv[1:] if argv is None else argv
-    if len(words) == 3 and words[0] == "watch-caller":
-        return watch_caller(int(words[1]), int(words[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)

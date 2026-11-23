@@ -1,6 +1,7 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+import ast
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 import io
@@ -511,6 +512,18 @@ if sys.argv[1] == "prepare":
             self.assertIn("caller watch did not start", result.stderr)
             self.assertFalse((root / "events").exists())
 
+    def test_caller_watch_imports_only_the_standard_library(self) -> None:
+        # The watcher must start fast on a loaded host.
+        # A slow import such as subprocess or json can miss the ready limit.
+        source = Path(mac_queue_run.__file__).with_name("caller_watch.py").read_text(encoding="utf-8")
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+        self.assertLessEqual(imported, {"__future__", "select", "sys"})
+
     def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -530,7 +543,7 @@ if sys.argv[1] == "prepare":
                         watchers: list[int] = []
                         for line in processes.splitlines():
                             fields = line.split(maxsplit=2)
-                            if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
+                            if len(fields) == 3 and fields[1] == str(queue.pid) and "/caller_watch.py " in fields[2]:
                                 watchers.append(int(fields[0]))
                         self.assertEqual(len(watchers), 1)
                         os.kill(watchers[0], signal.SIGKILL)
