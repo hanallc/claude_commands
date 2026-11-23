@@ -8,7 +8,7 @@ When this process ends by any signal, the link to the guest ends, and the guest 
 """
 from __future__ import annotations
 
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -50,7 +50,7 @@ GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
-       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
+       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -78,6 +78,29 @@ GUEST_NOT_LOCKED_STATUS = 77
 TOOL_FOLDERS = (Path('/nix/store'), Path('/usr'), Path('/bin'), Path('/sbin'))
 # The first bytes of a compiled program file.
 COMPILED_START = b'\x7fELF'
+# The read limit of a hand made run, on natedev and on the guest, is here for the same reason;
+# scripts/production/hand_made_limit.py adds the natedev paths.
+# The folders of the system that the run reads: the tool folders, the system profile and /etc. /bin and /usr hold
+# the /bin/sh and /usr/bin/env links. A missing folder is not bound.
+SYSTEM_FOLDERS = (*TOOL_FOLDERS, Path('/run/current-system'), Path('/etc'))
+# The system folders in which a user can own an entry; the run does not see such an entry.
+OWNED_FOLDERS = (Path('/etc'), Path('/bin'), Path('/usr'), Path('/sbin'))
+# No one can change a file here, so a read only bind can have a link into it.
+STORE = Path('/nix/store')
+# The run sees its attempt temp folder at this path, and TMPDIR names it.
+TEMP = Path('/tmp')
+# The socket of the private sccache server of the run, in the attempt temp folder.
+SCCACHE_SOCKET = TEMP / 'sccache.sock'
+# The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
+CARGO_LOCKS = ('.package-cache', '.package-cache-mutate', '.global-cache')
+# The key of the bwrap status line that gives the exit status of the program.
+EXIT_STATUS = re.compile(rb'"exit-code"\s*:')
+# The guest starts the argv with this shell in the limit: it prints the start line ($0), then runs the argv. So a
+# limit that bwrap does not set up prints no start line.
+START_SHELL = 'printf "%s\\n" "$0" && exec "$@"'
+BWRAP_MISSING = 'bwrap is not on PATH, so the run cannot start under the read limit; the program did not start'
+BWRAP_FAILED = ('bwrap did not start the program under the read limit (status {status}); the program did not start, '
+                + 'and the output above gives the cause')
 # The tree entry modes of a regular file.
 FILE_MODES = ('100644', '100755')
 CANCEL_RECORD_PREFIX = 'mac-linux-cancel'
@@ -124,8 +147,11 @@ class GuestSettings:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
     def command(self, shell: str) -> tuple[str, ...]:
+        # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A Mac under heavy
+        # load can be slow to answer a keepalive check.
         mac, guest = self.ssh_hops
-        return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
+        ssh = (*SSH, *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        return (*ssh, mac, shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -1315,6 +1341,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     from scripts.production import gate
 
     try:
+        # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
+        # run_gate_suites always sends a list for a targeted run without --full, so this guard protects only a future caller.
+        if mode is SuiteMode.TARGETED and not full and isinstance(selected, AllModules):
+            raise GuestUnavailable('the targeted run has no module list from the natedev selection')
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings
@@ -1429,7 +1459,7 @@ def unread_entry(copy: Path, word: str) -> str:
 
     A word with a slash must have no .. and no symbolic link in a part, and its last part must not exist. A word
     with no slash names one entry of the copy, and a plain folder passes: cargo test runs with a test folder.
-    The check uses lstat on each part, so it follows no link outside the sandbox. A missing part ends the path;
+    The check uses lstat on each part, so it follows no link outside the read limit. A missing part ends the path;
     each other lstat error is a refusal, because the guest cannot tell what the path names.
     """
     parts = Path(word).parts
@@ -1463,7 +1493,7 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
     can start a later match. A later word also counts each readable match, because bash finds a script name on
     PATH with no execute bit.
 
-    The check reads PATH outside the sandbox. The sandbox /tmp and /dev/shm start empty, so the sandbox PATH
+    The check reads PATH outside the read limit. The limit /tmp and /dev/shm start empty, so the limit PATH
     finds no file there that the check does not see.
     """
     copy = copy.resolve()
@@ -1491,6 +1521,166 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
                 return (f'The guest refuses the command word {word}: the guest PATH finds {match}, a program file '
                         + 'that natedev did not read; use a file in the checkout.')
     return ''
+
+
+def home_folder(environment: Mapping[str, str]) -> Path:
+    return Path(environment.get('HOME') or Path.home())
+
+
+def output_folder(checkout: Path, environment: Mapping[str, str]) -> Path:
+    """The one cargo build output folder of the run: CARGO_TARGET_DIR when it is set, else the checkout target."""
+    return checkout / environment.get('CARGO_TARGET_DIR', 'target')
+
+
+def bindable(path: Path, home: Path, *, read: bool) -> bool:
+    """The limit can bind the path: it exists, it holds no home folder, and no part of it is a link.
+
+    The program can write a read and write folder, so it can put a link there for the next run. A read only
+    bind can have a link into /nix/store, because no one can change that file.
+    """
+    real = Path(os.path.realpath(path))
+    return (os.path.lexists(path) and not home.is_relative_to(path)
+            and (real == Path(os.path.normpath(path)) or (read and real.is_relative_to(STORE))))
+
+
+def shown(folder: Path, kept: Sequence[Path]) -> bool:
+    """A PATH folder that the limit adds: absolute, not in a system folder, and it holds no temp folder or
+    checkout."""
+    return (folder.is_absolute() and not any(folder.is_relative_to(system) for system in SYSTEM_FOLDERS)
+            and not any(path.is_relative_to(folder) for path in kept))
+
+
+def unowned(folder: Path) -> Iterator[Path]:
+    """Each entry under the folder that root does not own; a link is no entry, because its target is bound or
+    hidden on its own. A folder that cannot be read is skipped: the program cannot read it either."""
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        try:
+            owner = entry.stat(follow_symlinks=False).st_uid
+        except OSError:
+            continue
+        if owner != 0:
+            yield Path(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            yield from unowned(Path(entry.path))
+
+
+def hidden_words() -> list[str]:
+    """The bwrap words that hide each entry of a system folder that root does not own: an empty read only folder
+    over a folder, /dev/null over a file."""
+    words: list[str] = []
+    for folder in OWNED_FOLDERS:
+        for path in unowned(folder):
+            words += (['--tmpfs', str(path), '--remount-ro', str(path)] if path.is_dir()
+                      else ['--ro-bind', os.devnull, str(path)])
+    return words
+
+
+def read_paths(environment: Mapping[str, str], kept: Sequence[Path]) -> list[Path]:
+    """The paths of the program environment that the run reads: the rustup folder, the cargo bin folder and
+    config, and each PATH folder that the limit adds. kept holds the temp folder and the checkout."""
+    home = home_folder(environment)
+    cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
+    folders = [Path(entry) for entry in environment.get('PATH', '').split(':') if entry]
+    return [Path(environment.get('RUSTUP_HOME') or home / '.rustup'), cargo_home / 'bin', cargo_home / 'config.toml',
+            *(folder for folder in folders if shown(folder, kept))]
+
+
+def written_paths(checkout: Path, environment: Mapping[str, str]) -> list[Path]:
+    """The paths of the program environment that the run reads and writes, the checkout first: the cargo registry
+    and git folders, the cargo lock files, and the sccache folder."""
+    home = home_folder(environment)
+    cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
+    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS),
+            Path(environment.get('SCCACHE_DIR') or home / '.cache' / 'sccache')]
+
+
+def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Path, read: Iterable[Path],
+                write: Iterable[Path]) -> list[str]:
+    """The bwrap words that start a program in its checkout under the read limit; the argv comes after them.
+
+    The attempt temp folder is /tmp, and its bind comes first, so a later bind under /tmp stays visible. A read
+    and write bind comes after each read only bind, so a read and write folder in a read only folder stays
+    writable. Only a path that is bindable with the home folder is bound. bwrap writes its status lines to
+    status_fd.
+    """
+    words = [bwrap, '--json-status-fd', str(status_fd), '--die-with-parent', '--unshare-pid', '--unshare-net',
+             '--dev', '/dev', '--proc', '/proc', '--bind', str(temp), str(TEMP)]
+    for system in SYSTEM_FOLDERS:
+        words += ['--ro-bind-try', str(system), str(system)]
+    words += hidden_words()
+    for option, paths in (('--ro-bind', read), ('--bind', write)):
+        for item in dict.fromkeys(paths):
+            if bindable(item, home, read=option == '--ro-bind'):
+                words += [option, str(item), str(item)]
+    # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
+    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'SCCACHE_SERVER_UDS',
+            str(SCCACHE_SOCKET), '--setenv', 'CARGO_NET_OFFLINE', 'true', '--chdir', str(checkout), '--']
+
+
+def setup_failed(status: int, status_fd: int) -> bool:
+    """bwrap did not set up the limit or did not start the program.
+
+    bwrap then exits with 1 and writes no exit-code line; it writes that line only when the program ends.
+    """
+    if status != 1:
+        return False
+    os.set_blocking(status_fd, False)
+    data = b''
+    try:
+        while chunk := os.read(status_fd, 65536):
+            data += chunk
+    except BlockingIOError:
+        pass
+    return EXIT_STATUS.search(data) is None
+
+
+def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environment: Mapping[str, str], home: Path,
+                    attempt: str, argv: Sequence[str]) -> list[str]:
+    """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
+
+    The program reads and writes the copy, which holds the run home and the build output, the cargo folders and
+    the sccache folder of its environment, and the attempt temp folder, which it sees as /tmp. home is the account
+    home of the guest: the limit binds no path that holds it. START_SHELL prints the start line in the limit.
+    """
+    write = [*written_paths(copy, environment), output_folder(copy, environment)]
+    words = limit_words(bwrap, status_fd, tmp, copy, home, read_paths(environment, [tmp, copy]), write)
+    return [*words, '/bin/sh', '-c', START_SHELL, run_start_line(attempt), *argv]
+
+
+def refuse_run(reason: str, attempt: str) -> int:
+    """Print the reason and the refused line: the guest started nothing."""
+    print(reason, file=sys.stderr, flush=True)
+    print(run_refused_line(attempt), flush=True)
+    return 1
+
+
+def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[str, str], attempt: str) -> int:
+    """Run the argv of a hand made run under the read limit, with its output on the stream standard output.
+
+    When bwrap is missing or does not set up the limit, the program does not start, and the guest refuses the run.
+    """
+    bwrap = shutil.which('bwrap')
+    if bwrap is None:
+        return refuse_run(BWRAP_MISSING, attempt)
+    status_read, status_write = os.pipe()
+    try:
+        try:
+            command = limited_command(bwrap, status_write, tmp, copy, environment, Path.home(), attempt, argv)
+            status = subprocess.run(command, cwd=copy, env=environment, stdin=subprocess.DEVNULL, check=False,
+                                    pass_fds=(*build_folders.held_build_folder_descriptors(), status_write)).returncode
+        finally:
+            os.close(status_write)
+        if setup_failed(status, status_read):
+            return refuse_run(BWRAP_FAILED.format(status=status), attempt)
+        return status
+    finally:
+        os.close(status_read)
 
 
 def run_guest(request_path: Path) -> int:
@@ -1525,11 +1715,8 @@ def run_guest(request_path: Path) -> int:
                 command = list(request['argv'])
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
-                    print(refusal, file=sys.stderr, flush=True)
-                    print(run_refused_line(request['attempt']), flush=True)
-                    return 1
-                print(run_start_line(request['attempt']), flush=True)
-                return run_sandboxed(tmp, command, copy.path, environment)
+                    return refuse_run(refusal, request['attempt'])
+                return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             reply = os.dup(1)
@@ -1540,12 +1727,6 @@ def run_guest(request_path: Path) -> int:
                                           copy.path, environment, reply)
             finally:
                 os.close(reply)
-
-
-def run_sandboxed(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str]) -> int:
-    """Run the argv command in the sandbox, with its standard output on the stream standard output."""
-    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
-                          check=False, pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
 
 def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],

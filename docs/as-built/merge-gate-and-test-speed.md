@@ -65,6 +65,10 @@ An assignment to `natedev` runs the gate on natedev.
 An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
 The AWS route refuses assigned gates that request type checks.
 An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
+For a targeted run, natedev selects the affected modules once, prints the `affected:` line, and sends that module list to the guest.
+The guest runs only the listed modules and does no selection. natedev refuses a guest result with a different module list.
+If natedev cannot select the modules (`GraphError`), it refuses the gate and the guest does not start.
+A full selection sends every module name. `--full` asks the guest for all modules.
 The gate reads the guest switch after it confirms the `mac-linux` assignment.
 If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
@@ -111,10 +115,12 @@ A targeted gate can reuse a certified test pass. The guest runs any requested ty
 When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
 If AWS refuses that unassigned run, natedev runs the selection.
 
-On natedev, a hand made run starts its program under `bwrap` with a read limit (`scripts/production/hand_made_limit.py`).
+On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.
+The rule set is in `scripts/build_targets/mac_linux.py` (`limit_words`), because the guest runner can read only that module; `scripts/production/hand_made_limit.py` adds the natedev paths.
 The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
 A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
-The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
+The system folders are `/nix/store`, `/usr`, `/bin`, `/sbin`, `/run/current-system` and `/etc`; a missing one is not bound.
+The root of the limit is read only, and each entry under `/etc`, `/bin`, `/usr` and `/sbin` that root does not own is hidden.
 The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
 For a `cargo` run, `hand_made_limit.start_refusal` (the natedev check at the attempt start) and `NatedevRun.run` (before the program starts) call `hand_made_limit.held_output` before the limit checks the output folder, so the limit binds the target link that the steps repair. The lock of the start check ends with that check. `held_output` runs `cargo_folder.checked_step` with the program environment, the code of the wrapper `--exec-checked` route. That code makes or checks the `target` link to the assigned build folder, holds the build folder lock until the program ends, and writes the use stamp. The lock is exclusive only while the step makes the folder and the link; then it is shared, so a parallel cargo step in the checkout runs. The program also gets the lock descriptor, as the wrapper gives it to cargo.
 `held_output` does the steps only when `cargo_folder.folder_step_due` gives true, the rule of the wrapper: a build subcommand other than `install`, no help or version word, and no `CARGO_FOLDER_CHECKED=1` or `BUILDLOG_STEP_SCOPE` in the environment of `hand_made.py`. The value option and build subcommand lists are one line each in the wrapper, and `cargo_folder.wrapper_words` reads them, so the wrapper starts no python for a word that is not a build subcommand.
@@ -126,14 +132,13 @@ When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper fo
 When the first word is `cargo` and its first match on `PATH` is the build-hold cargo wrapper of the checker repository, outside the checkout (`hand_made.installed_wrapper`), the check and the run take the next match that is not the wrapper (`hand_made.exec_path`), as the wrapper does in the `builds.slice` scope of the run. `run_attempt` finds this start file once and gives it to the check and to the run. The run starts that file by its path, so the wrapper does not run. The wrapper stays the start file and a program file, which the model reads, when there is no next match and for the wrapper of a unit worktree. It also stays the start file for a later word `clean`, because the real `cargo clean` can remove the assigned build folder; `checked_files` then refuses the run before the model call (`CLEAN_REFUSAL`), because the wrapper clean rule needs files that the read limit hides. For a checkout that is the checker repository, the wrapper is in the checkout, so the write path refusal below ends the attempt before the model call. A later word `cargo` reads the wrapper and each later match that is a program file. The run-start check finds the start file again with `exec_path` and refuses a different one, and names the old and the new start file. A `PATH` folder, a start file from `PATH`, a start file named with a slash that is not a checkout file, or a `PATH` match of a later word, whose real path is in a path that the run writes (the checkout, the cargo registry and git folders, `SCCACHE_DIR` or the output folder), is refused (`write_refusal`; `checked_files` finds these paths once with `written_paths`). The limit does not bind the wrapper folder or its `lib` folder.
 When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
 
-The guest takes no hand made run yet: `guest_refusal` refuses each one first with "the guest has no read limit yet", because the guest has no read limit like the natedev one. The hand made guest route below stays for the time when the guest has its read limit.
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
 It holds one argv, the work name and the owner unit, in place of the test selection.
 A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
 A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
 After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
 `GuestRefusedCommand` ends the attempt as a refusal and gives nothing back, as a refused word on the Mac does.
-`GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
+`GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock and end proof as the gate.
 Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
 The request also holds the checkout path of each file that natedev read for an argv word.
 After the checkout and clean of the numbered copy, `command_refusal` checks each argv word; a failed word ends the run before the start.
@@ -141,13 +146,19 @@ The guest then prints a refused line with the attempt, and `wait_for_start` rais
 A later word that names a `main_folder` fails: python runs a `__main__` file of that folder, such as `__main__.py` or `__main__.pyc`. Natedev uses the same `main_folder`.
 A word with a checked file passes. For another word with a slash, the path from the copy must have no `..` and no symbolic link in a part, and its last part must not exist.
 Another later word with no slash must name no entry of the copy other than a plain folder, for example the `.lint-sweep-used` stamp.
-The check uses `lstat` on each part and follows no link outside the sandbox. An `lstat` error other than a missing part fails the word.
+The check uses `lstat` on each part and follows no link outside the limit. An `lstat` error other than a missing part fails the word.
 For a word with no slash, each guest PATH match must be in `TOOL_FOLDERS` or be a compiled file outside the copy.
 For a later word, each readable PATH match counts, because bash finds a script name on PATH with no execute bit.
-The check reads PATH outside the sandbox; the sandbox `/tmp` and `/dev/shm` start empty, so the sandbox finds no file there that the check does not see.
+The check reads PATH outside the limit; the limit `/tmp` and `/dev/shm` start empty, so the program finds no file there that the check does not see.
 The guest prints a lock line with the attempt to stderr when it has taken the run lock.
 A failed lock step exits with `GUEST_NOT_LOCKED_STATUS`.
-The guest prints a start line with the attempt before it starts the argv.
+The guest runs the argv under the read limit (`run_limited`), not in the gate sandbox.
+The limit binds the system folders, the shown guest PATH folders, the numbered copy, the cargo folders and `SCCACHE_DIR` of the program environment, and the run temp folder as `/tmp`.
+The program environment puts the run home, `CARGO_HOME`, `RUSTUP_HOME` and `CARGO_TARGET_DIR` in the copy, so the rest of the guest home, the other numbered copies and the main checkout are hidden.
+The limit binds no path that holds the guest home (`Path.home()` of the runner).
+When `bwrap` is missing or does not set up the limit (`setup_failed`), the guest prints the cause and the refused line, so `wait_for_start` raises `GuestRefusedCommand` and the attempt ends as a refusal that names `bwrap`.
+Natedev keeps the end of the guest output, and a cargo failure from offline mode ends the attempt as the natedev no network refusal.
+`/bin/sh` in the limit prints the start line with the attempt, then runs the argv (`START_SHELL`), so a limit that `bwrap` does not set up prints no start line.
 `GuestCommand.start` returns at that line, and a stream that ends before it is a start failure with the guest output.
 A stream that ends before the lock line with `GUEST_NOT_LOCKED_STATUS` raises `GuestNotLocked`, and `finish` proves no end.
 The gate route still proves the end after a failed lock step.
