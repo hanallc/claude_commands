@@ -231,6 +231,71 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
     return results
 
 
+NEWER_SCRIPT_PROBE = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+ const line=()=>document.querySelector('[data-page-status]');
+ const status=()=>line().dataset.state+': '+line().textContent.replace(/\s+/g,' ');
+ const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
+ const placed=()=>PLACED;
+ const expected=sessionStorage.getItem('reload-probe');
+ if(expected){
+  sessionStorage.removeItem('reload-probe');
+  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+  for(let wait=0;wait<10;wait++){await flush();await pause(50);}
+  check(Math.abs(scrollY-Number(expected))<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected);
+  check(placed(),'the reload keeps the open place');
+  send();return;
+ }
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='300px';await flush();
+  PLACE
+  await flush();
+  check(scrollY>0 && placed(),'the probe starts at a scrolled place');
+  const newer=NEWER,realFetch=window.fetch;
+  window.fetch=(url,options)=>newer(url,options,realFetch) ?? realFetch(url,options);
+  const type=(field,words)=>{field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));};
+  const draft=DRAFT;
+  type(draft,'typed words');
+  AFTER
+  const held='A newer page loads at the next refresh after the open edit ends.';
+  await refresh();
+  check(line().dataset.state==='Paused' && status().includes(held),'a draft defers the reload: '+status());
+  // A held reload answers now, so a draft that outlasts the age limit stays Paused, not Late.
+  const now=Date.now,limit=JSON.parse(line().dataset.statusOptions).ageLimit;
+  Date.now=()=>now()+(limit+5)*1000;
+  await refresh();
+  check(line().dataset.state==='Paused' && status().includes(held),'a long draft stays Paused: '+status());
+  Date.now=now;
+  END
+  sessionStorage.setItem('reload-probe',String(scrollY));
+  await refresh();
+  for(let wait=0;wait<30;wait++) await pause(100);
+  sessionStorage.removeItem('reload-probe');
+  failures.push('the page did not reload after the draft ended; its status is '+status());
+ }catch(error){failures.push(String(error));}
+ send();
+})();</script>"""
+
+
+def newer_script_reload_results(page: str, *, newer: str, draft: str, place: str, placed: str = "true",
+                                after: str = "", end: str = "type(draft,'');") -> list[list[str]]:
+    """Prove in Firefox that a draft defers the reload for a newer page script and the reload keeps the place.
+
+    `newer` is a JavaScript function `(url, options, fetch)` that answers a refresh request with the newer
+    page and returns undefined for other requests. `draft` is a JavaScript expression for a visible text
+    field. `place` runs before the draft and scrolls the page; `placed` is true while the open place shows.
+    `after` runs after the typing, for example to close the item. `end` ends the draft and any open edit
+    around it; `type(field, words)` types into a field.
+    """
+    probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place)
+             .replace("DRAFT", draft).replace("AFTER", after).replace("END", end).replace("NEWER", newer))
+    return firefox_probe_results(page.replace("</body>", probe + "</body>").encode())
+
+
 class AccountsPageTests(unittest.TestCase):
     review_root: Path = Path()
 
@@ -729,48 +794,14 @@ window.fetch=(url,options)=>options?.method==='POST'
                        lambda match: match.group(1) + html.escape(json.dumps({"role": [{"index": 0, "details": True}]})) + '"',
                        rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"), count=1)
         self.assertNotEqual(newer, rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"))
-        setup = '''<script>
-localStorage.removeItem('roles-sort');Date.now=()=>200000;
-window.fetch=()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE});
-</script>'''.replace("NEWER_PAGE", json.dumps(newer).replace("</", "<\\/"))
-        probe = '''<script>
-(async()=>{
- const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
- const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
- const line=()=>document.querySelector('[data-page-status]');
- const status=()=>line().dataset.state+': '+line().textContent.replace(/\\s+/g,' ');
- const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
- const expected=sessionStorage.getItem('reload-probe');
- if(expected){
-  sessionStorage.removeItem('reload-probe');
-  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
-  await flush();
-  check(Math.abs(scrollY-Number(expected))<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected);
-  send();return;
- }
- try{
-  frameElement.style.width='1280px';frameElement.style.height='300px';await flush();
-  const draft=document.createElement('textarea');
-  document.querySelector('[data-accounts]').before(draft);draft.value='typed words';
-  scrollTo({top:120,behavior:'instant'});
-  const view=document.querySelector('[data-accounts]');
-  await refresh();
-  check(document.querySelector('[data-accounts]')===view,'a draft keeps the old tables');
-  check(line().dataset.state==='Paused' && status().includes('A newer page loads at the next refresh after the open edit ends.'),
-   'a draft defers the reload: '+status());
-  draft.value='';
-  sessionStorage.setItem('reload-probe',String(scrollY));
-  await refresh();
-  for(let wait=0;wait<30;wait++) await pause(100);
-  sessionStorage.removeItem('reload-probe');
-  failures.push('the page did not reload after the draft ended; its status is '+status());
- }catch(error){failures.push(String(error));}
- send();
-})();</script>'''
-        page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        setup = "<script>localStorage.removeItem('roles-sort');Date.now=()=>200000;</script>"
+        newer_reply = "()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE})".replace(
+            "NEWER_PAGE", json.dumps(newer).replace("</", "<\\/"))
+        place = ("document.querySelector('[data-accounts]').before(document.createElement('textarea'));"
+                 + "scrollTo({top:120,behavior:'instant'});")
+        page = rendered.replace("<script>", setup + "<script>", 1)
+        self.assertEqual(newer_script_reload_results(page, newer=newer_reply, place=place,
+                                                     draft="document.querySelector('textarea')"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:

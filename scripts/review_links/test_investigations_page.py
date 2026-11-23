@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.review_links.test_accounts_page import newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
@@ -123,6 +124,23 @@ class InvestigationsPageTests(unittest.TestCase):
         _ = investigation.mark_read(ORPHAN, read.id)
         body = investigations_page.render(self.root / "reviews").decode()
         assert_status_states(self, body, 15)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+        for hour in range(10, 15):
+            _ = self.file(UNIT.id, f"Find cause {hour}", f"2026-11-16T{hour}:00:00+00:00")
+        body = investigations_page.render(self.root / "reviews").decode()
+        self.assertEqual(body.count(f'data-script-version="{investigations_page.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(body.replace(investigations_page.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        # The page has no text field of its own, so the probe adds one, as on Accounts.
+        place = ("location.hash='owner=&show=all';await new Promise(resolve=>setTimeout(resolve,50));"
+                 + "document.querySelector('[data-cards]').before(document.createElement('textarea'));"
+                 + "scrollTo({top:120,behavior:'instant'});")
+        self.assertEqual(newer_script_reload_results(
+            body, newer=newer, place=place, draft="document.querySelector('textarea')",
+            placed="document.querySelector('#investigation-show').value==='all'"), [[]])
 
     def test_order_uses_answer_time_then_filed_time_then_read_time(self) -> None:
         items: list[investigation.Investigation] = []

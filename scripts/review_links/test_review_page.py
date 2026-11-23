@@ -44,7 +44,7 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.test_accounts_page import firefox_probe_results, newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
@@ -1459,6 +1459,34 @@ window.fetch=(url,options)=>{
         index = page.split('<script type="application/json" data-review-index>', 1)[1].split('</script>', 1)[0]
         self.assertEqual(next(entry['id'] for entry in unpack_index(index) if entry['key']==key), 'page-owner/Q1')
         self.assertIn('"review_id": "Q1"', path.read_text())
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'page-owner/C{number}', id=f'page-owner/C{number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 46)]
+        with patch.object(review_items, 'read', return_value=records):
+            markup = browser_markup(self.root)
+        self.assertEqual(markup.count(f'data-script-version="{review_page.SCRIPT_VERSION}"'), 1)
+        # Review reads the snapshot version as JSON, so the newer script version comes in that answer.
+        newer = r"""(url,options)=>{
+ const query=new URL(url,location.href).searchParams;
+ if(!query.has('version') || query.has('index') || query.has('body')) return undefined;
+ return Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,
+  script:'newer-script',facts:pageRefreshFacts()}));
+}"""
+        # The rows are drawn in a window after load, so the scroll place must outlast that first draw.
+        place = r"""scrollTo({top:1200,behavior:'instant'});await new Promise(resolve=>setTimeout(resolve,200));
+  const row=[...document.querySelectorAll('[data-review] [data-list-item]')].find(row=>row.getBoundingClientRect().top>0);
+  row.querySelector('.list-toggle').click();await readyReviewCard(row);"""
+        # A closed item keeps its words only in the page's drafts, so they still hold the reload.
+        close = "document.querySelector('#record-item-dialog [data-close]').click();"
+        after = close + "check(!document.querySelector('#record-item-dialog').open,'the item closes with its words');"
+        end = ("row.querySelector('.list-toggle').click();await readyReviewCard(row);"
+               + "type(document.querySelector('#record-item-dialog textarea'),'');" + close)
+        self.assertEqual(newer_script_reload_results(
+            markup, newer=newer, place=place, after=after, end=end,
+            draft="document.querySelector('#record-item-dialog textarea')"), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_dialog_keeps_its_body_and_scroll_across_refreshes(self) -> None:

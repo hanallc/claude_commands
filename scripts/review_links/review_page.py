@@ -1150,9 +1150,9 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
-        +page_frame.title('Review', 'review')
+        +page_frame.title('Review', 'review', SCRIPT_VERSION)
         +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
-        +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
+        +'<input type="search" id="list-search" placeholder="Filter by id or words" data-reload-safe></div>'
         +'<div class="review-queue">'
         +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
         +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
@@ -2246,6 +2246,9 @@ async function refreshReview(current){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
  if(!canApply() || dateTimePickerOpen(document)) return;
+ // A closed item keeps its words only in reviewDrafts, so they hold the reload too.
+ const newer=reloadForNewScript(version.script,()=>pageHoldsInput() || [...reviewDrafts.values()].some(stored=>stored.draft.feedback));
+ if(newer) return newer;
  view.itemError('');
  const finishDelivery=async()=>{
   if(!delivery || version.delivery_pending!==false) return;
@@ -2389,3 +2392,5 @@ window.consoleNavigate=place=>{
  location.hash=recordPlaceParams(target).toString();
 };
 })(legacyReviewPlace);''')
+SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, record_table.STYLE, record_table.DATE_TIME_STYLE,
+                                           STYLE, CARD_REQUEST_SCRIPT, record_table.render_dialog(), SCRIPT)

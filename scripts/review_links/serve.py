@@ -1021,8 +1021,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
                     return None
                 elif 'version' in fields and 'index' not in fields:
-                    self.json_response(200, {'version':snapshot.version, 'facts':snapshot.facts(),
-                                             'delivery_pending':delivery})
+                    self.json_response(200, {'version':snapshot.version, 'script':review_page.SCRIPT_VERSION,
+                                             'facts':snapshot.facts(), 'delivery_pending':delivery})
                     return None
                 elif 'index' in fields:
                     response = snapshot.full_index if fields.get('for-you') == ['1'] else snapshot.legacy_index

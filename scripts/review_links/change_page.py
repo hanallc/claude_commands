@@ -1617,11 +1617,6 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
-def script_version(script: str) -> str:
-    """Name a page script by its content; an open page reloads, not updates, when the server's script differs."""
-    return hashlib.sha256(script.encode()).hexdigest()[:12]
-
-
 CHANGE_IMAGE_STYLE = """main:not(:has(>.page-status)):has(.change-image){max-width:1056px}
 :is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
 .change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
@@ -1664,6 +1659,10 @@ summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible
 </style><style>''' + page_frame.COPY_STYLE + '''</style></head><body><main>''' + content
         + "</main><script>" + page_frame.ZOOM_SCRIPT + page_frame.COPY_SCRIPT + "</script><script>"
         + page_frame.CONSOLE_READY_SCRIPT + "</script></body></html>").encode("utf-8")
+
+
+# The static style and script that `document` puts around each page, for `page_frame.script_version`.
+DOCUMENT_ASSETS = document("", "").decode()
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:

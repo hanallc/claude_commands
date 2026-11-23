@@ -178,17 +178,21 @@ REFRESH_SCRIPT = r'''function pageHoldsInput(){
  const shown=node=>node.checkVisibility ? node.checkVisibility() : node.getClientRects().length>0;
  if([...document.querySelectorAll('dialog[open],[role=dialog],[role=menu]')].some(shown)) return true;
  if(getSelection()?.isCollapsed===false) return true;
+ // The address restores a [data-reload-safe] field after a short wait, so its text is a draft only while it has focus.
+ const draft=field=>!field.hasAttribute('data-reload-safe') || field===document.activeElement && document.hasFocus();
  return [...document.querySelectorAll('textarea,input:is([type=text],[type=search],[type=url],[type=email],[type=number],:not([type]))')]
-  .some(field=>shown(field) && field.value!==field.defaultValue);
+  .some(field=>shown(field) && field.value!==field.defaultValue && draft(field));
 }
 // A fragment from a changed page script can need a newer script than this page runs.
-// Returns the refresh facts when the fresh page has another script version, else null.
-function reloadForNewScript(page){
+// `page` is the fetched page, or the script version that a JSON read names (none from an older server).
+// `held` tells if the page holds input; a page with drafts outside view gives its own test.
+// Returns refresh facts when the fresh page has another script version, else null.
+// A held reload returns only the busy reason, so the status keeps the data and answer times it has.
+function reloadForNewScript(page,held=pageHoldsInput){
  const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
- const fresh=version(page),own=version(document);
+ const fresh=page instanceof Document ? version(page) : page,own=version(document);
  if(!fresh || !own || fresh===own) return null;
- // The open page keeps showing its own data, so the status keeps its own data time.
- if(pageHoldsInput()) return {...pageRefreshFacts(),busy:'A newer page loads at the next refresh after the open edit ends.'};
+ if(held()) return {busy:'A newer page loads at the next refresh after the open edit ends.'};
  location.reload();
  return pageRefreshFacts();
 }
@@ -243,6 +247,8 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function failed(error,own){if(own===request){failure=error.message || 'The read failed.';reading=false;draw();}}
  async function present(value,began,own,initial=false){
   try{
+  // A busy answer without data keeps the shown data and counts as an answer now, as setStatus does.
+  if(value.readAt===undefined && last) value={...last,busy:value.busy,answeredAt:Date.now()/1000};
   if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
   if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;

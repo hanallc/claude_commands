@@ -34,6 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
+from scripts.review_links.test_accounts_page import newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -3264,8 +3265,8 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
                 self.assertIn('data-card-fade-out-ms="365" data-card-fade-in-ms="725"', content)
                 # An open page reloads, not updates, when the server's page script is newer than its own.
-                self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
-                self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
+                self.assertIn(f'data-script-version="{change_browser.SCRIPT_VERSION}"', content)
+                self.assertNotIn('data-script=', content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
                 _ = write_config_fixture(settings, f"page_refresh_seconds={interval}\n")
@@ -3749,10 +3750,9 @@ class ChangePageTests(unittest.TestCase):
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
                          "row.dataset.key===current?.dataset.key", "ordered.slice(previous+1)"):
                 self.assertIn(rule, body)
-            # Both full reloads are for a page whose script is older than the server's:
-            # this page's own check and the shared reloadForNewScript.
-            self.assertEqual(body.count('location.reload'), 2)
-            self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
+            # The one full reload is the shared reloadForNewScript, for a page script older than the server's.
+            self.assertEqual(body.count('location.reload'), 1)
+            self.assertIn('const newer=reloadForNewScript(page,()=>activeSaves>0 || holdsText() || pageHoldsInput());', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads=true", body)
@@ -3799,6 +3799,22 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('<dt>kind:</dt><dd>See in action</dd>', details)
             self.assertNotIn('<dt>time:</dt>', details)
             self.assertNotIn('<details', card)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+        for text in ("First question", "Second question", "Third question"):
+            _ = self.file_user_question(text, question="Pick one.\n\nChoices:\n1. Compact\n2. Wide")
+        _, _, body = self.browser("questions")
+        self.assertEqual(body.count(f'data-script-version="{change_browser.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(body.replace(change_browser.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        second = "[...document.querySelectorAll('section[data-key]')][1].dataset.key"
+        place = (f"location.hash=new URLSearchParams({{showrunner:'',row:{second}}});"
+                 + "await new Promise(resolve=>setTimeout(resolve,300));scrollTo({top:120,behavior:'instant'});")
+        self.assertEqual(newer_script_reload_results(
+            body, newer=newer, place=place, draft="document.querySelector('section[data-key]:not([hidden]) textarea')",
+            placed=f"document.querySelector('section[data-key]:not([hidden])')?.dataset.key==={second}"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:

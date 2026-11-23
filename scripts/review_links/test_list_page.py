@@ -45,6 +45,7 @@ from scripts.review_links import console, list_page, page_frame, serve, staff_na
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
+from scripts.review_links.test_accounts_page import newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
@@ -965,6 +966,36 @@ if(example.filterOn){
  check(!empty() && rows.every(row=>!row.hidden),'Show all items reveals every row.');
 }
 ''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_draft_ends_and_keeps_its_place(self) -> None:
+        # The probe types "typed words", so every title matches it as a search.
+        for number in range(30):
+            _ = self.add(f"Check typed words {number}")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertEqual(markup.count(f'data-script-version="{list_page.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(markup.replace(list_page.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        row = "[...document.querySelectorAll('[data-list-item]')][20]"
+        toggle = (f"{row}.querySelector('.list-toggle').click();"
+                  + "await new Promise(resolve=>setTimeout(resolve,500));")
+        place = toggle + f"scrollTo({{top:{row}.getBoundingClientRect().top+scrollY-40,behavior:'instant'}});"
+        words = f"recordDetails({row}).querySelector('textarea[name=words]')"
+        with self.subTest(draft="words of a closed item"):
+            # A closed item keeps its words only in the page's drafts, so they still hold the reload.
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, draft=words, placed=f"recordIsOpen({row})",
+                after=toggle + f"check(!recordIsOpen({row}),'the item closes with its words');",
+                end=toggle + f"type({words},'');"), [[]])
+        with self.subTest(draft="search words"):
+            # The address keeps the search words only after a short wait, so the field holds while it has focus.
+            # A headless frame never has focus, so the probe gives it focus as a user's typing does.
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=f"recordIsOpen({row})",
+                draft="(field=>{document.hasFocus=()=>true;field.focus({preventScroll:true});return field;})"
+                      + "(document.querySelector('#list-search'))",
+                end="draft.blur();"), [[]])
 
     def browser_row_expansion(self, steps: str) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()

@@ -98,7 +98,7 @@ def render(root: Path) -> bytes:
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}"{names.style(owner)}>{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
     seconds = conf.read("review_links").number("page_refresh_seconds")
-    content = (STYLE + page_frame.title("Investigations", "review")
+    content = (STYLE + page_frame.title("Investigations", "review", SCRIPT_VERSION)
                + f'<div data-investigations data-refresh-seconds="{seconds}">'
                + '<div data-filters><label for="investigation-owner">Owner:</label>'
                + f'<select id="investigation-owner"><option value="">All</option>{options}</select>'
@@ -178,6 +178,7 @@ async function refresh(supersede=false,current=()=>true){
   const page=new DOMParser().parseFromString(await response.text(),'text/html');
   const fresh=page.querySelector('[data-investigations]');
   if(sending || request!==generation || !current()) return;
+  const newer=reloadForNewScript(page);if(newer) return newer;
   if(!fresh) throw new Error('The page has no investigation list.');
   const top=scrollY, focus=document.activeElement?.id;
   content.replaceWith(fresh);content=fresh;bind();apply();
@@ -192,3 +193,4 @@ window.addEventListener('hashchange',()=>{
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''
+SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)

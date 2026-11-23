@@ -244,10 +244,10 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
-    content = (STYLE + page_frame.title("Images", "images")
+    content = (STYLE + page_frame.title("Images", "images", SCRIPT_VERSION)
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
-               + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
+               + f'<div><div data-images data-refresh-seconds="{refresh_seconds}"'
                + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
@@ -518,12 +518,11 @@ async function refresh(_supersede=false,current=()=>true) {
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const fresh = page.querySelector('[data-images]');
     if (!isCurrent()) return;
+    // A draft can wait on a card that the address hides, so every card form counts.
+    const newer = reloadForNewScript(page, () => pageHoldsInput()
+      || [...list.querySelectorAll('form[data-image-form] textarea')].some(field => field.value !== ''));
+    if (newer) return newer;
     if (!fresh) throw new Error('The page has no image list.');
-    // A page from an older server script cannot bind the new cards, so it loads again.
-    if (fresh.dataset.script !== list.dataset.script) {
-      location.reload();
-      return;
-    }
     const facts = pageRefreshFacts(page);
     // Keep drafts and action results on cards that the server still shows.
     const forms = new Map([...list.querySelectorAll('form[data-image-form]')]
@@ -572,7 +571,7 @@ bind(list);
 apply();
 scrollToLinkedImage();
 })();"""
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
+SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)
 
 
 def main(arguments: list[str]) -> int:

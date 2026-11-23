@@ -201,10 +201,22 @@ Reduced motion stops the loader icon.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
 A page passes `page_frame.script_version(<its static script, style and markup>)` to `title`, which puts it on the status line as `data-script-version`.
-`reloadForNewScript(page)` runs before the loader swaps content. When the fetched page has another version, it reloads the page.
-Accounts calls it. An open Accounts page then never runs an old script on a fragment from a changed page script.
+A page in `change_page.document` adds `change_page.DOCUMENT_ASSETS`, the style and script around each page.
+`reloadForNewScript(page)` runs after the loader's stale-request check and before it swaps content.
+When the fetched page has another version, it reloads the page.
+Accounts, Images, The List, Review, the Changes and Questions pages, and Investigations call it.
+An open page then never runs an old script on a fragment from a changed page script. No page has a second reload rule.
+Review reads its snapshot version as JSON, so that answer names the script version as `script`, and Review passes the string.
 While the page holds typed text, a selection, or an open dialog or menu, the reload waits. The status shows Paused: **A newer page loads at the next refresh after the open edit ends.**
-The paused status keeps the data time of the content it shows. The browser keeps the scroll place across the reload.
+A text field marked `data-reload-safe` holds the reload only while it has focus, because the address restores its words after a short wait.
+The List and Review search fields carry it.
+A page can give its own hold test. Each one also holds for words that no visible field shows:
+- The List and Review hold for the words of a closed item. A successful send clears the stored words.
+- Images holds for feedback on a card that the address hides.
+- The Changes and Questions pages hold for a save in progress and for text on a card that is not shown.
+A held reload answers with only the busy reason. The status keeps the data it shows and counts the answer as current, so a long draft stays Paused and never shows Late.
+The browser keeps the scroll place across the reload. The address keeps the open row, the shown card and the filters.
+On Review an open item is a dialog, so the reload waits until the item closes.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.
@@ -1536,8 +1548,7 @@ On a narrow screen the panel goes above the cards and scrolls with them, and its
 When no images wait for an answer, the page shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
-The card list carries `data-script`, the page script hash.
-When a refresh brings a different hash, the page loads again in place of the swap.
+When a refresh brings a newer page script, the shared `reloadForNewScript` loads the page again in place of the swap.
 An older script does not bind the new card forms, so a form would post outside the script.
 
 Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.

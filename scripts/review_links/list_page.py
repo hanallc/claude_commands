@@ -1070,7 +1070,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + page_frame.title("The List", "list")
+    content = (STYLE + page_frame.title("The List", "list", SCRIPT_VERSION)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
@@ -1095,14 +1095,14 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
-               + counts + '</div>'
-               + page_frame.CONSOLE_DIALOG_ASSETS
-               + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
-               + '<button type="button" data-close autofocus>Close</button></div></dialog>'
-               + record_table.render_inline_detail()
-               + '<script>' + SCRIPT + '</script>')
+               + counts + '</div>' + DIALOGS + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
+
+DIALOGS = (page_frame.CONSOLE_DIALOG_ASSETS
+           + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
+           + '<button type="button" data-close autofocus>Close</button></div></dialog>'
+           + record_table.render_inline_detail())
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
@@ -1873,9 +1873,12 @@ async function refresh(_supersede=false,current=()=>true){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
- if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
  if(saving || dateTimePickerOpen(document) || !current()) return;
+ // A closed item keeps its words only in drafts, so they hold the reload too.
+ const newer=reloadForNewScript(page,()=>pageHoldsInput() || [...drafts.values()].some(draft=>draft.words));
+ if(newer) return newer;
+ if(!fresh) throw new Error('The page has no list.');
  refreshNeeded=false;
  const revealCreated=createdItem && rowIn(fresh,createdItem);
  if(revealCreated && tableView.openItem){
@@ -2060,3 +2063,4 @@ document.addEventListener('review-item-created',event=>{
 });
 void loadListCounts();
 })();''')
+SCRIPT_VERSION = page_frame.script_version(change_page.DOCUMENT_ASSETS, STYLE, DIALOGS, SCRIPT)
