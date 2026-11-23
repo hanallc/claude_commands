@@ -1,6 +1,7 @@
 """Test The List against private staff records and state folders."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import io
 import json
@@ -530,7 +531,7 @@ else:
 
             for case in ("interrupted owner", "slow notice", "accepted notice", "scan resume", "overlapping runs",
                          "same check", "state changed", "all confirmations", "pending instruction",
-                         "reopened", "Mac", "orphan sender", "exited sender"):
+                         "reopened", "capture allocation fails", "Mac", "orphan sender", "exited sender"):
                 with self.subTest(case=case):
                     for path in (sent, attempted):
                         _ = path.write_text("")
@@ -548,6 +549,8 @@ else:
                             self.check_manual_run_settlement(attempted, pending_instruction=case == "pending instruction")
                         case "reopened":
                             self.check_reopened_run_settlement(attempted)
+                        case "capture allocation fails":
+                            self.check_scheduled_capture_failure(sent, attempted)
                         case "Mac":
                             self.check_mac_scheduled_run(attempted)
                         case "orphan sender" | "exited sender":
@@ -801,6 +804,34 @@ the_list.fire_scheduled(timedelta(minutes=2))
             the_list.fire_scheduled(UPKEEP_INTERVAL)
         self.assertEqual(attempted.read_text(), sends)
         self.assertEqual(the_list.load(MORTY.id, item.id), reopened)
+
+    def check_scheduled_capture_failure(self, sent: Path, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        item = self.add("Capture allocation", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (tempfile.TemporaryFile() as report, redirect_stderr(io.StringIO()) as errors,
+              patch.object(the_list, "TemporaryFile", side_effect=(report, OSError(errno.ENOSPC, "No space left")))):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            self.assertTrue(report.closed)
+        self.assertIn("No space left", errors.getvalue())
+        self.assertEqual(attempted.read_text(), "")
+
+        pending = the_list.load(MORTY.id, item.id)
+        run = pending.run_deliveries[0]
+        self.assertIs(run.confirmation, the_list.AwaitingInstruction.OWNER)
+        self.assertEqual(run.notices, (the_list.ScheduledNotice(the_list.RunNotice.OWNER_START),
+                                       the_list.ScheduledNotice(the_list.RunNotice.PRODUCER_START)))
+        self.assertEqual([entry.what for entry in pending.log[len(item.log):]],
+                         [f"Scheduled run due {START.isoformat()}. Sending the instruction."])
+
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sent.read_text())
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1] for args in rows],
+                         [f"list-run:{item.id}:{run.key}:owner_start", f"list-run:{item.id}:{run.key}:producer_start"])
+        delivered = the_list.load(MORTY.id, item.id).run_deliveries[0]
+        self.assertEqual(delivered.confirmation, the_list.AwaitingConfirmation(START + timedelta(minutes=2)))
+        self.assertEqual([notice.state for notice in delivered.notices], [the_list.NoticeState.ACCEPTED] * 2)
 
     def check_mac_scheduled_run(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")

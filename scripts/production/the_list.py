@@ -20,7 +20,7 @@ import sys
 import threading
 from bisect import bisect_right
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -30,7 +30,7 @@ from itertools import chain, dropwhile, islice, takewhile
 from pathlib import Path
 from tempfile import TemporaryFile
 from time import monotonic
-from typing import Literal, TypedDict, cast
+from typing import IO, Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.agents import remote
@@ -2341,37 +2341,45 @@ while True:
 """
 
 
-def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice) -> None:
+@dataclass(frozen=True)
+class ScheduledNoticeCapture:
+    report: IO[bytes]
+    output: IO[bytes]
+    errors: IO[bytes]
+
+
+def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice,
+                           capture: ScheduledNoticeCapture) -> None:
     budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
     deadline = monotonic() + budget
     sender = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
     # Keep the sender output available even if a child keeps its descriptors open.
-    with TemporaryFile() as report, TemporaryFile() as output, TemporaryFile() as errors:
-        command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
-                   _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), str(report.fileno()), *sender]
-        timed_out = False
-        with subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True,
-                              pass_fds=(report.fileno(),), env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
-            try:
-                _ = child.wait(timeout=max(0, deadline - monotonic()))
-            except BaseException as error:
-                with suppress(ProcessLookupError):
-                    process_group.send_process_group(child.pid, signal.SIGKILL)
-                if not isinstance(error, subprocess.TimeoutExpired):
-                    raise
-                timed_out = True
-        timed_out = timed_out or child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL)
-        _ = report.seek(0)
-        receipt = report.readline()
-        _ = output.seek(0)
-        _ = errors.seek(0)
-        if not receipt.endswith(b"\n"):
-            if timed_out:
-                raise ListError("message delivery timed out")
-            raise ListError(errors.read().decode("utf-8", "replace").strip() or "the sender did not report its result")
-        status, output_size, error_size = map(int, receipt.split())
-        stdout = output.read(output_size).decode("utf-8", "replace")
-        stderr = errors.read(error_size).decode("utf-8", "replace")
+    report, output, errors = capture.report, capture.output, capture.errors
+    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",
+               _WAIT_FOR_SENDER_GROUP, str(Path(__file__).resolve().parents[2]), str(report.fileno()), *sender]
+    timed_out = False
+    with subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True,
+                          pass_fds=(report.fileno(),), env={**os.environ, "SEND_REPEAT_NOTICE_JOB": "1"}) as child:
+        try:
+            _ = child.wait(timeout=max(0, deadline - monotonic()))
+        except BaseException as error:
+            with suppress(ProcessLookupError):
+                process_group.send_process_group(child.pid, signal.SIGKILL)
+            if not isinstance(error, subprocess.TimeoutExpired):
+                raise
+            timed_out = True
+    timed_out = timed_out or child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL)
+    _ = report.seek(0)
+    receipt = report.readline()
+    _ = output.seek(0)
+    _ = errors.seek(0)
+    if not receipt.endswith(b"\n"):
+        if timed_out:
+            raise ListError("message delivery timed out")
+        raise ListError(errors.read().decode("utf-8", "replace").strip() or "the sender did not report its result")
+    status, output_size, error_size = map(int, receipt.split())
+    stdout = output.read(output_size).decode("utf-8", "replace")
+    stderr = errors.read(error_size).decode("utf-8", "replace")
     if timed_out:
         print(f"the_list: {identity}: {notice}: sender group timed out after the sender exited", file=sys.stderr)
     attempt = send_result.send_outcome(status, stdout)
@@ -2448,26 +2456,31 @@ def _settle_notice(store: record_store.NumberedRecords, item: ListItem, delivery
 def _deliver_scheduled_notice(store: record_store.NumberedRecords, identity: str, run_key: str,
                               kind: RunNotice, wait: timedelta) -> None:
     operation_deadline.check()
-    with exclusive(store.lock_path(), wait=False) as lock:
-        if lock is LockResult.BUSY:
-            return
-        item = load(store.owner, identity)
-        delivery = next((run for run in item.run_deliveries if run.key == run_key), None)
-        if delivery is None:
-            return
-        notice = next(entry for entry in delivery.notices if entry.kind is kind)
-        if notice.state is NoticeState.SENDING:
-            _settle_notice(store, item, delivery, kind, NoticeState.UNCERTAIN, wait)
-            return
-        if notice.state is not NoticeState.READY:
-            return
-        _save(store, _with_run_delivery(item, _change_notice(delivery, kind, NoticeState.SENDING), now()))
-    result = NoticeState.ACCEPTED
-    try:
-        _send_scheduled_notice(identity, delivery, kind)
-    except (ListError, OSError, subprocess.SubprocessError) as error:
-        print(f"the_list: {identity}: {kind}: {error}", file=sys.stderr)
-        result = NoticeState.UNCERTAIN
+    with ExitStack() as capture_files:
+        with exclusive(store.lock_path(), wait=False) as lock:
+            if lock is LockResult.BUSY:
+                return
+            item = load(store.owner, identity)
+            delivery = next((run for run in item.run_deliveries if run.key == run_key), None)
+            if delivery is None:
+                return
+            notice = next(entry for entry in delivery.notices if entry.kind is kind)
+            if notice.state is NoticeState.SENDING:
+                _settle_notice(store, item, delivery, kind, NoticeState.UNCERTAIN, wait)
+                return
+            if notice.state is not NoticeState.READY:
+                return
+            capture = ScheduledNoticeCapture(capture_files.enter_context(TemporaryFile()),
+                                             capture_files.enter_context(TemporaryFile()),
+                                             capture_files.enter_context(TemporaryFile()))
+            operation_deadline.check()
+            _save(store, _with_run_delivery(item, _change_notice(delivery, kind, NoticeState.SENDING), now()))
+        result = NoticeState.ACCEPTED
+        try:
+            _send_scheduled_notice(identity, delivery, kind, capture)
+        except (ListError, OSError, subprocess.SubprocessError) as error:
+            print(f"the_list: {identity}: {kind}: {error}", file=sys.stderr)
+            result = NoticeState.UNCERTAIN
     with exclusive(store.lock_path(), wait=False) as lock:
         if lock is LockResult.BUSY:
             return

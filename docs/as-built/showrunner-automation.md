@@ -637,7 +637,9 @@ The List reports a group timeout separately from the sender's result.
 
 On the first check at or after the start, the List saves the run and sets the item to Working.
 The owner receives the instruction. The producer receives a copy.
-The List saves each notice as sending before it calls the sender.
+The List opens the capture files before it saves the notice as sending.
+If a file cannot open, the notice stays ready for the next check.
+The List calls the sender after it saves the notice as sending.
 If the List cannot confirm acceptance, it records one uncertainty entry.
 The List calls `send.py` at most once per notice.
 The List starts runs due within two upkeep intervals in order of their saved start times.
