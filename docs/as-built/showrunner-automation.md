@@ -542,12 +542,12 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
 The CLI requires a producer staff row for the current session.
-Morty's fixed staff ID selects the folder for every caller.
+Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
 Old records without the field default to morty.
-`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+`record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
 Investigations retain their existing format and command behavior.
@@ -569,6 +569,9 @@ If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The saved recipient uses `the_list.py answer` to save an answer and mark the item unread.
 Morty can answer any List question.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
+Only morty can use `--keeper <staff id>` to answer in another keeper's folder.
+Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -586,7 +589,7 @@ Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
-2. Preserve an existing item number with `add --number <n>`.
+2. Use `add --number <n>` as morty to advance the sequence to a specified number.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
 4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
    Use a time or `delivered` to park. Use an empty condition to unpark.
@@ -602,13 +605,16 @@ They include the date for updates from another day.
 The page shows the time of each log entry beside its source.
 The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
+Other producers can add items assigned to themselves.
+The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
 They can update their own items with `--title`, `--done-when`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
 Only morty can change the owner or producer of an existing item.
 Their updates use the caller's staff name as the log source.
-They can add items with `--producer` set to their own name or staff ID.
+Their add can set `--producer` to their own name or staff ID; without it, the item goes to the caller.
+The CLI refuses another producer and `--number` on their add.
 The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
 Producers can park and close their own items. The CLI uses the caller's staff name as the log source.
 The writer checks the assigned producer under the same lock as the save.
@@ -644,15 +650,21 @@ The CLI refuses a write if the applicable setting is missing, invalid, or too sm
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in the same producer folder.
+References use numbers in morty's List folder.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
 Closing a prerequisite preserves its dependents' conditions.
 
-Closed records remain on disk with their time and closing words.
-Automatic numbering includes invalid records and Closed records.
-An explicit number must name an unused path.
+Closed and removed records remain on disk with their time, closing words, and log.
+The `.next-number` record in morty's List folder stores the next number.
+The sequence is per machine, and the List's machine is the one source.
+If the counter is missing, the allocator reads the record names and the migration log in all existing List folders.
+This scan includes invalid and Closed records and the migration entries for removed records.
+The first number is one more than the highest recorded number.
+The allocator advances the counter under the List store lock before it publishes the item.
+An explicit number must be at or above the next available number.
+A failed write after reservation leaves a gap in the sequence.
 Exact repeated operations change nothing.
 An update appends a log line and marks the item unread if it is not Closed.
 Closing clears the unread time.
@@ -667,7 +679,8 @@ Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
-`create_records` validates a complete typed batch before writing into an empty list folder.
+`create_records` validates a complete typed batch before writing into morty's empty List folder without a counter.
+It reserves the highest number in the batch before it writes any records.
 It checks forward references and cycles under the same lock as other writes.
 The one-off converter lives outside the repository and uses this API.
 It preserves item numbers, source sections, and each item's JSON data in Evidence.
