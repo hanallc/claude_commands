@@ -604,15 +604,18 @@ For example, use `--start '2026-11-30T09:00[America/Los_Angeles]'` to keep 09:00
 Use `--repeat 'FREQ=WEEKLY;BYDAY=MO'` to repeat on Mondays.
 The CLI prints the rule in words before it saves the schedule.
 The schedule stores its start and instruction in the `schedule` field.
-A series also stores its RRULE, the number of earlier runs, and changes or removals for specific runs.
+A series also stores its RRULE, run progress, and changes or skips by run number.
 Old records without the field have no schedule.
 The `list` command shows the start, repeat rule in words, and next run.
 
 Use `--scope this|following|all` to change or remove a repeat with `update`, `park`, or `close`.
 Use `this` to change the next run's start or words, or to skip the next run.
-Use `following` from the second run to apply the change from the next run.
+The run limit counts skipped runs.
+If you skip a run with `close`, the skip record keeps the closing words.
+Use `following` after a run occurs to apply the change from the next run.
 Use `all` to change or remove the series.
-Use `--repeat ''` to remove the repeat and keep one scheduled run.
+Use `--repeat ''` to remove the repeat and keep the pending run.
+Supply a new start if the pending start is in the past.
 Use `update --state Working`, `park`, or `close` to remove the schedule.
 The record keeps its earlier log entries when the schedule changes or ends.
 A producer can change its own schedules. Morty can change all schedules.
