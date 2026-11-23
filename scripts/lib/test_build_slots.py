@@ -345,32 +345,41 @@ class BuildSlotsTests(unittest.TestCase):
     def rescue_refs(self) -> str:
         return self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/")
 
-    def test_free_copy_with_an_ignored_folder_is_taken_again(self) -> None:
-        _ = (self.source / ".gitignore").write_text("target/\nbuilt/\n")
-        self.base = commit_repository(self.source, "ignore tool output")
+    def commit_allow_list_ignore(self) -> None:
+        _ = (self.source / ".gitignore").write_text(
+            "*\n!.gitignore\n!*.txt\n!scripts/\n!scripts/**\n!src/\n!src/**\n**/__pycache__/\n")
+        for module in ("scripts/tool.py", "src/lib.rs"):
+            (self.source / module).parent.mkdir()
+            _ = (self.source / module).write_text("source\n")
+        self.base = commit_repository(self.source, "ignore all but the tracked paths")
+
+    def test_free_copy_with_only_tool_output_folders_is_taken_again(self) -> None:
+        self.commit_allow_list_ignore()
         notices = io.StringIO()
         _ = self.enterContext(redirect_stderr(notices))
+        output = ("__pycache__/top.pyc", "scripts/__pycache__/tool.pyc", "target/keep")
         with self.take_queue_copy() as copy:
             path = copy.path
-            (path / "built").mkdir()
-            _ = (path / "built/output").write_text("tool output\n")
-            _ = (copy.cargo_dir / "keep").write_text("cached build output\n")
+            for name in output:
+                (path / name).parent.mkdir(exist_ok=True)
+                _ = (path / name).write_text(f"{name} output\n")
         refs = self.rescue_refs()
         with self.take_queue_copy() as reused:
             self.assertEqual(reused.path, path)
-            self.assertEqual((path / "built/output").read_text(), "tool output\n")
-            self.assertEqual((reused.cargo_dir / "keep").read_text(), "cached build output\n")
+            for name in output:
+                self.assertEqual((path / name).read_text(), f"{name} output\n")
         self.assertEqual(self.rescue_refs(), refs)
         self.assertNotIn("untracked folders", notices.getvalue())
 
     def test_free_copy_with_an_untracked_folder_is_kept(self) -> None:
+        self.commit_allow_list_ignore()
         exclude = self.source / ".git/info/exclude"
         exclude.parent.mkdir(exist_ok=True)
         with exclude.open("a") as output:
             _ = output.write("saved/\n")
         notices = io.StringIO()
         _ = self.enterContext(redirect_stderr(notices))
-        for folder in ("notes", "saved"):
+        for folder in ("notes", "saved", "src/target"):
             with self.subTest(folder=folder):
                 with self.take_queue_copy() as copy:
                     path = copy.path

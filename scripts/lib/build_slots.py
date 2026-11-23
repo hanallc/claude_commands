@@ -33,6 +33,8 @@ from scripts.lib.slot_root import slot_root as slot_root
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
 LEASE_SUFFIX = ".lease.json"
+# Python writes these folders beside each imported module; they hold no work.
+TOOL_OUTPUT_FOLDERS = ("__pycache__",)
 
 
 @dataclass(frozen=True)
@@ -416,8 +418,8 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 index.with_name("index.lock").unlink(missing_ok=True)
                 if not os.path.lexists(index):
                     _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z",
-                        "--exclude-per-directory=.gitignore", "--exclude=target/")
+                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
+                        *(f"--exclude={folder}/" for folder in TOOL_OUTPUT_FOLDERS))
                 rescued = False
                 try:
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
@@ -436,8 +438,8 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     target.unlink()
                 _exclude_slot_target(path, descriptor)
                 if not rescued:
-                    ignored = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
-                    _rescue(path, [entry for entry in ignored.split("\0") if entry.endswith("/")])
+                    output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
+                    _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
                 _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
                 _ = _git(path, "checkout", "--force", "--detach", revision)
                 _ = _git(path, "clean", "-ffx", "--exclude=/target",
