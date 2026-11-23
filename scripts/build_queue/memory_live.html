@@ -94,6 +94,7 @@ __PAGE_FRAME_STYLE__
 .build-limit-marks { display: inline-flex; flex-wrap: wrap; gap: 3px; align-items: center; }
 .build-limit-mark { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
 .build-limit-mark.free { border: 1px solid var(--ink-3); }
+.build-limit-mark.kept { background: var(--ink-3); }
 .build-limit-mark.line { width: 2px; height: 15px; margin-inline: 2px; background: var(--cap); }
 .build-limit-marks .lucide, .build-limit-legend .lucide, .build-limit-chip .lucide { width: 14px; height: 14px; flex: none; }
 .build-limit-marks .lucide-loader-circle, .build-limit-legend .lucide-loader-circle { color: var(--used); }
@@ -104,7 +105,7 @@ __PAGE_FRAME_STYLE__
 .build-limit-metric .build-limit-mark:not(.line) { width: 8px; height: 8px; }
 .build-limit-note, .build-limit-facts { color: var(--ink-2); font-size: .8rem; font-weight: 400; overflow-wrap: anywhere; }
 .build-limit-cell .build-limit-marks { gap: 3px; }
-.build-limit-cell .build-limit-mark.free { width: 9px; height: 9px; }
+.build-limit-cell .build-limit-mark:is(.free, .kept) { width: 9px; height: 9px; }
 .build-limit-wait { margin-top: 5px; }
 .build-limit-cell .build-limit-wait { margin-top: 0; }
 .build-limit-tip > .tip {
@@ -1312,9 +1313,9 @@ function limitMarks(kind, count = 1) {
   const marks = (buildLimitIcons[kind] ?? `<span class="build-limit-mark ${kind}" aria-hidden="true"></span>`).repeat(shown);
   return marks + (count > shown ? '<span aria-hidden="true">…</span>' : "");
 }
-function limitPlaceMarks(used, limit, runs, exempt = 0) {
+function limitPlaceMarks(used, limit, runs, exempt = 0, kept = 0) {
   const free = Number.isInteger(limit) && Number.isInteger(used) ? Math.max(0, limit - used) : 0;
-  return limitMarks("run", runs) + limitMarks("free", free)
+  return limitMarks("run", runs) + limitMarks("kept", kept) + limitMarks("free", free)
     + (limit == null ? "" : limitMarks("line")) + limitMarks("merge", exempt);
 }
 function limitPlaces(used, limit, runs, exempt) {
@@ -1366,16 +1367,26 @@ function limitWaitFields(waits) {
 function limitGpuCount(gpu, words) {
   return gpu?.used != null && gpu.limit != null ? limitWords(words, "count", gpu) : "";
 }
+function macClaimText(words, used, kept) {
+  const working = used - kept;
+  return [working ? limitWords(words, "occupied", {count: working}) : "",
+    kept ? limitWords(words, kept === 1 ? "kept" : "kept_many", {count: kept}) : ""].filter(Boolean).join(" · ");
+}
+function macHeadingCount(words, used, kept) {
+  const marks = limitMarks("run", used - kept) + limitMarks("kept", kept);
+  return `<div class="build-limit-count"><span class="build-limit-marks">${marks}</span>
+    <span>${esc(macClaimText(words, used, kept))}</span></div>`;
+}
 function limitCell(cell, words, machine) {
-  const {limit, used, other_used, merge_above, waits, note, policy, show_marks = true} = cell;
+  const {limit, used, other_used, kept = 0, merge_above, waits, note, policy, show_marks = true} = cell;
   const gpu = machine === "natedev" ? limitGpuCount(cell.gpu, words) : "";
   const noLimit = limit == null && policy === "no_limit";
   const onlyOther = limit == null && used == null;
   const waiting = limitWaitCount(waits);
   const count = limit == null ? (used || other_used || "")
     : limitWords(words, used == null ? "limit" : "count", {used, limit});
-  const runs = onlyOther ? other_used : Math.max(0, (used ?? 0) - merge_above.length);
-  const marks = (show_marks ? limitPlaceMarks(used, limit, runs, merge_above.length) : "")
+  const runs = onlyOther ? other_used : Math.max(0, (used ?? 0) - merge_above.length - kept);
+  const marks = (show_marks ? limitPlaceMarks(used, limit, runs, merge_above.length, kept) : "")
     + (noLimit ? limitMarks("unlimited") : "");
   const detail = count === "" && !marks && !waiting && !gpu && note;
   if (count === "" && !marks && !waiting && !gpu && !detail) return "";
@@ -1406,11 +1417,13 @@ function limitTooltipRows(key, limits) {
   }
   const cell = limits.repositories.find(row => row.name === identity)?.[machine];
   if (!cell) return [];
-  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, verify_used} = cell;
+  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, verify_used, kept = 0} = cell;
   const gpu = machine === "natedev" ? cell.gpu : null;
   const policyText = limit != null ? (used == null ? limit : limitWords(words, "count", {used, limit}))
     : policy === "no_limit" ? words.no_limit : policy === "configured" ? words.limit_set : "";
-  const rows = [field("Limit", policyText), field(machine === "mac" ? "In use" : "Run count", limit == null ? used || "" : ""),
+  const count = machine === "mac" ? field("Places", limit == null || kept ? macClaimText(words, used ?? 0, kept) : "")
+    : field("Run count", limit == null ? used || "" : "");
+  const rows = [field("Limit", policyText), count,
     field("Verify runs", verify_used || ""),
     ...(gpu ? [field(words.gpu, limitGpuCount(gpu, words)), field("GPU limit", words.gpu_limit)] : []),
     staffField("Running", runs.filter(Boolean)),
@@ -1438,13 +1451,13 @@ function renderBuildLimits(limits) {
   machines.push(["aws", words.aws]);
   const headings = machines.map(([key, name]) => {
     const data = limits[key];
+    const {unattributed, unattributed_kept = 0} = data;
     return `<th scope="col"${data.unattributed_note ? ` data-tip="limit:machine:${key}"` : ""}>${esc(name)}
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
     ${data.facts ? `<div class="build-limit-facts">${esc(data.facts)}</div>` : ""}
-    ${!data.unattributed ? "" : key === "mac"
-      ? `<div class="build-limit-count"><span class="build-limit-marks">${limitMarks("run", data.unattributed)}</span>
-        <span>${esc(limitWords(words, "occupied", {count: data.unattributed}))}</span></div>`
-      : `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>`}
+    ${!unattributed ? "" : key === "mac"
+      ? macHeadingCount(words, unattributed, unattributed_kept)
+      : `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: unattributed}))}</div>`}
     ${data.shared.map(metric => limitMetric(metric, words, `limit:metric:${key}:${metric.label}`)).join("")}
     ${limitWaitBadge(data.waits, `limit:machine:${key}`)}</th>`;
   }).join("");
@@ -1454,7 +1467,7 @@ function renderBuildLimits(limits) {
         const cell = limitCell(row[key], words, key);
         return cell ? `<td data-tip="${esc(`limit:cell:${key}:${row.name}`)}">${cell}</td>` : "<td></td>";
       }).join("")}</tr>`).join("");
-  const legend = [["run", "legend_run"], ["free", "legend_free"], ["line", "legend_line"],
+  const legend = [["run", "legend_run"], ["kept", "legend_kept"], ["free", "legend_free"], ["line", "legend_line"],
     ["merge", "merge_above"], ["wait", "legend_wait"], ["unlimited", "no_limit"], ["gpu", "gpu"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="${esc(words.table)}">
     <thead><tr><th scope="col">${esc(words.repository)}</th>${headings}</tr></thead><tbody>${rows}</tbody></table></div>
