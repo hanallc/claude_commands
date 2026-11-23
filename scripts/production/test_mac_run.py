@@ -16,7 +16,7 @@ from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
 from scripts.lib import copy_record, scratch
 from scripts.lib.git_test_support import fixture_git_environment
 
@@ -353,7 +353,8 @@ class MacRunTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         environment = fixture_git_environment(self.root)
-        environment.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")})
+        environment.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                            "CLAUDE_SESSION_NAME": FIXTURE_OWNER})
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         installed = self.home / ".claude"
         installed.mkdir(parents=True)
@@ -401,7 +402,6 @@ class MacRunTests(unittest.TestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "COPIES_CONFIG": str(copies_config),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),

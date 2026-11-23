@@ -1610,22 +1610,10 @@ def write_backoff(until: float, target: str = "mac", *, wait: bool = True, stric
             raise
 
 
-SERVER_ALIVE_INTERVAL_SECONDS = 15
-
-
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
-    # SSH ends a session after this count of unanswered keepalive checks: a lost run ends after the unreachable wait.
-    alive_count = math.ceil(config.unreachable_wait_s / SERVER_ALIVE_INTERVAL_SECONDS)
-    return [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={config.connect_timeout_s:g}",
-        "-o",
-        f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}",
-        "-o",
-        f"ServerAliveCountMax={alive_count}",
-    ]
+    # A lost run ends after the unreachable wait.
+    return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={config.connect_timeout_s:g}",
+            *eligibility.server_alive_options(config.unreachable_wait_s)]
 
 
 def ssh_prefix(config: OffloadConfig | eligibility.SshProbeSettings) -> list[str]:
@@ -2987,7 +2975,8 @@ def claimed_run(
                 try:
                     permission = admission_client.consume_permission(wire.ConsumePermission(
                         uuid.uuid4().hex, assignment, reference, holder))
-                except wire.AdmissionUnavailable:
+                except wire.AdmissionUnavailable as error:
+                    print(f"mac_test: no launch permission from the queue: {error.reason}", file=sys.stderr, flush=True)
                     if routed_mac_command:
                         break
                     evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())

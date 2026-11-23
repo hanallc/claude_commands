@@ -44,8 +44,8 @@ class FakeSessionMoves:
                  source_accounts: Mapping[str, str] = _NO_SOURCES, batch_id: str = "",
                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
-                 staff_members: Collection[staff.StaffId] = ()) -> list[stop_resume.MoveResult]:
-        del cause, batch_id, staff_members
+                 staff_members: Collection[staff.StaffId] = (), user_command: bool = False) -> list[stop_resume.MoveResult]:
+        del cause, batch_id, staff_members, user_command
         self.sources.append(dict(source_accounts))
         self.batches.append(list(sessions))
         return [stop_resume.ClaudeUp(session, "w1:p1", target, start_state=ClaudeStartState.ALREADY_RUNNING)

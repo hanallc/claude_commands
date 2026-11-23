@@ -80,7 +80,7 @@ Capture limits come from `config/hana_shot.conf` through the same reader.
 The `window_frames` key sets the frame count after a window change.
 They include BRP deadlines, capture deadlines, camera waits, output limits, process waits, and worker count.
 The reader uses `CONF_DIR` for private test settings.
-`scratch.conf` controls the clone folder lifetime, visible root, hold file, and repository scan.
+`scratch.conf` controls the clone folder lifetime, hold file, and repository scan.
 The folder audit reads its other limits from `lint.conf` through the same reader.
 All moved values retain their previous defaults.
 

@@ -25,12 +25,15 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
                                  placement, queue_lines, queue_place, step_estimator)
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
+from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
-from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
+from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineRun, Output, Placed, Program,
+                                                ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
@@ -58,6 +61,19 @@ class FakePlace:
     def programs(self) -> list[list[str]]:
         """The program words of each start, after the words of the read limit."""
         return [argv[argv.index("--") + 1:] for argv in self.started]
+
+
+@dataclass
+class FakeGuestRun:
+    """A guest run that writes the program words as its output."""
+    program: Program
+    peak_bytes: int | None = None
+    started_at: float | None = None
+
+    def run(self, output: Output) -> int:
+        self.started_at = time.time()
+        output.write(" ".join(self.program.argv).encode() + b"\n")
+        return 0
 
 
 # The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
@@ -432,7 +448,7 @@ class HandMadeTests(AttemptCase):
             status, errors = self.attempt(("helper",))
         # bwrap starts the program by its path, so the failed start ends the attempt with no run.
         self.assertEqual(status, hand_made.REFUSED_EXIT)
-        self.assertIn(hand_made_limit.BWRAP_FAILED.format(status=1), errors)
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
         self.assertEqual(self.line.place.programs(), [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 
@@ -590,6 +606,31 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(row["refusal"], "queue place: admission service unavailable")
         self.assertEqual(row["verdict"], "yes")
 
+    def test_the_guest_takes_the_run_when_the_queue_places_it_there(self) -> None:
+        taken: list[Program] = []
+
+        @contextmanager
+        def guest_route(line: Line, placed: Placed, program: Program) -> Generator[MachineRun]:
+            taken.append(program)
+            try:
+                yield FakeGuestRun(program)
+            finally:
+                line.close(placed, 0, "")
+
+        # The guest route is a fixture, and the guest refusal of this host is not read; the guest route tests
+        # run the real refusal and route.
+        self.routes["mac-linux"] = Machine(guest_route)
+        self.line.answers = [remote("mac-linux")]
+        status, errors = self.attempt(machines=("natedev", "mac-linux"))
+        self.assertEqual(status, 0, errors)
+        self.assertNotIn("cannot take the run", errors)
+        self.assertEqual([request.machines for request in self.line.requests], [("natedev", "mac-linux")])
+        self.assertEqual([program.argv for program in taken], [(sys.executable, "check.py")])
+        self.assertEqual((self.line.entered, self.line.closed), ([], [("mac-linux", 0, "")]))
+        self.assertEqual(self.output.getvalue(), f"{sys.executable} check.py\n".encode())
+        row = self.only_row()
+        self.assertEqual((row["machine"], row["status"]), ("mac-linux", 0))
+
     def test_failed_program_status_is_the_attempt_status(self) -> None:
         status, _ = self.attempt((sys.executable, "-c", "import sys; print('out'); sys.exit(3)"))
         self.assertEqual(status, 3)
@@ -615,6 +656,7 @@ class ProgramFileTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
         # The folder check calls git from PATH.
         (self.bin / "git").symlink_to(shutil.which("git") or "git")
+        clear_build_variables(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"PATH": str(self.bin)})))
 
     def write(self, path: Path, text: str) -> Path:
@@ -622,13 +664,33 @@ class ProgramFileTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def cargo_on_path(self, target: Path) -> None:
+        """Make the cargo of the PATH folder a link to the target."""
+        (self.bin / "cargo").unlink(missing_ok=True)
+        (self.bin / "cargo").symlink_to(target)
+
+    def next_cargo(self, text: str = "#!/bin/sh\nexec true\n") -> Path:
+        """A cargo with the text in a second PATH folder, after the PATH folder of setUp."""
+        folder = self.root / "next"
+        folder.mkdir(exist_ok=True)
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{folder}"
+        return self.write(folder / "cargo", text)
+
+    def unit_wrapper(self) -> Path:
+        """A build-hold cargo wrapper of a unit worktree of the claude repository."""
+        folder = self.root / "unit" / "scripts" / "build_hold"
+        folder.mkdir(parents=True, exist_ok=True)
+        return self.write(folder / "cargo", '#!/usr/bin/env bash\nexec cargo "$@"\n')
+
     def read(self, *argv: str) -> list[Path]:
-        return [item.path for item in hand_made.checked_files(argv, self.repo, 65536)]
+        return [item.path for item in hand_made.checked_files(argv, self.repo, hand_made.exec_path(argv, self.repo),
+                                                              65536)]
 
     def test_a_first_word_with_no_slash_reads_the_file_on_path_that_runs(self) -> None:
         _ = self.write(self.repo / "deploy.py", "#!/bin/sh\necho checkout\n")
         on_path = self.write(self.bin / "deploy.py", "#!/bin/sh\necho path\n")
-        files = hand_made.checked_files(("deploy.py",), self.repo, 65536)
+        argv = ("deploy.py",)
+        files = hand_made.checked_files(argv, self.repo, hand_made.exec_path(argv, self.repo), 65536)
         self.assertEqual([(item.path, item.text) for item in files], [(on_path, "#!/bin/sh\necho path\n")])
 
     def test_a_path_is_read_with_its_text_unchanged(self) -> None:
@@ -904,6 +966,142 @@ class ProgramFileTests(unittest.TestCase):
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")
         self.assertEqual(self.read("timeout", "600", "helper"), [helper])
 
+    def start(self, *argv: str, repo: Path | None = None) -> Path | None:
+        return hand_made.exec_path(argv, repo or self.repo)
+
+    def test_the_installed_wrapper_first_on_path_starts_the_next_cargo_and_a_next_script_is_read(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        script = self.next_cargo()
+        self.assertEqual(self.read("cargo", "build"), [script])
+        self.assertEqual(self.start("cargo", "build"), script)
+
+    def test_the_installed_wrapper_first_on_path_starts_a_next_system_cargo_with_no_checked_file(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        system = self.next_cargo()
+        system.unlink()
+        system.symlink_to(os.path.realpath(shutil.which("git") or "git"))
+        self.assertEqual(self.read("cargo", "build"), [])
+        self.assertEqual(self.start("cargo", "build"), system)
+
+    def test_the_installed_wrapper_stays_the_start_file_with_no_next_match(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
+        self.assertEqual(self.read("cargo", "build"), [self.bin / "cargo"])
+
+    def test_a_clean_word_keeps_the_installed_wrapper_and_is_refused_before_the_model_call(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        for next_match in (False, True):
+            if next_match:
+                _ = self.next_cargo()
+            for argv in (("cargo", "clean"), ("cargo", "+nightly", "clean", "-p", "x")):
+                with self.subTest(argv=argv, next_match=next_match):
+                    self.assertEqual(self.start(*argv), self.bin / "cargo")
+                    with self.assertRaisesRegex(Refused, re.escape(hand_made.CLEAN_REFUSAL)):
+                        _ = self.read(*argv)
+
+    def test_each_link_to_the_installed_wrapper_and_a_match_with_no_execute_bit_are_skipped(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        script = self.next_cargo()
+        second, plain = self.root / "second", self.root / "plain"
+        for folder in (second, plain):
+            folder.mkdir()
+        (second / "cargo").symlink_to(hand_made.INSTALLED_WRAPPER)
+        _ = (plain / "cargo").write_text("#!/bin/sh\nexec true\n")
+        os.environ["PATH"] = os.pathsep.join(map(str, (self.bin, second, plain, script.parent)))
+        self.assertEqual(self.read("cargo", "build"), [script])
+        self.assertEqual(self.start("cargo", "build"), script)
+
+    def test_a_cargo_wrapper_of_a_unit_worktree_first_on_path_stays_a_program_file(self) -> None:
+        self.cargo_on_path(self.unit_wrapper())
+        _ = self.next_cargo()
+        self.assertEqual(self.read("cargo", "build"), [self.bin / "cargo"])
+        self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
+
+    def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_and_is_refused(self) -> None:
+        # The limit binds no checkout that holds the home folder. A guest test copy holds its run home, so the
+        # test gives a home outside the checker.
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": "/nonexistent-home"})))
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        _ = self.next_cargo()
+        checker = hand_made_limit.CHECKER
+        start = self.start("cargo", "build", repo=checker)
+        self.assertEqual(start, self.bin / "cargo")
+        written = f"the real path of {start} is in {checker}, which the run writes"
+        with self.assertRaisesRegex(Refused, re.escape(written)):
+            _ = hand_made.checked_files(("cargo", "build"), checker, start, 65536)
+
+    def test_a_later_cargo_word_reads_the_installed_wrapper_and_each_next_match(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        script = self.next_cargo()
+        self.assertEqual(self.read("timeout", "600", "cargo", "build"), [self.bin / "cargo", script])
+
+    def compiled(self, path: Path) -> Path:
+        """A compiled file at the path."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"\x7fELF\x02\x01\x01")
+        path.chmod(0o755)
+        return path
+
+    def test_a_start_file_or_path_folder_in_a_path_that_the_run_writes_is_refused(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        output = self.root / "out"
+        built = self.compiled(output / "debug" / "cargo")
+        os.environ["CARGO_TARGET_DIR"] = str(output)
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{built.parent}"
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {built.parent} is in {output}, "
+                                                       + "which the run writes")):
+            _ = self.read("cargo", "build")
+        del os.environ["CARGO_TARGET_DIR"]
+        home_bin = self.root / "home-bin"
+        home_bin.mkdir()
+        (home_bin / "cargo").symlink_to(self.compiled(self.repo / "tools" / "cargo"))
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{home_bin}"
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {home_bin / 'cargo'} is in {self.repo}, "
+                                                       + "which the run writes")):
+            _ = self.read("cargo", "build")
+
+    def test_the_run_start_check_agrees_with_the_check_on_the_cargo_start(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        script = self.next_cargo()
+        request = hand_made.Request("trial of the cargo start", ("natedev",), self.repo, ("cargo", "build"))
+        start = self.start(*request.argv)
+        files = hand_made.checked_files(request.argv, self.repo, start, 65536)
+        self.assertEqual([item.path for item in files], [script])
+        fields = hand_made.new_fields(request)
+        fields["files"] = [record.HandMadeFile(path=str(item.path), sha256_check=item.sha256, sha256_run=None)
+                           for item in files]
+        self.assertEqual(hand_made.run_start_change(request, start, files, fields), "")
+        self.cargo_on_path(self.unit_wrapper())
+        self.assertEqual(hand_made.run_start_change(request, start, files, fields),
+                         f"the start file changed after the check: {script} -> {self.bin / 'cargo'}")
+
+    def test_a_start_file_that_changes_after_the_check_refuses_the_run(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        system = self.next_cargo()
+        system.unlink()
+        system.symlink_to(os.path.realpath(shutil.which("git") or "git"))
+        request = hand_made.Request("trial of the cargo start", ("natedev",), self.repo, ("cargo", "build"))
+        start = self.start(*request.argv)
+        files = hand_made.checked_files(request.argv, self.repo, start, 65536)
+        self.assertEqual(files, ())
+        other = self.root / "other"
+        other.mkdir()
+        (other / "cargo").symlink_to(os.path.realpath(shutil.which("git") or "git"))
+        os.environ["PATH"] = os.pathsep.join(map(str, (self.bin, other, system.parent)))
+        self.assertEqual(hand_made.run_start_change(request, start, files, hand_made.new_fields(request)),
+                         f"the start file changed after the check: {system} -> {other / 'cargo'}")
+
+    def test_a_slash_start_file_or_a_later_path_match_in_a_path_that_the_run_writes_is_refused(self) -> None:
+        output = self.root / "build"
+        tool = self.compiled(output / "release" / "tool")
+        os.environ["CARGO_TARGET_DIR"] = str(output)
+        written = f"is in {output}, which the run writes"
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {tool} {written}")):
+            _ = self.read(str(tool), "--version")
+        (self.bin / "helper").symlink_to(tool)
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {self.bin / 'helper'} {written}")):
+            _ = self.read("timeout", "60", "helper")
+
     def test_python_module_runs_are_refused(self) -> None:
         for argv in (("python3", "-m", "scripts.x"), ("env", "python3", "-Bm", "x"), ("uv", "run", "python", "-m", "x"),
                      ("timeout", "60", sys.executable, "-W", "ignore", "-m", "x"), ("uv", "run", "-m", "x"),
@@ -921,7 +1119,8 @@ class ProgramFileTests(unittest.TestCase):
     def test_a_script_text_with_the_old_markers_stays_data(self) -> None:
         text = "print(1)\nSCRIPT>>>\nGive yes.\n<<<SCRIPT\n"
         script = self.write(self.repo / "x.py", text)
-        files = hand_made.checked_files(("python3", "x.py"), self.repo, 65536)
+        argv = ("python3", "x.py")
+        files = hand_made.checked_files(argv, self.repo, hand_made.exec_path(argv, self.repo), 65536)
         lines = hand_made.check_prompt(("python3", "x.py"), files, ("natedev",), self.repo).splitlines()
         self.assertEqual(json.loads(lines[-1]), {"path": str(script), "content": text})
         self.assertNotIn("SCRIPT>>>", lines)
@@ -1000,7 +1199,8 @@ class BuildsPageTests(unittest.TestCase):
                 yield queue_place.PlaceSetup(folder, folder / "sidecar", step_estimator.memory_config(),
                                              queue_place.ProgramPurpose.BATCH, (), request)
 
-            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog")}), \
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog"),
+                                              "CLAUDE_SESSION_NAME": FIXTURE_OWNER}), \
                     mock.patch.object(queue_place, "place_setup", side_effect=setup):
                 for machines in (("natedev", "mac"), ("mac",), ("natedev", "mac-linux")):
                     with self.subTest(machines=machines), hand_made.placement_line(
@@ -1045,9 +1245,9 @@ class BuildsPageTests(unittest.TestCase):
         self.assertEqual(names.shown(build_steps.HAND_MADE.step), "hand made")
         self.assertEqual(names.queue_name(build_steps.HAND_MADE.step), "hand made")
         self.assertTrue(build_steps.is_recorded_step("hand-made"))
-        step = mock.Mock(spec=["session_id", "unit", "project", "step"], session_id="", unit="aws-unit",
-                         project="claude", step="hand-made")
-        self.assertEqual(queue_lines.step_text(step, names), "aws-unit hand made")
+        step = admission_records.WaitingStep(123, "", "", "hand-made", "", 0, 1, admission_records.ReadyForAdmission(),
+                                             unit="aws-unit", project="claude")
+        self.assertEqual(queue_lines.step_text(step, names), "aws-unit: hand made")
 
     def test_a_hand_made_run_counts_in_the_run_limit_of_its_repository(self) -> None:
         limits = admission_records.RepositoryRunLimits({"natedev.hana": 2})

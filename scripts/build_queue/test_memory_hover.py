@@ -98,14 +98,14 @@ class MemoryHoverTests(unittest.TestCase):
         fixture.setUp()
         page = fixture.caller_selection_page()
         expected = (
-            (700001, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (50, "CI nextest", "hana CI", "hana CI"),
-            (301, "held caller", "held caller", "held caller"),
-            (302, "unregistered session", "unregistered session", "unregistered session"),
-            (304, "hana nextest", "unregistered session", "hana nextest"),
-            (200, "recorded local", "recorded local", "recorded local"),
-            (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (303, "recorded slot", "recorded slot", "recorded slot"),
+            (700001, "recorded cloud", "", "recorded cloud"),
+            (50, "hana CI: nextest", "", "hana CI"),
+            (301, "held caller", "", "held caller"),
+            (302, "unregistered session", "", "unregistered session"),
+            (304, "hana: nextest", "unregistered session", "hana: nextest"),
+            (200, "recorded local", "", "recorded local"),
+            (700002, "recorded cloud", "", "recorded cloud"),
+            (303, "recorded slot", "", "recorded slot"),
         )
         self.assertEqual(page["reserved"], 11.0)
         self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
@@ -128,6 +128,18 @@ class MemoryHoverTests(unittest.TestCase):
                 assert owner is not None
                 self.assertEqual("".join(owner.itertext()), caller)
                 self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+
+    def test_the_second_line_shows_no_owner_that_the_row_name_shows(self) -> None:
+        walk = [{"name": "aws-unit: test affected", "caller": "aws-unit", "queued": True},
+                {"name": "hana CI: nextest", "ci_label": "hana CI · hana-mac-1"},
+                {"kind": "mac-build", "name": "hana: nextest", "showrunner": "hana"},
+                {"kind": "cloud", "name": "held caller", "caller": "held caller"},
+                {"kind": "cloud", "name": "research: nextest", "showrunner": "hana"}]
+        waiters = [{"name": "devtools: cargo check", "caller": "fixture"}]
+        lines = self.page_expression(
+            "[...data.walk.map(row => rowOwner(row)), ...data.waiters.map(row => rowOwner(row, true))]",
+            {"walk": walk, "waiters": waiters})
+        self.assertEqual(lines, ["", "", "", "", "hana", "fixture"])
 
     def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
@@ -313,6 +325,29 @@ class MemoryHoverTests(unittest.TestCase):
             assert row is not None
             self.assertEqual(row.findtext("th[@class='step']/span"), name)
             self.assertEqual(row.findtext("td[@class='unit']/span"), "builder")
+
+    def test_a_waiting_row_note_shows_its_reason_and_the_job_start(self) -> None:
+        started = "10:14 PST · 1 h 10 min ago"
+        held = "natedev is held by fps for Phase 3 timing; waiting for release"
+        data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [],
+            "waiters": [{"name": "hana CI: build", "since": 100, "need": 1, "reason": "free memory",
+                         "job_start": started},
+                        {"name": "hana CI: test", "since": 110, "need": 1, "why": "build hold", "reason": held,
+                         "job_start": started},
+                        {"name": "claude gate", "since": 120, "need": 1, "why": "machine choice",
+                         "reason": "waits for a machine choice"}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-2']//span[@class='wait-note']"),
+                         "waits for a machine choice")
+        for key, note in (("wait:fixture-wait-0", f"job started {started}"),
+                          ("wait:fixture-wait-1", f"{held} · job started {started}")):
+            with self.subTest(key=key):
+                self.assertEqual(root.findtext(f".//div[@data-tip='{key}']//span[@class='wait-note']"), note)
+                grid = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
+                labels = {cell.text: "".join(grid[index + 1].itertext()) for index, cell in enumerate(grid) if cell.tag == "dt"}
+                self.assertEqual(labels["Job start"], started)
+                self.assertNotIn("Order", labels)
 
     def test_cargo_and_gate_tooltips_show_a_call_without_verify(self) -> None:
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,

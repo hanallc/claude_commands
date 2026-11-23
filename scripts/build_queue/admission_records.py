@@ -1,7 +1,8 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import math
@@ -21,7 +22,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
-from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
+from scripts.build_queue.snapshot_codec import select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -676,6 +677,21 @@ Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 NO_PRESSURE_HOLD = NoPressureHold()
 
 
+@dataclass(frozen=True)
+class JobStart:
+    """The queue clock time when the GitHub job of a CI step started. GitHub counts its 6-hour job limit from it."""
+    started_at: float
+
+
+@dataclass(frozen=True)
+class NoJobStart:
+    """The step has no GitHub job, or the client could not read the job start."""
+
+
+NO_JOB_START = NoJobStart()
+CiJobStart = JobStart | NoJobStart
+
+
 class Waiter(TypedDict):
     pid: int
     start_time: str
@@ -689,6 +705,7 @@ class Waiter(TypedDict):
     session_name: NotRequired[str]
     unit: NotRequired[str]
     ci_runner: NotRequired[str]
+    ci_job_start: NotRequired[JobStart]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -711,6 +728,8 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    # The caller's own text for the work, such as the mac_queue_run --what text.
+    what: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1097,15 @@ WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMe
               | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
 
 
+@dataclass(frozen=True)
+class MachineChoiceWait:
+    """The step waits for placement to choose a machine for it, such as a Mac Linux guest."""
+
+
+# Only a queue row waits for a machine choice. An admission reply never carries it.
+WaitingStepReason = WaitReason | MachineChoiceWait
+
+
 def held_text(wait: NatedevHeld) -> str:
     if wait.holder and wait.purpose:
         return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
@@ -1157,7 +1185,7 @@ class WaitingStep:
     folder: str
     since: float
     need: int
-    reason: WaitReason
+    reason: WaitingStepReason
     unit: str = ""
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
@@ -1166,9 +1194,11 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
+    what: str = field(default="", kw_only=True)
 
 
 class ConfirmedGuestRun(TypedDict):
@@ -1203,6 +1233,7 @@ class RunningStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    what: str = field(default="", kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1716,6 +1747,16 @@ def waiter_route(row: Waiter) -> StepRoute:
     return row.get("route", DIRECT_CARGO)
 
 
+def waiter_job_start(row: Waiter) -> CiJobStart:
+    """Return the CI job start of a queue row. A row without one has NO_JOB_START."""
+    return row.get("ci_job_start", NO_JOB_START)
+
+
+def job_order_since(since: float, job_start: CiJobStart) -> float:
+    """Rank a CI step at its job start when the job started before the step arrived."""
+    return min(since, job_start.started_at) if isinstance(job_start, JobStart) else since
+
+
 def direct_cargo_route() -> LocalRequired:
     """Keep the caller's reason when a direct command must run locally."""
     reason = os.environ.get("BUILD_QUEUE_LOCAL_REASON", "")
@@ -1758,7 +1799,7 @@ def queue_staff() -> QueueStaff:
 
 
 def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
-                 worktree: str, *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
+                 *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
     """Resolve the caller name and its unit for queue priority."""
     reference = session_id or staff_id
     staff_name = ""
@@ -1768,9 +1809,7 @@ def queue_caller(session_id: str, staff_id: str, exported_name: str, session_fol
             unit = owner.name if owner is not None and owner.kind == "unit" else ""
         session_id = session_id or member.current_session
         staff_name = member.name
-    folder = public_queue_text(Path(worktree).name) if not reference else ""
-    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
-                             f"terminal · {folder}" if folder else "")
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name)
     return QueueCaller(session_id, name, unit)
 
 
@@ -1782,10 +1821,11 @@ FAMILY_LIMIT = 64
 
 
 class FamilyProcess(NamedTuple):
-    """One process of a caller family and the script file that it runs."""
+    """One process of a caller family, the script file that it runs, and the name of its cgroup unit."""
     argv: tuple[str, ...]
     tty: int
     script: Path | None
+    unit: str
 
 
 def run_script(argv: Sequence[str]) -> Path | None:
@@ -1800,12 +1840,72 @@ def run_script(argv: Sequence[str]) -> Path | None:
     return None
 
 
-def family_owner_name(pid: int, proc_root: Path) -> str:
-    """Name the owner of a process that has no session and no staff reference.
+@dataclass(frozen=True)
+class TerminalOwner:
+    """The user started the work: at a terminal, in a login session, or in a desktop app."""
+    name: str = "terminal"
+
+
+TERMINAL_OWNER = TerminalOwner()
+
+
+@dataclass(frozen=True)
+class StaffOwner:
+    """A script under the state root of a staff member started the work."""
+    member_id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class StateSessionOwner:
+    """A script under the state root of an id that no staff member has; the name is the short id."""
+    name: str
+
+
+@dataclass(frozen=True)
+class OwnerNotGiven:
+    """The request does not say who started it; the program names the work that asks."""
+    program: str
+    unit: str = ""
+
+
+type FamilyOwner = TerminalOwner | StaffOwner | StateSessionOwner | OwnerNotGiven
+# The user's own scopes: a desktop app (app-*.scope) and a login session (session-*.scope).
+USER_SCOPE_PREFIXES = ("app-", "session-")
+
+
+def cgroup_unit(pid: int, proc_root: Path) -> str:
+    """The name of the cgroup unit of a process, such as `run-p1-i2.service`; empty when it cannot be read."""
+    try:
+        cgroup = read_proc_text(proc_root / str(pid) / "cgroup")
+    except OSError:
+        return ""
+    return next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::")), "")
+
+
+def service_owner(process: FamilyProcess, pid: int, proc_root: Path, scripts: Sequence[Path]) -> OwnerNotGiven:
+    """Name the systemd service that started the work."""
+    if not (process.unit.startswith("run-") and process.unit.endswith(".service")):
+        return OwnerNotGiven(f"systemd · {process.unit}")
+    # systemd-run generates the unit name, so the script or the folder names the work.
+    if scripts:
+        return OwnerNotGiven(f"systemd · {scripts[-1].name}")
+    try:
+        return OwnerNotGiven(f"systemd · {Path(os.readlink(proc_root / str(pid) / 'cwd')).name or process.unit}")
+    except OSError:
+        return OwnerNotGiven(f"systemd · {process.unit}")
+
+
+def family_owner(pid: int, proc_root: Path) -> FamilyOwner:
+    """Find the owner of a process that has no session and no staff reference.
 
     Read the process and its parents once, up to the first claude or codex process.
     A read error stops the read, and the next rule applies.
-    An empty name keeps the `terminal · <folder>` name that queue_caller gives.
+    A script under the showrunner state root gives its staff member, or else the short session id.
+    A terminal with no agent above it gives TERMINAL_OWNER: the user.
+    A family with a process in a systemd service does not say who started it.
+    Otherwise a desktop app scope or a login session scope with no agent above it gives TERMINAL_OWNER.
+    Every other family, such as an agent family with no session, does not say who started it.
     """
     family: list[FamilyProcess] = []
     under_agent = False
@@ -1827,49 +1927,127 @@ def family_owner_name(pid: int, proc_root: Path) -> str:
                 script = Path(os.readlink(folder / "cwd")) / script
             except OSError:
                 pass
-        family.append(FamilyProcess(argv, tty, script))
+        family.append(FamilyProcess(argv, tty, script, cgroup_unit(current, proc_root)))
         current = parent
     if not family:
-        # macOS has no /proc. The caller keeps the terminal name.
-        return ""
+        # macOS has no /proc. The caller is the user's terminal.
+        return TERMINAL_OWNER
     scripts = [process.script for process in family if process.script is not None]
     state = state_root()
     for script in scripts:
         if script.is_relative_to(state) and len(parts := script.relative_to(state).parts) > 1:
             members = queue_staff()
             member = members.by_member_reference(parts[0]) if isinstance(members, staff.StaffSnapshot) else None
-            return f"{member.name if member else parts[0][:8]} · {script.name}"
+            return StaffOwner(member.id, member.name) if member else StateSessionOwner(parts[0][:8])
     if not under_agent and any(process.tty for process in family):
-        return ""
-    try:
-        cgroup = read_proc_text(proc_root / str(pid) / "cgroup")
-    except OSError:
-        cgroup = ""
-    # Login sessions and terminals run in .scope units, so only a service matches.
-    unit = next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::")), "")
-    if unit.startswith("run-") and unit.endswith(".service"):
-        # systemd-run generates the unit name, so the script or the folder names the work.
-        if scripts:
-            return f"systemd · {scripts[-1].name}"
-        try:
-            return f"systemd · {Path(os.readlink(proc_root / str(pid) / 'cwd')).name or unit}"
-        except OSError:
-            return f"systemd · {unit}"
-    if unit.endswith(".service"):
-        return f"systemd · {unit}"
+        return TERMINAL_OWNER
+    # A timer or another service can start a scope; a service anywhere in the family means no person started it.
+    service = next((process for process in family if process.unit.endswith(".service")), None)
+    if service is not None:
+        return service_owner(service, pid, proc_root, scripts)
+    own = family[0].unit
+    if not under_agent and own.startswith(USER_SCOPE_PREFIXES) and own.endswith(".scope"):
+        # A desktop app, such as Zed, or a login session started the work: the user.
+        return TERMINAL_OWNER
     if scripts:
-        return f"script · {scripts[-1].name}"
-    return f"script · {Path(family[0].argv[0]).name if family[0].argv else 'unknown program'}"
+        return OwnerNotGiven(f"script · {scripts[-1].name}")
+    return OwnerNotGiven(f"script · {Path(family[0].argv[0]).name if family[0].argv else 'unknown program'}")
 
 
-def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
+def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
+    """Find who started a request, in this order: a session, a staff reference, a session name,
+    a state-root script or a terminal, and last the recorded owner of the worktree."""
     session = staff.caller_identity()
     reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
-    exported = os.environ.get("CLAUDE_SESSION_NAME", "") or (
-        "" if session or reference else family_owner_name(os.getpid(), PROC_ROOT))
-    caller = queue_caller(session, reference, exported,
-        os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
-        members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=os.environ.get(BUILDLOG_UNIT, ""))
+    exported = os.environ.get("CLAUDE_SESSION_NAME", "")
+    unit = os.environ.get(BUILDLOG_UNIT, "")
+    if session or reference or exported:
+        return queue_caller(session, reference, exported, os.environ.get("CLAUDE_SESSION_FOLDER", ""),
+            members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=unit)
+    family = family_owner(os.getpid(), PROC_ROOT)
+    if isinstance(family, StaffOwner):
+        return queue_caller("", family.member_id, family.name, "", members=queue_staff(), unit=unit)
+    if isinstance(family, (TerminalOwner, StateSessionOwner)):
+        return QueueCaller("", family.name, unit)
+    owner = folder_owner(Path(worktree)) if worktree and Path(worktree).is_absolute() else ""
+    if not owner:
+        return replace(family, unit=unit)
+    members = queue_staff()
+    if isinstance(members, staff.StaffSnapshot) and members.by_member_reference(owner):
+        return queue_caller("", owner, "", "", members=members, unit=unit)
+    return QueueCaller("", owner, unit)
+
+
+def folder_owner(worktree: Path) -> str:
+    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
+    from scripts.copies import copies
+    from scripts.lib import scratch
+
+    try:
+        # The queue request reads the owner only; it never clears a stale removal intent.
+        return copies.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
+    except (copies.CopyError, OSError):
+        return ""
+
+
+OWNER_VARIABLES = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "BUILDLOG_OWNER_STAFF_ID", "CLAUDE_SESSION_NAME")
+
+
+def owner_given(environment: Mapping[str, str]) -> bool:
+    """True when the environment has a variable that says who started the work."""
+    return any(environment.get(name) for name in OWNER_VARIABLES)
+
+
+def named_owner(environment: Mapping[str, str], name: str) -> dict[str, str]:
+    """CLAUDE_SESSION_NAME set to this name when the environment says no owner; otherwise nothing."""
+    return {} if owner_given(environment) else {"CLAUDE_SESSION_NAME": name}
+
+
+def owner_environment() -> dict[str, str]:
+    """The owner variables for work that leaves this process family, such as a systemd unit.
+
+    A caller with no owner variable passes the owner that its process family gives.
+    A staff member goes in BUILDLOG_OWNER_STAFF_ID, so the staff link stays."""
+    given = {name: os.environ[name] for name in (*OWNER_VARIABLES, BUILDLOG_UNIT) if os.environ.get(name)}
+    if owner_given(given):
+        return given
+    family = family_owner(os.getpid(), PROC_ROOT)
+    if isinstance(family, StaffOwner):
+        return {**given, "BUILDLOG_OWNER_STAFF_ID": family.member_id}
+    return given if isinstance(family, OwnerNotGiven) else {**given, **named_owner(given, family.name)}
+
+
+@contextmanager
+def default_owner(reference: str) -> Generator[None]:
+    """Name this owner for the queue requests of this process and its children when the caller names none.
+
+    The name goes in CLAUDE_SESSION_NAME, and a staff unit also goes in BUILDLOG_UNIT when it is not set.
+    The owner never goes in BUILDLOG_OWNER_STAFF_ID: a hold sends its restart notice to that staff member,
+    and this owner did not start the run."""
+    if not reference or owner_given(os.environ):
+        yield
+        return
+    members = queue_staff()
+    caller = (queue_caller("", reference, reference, "", members=members)
+              if isinstance(members, staff.StaffSnapshot) else QueueCaller("", reference, ""))
+    names = {"CLAUDE_SESSION_NAME": caller.name}
+    if caller.unit and not os.environ.get(BUILDLOG_UNIT):
+        names[BUILDLOG_UNIT] = caller.unit
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                _ = os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def waiter_identity(step: str, worktree: str, owner: QueueCaller | OwnerNotGiven) -> WaiterIdentity:
+    """The stored parts of a request: who started it, and the step that says what it does."""
+    caller = owner if isinstance(owner, QueueCaller) else QueueCaller("", owner.program, owner.unit)
     identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
         "step": step, "folder": os.getcwd() if worktree else ""}
     if caller.unit:
@@ -1944,8 +2122,10 @@ def behind_place(reason: BehindHead, waiting: Sequence[WaitingStep]) -> int:
                  if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
 
 
-def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
+def reason_phrase(reason: WaitingStepReason, waiting: Sequence[WaitingStep]) -> str:
     match reason:
+        case MachineChoiceWait():
+            return "waits for a machine choice"
         case TokenWaitingWaiter():
             return "waiting for the cargo token"
         case EstimateExpired():

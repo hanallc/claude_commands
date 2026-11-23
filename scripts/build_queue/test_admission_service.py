@@ -6381,7 +6381,7 @@ class ServiceTests(unittest.TestCase):
                         "since": request.since, "need": GIB, "step": "nextest", "session_name": caller,
                         "unit": unit, "folder": folder}
                     waiting = service.WaitingAdmission(request, row, service.NO_CONNECTION)
-                    self.assertEqual(service.wait_line_name(waiting), f"{expected} · nextest")
+                    self.assertEqual(service.wait_line_name(waiting), f"{expected}: nextest")
 
     def test_wait_lines_then_ranked_admissions_and_release_frees_charge(self) -> None:
         for owner_name in ("session", "CI", "unit", "folder", "pid", "continuation"):
@@ -6395,20 +6395,20 @@ class ServiceTests(unittest.TestCase):
                 fixture.hold_starts()
                 request = fixture.request(need=12 * GIB if owner_name == "continuation" else 8 * GIB, run=run)
                 head: wire.AdmitRequest | wire.ServiceEstimateRequest = request
-                label = "fixture · nextest"
+                label = "fixture: nextest"
                 if owner_name == "CI":
                     head = replace(fixture.service_request(runner="hana-linux-2"), argv=("cargo", "test"))
-                    label = "hana CI · hana-linux-2 · compile · test"
+                    label = "hana CI · hana-linux-2 · compile: test"
                 elif owner_name == "unit":
                     head = replace(request, identity=replace(request.identity, unit="compiler"))
-                    label = "compiler · nextest"
+                    label = "compiler: nextest"
                 elif owner_name in ("folder", "pid"):
                     head = replace(request, identity=replace(request.identity, session_id="", name="",
                         folder="/builds/hana" if owner_name == "folder" else "/"))
-                    label = "terminal · hana · nextest" if owner_name == "folder" else "unregistered session · nextest"
+                    label = "hana: nextest" if owner_name == "folder" else "unregistered session: nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
-                    label = "ordinary · nextest"
+                    label = "ordinary: nextest"
                     ordinary = fixture.request(need=8 * GIB, since=fixture.clock.now() - 1)
                     ordinary = replace(ordinary, identity=replace(ordinary.identity, name="ordinary"))
                     ordinary_peer = fixture.connect(ordinary)
@@ -6431,7 +6431,7 @@ class ServiceTests(unittest.TestCase):
                             self.assertIn("this build is the queue head", output.getvalue())
                         else:
                             self.assertEqual(waits[-1].snapshot.head_need, 8 * GIB)
-                            self.assertIn("head ordinary · nextest needs 8.0 GiB", output.getvalue())
+                            self.assertIn("head ordinary: nextest needs 8.0 GiB", output.getvalue())
                             self.assertNotIn("this build is the queue head", output.getvalue())
                 fixture.free((20 if owner_name == "continuation" else 60) * GIB)
                 if owner_name == "continuation":
@@ -9469,3 +9469,84 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 fixture.allow_next_start()
             self.assertEqual(only_admitted(fixture.server.handle_request(child)), granted)
             self.assertEqual(len([record for record in fixture.server.reservations.values() if record.owner == child.owner]), 1)
+
+
+class CiJobStartPlaceTests(unittest.TestCase):
+    def ci_request(self, fixture: AdmissionFixture, job_start: records.CiJobStart) -> wire.ServiceEstimateRequest:
+        return replace(fixture.service_request(), job_start=job_start)
+
+    def test_a_ci_step_whose_job_started_before_an_older_step_ranks_first(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.JobStart(now - 900))
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            rows = {row["pid"]: row for _, row in inputs.ordered}
+            self.assertEqual(rows[ci.owner.pid].get("order_since"), now - 900)
+            self.assertEqual(rows[ci.owner.pid]["since"], ci.since)
+
+    def test_a_ci_step_with_no_job_start_keeps_its_arrival_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.NO_JOB_START)
+            envelope = wire.parse_record(wire.encode_request(ci), dict[str, object])
+            data = cast(dict[str, object], envelope["data"])
+            self.assertEqual(data.pop("job_start"), {"kind": "NoJobStart"})
+            legacy = wire.parse_request(wire.encode_record(envelope))
+            assert isinstance(legacy, wire.ServiceEstimateRequest)
+            self.assertEqual(legacy.job_start, records.NO_JOB_START)
+            for request in (older, legacy):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, ci.owner.pid])
+            self.assertNotIn("ci_job_start", fixture.server.waiters[ci.episode].row)
+
+    def test_two_steps_of_one_ci_job_both_rank_at_the_job_start(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            started = fixture.clock.now() - 1200
+            first = self.ci_request(fixture, records.JobStart(started))
+            fixture.clock.advance(300)
+            between = fixture.request()
+            fixture.clock.advance(300)
+            second = self.ci_request(fixture, records.JobStart(started))
+            for request in (between, second, first):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, second.owner.pid, between.owner.pid])
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            rows = {row["pid"]: row for _, row in inputs.ordered}
+            for request in (first, second):
+                self.assertEqual(rows[request.owner.pid].get("order_since"), started)
+                self.assertEqual(rows[request.owner.pid]["since"], request.since)
+            self.assertEqual(rows[between.owner.pid].get("order_since"), between.since)
+
+    def test_a_restart_keeps_the_job_start_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.JobStart(now - 900))
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            fixture.server.persist()
+            saved = [place for place in service.read_state(fixture.state_dir).places.values() if place.owner == ci.owner]
+            self.assertEqual([place.ci_job_start for place in saved], [records.JobStart(now - 900)])
+            fixture.restart()
+            ranked = fixture.server._ranked_waiters()  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual([row["pid"] for _, row in ranked], [ci.owner.pid, older.owner.pid])
+            self.assertEqual(ranked[0][1].get("order_since"), now - 900)
+            fixture.clock.advance(1)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
