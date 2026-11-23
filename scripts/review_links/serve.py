@@ -45,7 +45,7 @@ from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -86,6 +86,7 @@ def published_console_page(root: Path, path: str) -> str:
 CONSOLE_DOCUMENTS = {
     accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
     review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
+    placement_disk.PAGE_PATH: "placement_disk",
 }
 
 
@@ -1074,6 +1075,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
                 return None
             self.html_response(200, owned_document(content, "images"))
+            return None
+        if route.path == placement_disk.PAGE_PATH:
+            try:
+                content = placement_disk.render()
+            except (OSError, ValueError) as error:
+                print(f"review-links placement disk: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Placement disk POC page is not available.</p>"))
+                return None
+            self.html_response(200, owned_document(content, "placement_disk"))
             return None
         try:
             location = old_console_link(root, self.path)

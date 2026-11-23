@@ -26,7 +26,7 @@ import unittest
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -77,6 +77,7 @@ class HttpReply:
     status: int
     content_type: str
     body: bytes
+    headers: dict[str, str] = field(default_factory=dict[str, str], compare=False)
 
 
 def fake_firefox(tool: str) -> str | None:
@@ -667,14 +668,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             HttpReply(200, "image/png", image.png))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_shared_dialog_opens_from_all_nine_served_console_pages(self) -> None:
+    def test_shared_dialog_opens_from_all_ten_served_console_pages(self) -> None:
         from scripts.build_queue import memory_files
         from scripts.disks import disks_page
         from scripts.review_links.test_new_item_dialog import DialogFixture, capture_dialogs
 
         owner = fixture_member("producer", name="console-owner")
+        poc = self.root.parent / placement_disk.PAGE_NAME
+        _ = poc.write_bytes(change_page.document("<h1>placement_disk</h1>"))
         _ = write_config_fixture(conf.path("console"), "".join(
-            f"page.{page}.owner={owner.id}\n" for page in sorted(page_frame.OWNER_PAGES)))
+            f"page.{page}.owner={owner.id}\n" for page in sorted(page_frame.OWNER_PAGES)) + f"placement_disk.file={poc}\n")
         for name, leaf in (("aws_page", aws_page.PAGE_NAME), ("disks", disks_page.PAGE_NAME),
                            ("memory_feed", memory_files.PAGE_NAME)):
             folder = self.root / name
@@ -692,6 +695,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "disks": f"/disks/{disks_page.PAGE_NAME}",
             "images": images.PAGE_PATH,
             "list": list_page.PAGE_PATH,
+            "placement_disk": placement_disk.PAGE_PATH,
             "rebuilds": f"/console/{change_page.REBUILDS_NAME}",
             "review": review_page.PAGE_PATH,
         }
@@ -731,6 +735,34 @@ class ReviewLinksServerTests(unittest.TestCase):
         for page, fixture in zip(pages, fixtures.values(), strict=True):
             with self.subTest(page=page):
                 self.assertEqual(fixture.results, [])
+
+    def test_placement_disk_page_reads_its_file_on_each_request(self) -> None:
+        owner = fixture_member("producer", name="console-owner")
+        poc = self.root.parent / placement_disk.PAGE_NAME
+        _ = write_config_fixture(conf.path("console"), f"page.placement_disk.owner={owner.id}\nplacement_disk.file={poc}\n")
+        missing = self.request(placement_disk.PAGE_PATH)
+        self.assertEqual(missing.status, 503, missing.body)
+        self.assertIn(b"The Placement disk POC page is not available.", missing.body)
+        # The real page has an empty scene main and its heading in the panel after it.
+        for heading in (b"First draft", b"Second draft"):
+            with self.subTest(heading=heading):
+                _ = poc.write_bytes(b'<!doctype html><html><head><title>POC</title></head><body><main id="stage"></main>'
+                                    + b'<aside id="panel"><h1>' + heading + b'</h1></aside></body></html>')
+                response = self.request(placement_disk.PAGE_PATH)
+                self.assertEqual(response.status, 200, response.body)
+                self.assertNotIn("content-security-policy", response.headers)
+                self.assertIn(b'<main id="stage"></main>', response.body)
+                self.assertIn(b'<aside id="panel"><div class="page-heading"><h1>' + heading + b'</h1>', response.body)
+                self.assertIn(b'data-page-owner="placement_disk"', response.body)
+
+    def test_placement_disk_file_expands_the_home_folder(self) -> None:
+        home = self.root.parent / "home"
+        _ = write_config_fixture(conf.path("console"), "placement_disk.file=~/poc/page.html\n")
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertEqual(placement_disk.source(), home / "poc" / "page.html")
+        _ = write_config_fixture(conf.path("console"), "placement_disk.file=~no-such-user-fixture/page.html\n")
+        with self.assertRaises(ValueError):
+            _ = placement_disk.source()
 
     def test_page_owner_dialog_accepts_a_proposal_for_the_page_owner(self) -> None:
         case = self.review_fixture()
@@ -3120,7 +3152,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             connection.request("GET", path)
             response = connection.getresponse()
             headers = {name.lower(): value for name, value in response.getheaders()}
-            return HttpReply(response.status, headers.get("content-type", ""), response.read())
+            return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
         finally:
             connection.close()
 
