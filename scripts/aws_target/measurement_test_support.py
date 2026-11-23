@@ -17,6 +17,7 @@ from scripts.aws_target.ledger_test_support import REAL_POPEN, CostFixture, char
 from scripts.buildlog import index, store
 from scripts.lib import conf
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, call, encode, step
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 DAY = "2026-01-15"
@@ -75,7 +76,8 @@ class MeasurementFixture(CostFixture):
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
-            + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n")
+            + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n"
+            + UNREACHABLE_WAIT_FIXTURE)
 
     def book(self) -> ledger.CostLedger:
         return ledger.CostLedger(self.state)
