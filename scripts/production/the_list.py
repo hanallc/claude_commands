@@ -330,6 +330,7 @@ class AwaitingConfirmation:
 class RunResult(StrEnum):
     CONFIRMED = "confirmed"
     NOT_CONFIRMED = "not confirmed"
+    MANUALLY_SETTLED = "manually settled"
 
 
 RunConfirmation = AwaitingInstruction | AwaitingConfirmation | RunResult
@@ -380,6 +381,8 @@ class RunDelivery:
                 status = "Confirmed."
             case RunResult.NOT_CONFIRMED:
                 status = "No confirmation."
+            case RunResult.MANUALLY_SETTLED:
+                status = "Settled by a manual state change."
             case AwaitingInstruction.OWNER:
                 status = "Sending the instruction."
             case AwaitingConfirmation():
@@ -1126,7 +1129,7 @@ def _validate(item: ListItem) -> None:
         raise ListError("a schedule requires the Scheduled state and a start and words")
     if (item.state is not ItemState.SCHEDULED and item.schedule is not NoSchedule.UNSET
             and not (item.state is not ItemState.CLOSED and isinstance(item.schedule, ScheduledSeries)
-                     and bool(item.run_deliveries))):
+                     and (item.schedule.finished_runs or item.run_deliveries))):
         raise ListError("a schedule requires the Scheduled state and a start and words")
     if item.schedule is not NoSchedule.UNSET and item.parked_until is not NoTimestamp.UNSET:
         raise ListError("a Scheduled item cannot be parked")
@@ -2067,12 +2070,21 @@ def _with_run_delivery(item: ListItem, delivery: RunDelivery, moment: datetime, 
     active = tuple(run for run in deliveries
                    if not isinstance(run.confirmation, RunResult) or any(notice.needs_check() for notice in run.notices))
     state = item.state
-    if not active and item.schedule is not NoSchedule.UNSET:
+    if (not active and state is ItemState.WORKING and item.schedule is not NoSchedule.UNSET
+            and delivery.confirmation is not RunResult.MANUALLY_SETTLED):
         state = ItemState.SCHEDULED
     changed = replace(item, log=tuple(log), run_deliveries=active, state=state)
     if changed.log != item.log or state != item.state:
         changed = replace(changed, updated=moment, unread_since=moment)
     return changed
+
+
+def _settle_current_run(item: ListItem, moment: datetime) -> ListItem:
+    for delivery in reversed(item.run_deliveries):
+        if not isinstance(delivery.confirmation, RunResult):
+            settled = replace(delivery, confirmation=RunResult.MANUALLY_SETTLED)
+            return _with_run_delivery(item, settled, moment)
+    return item
 
 
 def _due_schedule(schedule: Schedule, moment: datetime, normal_window: timedelta) -> DueRuns | NoDueRun:
@@ -2137,6 +2149,8 @@ def confirm_scheduled(keeper: staff.StaffId, identity: str, caller: staff.StaffR
             return
         if confirmation is AwaitingInstruction.OWNER:
             raise ListError("the scheduled run is waiting for its owner instruction")
+        if confirmation is RunResult.MANUALLY_SETTLED:
+            raise ListError("a manual state change settled the scheduled run")
         if not isinstance(confirmation, AwaitingConfirmation) or moment >= confirmation.deadline:
             raise ListError("the confirmation time has passed")
         _save(store, _with_run_delivery(item, replace(delivery, confirmation=RunResult.CONFIRMED), moment))
@@ -2178,8 +2192,11 @@ def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNoti
 
 
 def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNotice) -> None:
-    command = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
-    deadline = monotonic() + operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
+    budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
+    deadline = monotonic() + budget
+    sender = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
+    # Kill the group at the deadline even if the sender would exit on TERM.
+    command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), *sender]
     # Keep the sender's delivery children in the same process group.
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                           errors="replace", start_new_session=True,
@@ -2189,6 +2206,8 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
         finally:
             with suppress(ProcessLookupError):
                 process_group.send_process_group(child.pid, signal.SIGKILL)
+    if child.returncode in (124, -signal.SIGKILL, 128 + signal.SIGKILL):
+        raise ListError("message delivery timed out")
     attempt = send_result.send_outcome(child.returncode, stdout)
     if (isinstance(attempt, send_result.ConfirmedSendOutcome)
             and attempt.header.outcome in {"sent", "queued", "kept", "skipped", "replaced"}):
@@ -2453,6 +2472,8 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
             _require_schedule_scope(item.schedule, schedule_scope)
         if changed.state is ItemState.SCHEDULED:
             changed = replace(changed, parked_until=NoTimestamp.UNSET)
+        if changed.state is not item.state:
+            changed = _settle_current_run(changed, moment)
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
@@ -2587,8 +2608,9 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         answered = tuple(question for question in item.questions if question.answer is not None)
         closed_questions = tuple(ItemChange(moment, QuestionClosed(question), source)
                                  for question in item.questions if question.answer is None)
-        return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
-                       questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
+        changed = replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
+                          questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
+        return _settle_current_run(changed, moment)
 
     def close_event(changed: ListItem) -> FieldChange:
         if changed.state is not ItemState.CLOSED:

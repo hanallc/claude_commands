@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -357,6 +358,16 @@ if "Slow notice" in args[-1] and key.endswith(":owner_start"):
                           start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as child:
         assert child.stdout.readline() == b"ready\n"
         child.wait()
+if "Orphan sender" in args[-1] and key.endswith(":owner_start"):
+    program = (
+        "import signal, socket, sys\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=8) as connection:\n"
+        "    connection.sendall(b'R')\n"
+        "    connection.recv(1)\n"
+    )
+    with subprocess.Popen([sys.executable, "-c", program, os.environ["SCHEDFIRE_TEST_READY_PORT"]]) as child:
+        child.wait()
 if "Scan resume" in args[-1] and key.endswith("_start"):
     time.sleep(30)
 rows = log.read_text().splitlines() if log.exists() else []
@@ -495,7 +506,7 @@ else:
                     self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
 
             for case in ("interrupted owner", "slow notice", "scan resume", "overlapping runs",
-                         "same check", "state changed", "Mac"):
+                         "same check", "state changed", "Mac", "orphan sender"):
                 with self.subTest(case=case):
                     for path in (sent, attempted):
                         _ = path.write_text("")
@@ -508,9 +519,11 @@ else:
                         case "scan resume":
                             self.check_scheduled_scan_resumes(sent)
                         case "overlapping runs" | "same check" | "state changed":
-                            self.check_overlapping_scheduled_runs(sent, case)
+                            self.check_overlapping_scheduled_runs(sent, attempted, case)
                         case "Mac":
                             self.check_mac_scheduled_run(attempted)
+                        case "orphan sender":
+                            self.check_scheduled_sender_stops_after_upkeep_dies(sender)
 
     def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Check the figures.")
@@ -565,6 +578,39 @@ else:
         self.assertEqual(sum(slow.title in args[-1] and args[args.index("--key") + 1].endswith(":owner_start")
                              for args in rows), 1)
 
+    def check_scheduled_sender_stops_after_upkeep_dies(self, sender: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        _ = self.add("Orphan sender", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        program = """import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from scripts.agents import remote
+from scripts.message import session_send
+from scripts.production import the_list
+
+session_send.SEND_SCRIPT = Path(sys.argv[1])
+the_list.now = lambda: datetime.fromisoformat(sys.argv[2])
+remote.local_machine = lambda: "natedev"
+the_list.fire_scheduled(timedelta(minutes=2))
+"""
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(5)
+            address = cast(tuple[str, int], listener.getsockname())
+            env = {**os.environ, "SCHEDFIRE_TEST_READY_PORT": str(address[1])}
+            with subprocess.Popen([sys.executable, "-c", program, str(sender), START.isoformat()],
+                                  env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as upkeep:
+                try:
+                    connection = listener.accept()[0]
+                    with connection:
+                        connection.settimeout(5)
+                        self.assertEqual(connection.recv(1), b"R")
+                        upkeep.kill()
+                        self.assertEqual(connection.recv(1), b"")
+                finally:
+                    upkeep.kill()
+
     def check_scheduled_scan_resumes(self, sent: Path) -> None:
         schedule = the_list.ScheduledRun(START, "Read the figures.")
         changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
@@ -581,7 +627,7 @@ else:
         for item in (slow, later):
             self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
 
-    def check_overlapping_scheduled_runs(self, sent: Path, case: str) -> None:
+    def check_overlapping_scheduled_runs(self, sent: Path, attempted: Path, case: str) -> None:
         first = the_list.ScheduledRun(START.replace(hour=17), "First words.")
         schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"))
         item = self.add("Lose receipt in moved run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
@@ -607,6 +653,9 @@ else:
                     delivered = the_list.load(MORTY.id, item.id)
                     self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
                     self.assertEqual(delivered.schedule, remaining)
+                    self.assertEqual(delivered.run_deliveries, ())
+                    self.assertEqual(delivered.log[active.log_index].what,
+                                     f"Scheduled run due {second.isoformat()}. Settled by a manual state change.")
         tick = moved + timedelta(seconds=30) if case == "same check" else moved
         with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
             the_list.fire_scheduled(UPKEEP_INTERVAL)
@@ -616,7 +665,13 @@ else:
                 self.assertNotIn("Missed.", "\n".join(str(entry.what) for entry in first_check.log))
             the_list.fire_scheduled(UPKEEP_INTERVAL)
             started = the_list.load(MORTY.id, item.id)
-            self.assertEqual([run.run.start for run in started.run_deliveries], [second, moved])
+            expected = [moved] if case == "state changed" else [second, moved]
+            self.assertEqual([run.run.start for run in started.run_deliveries], expected)
+            if case == "state changed":
+                sends = attempted.read_text()
+                with patch.object(the_list, "now", return_value=second + timedelta(minutes=2)):
+                    the_list.fire_scheduled(UPKEEP_INTERVAL)
+                self.assertEqual(attempted.read_text(), sends)
             for run in started.run_deliveries:
                 self.assertEqual(self.command("confirm", "--id", item.id, "--run", run.key),
                                  (0, f"confirmed {item.id}\n", ""))

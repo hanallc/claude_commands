@@ -617,7 +617,8 @@ Use `all` to change or remove the series.
 Use `--repeat ''` to remove the repeat and keep the pending run.
 Supply a new start if the pending start is in the past.
 Use scoped `update --state Working`, `park`, or `close` to remove a repeat schedule.
-A state update without a scope applies to the current run while it is active.
+A state update settles the current run and clears its confirmation deadline.
+The next run stays scheduled.
 The record keeps its earlier log entries when the schedule changes or ends.
 A producer can change its own schedules. Morty can change all schedules.
 Herdr upkeep checks the List on natedev after it restores the shared server.
@@ -626,6 +627,7 @@ It reads the next check time from each item header.
 It loads the item when a run, notice, or confirmation deadline is due.
 If the scan reaches its time limit, the next check starts after the last item it inspected.
 Delivery has separate time limits for a notice, an item, and the whole check.
+The sender's process group has a deadline even if upkeep stops.
 
 On the first check at or after the start, the List saves the run and sets the item to Working.
 The owner receives the instruction. The producer receives a copy.
@@ -644,7 +646,7 @@ The confirmation time starts when the sender accepts the owner's instruction or 
 If the confirmation time passes, the List sends one phone text to nate and a second message to the producer.
 The List stores the result on the run's start line.
 Each future run can start while an earlier run awaits confirmation.
-After the active runs finish, the item returns to Scheduled if runs remain.
+After the active runs finish, an item still in Working returns to Scheduled if runs remain.
 The item stays open when the series ends.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
