@@ -58,12 +58,14 @@ class FakeRoute:
     entered: list[Path] = field(default_factory=list[Path])
     refusal: str = ""
     end_error: Exception | None = None
+    checked: list[Mapping[Path, bytes]] = field(default_factory=list[Mapping[Path, bytes]])
 
     @contextmanager
-    def __call__(self, repo: Path) -> Generator[hand_made.ProgramPlace]:
+    def __call__(self, repo: Path, checked: Mapping[Path, bytes]) -> Generator[hand_made.ProgramPlace]:
         if self.refusal:
             raise QueuePlaceRefused(self.refusal)
         self.entered.append(repo)
+        self.checked.append(checked)
         yield self.place
         if self.end_error is not None:
             raise self.end_error
@@ -165,6 +167,7 @@ class HandMadeTests(unittest.TestCase):
         self.assertIn("check yes: The script only prints a line.", errors)
         self.assertEqual(self.output.getvalue(), b"hand made ran\n")
         self.assertEqual(self.route.entered, [self.repo])
+        self.assertEqual(self.route.checked, [{self.repo / "check.py": SCRIPT.encode()}])
         self.assertEqual(self.route.place.started, [[sys.executable, "check.py"]])
         command = self.calls[0]
         self.assertEqual(command[:2], [str(self.root / "claude"), "-p"])
@@ -544,6 +547,9 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.read(str(outside)), [outside])
         # A wrapper starts a text file with no #! with /bin/sh.
         self.assertEqual(self.read("timeout", "600", "plain"), [plain])
+        # A later word with a slash outside the checkout reads each file that is not compiled.
+        self.assertEqual(self.read("bash", str(plain)), [plain])
+        self.assertEqual(self.read("bash", str(self.bin / "compiled")), [])
         self.assertEqual(self.read("timeout", "600", "compiled"), [])
         self.assertEqual(self.read(sys.executable, "-c", "print(1)"), [])
 
@@ -568,6 +574,30 @@ class ProgramFileTests(unittest.TestCase):
                 _ = self.read(sys.executable, "-c", "1")
         with mock.patch.dict(os.environ, clean | {"PATH": f"{self.bin}:/usr/bin", "LD_LIBRARY_PATH": "/x"}, clear=True):
             self.assertEqual(self.read(sys.executable, "-c", "1"), [])
+
+    def test_a_later_word_reads_a_path_script_with_no_execute_bit(self) -> None:
+        helper = self.bin / "helper"
+        _ = helper.write_text("rm -rf ~/work\n")
+        helper.chmod(0o644)
+        self.assertEqual(self.read("bash", "helper"), [helper])
+
+    def test_a_word_that_names_a_folder_with_a_main_file_is_refused(self) -> None:
+        package = self.repo / "build"
+        package.mkdir()
+        _ = self.write(package / "__main__.py", "import os\n")
+        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
+            _ = self.read("python3", "build")
+
+    def test_a_word_that_names_a_folder_with_a_compiled_main_file_is_refused(self) -> None:
+        package = self.repo / "build"
+        package.mkdir()
+        _ = self.write(package / "__main__.pyc", "compiled\n")
+        with self.assertRaisesRegex(hand_made.Refused, "a word names a folder with a __main__ file"):
+            _ = self.read("python3", "build")
+
+    def test_a_word_that_names_a_plain_folder_is_not_refused(self) -> None:
+        (self.repo / "test").mkdir()
+        self.assertEqual(self.read("cargo", "test"), [])
 
     def test_a_wrapper_word_from_path_with_no_start_line_is_read(self) -> None:
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")
@@ -626,11 +656,18 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 2)
         return errors.getvalue()
 
-    def test_machine_is_required_and_only_natedev_is_accepted_in_this_phase(self) -> None:
+    def test_machine_is_required_and_only_natedev_or_the_guest_is_accepted_in_this_phase(self) -> None:
         self.assertIn("--machine", self.parse("--why", "trial", "--", "true"))
-        self.assertIn("machine mac comes in a later phase; this phase accepts only natedev",
+        self.assertIn("machine mac comes in a later phase; this phase accepts one of: natedev, mac-linux",
                       self.parse("--why", "trial", "--machine", "natedev", "--machine", "mac", "--", "true"))
         self.assertIn("give the command after --", self.parse("--why", "trial", "--machine", "natedev"))
+
+    def test_a_run_names_one_machine_in_this_phase(self) -> None:
+        self.assertIn("a run that names more than one machine comes in a later phase; name one of natedev, mac-linux",
+                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "mac-linux", "--", "true"))
+        request = hand_made.parse_request(["--why", "trial", "--machine", "mac-linux", "--repo", str(REPOSITORY),
+                                           "--", "true"])
+        self.assertEqual(request.machines, ("mac-linux",))
 
     def test_repo_must_be_the_top_folder_of_a_git_work_tree(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -657,7 +694,7 @@ class BuildsPageTests(unittest.TestCase):
 
         from scripts.build_queue import queue_place
         with mock.patch.object(queue_place, "queue_place", side_effect=place):
-            with hand_made.natedev_place(REPOSITORY) as held:
+            with hand_made.natedev_place(REPOSITORY, {}) as held:
                 self.assertIsInstance(held, FakePlace)
         self.assertEqual([(program, repo) for program, repo, _ in seen], [("hand-made", REPOSITORY)])
         from scripts.build_queue.admission_client import AdmissionHoldCheck

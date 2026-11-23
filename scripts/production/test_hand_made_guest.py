@@ -1,0 +1,388 @@
+"""Run hand made attempts on the Mac Linux guest route with an injected guest start, run and end."""
+from __future__ import annotations
+
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr
+from dataclasses import dataclass, field
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import cast, final, override
+import unittest
+from unittest import mock
+
+from scripts.build_targets import mac_linux, target_config
+from scripts.lib import models_registry, nix_env
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.notify import review
+from scripts.production import hand_made, hand_made_guest
+from scripts.production.test_hand_made import REGISTRY_TEXT, SCRIPT, YES, envelope, no_envrc, same_model
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+SNAPSHOT = mac_linux.checkout_source
+ORIGIN = "https://example.test/claude_commands.git"
+COMMAND = ("python3", "check.py")
+# The injected stream: it reads the request from the bootstrap on its input, and prints the lock line when it
+# has one. Then it prints the setup error and exits with the status, or prints the start line and the request
+# and exits with the status.
+GUEST_RUN = """import json, sys, tarfile
+status, start, locked, setup_error = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+    for member in archive:
+        if member.name == "request.json":
+            request = json.load(archive.extractfile(member))
+if locked:
+    print(locked, request["attempt"], file=sys.stderr, flush=True)
+if setup_error:
+    print(setup_error, file=sys.stderr, flush=True)
+    sys.exit(status)
+print(start, request["attempt"], flush=True)
+print("guest ran", json.dumps(request), flush=True)
+sys.exit(status)
+"""
+
+
+@dataclass
+class InjectedGuest:
+    """The guest start, run and end of mac_linux, with no SSH. The snapshot of the checkout is real."""
+    status: int = 0
+    locked: bool = True
+    arm_error: str = ""
+    setup_error: str = ""
+    stream_program: str = sys.executable
+    before_snapshot: Callable[[], None] = lambda: None
+    proofs: list[mac_linux.GuestEndProven | mac_linux.GuestEndPending] = field(
+        default_factory=lambda: [mac_linux.GuestEndProven()])
+    events: list[str] = field(default_factory=list[str])
+
+    def source(self, repo: Path) -> mac_linux.CheckoutSource:
+        self.events.append("snapshot")
+        self.before_snapshot()
+        return SNAPSHOT(repo)
+
+    def bundle(self, _repo: Path, _settings: mac_linux.GuestSettings) -> mac_linux.FullBundle:
+        return mac_linux.FullBundle(mac_linux.BundleReason.FIRST_RUN)
+
+    @contextmanager
+    def refs(self, _repo: Path, _source: mac_linux.CheckoutSource, attempt: str) -> Generator[str]:
+        self.events.append("refs")
+        try:
+            yield f"refs/mac-linux/{attempt}"
+        finally:
+            self.events.append("refs removed")
+
+    def arm(self, _settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+        if self.arm_error:
+            raise mac_linux.GuestUnavailable(self.arm_error)
+        self.events.append("arm")
+        return mac_linux.ArmedGuestAttempt(attempt, "boot", 1)
+
+    def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
+               _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
+               count: bool) -> list[str]:
+        self.events.append(f"run count={count}")
+        return [self.stream_program, "-c", GUEST_RUN, str(self.status), mac_linux.RUN_START,
+                mac_linux.RUN_LOCKED if self.locked else "", self.setup_error]
+
+    def prove(self, _settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt, *,
+              proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
+        del proof_deadline
+        self.events.append(f"prove {armed.attempt == self.attempt()}")
+        return self.proofs.pop(0) if len(self.proofs) > 1 else self.proofs[0]
+
+    def attempt(self) -> str:
+        return next(event.split()[1] for event in self.events if event.startswith("attempt "))
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        arm = self.arm
+
+        def record_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+            self.events.append(f"attempt {attempt}")
+            return arm(settings, attempt)
+
+        with (mock.patch.object(mac_linux, "checkout_source", self.source),
+              mock.patch.object(mac_linux, "guest_bundle", self.bundle),
+              mock.patch.object(mac_linux, "bundle_refs", self.refs),
+              mock.patch.object(mac_linux, "arm_guest", record_arm),
+              mock.patch.object(mac_linux, "stream_arguments", self.stream),
+              mock.patch.object(mac_linux, "prove_guest_end", self.prove)):
+            yield
+
+
+@final
+class GuestRouteTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+        self.repo = Path()
+        self.config = Path()
+        self.calls: list[list[str]] = []
+        self.output = io.BytesIO()
+        self.guest = InjectedGuest()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.config = self.root / "config"
+        self.config.mkdir()
+        self.switch("on")
+        _ = (self.config / "mac_linux.conf").write_text(
+            "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=2\nrun.time_limit_seconds=7\n")
+        _ = write_config_fixture(self.config / "mac_test.conf", "unreachable_backoff_s=30\n")
+        (self.root / "tmp").mkdir()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_TARGET": "natedev", "BUILDLOG_UNIT": "aws-unit",
+            "CONF_DIR": str(self.config), "TMPDIR": str(self.root / "tmp"),
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "target-state"),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.test",
+            "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.test"})))
+        self.repo = self.checkout("repo", ORIGIN)
+        _ = self.enterContext(mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")))
+        _ = self.enterContext(mock.patch.object(
+            review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")))
+        _ = self.enterContext(mock.patch.object(nix_env, "ensure", side_effect=no_envrc))
+        _ = self.enterContext(mock.patch.object(models_registry, "claude_model", side_effect=same_model))
+        self.calls = []
+        self.output = io.BytesIO()
+        self.guest = InjectedGuest()
+
+    def checkout(self, name: str, origin: str) -> Path:
+        """A clean checkout with check.py and an origin/main at its head."""
+        repo = self.root / name
+        repo.mkdir()
+        _ = (repo / "check.py").write_text(SCRIPT)
+        _ = (repo / ".gitignore").write_text("target/\n")
+        for command in (["init", "-q", "--initial-branch=main"], ["add", "-A"], ["commit", "-qm", "fixture"],
+                        ["remote", "add", "origin", origin], ["update-ref", "refs/remotes/origin/main", "HEAD"]):
+            _ = self.git(repo, *command)
+        return repo
+
+    def git(self, repo: Path, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def switch(self, value: str) -> None:
+        _ = write_config_fixture(self.config / "build_targets.conf",
+                                 f"enabled.mac-linux={value}\n{target_config.UNREACHABLE_WAIT_KEY}=20\n")
+
+    def runner(self, argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        del timeout, env
+        self.calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, envelope(YES), "")
+
+    def attempt(self, argv: tuple[str, ...] = COMMAND, repo: Path | None = None) -> tuple[int, str]:
+        request = hand_made.Request("trial of the guest route", (hand_made_guest.MACHINE,), repo or self.repo, argv)
+        services = hand_made.Services(registry_text=lambda: REGISTRY_TEXT, runner=self.runner,
+                                      output=lambda: self.output)
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.guest.installed():
+            status = hand_made.attempt(request, services)
+        return status, errors.getvalue()
+
+    def rows(self) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for path in sorted((self.root / "buildlog").glob("*/*.jsonl"))
+                for line in path.read_text().splitlines()]
+
+    def only_row(self) -> dict[str, object]:
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def assert_refused(self, argv: tuple[str, ...], cause: str, *, checked: bool) -> None:
+        """The attempt is a refusal with the cause, and the guest starts nothing."""
+        status, errors = self.attempt(argv)
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        self.assertIn(cause, errors)
+        self.assertEqual(bool(self.calls), checked)
+        self.assertNotIn("arm", self.guest.events)
+        self.assertEqual(self.rows()[-1]["status"], None)
+
+    def test_the_guest_route_is_the_mac_linux_entry_of_the_route_table(self) -> None:
+        self.assertIs(hand_made.ROUTES["mac-linux"], hand_made_guest.guest_place)
+        registry = (REPOSITORY / "config/build_targets.conf").read_text()
+        self.assertIn(f"kind.{hand_made_guest.MACHINE}=ssh", registry)
+
+    def test_a_guest_run_sends_the_argv_streams_the_output_and_records_the_guest(self) -> None:
+        with mock.patch.dict(os.environ, {"CC": "fixture-cc"}):
+            status, errors = self.attempt()
+        self.assertEqual(status, 0, errors)
+        output = self.output.getvalue().decode()
+        self.assertTrue(output.startswith("guest ran "), output)
+        request = cast(dict[str, object], json.loads(output.removeprefix("guest ran ")))
+        self.assertEqual((request["argv"], request["work"], request["unit"], request["commit"], request["tree"]),
+                         (list(COMMAND), "hand-made", "aws-unit", self.git(self.repo, "rev-parse", "HEAD"),
+                          self.git(self.repo, "rev-parse", "HEAD^{tree}")))
+        self.assertEqual(request["checked"], ["check.py"])
+        attempt = self.guest.attempt()
+        self.assertEqual(request["attempt"], attempt)
+        self.assertEqual(self.guest.events, ["snapshot", "refs", f"attempt {attempt}", "arm", "run count=False",
+                                             "prove True", "refs removed"])
+        row = self.only_row()
+        self.assertEqual((row["machine"], row["machines"], row["status"], row["refusal"], row["peak_mem_bytes"]),
+                         ("mac-linux", ["mac-linux"], 0, None, None))
+        prompt = self.calls[0][-1]
+        self.assertIn("Machines: mac-linux", prompt)
+        # The guest gives the program its own variables, so the model does not see the natedev ones.
+        self.assertNotIn("fixture-cc", prompt)
+
+    def test_a_guest_that_is_off_takes_no_run(self) -> None:
+        self.switch("off")
+        status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("mac-linux is off (build_targets.conf enabled.mac-linux=off)", errors)
+        self.assertEqual(self.guest.events, [])
+        row = self.only_row()
+        self.assertEqual((row["refusal"], row["status"], row["machine"]),
+                         ("queue place: mac-linux is off (build_targets.conf enabled.mac-linux=off)", None, None))
+
+    def test_a_failed_guest_start_is_a_refusal_with_the_cause(self) -> None:
+        self.guest.arm_error = "guest arm exited 255: fixture SSH refused the connection"
+        status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        cause = "queue place: mac-linux: guest start: guest arm exited 255: fixture SSH refused the connection"
+        self.assertIn(cause, errors)
+        self.assertEqual(self.guest.events, ["snapshot", "refs", f"attempt {self.guest.attempt()}", "refs removed"])
+        row = self.only_row()
+        self.assertEqual((row["refusal"], row["status"], row["machine"]), (cause, None, "mac-linux"))
+
+    def test_a_busy_guest_run_lock_is_a_refusal_at_once_with_no_end_proof(self) -> None:
+        self.guest.locked, self.guest.status = False, mac_linux.GUEST_NOT_LOCKED_STATUS
+        self.guest.setup_error = "The guest run lock is held."
+        status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        cause = "queue place: mac-linux: guest start: The guest run lock is held."
+        self.assertIn(cause, errors)
+        self.assertEqual(self.output.getvalue(), b"")
+        self.assertEqual(self.guest.events[-2:], ["run count=False", "refs removed"])
+        row = self.only_row()
+        self.assertEqual((row["refusal"], row["status"]), (cause, None))
+
+    def test_a_stream_that_ends_after_the_lock_line_proves_the_end(self) -> None:
+        # The status of a lock refusal after the lock line comes from a later step, so the end needs proof.
+        self.guest.status = mac_linux.GUEST_NOT_LOCKED_STATUS
+        self.guest.setup_error = "fixture bundle error"
+        status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        self.assertIn("queue place: mac-linux: guest start: fixture bundle error", errors)
+        self.assertNotIn(mac_linux.RUN_LOCKED, errors)
+        self.assertEqual(self.guest.events[-3:], ["run count=False", "prove True", "refs removed"])
+
+    def test_the_guest_end_is_proved_after_a_failed_run(self) -> None:
+        self.guest.status = 3
+        status, errors = self.attempt()
+        self.assertEqual(status, 3, errors)
+        self.assertEqual(self.guest.events[-2:], ["prove True", "refs removed"])
+        self.assertEqual((self.only_row()["status"], self.only_row()["refusal"]), (3, None))
+
+    def test_the_guest_end_is_proved_after_a_start_failure_after_the_arm(self) -> None:
+        self.guest.stream_program = str(self.root / "missing-ssh")
+        status, errors = self.attempt()
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("queue place: mac-linux: guest start: ", errors)
+        self.assertIn("missing-ssh", errors)
+        self.assertEqual(self.guest.events[-3:], ["run count=False", "prove True", "refs removed"])
+
+    def unproven(self) -> tuple[int, str]:
+        """Run an attempt with a guest that never proves the end, with a clock that the waits move."""
+        self.guest.proofs = [mac_linux.GuestEndPending("fixture cleanup SSH refused the connection")]
+        now = 0.0
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with mock.patch.object(mac_linux, "monotonic", lambda: now), mock.patch.object(mac_linux, "sleep", advance):
+            return self.attempt()
+
+    def test_a_guest_end_with_no_proof_keeps_the_run_status(self) -> None:
+        self.guest.status = 5
+        status, errors = self.unproven()
+        self.assertEqual(status, 5)
+        self.assertIn("after the run: queue place: mac-linux: guest unreachable: fixture-guest did not confirm "
+                      + f"the run ended within 20 seconds ({target_config.UNREACHABLE_WAIT_KEY})", errors)
+        self.assertEqual(self.guest.events.count("prove True"), 3)
+        self.assertEqual(self.guest.events[-1], "refs removed")
+        self.assertEqual((self.only_row()["status"], self.only_row()["refusal"]), (5, None))
+
+    def test_a_start_failure_with_no_end_proof_names_both_causes(self) -> None:
+        self.guest.status, self.guest.setup_error = 1, "fixture bundle error"
+        status, errors = self.unproven()
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        cause = ("queue place: mac-linux: guest unreachable: fixture-guest did not confirm the run ended within 20 "
+                 + f"seconds ({target_config.UNREACHABLE_WAIT_KEY}); the first error: mac-linux: guest start: "
+                 + "fixture bundle error")
+        self.assertIn(cause, errors)
+        self.assertEqual((self.only_row()["refusal"], self.only_row()["status"]), (cause, None))
+
+    def test_a_file_that_changes_before_the_snapshot_is_refused_before_the_guest_starts(self) -> None:
+        def change() -> None:
+            _ = (self.repo / "check.py").write_text('print("changed")\n')
+
+        self.guest.before_snapshot = change
+        self.assert_refused(COMMAND, "queue place: mac-linux: guest start: the commit for the guest does not hold the "
+                            + "checked text of check.py: the file changed after the check, or git does not keep it",
+                            checked=True)
+        self.assertEqual(self.guest.events, ["snapshot"])
+
+    def test_a_program_file_that_git_ignores_is_refused_before_the_guest_starts(self) -> None:
+        (self.repo / "target").mkdir()
+        _ = (self.repo / "target/tool.py").write_text(SCRIPT)
+        self.assert_refused(("python3", "target/tool.py"), "does not hold the checked text of target/tool.py",
+                            checked=True)
+
+    def test_a_program_file_with_a_link_in_its_path_is_refused_before_the_model_call(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        _ = (outside / "tool.py").write_text(SCRIPT)
+        (self.repo / "linked.py").symlink_to(outside / "tool.py")
+        (self.repo / "tools").symlink_to(outside, target_is_directory=True)
+        _ = self.git(self.repo, "add", "linked.py", "tools")
+        _ = self.git(self.repo, "commit", "-qm", "links")
+        (self.repo / "sub").mkdir()
+        for word in ("linked.py", "tools/tool.py", "sub/../check.py"):
+            with self.subTest(word=word):
+                self.assert_refused(("python3", word), "mac-linux takes no program file with a symbolic link or .. "
+                                    + "in its path in the checkout, because the guest copy can hold another file "
+                                    + f"there: {self.repo / word}; give the real path", checked=False)
+
+    def test_an_absolute_path_in_the_command_is_refused_before_the_model_call(self) -> None:
+        word = str(self.repo / "check.py")
+        self.assert_refused(("python3", word), "mac-linux takes no absolute path in the command, because the path "
+                            + f"names a file of the guest: {word}; give a path in the checkout or a program name",
+                            checked=False)
+
+    def test_another_repository_is_refused_before_the_model_call(self) -> None:
+        other = self.checkout("other", "https://example.test/other.git")
+        status, errors = self.attempt(repo=other)
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        self.assertIn("mac-linux: the Mac Linux guest accepts claude_commands, but the source repository is other",
+                      errors)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.guest.events, [])
+
+    def test_a_program_file_outside_the_checkout_is_refused_before_the_model_call(self) -> None:
+        tools = self.root / "tools"
+        tools.mkdir()
+        script = tools / "fixture-tool"
+        _ = script.write_text("#!/bin/sh\necho tool\n")
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}):
+            status, errors = self.attempt(("fixture-tool",))
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn("mac-linux runs its own copy of each program file outside the checkout, and the check reads "
+                      + f"only the natedev copy: {script}; use a file in the checkout", errors)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.guest.events, [])
+        files = cast(list[dict[str, object]], self.only_row()["files"])
+        self.assertEqual([item["path"] for item in files], [str(script)])
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

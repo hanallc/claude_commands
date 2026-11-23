@@ -38,17 +38,17 @@ from typing import BinaryIO, Literal, Protocol, TextIO, Unpack, cast
 
 from scripts.accounts.role_map import CLAUDE_GROUPS, ClaudeGroup
 from scripts.build_queue.queue_place import PopenArguments, QueuePlaceRefused
+from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, main_folder
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
+from scripts.production import hand_made_guest
 
 DESCRIPTION = "Check a hand command with a model, run it in a queue place, and record the attempt."
 SECTION = "cli.hand_made"
 # The exit status of an attempt with no program status. The record row tells it from a program exit 2.
 REFUSED_EXIT = 2
-# Folders of installed tools. A program found in one of them is a tool, not a program file of the check.
-TOOL_FOLDERS = (Path("/nix/store"), Path("/usr"), Path("/bin"), Path("/sbin"))
 PYTHON = re.compile(r"python[0-9.]*")
 # Short options of env and of uv run that take the next word, or the rest of their cluster, as their value.
 ENV_VALUE_LETTERS = "CSau"
@@ -154,13 +154,14 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def path_programs(name: str) -> list[Path]:
-    """Each file on PATH that execvp can start for a name with no slash, in PATH order.
+def path_programs(name: str, *, executable: bool = True) -> list[Path]:
+    """Each file on PATH for a name with no slash, in PATH order: with executable, each file that execvp can
+    start; else each file that a program can read, because bash finds a script name on PATH with no execute bit.
 
     checked_files refuses a PATH entry that is empty, relative or in the checkout.
     """
     return [path for path in (Path(folder) / name for folder in os.get_exec_path())
-            if path.is_file() and os.access(path, os.X_OK)]
+            if path.is_file() and os.access(path, os.X_OK if executable else os.R_OK)]
 
 
 def exec_path(name: str, repo: Path) -> Path | None:
@@ -176,7 +177,7 @@ def in_checkout(path: Path, repo: Path) -> bool:
 def outside_program(path: Path, any_text: bool) -> bool:
     """A program file outside the checkout that the check reads; the tool folders hold no program file.
 
-    With any_text, each file that is not compiled (first bytes \\x7fELF) is one. Else only a text program
+    With any_text, each file that is not compiled (first bytes COMPILED_START) is one. Else only a text program
     (first bytes #!) is one.
     """
     real = path.resolve()
@@ -184,28 +185,29 @@ def outside_program(path: Path, any_text: bool) -> bool:
         return False
     try:
         with real.open("rb") as handle:
-            start = handle.read(4)
+            start = handle.read(len(COMPILED_START))
     except OSError:
         return False
-    return start != b"\x7fELF" if any_text else start[:2] == b"#!"
+    return start != COMPILED_START if any_text else start[:2] == b"#!"
 
 
 def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     """Each file that the command can run. A wrapper such as timeout or env starts a later word with execvp,
     and an interpreter opens a later word as a path, so each later word gives both files.
 
-    The execvp of a wrapper runs a text file with no #! with /bin/sh, so a later word found on PATH reads
-    each file that is not compiled. The execvp of a wrapper also goes on to a later PATH match when a start
-    fails, for example for a #! line with a missing interpreter, so a later word reads each match. The run
+    The execvp of a wrapper runs a text file with no #! with /bin/sh, and an interpreter reads a file with
+    no #!, so a later word reads each file that is not compiled: from PATH, and from its path outside the
+    checkout. The execvp of a wrapper also goes on to a later PATH match when a start fails, for example
+    for a #! line with a missing interpreter, so a later word reads each match. The run
     starts the first word by its exec_path, with no PATH search and no /bin/sh, so the first word reads only
     that file and only a #! script; the model sees a word with a slash in the command.
     """
     found: list[Path] = []
     for index, word in enumerate(argv):
-        programs = [repo / word] if "/" in word else path_programs(word)
+        programs = [repo / word] if "/" in word else path_programs(word, executable=not index)
         for program in programs if index else programs[:1]:
             if os.path.isfile(program) and (
-                    in_checkout(program, repo) or outside_program(program, any_text=bool(index) and "/" not in word)):
+                    in_checkout(program, repo) or outside_program(program, any_text=bool(index))):
                 found.append(program)
         if index and in_checkout(repo / word, repo) and os.path.isfile(repo / word):
             found.append(repo / word)
@@ -311,6 +313,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
     if sets_variable(argv):
         raise Refused("env NAME=VALUE is refused: a variable can make the program load code that the check does not "
                       + "read; set the variable outside the hand made command")
+    if any(main_folder(os.path.join(repo, word)) for word in argv[1:]):
+        raise Refused("a word names a folder with a __main__ file, such as __main__.py or __main__.pyc: python runs "
+                      + "that file, and the check cannot read it; run the program file by its path")
     for name in PATH_LIST_VARIABLES:
         for entry in os.environ[name].split(os.pathsep) if name in os.environ else ():
             if not entry or not os.path.isabs(entry) or in_checkout(Path(entry).resolve(), repo):
@@ -340,8 +345,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
 def check_prompt(argv: Sequence[str], files: Sequence[CheckedFile], machines: Sequence[str], repo: Path) -> str:
     lines = [f"Repository checkout: {repo}", f"Machines: {', '.join(machines)}",
              f"Command (JSON argv): {json.dumps(list(argv))}"]
+    # Only natedev gives the program these variables; another machine gives its own.
     shown = {name: os.environ[name] for name in sorted(SHOWN_VARIABLES) if name in os.environ}
-    if shown:
+    if shown and LOCAL_MACHINE in machines:
         lines.append("Variables that the program gets and that can change the code it runs (JSON): "
                      + json.dumps(shown))
     if not files:
@@ -426,12 +432,16 @@ class ProgramPlace(Protocol):
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]: ...
 
 
-Route = Callable[[Path], AbstractContextManager[ProgramPlace]]
+# A route gets the checkout and the bytes of each program file that the check read.
+Route = Callable[[Path, Mapping[Path, bytes]], AbstractContextManager[ProgramPlace]]
 
 
 @contextmanager
-def natedev_place(repo: Path) -> Generator[ProgramPlace]:
-    """Wait for a natedev hold to end and for a place in the natedev line, as a gate job does."""
+def natedev_place(repo: Path, _checked: Mapping[Path, bytes]) -> Generator[ProgramPlace]:
+    """Wait for a natedev hold to end and for a place in the natedev line, as a gate job does.
+
+    natedev runs the files in place and reads them again at run start, so it does not use the checked bytes.
+    """
     from scripts.build_queue.admission_client import AdmissionHoldCheck
     from scripts.build_queue.queue_place import queue_place
     from scripts.production.gate import BuildHoldWait
@@ -445,8 +455,11 @@ def natedev_place(repo: Path) -> Generator[ProgramPlace]:
         raise QueuePlaceRefused(str(error)) from error
 
 
-# One route for each machine. A later phase adds the Mac and the Mac Linux guest.
-ROUTES: Mapping[str, Route] = {"natedev": natedev_place}
+# The machine that runs the command with the files that the check read. Another machine runs the
+# command in its own copy of the checkout, and finds the first word in that copy or on its own PATH.
+LOCAL_MACHINE = "natedev"
+# One route for each machine. A later phase adds the Mac.
+ROUTES: Mapping[str, Route] = {LOCAL_MACHINE: natedev_place, hand_made_guest.MACHINE: hand_made_guest.guest_place}
 
 
 @dataclass(frozen=True)
@@ -593,16 +606,57 @@ def run_start_change(request: Request, files: Sequence[CheckedFile], fields: rec
     return changed
 
 
+def linked_path(path: Path, repo: Path) -> bool:
+    """A path in the checkout with .. or a symbolic link in it, from the checkout down."""
+    relative = path.relative_to(repo)
+    if ".." in relative.parts:
+        return True
+    return any((repo / Path(*relative.parts[:end])).is_symlink() for end in range(1, len(relative.parts) + 1))
+
+
+def guest_refusal(request: Request, files: Sequence[CheckedFile]) -> str:
+    """The reason that the guest takes no run of the command, before the model call; empty for none.
+
+    The guest runs the command in its own copy of one commit of the checkout. Each program file must be a
+    file of the checkout that the copy holds at the same path.
+    """
+    machine = hand_made_guest.MACHINE
+    absolute = [word for word in request.argv if os.path.isabs(word)]
+    if absolute:
+        return (f"{machine} takes no absolute path in the command, because the path names a file of the guest: "
+                + f"{', '.join(absolute)}; give a path in the checkout or a program name")
+    outside = [str(item.path) for item in files if not in_checkout(item.path, request.repo)]
+    if outside:
+        return (f"{machine} runs its own copy of each program file outside the checkout, and the check reads only "
+                + f"the natedev copy: {', '.join(outside)}; use a file in the checkout")
+    linked = [str(item.path) for item in files if linked_path(item.path, request.repo)]
+    if linked:
+        return (f"{machine} takes no program file with a symbolic link or .. in its path in the checkout, because the "
+                + f"guest copy can hold another file there: {', '.join(linked)}; give the real path")
+    try:
+        _ = hand_made_guest.run_owner(request.repo)
+    except QueuePlaceRefused as error:
+        return str(error)
+    return ""
+
+
 def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str, started: float,
                 services: Services) -> int:
     settings = read_settings(services.registry_text())
     fields["check_model"], fields["check_effort"] = settings.model, settings.effort
     fields["check_started_at"] = now_text()
     files = checked_files(request.argv, request.repo, settings.max_script_bytes)
-    # The run starts this file, so execvp never goes on to a later PATH match that the check did not read.
-    start = exec_path(request.argv[0], request.repo)
     fields["files"] = [record.HandMadeFile(path=str(item.path), sha256_check=item.sha256, sha256_run=None)
                        for item in files]
+    machine = request.machines[0]
+    start: Path | None = None
+    if machine == LOCAL_MACHINE:
+        # The run starts this file, so execvp never goes on to a later PATH match that the check did not read.
+        start = exec_path(request.argv[0], request.repo)
+    elif machine == hand_made_guest.MACHINE:
+        refusal = guest_refusal(request, files)
+        if refusal:
+            raise Refused(refusal)
     result = check(request.argv, files, request.machines, request.repo, settings, services.runner)
     fields["check_ended_at"] = now_text()
     fields["check_model"], fields["check_account"] = result.model, result.account
@@ -612,10 +666,9 @@ def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str,
     note(f"check {result.outcome.answer}: {result.outcome.reason}")
     if result.outcome.answer == "no":
         raise Refused("the check said no; change the command or the script and start a new attempt")
-    machine = request.machines[0]
     requested = time.time()
     try:
-        with services.routes[machine](request.repo) as place:
+        with services.routes[machine](request.repo, {item.path: item.text.encode() for item in files}) as place:
             placed = time.time()
             fields["machine"], fields["placed_at"] = machine, store.utc_iso(placed)
             fields["queue_wait_s"] = round(placed - requested, 3)
@@ -710,7 +763,10 @@ def parse_request(argv: Sequence[str]) -> Request:
     machines = tuple(dict.fromkeys(args.machine))
     later = [name for name in machines if name not in ROUTES]
     if later:
-        parser.error(f"machine {', '.join(later)} comes in a later phase; this phase accepts only "
+        parser.error(f"machine {', '.join(later)} comes in a later phase; this phase accepts one of: "
+                     + ", ".join(ROUTES))
+    if len(machines) > 1:
+        parser.error("a run that names more than one machine comes in a later phase; name one of "
                      + ", ".join(ROUTES))
     repo = Path(args.repo or os.getcwd()).resolve()
     if work_tree_top(repo) != repo:

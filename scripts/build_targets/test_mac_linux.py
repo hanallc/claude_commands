@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr, suppress
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -110,7 +111,8 @@ if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
     guest.stdin.close()
     with selectors.DefaultSelector() as ready:
         ready.register(guest.stderr, selectors.EVENT_READ)
-        assert ready.select(3), 'The guest did not reach the pause before take_copy.'
+        assert ready.select(3), 'The guest did not take the run lock.'
+    assert guest.stderr.readline().startswith(b'mac-linux run locked ')
     assert guest.stderr.readline() == b'fixture pause before take_copy\\n'
     if scenario == 'interrupted-before-copy':
         print('fixture local SSH is still active', file=sys.stderr, flush=True)
@@ -311,6 +313,133 @@ class MacLinuxSandboxTests(unittest.TestCase):
         unlocked = subprocess.run(['flock', '--exclusive', '--timeout', '1', str(run_lock), 'true'],
                                   timeout=2, check=False)
         self.assertEqual(unlocked.returncode, 0, 'The guest run lock is still held after the deadline.')
+
+
+class GuestCommandParityTests(unittest.TestCase):
+    """The guest starts only a file that natedev read, or a tool: command_refusal checks each argv word."""
+    copy: Path = Path()
+    tools: Path = Path()
+    user: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.copy, self.tools, self.user = root / 'copy', root / 'tools', root / 'user'
+        for folder in (self.copy / 'target', self.copy / 'scripts', self.tools, self.user):
+            folder.mkdir(parents=True)
+        _ = self.enterContext(patch.object(mac_linux, 'TOOL_FOLDERS', (self.tools,)))
+
+    @staticmethod
+    def program(path: Path, data: bytes) -> Path:
+        _ = path.write_bytes(data)
+        path.chmod(0o755)
+        return path
+
+    def refusal(self, *argv: str, checked: tuple[str, ...] = (), search_path: str | None = None) -> str:
+        path = f'{self.tools}{os.pathsep}{self.user}' if search_path is None else search_path
+        return mac_linux.command_refusal(self.copy, argv, list(checked), path)
+
+    def test_a_word_with_a_checked_file_runs_the_checked_blob(self) -> None:
+        _ = self.program(self.copy / 'scripts/run.sh', b'echo checked\n')
+        for word in ('scripts/run.sh', './scripts/run.sh'):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal(word, checked=('scripts/run.sh',)), '')
+
+    def test_a_word_with_a_slash_and_no_checked_file_must_name_no_guest_file(self) -> None:
+        _ = self.program(self.copy / 'target/run.sh', b'echo unread\n')
+        outside = self.program(self.user / 'outside.sh', b'echo outside\n')
+        for word, reason in (('target/run.sh', f'the guest has a file at {self.copy / "target/run.sh"}'),
+                             ('target/', f'the guest has a file at {self.copy / "target"}'),
+                             ('../user/outside.sh', 'the path has ..'),
+                             (str(outside), f'the guest has a file at {outside}')):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal('bash', word),
+                                 f'The guest refuses the command word {word}: {reason}, and natedev read no file there.')
+        self.assertEqual(self.refusal('bash', 'target/missing.sh', '--out=a/b', 'target/run.sh/x'), '')
+
+    def test_a_word_with_a_slash_through_a_symbolic_link_is_refused(self) -> None:
+        # Outside the sandbox /proc/self/cwd is the main checkout, so a check that follows the link finds no file;
+        # in the copy the link leads to the unread target/h/run.sh.
+        (self.copy / 'target/h').mkdir()
+        _ = self.program(self.copy / 'target/h/run.sh', b'echo unread\n')
+        (self.copy / 'target/d').symlink_to('/proc/self/cwd/target/h')
+        self.assertEqual(self.refusal('bash', 'target/d/run.sh'),
+                         f'The guest refuses the command word target/d/run.sh: {self.copy / "target/d"} is a symbolic '
+                         + 'link, and natedev read no file there.')
+
+    def test_a_path_that_the_guest_cannot_read_is_refused(self) -> None:
+        denied = OSError(errno.EACCES, 'Permission denied')
+        with patch.object(Path, 'lstat', side_effect=denied):
+            for argv, word in ((('bash', 'target/run.sh'), 'target/run.sh'), (('bash', 'helper'), 'helper')):
+                with self.subTest(word=word):
+                    self.assertEqual(self.refusal(*argv),
+                                     f'The guest refuses the command word {word}: the guest cannot read '
+                                     + f'{self.copy / Path(word).parts[0]}: Permission denied, and natedev read no '
+                                     + 'file there.')
+
+    def test_a_later_bare_word_with_an_unread_file_in_the_copy_is_refused(self) -> None:
+        # The copy keeps the stamp that an earlier run wrote, and bash opens a later word from the copy.
+        _ = (self.copy / '.lint-sweep-used').write_text('rm -rf ~/work\n')
+        (self.copy / 'linked').symlink_to(self.copy / 'scripts')
+        for word, reason in (('.lint-sweep-used', f'the guest has a file at {self.copy / ".lint-sweep-used"}'),
+                             ('linked', f'{self.copy / "linked"} is a symbolic link')):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal('bash', word),
+                                 f'The guest refuses the command word {word}: {reason}, and natedev read no file there.')
+        _ = self.program(self.copy / 'scripts/run.sh', b'echo checked\n')
+        self.assertEqual(self.refusal('bash', 'run.sh', checked=('run.sh',)), '')
+        # A plain folder passes: cargo test runs with a test folder in the copy.
+        (self.copy / 'test').mkdir()
+        self.assertEqual(self.refusal('cargo', 'test'), '')
+
+    def test_a_bare_word_runs_only_a_tool_or_a_compiled_file(self) -> None:
+        _ = self.program(self.tools / 'wrapped', b'#!/bin/sh\necho tool\n')
+        _ = self.program(self.user / 'compiled', b'\x7fELF\x02\x01\x01')
+        (self.user / 'linked').symlink_to(self.tools / 'wrapped')
+        for word in ('missing-program', 'wrapped', 'compiled', 'linked'):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal('timeout', '60', word), '')
+
+    def test_a_bare_word_with_a_text_match_outside_the_tool_folders_is_refused(self) -> None:
+        _ = self.program(self.user / 'helper', b'rm -rf ~/work\n')
+        # A wrapper goes on to a later match when a start fails, so the later match counts too.
+        _ = self.program(self.tools / 'both', b'#!/missing/interpreter\n')
+        _ = self.program(self.user / 'both', b'#!/bin/sh\necho later\n')
+        for word in ('helper', 'both'):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal('timeout', '60', word),
+                                 f'The guest refuses the command word {word}: the guest PATH finds {self.user / word}, '
+                                 + 'a program file that natedev did not read; use a file in the checkout.')
+
+    def test_a_later_word_with_only_read_access_on_the_path_is_refused(self) -> None:
+        # bash finds a script name on PATH with no execute bit; execvp of the first word does not.
+        helper = self.user / 'helper'
+        _ = helper.write_bytes(b'rm -rf ~/work\n')
+        helper.chmod(0o644)
+        self.assertEqual(self.refusal('bash', 'helper'),
+                         f'The guest refuses the command word helper: the guest PATH finds {helper}, '
+                         + 'a program file that natedev did not read; use a file in the checkout.')
+        self.assertEqual(self.refusal('helper'), '')
+
+    def test_a_later_word_that_names_a_folder_with_a_main_file_is_refused(self) -> None:
+        # Python 3.13 runs a folder that holds only __main__.pyc.
+        _ = (self.copy / 'target/__main__.pyc').write_bytes(b'compiled')
+        _ = (self.copy / 'scripts/__main__.py').write_text('print("unread")\n')
+        _ = (self.copy.parent / '__main__.py').write_text('print("unread")\n')
+        for word, folder in (('target', self.copy / 'target'), ('./target', self.copy / 'target'),
+                             ('scripts', self.copy / 'scripts'), ('..', self.copy / '..')):
+            with self.subTest(word=word):
+                self.assertEqual(self.refusal('python3', word),
+                                 f'The guest refuses the command word {word}: python runs a __main__ file of the '
+                                 + f'folder {folder}, and natedev read no file there.')
+        # A plain folder is no package: cargo test runs with a test folder in the copy.
+        (self.copy / 'test').mkdir()
+        self.assertEqual(self.refusal('cargo', 'test'), '')
+
+    def test_a_bare_word_found_in_the_copy_is_refused(self) -> None:
+        _ = self.program(self.copy / 'target/built', b'\x7fELF\x02\x01\x01')
+        refusal = self.refusal('built', search_path=f'target{os.pathsep}{self.tools}')
+        self.assertIn(f'the guest PATH finds {self.copy / "target/built"}', refusal)
 
 
 class MacLinuxRouteTests(unittest.TestCase):
@@ -1185,6 +1314,72 @@ fi
         self.assertIn(f'The guest cannot find the type-check tool {missing}', result)
         self.assertIn('Guest cleanup: ended', result)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        for status in (0, 4):
+            program = f'import os, sys\nprint("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n'
+            script = self.repo / 'scripts/fixture/hand.py'
+            _ = script.write_text(program, encoding='utf-8')
+            command = mac_linux.GuestCommand(settings)
+            try:
+                process = command.start(self.repo, ['python3', 'scripts/fixture/hand.py'], work='hand-made',
+                                        unit='caller', bootstrap=self.root / 'bootstrap.tar',
+                                        checked={script: program.encode()})
+                with process:
+                    output, _ = process.communicate(timeout=60)
+            finally:
+                command.finish()
+            self.assertEqual(process.returncode, status, output)
+            self.assertTrue(output.decode().endswith(f'guest ran in {self.guest_home / "build/claude/caller/1"}\n'),
+                            output)
+            # start reads the start line, so the process output does not hold it.
+            self.assertNotIn(mac_linux.RUN_START.encode(), output)
+            self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
+            self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
+
+    def test_command_request_refuses_a_guest_file_that_natedev_did_not_read(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        command = mac_linux.GuestCommand(settings)
+        write = "from pathlib import Path; Path('target/run.sh').write_text('echo unread')"
+        try:
+            process = command.start(self.repo, ['python3', '-c', write], work='hand-made', unit='caller',
+                                    bootstrap=self.root / 'bootstrap.tar', checked={})
+            with process:
+                output, _ = process.communicate(timeout=60)
+        finally:
+            command.finish()
+        self.assertEqual(process.returncode, 0, output)
+        # The numbered copy keeps target/, so the guest has the file and natedev has none.
+        command = mac_linux.GuestCommand(settings)
+        with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'The guest refuses the command word target/run.sh: '
+                                    + r'the guest has a file at /\S+/target/run\.sh, and natedev read no file there\.'):
+            try:
+                _ = command.start(self.repo, ['bash', 'target/run.sh'], work='hand-made', unit='caller',
+                                  bootstrap=self.root / 'bootstrap.tar', checked={})
+            finally:
+                command.finish()
+        self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
+
+    def test_command_request_with_a_busy_run_lock_is_refused_at_once_with_no_end_proof(self) -> None:
+        command = mac_linux.GuestCommand(mac_linux.read_settings(conf.read(self.registry)))
+        lock = self.run_lock()
+        lock.parent.mkdir(parents=True)
+        with lock.open('w') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(mac_linux.GuestNotLocked, '^The guest run lock is held.$'):
+                try:
+                    _ = command.start(self.repo, ['python3', '-c', 'print(1)'], work='hand-made', unit='caller',
+                                      bootstrap=self.root / 'bootstrap.tar', checked={})
+                finally:
+                    command.finish()
+        assert command.process is not None and command.process.stdout is not None
+        self.assertTrue(command.process.stdout.closed)
+        self.assertEqual(command.process.returncode, mac_linux.GUEST_NOT_LOCKED_STATUS)
+        self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run'])
 
     def test_dirty_modules_are_included_in_the_snapshot(self) -> None:
         (self.repo / 'scripts/fixture/test_added.py').touch()
