@@ -23,6 +23,11 @@ from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
 
+# A helper that copies a data folder, as a test fixture does.
+COPY_SCAN = ("from pathlib import Path\nROOT = Path(__file__).resolve().parents[2]\n"
+             + "def copy_data():\n    return list((ROOT / 'scripts/data').rglob('*'))\n")
+
+
 class AffectedModulesTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -724,6 +729,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/duplicate/subject.py", "VALUE = 1\n")
         self.write("scripts/component/adapter.py", "from scripts.component import subject\n")
+        self.write("scripts/component/adapter_cli.py", "import scripts.component.adapter\n")
         self.add_test("checks/test_qualified.py", "import scripts.component.adapter\n")
         self.add_test("checks/test_bare.py", "from subject import VALUE\n")
         self.add_test("checks/test_mention.py", 'SOURCE = "../component/subject.py"\n')
@@ -927,6 +933,7 @@ class AffectedModulesTests(unittest.TestCase):
     def test_direct_imports_and_same_folder_select_without_a_second_import_step(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/adapters/adapter.py", "import scripts.component.subject\n")
+        self.write("scripts/adapters/adapter_cli.py", "import scripts.adapters.adapter\n")
         self.add_test("checks/test_direct.py", "import scripts.component.subject\n")
         self.add_test("checks/test_indirect.py", "import scripts.adapters.adapter\n")
         self.add_test("component/test_neighbor.py", "VALUE = 1\n")
@@ -952,6 +959,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("config/custom.json", "{}\n")
         self.write("verify.sh", "true\n")
         self.write("scripts/adapters/adapter.py", "# config/custom.json\n")
+        self.write("scripts/adapters/adapter_cli.py", "import scripts.adapters.adapter\n")
         self.add_test("checks/test_path.py", "# ./config/custom.json\n")
         self.add_test("checks/test_root_path.py", "SCRIPT = 'verify.sh'\n")
         self.add_test("checks/test_fragment.py", "PATHS = 'custom.json old/config/custom.json config/custom.json.bak'\n")
@@ -973,6 +981,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/component/test_fixture.py", "from scripts.component import relay_test_support\n")
         self.write("scripts/adapters/path_adapter.py",
                    "from scripts.component import reader_test_support\n")
+        self.write("scripts/adapters/adapter_cli.py", "from scripts.adapters import path_adapter\n")
         for path, text in (
             ("component/test_support_path.py", "from scripts.component import relay_test_support\n"),
             ("checks/test_folder_path.py", "PARTS = 'component tool.sh'\n"),
@@ -986,6 +995,28 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
                               ["test_support_path.py", "test_folder_path.py", "test_inherited_fixture.py"])
+
+    def test_a_test_only_helper_without_a_support_name_brings_its_scan(self) -> None:
+        self.write("scripts/data/input.txt", "before\n")
+        self.write("scripts/component/copy_fixture.py", COPY_SCAN)
+        self.write("scripts/component/recorder.py", "from scripts.component import copy_fixture\n")
+        self.add_test("checks/test_copy.py", "from scripts.component import recorder\n")
+        self.certify()
+        self.write("scripts/data/input.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_copy.py",))
+
+    def test_a_module_that_production_imports_is_not_followed(self) -> None:
+        self.write("scripts/data/input.txt", "before\n")
+        self.write("scripts/component/copy_tool.py", COPY_SCAN)
+        self.write("scripts/component/runner.py", "from scripts.component import copy_tool\n")
+        self.write("scripts/component/copy_main.py", COPY_SCAN + "if __name__ == '__main__':\n    copy_data()\n")
+        self.add_test("checks/test_tool.py", "from scripts.component import copy_tool\n")
+        self.add_test("checks/test_main.py", "from scripts.component import copy_main\n")
+        self.certify()
+        self.write("scripts/data/input.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
 
     def test_a_changed_script_selects_tests_of_every_script_that_calls_it(self) -> None:
         self.write("scripts/component/tool.sh", "# runner.sh calls this file.\ntrue\n")

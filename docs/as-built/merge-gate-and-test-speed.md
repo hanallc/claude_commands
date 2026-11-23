@@ -515,10 +515,15 @@ A static Python graph selects a test module under four rules:
 
 1. The test module changed.
 2. The test module directly imports a changed Python file.
-3. The test or an imported `*_test_support.py` module names a changed file through tokens.
+3. The test or an imported test-only helper names a changed file through tokens, or imports a changed file.
 4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
 
-The third rule follows imports only through `*_test_support.py` modules.
+The third rule follows imports only through test modules and test-only helpers.
+A test-only helper is a non-test module that only test modules and other test-only helpers import.
+A module that nothing imports, or whose text holds the `__main__` token, is production code.
+A module that production code imports is production code too.
+Each `*_test_support.py` module is a test-only helper, whatever imports it.
+The selector finds the helpers once for each graph.
 A whole path token matches any changed file, including a repository-root file.
 A base name token also matches when the source shares the file's folder or contains that folder's name as a token.
 Repository-root files require a whole path token.
@@ -530,7 +535,7 @@ Removed source files also count.
 The selector reads that text only when no earlier rule selects the module.
 
 A folder scan also selects a test module when the scan can read a changed path.
-The scan can be in the test module or in an imported `*_test_support.py` module.
+The scan can be in the test module or in an imported test-only helper.
 The selector finds `glob`, `rglob`, `os.walk` and `git ls-files` calls, and the helper calls that give them a folder.
 A `walk` call on the imported `ast` module is not a folder scan.
 A scan root is known when the code builds it from `__file__`, an absolute path or an imported root.

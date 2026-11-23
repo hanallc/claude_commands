@@ -1155,8 +1155,28 @@ def names_path(tokens: frozenset[str], source: str, paths: set[str],
                for folder, names in folder_names.items())
 
 
-def fixture_sources(imports: dict[str, set[str]], path: str) -> set[str]:
-    """Include imported test fixtures and their imported test fixtures."""
+def test_only_helpers(graph: SourceGraph) -> frozenset[str]:
+    """Return the non-test modules that only test modules and other test-only helpers import.
+
+    A module that nothing imports, or whose text holds the `__main__` token, is production code.
+    A module that production code imports is production code too.
+    A `*_test_support.py` module is always a test-only helper, so no current selection drops.
+    """
+    importers: dict[str, set[str]] = defaultdict(set)
+    for source, dependencies in graph.imports.items():
+        for dependency in dependencies:
+            importers[dependency].add(source)
+    supports = {path for path in graph.imports if path.endswith("_test_support.py")}
+    helpers = supports | {path for path in importers
+                          if not is_test_module(path) and "__main__" not in graph.tokens.get(path, frozenset())}
+    while production := {path for path in helpers - supports
+                         if any(not is_test_module(importer) and importer not in helpers for importer in importers[path])}:
+        helpers -= production
+    return frozenset(helpers)
+
+
+def fixture_sources(imports: dict[str, set[str]], helpers: frozenset[str], path: str) -> set[str]:
+    """Include the imported test modules and test-only helpers, and what they import of the same kind."""
     pending = [path]
     seen: set[str] = set()
     while pending:
@@ -1165,7 +1185,7 @@ def fixture_sources(imports: dict[str, set[str]], path: str) -> set[str]:
             continue
         seen.add(source)
         pending.extend(dependency for dependency in imports.get(source, set())
-                       if dependency.endswith("_test_support.py") or is_test_module(dependency))
+                       if dependency in helpers or is_test_module(dependency))
     return seen
 
 
@@ -1314,12 +1334,13 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 folder_stems[str(Path(source).parent)].add(Path(source).stem)
         named = changed | script_callers(repo, set(blobs) | dirty, changed)
         folder_names = folder_names_of(named)
+        helpers = test_only_helpers(graph)
         selected: list[Path] = []
         no_reads = ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord())
         for module in modules:
             path = module.relative_to(repo).as_posix()
             reads = recorded.positive_reads.get(path, no_reads)
-            sources = fixture_sources(graph.imports, path)
+            sources = fixture_sources(graph.imports, helpers, path)
             static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
             config_reads = reads.config_reads
             config_changed = bool(configs) and (path not in known_configs
