@@ -2960,32 +2960,31 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
             unconfirmed = unconfirmed_guest_run(step)
+            guest_gate = guest is not None or unconfirmed
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
-            verb = step.step
-            what = row_what(step.what, "")
-            unknown_gate = verb in GATE_STEPS and not what
-            who = step_owner_name(shown_step, labels)
-            title_step = (QueueRowName.owned(who, "") if unknown_gate else
-                          build_row_step(verb, step.package, step.project, step.folder, names, what=what))
-            if isinstance(title_step, NoNamedStep):
+            job = NotGateStep() if guest_gate and not isinstance(step.job, StepJob) else local_job(step)
+            if guest_gate:
+                guest_labels = replace(identity, unit=step.unit or identity.unit)
+                owner = replace(owner, labels=guest_labels, unit=staff_unit(guest_labels))
+                shown_step = replace(shown_step, step=job_step(job, step.step), unit=guest_labels.unit)
+            named = local_step_name(shown_step, owner, names, labels, "", job if guest_gate else NotGateStep())
+            if isinstance(named, NoNamedStep):
                 continue
             remote_groups.add(key)
-            display_name = title_step if unknown_gate else QueueRowName.owned(who, title_step)
-            parts = [] if unknown_gate else staff_names.row_parts(who, title_step, identity.unit)
-            remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit, caller=owner.caller),
-                "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
+            remote_row: RunRow = {**queue_row_labels(named.title, named.name, unit=owner.unit, caller=owner.caller),
+                "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                 **owner.fields(),
-                "state": "running" if guest or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
-                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
+                "state": "running" if guest_gate or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
+                "pid": step.pid, "detail": owner.labels.unit, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": MAC_LINUX_TARGET if guest or unconfirmed else admission_records.execution_host(step, machine),
+                "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
-                **job_notes(local_job(step), names, step=step.step, verify=step.verify,
+                **job_notes(job, names, step=step.step, verify=step.verify,
                             ci=step.unit in ci_runners),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}

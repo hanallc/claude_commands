@@ -707,6 +707,50 @@ class MemoryHoverTests(unittest.TestCase):
                 for row in table.findall("./tbody/tr"):
                     self.assertEqual(len(row), len(headers) - 2 * int(row.get("class", "").startswith(("wait", "queue-head"))))
 
+    def test_guest_row_shows_confirmation_and_caller(self) -> None:
+        for guest, state in (({"guest_run": {"attempt": "fixture"}}, "running"),
+                             ({"guest_unconfirmed": True}, "not confirmed")):
+            with self.subTest(state=state):
+                reading = {"total": 64, "read_at": 200, "walk": [{
+                    "name": "phases: test affected", "title": {"unit": "phases", "step": "test affected"},
+                    "caller": "phases", "machine": "mac-linux", "started_at": 100,
+                    "used": {"kind": "RunUseUnavailable", "reason": "remote memory is unavailable"},
+                    "progress": {"kind": "NoProgress"}, **guest}]}
+                table, tip = cast(tuple[str, str], self.page_expression(
+                    "(renderWalk(data), [$('walk').innerHTML, tipText('row:fixture-run-0', data).join('\\n')])",
+                    reading, walk=True))
+                row = ElementTree.fromstring(f"<root>{table}</root>").find(".//tr[@data-tip='row:fixture-run-0']")
+                assert row is not None
+                self.assertEqual(row.findtext("td[@class='machine']/strong[@data-machine='mac-linux']"),
+                                 f"mac-linux ({state})")
+                for column in ("place", "done", "vcpus"):
+                    self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
+                self.assertIn("Caller  phases", tip)
+
+    def test_guest_row_shows_on_mac_linux_in_the_memory_column(self) -> None:
+        reading = {"total": 64, "read_at": 200, "walk": [{
+            "name": "test affected", "machine": "mac-linux", "guest_unconfirmed": True,
+            "used": {"kind": "RunUseUnavailable", "reason": "remote memory is unavailable"}}]}
+        table = self.page_expression("(renderWalk(data), $('walk').innerHTML)", reading, walk=True)
+        chart = ElementTree.fromstring(f"<root>{table}</root>").find(".//div[@data-run='fixture-run-0']")
+        assert chart is not None
+        self.assertEqual(chart.findtext(".//div[@class='amounts']"), "on mac-linux")
+
+    def test_guest_targets_stay_visible_when_a_machine_is_recorded(self) -> None:
+        targets = ["natedev", "mac-linux"]
+        reading = {"total": 64, "read_at": 200, "walk": [{
+            "name": "guest", "guest_unconfirmed": True, "machine": "mac-linux", "targets": targets}],
+            "waiters": [{"name": "gate", "machine": "natedev", "targets": targets, "since": 100}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", reading, walk=True)
+        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        running = table.find(".//tr[@data-tip='row:fixture-run-0']/td[@class='machine']")
+        waiting = table.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
+        assert running is not None and waiting is not None
+        self.assertEqual([label.get("data-machine") for label in running], targets)
+        self.assertEqual(running.findtext("strong"), "mac-linux (not confirmed)")
+        self.assertEqual([label.get("data-machine") for label in waiting.findall("span/span")], targets)
+        self.assertIsNone(waiting.find(".//strong"))
+
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
             with self.subTest(state=state):
@@ -980,6 +1024,51 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
                                 ('{"hidden": true}', [0, 0, 2, reads])):
             with self.subTest(frame=frame):
                 result = subprocess.run([executable, "-e", javascript, frame], text=True, capture_output=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_page_reload_compares_the_loaded_page_on_start_and_on_visibility(self) -> None:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        javascript = """
+const [initial, shown] = JSON.parse(process.argv[1]);
+let stamp = initial, reloads = 0;
+const document = {lastModified: "11/23/2026 10:00:00", visibilityState: "hidden"};
+const location = {pathname: "/memory_live.html", reload: () => { reloads++; }};
+const window = {frameElement: null};
+const visibility = [];
+document.addEventListener = (kind, handler) => { if (kind === "visibilitychange") visibility.push(handler); };
+const addEventListener = () => {};
+const page = {refresh() {}};
+const createPageRefresh = () => page;
+const setInterval = () => 0;
+const fetch = async () => {
+  const modified = stamp;
+  return {ok: true, headers: {get: () => modified}};
+};
+""" + loop + """
+async function check() {
+  await Promise.resolve();
+  const atStart = reloads;
+  stamp = shown;
+  document.visibilityState = "visible";
+  for (const handler of visibility) handler();
+  await Promise.resolve();
+  const atVisibility = reloads;
+  await reloadWhenPageChanges();
+  process.stdout.write(JSON.stringify([atStart, atVisibility, reloads]));
+}
+void check();
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        current = "Mon, 23 Nov 2026 10:00:00 GMT"
+        newer = "Mon, 23 Nov 2026 10:00:01 GMT"
+        for initial, shown, expected in ((current, current, [0, 0, 0]), (current, newer, [0, 1, 1]),
+                                         (newer, newer, [1, 1, 1])):
+            with self.subTest(initial=initial, shown=shown):
+                result = subprocess.run([executable, "-e", javascript, json.dumps([initial, shown])],
+                    env={"TZ": "UTC"}, text=True, capture_output=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)

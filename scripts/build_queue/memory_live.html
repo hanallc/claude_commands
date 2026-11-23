@@ -927,7 +927,7 @@ function stepTooltip(key, data) {
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (unavailable) return [...rows, ...stepFields, ...guestFields, ...namedTargets,
+  if (unavailable) return [...rows, ...(guestRow(row) ? ownerFields(row) : []), ...stepFields, ...guestFields, ...namedTargets,
     ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
@@ -1109,9 +1109,9 @@ function rowLabel(name, owner = "", note = "") {
     `<span class="owner">${roleName(owner)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
-function rowMemory(tip, bars = "") {
-  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
-    `<div class="amounts"></div></div>`;
+function rowMemory(tip, note = "") {
+  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}"></div>` +
+    `<div class="amounts">${esc(note)}</div></div>`;
 }
 function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
@@ -1860,12 +1860,13 @@ function renderWalk(d) {
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    const target = targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : guestRow(r) ? [r.machine] : undefined,
-      guestRow(r) ? guestState(r) : undefined);
+    const guest = guestRow(r);
+    const named = r.targets?.length > 1 || r.targets?.includes("mac-linux") ? r.targets : guest ? [] : undefined;
+    const target = targetCell(r.machine, named, guest ? guestState(r) : undefined);
     cells(stageText(r),
       r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, target, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
-      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
   const columnClasses = ["place", "done", "step", "duration", "verify", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
@@ -1888,7 +1889,7 @@ function renderWalk(d) {
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
-    const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
+    const target = targetCell("", w.targets?.length ? w.targets : w.machine ? [w.machine] : []);
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, target, null, tip, w.verify?.verb, rowClass);
     const reason = w.order_note
       || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
@@ -2114,6 +2115,7 @@ function placeMemoryBars(d) {
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
+    if (guestRow(run)) continue;
     const amount = shown.walk.find(run => run.key === row.dataset.run);
     let bars = "";
     const amounts = [];
@@ -2300,21 +2302,26 @@ async function loadReport(version,current) {
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
-let pageStamp = null;
+const pageStamp = Date.parse(document.lastModified);
+let pageReloading = false;
 async function reloadWhenPageChanges() {
-  if (consoleHidden() || paused) return;
+  if (consoleHidden() || paused || pageReloading) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
-    const stamp = r.headers.get("Last-Modified");
-    if (paused) return;
-    if (pageStamp && stamp && stamp !== pageStamp) location.reload();
-    pageStamp = stamp || pageStamp;
+    if (!r.ok || consoleHidden() || paused || pageReloading) return;
+    if (Date.parse(r.headers.get("Last-Modified")) > pageStamp) {
+      pageReloading = true;
+      location.reload();
+    }
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
 const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
 void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void reloadWhenPageChanges();
+});
 addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
     reloadWhenPageChanges();

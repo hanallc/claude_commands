@@ -588,6 +588,39 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
             + '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
 
+    def test_consumed_guest_gate_uses_the_recorded_job_and_owner(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        with mock.patch.object(admission_client, "view", return_value=captured_reading(running=(step,))):
+            page = memory_feed.reading()
+        (row,) = (cast(memory_feed.RunRow, row) for row in page["walk"] if row.get("guest_unconfirmed"))
+        self.assertEqual(row["title"], {"unit": "phases", "step": "test affected"})
+        self.assertEqual((row.get("caller"), row.get("machine"), row["state"]),
+                         ("phases", "mac-linux", "running"))
+
+    def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"))
+        with (mock.patch.object(admission_client, "view", side_effect=[
+                  captured_reading(running=(step,)), wire.AdmissionUnavailable("queue read timed out")]),
+              mock.patch.object(time, "sleep", side_effect=[None, FeedStopped]),
+              self.assertRaises(FeedStopped)):
+            _ = memory_feed.main([])
+        payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(payload["read_error"], "queue read timed out")
+        rows = cast(list[dict[str, object]], payload["walk"])
+        row, = [row for row in rows if row.get("guest_unconfirmed")]
+        _tips, table = self.render_assignment_table(payload)
+        self.assertEqual(table.count(f'data-tip="row:{row["key"]}" tabindex="0"'), 1)
+
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
         now = base.explanation.now
@@ -622,7 +655,7 @@ class MemoryFeedTests(unittest.TestCase):
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
         self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
-                         ("mac-linux", True, "uncertain"))
+                         ("mac-linux", True, "running"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
