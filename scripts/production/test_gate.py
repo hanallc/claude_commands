@@ -6,6 +6,7 @@ from scripts.build_queue import admission_records
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
 import fcntl
@@ -227,7 +228,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     if fails:
                         raise RuntimeError("module preparation failed")
                     prepared = prepare(root, {**environment, "HERDR_BIN": "/host/herdr"})
-                    self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
+                    self.assertEqual(prepared["HERDR_BIN"], MISSING_HERDR_BIN)
                     return prepared
 
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
