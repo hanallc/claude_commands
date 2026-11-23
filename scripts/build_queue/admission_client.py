@@ -689,6 +689,10 @@ class LeftQueue:
     pass
 
 
+class WaitLimitReached(Exception):
+    """The caller's wait_until came before a grant, and the caller left the queue."""
+
+
 class _QueueLeft(Exception):
     pass
 
@@ -701,6 +705,10 @@ class AcquisitionRetry:
     last_outage_line: float = float("-inf")
     leave_interval: float = float("inf")
     unreachable_deadline: float = float("inf")
+    # The caller's deadline. The first Wait reply arms it as the LAUNCH deadline, so the first reply decides a
+    # call that starts late. Before the first Wait reply, a connection fault takes the unreachable path. After
+    # it, the deadline also ends a wait during an outage.
+    wait_until: float = float("inf")
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -885,7 +893,8 @@ class AdmissionRefusalHandler(Protocol):
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, report_refusal: bool = True,
-          configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
+          configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE,
+          wait_until: float = math.inf
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     def refuse(reason: str, *, checker: bool = False) -> wire.Refused:
         return _refused(reason, checker=checker) if report_refusal else wire.Refused(reason)
@@ -899,7 +908,11 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
-    if retry is None:
+    assert wait_until == math.inf or owns_retry and isinstance(request, wire.ServiceEstimateRequest), \
+        "wait_until bounds only a service estimate wait outside an outer acquisition"
+    if wait_until < math.inf:
+        retry = AcquisitionRetry(math.inf, wait_until=wait_until)
+    elif retry is None:
         limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
         launch = isinstance(request, wire.LaunchRequest)
         deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
@@ -1238,6 +1251,8 @@ def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
     if isinstance(answer, wire.Refused):
         return refuse(answer.reason, checker=True)
     if cause is AcquisitionDeadline.LAUNCH:
+        if retry.wait_until < math.inf:
+            raise WaitLimitReached()
         return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
     if cause is AcquisitionDeadline.UNREACHABLE:
         raise _unreachable(configuration)
@@ -1477,6 +1492,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         if waiting_callback is not None:
             callback_peer, waiting = waiting_callback
             on_wait(waiting)
+            retry.deadline = min(retry.deadline, retry.wait_until)
             if (expired := deadline_limit()) is not None:
                 return request, expired
             waiting_callback = None
@@ -1594,9 +1610,17 @@ def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotR
 
 
 def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],
-                  timing: wire.AcquisitionTiming = wire.PROTOCOL_ACQUISITION_TIMING
-                  ) -> wire.Admitted | wire.Refused | LeftQueue:
-    reply = _call(request, on_wait, configuration=timing)
+                  timing: wire.AcquisitionTiming = wire.PROTOCOL_ACQUISITION_TIMING, *,
+                  wait_until: float = math.inf) -> wire.Admitted | wire.Refused | LeftQueue:
+    """Wait for a service estimate grant.
+
+    wait_until is a CLOCK.monotonic() time that applies from the first Wait reply. A wait without a grant at
+    that time leaves the queue and raises WaitLimitReached. Before the first Wait, the first reply decides:
+    a grant runs and a Wait ends the call. Before the first Wait reply, a connection fault takes the
+    unreachable path. After it, the deadline also ends a wait during an outage, and the error line gives the
+    facts of the last wait.
+    """
+    reply = _call(request, on_wait, configuration=timing, wait_until=wait_until)
     if isinstance(reply, (wire.Admitted, wire.Refused, LeftQueue)):
         return reply
     return wire.Refused("invalid service estimate answer")
@@ -1704,6 +1728,8 @@ class WaitOutput:
     announced_hana_image_stale: bool = False
     status_open: bool = False
     local_reason: str = field(default_factory=lambda: os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
+    # The facts of the last wait line, without the time prefix.
+    last_wait: str = ""
 
     def retry_notices(self, notices: tuple[placement.ProviderRetryNotice, ...], *, placement_events: bool) -> None:
         for retry in notices:
@@ -1798,6 +1824,7 @@ class WaitOutput:
                 self.held = True
                 self.on_event("first")
                 self.on_event('holder {"kind":"none"}')
+            self.last_wait = reply.text
             if first or reasons != self.last_reasons:
                 self.status(reply.text)
                 self.last_reasons = reasons
@@ -1825,11 +1852,6 @@ class WaitOutput:
                        {"kind": "unit", "unit": holder.unit} if isinstance(holder, records.UnitHolder) else {"kind": "none"})
             self.on_event("holder " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
             self.last_holder = reply.snapshot.holder
-        if not first and reasons == self.last_reasons and reply.position == self.last_position:
-            return
-        self.last_reasons, self.last_position = reasons, reply.position
-        prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
-                  if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
         place = ("this build is the queue head" if reply.position == 1 else
                  f"place {reply.position} in line" if reply.position > 1 else "")
         subject = " ".join(name for value in (snapshot.repo, snapshot.step)
@@ -1842,9 +1864,15 @@ class WaitOutput:
                 if not behind and snapshot.head_need and reply.position != 1 else "")
         parts = (place, f"{subject} needs {snapshot.peak.bytes / records.GIB:.1f} GiB",
                  f"{snapshot.available / records.GIB:.1f} GiB free", reason, head,
-                 f"runs on natedev: {self.local_reason}" if self.local_reason else "",
-                 "/build:page shows the detail" if first else "")
-        self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
+                 f"runs on natedev: {self.local_reason}" if self.local_reason else "")
+        # Every Wait updates the facts, also a Wait that prints no new line.
+        self.last_wait = "; ".join(part for part in parts if part)
+        if not first and reasons == self.last_reasons and reply.position == self.last_position:
+            return
+        self.last_reasons, self.last_position = reasons, reply.position
+        prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
+                  if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
+        self.status(f"{prefix}: {self.last_wait}" + ("; /build:page shows the detail" if first else ""))
 
     def elapsed_seconds(self) -> int:
         if isinstance(self.last_resource, wire.PlacementResourceWait):

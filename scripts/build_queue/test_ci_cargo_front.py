@@ -1,8 +1,11 @@
 """CI cargo jobs share the admission queue and release their grants."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from dataclasses import replace
+import io
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -10,16 +13,22 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from typing import TextIO, cast
 import unittest
+from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import queue_place
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 DENIED_HOME_CLIENT = """
@@ -78,20 +87,36 @@ if '--version' not in sys.argv:
 raise SystemExit(int(os.environ.get('FAKE_CARGO_STATUS', '0')))
 """
 
+# The front has no Runner.Worker ancestor, also when the test runs in a GitHub job.
 DENIED_HOME_FRONT = """
 import faulthandler
-import runpy
 import signal
 from unittest import mock
-from scripts.build_queue import admission_records as records, step_estimator
+from scripts.build_queue import admission_records as records, ci_cargo_front, step_estimator
 from scripts.buildlog import store
 from scripts.lib import conf
 faulthandler.register(signal.SIGUSR2)
-with mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
+with mock.patch.object(ci_cargo_front, 'job_start', return_value=None), \\
+     mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
      mock.patch.object(step_estimator, 'step_estimate', side_effect=PermissionError('runner history')), \\
      mock.patch.object(conf, 'read', side_effect=PermissionError('runner config path')), \\
      mock.patch.object(store, 'locked_rows', side_effect=PermissionError('runner history path')):
-    runpy.run_module('scripts.build_queue.ci_cargo_front', run_name='__main__')
+    raise SystemExit(ci_cargo_front.main())
+"""
+
+# The job reaches its 1-minute wait limit {lead} seconds after the front reads the job start.
+JOB_DEADLINE_FRONT = """
+import time
+from unittest import mock
+from scripts.build_queue import admission_records as records, ci_cargo_front, step_estimator
+from scripts.buildlog import store
+def job_start(pid, proc_root):
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - 60 + {lead}
+with mock.patch.object(ci_cargo_front, 'job_start', job_start), \\
+     mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
+     mock.patch.object(step_estimator, 'step_estimate', side_effect=PermissionError('runner history')), \\
+     mock.patch.object(store, 'locked_rows', side_effect=PermissionError('runner history path')):
+    raise SystemExit(ci_cargo_front.main())
 """
 
 
@@ -154,7 +179,9 @@ class CargoLifetimeTests(unittest.TestCase):
                     + ", 'a') as output:\n    output.write('\\n'.join(os.environ[name] for name in"
                     + " ('PATH', 'TMPDIR', 'PYTHONPATH')) + '\\n')\ndescendant = 0"))
                 cargo.chmod(0o755)
-                environment = {**os.environ, "BUILD_QUEUE_LOCAL_REASON": reason,
+                # A real Runner.Worker ancestor reads this key; a real GitHub job prints no warning.
+                _ = write_config_fixture(fixture.root / "build_queue.conf", "# whole: 1..\nci_job_wait_limit_minutes=360\n")
+                environment = {**os.environ, "BUILD_QUEUE_LOCAL_REASON": reason, "GITHUB_ACTIONS": "",
                     "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
                     "PATH": os.pathsep.join((str(front_dir), str(devshell_dir), str(shim_dir),
                                               str(cargo_dir), os.environ["PATH"]))}
@@ -206,15 +233,16 @@ class CargoLifetimeTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def start_front(self, fixture: AdmissionFixture, *arguments: str) -> subprocess.Popen[str]:
+    def start_front(self, fixture: AdmissionFixture, *arguments: str,
+                    script: str = DENIED_HOME_FRONT) -> subprocess.Popen[str]:
         cargo = fixture.root / "fake-cargo"
         _ = cargo.write_text(FAKE_CARGO)
         cargo.chmod(0o755)
         environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
             "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(fixture.root),
-            "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile"}
-        child = subprocess.Popen([sys.executable, "-c", DENIED_HOME_FRONT,
+            "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile", "GITHUB_ACTIONS": ""}
+        child = subprocess.Popen([sys.executable, "-c", script,
             "--cargo", str(cargo), "--", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=environment, cwd=fixture.root)
         self.addCleanup(self.stop_front, child)
@@ -228,6 +256,48 @@ class CargoLifetimeTests(unittest.TestCase):
         except subprocess.TimeoutExpired:
             child.kill()
             _ = child.communicate(timeout=3)
+
+    def start_job_front(self, fixture: AdmissionFixture, lead: float) -> tuple[subprocess.Popen[str], float]:
+        """Start a front in a job that reaches its 1-minute wait limit lead seconds after the front reads its start.
+
+        Return the front and the earliest deadline on the CLOCK_BOOTTIME clock.
+        """
+        _ = write_config_fixture(fixture.root / "build_queue.conf", "# whole: 1..\nci_job_wait_limit_minutes=1\n")
+        earliest = time.clock_gettime(time.CLOCK_BOOTTIME) + lead
+        return self.start_front(fixture, "build", script=JOB_DEADLINE_FRONT.format(lead=lead)), earliest
+
+    def assert_only_wait_lines_before_the_error(self, errors: str, step: str) -> str:
+        """Return the one ::error:: line; every line before it is a wait line."""
+        lines = errors.splitlines()
+        index, = [index for index, line in enumerate(lines) if line.startswith("::error::")]
+        for line in lines[:index]:
+            self.assertTrue(line.startswith(("waiting for memory", "still waiting for memory")), line)
+        self.assertTrue(lines[index].startswith("::error::build queue: the job ran 1 min, past ci_job_wait_limit_minutes=1; "
+                                                + f"this step {step} and left the queue: "), lines[index])
+        return lines[index]
+
+    def assert_runs_after_a_refused_connect(self, lead: float) -> None:
+        """Refuse the first connect of a job front, then serve it a grant: cargo runs."""
+        with AdmissionFixture() as fixture:
+            fixture.kill_socket_server()
+            child, _ = self.start_job_front(fixture, lead)
+            self.assertRegex(self.error_line(child), "not reachable|unavailable")
+            # The front read the job start before it tried the socket.
+            time.sleep(max(0.0, lead + 1))
+            fixture.server = fixture.new_server()
+            with fixture.serving():
+                data = self.started(child)
+                self.supply_front_memory(fixture, child)
+                os.kill(int(str(data["pid"])), signal.SIGUSR1)
+                output, errors = child.communicate(timeout=8)
+                self.assertEqual(child.returncode, 0, output + errors)
+                self.assertNotIn("::error::", errors)
+
+    def error_line(self, child: subprocess.Popen[str]) -> str:
+        stream = cast(TextIO, child.stderr)
+        self.assertTrue(select.select([stream], [], [], TEST_HANG_GUARD_SECS)[0],
+                        "the Cargo wrapper wrote no error line")
+        return stream.readline()
 
     def started(self, child: subprocess.Popen[str]) -> dict[str, object]:
         stream = cast(TextIO, child.stdout)
@@ -306,6 +376,64 @@ class CargoLifetimeTests(unittest.TestCase):
                     self.assertFalse(fixture.server.reservations)
                     self.assertFalse(fixture.server.waiters)
 
+    def test_a_wait_past_the_job_deadline_leaves_the_queue_with_an_error_line(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", **{"program_first_peak_gib.cargo": "4"})
+            _ = fixture.occupy_host()
+            fixture.free(0)
+            with fixture.serving():
+                head = self.start_front(fixture, "build")
+                self.assertIn("waiting for memory", self.error_line(head))
+                late, earliest = self.start_job_front(fixture, 3)
+                waiting = self.error_line(late)
+                self.assertIn("waiting for memory", waiting)
+                output, errors = late.communicate(timeout=3 + 60)
+                self.assertEqual(late.returncode, 1, output + errors)
+                self.assertGreaterEqual(time.clock_gettime(time.CLOCK_BOOTTIME), earliest)
+                error = self.assert_only_wait_lines_before_the_error(waiting + errors, "waited 0 min")
+                facts = waiting.strip().partition(": ")[2].removesuffix("; /build:page shows the detail")
+                self.assertIn("place 2 in line", facts)
+                self.assertIn("head ", facts)
+                self.assertIn("reason", facts)
+                self.assertTrue(error.endswith(facts), error)
+                _ = fixture.run_pass()
+                with fixture.loop_turn():
+                    self.assertEqual([waiting.request.owner.pid for waiting in fixture.server.waiters.values()],
+                                     [head.pid])
+                    self.assertFalse(fixture.caller_reservations())
+
+    def test_a_call_with_no_reply_at_the_job_deadline_runs_with_a_later_grant(self) -> None:
+        self.assert_runs_after_a_refused_connect(2)
+
+    def test_a_call_after_the_job_deadline_runs_with_a_grant_after_a_refused_connect(self) -> None:
+        self.assert_runs_after_a_refused_connect(-30)
+
+    def test_a_call_after_the_job_deadline_runs_with_a_grant_in_the_first_reply(self) -> None:
+        with AdmissionFixture() as fixture, fixture.serving():
+            child, _ = self.start_job_front(fixture, -30)
+            data = self.started(child)
+            self.supply_front_memory(fixture, child)
+            os.kill(int(str(data["pid"])), signal.SIGUSR1)
+            output, errors = child.communicate(timeout=8)
+            self.assertEqual(child.returncode, 0, output + errors)
+            self.assertNotIn("::error::", errors)
+
+    def test_a_call_after_the_job_deadline_leaves_at_a_wait_in_the_first_reply(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", **{"program_first_peak_gib.cargo": "4"})
+            _ = fixture.occupy_host()
+            fixture.free(0)
+            with fixture.serving():
+                child, _ = self.start_job_front(fixture, -30)
+                output, errors = child.communicate(timeout=30)
+                self.assertEqual(child.returncode, 1, output + errors)
+                error = self.assert_only_wait_lines_before_the_error(errors, "started past the limit")
+                self.assertIn("this build is the queue head", error)
+                self.assertIn("GiB free", error)
+                _ = fixture.run_pass()
+                with fixture.loop_turn():
+                    self.assertFalse(fixture.server.waiters)
+
     def test_cancelled_cargo_releases_and_records_a_failed_peak(self) -> None:
         with AdmissionFixture() as fixture, fixture.serving():
             child = self.start_front(fixture, "build")
@@ -350,6 +478,64 @@ class CargoLifetimeTests(unittest.TestCase):
                         os.kill(descendant, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+
+class JobStartTests(unittest.TestCase):
+    def test_job_start_is_the_start_of_the_runner_worker_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 50, parent=1, start="40", name="Runner.Listener")
+            write_process(proc, 100, parent=50, start="12345", name="Runner.Worker")
+            write_process(proc, 200, parent=100, start="12400", name="bash")
+            write_process(proc, 300, parent=200, start="12500", name="python3")
+            self.assertEqual(ci_cargo_front.job_start(300, proc), 12345 / os.sysconf("SC_CLK_TCK"))
+
+    def test_a_parent_cycle_without_a_runner_worker_means_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 200, parent=300, start="12400", name="bash")
+            write_process(proc, 300, parent=200, start="12500", name="python3")
+            self.assertIsNone(ci_cargo_front.job_start(300, proc))
+
+    def run_front_call(self, proc: Path, folder: Path, **environment: str) -> tuple[int, str, mock.Mock]:
+        """Run run_cargo in this process with a fixture proc root. The queue refuses at once."""
+        held = mock.Mock(side_effect=queue_place.QueuePlaceRefused("stopped by the test"))
+        errors = io.StringIO()
+        with mock.patch.object(ci_cargo_front, "PROC_ROOT", proc), \
+             mock.patch.object(queue_place, "held_reservation", held), \
+             mock.patch.dict(os.environ, environment), redirect_stderr(errors):
+            status = ci_cargo_front.run_cargo("cargo", ["build"], "", folder)
+        return status, errors.getvalue(), held
+
+    def test_no_runner_worker_ancestor_means_no_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder) / "proc"
+            write_process(proc, os.getpid(), parent=200, name="python3")
+            write_process(proc, 200, parent=1, name="bash")
+            write_process(proc, 1, parent=0, name="systemd")
+            self.assertIsNone(ci_cargo_front.job_start(os.getpid(), proc))
+            for actions, warning in (("", ""), ("true", "::warning::build queue: no readable Runner.Worker ancestor")):
+                with self.subTest(actions=actions), \
+                     mock.patch.object(conf, "read_or_repository", side_effect=AssertionError("no config read")):
+                    status, errors, held = self.run_front_call(proc, Path(folder), GITHUB_ACTIONS=actions)
+                self.assertEqual(status, 1)
+                self.assertEqual(cast(float, held.call_args.kwargs["wait_until"]), math.inf)
+                self.assertEqual(errors.splitlines()[0].startswith("::warning::"), bool(warning), errors)
+                if warning:
+                    self.assertIn(warning, errors)
+
+    def test_a_missing_or_bad_key_in_a_runner_job_exits_1_with_its_reason(self) -> None:
+        for setting in ("", "# whole: 1..\nci_job_wait_limit_minutes=0\n", "# whole: 1..\nci_job_wait_limit_minutes=soon\n"):
+            with self.subTest(setting=setting), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                proc = root / "proc"
+                write_process(proc, os.getpid(), parent=100, name="python3")
+                write_process(proc, 100, parent=1, start="500", name="Runner.Worker")
+                _ = (root / "build_queue.conf").write_text("# Queue move controls on the Builds page.\n" + setting)
+                status, errors, held = self.run_front_call(proc, root, CONF_DIR=str(root))
+                self.assertEqual(status, 1)
+                held.assert_not_called()
+                self.assertRegex(errors, r"(?m)^::error::build queue: .*build_queue\.conf: ci_job_wait_limit_minutes=")
 
 
 class RunnerHomeTests(unittest.TestCase):

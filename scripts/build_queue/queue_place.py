@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
+import math
 import os
 from pathlib import Path
 import signal
@@ -77,6 +78,16 @@ class UnmeasuredProbe:
 
 class QueuePlaceRefused(Exception):
     """The program cannot acquire or keep its queue place."""
+
+
+class QueueWaitLimitReached(Exception):
+    """The caller's deadline came before the grant, and the caller left the queue."""
+
+    def __init__(self, facts: str, waited_seconds: int) -> None:
+        super().__init__(facts)
+        # The facts of the last wait line, without the time prefix.
+        self.facts: str = facts
+        self.waited_seconds: int = waited_seconds
 
 
 def no_hold_wait() -> None:
@@ -470,16 +481,18 @@ QueueReply = wire.Admitted | wire.LaunchAdmitted | wire.Refused | admission_clie
 
 
 def request_place(request: QueueRequest | RefreshedLaunch, output: admission_client.WaitOutput, *,
-                  before_check: Callable[[], None] = no_hold_wait) -> QueueReply:
+                  before_check: Callable[[], None] = no_hold_wait, wait_until: float = math.inf) -> QueueReply:
     """Send a queue request and wait for its answer.
 
-    This is the one place that requests a build queue place.
+    This is the one place that requests a build queue place. wait_until bounds only a service estimate wait.
     """
+    assert wait_until == math.inf or isinstance(request, wire.ServiceEstimateRequest), \
+        "wait_until bounds only a service estimate wait"
     if isinstance(request, RefreshedRequest):
         return admission_client.wait_for_admission(request.refresh, output, attempt=before_check)
     if isinstance(request, RefreshedLaunch):
         return admission_client.wait_for_launch(request.refresh, output)
-    return admission_client.service_admit(request, output)
+    return admission_client.service_admit(request, output, wait_until=wait_until)
 
 
 def local_context(local: wire.AdmitRequest) -> wire.LocalAdmissionContext:
@@ -554,12 +567,21 @@ class HeldReservation:
 
 
 @contextmanager
-def held_reservation(request: QueueRequest, *,
-                     before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
-    """Wait for admission, then release the grant with the holder's status."""
+def held_reservation(request: QueueRequest, *, before_check: Callable[[], None] = no_hold_wait,
+                     wait_until: float = math.inf) -> Generator[HeldReservation]:
+    """Wait for admission, then release the grant with the holder's status.
+
+    wait_until (a CLOCK.monotonic() time) applies only to a ServiceEstimateRequest, from its first Wait reply.
+    A wait without a grant at that time leaves the queue and raises QueueWaitLimitReached. Before the first Wait,
+    the first reply decides: a grant runs and a Wait ends the call.
+    """
     # service_admit sets the service estimate timing on the output.
     output = admission_client.WaitOutput()
-    reply = request_place(request, output, before_check=before_check)
+    try:
+        reply = request_place(request, output, before_check=before_check, wait_until=wait_until)
+    except admission_client.WaitLimitReached:
+        output.end_status()
+        raise QueueWaitLimitReached(output.last_wait, output.elapsed_seconds()) from None
     if isinstance(reply, wire.Refused):
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):

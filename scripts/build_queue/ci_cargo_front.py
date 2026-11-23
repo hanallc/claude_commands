@@ -11,6 +11,7 @@ from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass
 from functools import partial
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 
 from scripts.build_queue import admission_client as client
@@ -28,17 +30,38 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
+from scripts.lib import cancellation, conf, process_stat
 from scripts.lib.descendants import adopt_descendants
 
 
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
+PROC_ROOT = process_stat.PROC_ROOT
+JOB_WAIT_LIMIT_KEY = "ci_job_wait_limit_minutes"
 
 
 @dataclass(frozen=True)
 class JobTemporaryFolder:
     """Put counter files in the job's default temporary folder."""
+
+
+@dataclass(frozen=True)
+class JobWaitLimit:
+    """A queue wait ends when the job is this many minutes old. start is on the CLOCK_BOOTTIME clock."""
+    start: float
+    minutes: int
+
+    def age_seconds(self) -> float:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - self.start
+
+    def wait_until(self) -> float:
+        """Return the CLOCK.monotonic() time when the job reaches the limit."""
+        return client.CLOCK.monotonic() + self.minutes * 60 - self.age_seconds()
+
+    def error_line(self, left: queue_place.QueueWaitLimitReached, *, started_late: bool) -> str:
+        step = "started past the limit" if started_late else f"waited {left.waited_seconds // 60} min"
+        return (f"::error::build queue: the job ran {int(self.age_seconds()) // 60} min, past "
+                + f"{JOB_WAIT_LIMIT_KEY}={self.minutes}; this step {step} and left the queue: {left.facts}")
 
 
 def building_call(arguments: Sequence[str]) -> bool:
@@ -103,6 +126,24 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
+def job_start(pid: int, proc_root: Path) -> float | None:
+    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None outside a runner.
+
+    A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
+    """
+    seen: set[int] = set()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            name, fields = process_stat.name_and_fields(pid, proc_root)
+            if name == "Runner.Worker":
+                return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+            pid = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
 def remove_abandoned_folders(shared_folder: Path) -> None:
     """Remove this user's shared admission folders when their owners are not live."""
     uid = os.getuid()
@@ -128,6 +169,16 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
+    limit: JobWaitLimit | None = None
+    if (job := job_start(pid, PROC_ROOT)) is not None:
+        try:
+            limit = JobWaitLimit(job, conf.read_or_repository("build_queue").value(JOB_WAIT_LIMIT_KEY, conf.positive_whole))
+        except conf.Unusable as error:
+            print(f"::error::build queue: {error}", file=sys.stderr)
+            return 1
+    elif os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::build queue: no readable Runner.Worker ancestor, so this step has no {JOB_WAIT_LIMIT_KEY} deadline",
+              file=sys.stderr)
     argv = [command, *arguments]
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
@@ -147,9 +198,16 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
             client.CLOCK.now(), str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
             route=records.direct_cargo_route())
+        wait_until = limit.wait_until() if limit is not None else math.inf
+        started_late = wait_until <= client.CLOCK.monotonic()
         with ExitStack() as reservation:
             try:
-                held = reservation.enter_context(queue_place.held_reservation(request))
+                held = reservation.enter_context(queue_place.held_reservation(request, wait_until=wait_until))
+            except queue_place.QueueWaitLimitReached as error:
+                assert limit is not None
+                # The runner reads workflow commands from stderr too; stdout can be the caller's pipe.
+                print(limit.error_line(error, started_late=started_late), file=sys.stderr, flush=True)
+                return 1
             except queue_place.QueuePlaceRefused as error:
                 print(error, file=sys.stderr)
                 return 1

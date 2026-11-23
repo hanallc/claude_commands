@@ -315,6 +315,19 @@ class ClientTests(unittest.TestCase):
                     client.WaitOutput()(replace(WAIT, position=2, snapshot=snapshot))
                 self.assertIn(f"head {name} needs 2.0 GiB", output.getvalue().split("; "))
 
+    def test_a_wait_that_prints_no_line_still_updates_the_last_wait_facts(self) -> None:
+        output = client.WaitOutput()
+        for label, available in (("first head", GIB), ("second head", 3 * GIB)):
+            snapshot = replace(WAIT.snapshot, head_need=2 * GIB, head_label=label, available=available)
+            with redirect_stderr(io.StringIO()) as printed:
+                output(replace(WAIT, position=2, snapshot=snapshot))
+            if label == "first head":
+                self.assertIn("head first head needs 2.0 GiB", printed.getvalue())
+            else:
+                self.assertEqual(printed.getvalue(), "")
+        self.assertIn("head second head needs 2.0 GiB", output.last_wait.split("; "))
+        self.assertIn("3.0 GiB free", output.last_wait.split("; "))
+
     def test_wait_output_matches_the_service_name_after_reply_decoding(self) -> None:
         with AdmissionFixture() as fixture:
             head = fixture.request(need=2 * GIB)

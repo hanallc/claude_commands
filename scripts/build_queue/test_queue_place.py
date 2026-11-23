@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import functools
 import io
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -1759,7 +1760,7 @@ class HeldReservationTests(unittest.TestCase):
             with queue.held_reservation(request) as held:
                 held.status = 0
         service_admit.assert_called_once()
-        self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
+        self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY, wait_until=math.inf))
         release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
 
 

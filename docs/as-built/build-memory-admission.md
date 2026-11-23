@@ -2388,6 +2388,38 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
+A building call in a GitHub job has a job wait limit.
+GitHub cancels a job at its 6-hour limit and the front gives no error; the job wait limit gives the error first.
+`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
+`process_stat.name_and_fields` reads each process name and stat fields.
+The deadline is the job start plus `ci_job_wait_limit_minutes` from `build_queue.conf`, read through `conf.read_or_repository`.
+The key has no fallback value. An unusable key prints `::error::build queue: <reason>`, and the call exits 1.
+A runner account without a live configuration folder reads the committed file in the pinned source tree.
+A call without a readable `Runner.Worker` ancestor has no deadline and reads no configuration.
+A parent cycle in `/proc` also ends the walk without a job start.
+When `GITHUB_ACTIONS=true`, that call prints one `::warning::` line that names the missing deadline.
+`held_reservation` gives the deadline to `service_admit` as `wait_until`.
+`wait_until` applies only to a `ServiceEstimateRequest` with no outer acquisition; an assert refuses other uses.
+The first wait reply arms `AcquisitionRetry.wait_until` as the acquisition deadline.
+Before the first wait reply, the first reply decides: a grant runs, and a wait ends the call.
+A call that starts after the deadline follows the same rule, so its first reply decides.
+A wait without a grant at the deadline leaves the queue, and `service_admit` raises `WaitLimitReached`.
+Before the first wait reply, a connection fault takes the unreachable path and its own limit.
+After the service answers, a grant runs, also past the deadline.
+After the first wait reply, the deadline also ends a wait during an outage.
+The error line then gives the facts of the last wait.
+No `memory admission check failed` line is printed for `WaitLimitReached`.
+`held_reservation` turns it into `QueueWaitLimitReached`, with `WaitOutput.last_wait` and `WaitOutput.elapsed_seconds()`.
+`QueueWaitLimitReached` is a plain `Exception`, not a `QueuePlaceRefused`.
+Each wait reply sets `last_wait`, also a reply that prints no new line.
+`last_wait` holds the facts of the last wait line, without the time prefix.
+The facts are the place in line, the step need, the free memory, the wait reason and the head.
+The front prints one `::error::` line on stderr and exits 1:
+`::error::build queue: the job ran <age> min, past ci_job_wait_limit_minutes=<limit>; this step <step> and left the queue: <facts>`.
+`<step>` is `waited <wait> min`, or `started past the limit` for a call that starts after the deadline.
+A grant before the deadline runs to its end; the deadline ends only a wait.
+
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
 Unregistered CI use counts once in the cap and has no memory reservation.
