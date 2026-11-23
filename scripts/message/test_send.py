@@ -6679,7 +6679,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def assert_mac_locked_not_sent(self, sender: str = "hana") -> None:
         code, output, sent = self.mac_locked_main(sender)
         self.assertEqual(code, 0)
-        self.assertIn("not sent: the Mac is off on purpose", output)
+        self.assertIn("SKIPPED: the Mac is off on purpose", output)
         sent.assert_not_called()
 
     def test_mac_locked_push_waits_for_a_mac_in_use(self) -> None:
@@ -6705,10 +6705,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         def unusable_enabled(_state: Path, _mac_test_conf: Path, build_targets_conf: Path) -> None:
             _ = write_config_fixture(build_targets_conf, "enabled.mac=maybe\n")
 
-        def missing_settings(_state: Path, mac_test_conf: Path, _build_targets_conf: Path) -> None:
+        def missing_settings_with_no_committed_copy(_state: Path, mac_test_conf: Path,
+                                                    _build_targets_conf: Path) -> None:
+            # CONF_DIR is not a Git checkout, so conf finds no committed copy.
+            # A missing live file reads the committed file.
             mac_test_conf.unlink()
 
-        for fault in (corrupt_block, unusable_offload, unusable_enabled, missing_settings):
+        for fault in (corrupt_block, unusable_offload, unusable_enabled, missing_settings_with_no_committed_copy):
             fault(*self.mac_in_use())
             with self.subTest(fault=fault.__name__):
                 self.assert_mac_locked_sent()
@@ -6724,6 +6727,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = write_config_fixture(mac_test_conf, "offload=off\n")
         self.assert_mac_locked_sent("hana", "--machine", "natedev")
         self.assert_mac_locked_not_sent()
+
+    def test_mac_locked_skip_on_natedev_is_a_confirmed_skip_on_the_mac(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        code, output, _ = self.mac_locked_main()
+        options = send.parse(["--machine", "natedev", "--to", "user", "--text-id", "mac.locked",
+                              "--value", "sender=hana", "--value", "waiting=One unit's phase waits for 2 shots",
+                              "--clears-when", "true"])
+        message = send.Message("user", "hana", "Mac locked", "Details", options.key)
+        with mock.patch.object(send, "run", return_value=(code, output, "")):
+            result = send.remote(message, "natedev", options)
+        self.assertEqual(result.outcome, "skipped")
+        self.assertIsInstance(result.failure, send.NoFailedPush)
+        self.assertIn("the Mac is off on purpose (offload=off)", result.detail)
 
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",

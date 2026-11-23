@@ -88,7 +88,8 @@ message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
-                 an emergency push with the key is still live
+                 an emergency push with the key is still live,
+                 or a mac.locked push for a Mac that is off on purpose
   PENDING: why   an earlier send has not confirmed acceptance     exit 5
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
@@ -5905,10 +5906,10 @@ def main(argv: list[str]) -> int:
                     and not isinstance(options.scope, NamedMachine)):
                 from scripts.mac_test import mac_test
                 values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
-                machine = mac_test.machine_off_on_purpose("mac", values.get("sender"))
-                if isinstance(machine, mac_test.OffOnPurpose):
-                    print(f"not sent: the Mac is off on purpose ({machine.reason})")
-                    return 0
+                mac_use = mac_test.machine_off_on_purpose("mac", values.get("sender"))
+                if isinstance(mac_use, mac_test.OffOnPurpose):
+                    print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
+                    return EXIT["skipped"]
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)

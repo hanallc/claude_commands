@@ -578,15 +578,14 @@ def machine_off_on_purpose(target: str, asking_session: str | None = None) -> Of
         pass
     if target != "mac":
         return MACHINE_IN_USE
-    paths = state_paths()
     try:
-        block = read_block(paths.block)
+        block = read_block(state_paths().block)
         if not isinstance(block, NoMacBlock) and block.holder != asking_session:
             return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
     except StateReadError:
         pass
     try:
-        settings = conf.read(config_path(paths.target if paths.registry_selected else ""))
+        settings = conf.read("mac_test")
         if not settings.value("offload", conf.on_off, default=True, recover_invalid=False):
             return OffOnPurpose("offload=off")
     except ConfigError:
