@@ -51,7 +51,7 @@ GUEST_CLAIM_TARGET = 'mac'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
-       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
+       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -148,8 +148,11 @@ class GuestSettings:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
     def command(self, shell: str) -> tuple[str, ...]:
+        # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A Mac under heavy
+        # load can be slow to answer a keepalive check.
         mac, guest = self.ssh_hops
-        return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
+        ssh = (*SSH, *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        return (*ssh, mac, shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
