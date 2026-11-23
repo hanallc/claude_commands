@@ -61,9 +61,9 @@ class ReadSlotsTests(unittest.TestCase):
             with self.subTest(step=step):
                 use = slots.slot_use({"unit": "unit-id", "showrunner": "showrunner-id",
                                       "work": step, "purpose": "helper"}, names, lambda owner: "builder")
-                self.assertEqual(use["name"], "builder " + expected)
+                self.assertEqual(use["name"], "builder: " + expected)
                 self.assertEqual(use.get("name_parts"), [{"kind": "staff", "text": "builder"},
-                    {"kind": "text", "text": " " + expected}])
+                    {"kind": "text", "text": ": " + expected}])
 
     def test_copies_group_by_unit_and_report_their_own_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -91,8 +91,8 @@ class ReadSlotsTests(unittest.TestCase):
         self.assertEqual((first["repository"], second["repository"]), ("hana/one", "hana/two"))
         self.assertIsNone(first["maximum"])
         held, expired = first["slots"]
-        self.assertEqual(held["used_by"], {"name": "one integrate", "showrunner": "builds", "name_parts": [
-            {"kind": "staff", "text": "one"}, {"kind": "text", "text": " integrate"}]})
+        self.assertEqual(held["used_by"], {"name": "one: integrate", "showrunner": "builds", "name_parts": [
+            {"kind": "staff", "text": "one"}, {"kind": "text", "text": ": integrate"}]})
         self.assertEqual((held.get("key"), expired.get("key"), second["slots"][0].get("key")),
                          ("hana/one/1", "hana/one/2", "hana/two/1"))
         self.assertTrue(expired["needs_review"])
