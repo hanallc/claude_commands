@@ -690,8 +690,11 @@ class ReplayLedger(dict[str, ReplayEntry]):
 class PendingAdmission:
     episode: str
     need_source: records.NeedSource
+    # The step was the first queued row in queue order.
     is_head: bool
     wait_seconds: float
+    # The default exists only so that outbox entries saved before this field decode.
+    passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -3503,6 +3506,8 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
+                if isinstance(pending.passed, gate.PassedRows):
+                    event["passed"] = pending.passed
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
@@ -3571,13 +3576,18 @@ class AdmissionServer:
                 reply: wire.Admitted | wire.LaunchAdmitted = admission
                 self.ledger[request.episode] = ReplayEntry(reply, now)
             else:
-                result = self.last_result
-                candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
+                # Every caller admits after the pass that set last_result, so it is the admitting walk.
+                result, inputs = self.last_result, self.last_inputs
+                started = records.waiter_owner(waiting.row)
+                candidate: gate.QueuedHead | gate.NoQueuedHead = gate.NoQueuedHead()
+                passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
+                if isinstance(result, gate.PassResult) and isinstance(inputs, records.QueueInputs):
+                    candidate = result.policy.queued_head
+                    passed = gate.passed_rows(result.policy.walk, started, inputs.pending_remote_starts)
                 source = request.profile.peak.source
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
-                    isinstance(candidate, gate.QueuedHead)
-                        and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
-                    max(0.0, now - waiting.row["since"])))
+                    isinstance(candidate, gate.QueuedHead) and records.waiter_owner(candidate.waiter) == started,
+                    max(0.0, now - waiting.row["since"]), passed))
                 self.reservations[request.episode] = admission
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
                 if slot is not None:

@@ -666,9 +666,32 @@ The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, `is_head`, and `passed`.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+`is_head` is true when the step was the first queued row in queue order.
+A token-waiting row is not a queued row.
+A false `is_head` does not show that the step went past a row that waits for memory.
+The first queued row is often a step that waits for its repository run limit.
+
+`passed` is a `PassedRows` object. It counts the earlier rows that the step went past, by cause.
+`passed_rows` reads the walk of the pass that admitted the step.
+The walk records the `run_limit` cause on each row as `HeldByRunLimit`, so `passed_rows` does not repeat rule 8.
+A row that the same pass admits is not a passed row.
+Each passed row has one cause. The first cause in this list that applies is the cause:
+
+1. `run_limit`: the row waits for its repository run limit, or waits behind such a row (rule 8).
+2. `cargo_token`: the row left to wait for the Cargo token.
+3. `other_machine`: the row is not routed to natedev, or a remote start is pending for it.
+4. `gpu`: the row waits for a GPU test slot.
+5. `folder`: the row waits for a busy Cargo folder.
+6. `memory`: any other held local row.
+
+The walk never starts a step past a local row that waits for memory, so `memory` is always 0.
+A nonzero `memory` is a walk fault.
+A cloud admission is not in the local walk and has no `passed`.
+`read_queue_lifetimes` reads a row without `passed` as `PassedNotRecorded`, not as zero counts.
 
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
@@ -1835,7 +1858,7 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 
 ### Scratch folders (`scripts/lib/scratch.py`, `scripts/hooks/pre-tool-use-scratch-guard.py`)
 
-`scratch.conf` holds the default lifetime, visible root, hold file, repository depth, excluded folders, and random suffix length.
+`scratch.conf` holds the default lifetime, hold file, repository depth, excluded folders, and random suffix length.
 The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
 `CONF_DIR` selects the configuration folder.
 
@@ -1843,13 +1866,12 @@ The folder audit reads clone age from `hana_instances.conf` and the Mac disk flo
 It reads its other limits and default state folder from `lint.conf` through the same reader.
 The audit and temporary sweep share `folder_remove_after_seconds`.
 The audit and repository scan share `scratch.conf` `repo_skip`.
-The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
-`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new [--task <task> | --until <when>] [--name <word>]` makes a folder and prints its path.
 `scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
 The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
@@ -1890,7 +1912,6 @@ The folder stays with its hold marked ended.
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
-`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
@@ -1903,7 +1924,7 @@ Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/ses
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.
 It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
-In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+In ~/rust, `config/rust_roots.txt` and `scratch` name kept folders.
 Every folder in ~/rust/scratch is loose.
 In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
 The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
