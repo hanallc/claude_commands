@@ -984,10 +984,34 @@ A stopped worker's result goes to its parent. A stopped parent's result waits in
 A bare call from a Claude director stays attached.
 `assign.sh` does not detach the commands that its worker starts later.
 
-A merge gate in a Claude background shell has no proved survival.
-`copies.py run` starts the gate attached, and `merge_gate.py` stops its module groups on TERM or HUP.
-Before another run, check for a complete saved gate result.
-Put a gate that must survive a restart in a detached run.
+A `copies.py run` call from a unit director or a showrunner with an open run starts a detached run.
+`copies.py` calls `detached_runs.py start` in a separate process. The supervisor has no parent in the session's process tree.
+Every detached supervisor, a worker's too, runs in its own user scope `detached-supervisor-<run id>.scope`.
+The scope is in the user manager's default slice, outside `builds.slice`. The build memory reads do not count it.
+A stop of the pane's cgroup does not end it. The scope is outside the run slice, so a run stop does not end it either.
+With no user systemd, or with `BUILDLOG_SCOPE=0`, the supervisor starts without a scope.
+If systemd does not put the supervisor in its scope within `SUPERVISOR_SCOPE_SECONDS`, the start stops that attempt.
+It then starts the supervisor without a scope and writes a line in the run log.
+If the command scope fails, the command runs in the supervisor's cgroup, which is not under `builds.slice`.
+The call then observes the run. It prints the run log as the log grows and returns the command's exit status.
+The observer prints stdout and stderr of the command as one stream.
+A session stop ends the observer only. The run, its queue place and its age stay.
+A director's `copies.py run` has no live-run limit, and it gets no worker environment (`UNIT_RUN_DIR`, `UNIT_TEAM_ROLE`).
+Other director starts, such as a showrunner's `merge_checkpoint` run, keep the limit and the worker environment.
+The end notice always goes to the director's fixed staff row. The current conversation of that row gets it after the restart.
+The call pins its source before the start: `--commit` and a local `--merge` become commit hashes.
+A second call attaches to the live run only for the same source and command, and it starts nothing.
+The same source is the same commit, and with `--apply-uncommitted` also the same tree key of that worktree.
+A `--merge origin/<branch>` call keeps the branch name, because the run fetches the branch.
+A repeat call with the same branch name attaches, also when the branch moved after the first call.
+The twin check ignores the environment. Two calls that differ only in their environment attach to one run.
+The twin check matches the staff ID, so a renamed director attaches to its own run.
+At the start or the attach, the call prints the run ID, the record path and the stop command.
+To end the run, run that stop command. A TaskStop, an Esc, a Bash timeout or a TERM ends the observer only.
+A worker's call and a call inside a detached run stay attached. The worker contract already detaches worker runs.
+After a move, a restart or a relaunch, the resume message of a director names each live detached run of its staff ID.
+Before another run, read the run record and check for a complete saved gate result.
+Other gates that must survive a restart need their own detached run.
 
 The cloud gate runs as its own user service and on a remote guest.
 A local stop does not end it. Its outcome stays under the Git `cloud-gates` folder.

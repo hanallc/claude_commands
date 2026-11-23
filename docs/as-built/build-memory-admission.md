@@ -1666,7 +1666,13 @@ Those workers may build.
 
 **Build audit.** `audit_builds(proc_root, holders)` reads `cargo-tile-real`, `cargo`, `cargo-nextest`, `rustc` and `rustdoc`. One top cargo or nextest process is one build. Nested cargo, nextest and compiler processes are its children, including through a shell. A compiler with no cargo ancestor is a separate build. The audit reads each process start time before and after its other files. It checks the process and its ancestors again before classification. A parent with a later start time cannot own an earlier child. An unreadable environment does not remove the build from the audit.
 
-The owner comes from `CLAUDE_CODE_SESSION_ID`, `owning_session(environment)`, or `CODEX_THREAD_ID` on the process or an ancestor.
+The owner comes from the process or the nearest ancestor that names one.
+On each process, the audit uses this order:
+1. `owning_session(environment)`, when `BUILDLOG_OWNER_STAFF_ID` is set. A detached run keeps the session id of its start, so its run folder or its staff row names the current owner.
+2. `CLAUDE_CODE_SESSION_ID`.
+3. `owning_session(environment)`.
+4. `CODEX_THREAD_ID`.
+
 Otherwise, the nearest `claude` or `codex` ancestor supplies the owner.
 An agent without a session id has a command, PID, and start time as its identity.
 The `holder` class uses the file key rule from `caller_holds_only_own`.

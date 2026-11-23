@@ -59,7 +59,10 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
                     workers = worker.resume_workers(row.id, record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row)]
+        from scripts.agents import detached_runs
+
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row,
+                                      detached=detached_runs.director_resume_context(row))]
     return argv, restored
 
 

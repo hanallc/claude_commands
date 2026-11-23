@@ -367,6 +367,9 @@ only to complete a report.
   the command's process group. The supervisor delivers the stopped result.
 - A detached `verify.sh` run uses the same record and command: `verify.sh`
   detaches through `detached_runs.py` and handles TERM to stop its step.
+- Your own `copies.py run` is a detached run. It prints its record and its
+  stop command when it starts. Stop it with that command. A stop of its
+  background shell ends only the observer; the run keeps its queue place.
 - For a run in the memory queue, cancel its owning run as above. The queue
   drops dead callers on its next read. It has no separate cancel command;
   `memory_admit.py release` only releases a reservation. A clean queue cancel

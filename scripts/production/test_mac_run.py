@@ -53,9 +53,9 @@ MAC_RUN_CONFIG = {
     "mac_run_example_log_prefix": "/tmp/mac_run_",
     "mac_run_source": "~/rust/hana",
 }
-# owning_session.owning_session() reads these; a Mac block admits the session they name.
+# These variables name the session that owns a run; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
-    "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
+    "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "BUILDLOG_OWNER_STAFF_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
     "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
 })
 

@@ -21,7 +21,6 @@ import json
 import math
 import os
 import re
-import shlex
 import time
 from pathlib import Path
 import subprocess
@@ -1355,12 +1354,8 @@ def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -
     lines: list[str] = []
     for directory in dict.fromkeys(directories):
         runs = directory / worker_lifecycle.DETACHED_RUNS_DIR
-        for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})):
-            result = runs / f"{record['run_id']}.json"
-            log = record["log"]
-            command = shlex.join(["cat", "--", str(result), log])
-            lines.append(f"Detached run {record['run_id']} remains live. Result: {result}; log: {log}. "
-                         + f"Read it with: `{command}`. Its result follows this worker after the move.")
+        lines.extend(detached_runs.resume_line(runs, record)
+                     for record in detached_runs.live_runs_for_staff(runs, frozenset({row.id})))
     return "\n".join(lines)
 
 

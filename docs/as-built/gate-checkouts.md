@@ -142,6 +142,10 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
 -- <cmd> ...` executes the command with the checkout as its working directory.
 Every `{tree}` occurrence in an argument becomes the checkout's absolute path.
 The command's exit status is returned, and its output passes through.
+A call from a unit director or a showrunner with an open run starts the same call as a detached run and observes it.
+The run and its queue place outlive a session stop or a move. The output then comes from the run log, with stderr in the same stream.
+A second call for the same source attaches to the live run. A `--merge origin/<branch>` call matches on the branch name.
+See `shutdown-and-restart.md`, "Gates during a session restart".
 
 `--publish PATH` copies a built file out of the checkout after the command returns.
 The option can repeat. Each PATH is relative to the checkout.

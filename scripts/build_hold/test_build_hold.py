@@ -140,6 +140,17 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
                 self.assertEqual(session_owner.owning_session(), OwningSession("shell-session"))
 
+    def test_a_moved_holder_owns_its_detached_build_with_the_old_session_id(self) -> None:
+        row = fixture_member("showrunner", name="moved-holder", runtime_id=fixture_runtime_id("new-session"))
+        build = build_hold.AuditProcess(build_hold.ProcessIdentity(4100, "41000"), 1, "cargo", ("cargo", "test"),
+                                        str(self.scratch), {"CLAUDE_CODE_SESSION_ID": fixture_runtime_id("old-session"),
+                                                            "BUILDLOG_OWNER_STAFF_ID": row.id}, False)
+        holder = build_hold.Holder(row.name, datetime.now(timezone.utc), "a gate", build_hold.UnknownReleaseEta(),
+                                   build_hold.holder_path(Path(), row.id).name)
+        owner = build_hold.audit_owner(build, ())
+        self.assertEqual(owner, OwningSession(fixture_runtime_id("new-session")))
+        self.assertTrue(build_hold.owner_is_sole_holder(owner, (holder,)))
+
     def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
@@ -2749,6 +2760,24 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.assertEqual(build.owner, OwningSession(owner.current_session))
         self.assertEqual(build.classification, "holder")
         self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
+
+    def test_a_codex_worker_detached_build_belongs_to_its_director_under_the_director_hold(self) -> None:
+        with isolated_staff_file(self.scratch / "staff.json", {}):
+            director = fixture_member("showrunner", name="holder")
+            _ = staff.set_run(director.id, staff.OpenRun(Path("/unit/run")))
+            worker = fixture_member("worker", name="worker", parent=director.id)
+        (self.holders / "holder").unlink()
+        _ = write_holder(self.holders, director.current_session, "2026-10-28T12:00:00+00:00", "app test")
+        _ = self.process(10, "cargo", argv=("cargo", "test"), environment={
+            "UNIT_RUN_DIR": "/unit/run", "CODEX_THREAD_ID": str(worker.current_session),
+            "BUILDLOG_OWNER_STAFF_ID": str(worker.id), "UNIT_DETACHED_RUN": "1"})
+        build, = self.builds()
+        self.assertEqual(build.owner, OwningSession(director.current_session))
+        self.assertEqual(build.classification, "holder")
+        table = build_hold.read_audit_processes(self.proc)
+        decision, = hold_enforcer.decide_builds(table, build_hold.natedev_holds(self.holders).in_force,
+                                                table[10].uid, 999, frozenset())
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
 
     def test_session_environment_precedes_worker_mapping(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "direct", "UNIT_RUN_DIR": "/unit/run"})

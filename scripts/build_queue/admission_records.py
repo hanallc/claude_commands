@@ -1800,10 +1800,17 @@ def queue_staff() -> QueueStaff:
 
 def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
                  *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
-    """Resolve the caller name and its unit for queue priority."""
+    """Resolve the caller name and its unit for queue priority.
+
+    A detached run keeps the session id of the session that started it. When that session no longer
+    names a member, the fixed staff id names the member and its current session."""
     reference = session_id or staff_id
     staff_name = ""
-    if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
+    member = members.by_member_reference(reference) if isinstance(members, staff.StaffSnapshot) and reference else None
+    if member is None and session_id and staff_id and isinstance(members, staff.StaffSnapshot):
+        member = members.by_member_reference(staff_id)
+        session_id = (member.current_session if member is not None else "") or session_id
+    if member is not None and isinstance(members, staff.StaffSnapshot):
         if not unit:
             owner = members.parent_of(member) if member.kind == "worker" else member
             unit = owner.name if owner is not None and owner.kind == "unit" else ""

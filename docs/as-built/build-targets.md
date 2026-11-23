@@ -116,10 +116,14 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   No run variable returns `NoRunNamed`.
   An unmatched run or an unreadable staff snapshot returns `RunNotInStaff`.
   `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
-  A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
-  Without either session, `owning_session` returns `NoOwningSession`.
-  `scripts.build_hold.owning_session` defines both functions, both session types and the three run results.
-  It imports no repository module at load; `run_resolution` imports `staff` only when a run variable is set.
+  A `RunOwner` supplies its session.
+  Otherwise, `owning_session` uses `staff_owner_session`: the current session of the staff row in `BUILDLOG_OWNER_STAFF_ID`.
+  A detached run keeps the session id of its start, so after a move only the staff row names the current session.
+  Then `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
+  Without a session from these three, `owning_session` returns `NoOwningSession`.
+  `scripts.build_hold.owning_session` defines the three functions, both session types and the three run results.
+  It imports no repository module at load.
+  `run_resolution` imports `staff` only when a run variable is set, and `staff_owner_session` only when `BUILDLOG_OWNER_STAFF_ID` is set.
   So a session lookup does not load `build_hold`.
   All callers import the functions and types from this module.
   `placement.SubmittingSession` uses their union directly.

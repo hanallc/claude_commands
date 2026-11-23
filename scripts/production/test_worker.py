@@ -689,7 +689,7 @@ class WorkerCommandTests(unittest.TestCase):
         run = self.run_dir / "detached_runs" / opened.row.name
         context = (f"Detached run {opened.row.name} remains live. "
                    + f"Result: {run}.json; log: {run}.log. Read it with: `cat -- {run}.json {run}.log`. "
-                   + "Its result follows this worker after the move.")
+                   + "Its result follows you after the move.")
         target = self.fixture.root / ".codex2"
         target.mkdir()
         (target / "sessions").symlink_to(self.fixture.root / "codex/sessions", target_is_directory=True)

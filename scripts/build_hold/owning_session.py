@@ -53,10 +53,27 @@ def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | No
     return NoRunNamed()
 
 
+def staff_owner_session(environment: Mapping[str, str] = os.environ) -> str:
+    """The current session of the staff row in BUILDLOG_OWNER_STAFF_ID, or an empty string.
+
+    A detached run keeps the session id of its start. After a move, only the staff row names the current session.
+    """
+    reference = environment.get("BUILDLOG_OWNER_STAFF_ID", "")
+    if not reference:
+        return ""
+    from scripts.production import staff
+
+    try:
+        member = staff.local_snapshot().by_member_reference(reference)
+    except staff.StaffUnreadable:
+        return ""
+    return str(member.current_session) if member is not None else ""
+
+
 def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
+    """Find the session that owns this run, then the staff owner's session, before the shell's session id."""
     resolution = run_resolution(environment)
     if isinstance(resolution, RunOwner):
         return OwningSession(resolution.session_id)
-    session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
+    session_id = staff_owner_session(environment) or environment.get("CLAUDE_CODE_SESSION_ID", "")
     return OwningSession(session_id) if session_id else NoOwningSession()

@@ -5086,6 +5086,27 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("/unit:merge", text)
         self.assertIn("~/.claude/commands/unit/merge.md", text)
 
+    def test_resume_director_names_its_live_detached_runs(self) -> None:
+        from scripts.agents import detached_runs
+        from scripts.lib.resume_message import ResumeWorkers
+        from scripts.production import worker
+
+        # A director's copies.py run is a detached run. The resumed director reads its record before it runs again.
+        run = self.root / "director-run"
+        row = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(self.entry["session_id"]),
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root),
+                             unit_type=staff.UnitDetails("merge"), run=staff.OpenRun(run))
+        line = "Detached run fixture-run remains live."
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers()),
+              patch.object(detached_runs, "resume_context", return_value=line) as context):
+            result = stop_resume.resume(str(row.id), why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        context.assert_called_once_with(run / detached_runs.DETACHED_RUNS_DIR, "alpha", identity=row.id)
+        self.assertEqual(len(self.client.prompts), 1)
+        self.assertIn(line, self.client.prompts[0][1].text)
+
     def test_no_worker_mode_resumes_the_director_alone_with_the_notice(self) -> None:
         from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers
         from scripts.production import worker

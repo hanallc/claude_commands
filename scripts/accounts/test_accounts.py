@@ -8855,7 +8855,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
             + f"Result: {self.run_dir}/detached_runs/{kept.name}.json; "
             + f"log: {self.run_dir}/detached_runs/{kept.name}.log. Read it with: "
             + f"`cat -- {self.run_dir}/detached_runs/{kept.name}.json {self.run_dir}/detached_runs/{kept.name}.log`. "
-            + "Its result follows this worker after the move.",
+            + "Its result follows you after the move.",
             f"{locked.name} ({locked.id}): not moved: dispatch lock is held",
             f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
             f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
@@ -9001,7 +9001,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
         log_path = result_path.with_suffix(".log")
         context = (f"Detached run {row.name} remains live. Result: {result_path}; log: {log_path}. "
-                   + f"Read it with: `cat -- {result_path} {log_path}`. Its result follows this worker after the move.")
+                   + f"Read it with: `cat -- {result_path} {log_path}`. Its result follows you after the move.")
         with (live_detached_run(self.run_dir, row),
               patch.object(inventory, "listing", return_value=[]),
               patch.object(stop_resume, "_record_launches"),
