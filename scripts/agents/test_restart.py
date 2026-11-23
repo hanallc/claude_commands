@@ -780,6 +780,8 @@ class MixedRestartTests(ShutdownTestCase):
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, fixture.enter_context(patch.dict(os.environ, environment)))
+        # The fixture files are disposable; on a loaded disk each fsync waits for seconds.
+        _ = cast(object, fixture.enter_context(patch.object(os, "fsync")))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(root / 'conf' / source.name)
         registry = root / "conf/models.conf"
@@ -962,7 +964,8 @@ class MixedRestartTests(ShutdownTestCase):
         endpoint = root / "config/herdr/sessions/agents/herdr.sock"
         endpoint.parent.mkdir(parents=True)
         server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
-        thread = Thread(target=server.serve_forever, daemon=True)
+        # A short poll makes shutdown return at once, not after the default half second.
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         _ = fixture.callback(server.server_close)
         _ = fixture.callback(server.shutdown)
