@@ -32,6 +32,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_session, fixture_runtime_id, fixture_worker, transcript_fixture
+from scripts.style import style_plan
 from scripts.message import send, sessions
 from scripts.agents import stop_resume
 from scripts.usage import agents_log
@@ -1221,11 +1222,25 @@ class AssignLauncherTests(HookAssignmentFixture):
         start_pass = pass_record.start_pass
         write_manifest = atomic_file.write_text_atomic
         interrupted_ticket = "style-ticket-interrupted"
+        legacy_ticket = "style-ticket-legacy"
+        unregistered_worker = "impl-board-retry"
+        widened = "src/widened.py"
+        blocked_board = self.session_dir.parent / "blocked-board"
+        (blocked_board / "board.log").mkdir(parents=True)
         interrupted = False
+        widen_on_launch = False
+        blocked_registration = ""
 
         def check_worker_arguments(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal widen_on_launch
             if len(command) > 2 and Path(command[1]).name == "worker.py" and command[2] == "assign":
                 _ = run_command([sys.executable, "-c", "pass", *command[2:]], check=True)
+                if widen_on_launch:
+                    widen_on_launch = False
+                    style_plan.widen_live_dispatch(self.session_dir, "legacy", (widened,))
+            if (len(command) > 5 and Path(command[1]).name == "board.sh"
+                    and command[4:6] == [blocked_registration, "register"]):
+                return run_command([*command[:3], str(blocked_board), *command[4:]], capture_output=True, **options)
             return run_command(command, **options)
 
         def start_with_ticket_lock(args: argparse.Namespace,
@@ -1245,8 +1260,13 @@ class AssignLauncherTests(HookAssignmentFixture):
                     raise OSError("Manifest publication interrupted.")
             write_manifest(path, text, new_file_mode=new_file_mode)
 
+        def check_registration(name: str) -> None:
+            board = (self.session_dir / "board.log").read_text().splitlines()
+            self.assertEqual(sum(f"[{name}] register:" in line for line in board), 1)
+
         self.native.agent.during_prompt = lambda: None
-        for round_number, case in enumerate(("stale manifest", "large paths", interrupted_ticket), start=2):
+        cases = ("stale manifest", interrupted_ticket, legacy_ticket, unregistered_worker, "large paths")
+        for round_number, case in enumerate(cases, start=2):
             with self.subTest(admission=case):
                 paths = self.paths.read_text().splitlines()
                 manifest = manifest.parent / f"dispatch_{round_number}_paths.json"
@@ -1255,7 +1275,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 elif case == "large paths":
                     paths = [f"src/{index:04d}-{'x' * 48}.py" for index in range(3300)]
                     write_text_atomic(self.paths, "\n".join(paths) + "\n")
-                worker_name = case if case.startswith("style-ticket-") else f"impl{round_number}"
+                worker_name = case if case in (interrupted_ticket, legacy_ticket, unregistered_worker) else f"impl{round_number}"
+                pass_id = ""
                 with (patch.object(subprocess, "run", side_effect=check_worker_arguments),
                       patch.object(pass_record, "start_pass", side_effect=start_with_ticket_lock),
                       patch.object(atomic_file, "write_text_atomic", side_effect=write_with_ticket_lock)):
@@ -1264,8 +1285,33 @@ class AssignLauncherTests(HookAssignmentFixture):
                         self.assertEqual(refused.returncode, worker.ExitCode.UNCERTAIN, refused.stderr)
                         self.assertIn("Manifest publication interrupted.", refused.stderr)
                         self.assertEqual(self.turn_starts, round_number - 1)
+                    if case in (legacy_ticket, unregistered_worker):
+                        blocked_registration = worker_name
+                        refused = self.launch("implement", "--to", worker_name)
+                        self.assertEqual(refused.returncode, worker.ExitCode.UNCERTAIN, refused.stderr)
+                        self.assertIn("unable to register the assignment on the board", refused.stderr)
+                        self.assertEqual(self.turn_starts, round_number - 1)
+                        published = read_object(manifest)
+                        pass_id = pass_record.string(published["pass_instance_id"])
+                        if case == legacy_ticket:
+                            del published["pass_instance_id"]
+                            write_text_atomic(manifest, json.dumps(published))
+                            widen_on_launch = True
+                            paths.append(widened)
+                        else:
+                            saved_manifest = manifest.read_bytes()
+                            refused = self.launch("implement", "--to", worker_name)
+                            self.assertEqual(refused.returncode, worker.ExitCode.UNCERTAIN, refused.stderr)
+                            self.assertIn("unable to register the assignment on the board", refused.stderr)
+                            self.assertEqual(self.turn_starts, round_number - 1)
+                            self.assertEqual(manifest.read_bytes(), saved_manifest)
+                        blocked_registration = ""
+                        self.native.agent.during_prompt = lambda: check_registration(worker_name)
                     _ = self.successful("implement", "--to", worker_name)
+                    self.native.agent.during_prompt = lambda: None
                 passed = pass_record.pass_slots(read_object(self.session_dir / unit_runs.STATE_FILE))[worker_name]
+                if pass_id:
+                    self.assertEqual(passed["instance_id"], pass_id)
                 self.assertEqual(read_object(manifest), {"worker": worker_name, "round": round_number,
                                                        "paths": paths, "pass_instance_id": passed["instance_id"]})
 
@@ -1604,6 +1650,8 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(saved["instance_id"], passed["instance_id"])
         self.assertEqual(saved["assign_status_file"], str(status))
         self.assertEqual(progress_history.dispatch_delivery(saved).actions.status_file, str(status))
+        board = (self.session_dir / "board.log").read_text().splitlines()
+        self.assertEqual(sum("[impl2] register:" in line for line in board), 1)
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         self.assertEqual(status.read_text(), "done\n")
         self.assertFalse(status.with_name("impl_status").exists())

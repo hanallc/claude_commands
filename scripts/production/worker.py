@@ -801,18 +801,37 @@ def _publish_assignment(run: Path, phase: str, slot: str, role: WorkerRole, inst
     if isinstance(number, PassNotAdmitted):
         raise ValueError(f"Pass {instance} has no recorded start")
     manifest = phase_reservation.phase_directory(run, phase) / f"dispatch_{number}_paths.json"
+    saved: dict[str, object] = {}
     if isinstance(action, pass_recorder.MatchedDispatch):
         with suppress(FileNotFoundError):
             saved = pass_recorder.json_object(manifest.read_text(encoding="utf-8")) or {}
-            if saved.get("pass_instance_id") == instance:
-                return
-    atomic_file.write_text_atomic(manifest, json.dumps({
-        "worker": slot, "round": number, "paths": assignment.paths, "pass_instance_id": instance,
-    }))
+    if saved.get("pass_instance_id") != instance:
+        paths = assignment.paths
+        if isinstance(action, pass_recorder.MatchedDispatch) and slot.startswith("style-ticket-"):
+            legacy = (pass_recorder.string_list(saved.get("paths"))
+                      if "pass_instance_id" not in saved and saved.get("worker") == slot
+                      and saved.get("round") == number else [])
+            current: list[str] = []
+            with suppress(FileNotFoundError):
+                current = (manifest.parent / "ticket-paths.txt").read_text(encoding="utf-8").splitlines()
+            paths = list(dict.fromkeys([*paths, *legacy, *current]))
+        atomic_file.write_text_atomic(manifest, json.dumps({
+            "worker": slot, "round": number, "paths": paths, "pass_instance_id": instance,
+        }))
     status = pass_recorder.string(pass_recorder.pass_slots(state)[slot].get("assign_status_file"))
+    _register_assignment(run, slot, role, instance, status)
+
+
+def _register_assignment(run: Path, slot: str, role: WorkerRole, instance: str, status: str) -> None:
+    marker = f"; pass {instance}"
+    with suppress(FileNotFoundError):
+        with (run / "board.log").open(encoding="utf-8") as board:
+            if any(line.partition(" ")[2].startswith(f"[{slot}] register: role=")
+                   and line.endswith(f"{marker}\n") for line in board):
+                return
     scripts = Path(__file__).resolve().parents[1]
     posted = subprocess.run(["bash", str(scripts / "direct/board.sh"), "post", str(run), slot, "register",
-                             f"role={role}; status in {status}"], check=False)
+                             f"role={role}; status in {status}{marker}"], check=False)
     if posted.returncode:
         raise OSError(f"{slot}: unable to register the assignment on the board")
     _ = subprocess.run(["bash", str(scripts / "agents/heartbeat.sh"), str(run / "heartbeat.log"),

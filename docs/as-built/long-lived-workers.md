@@ -98,7 +98,10 @@ The recorder gives the replacement a new pass id even when the assignment inputs
 
 A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
 `assign.sh` removes each temporary prompt when the recorder confirms that no pass uses it.
-The worker publishes a missing manifest before submission and preserves the admitted pass's manifest on retry.
+The worker publishes the manifest and registers the pass on the board before submission.
+A retry preserves a manifest that names the admitted pass.
+Under the ticket lock, the worker merges the current ticket paths and paths from a matching legacy manifest.
+A retry posts a board registration if the board lacks a registration for the admitted pass ID.
 A matching retry checks the receipt before it validates and restores the recorded prompt under the recorder lock.
 The pass records the digest before submission.
 Changed content at the same prompt path starts a new pass after completion.
