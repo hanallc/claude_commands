@@ -117,7 +117,6 @@ The tool folders are the repository of the checker code, the config folder, and 
 When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
 When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
 
-The guest takes no hand made run yet: `guest_refusal` refuses each one first with "the guest has no read limit yet", because the guest has no read limit like the natedev one. The hand made guest route below stays for the time when the guest has its read limit.
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
 It holds one argv, the work name and the owner unit, in place of the test selection.
 A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.

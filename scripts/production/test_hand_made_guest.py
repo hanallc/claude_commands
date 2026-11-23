@@ -140,7 +140,6 @@ class GuestRouteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.lift_read_limit_guard()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.config = self.root / "config"
         self.config.mkdir()
@@ -169,10 +168,6 @@ class GuestRouteTests(unittest.TestCase):
         (self.root / "place").mkdir()
         # The queue gives the run to the guest; a later wait gives it to natedev.
         self.line = FakeLine(self.root / "place", answers=[remote(hand_made_guest.MACHINE), local_grant()])
-
-    def lift_read_limit_guard(self) -> None:
-        """Remove the refusal for a guest with no read limit, so that the test reaches the guest route behind it."""
-        _ = self.enterContext(mock.patch.object(hand_made_guest, "NO_READ_LIMIT", ""))
 
     def checkout(self, name: str, origin: str) -> Path:
         """A clean checkout with check.py and an origin/main at its head."""
