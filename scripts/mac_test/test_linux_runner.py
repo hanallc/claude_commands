@@ -1430,7 +1430,7 @@ class LinuxProcessTests(unittest.TestCase):
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
             _ = selector_runner.write_text(
-                "#!/bin/bash\nprintf '%s' " + shlex.quote(selector.stdout)
+                "#!/usr/bin/env bash\nprintf '%s' " + shlex.quote(selector.stdout)
                 + "; printf '%s' " + shlex.quote(selector.stderr)
                 + " >&2; exit " + str(selector.returncode) + "\n"
             )
@@ -1442,7 +1442,7 @@ class LinuxProcessTests(unittest.TestCase):
             with mock.patch.object(subprocess, "Popen", open_process):
                 result = run_command(["bash", "-c", stubs + argv[-1]], text=True,
                                      capture_output=True, check=False, timeout=5,
-                                     env={"HOME": str(dispatch.fixture.root), "PATH": "/usr/bin:/bin"})
+                                     env={"HOME": str(dispatch.fixture.root), "PATH": os.environ["PATH"]})
             cleanups.append(result)
             return result
 

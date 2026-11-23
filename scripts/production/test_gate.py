@@ -6,6 +6,7 @@ from scripts.build_queue import admission_records
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
 import fcntl
@@ -16,12 +17,15 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import tempfile
+import time
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
@@ -225,7 +229,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     if fails:
                         raise RuntimeError("module preparation failed")
                     prepared = prepare(root, {**environment, "HERDR_BIN": "/host/herdr"})
-                    self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
+                    self.assertEqual(prepared["HERDR_BIN"], MISSING_HERDR_BIN)
                     return prepared
 
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
@@ -270,6 +274,21 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         allocate.assert_called_once_with(mock.ANY, "g", gate_root)
         self.assert_all_modules_started()
+
+    def test_nested_gate_uses_the_inherited_module_folder_only_under_the_gate_root(self) -> None:
+        gate_root = self.fixture_root.parent
+        module = gate_root / "inherited-module"
+        module.mkdir()
+        outside = gate_root.parent / f"{gate_root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        for inherited, parent in ((module, module.resolve()), (outside, gate_root)):
+            with self.subTest(inherited=inherited.name):
+                with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(inherited)}),
+                      mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+                    result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                allocate.assert_called_once_with(mock.ANY, "g", parent)
 
     @gate_suites("hooks", "message")
     def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
@@ -370,6 +389,18 @@ class MergeGateCheckpointTests(MergeGateFixture):
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
+        self.assert_not_pushed()
+
+    def test_a_mac_linux_guest_that_took_no_run_undoes_the_merge_with_one_line(self) -> None:
+        cause = "the guest did not arm the run: fixture SSH refused the connection"
+        with mock.patch.object(gate, "run_gate_suites",
+                               side_effect=gate.MacLinuxTookNoRun(f"Mac Linux guest took no run: {cause}")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-1:],
+                         [f"Mac Linux guest took no run: {cause}; merge undone, not pushed"])
+        self.assertNotIn("REFUSED", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
     def test_merge_checkout_behind_origin_is_refused(self) -> None:
@@ -675,6 +706,26 @@ class GateRecoveryTests(MergeGateFixture):
         self.assertEqual(finished.path.read_text(), saved)
         self.assertEqual(canary.read_text(), "fixture data")
         self.assertNotIn(str(folder), result.stderr)
+
+
+class LiveConfigTripwireTests(unittest.TestCase):
+    def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        job_root = root / "job"
+        job_root.mkdir()
+        marker = job_root / "live-config-writes"
+        _ = marker.write_text("/fixture/config/console.conf\n")
+        log = job_root / "output.log"
+        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
+        job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
+                                  time.time(), log.open("w+"), log, "test_fixture.py")
+        self.addCleanup(job.output.close)
+        with mock.patch.object(gate, "kill_job_group"):
+            result = gate.finish_gate_job(job, 0)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a test attempted to write live configuration at /fixture/config/console.conf", result.output)
+        self.assertFalse(job_root.exists())
 
 
 if __name__ == "__main__":

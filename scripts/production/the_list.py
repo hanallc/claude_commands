@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -189,7 +190,7 @@ class PageFeedback:
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
-    action: Literal["tell", "remove", "park", "unpark"] = "tell"
+    action: Literal["tell", "remove", "park", "unpark", "read"] = "tell"
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
@@ -1319,6 +1320,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                                        form_words=request.form_words, parked_until=request.parked_until,
                                        recipient=page_action.recipient)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+            elif request.action == "read" and changed.state != item.state:
+                entries.append(ItemChange(moment, _next_step_notice(request, changed), PAGE_SOURCE))
             elif request.action == "unpark":
                 reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
                           else UnparkNoChangeReason.NO_ACTIVE_PARKING)
@@ -1406,6 +1409,7 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
     return _update(keeper, identity, changes, source=source).item
 
 
+_LAUNCHER = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
 _PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence",
                            "title", "done_when")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
@@ -1645,12 +1649,41 @@ def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
 def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
                    update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate,
                    page_request: PageRequest | NoPageRequest) -> ListEdit:
-    """Return the result and the item read under the write lock."""
-    def edit(item: ListItem, _: datetime) -> ListItem:
+    """Return the result and the item read under the write lock.
+
+    A List page Mark read on an item that waits for nate moves it to Working.
+    The same write saves a notice that asks the item's producer for the next step.
+    """
+    def edit(item: ListItem, moment: datetime) -> ListItem:
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
-        return replace(item, unread_since=NoTimestamp.UNSET)
+        read = replace(item, unread_since=NoTimestamp.UNSET)
+        if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
+            return read
+        working = ItemChange(moment, FieldChange("Updated", {"state": ItemState.WORKING}), source)
+        return replace(read, state=ItemState.WORKING, log=(*item.log, working))
     return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
+
+
+def has_open_question(item: ListItem) -> bool:
+    return any(question.answer is None for question in item.questions)
+
+
+def _waits_for_nate(item: ListItem, moment: datetime) -> bool:
+    """Return True for an unparked item that waits for nate with no open question."""
+    # Item 232 adds open asks; an item with an open ask must also return False here.
+    return (item.state == ItemState.WAITING_FOR_NATE and not has_open_question(item)
+            and not parking_active(item.parked_until, moment))
+
+
+def _next_step_notice(request: PageRequest, item: ListItem) -> PageFeedback:
+    """Ask the item's producer for the next step and save the producer as the recipient."""
+    producer = staff.snapshot().by_id(item.producer)
+    name = shlex.quote(producer.name if producer is not None else item.producer)
+    words = (f"List page: nate read item {item.number}, so it is now Working. Write its next step: "
+             + f"`{_LAUNCHER} update --id {item.id} --source {name} --next-step \"<step>\"`.")
+    # The page words stay in form_words, so a retry matches the page request.
+    return PageFeedback(request.request, words, action="read", form_words=request.words, recipient=item.producer)
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
@@ -1696,7 +1729,7 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park", "unpark") or not words.strip():
+    if action not in ("tell", "remove", "park", "unpark", "read") or not words.strip():
         raise ListError("invalid List feedback action")
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     return PageFeedback(request, words, state, alerted_to,
@@ -1741,7 +1774,10 @@ def _previous_page_request(
         item: ListItem, request: PageRequest) -> PageActivity | NoPageRequest:
     previous = _page_requests(item).get(_request_id(request.request), NoPageRequest.ABSENT)
     if previous is not NoPageRequest.ABSENT:
-        if isinstance(previous, PageFeedback):
+        if isinstance(previous, PageFeedback) and previous.action == "read":
+            # A Mark read notice keeps the page words in form_words.
+            key = PageRequest(previous.request, "read", previous.form_words)
+        elif isinstance(previous, PageFeedback):
             key = previous.key()
         elif isinstance(previous, (QuestionRequestReceipt, UnparkNoChangeReceipt)):
             key = previous.request
@@ -2119,12 +2155,11 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     owner = next((row for row in staff.active(members, "showrunner") if row.id == item.owner), None)
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
     item_text = f"item {item.number}: {item.title}"
-    launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
     update_options = ", ".join(f"`{option}`" for option in _PRODUCER_UPDATE_OPTIONS)
     notices = (
         ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
-         + f"Run `{launcher} list --all --latest-status` to read it. "
-         + f"Run `{launcher} update --id {item.id}` to update it. Use any of {update_options}."),
+         + f"Run `{_LAUNCHER} list --all --latest-status` to read it. "
+         + f"Run `{_LAUNCHER} update --id {item.id}` to update it. Use any of {update_options}."),
         ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
          if producer is None else f"{producer.name} is the producer of {item_text}. "
          + f"Send design questions on this item to {producer.name}."),

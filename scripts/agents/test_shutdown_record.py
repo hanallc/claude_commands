@@ -17,6 +17,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.agents import shutdown_record
 from scripts.agents.test_support import ShutdownTestCase
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 class ShutdownRecordTests(ShutdownTestCase):
@@ -27,7 +28,7 @@ class ShutdownRecordTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": "/nonexistent/herdr"})))
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": MISSING_HERDR_BIN})))
 
     def test_shutdown_rerun_after_first_worker_stop(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")

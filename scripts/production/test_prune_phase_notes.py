@@ -14,6 +14,7 @@ from typing import override
 from scripts.production import staff, staff_test_support
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).with_name("prune_phase_notes.py")
 
@@ -37,7 +38,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(self.root / "home"), "NOTIFIER_STATE_DIR": str(self.notifier),
                     "PHASE_TABLE_VAULT": str(self.vault), "USER_ZONE": "America/New_York",
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-                    "HERDR_BIN": "/nonexistent/herdr"}
+                    "HERDR_BIN": MISSING_HERDR_BIN}
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         write_text_atomic(self.root / "staff.json", '{"schema":2,"rows":[]}\n')
 
