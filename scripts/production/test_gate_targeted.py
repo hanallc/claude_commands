@@ -86,7 +86,11 @@ argparse.ArgumentParser.exit = checked_exit
             return gate.GateRun((), 0, 0, tests_reused=True)
 
         self.environment.update(dict.fromkeys(admission_records.OWNER_VARIABLES, ""))
+        # The test fixes the process family to one that names no owner. A terminal or login session family, such
+        # as a guest test runner, names the user, and then the worktree owner would not apply.
+        unnamed = admission_records.OwnerNotGiven("script · test")
         with mock.patch.dict(os.environ, dict.fromkeys(admission_records.OWNER_VARIABLES, "")), \
+             mock.patch.object(admission_records, "family_owner", return_value=unnamed), \
              mock.patch.object(gate, "run_suites", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
