@@ -558,14 +558,13 @@ class PlacementLine:
     """The one placement request of an attempt, with a candidate for each named machine."""
     request: wire.PlacementRequest
     setup: queue_place.PlaceSetup
-    refresh: Callable[[], wire.AdmitRequest]
 
     @property
     def folder(self) -> Path:
         return self.setup.folder
 
     def wait(self) -> Placed:
-        answer = queue_place.wait_for_placement(self.request, self.refresh, "the hand made run left the queue")
+        answer = queue_place.wait_for_placement(self.request, "the hand made run left the queue")
         if isinstance(answer, admission_client.LeftQueue):
             raise Refused("queue place: the run left the queue")
         if isinstance(answer, wire.DispatchStatus):
@@ -608,7 +607,7 @@ def placement_line(request: Request) -> Generator[Line]:
         with queue_place.place_setup(HAND_MADE.step, request.repo) as setup:
             refresh = setup.request
             assert refresh is not None, "a named place takes a reservation"
-            yield PlacementLine(placement_request(request, refresh()), setup, refresh)
+            yield PlacementLine(placement_request(request, refresh()), setup)
     except wire.AdmissionUnavailable as error:
         raise Refused(f"queue place: {error.reason}") from error
 

@@ -33,6 +33,9 @@ from scripts.direct.local_release_wait import local_release_waiter
 import uuid
 
 
+DETACHED_SLICE_ENV = "DETACHED_RUN_SLICE"
+
+
 @dataclass(frozen=True)
 class ConfiguredFirstPeak:
     pass
@@ -81,6 +84,8 @@ def no_hold_wait() -> None:
 
 
 def in_builds_slice() -> bool:
+    if sys.platform != "linux":
+        return False
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
     except OSError:
@@ -91,7 +96,7 @@ def suite_scope_prefix() -> list[str]:
     if os.environ.get("BUILDLOG_SCOPE") == "0":
         print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
         return []
-    if in_builds_slice():
+    if not os.environ.get(DETACHED_SLICE_ENV) and in_builds_slice():
         print("Module scope skipped: gate already runs in builds.slice", flush=True)
         return []
     return probe_scope_prefix()
@@ -99,8 +104,11 @@ def suite_scope_prefix() -> list[str]:
 
 def probe_scope_prefix() -> list[str]:
     """Check whether the user manager can start a separate program scope."""
+    if sys.platform != "linux":
+        return []
+    slice_name = os.environ.get(DETACHED_SLICE_ENV) or "builds.slice"
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
+              "--expand-environment=no", f"--slice={slice_name}", "--"]
     try:
         probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=10, check=False)
@@ -110,7 +118,7 @@ def probe_scope_prefix() -> list[str]:
     if probe.returncode:
         print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
         return []
-    print("Module scope: builds.slice", flush=True)
+    print(f"Module scope: {slice_name}", flush=True)
     return prefix
 
 
@@ -329,6 +337,8 @@ class QueuePlace:
         return child
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
+        if sys.platform != "linux":
+            raise QueuePlaceRefused("a queued program requires Linux")
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
         if self.arguments and tuple(argv) != self.arguments:
@@ -481,12 +491,20 @@ def local_context(local: wire.AdmitRequest) -> wire.LocalAdmissionContext:
 PlacementEnd = wire.LocalPlacementGranted | wire.Assignment | wire.DispatchStatus | admission_client.LeftQueue
 
 
-def wait_for_placement(request: wire.PlacementRequest, refresh: Callable[[], wire.AdmitRequest],
-                       cancel_reason: str) -> PlacementEnd:
+def refreshed_placement(request: wire.PlacementRequest, local: wire.LocalAdmissionContext) -> wire.PlacementRequest:
+    """The request with a new estimate for its local part. A program profile stays; a step profile comes from argv."""
+    profile = (request.profile if isinstance(request.profile, admission_records.ProgramProfile)
+               else admission_records.INFER_FROM_ARGV)
+    refreshed = admission_client.step_request(list(local.argv), local.cwd, wire.Owner(request.owner.pid, request.owner.start_time),
+                                              request.since, local.sidecar, request.episode, profile, run=request.run)
+    return replace(request, profile=refreshed.profile, local=local_context(refreshed))
+
+
+def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> PlacementEnd:
     """Send the placement request until the queue gives it a machine or ends its episode.
 
-    An expired estimate rebuilds the local part of the request with refresh. An answer that gives no
-    machine, and an error, cancel the episode with cancel_reason.
+    An expired estimate rebuilds the local part of the request with refreshed_placement. An answer that
+    gives no machine, and an error, cancel the episode with cancel_reason.
     """
     output = admission_client.WaitOutput()
     directory = store.root() / "admission"
@@ -510,8 +528,7 @@ def wait_for_placement(request: wire.PlacementRequest, refresh: Callable[[], wir
                     if isinstance(cause, admission_records.HeadAdmissionStatus):
                         cause = cause.cause
                     if isinstance(request.local, wire.LocalAdmissionContext) and isinstance(cause, admission_records.EstimateExpired):
-                        local = refresh()
-                        request = replace(request, profile=local.profile, local=local_context(local))
+                        request = refreshed_placement(request, request.local)
                 elif isinstance(answer.wait, wire.PlacementResourceWait):
                     output.resource_wait(answer.wait)
                 events.wait(admission_records.read_memory_config().waiting_pass_seconds)

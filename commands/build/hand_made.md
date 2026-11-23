@@ -12,10 +12,11 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/hand_made.py --why '<
 
 The command does four steps:
 
-1. A model reads the command and its program files, and gives yes or no with one reason. The program files come from each command word: the file in the checkout that the word names, and the file that the word starts from PATH when it is in the checkout or outside the system folders. Outside the system folders, the first word gives a `#!` script from its first match on PATH, and a later word gives each file that is not compiled (ELF) from each match on PATH and from its path when it has a slash. The run starts the first word by the path of its first match, so no later match on PATH runs. The program gets that path as its `argv[0]`. The model gives no for a program file that it did not read. These forms are refused before the model call:
+1. A model reads the command and its program files, and gives yes or no with one reason. The program files come from each command word: the file in the checkout that the word names, each file that is not compiled (ELF) that a later word with a slash names outside the checkout, and the file that the word starts from PATH when it is in the checkout or outside the system folders. Outside the system folders, the first word gives a `#!` script from its first match on PATH, and a later word gives each file that is not compiled (ELF) from each match on PATH, also a file with no execute bit. The run starts the first word by the path of its first match, so no later match on PATH runs. The program gets that path as its `argv[0]`. The model gives no for a program file that it did not read. These forms are refused before the model call:
    - `python -m` and `uv run -m`: run the module file by its path. Put `--` before a `uv run` command that follows a uv option.
    - `env -C`, `env --chdir`, `env -S`, `uv --directory` and `uv --project`: give the checkout with `--repo`, and give the command words one by one.
    - `env NAME=VALUE`: set the variable outside the hand made command.
+   - A later word that names a folder with a `__main__` entry, such as `__main__.py` or `__main__.pyc`, or a folder that cannot be listed: python runs that file, and the check cannot read it. Run the program file by its path.
    - An empty entry, a relative entry or an entry in the checkout in `PATH`, `LD_LIBRARY_PATH`, `PKG_CONFIG_PATH`, `LIBCLANG_PATH` or `SCCACHE_DIR`: tools then load files from the checkout that the check does not read. Remove the entry.
 2. A yes sends one placement request with a place in the line of each named machine. The first free machine takes the whole run. A held natedev, or a Mac that is off or full, takes no run. The Builds page shows the run as `hand made`.
 3. At run start, the command reads each checked file again on natedev and finds the program files again, also for a run that goes to the Mac. A changed, removed or new program file ends the attempt with no run.
@@ -25,17 +26,19 @@ On the Mac:
 
 - Before the model call, the command finds each named machine that cannot take the run. That machine stays out of the placement; with no machine left, the attempt ends. The Mac cannot take a run when:
   - the checkout has no repository name for a Mac mirror;
-  - a checked file is outside the checkout;
+  - a command word has a `..` part, also after the `=` of an option value: the copy sends each link of the checkout as a link, so on the Mac the word can name another file;
+  - a checked file is outside the checkout, or its path has a link in a part;
   - the copy to the Mac leaves out a checked file (`.git`, `target` or a git-ignored file);
   - a command word names the natedev checkout path;
+  - the first word starts with `-` or has an `=`;
   - the first word has a slash and is not a checked file in the checkout or a program in a Mac system folder.
 - The command copies the checkout to the Mac mirror of its repository, as offload does, with the offload SSH options, and holds the mirror lease until the run ends. The copy leaves out `.git`, `target` and each git-ignored file.
 - In the same SSH command, before the start, the Mac runs only a file that natedev read, or a program in a system folder. A word that fails one of these checks ends the attempt with no run, and the refusal names the word:
   - each checked file in the mirror has the checked sha256;
   - another word with a slash names no path in the mirror or on the Mac, unless it is a program in a system folder;
   - another word with no slash names no file in the mirror;
-  - a word with no slash has no match on the program `PATH`, or each match is in a system folder or is a compiled Mac file (Mach-O or universal); a wrapper goes on to a later match when a start fails;
-  - a later word names no folder with a `__main__.py` in the mirror.
+  - for a word with no slash, each file with that name in a folder of the program `PATH` is in a system folder or is a compiled Mac file (Mach-O or universal). This counts each file, also a file with no execute bit: a wrapper goes on to a later match when a start fails, and bash opens a script on `PATH` with no execute bit;
+  - a later word names no folder with a `__main__` entry of any suffix, such as `__main__.py` or `__main__.pyc`, and no folder that cannot be listed.
 - The Mac shell expands no word that starts with `=`.
 - The system folders are `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/run/current-system/sw/bin` and `/nix/var/nix/profiles/default/bin`. The program `PATH` is the system folders, then `~/.cargo/bin`. A first word with no slash starts only from the program `PATH`.
 - The program gets the Mac values of the natedev variable list below, the program `PATH`, and `MAC_PLACEMENT`. It gets no other variable.
