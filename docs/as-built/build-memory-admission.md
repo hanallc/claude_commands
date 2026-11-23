@@ -583,6 +583,7 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
 Each pass compares its build space hold with the last pass and writes an event only at a change.
 A restart reads the last hold from `admission/queue.json`, so it writes no second start. A hold that ended while the service was down gets its end at the first pass.
+A restart without a current `queue.json` during a hold writes a second start; the risk is accepted.
 These two events carry no `pid`.
 
 Each step event identifies the logical step by `pid`, `start_time`, and the original `since`.
