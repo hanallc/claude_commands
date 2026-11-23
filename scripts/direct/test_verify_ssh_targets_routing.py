@@ -374,7 +374,7 @@ raise SystemExit(75)
             + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n"
             + "settings.hana-gpu=cloud_gate.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = (self.root / "cloud_gate.conf").write_text(
-            "execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
+            "enabled=on\nexecution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
             + "hana_gpu_repository=https://example.com/team/hana\n"
             + "hana_gpu_instance_types=g6.2xlarge\nhana_gpu_selections=sample:shader_variants\n")
         account = self.target_state("aws")
