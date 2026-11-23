@@ -85,7 +85,7 @@ A new unit or style production uses `worktree` as its main short name. The branc
   It prints the Mac output and returns the Mac exit status.
   ssh runs in its own session with its input from `/dev/null`, so a terminal or pane signal does not reach it.
   natedev waits for ssh inside `cancellation.defer_cleanup_signals()`, so SIGINT, SIGTERM and SIGHUP take effect only after ssh ends.
-  ssh starts inside that block, so it inherits these signals blocked. Signals sent to the ssh pid stay pending. Only SIGKILL ends ssh, and then the claim ends while the Mac run can go on.
+  ssh starts inside that block, so it inherits SIGINT, SIGTERM and SIGHUP blocked. These three signals stay pending at the ssh pid. Other signals, such as SIGQUIT or SIGKILL, end ssh. Then the claim ends while the Mac run can go on.
   After ssh ends, SIGINT raises `KeyboardInterrupt`, and the claim block releases the claim. SIGTERM and SIGHUP end natedev without the release. The next `live_claims` read removes the claim, because its pid is dead.
   The claim is released at the end, also when ssh fails.
   Limit: the claim covers the Mac run only while ssh lives. If the link dies, ssh ends and the Mac run can go on without the claim.
@@ -105,7 +105,7 @@ A new unit or style production uses `worktree` as its main short name. The branc
   Migration defers SIGTERM, SIGHUP and SIGINT from each rename to its link (`cancellation.defer_cleanup_signals`), so a stop does not leave the checkout with no `target`.
   If a new `target` appears between the move and the link, migration keeps the checkout as `rerun: …`. The reason names the folder that holds the earlier target: the output, or `.saved-target-<checkout name>-*/target` when the output was not empty. Run migration again.
   If the link fails for another reason, migration moves the target back from the output to where it came from and keeps the checkout as `kept: <error>`. If the move back also fails, the target stays in the output, and the next run links it.
-  Each later run reports each `.saved-target-<checkout name>-*` folder as `kept for a manual removal list: …`. This applies to the selected main checkouts and moved worktrees.
+  Each later run reports each `.saved-target-<checkout name>-*` folder as `kept for a manual removal list: …`. This applies to each selected main checkout and moved worktree, before any defer or keep.
   It also reports each older `.saved-target-XXXXXXXX` folder beside such a checkout. That form names no checkout, so a run reports each folder once, also when many checkouts share the parent folder.
   A held or changed build-folder lock keeps the checkout as `kept: <output>: the build folder lock is held. Rerun when idle`.
   In each case migration goes on with the next checkout.

@@ -1351,6 +1351,21 @@ class WorktreeLifecycleTests(unittest.TestCase):
         line = f"kept for a manual removal list: {unnamed} (worktrees, the checkout's earlier Cargo target)"
         self.assertEqual(result.stderr.count(line), 1, result.stderr)
 
+    def test_migration_reports_the_saved_target_of_a_main_checkout_with_a_deferred_output(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        saved = main.parent / f".saved-target-{main.name}-abcd1234"
+        (saved / "target").mkdir(parents=True)
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees.MigrationPublication, "places_output", return_value=False),
+              redirect_stdout(text := StringIO()), redirect_stderr(errors := StringIO())):
+            status = worktrees.migrate_worktrees(None, scope=worktrees.MigrationScope.REPOSITORY,
+                                                 repo="origin", dry_run=False)
+        self.assertEqual(status, 0, text.getvalue() + errors.getvalue())
+        self.assertIn(f"defer main output {main} ->", text.getvalue())
+        self.assertIn(f"kept for a manual removal list: {saved} (worktrees, the checkout's earlier Cargo target)",
+                      errors.getvalue())
+
     def test_migration_reports_the_saved_target_of_a_linked_moved_worktree(self) -> None:
         self.layout_fixture()
         new, output, _lock = self.moved_worktree_with_real_target()

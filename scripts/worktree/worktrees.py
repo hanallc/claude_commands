@@ -3307,7 +3307,6 @@ def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *,
     if reason := _migration_target_lock(checkout, common, output):
         progress.kept[checkout] = reason
         return False
-    _report_saved_targets(checkout, progress.reported_saved_targets)
     target = checkout / "target"
     real = _is_real_target(target)
     with ExitStack() as held:
@@ -3470,6 +3469,9 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
         progress.moved += 1
         names = f"{layout.unit} | {layout.short_name} | {planned.source} | {layout.output.value}"
         print(f"move {layout.old} -> {layout.new} | {names}")
+    # The report comes before any defer or keep, so each saved folder is reported in each run.
+    for checkout in (*(main.checkout for main in plan.main), *plan.moved, *plan.saved):
+        _report_saved_targets(checkout, progress.reported_saved_targets)
     for main in plan.main:
         output = build_folders.main_output_path(main.repo)
         if not publication.places_output(main.repo):
@@ -3486,8 +3488,6 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
         elif _switch_output(checkout, recorded, progress, dry_run=dry_run):
             _ = progress.kept.pop(checkout, None)
             print(f"output {checkout} -> {recorded}")
-    for checkout in plan.saved:
-        _report_saved_targets(checkout, progress.reported_saved_targets)
     progress.print_keeps(dry_run=dry_run)
     if not dry_run and any(selection.includes(path)
                            and progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
