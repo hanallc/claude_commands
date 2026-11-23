@@ -251,6 +251,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/board_reads.py` | read | active, StaffSnapshot, OpenRun |
 | `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
@@ -302,6 +303,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/staff_test_support.py` | write | ensure, ensure_worker, initial_snapshot, local_snapshot, move, native_id, operation, set_doc, set_run, set_worktree, snapshot, update_current_session |
 | `scripts/production/stall_watch.py` | read | snapshot |
 | `scripts/production/store_owner.py` | read | snapshot |
+| `scripts/production/stranded.py` | read | snapshot, by_id, StaffRow, OpenRun, PresentWorktree |
 | `scripts/production/style_units.py` | read | snapshot |
 | `scripts/production/the_list.py` | read | snapshot, by_current_session and by_id find the caller and check the owner of a list item |
 | `scripts/production/tidy_wrapped.py` | read | initial_snapshot |

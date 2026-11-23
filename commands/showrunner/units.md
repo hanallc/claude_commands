@@ -151,6 +151,34 @@ and shows only when it differs. The date is now plus `approved / r` days.
 When `r` is zero, it ends with `no ETA: nothing built in 24 h`. Numbers use
 thousands commas. Times and the date use the production zone.
 
+A `**Stranded**` section follows the unit tables. It prints only when it has rows.
+A row shows when one of these conditions is older than `stranded_after_hours` in `config/production.conf` (4):
+
+1. A completed unit phase has an approved hash, and the hash is not on main.
+   The newest review of the phase with an `APPROVE` or `REQUEST CHANGES` verdict must approve.
+   The hash is the last checkpoint commit of the phase, before or after that review.
+   A phase with no checkpoint uses the commit that this review approved.
+2. A unit tree has staged or changed tracked files, no commit, and no live run.
+
+The rows use these forms, with times in the user zone:
+
+- `natest 421 approved 001ff6ea4e 05:21 PST, not on main, not in the merge line (33 h)`
+- `natest tree recenttimes421: 3 changed files, no commit for 6 h, no live run`
+
+The approved row says `in the merge line` when the hash is in the production's merge line.
+A merge of the same unit and phase on main at or after the approval clears the row.
+The unit trees are the unit's home tree and the linked trees that belong to the unit.
+A tree belongs to only one unit, and the home tree of another staff row belongs to no other unit.
+A live run is a step record, a detached run of the unit, or a build queue run or wait in the tree.
+The build queue runs come from the queue snapshot file that the admission service writes at each pass.
+A queue run with the unit's name outside every production tree also counts.
+When a run source is unreadable, or the queue snapshot is older than `silence_seconds` in `config/build_admission.conf`, the tree row ends with `live runs unread`.
+When no local repository holds an approved hash, the row shows only while the unit run that holds the approval is open.
+A phase merge in the production checkout can still clear it. Else the row ends with `commit not in a local repository`.
+The agent-notes part `stranded` sends one message to the showrunner when a row first shows.
+It does not send a `live runs unread` row until a check reads all the run sources.
+It never sends a `commit not in a local repository` row.
+
 Read failures that make the table wrong or incomplete appear as `anomaly:` lines below the table.
 Staff name conflicts also produce lines. Worker run checks share one process snapshot when needed.
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.

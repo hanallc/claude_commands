@@ -61,6 +61,13 @@ def shown_time(moment: datetime) -> str:
     return moment.astimezone(user_zone()).strftime("%b %d, %Y, %H:%M")
 
 
+def short_time(moment: datetime, *, now: float, zone: ZoneInfo) -> str:
+    """A time in `zone` as 14:05 on the day of `now`, else as 2026-11-22 14:05."""
+    local = moment.astimezone(zone)
+    today = datetime.fromtimestamp(now, zone).date()
+    return local.strftime("%H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
+
+
 def main() -> int:
     try:
         print(user_zone_name())

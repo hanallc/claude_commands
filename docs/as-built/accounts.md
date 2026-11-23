@@ -43,7 +43,8 @@ The agent-notes job runs these parts in separate processes:
 6. Login reminders.
 7. Phase note pruning.
 8. Producer folder size checks.
-9. Vault commits.
+9. Stranded work checks.
+10. Vault commits.
 
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.

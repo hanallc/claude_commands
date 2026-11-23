@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.direct import phase_waits, plan_history
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
-from scripts.production import land_queue, land_runs, staff, unit_phases, unit_queue, waits_on
+from scripts.production import board_reads, land_queue, land_runs, staff, unit_phases, unit_queue, waits_on
 
 
 class WaitsOnTests(unittest.TestCase):
@@ -285,39 +285,39 @@ class WaitsOnTests(unittest.TestCase):
         carried_view = view._replace(carried_line={"7" * 40: line["c" * 40]})
         running_view = view._replace(running={"0" * 40: "shelled images-card", "8" * 40: "shelled live-owner"},
                                     carried_running=frozenset({"7" * 40}))
-        cases: list[tuple[str, land_queue.LandView, dict[str, unit_phases.PhaseSentWork], bool,
+        cases: list[tuple[str, land_queue.LandView, dict[str, board_reads.PhaseSentWork], bool,
                           tuple[unit_phases.WorkItem, ...], frozenset[str]]] = [
             ("no open rows", view, {}, False, (running, first, *paired, *failures), frozenset()),
             ("open rows before other phases", view,
-             {"images-card": unit_phases.SentCommit("0" * 40), "shot-rule": unit_phases.SentCommit("a" * 40),
-              "land-line": unit_phases.SentCommit("c" * 40), "images": unit_phases.SentCommit("f" * 40)}, True,
+             {"images-card": board_reads.SentCommit("0" * 40), "shot-rule": board_reads.SentCommit("a" * 40),
+              "land-line": board_reads.SentCommit("c" * 40), "images": board_reads.SentCommit("f" * 40)}, True,
              (running, first, unit_phases.WorkItem("land-line", "2nd in sdlc's merge line"),
               unit_phases.WorkItem("workers-why", "Merges with land-line"), failures[1]),
              frozenset({"land-line"})),
-            ("single open row", view, {"shot-rule": unit_phases.SentCommit("a" * 40)}, False,
+            ("single open row", view, {"shot-rule": board_reads.SentCommit("a" * 40)}, False,
              (running, first, *paired, *failures), frozenset()),
             ("carried commit joins its item", carried_view,
-             {"workers-why": unit_phases.SentCommit("b" * 40), "checkpoint-wait": unit_phases.SentCommit("7" * 40),
-              "land-line": unit_phases.SentCommit("c" * 40)}, False,
+             {"workers-why": board_reads.SentCommit("b" * 40), "checkpoint-wait": board_reads.SentCommit("7" * 40),
+              "land-line": board_reads.SentCommit("c" * 40)}, False,
              (running, first, paired[0], unit_phases.WorkItem("checkpoint-wait", "Merges with workers-why"),
               paired[1], *failures), frozenset({"workers-why", "checkpoint-wait", "land-line"})),
             ("running direct and carried commits", running_view,
-             {"carried": unit_phases.SentCommit("7" * 40), "images-card": unit_phases.SentCommit("0" * 40)}, False,
+             {"carried": board_reads.SentCommit("7" * 40), "images-card": board_reads.SentCommit("0" * 40)}, False,
              (unit_phases.WorkItem("Carried", "sdlc merges it now"),
               unit_phases.WorkItem("images-card", "Merges with carried"),
               unit_phases.WorkItem("live-owner", "Merges with carried"), first, *paired, *failures),
              frozenset({"carried", "images-card"})),
-            ("single running open row", view, {"images-card": unit_phases.SentCommit("0" * 40)}, False,
+            ("single running open row", view, {"images-card": board_reads.SentCommit("0" * 40)}, False,
              (running, first, *paired, *failures), frozenset()),
-            ("open failed work remains current", view, {"images": unit_phases.SentCommit("f" * 40)}, False,
+            ("open failed work remains current", view, {"images": board_reads.SentCommit("f" * 40)}, False,
              (running, first, *paired, failures[1], failures[0]), frozenset()),
             ("carried phase has its live rank", view._replace(carried_line={
                 "7" * 40: land_queue.Place(4, "builds batch", "builder carrier")}),
-             {"carried": unit_phases.SentCommit("7" * 40)}, False,
+             {"carried": board_reads.SentCommit("7" * 40)}, False,
              (running, first, *paired, unit_phases.WorkItem("Carried", "4th in sdlc's merge line"), *failures), frozenset()),
             ("checkpoint has no line", view,
-             {"absent": unit_phases.SentCommit("6" * 40), "no-hash": unit_phases.SentCommitUnrecorded(),
-              "not-sent": unit_phases.NoSentWork()}, False,
+             {"absent": board_reads.SentCommit("6" * 40), "no-hash": board_reads.SentCommitUnrecorded(),
+              "not-sent": board_reads.NoSentWork()}, False,
              (running, first, *paired,
               unit_phases.WorkItem("Absent", "Checkpoint 666666666 at time not recorded; not in sdlc's merge line"),
               unit_phases.WorkItem("no-hash", "Merge position not recorded"), *failures), frozenset()),

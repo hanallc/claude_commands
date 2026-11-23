@@ -26,7 +26,7 @@ from typing import NamedTuple, cast, override
 from unittest.mock import ANY, Mock, call, patch
 
 
-from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
+from scripts.production import board_reads, census, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
@@ -1211,7 +1211,7 @@ class UnitPhasesTests(unittest.TestCase):
         ]
         for view, expected in views:
             with self.subTest(merge=expected):
-                result = unit_phases.unit_lands("shells", view, open_sent={"images": unit_phases.phase_sent_work(events)},
+                result = unit_phases.unit_lands("shells", view, open_sent={"images": board_reads.phase_sent_work(events)},
                     now=now, zone=ZoneInfo("UTC"), on_main=lambda _commit: False, production="sdlc")
                 if not expected:
                     self.assertEqual(result.entries, ())
@@ -1236,8 +1236,8 @@ class UnitPhasesTests(unittest.TestCase):
             "Images", "The production cannot merge it: test_cards red"),))
         for kind in ("phase_started", "pass_started", "activity_started"):
             with self.subTest(restarted=kind):
-                self.assertIsInstance(unit_phases.phase_sent_work([*events, {"event_type": kind}]), unit_phases.NoSentWork)
-        self.assertIsInstance(unit_phases.phase_sent_work(events[:2]), unit_phases.NoSentWork)
+                self.assertIsInstance(board_reads.phase_sent_work([*events, {"event_type": kind}]), board_reads.NoSentWork)
+        self.assertIsInstance(board_reads.phase_sent_work(events[:2]), board_reads.NoSentWork)
 
     def test_checkpoint_outside_the_merge_line_names_its_hash_and_recorded_time(self) -> None:
         member = self.member("devtools")
@@ -1262,9 +1262,9 @@ class UnitPhasesTests(unittest.TestCase):
                               detail_rows(rendered, member.name))
                 self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
                 self.assertNotIn("Merge submission", rendered)
-        sent = unit_phases.phase_sent_work([
+        sent = board_reads.phase_sent_work([
             {"event_type": "checkpoint", "checkpoint_commit": commit, "timestamp_epoch": at}])
-        self.assertEqual(sent, unit_phases.SentCommit(commit, at))
+        self.assertEqual(sent, board_reads.SentCommit(commit, at))
         result = unit_phases.unit_lands("devtools", view, open_sent={"acctload": sent},
                                        now=now, zone=ZoneInfo("UTC"), on_main=lambda _: False)
         self.assertEqual(result.entries, (unit_phases.WorkItem("Acctload",
@@ -1661,9 +1661,9 @@ class UnitPhasesTests(unittest.TestCase):
             "phase": "result", "landed": True, "step": "push", "state": "done", "detail": "", "time": merge_date}
         for evidence in ("subject", "result"):
             _ = self.queue(dependent, unit_queue.QueuedItem("Review delivery", f"finished/{evidence}"))
-            for offset in (-1, 0, 1, unit_phases.CheckpointTimeUnrecorded()):
+            for offset in (-1, 0, 1, board_reads.CheckpointTimeUnrecorded()):
                 with self.subTest(evidence=evidence, checkpoint_offset=offset):
-                    checkpoint_time: dict[str, object] = ({} if isinstance(offset, unit_phases.CheckpointTimeUnrecorded)
+                    checkpoint_time: dict[str, object] = ({} if isinstance(offset, board_reads.CheckpointTimeUnrecorded)
                                                           else {"timestamp_epoch": merge_at + offset})
                     old_failure: land_runs.LandResult = {**landed, "commit": "f" * 40, "phase": evidence,
                         "landed": False, "detail": "old failed attempt", "time": "2026-11-15T17:50:00+00:00"}
@@ -2782,6 +2782,30 @@ class UnitPhasesTests(unittest.TestCase):
         sender.assert_not_called()
         self.assertEqual(staff.by_id(member.id), member)
 
+    def test_stranded_section_prints_below_the_units_only_when_it_has_rows(self) -> None:
+        from scripts.production import session_staff, stranded
+
+        doc = self.root / "production.md"
+        _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
+        owner = fixture_member("showrunner", name="stranded-owner", doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("unit", name="member", parent=owner.id)
+        text = "member tree p7: 3 changed files, no commit for 6 h, no live run"
+        row = stranded.StrandedRow("member", stranded.StrandedKind.TREE, "tree:/p7", text, 6 * 3600)
+        for found, expected in (([row], ["**Stranded**", "", f"- {text}"]), ([], [])):
+            with self.subTest(rows=len(found)):
+                output = io.StringIO()
+                with (patch.object(unit_lookup, "observed_session_labels", return_value=()),
+                      patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
+                      patch.object(unit_phases, "production_records", return_value={}),
+                      patch.object(stranded, "rows", return_value=found) as read, contextlib.redirect_stdout(output)):
+                    self.assertEqual(unit_phases.main(["--production", owner.name]), 0)
+                lines = output.getvalue().splitlines()
+                self.assertIn("**member** — idle", lines)
+                self.assertEqual(lines[lines.index("**Stranded**"):] if found else
+                                 [line for line in lines if "Stranded" in line], expected)
+                read.assert_called_once_with(owner.name, ANY, ANY)
+                self.assertIsInstance(cast(object, read.call_args.args[2]), board_reads.BoardReads)
+
     def test_census_failure_preserves_director_presence_and_reports_workers_unknown(self) -> None:
         doc = self.root / "production.md"
         _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
@@ -2833,14 +2857,15 @@ class UnitPhasesTests(unittest.TestCase):
             return {}
 
         def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo,
-                   census_read: census.Census | census.CensusFailed, columns: int | None, repository: Path) -> str:
+                   census_read: census.Census | census.CensusFailed, columns: int | None, repository: Path,
+                   reads: board_reads.BoardReads) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
             self.assertIs(census_read, LOCAL)
             self.assertIsNone(columns)
-            self.assertEqual(repository, self.root)
+            self.assertEqual((repository, reads.repository), (self.root, self.root))
             calls.append("table")
             return "phase table"
 
@@ -3004,7 +3029,7 @@ class UnitPhasesTests(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone,
-                                                 census_read=LOCAL, columns=None, repository=self.root)
+                                                 census_read=LOCAL, columns=None, repository=self.root, reads=ANY)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import ClassVar, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.production import change_review, session_staff, staff, unit_config, unit_phases
+from scripts.production import board_reads, change_review, session_staff, staff, unit_config
 from scripts.production.staff_test_support import (
     StaffTestCase, isolated_staff_file, isolated_source_readers, source_environment,
     fixture_member, fixture_worker, fixture_runtime_id, fixture_session, recorded_showrunner, recorded_unit,
@@ -2836,8 +2836,8 @@ print('two homes isolated; recorder lock retained; caller restored')
             ids = {name: [str(event["event_id"]) for event in events if event.get("event_type") == "checkpoint"]
                    for name, events in readers.items()}
             ids["checkpoint_producers"] = [wrong_id] if wrong in producers else []
-            sent = unit_phases.phase_sent_work(plan_history.read_run_events(history))
-            ids["phase_sent_work"] = [wrong_id] if isinstance(sent, unit_phases.SentCommit) and sent.commit == wrong else []
+            sent = board_reads.phase_sent_work(plan_history.read_run_events(history))
+            ids["phase_sent_work"] = [wrong_id] if isinstance(sent, board_reads.SentCommit) and sent.commit == wrong else []
             return ids
 
         def resolved(commit: str) -> bool:
@@ -4625,6 +4625,44 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(slots["impl"]["launcher_command"], ["assign.sh", "--role", "impl"])
         self.assertEqual(len(self.pass_events("hook-completion", "pass_finished")), 1)
         self.assertEqual(self.pass_events("hook-completion", "pass_finished")[0].get("reply_file"), delivery.reply_file)
+
+    def test_review_pass_end_records_the_verdict_and_the_phase_tree_head(self) -> None:
+        run = self.start_run("review-verdict", 42_000)
+        self.start_phase(run, 42_010)
+        head = commit_repository(self.working_dir, "reviewed work", allow_empty=True)
+        phase_folder = phase_reservation.phase_directory(run, "3")
+        phase_folder.mkdir(parents=True, exist_ok=True)
+        tree_file = phase_folder / phase_reservation.WORKTREE_FILE
+        reply = self.root / "verdict-reply.txt"
+
+        def review(reply_text: str | None, tree: Path) -> dict[str, object]:
+            finished = len(self.pass_events("review-verdict", "pass_finished"))
+            prompt = self.root / f"verdict-prompt-{finished}.txt"
+            _ = prompt.write_text(f"Review {finished} of the phase in {tree.name}.\n")
+            _ = tree_file.write_text(f"{tree}\n")
+            reply.unlink(missing_ok=True)
+            if reply_text is not None:
+                _ = reply.write_text(reply_text)
+            instance = progress_history.begin_dispatch(run, slot="review", phase="3", role="review",
+                worker_name="reviewer", worker_id=staff.StaffId(fixture_runtime_id("verdict-reviewer")),
+                launcher_command=["assign.sh"], prompt=prompt, kind="broad", lens="contract")
+            progress_history.save_dispatch_delivery(run, instance,
+                pass_recorder.DispatchDelivery("Review.", instance, str(reply)))
+            progress_history.complete_dispatch(run, "review", instance)
+            return self.pass_events("review-verdict", "pass_finished")[-1]
+
+        approved = review("Checked it.\n\n**APPROVE**\n\nA later REQUEST CHANGES word.\nDONE x\n", self.working_dir)
+        self.assertEqual((approved["verdict"], approved["reviewed_commit"], approved["reviewed_tree"]),
+                         ("APPROVE", head, str(self.working_dir)))
+        quoted = review("Give a verdict (APPROVE or REQUEST CHANGES) in the reply.\nDONE x\n", self.working_dir)
+        self.assertEqual(quoted["verdict"], "no verdict")
+        for text, verdict in (("**Verdict: REQUEST CHANGES**\n", pass_recorder.ReviewVerdict.REQUEST_CHANGES),
+                              ("Notes.\n## APPROVE\n", pass_recorder.ReviewVerdict.APPROVE),
+                              ("Verdict: **APPROVE**\n", pass_recorder.ReviewVerdict.APPROVE)):
+            self.assertIs(pass_recorder.reply_verdict(text), verdict)
+        unknown = review(None, self.root / "not-a-tree")
+        self.assertEqual((unknown["verdict"], unknown["reviewed_commit"], unknown["reviewed_tree"]),
+                         ("no verdict", "unknown", "unknown"))
 
     def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
         session = self.start_run("dispatch-worker", 41_000)

@@ -183,6 +183,24 @@ class JobTests(unittest.TestCase):
             self.assertEqual(job._perform(Part.FOLDER_SIZE), 0)  # pyright: ignore[reportPrivateUsage]
         check.assert_called_once_with()
 
+    def test_stranded_part_sends_each_timer_production_its_rows(self) -> None:
+        from scripts.production import showrunners, staff, stranded
+        from scripts.production.staff_test_support import fixture_member
+
+        owner = fixture_member("showrunner", name="stranded-owner")
+        (self.root / "notifier" / f"showrunner-{owner.id}").mkdir(parents=True)
+        row = stranded.StrandedRow("natest", stranded.StrandedKind.TREE, "tree:/p7", "natest tree p7: 1 changed file", 1)
+        with (patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+                                      "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"),
+              patch.object(stranded, "rows", return_value=[row]) as read,
+              patch.object(stranded, "send_notice", return_value=True) as send):
+            self.assertEqual(job._perform(Part.STRANDED), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(job._perform(Part.STRANDED), 0)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(read.call_args_list[0].args[0], owner.name)
+        send.assert_called_once_with(staff.by_id(owner.id), "Stranded work. Run /showrunner:units for the list.\n"
+                                     + "- natest tree p7: 1 changed file")
+
     def vault_git(self, *arguments: str) -> str:
         return subprocess.run(
             ["git", "-C", str(self.root / "rust/hanadocs"), *arguments], check=True,

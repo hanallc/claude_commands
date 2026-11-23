@@ -34,8 +34,8 @@ from scripts.production import census, live_units
 from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.agents import remote
-from scripts.lib import conf, git_files
-from scripts.lib.user_zone import user_zone
+from scripts.lib import conf
+from scripts.lib.user_zone import short_time, user_zone
 from scripts.production import unit_config
 from scripts.message import session_send
 from scripts.herdr import herdr
@@ -47,7 +47,9 @@ from scripts.direct import plan_history, recorder_state
 
 from scripts.production import display_cells, land_queue, land_runs
 from scripts.production import unit_queue, waits_on
-from scripts.lib import unit_runs
+from scripts.production.board_reads import (
+    BoardReads, CheckpointRepositoryUnavailable, NoSentWork, PhaseSentWork, SentCommit, UnitRunStart,
+    completed_unit_phases, phase_sent_work, unit_run_history)
 from scripts.whoami import quota_state
 
 
@@ -88,12 +90,6 @@ def elapsed_text(seconds: float) -> str:
         return f"{hours}h {minutes}m"
     days, hours = divmod(hours, 24)
     return f"{days}d {hours}h"
-
-
-def short_time(moment: datetime, *, now: float, zone: ZoneInfo) -> str:
-    local = moment.astimezone(zone)
-    today = datetime.fromtimestamp(now, zone).date()
-    return local.strftime("%H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
 
 
 class ProgressState(NamedTuple):
@@ -363,9 +359,6 @@ def plan_phase_rows(fields: BoardPlanRecord) -> list[BoardPlanPhase]:
 # The repository whose local origin/main a queued item's wait is checked against; no fetch.
 REPOSITORY = Path(__file__).resolve().parents[2]
 
-WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
-
-
 def ordinal(number: int) -> str:
     suffix = "th" if 10 <= number % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
     return f"{number}{suffix}"
@@ -403,42 +396,6 @@ def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo) -> str
             return "not in the merge line"
         case land_queue.LineUnused():
             return "merge position not recorded"
-
-
-class CheckpointTimeUnrecorded(NamedTuple):
-    """The checkpoint event has no recorded time."""
-
-
-class SentCommit(NamedTuple):
-    """The commit and checkpoint time after the phase's last work start."""
-
-    commit: str
-    timestamp_epoch: float | CheckpointTimeUnrecorded = CheckpointTimeUnrecorded()
-
-
-class SentCommitUnrecorded(NamedTuple):
-    """The phase sent work without a recorded commit."""
-
-
-class NoSentWork(NamedTuple):
-    """The phase has no sent work after its last work start."""
-
-
-PhaseSentWork = SentCommit | SentCommitUnrecorded | NoSentWork
-
-
-def phase_sent_work(events: list[dict[str, object]]) -> PhaseSentWork:
-    """Find the sent commit after the phase's last work start."""
-    for event in reversed(events):
-        kind = event.get("event_type")
-        if kind == "checkpoint":
-            commit = event.get("checkpoint_commit")
-            at = event.get("timestamp_epoch")
-            recorded = float(at) if isinstance(at, int | float) and not isinstance(at, bool) else CheckpointTimeUnrecorded()
-            return SentCommit(commit, recorded) if isinstance(commit, str) and commit else SentCommitUnrecorded()
-        if kind in WORK_STARTS:
-            return NoSentWork()
-    return NoSentWork()
 
 
 class WorkItem(NamedTuple):
@@ -642,54 +599,6 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     return UnitMergeNotes(frozenset(grouped), tuple(parts), pending, frozenset(wait_targets))
 
 
-def completed_unit_phases(events: Sequence[dict[str, object]]) -> dict[str, PhaseSentWork]:
-    """Read completed phases and their sent work from their latest instances."""
-    instances: dict[str, str] = {}
-    phases: dict[str, list[dict[str, object]]] = {}
-    completed: set[str] = set()
-    for event in events:
-        kind = event.get("event_type")
-        phase = str(event.get("phase_id") or instances.get(str(event.get("phase_instance_id", "")), ""))
-        if kind == "phase_started":
-            instances[str(event.get("phase_instance_id", ""))] = phase
-            phases[phase] = []
-            completed.discard(phase)
-        if phase in phases and phase not in completed:
-            phases[phase].append(event)
-            if kind == "phase_finished" and event.get("status") == "completed":
-                completed.add(phase)
-    return {phase: phase_sent_work(history) for phase, history in phases.items() if phase in completed}
-
-
-class UnitRunStart(NamedTuple):
-    """The recorded start of a unit run."""
-
-    started: float
-    path: Path
-    start: dict[str, object]
-
-
-def unit_run_history(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, list[UnitRunStart]]:
-    """Order each unit's runs with its current staff run first."""
-    snapshot = staff.StaffSnapshot(staff.active(snapshot, "unit"))
-    runs: dict[staff.StaffId, list[UnitRunStart]] = {}
-    for path, started_event in plan_history.run_starts():
-        try:
-            owner = unit_runs.run_owner(started_event, snapshot)
-        except staff.StaffUnreadable:
-            continue
-        if isinstance(owner, unit_runs.RunOwnerUnrecorded):
-            continue
-        started = next((float(value) for value in (started_event.get("run_started_at"), started_event.get("timestamp_epoch"))
-                        if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
-        runs.setdefault(owner.id, []).append(UnitRunStart(started, path, started_event))
-    for owner in snapshot.rows:
-        if owner.id in runs:
-            current_run = owner.run.path.name if isinstance(owner.run, staff.OpenRun) else ""
-            runs[owner.id].sort(key=lambda run: (run.path.stem == current_run, run.started, run.path.name), reverse=True)
-    return runs
-
-
 def run_is_finished(events: list[dict[str, object]]) -> bool:
     """The latest finish or reopen event determines whether the run is finished."""
     for event in reversed(events):
@@ -697,10 +606,6 @@ def run_is_finished(events: list[dict[str, object]]) -> bool:
         if kind in ("run_finished", "reopened"):
             return kind == "run_finished"
     return False
-
-
-class CheckpointRepositoryUnavailable(NamedTuple):
-    """The unit has no readable checkout or recorded merge destination."""
 
 
 class DependencyHistoryUnavailable(NamedTuple):
@@ -1365,29 +1270,6 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     return "\n".join(lines)
 
 
-class RepositoryEvidence:
-    """One repository's merge records and cached checkpoint decisions for this render."""
-
-    def __init__(self, repository: Path) -> None:
-        self.repository: Path = repository
-        self.land: land_queue.LandView = land_queue.land_view(repository)
-        self.phase_merges: dict[tuple[str, str], waits_on.PhaseMerge] = waits_on.landed_phases(repository)
-        self.identities: frozenset[waits_on.CommitIdentity] = waits_on.main_commit_identities(repository)
-        self.main_states: dict[str, bool] = {}
-
-    def on_main(self, commit: str) -> bool:
-        """Share the ancestry and copied-checkpoint decision across all board uses."""
-        key = commit.lower()
-        if key not in self.main_states:
-            self.main_states[key] = (waits_on.on_main(self.repository, commit)
-                                     or waits_on.copied_on_main(self.repository, commit, self.identities))
-        return self.main_states[key]
-
-    def names_checkpoint(self, unit: str, phase: str, commit: str) -> bool:
-        merge = self.phase_merges.get((unit, phase))
-        return merge is not None and commit.lower().startswith(merge.checkpoint_commit.lower())
-
-
 def phase_dependency(events: list[dict[str, object]], phase: str) -> waits_on.PhaseSent | waits_on.PhaseOpen | waits_on.PhaseNotStarted:
     """Read the checkpoint from the latest attempt of the phase."""
     instance = next((event.get("phase_instance_id") for event in reversed(events)
@@ -1410,25 +1292,21 @@ def phase_dependency(events: list[dict[str, object]], phase: str) -> waits_on.Ph
 def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           now: float | None = None, zone: ZoneInfo | None = None,
           snapshot: staff.StaffSnapshot | None = None, census_read: census.Census | census.CensusFailed,
-          columns: int | None = None, repository: Path = REPOSITORY) -> str:
+          columns: int | None = None, repository: Path = REPOSITORY, reads: BoardReads | None = None) -> str:
     """Build each unit's state once for its status row, block and summary bucket."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
     now = pass_recorder.now_epoch() if now is None else now
     zone = user_zone() if zone is None else zone
     view = census_view(census_read)
-    evidence: dict[Path, RepositoryEvidence] = {}
-
-    def repository_evidence(source: Path) -> RepositoryEvidence:
-        if source not in evidence:
-            evidence[source] = RepositoryEvidence(source)
-        return evidence[source]
-
+    reads = BoardReads(repository, unit_run_history(snapshot)) if reads is None else reads
+    repository_evidence = reads.at
+    checkout_source = reads.source
+    read_history = reads.run
     current_evidence = repository_evidence(repository)
     recorded_land = current_evidence.land._replace(carried_running=frozenset(), carried_line={})
     results = {checkpoint_result_key(row): row for row in recorded_land.results.values()}
     landed_checkpoints = {(row["unit"], row["phase"]): row["commit"] for row in results.values() if row["landed"]}
     pending_results = {commit: row for commit, row in recorded_land.results.items() if not row["landed"]}
-    run_histories: dict[Path, plan_history.CompleteRunHistory | plan_history.IncompleteRunHistory] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
@@ -1436,25 +1314,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     dependency_members = {row.name: row for row in staff.active(snapshot, "unit")}
     unit_repositories: dict[staff.StaffId, Path | CheckpointRepositoryUnavailable] = {}
     destination_repositories: dict[str, Path | CheckpointRepositoryUnavailable] = {}
-    common_directories: dict[Path, Path] = {}
-    try:
-        common_directories[git_files.locate(repository).common_dir] = repository
-    except (OSError, ValueError, RuntimeError):
-        pass
-
-    def checkout_source(path: Path) -> Path | CheckpointRepositoryUnavailable:
-        if path == repository:
-            return repository
-        try:
-            checkout = git_files.locate(path)
-        except (OSError, ValueError, RuntimeError):
-            return CheckpointRepositoryUnavailable()
-        return common_directories.setdefault(checkout.common_dir, checkout.toplevel)
-
-    def read_history(path: Path) -> plan_history.CompleteRunHistory | plan_history.IncompleteRunHistory:
-        if path not in run_histories:
-            run_histories[path] = plan_history.read_run_history(path)
-        return run_histories[path]
 
     def read_run(path: Path) -> list[dict[str, object]]:
         return read_history(path).events
@@ -1504,7 +1363,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         land = repository_evidence(source).land if isinstance(source, Path) else recorded_land
         return land._replace(results=pending_results)
 
-    history = unit_run_history(snapshot)
+    history = reads.history
     newest = {unit_id: starts[0] for unit_id, starts in history.items()}
 
     def latest_attempt(member: staff.StaffRow, phase: str) -> (
@@ -1788,6 +1647,18 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
         print(f"anomaly: could not send unit anomalies: {' '.join(str(error).splitlines())}")
 
 
+def stranded_section(production: str, board: BoardReads) -> str:
+    """The Stranded list, or empty when it has no rows; a read failure is an anomaly."""
+    from scripts.production import stranded
+
+    try:
+        rows = stranded.rows(production, pass_recorder.now_epoch(), board)
+    except (OSError, ValueError, Refusal, staff.StaffRefused) as error:
+        session_staff.report_anomaly(f"stranded list unavailable: {error}")
+        return ""
+    return "\n".join(["**Stranded**", "", *(f"- {row.text}" for row in rows)]) if rows else ""
+
+
 def main(arguments: list[str], columns: int | None = None) -> int:
     match arguments:
         case ["--help"] | ["-h"]:
@@ -1829,16 +1700,18 @@ def main(arguments: list[str], columns: int | None = None) -> int:
                 if not units:
                     output = "no live units"
                 else:
+                    board = BoardReads(production.checkout, unit_run_history(snapshot))
                     sections: list[str] = []
                     if product_units:
                         if isinstance(census_read, census.CensusFailed):
                             session_staff.report_anomaly(census_read.reason)
                         sections.append(table(product_units, records, zone=production.zone, census_read=census_read,
-                                              columns=columns, repository=production.checkout))
+                                              columns=columns, repository=production.checkout, reads=board))
                     if ticket_units:
                         from scripts.production import style_units
                         sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
-                    output = "\n\n".join(sections)
+                    sections.append(stranded_section(name, board))
+                    output = "\n\n".join(section for section in sections if section)
         except recorder_state.OldRecorderState as error:
             print(str(error), file=sys.stderr)
             return 1

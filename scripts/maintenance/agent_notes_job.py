@@ -192,6 +192,9 @@ def _perform(part: Part) -> int:
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()
+    elif part is Part.STRANDED:
+        from scripts.production.stranded import main
+        return main()
     elif part is Part.FOLDER_SIZE:
         from scripts.maintenance import folder_size
         folder_size.run()

@@ -19,6 +19,7 @@ class Part(str, Enum):
     LOGINS = "logins"
     PRUNE = "prune"
     FOLDER_SIZE = "folder_size"
+    STRANDED = "stranded"
     VAULT = "vault"
     VAULT_SAVE = "vault_save"
 

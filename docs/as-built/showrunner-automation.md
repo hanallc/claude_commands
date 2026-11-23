@@ -998,6 +998,62 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
+  - **Stranded work (`scripts/production/stranded.py`, item 259):** `stranded.rows(production, now, reads)` returns the production's `StrandedRow` list.
+    `unit_phases.main` prints the rows in a `**Stranded**` section below the unit tables. The section prints only when it has rows.
+    A read failure adds one `stranded list unavailable` anomaly line and no section.
+    The age limit is `stranded_after_hours` in `config/production.conf` (4).
+    `scripts/production/board_reads.py` holds the reads that the board and the stranded list share.
+    `BoardReads` holds the unit run history that the caller passes, and reads each run file and the `RepositoryEvidence` of each repository once.
+    `unit_phases.main` makes one `BoardReads`, named `board`, and passes it to `table` and to `stranded.rows`.
+    The agent-notes part makes one `stranded.PassReads` for all productions. It holds one unit run history read and one `LiveRunReader`.
+    `rows` makes a `BoardReads` for each production from that history. The live runs are read once, at the first use.
+    `board_reads.py` also holds `phase_sent_work` and `completed_unit_phases`, which read the checkpoint commit of a phase.
+    `user_zone.short_time` writes the times. This keeps the import graph free of cycles.
+    - **Approved hash:** a completed review `pass_finished` event records `verdict`, `reviewed_commit` and `reviewed_tree`.
+      `pass_record.close_slot_pass` writes them, so the review launcher and the hook completion both record them.
+      `verdict` is the first `APPROVE` or `REQUEST CHANGES` at the start of a reply line, after optional markdown marks or `Verdict:`.
+      A verdict word inside a sentence is not a verdict. Without a verdict line, the value is `no verdict`.
+      `reviewed_commit` and `reviewed_tree` are the phase tree `HEAD` and folder, or `unknown`.
+      For each run, the list reads the latest instance of each completed phase.
+      The newest completed review with a verdict must approve. A review lens with `no verdict` does not count.
+      When the phase has a `checkpoint` event, the hash is the `checkpoint_commit` of the last one, before or after that review.
+      The approval time is the later of the checkpoint time and the review time. In loop mode the review reads uncommitted work, so the reviewed `HEAD` is not the approved work.
+      A phase with no checkpoint uses `reviewed_commit` from that review.
+      An older event without these fields uses the reply text: the verdict line and the last backticked hash before its end.
+      An approved hash older than the limit and not on main gives a row.
+      The repository is the one at the phase tree. When the phase tree is gone, it is the one at the unit home tree.
+      `RepositoryEvidence.on_main` checks ancestry and copied commits. A merge of the same unit and phase on main at or after the approval clears the row.
+      When neither tree is a readable repository with the commit, the approval shows only while the unit run that holds it is open.
+      The run is open when the staff row's open run has the name of the run file. Then the merge check reads the production checkout.
+      If no such merge clears the approval, the row gets `RowCheck.COMMIT_UNREAD` and ends its text with `commit not in a local repository`.
+      `land_queue.land_state` gives `in the merge line` for a running or waiting merge, else `not in the merge line`.
+    - **Changed tree:** the unit trees are the local home trees and the linked trees that belong to one unit.
+      Each repository lists its linked trees once, and `finished_worktrees.tree_unit` reads each tree's checkout record once.
+      The record names the unit. A tree without a unit in its record belongs to the unit whose home folder holds it.
+      The home folder counts only when no other staff home is inside it, so a shared root such as `~/worktrees` gives no tree.
+      A tree that is the home of another staff row is not a linked tree of a unit. Each tree shows once.
+      `git status --porcelain --untracked-files=no` counts staged and changed tracked files. Eight threads run these reads in parallel.
+      The age starts at the newer of the last commit time and the newest changed file time.
+      The live runs are the `step_record.live_records` steps, the detached runs of each unit run folder, and the build queue steps.
+      The build queue steps are the running and waiting steps of the queue snapshot `<buildlog>/admission/queue.json`.
+      The admission service writes this file at each completed pass. The list does not ask the live service.
+      A missing snapshot, or one older than `silence_seconds` in `config/build_admission.conf` (120), is unread. `head_stall` uses the same limit.
+      A live folder inside the tree skips the tree. A detached run of the tree's unit skips the tree.
+      A queue step with the unit's name and a folder outside every production tree also skips the unit's trees.
+      An unread run source gives the row `RowCheck.LIVE_RUNS_UNREAD` and ends its text with `live runs unread`.
+    - **Message:** the agent-notes part `stranded` (`[parts.stranded]` in `config/agent_notes.toml`, every 600 s) calls `stranded.main`.
+      For each showrunner with a notifier folder, it sends one message with the new rows through `send.py --from stranded`.
+      `~/.local/state/showrunner/<showrunner id>/stranded_sent.json` keeps the sent row keys.
+      A send keeps the current keys that were sent before, plus the new keys. A key whose row is gone drops out, so the row sends again if it returns.
+      A `live runs unread` row is not sent, and its key is not added, until a check reads all the run sources.
+      A `commit not in a local repository` row is never sent, and its key is not added.
+      A failed send keeps the record without the new keys, so the next run sends them again. It also makes the part fail.
+      The send passes `--repeat-minutes` with `units_anomaly_repeat_minutes` from `config/production.conf` (60). The key is a hash of the text.
+      So when the part stops after a delivered send and before the record write, `send.py` skips the same text on the next pass.
+    - **Cost:** one call without the board's reads takes 1.6 s to 2.4 s for builds, with 199 trees and 134 runs.
+      The run files and the repository evidence take about 0.5 s of that, and the board reads them once for both uses.
+      With the board's reads, the call takes 0.8 s to 1.1 s. The tree status reads take about 0.45 s.
+      The main checks of the approved hashes take about 0.25 s. The live runs, with the queue snapshot, take about 0.12 s.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
     The director finishes its current turn and holds at the prompt.
     `agents exit <unit> --why "<why>"` records `exited: {since, by, why}` and stops the director and workers.

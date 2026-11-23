@@ -1,7 +1,8 @@
 """Make a worktree after checking for finished worktrees."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 import os
 from pathlib import Path
 import platform
@@ -106,23 +107,36 @@ def process_directories() -> ProcessDirectoriesRead | ProcessDirectoriesUnreadab
     return ProcessDirectoriesUnreadable()
 
 
-def belongs_to_unit(path: Path, unit_folder: Path, unit: str, snapshot: staff.StaffSnapshot) -> bool:
+class NoUnit(Enum):
+    NO_UNIT = "no unit owns the worktree"
+
+
+def tree_unit(path: Path, unit_folders: Mapping[Path, str], snapshot: staff.StaffSnapshot) -> str | NoUnit:
+    """Name the unit that owns a linked worktree; it reads the checkout record once.
+
+    The record names the unit. A tree with no record, or a record that names no unit,
+    belongs to the unit whose folder in `unit_folders` holds the tree.
+    """
+    folder_unit = unit_folders.get(path.parent, NoUnit.NO_UNIT)
     try:
         record = worktrees.checkout_record(path)
         if record is None:
-            return path.parent == unit_folder and not worktrees.record_file(path).is_symlink()
+            return NoUnit.NO_UNIT if worktrees.record_file(path).is_symlink() else folder_unit
     except (OSError, ValueError):
-        return False
+        return NoUnit.NO_UNIT
     if isinstance(record.layout, worktrees.RecordedWorktreeOutput):
-        return record.layout.unit == unit
+        return record.layout.unit
     owner = snapshot.owner_of(record.owner)
     if owner is not None and owner.kind == "unit":
-        return owner.name == unit
-    if record.owner == unit:
-        return True
-    if any(row.kind == "unit" and row.name == record.owner for row in snapshot.rows):
-        return False
-    return path.parent == unit_folder
+        return owner.name
+    if record.owner in unit_folders.values() or any(row.kind == "unit" and row.name == record.owner
+                                                    for row in snapshot.rows):
+        return record.owner
+    return folder_unit
+
+
+def belongs_to_unit(path: Path, unit_folder: Path, unit: str, snapshot: staff.StaffSnapshot) -> bool:
+    return tree_unit(path, {unit_folder: unit}, snapshot) == unit
 
 
 def matches_repository(path: Path, common_dir: Path) -> bool:

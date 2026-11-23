@@ -736,6 +736,61 @@ def record_event(
     return event
 
 
+class ReviewVerdict(Enum):
+    """The first verdict word at the start of a line in a review reply."""
+
+    APPROVE = "APPROVE"
+    REQUEST_CHANGES = "REQUEST CHANGES"
+    NO_VERDICT = "no verdict"
+
+
+class HeadUnknown(Enum):
+    UNKNOWN = "unknown"
+
+
+class ReviewedHead(NamedTuple):
+    """The phase tree and its HEAD when a review pass ends."""
+
+    tree: Path
+    commit: str
+
+
+# A verdict word at the start of a line, after optional markdown marks and an optional "Verdict:" label.
+# A verdict word inside a sentence, such as "(APPROVE or REQUEST CHANGES)", is not a verdict.
+VERDICT_WORD = re.compile(r"^[ \t>#*_-]*(?:(?i:verdict)[ \t]*:[ \t]*[*_]*[ \t]*)?(APPROVE|REQUEST CHANGES)\b", re.MULTILINE)
+
+
+def reply_verdict(text: str) -> ReviewVerdict:
+    found = VERDICT_WORD.search(text)
+    return ReviewVerdict(found.group(1)) if found else ReviewVerdict.NO_VERDICT
+
+
+def file_verdict(reply_file: str) -> ReviewVerdict:
+    """The verdict of a reply file; a missing or unreadable file has no verdict."""
+    if not reply_file:
+        return ReviewVerdict.NO_VERDICT
+    try:
+        return reply_verdict(Path(reply_file).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return ReviewVerdict.NO_VERDICT
+
+
+def reviewed_head(session_dir: Path, phase_id: str) -> ReviewedHead | HeadUnknown:
+    """Read the HEAD of the phase tree; one git call."""
+    from scripts.direct import phase_reservation
+
+    if not phase_reservation.phase_directory_name(phase_id):
+        return HeadUnknown.UNKNOWN
+    try:
+        tree = phase_reservation.phase_worktree(phase_reservation.phase_directory(session_dir, phase_id)).root
+    except (OSError, ValueError, LookupError, staff.StaffRefused):
+        return HeadUnknown.UNKNOWN
+    head = subprocess.run(["git", "-C", str(tree), "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+                          capture_output=True, text=True, check=False)
+    commit = head.stdout.strip()
+    return ReviewedHead(tree, commit) if head.returncode == 0 and commit else HeadUnknown.UNKNOWN
+
+
 def close_slot_pass(
     session_dir: Path,
     state: dict[str, object],
@@ -754,7 +809,13 @@ def close_slot_pass(
         return False
     event = record_event(state, "pass_finished", now, current_pass)
     event["status"] = status
-    event["reply_file"] = dispatch_delivery(current_pass).reply_file
+    reply_file = dispatch_delivery(current_pass).reply_file
+    event["reply_file"] = reply_file
+    if string(current_pass.get("kind")) == "review":
+        event["verdict"] = file_verdict(reply_file).value
+        reviewed = reviewed_head(session_dir, string(event.get("phase_id")))
+        event["reviewed_commit"] = reviewed.commit if isinstance(reviewed, ReviewedHead) else reviewed.value
+        event["reviewed_tree"] = str(reviewed.tree) if isinstance(reviewed, ReviewedHead) else reviewed.value
     # Taken from the pass, not from the environment. A stale pass is closed by
     # whichever launcher starts the next one in that worker, and reading the
     # environment here would stamp the closer's worker onto the opener's work.
