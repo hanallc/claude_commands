@@ -677,8 +677,8 @@ After a lost response for a pending capture, Send retries the original payload, 
 The dialog keeps any edits for a new Send.
 Review refreshes the saved row.
 The List refreshes its records after the save.
-Both pages keep the address, scroll position, and focus while an open item holds edits.
-Review also keeps the open row's place on the screen.
+Both pages keep the address and focus while an open item holds edits.
+The open row keeps its place on the screen.
 Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.

@@ -1115,8 +1115,7 @@ def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str, *,
                            'zone': snapshot.zone.key, 'later': dict(snapshot.later),
                            'requestTimeoutSeconds': snapshot.request_timeout_seconds})
     content = (record_table.STYLE + record_table.DATE_TIME_STYLE + STYLE + CARD_VIEW_STYLE
-               + f'<div data-review-card {snapshot.card_motion.attributes()}'
-               + f' style="--list-log-max-height:{snapshot.log_max_height_rem}rem">'
+               + f'<div data-review-card {snapshot.card_motion.attributes()}>'
                + '<div class="review-card-status" data-review-card-updates>'
                + '<span role="status" data-review-card-notice></span>'
                + '<button type="button" data-show-record-updates hidden>Show updates</button></div></div>'
@@ -1469,7 +1468,9 @@ scrollbar-color:color-mix(in srgb,var(--ink-3) 45%,var(--card)) transparent}
 .review-box .review-panel{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
 column-gap:24px;row-gap:0;border:0;padding:0}
 .review-box .review-panel>div{min-width:0}
-.review-box :is([data-title-fallback],[data-empty-review-section],section:has(>.list-log:empty)){display:none}
+.review-box :is([data-title-fallback],[data-empty-review-section],.list-log-panel:has(.list-log:empty)){display:none}
+/* The box scrolls as one area, so its log takes its full height. */
+.review-box .review-log-column>.list-log-panel{flex:none;contain:none}.review-box .list-log-scroll{max-height:none;overflow:visible}
 .review-box .review-panel:not(:has(.review-handoff,[data-review-body]>:not([data-empty-review-section])))
 >div:nth-child(2){grid-column:1/-1}
 .review-box .review-source{margin:12px 0 0!important}
