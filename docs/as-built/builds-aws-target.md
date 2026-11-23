@@ -397,6 +397,7 @@ A refused key is the one exception.
 When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
 While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
 The hourly job also makes no AWS call while the record exists.
+The cloud gate route then sends each gate to natedev with no AWS call, with the reason `key_refusal.REFUSED_REASON`.
 The record clears only after one child sees every AWS machine off and a later child sees one on.
 So a person sets `enabled=off` in both `cloud_gate.conf` and `hana_aws.conf`, keeps them off for at least one tick (about 10 s), then sets one to `on`.
 An unusable `enabled` value does not count as off for this rule.

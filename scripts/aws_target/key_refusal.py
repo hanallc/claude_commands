@@ -2,7 +2,7 @@
 
 A refused key refuses every later call too, so each tick would only repeat the refusal.
 The record holds the calls until a tick sees every AWS machine off and a later tick sees one on.
-The hourly job reads the record too, so it also makes no call while the record exists.
+The hourly job and the cloud gate route read the record too, so they also make no call while it exists.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 RECORD_NAME = 'key_refused.json'
 UNREADABLE_CODE = 'unreadable refusal record'
+REFUSED_REASON = 'AWS refused the key; no AWS call until a person turns every AWS machine off and then one on'
 
 
 @dataclass(frozen=True)

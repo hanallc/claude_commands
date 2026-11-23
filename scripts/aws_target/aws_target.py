@@ -665,8 +665,7 @@ def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *
             code = refused_key_code(error)
             if code:
                 key_refusal.write(directory, key_refusal.KeyRefused(code, int(clock()), off_seen=False))
-                print(f'aws_target: AWS refused the key ({code}); no AWS call until a person turns '
-                      + 'every AWS machine off and then one on again', file=sys.stderr)
+                print(f'aws_target: {key_refusal.REFUSED_REASON} ({code})', file=sys.stderr)
                 return 1
             status = 1
     return status

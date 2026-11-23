@@ -8,9 +8,11 @@ import subprocess
 from typing import override
 from unittest import mock
 
-from scripts.aws_target import aws_target, key_refusal
+from scripts.aws_target import aws_target, cloud_gate, key_refusal
 from scripts.aws_target.hana_provider import ProviderKeyRefused, ProviderPending, ProviderStartRefused
-from scripts.aws_target.ledger_test_support import CostFixture, override_fixture_settings
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, override_fixture_settings
+from scripts.build_targets import target_config
+from scripts.production import gate
 
 REFUSED_DESCRIBE = ProviderKeyRefused('AuthFailure', 'Hana provider call failed: ec2:DescribeInstances (AuthFailure)')
 
@@ -51,7 +53,7 @@ class KeyRefusalTests(CostFixture):
         self.lifecycle_error = REFUSED_DESCRIBE
         error = StringIO()
         self.assertEqual(self.tick(error), 1)
-        self.assertIn('AWS refused the key (AuthFailure)', error.getvalue())
+        self.assertIn(key_refusal.REFUSED_REASON + ' (AuthFailure)', error.getvalue())
         self.assertEqual(key_refusal.read(self.state), key_refusal.KeyRefused('AuthFailure', 1000, off_seen=False))
         for _tick in range(3):
             self.assertEqual(self.tick(), 0)
@@ -124,3 +126,21 @@ class KeyRefusalTests(CostFixture):
         self.assertEqual(self.tick(), 1)
         self.assertEqual(self.events, ['lifecycle', 'refresh'] * 2)
         self.assertEqual(key_refusal.read(self.state), key_refusal.NoKeyRefusal())
+
+    def test_the_cloud_gate_route_makes_no_call_while_the_record_exists(self) -> None:
+        key_refusal.write(target_config.ssh_target_state_directory('aws'),
+                          key_refusal.KeyRefused('AuthFailure', 1000, off_seen=False))
+        commands: list[str] = []
+
+        def record(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] != 'git':
+                commands.append(arguments[0])
+            return git_only(arguments, **options)
+
+        service = mock.Mock(side_effect=AssertionError('A cloud gate service started after a refused key'))
+        with mock.patch.object(subprocess, 'run', side_effect=record), redirect_stderr(StringIO()):
+            outcome = cloud_gate.run(self.root, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=service)
+        self.assertEqual(outcome, cloud_gate.LocalFallback(key_refusal.REFUSED_REASON))
+        service.assert_not_called()
+        self.assertEqual(commands, [])
