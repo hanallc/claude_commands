@@ -36,6 +36,7 @@ from scripts.lib.dev_shell import (
     shell_inputs as shell_inputs,
     shell_key as shell_key,
 )
+from scripts.mac_test import floor_claims
 from scripts.mac_test.abandoned_sessions import removal_script
 
 if TYPE_CHECKING:
@@ -95,7 +96,7 @@ class LeasedCommandLost(RuntimeError):
 
 def execution_descriptors() -> tuple[int, ...]:
     """Keep mirror locks and maker locks through every command child."""
-    return tuple(dict.fromkeys((*copies.inherited_mirror_descriptors(),
+    return tuple(dict.fromkeys((*floor_claims.inherited_mirror_descriptors(),
                                *build_folders.held_build_folder_descriptors())))
 
 

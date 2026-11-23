@@ -20,6 +20,19 @@ root="${shim%/*/*/*}"
 NEED_MAJOR=3
 NEED_MINOR=12
 
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    cache_dir="$XDG_CACHE_HOME/claude"
+elif [[ ${OSTYPE:-} == darwin* ]]; then
+    cache_dir="$HOME/Library/Caches/claude"
+else
+    cache_dir="$HOME/.cache/claude"
+fi
+# --cache-folder prints the folder of the python path cache, which this file then reads and runs.
+if [[ "${1:-}" == --cache-folder ]]; then
+    printf '%s\n' "$cache_dir"
+    exit 0
+fi
+
 python_options=()
 file_separator=()
 mode=stdin
@@ -114,13 +127,6 @@ else
     set -- ${python_options[@]+"${python_options[@]}"} -P -c "$bootstrap" "$root" "$mode" "$target" "$@"
 fi
 
-if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
-    cache_dir="$XDG_CACHE_HOME/claude"
-elif [[ ${OSTYPE:-} == darwin* ]]; then
-    cache_dir="$HOME/Library/Caches/claude"
-else
-    cache_dir="$HOME/.cache/claude"
-fi
 cache_file="$cache_dir/python3-$NEED_MAJOR.$NEED_MINOR"
 
 if [[ -z "${CLAUDE_PYTHON:-}" && -r "$cache_file" ]]; then

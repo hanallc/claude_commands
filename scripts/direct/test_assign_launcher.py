@@ -33,6 +33,7 @@ from scripts.production.staff_test_support import fixture_session, fixture_runti
 from scripts.message import send, sessions
 from scripts.agents import stop_resume
 from scripts.usage import agents_log
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 def setUpModule() -> None:
     codex_fixture.setUpModule()
@@ -56,7 +57,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "UNIT_RUN_ROOT": str(self.session_dir.parent),
             "SCRATCH_ROOT": str(self.session_dir.parent / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(self.session_dir.parent / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.session_dir.parent / "scratch-holds.json"),
         })))
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):
@@ -758,7 +758,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         prompt = self.prompt.read_bytes()
         self.native.fixture.world.unreadable = True
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             result = self.launch(execution=InProcessAssignment())
         self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
         self.assertEqual(self.native.fixture.world.launches, [])
@@ -773,7 +773,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         write_text_atomic(self.prompt, "Phase 3 — Claim before assignment\nImplement the assigned change.\n")
         write_text_atomic(self.session_dir / "dispatch_events.txt", "")
         environment, calls = HerdrClaimFixture().claim_fixture(self.session_dir, claim_status)
-        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        environment["HERDR_BIN"] = MISSING_HERDR_BIN
         self.native.fixture.world.unreadable = True
         with patch.dict(os.environ, environment):
             self.instrument_launcher("\n".join((

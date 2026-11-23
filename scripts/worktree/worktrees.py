@@ -101,6 +101,11 @@ class Kept:
 
 
 @dataclass(frozen=True)
+class Clean:
+    """The check found no unsaved work in the checkout."""
+
+
+@dataclass(frozen=True)
 class OriginBranchAbsent:
     """Origin has no branch to delete."""
 
@@ -538,11 +543,16 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
     return CheckedOriginTip(tip)
 
 
+def dirty_check(path: Path) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes, and name them on one line."""
+    dirty = git(path, "status", "--porcelain").stdout
+    return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines())) if dirty else Clean()
+
+
 def cleanup(path: Path) -> CleanupReady | Kept:
     _ = git(path, "fetch", "--no-prune", "origin")
-    dirty = git(path, "status", "--porcelain").stdout
-    if dirty:
-        return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
+    if isinstance(dirty := dirty_check(path), Kept):
+        return dirty
     head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode == 1:
         return Kept(path, "HEAD is detached")
@@ -606,9 +616,8 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if isinstance(member, session_staff.MemberFound):
         return Kept(path, f"staff member {member.row.name} holds this worktree")
     if path.exists():
-        dirty = git(path, "status", "--porcelain").stdout
-        if dirty:
-            return Kept(path, f"dirty worktree: {dirty.rstrip()}")
+        if isinstance(dirty := dirty_check(path), Kept):
+            return dirty
         head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
         expected = f"refs/heads/{record.branch}"
         if head.returncode or head.stdout.strip() != expected:
@@ -701,8 +710,12 @@ def create_checkout(path: Path, source: Path,
                     layout: RecordedWorktreeOutput | UnassignedOutput, *,
                     owner: str = "", merge_branch: str = "", allow_empty: bool = False,
                     allow_existing: bool = False, fixed_base: bool = False,
-                    use_recorded_branch: bool = False, carry_envrc_permission: bool = False) -> Path:
-    """Finish a recorded checkout or make one through the shared allocator."""
+                    use_recorded_branch: bool = False, record_adoption: bool = False,
+                    carry_envrc_permission: bool = False) -> Path:
+    """Finish a recorded checkout or make one through the shared allocator.
+
+    Unit admission opts in to setting up and recording an existing checkout.
+    """
     path = path.absolute()
     repo = main_checkout(source)
     with move_lock():
@@ -724,6 +737,14 @@ def create_checkout(path: Path, source: Path,
         start = branch.start_point if isinstance(branch, build_folders.NewWorktreeBranch) else f"refs/heads/{branch.name}"
         if record is None:
             if registered and allow_existing:
+                if record_adoption:
+                    if not isinstance(layout, RecordedWorktreeOutput):
+                        raise ValueError(f"{path}: adoption requires a worktree output assignment")
+                    output = checked_output(layout)
+                    base = checkout_base(path, "HEAD")
+                    ensure_target_link(path, output)
+                    record = new_record(path, branch.name, repo, base, owner, merge_branch)
+                    write_record(replace(record, layout=layout))
                 return path
             if exists and not (allow_empty and empty_checkout_path(path)):
                 raise FileExistsError(f"{path}: editable repository destination is occupied")
@@ -925,6 +946,45 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
     elif not retain_record:
         release_worktree_pair(path)
         record_file(path).unlink(missing_ok=True)
+
+
+def unsaved_work(path: Path) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes or with commits that are on no remote."""
+    dirty = dirty_check(path)
+    if isinstance(dirty, Clean) and git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes").stdout.strip():
+        return Kept(path, "commits that are on no remote")
+    return dirty
+
+
+def remove_named(unit: str, short_name: str) -> list[str]:
+    """Remove each recorded worktree of `unit` called `short_name`, and keep its branch.
+
+    A worktree with unsaved work stays, and its line names the command to run after the work is saved.
+    A worktree that an error stops stays, and its line names the first line of the error.
+    """
+    lines: list[str] = []
+    for record_path in sorted(state_folder().glob("*.json")):
+        try:
+            record = read_record(record_path)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record.layout, RecordedWorktreeOutput) or (
+                record.layout.unit, record.layout.short_name) != (unit, short_name):
+            continue
+        path, repo = Path(record.path), Path(record.repo)
+        try:
+            state = unsaved_work(path) if path.exists() else Clean()
+            if isinstance(state, Clean):
+                remove_git_checkout(path, repo)
+                continue
+        except (Refused, OSError, ValueError) as error:
+            first_line = str(error).partition("\n")[0]
+            lines.append(f"{path} not removed: {first_line}")
+            continue
+        command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
+        lines.append(f"{path} kept: {state.reason}. Save the work, then run: {command}")
+    return lines
 
 
 @dataclass(frozen=True)

@@ -308,7 +308,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step: nextest needs 0.4 GiB", output.getvalue())
         self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()

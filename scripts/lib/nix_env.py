@@ -6,6 +6,7 @@ Linked worktrees registered by repositories below those roots also qualify.
 Numbered copies require a regular envrc that matches their recorded source commit.
 Legacy AWS slots require a regular envrc that matches their Git HEAD.
 Registered scratch copies qualify when their envrc matches their recorded source commit in a trusted repository.
+A `copies.py run` snapshot qualifies the same way, by the source commit its binding names.
 Other folders require explicit direnv approval.
 Without an envrc, the caller keeps its environment without running direnv.
 """
@@ -152,7 +153,7 @@ def slot_envrc_trust(envrc: Path) -> SlotEnvrcTrust:
 
 
 def _legacy_copy_envrc(envrc: Path) -> bool:
-    """Compare a legacy copy's envrc with its recorded source commit."""
+    """Compare a legacy copy's or a run snapshot's envrc with its recorded source commit."""
     import subprocess
     from scripts.lib import copy_record, git_files
 
