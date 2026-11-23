@@ -101,6 +101,7 @@ class ReplacedClientTests(unittest.TestCase):
                 (wire.AdmissionUnavailable(OTHER_REASON), False,
                  f"admission service unavailable: {OTHER_REASON}; step refused\n", "")):
             with self.subTest(raised=raised.reason, pinned=pinned), \
+                 mock.patch.dict(os.environ, {client.RESERVED_STEP_ENV: ""}), \
                  mock.patch.object(client, "_place_step", side_effect=raised), \
                  redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()) as output:
                 status = client.main([*arguments, *(["--pinned-refusals"] if pinned else [])])
