@@ -19,13 +19,17 @@ from unittest import mock
 from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement
+from scripts.build_queue import queue_place
 from scripts.build_queue import test_placement as placement_fixture
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import conf, process_group
+from scripts.lib.build_slots import SlotQueuePosition
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
@@ -464,6 +468,114 @@ class MacGateSuitesTests(GateSuitesFixture):
             guest.assert_called_once()
             self.cloud_route.assert_not_called()
             local.assert_not_called()
+            # The guest took the run, so the gate is not placed again.
+            self.assertFalse(Path(str(path) + CLAIM_FAILURE_SUFFIX).exists())
+
+    def gate_request(self, *assignments: placement.PlacementAssignment) -> admission_wire.PlacementRequest:
+        first = assignments[0]
+        profile = admission_records.ProgramProfile("gate", str(self.checkout), str(self.checkout),
+            admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0.0))
+        return admission_wire.PlacementRequest(first.episode, first.owner, first.since, profile,
+            placement.PlacementConstraints(first.source_key, ("gate.py", "--tests-only"), str(self.checkout), "",
+                first.session, tuple(placement.PlacementCandidate(item.destination) for item in assignments)))
+
+    def test_silent_mac_linux_guest_writes_a_claim_failure_and_exits_79(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        assignment = self.gate_assignment("mac-linux")
+        path = self.write_gate_assignment(assignment)
+        self.set_placement_status(assignment, placement.CurrentAssignment())
+        reason = "mac-linux: not started: the guest did not arm the run: fixture SSH refused the connection"
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(reason)) as guest,
+              mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
+        self.assertIn(reason, errors.getvalue())
+        guest.assert_called_once()
+        local.assert_not_called()
+        self.cloud_route.assert_not_called()
+        refusal = first_step.read_gate_claim_failure(path, self.gate_request(assignment))
+        self.assertEqual((refusal.assignment, refusal.reason), (assignment, MAC_LINUX_NO_ANSWER))
+        self.assertIsInstance(refusal.claim, placement.NoProviderClaim)
+
+    def test_silent_mac_linux_guest_goes_back_to_its_lines_and_natedev_runs_the_gate(self) -> None:
+        # Two named machines: the Mac Linux guest takes no run, so natedev takes the gate.
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        guest_assignment = self.gate_assignment("mac-linux")
+        local_assignment = replace(guest_assignment, attempt="natedev-attempt",
+            destination=placement.PlacementDestination("local", "natedev", "fixture-dev", claim_state.RepositoryScope("fixture")))
+        request = self.gate_request(guest_assignment, local_assignment)
+        local_grant = admission_wire.LocalPlacementGranted(local_assignment,
+            admission_wire.Admitted("reservation", 1, "fixture", "", "", {}))
+        path = self.write_gate_assignment(guest_assignment)
+        self.set_placement_status(guest_assignment, placement.CurrentAssignment())
+        admitted = first_step.FirstStepAdmission(SlotQueuePosition("episode", 1.0),
+            first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
+
+        def settle(refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
+            self.assertEqual((refusal.assignment, refusal.reason), (guest_assignment, MAC_LINUX_NO_ANSWER))
+            return admission_wire.DispatchStatus(guest_assignment, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER),
+                placement.PermissionAvailable(), retry=placement.RetryAt(13.0))
+
+        def place(placed: admission_wire.PlacementRequest) -> admission_wire.LocalPlacementGranted:
+            self.assertEqual(placed, request)
+            self.set_placement_status(local_assignment, placement.CurrentAssignment())
+            return local_grant
+
+        def run() -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()):
+                status = gate.main(["--tests-only", "--repo", str(self.checkout)])
+            return subprocess.CompletedProcess(["gate.py", "--tests-only"], status, "", "")
+
+        local_result = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0,
+                                    selection_certified=True)
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(
+                  "mac-linux: not started: the guest did not arm the run: fixture")) as guest,
+              mock.patch.object(gate, "run_suites", return_value=local_result) as local,
+              mock.patch.object(admission_client, "claim_failure", side_effect=settle) as settled,
+              mock.patch.object(first_step, "_placement_grant", side_effect=place) as placed,
+              mock.patch.object(queue_place, "release_place", return_value=None),
+              redirect_stdout(io.StringIO()) as output):
+            result = admitted.run_gate(run)
+            self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], local_assignment.episode)
+        self.assertEqual(result.returncode, 0)
+        guest.assert_called_once()
+        local.assert_called_once()
+        settled.assert_called_once()
+        placed.assert_called_once_with(request)
+        self.cloud_route.assert_not_called()
+        self.assertEqual(admission_wire.read_assignment(path), local_grant)
+        self.assertIn("placement: retry — fixture-host (mac-linux) did not answer.", output.getvalue())
+
+    def test_a_refused_placement_during_the_retry_stops_the_gate_as_blocked(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        guest_assignment = self.gate_assignment("mac-linux")
+        request = self.gate_request(guest_assignment)
+        path = self.write_gate_assignment(guest_assignment)
+        self.set_placement_status(guest_assignment, placement.CurrentAssignment())
+        admitted = first_step.FirstStepAdmission(SlotQueuePosition("episode", 1.0),
+            first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
+
+        def settle(_refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
+            return admission_wire.DispatchStatus(guest_assignment, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER),
+                placement.PermissionAvailable(), retry=placement.RetryAt(190.0))
+
+        def run() -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()):
+                status = gate.main(["--tests-only", "--repo", str(self.checkout)])
+            return subprocess.CompletedProcess(["gate.py", "--tests-only"], status, "", "")
+
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(
+                  "mac-linux: not started: fixture")) as guest,
+              mock.patch.object(admission_client, "claim_failure", side_effect=settle),
+              mock.patch.object(first_step, "_placement_grant",
+                                side_effect=first_step.FirstStepRefused("the request left the queue", 75)),
+              redirect_stdout(io.StringIO())):
+            result = admitted.run_gate(run)
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
+        self.assertIn("Gate placement blocked. the request left the queue", result.stderr)
+        guest.assert_called_once()
 
     def test_merge_gate_cli_reports_failed_mac_linux_jobs(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")

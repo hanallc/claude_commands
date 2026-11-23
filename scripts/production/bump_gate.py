@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 
 from scripts.production.checkpoint_gate import (
@@ -46,7 +47,9 @@ def run_gate(path: Path) -> int:
             steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
                                tuple(tuple(command) for command in record["merge_tests"]))
             command = steps[0].command if steps else []
-            # Empty selections and OtherCommand keep the existing slot order.
+            # The checkpoint caller places each named gate under its own process.
+            if gate_targets(command):
+                command = []
             with copies.command_tree(record["owner_id"], source, copies.CommittedSource("HEAD"),
                                      command, step="integrate") as clone:
                 production = replace(production, checkout=clone)

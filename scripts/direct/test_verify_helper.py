@@ -145,6 +145,27 @@ def main():
                 status, output, errors = self.request(process, "second", "", "newer")
                 self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
 
+    def test_a_tree_update_rebinds_a_namespace_package_member(self) -> None:
+        # A namespace package has no source file, so it stays loaded across a tree update.
+        package = self.root / "fixturens"
+        package.mkdir()
+        _ = (package / "base.py").write_text("OLD = 'old'\n")
+        self.program = self.root / "namespace_program.py"
+        _ = self.program.write_text('''import json, os, sys
+from pathlib import Path
+def main():
+    from fixturens import base
+    if sys.argv[1:] == ["update"]:
+        package = Path(__file__).parent / "fixturens"
+        (package / "base.py.new").write_text("OLD = 'old'\\nNEW = 'new'\\n")
+        os.replace(package / "base.py.new", package / "base.py")
+    print(json.dumps(dict(value=getattr(base, "NEW", base.OLD))))
+    return 0
+''')
+        process = self.start_helper()
+        self.assertEqual(self.request(process, "first", "", "update"), (0, dict(value="old"), ""))
+        self.assertEqual(self.request(process, "second", "", "read"), (0, dict(value="new"), ""))
+
     def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
         process = self.start_helper()
         assert process.stdin is not None

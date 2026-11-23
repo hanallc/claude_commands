@@ -37,6 +37,7 @@ from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from secrets import token_hex
 from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
@@ -511,6 +512,8 @@ if has "$@"; then
     if ! has "$@"; then printf 'Cargo.toml\0'; fi
     exit 0
 fi
+wanted=--max-parents=0
+if has "$@"; then printf '%s\n' "${TEST_ROOT_COMMIT:?}"; exit 0; fi
 for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
@@ -555,6 +558,16 @@ if "--assignment-file" in arguments:
     with redirect_stdout(io.StringIO()):
         claim_status = assigned_mac_test.command_claim(claim_args, paths, watch_claim=False,
             session=assignment.session, assignment=assignment)
+    if claim_status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        from scripts.mac_test import offload
+
+        reason = claim_state.MAC_HISTORY_KEY_UNAVAILABLE
+        status = offload.write_result(offload.DeclinedMacRun(reason, 0), offload.ResultFile(result))
+        try:
+            _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assignment.episode, assignment.owner, reason))
+        except wire.AdmissionUnavailable as error:
+            print(f"fixture cancellation failed: {{error}}", file=sys.stderr, flush=True)
+        raise SystemExit(status)
     if claim_status != 0:
         raise SystemExit(75)
     held, = [held for held in claim_state.read_claims(paths) if held.record["pid"] == os.getpid()]
@@ -1033,6 +1046,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.fixture_paths()
             self.environment = self.fixture_environment.copy()
+            self.environment["TEST_ROOT_COMMIT"] = token_hex(20)
         else:
             # Standalone consumers own their fixture through doCleanups().
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1302,6 +1316,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "holder_pid"),
             "TEST_METADATA": json.dumps(metadata),
+            "TEST_ROOT_COMMIT": token_hex(20),
             "TEST_RUNNER_SECONDS": "3.25",
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
@@ -1364,7 +1379,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
-            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
+            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "remove_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",

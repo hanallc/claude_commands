@@ -29,7 +29,7 @@ from typing import Literal, cast
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
-from scripts.build_queue import admission_service, placement
+from scripts.build_queue import admission_protocol, admission_service, placement
 from scripts.aws_target import hana_placement
 from scripts.build_targets import target_config
 from scripts.mac_test import claim_state
@@ -43,7 +43,6 @@ from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.lib.process_group import send_process_group
 
 
 def ci_placement_lines(proc_root: Path) -> list[str]:
@@ -91,16 +90,60 @@ def ci_placement_lines(proc_root: Path) -> list[str]:
             for status, name, since, pid in sorted(rows.values(), key=lambda row: (row[2], row[3]))]
 
 
-def admitted_processes() -> frozenset[build_hold.ProcessIdentity]:
-    """Read durable grants, which precede replies and the next decision pass."""
-    from scripts.build_queue import admission_service
-
+def admission_state() -> admission_service.ServiceState:
+    """Read the durable admission state, or raise OSError when it is unavailable."""
     try:
-        state = admission_service.read_state(store.root() / "admission")
+        return admission_service.read_state(store.root() / "admission")
     except (OSError, ValueError) as error:
         raise OSError(f"admission state unavailable: {error}") from error
+
+
+def reservation_owners(state: admission_service.ServiceState) -> frozenset[build_hold.ProcessIdentity]:
+    """Name the owner of each durable grant."""
     return frozenset(build_hold.ProcessIdentity(record.owner.pid, record.owner.start_time)
                      for record in state.reservations.values())
+
+
+def admitted_processes() -> frozenset[build_hold.ProcessIdentity]:
+    """Read durable grants, which precede replies and the next decision pass."""
+    return reservation_owners(admission_state())
+
+
+@dataclass(frozen=True)
+class AdmissionUnreadable:
+    """The drain cannot read the admission state."""
+    reason: str
+
+
+def taken_runs(state: admission_service.ServiceState, proc_root: Path) -> frozenset[build_hold.ProcessIdentity]:
+    """Name each live run that natedev took, by its run controller process.
+
+    A verify run slot holds natedev from the first local grant to the end of the outer verify call.
+    A local reservation holds its run, or its owner when it has no run.
+    """
+    runs = {build_hold.ProcessIdentity(slot.owner.pid, slot.owner.start_time)
+            for slot in admission_service.saved_verify_run_slots(state).values()}
+    for record in state.reservations.values():
+        # A grant returned before launch did not use natedev.
+        if (isinstance(record.place, admission_protocol.LocalPlace)
+                and not isinstance(record.ending, admission_service.LocalGrantReturned)):
+            run = record.owner if isinstance(record.run, admission_protocol.NoRun) else record.run
+            runs.add(build_hold.ProcessIdentity(run.pid, run.start_time))
+    return frozenset(run for run in runs if build_hold.process_start_time(run.pid, proc_root) == run.start_time)
+
+
+def recorded_runs(
+    candidates: set[build_hold.ProcessIdentity], processes: Mapping[int, build_hold.AuditProcess],
+) -> frozenset[build_hold.ProcessIdentity]:
+    """Name the run that BUILDLOG_RUN records for each candidate, when that run is a live ancestor."""
+    runs: set[build_hold.ProcessIdentity] = set()
+    for candidate in candidates:
+        process = processes[candidate.pid]
+        lineage = (process, *build_hold.audit_ancestors(process, processes))
+        recorded = next((value for item in lineage if (value := item.environment.get("BUILDLOG_RUN"))), "")
+        runs.update(item.identity for item in lineage
+                    if f"{item.identity.pid}:{item.identity.start_time}" == recorded)
+    return frozenset(runs)
 
 
 @dataclass(frozen=True)
@@ -301,11 +344,19 @@ def classify_drain_runs(
 def drain_identities(
     proc_root: Path, identity: build_hold.HolderIdentity,
 ) -> tuple[build_hold.ProcessIdentity, ...]:
-    """Keep working gates, CI workers, and builds that the hold could stop.
+    """Keep each run that natedev took, and working gates, CI workers, and builds that the hold could stop.
 
-    A gate that only waits is not kept: it waits for the release like new work.
+    A kept run holds natedev until it ends, also between its steps.
+    The drain keeps the run and the outermost working process of its step.
+    A gate that only waits under no taken run is not kept: it waits for the release like new work.
     """
     processes = build_hold.read_audit_processes(proc_root, build_hold.DRAIN_BUILD_AUDIT)
+    admission: admission_service.ServiceState | AdmissionUnreadable
+    try:
+        admission = admission_state()
+    except OSError as error:
+        print(f"{error}; the drain keeps every outermost gate and reads runs from BUILDLOG_RUN", file=sys.stderr)
+        admission = AdmissionUnreadable(str(error))
     holder = build_hold.Holder(identity.name, datetime.now(timezone.utc), "drain",
                                build_hold.UnknownReleaseEta(), identity.key)
     claims = claimed_processes(proc_root)
@@ -314,14 +365,18 @@ def drain_identities(
     candidates = {decision.process.identity for decision in
                   decide_builds(processes, (holder,), os.getuid(), os.getpid(), claimed)
                   if isinstance(decision, WouldStopBuild)}
-    candidates.update(working_gates(processes, claims))
+    candidates.update(working_gates(processes, claims, admission if isinstance(admission, AdmissionUnreadable)
+                                    else reservation_owners(admission)))
     candidates.update(process.identity for process in processes.values()
                       if process.command == "Runner.Worker"
                       or process.executable == "Runner.Worker"
                       or process.argv and Path(process.argv[0]).name == "Runner.Worker")
+    runs = (recorded_runs(candidates, processes) if isinstance(admission, AdmissionUnreadable)
+            else taken_runs(admission, proc_root))
+    outermost = {candidate for candidate in candidates if not any(
+        parent.identity in candidates for parent in build_hold.audit_ancestors(processes[candidate.pid], processes))}
     return tuple(process.identity for process in processes.values()
-                 if process.identity in candidates and not any(
-                     parent.identity in candidates for parent in build_hold.audit_ancestors(process, processes)))
+                 if process.identity in outermost or process.identity in runs)
 
 
 def wait_for_kept_runs(
@@ -345,17 +400,14 @@ def wait_for_kept_runs(
 
 def working_gates(
     processes: Mapping[int, build_hold.AuditProcess], claims: build_hold.LiveClaims | build_hold.ClaimsUnreadable,
+    admitted: frozenset[build_hold.ProcessIdentity] | AdmissionUnreadable,
 ) -> tuple[build_hold.ProcessIdentity, ...]:
     """Keep every eligible gate if the drain cannot read work evidence."""
-    try:
-        runs = classify_drain_runs(processes, admitted_processes(), claims)
-    except OSError as error:
-        unreadable = str(error)
-    else:
-        if not isinstance(runs, build_hold.ClaimsUnreadable):
-            return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
-        unreadable = f"claims unreadable: {runs.reason}"
-    print(unreadable, file=sys.stderr)
+    if isinstance(claims, build_hold.ClaimsUnreadable):
+        print(f"claims unreadable: {claims.reason}", file=sys.stderr)
+    elif not isinstance(admitted, AdmissionUnreadable) and not isinstance(
+            runs := classify_drain_runs(processes, admitted, claims), build_hold.ClaimsUnreadable):
+        return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
     return tuple(process.identity for process in processes.values()
                  if is_outermost_drain_gate(process, build_hold.audit_ancestors(process, processes)))
 
@@ -496,7 +548,7 @@ def stop_with_restart_notice(
 def stop_waiting_run(
     run: WaitingRun, holder: build_hold.Holder, processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
     *, signal_process: Callable[[int, int], None] = os.kill,
-    signal_group: Callable[[int, int], None] = send_process_group,
+    signal_group: Callable[[int, int], None] | None = None,
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
 ) -> StoppedRun | RunIdentityChanged:
     """Check process identities before TERM and record each stopped gate."""
@@ -507,8 +559,21 @@ def stop_waiting_run(
 
     process = run.process
     identity = process.identity
-    holders = (holder, *build_hold.natedev_holds(build_hold.holder_directory()).in_force)
-    if isinstance(keeping_holder(process, build_hold.audit_ancestors(process, processes), processes, holders), build_hold.Holder):
+    holder_directory = build_hold.holder_directory()
+    holders = build_hold.natedev_holds(holder_directory).in_force
+    if holder not in holders:
+        return RunIdentityChanged(run)
+
+    def kept(candidate: build_hold.AuditProcess) -> bool:
+        lineage = build_hold.audit_ancestors(candidate, processes)
+        return isinstance(keeping_holder(candidate, lineage, processes, holders), build_hold.Holder)
+
+    def supervisor_is_current(run: DetachedRun) -> bool:
+        supervisor = run.supervisor.identity
+        return (build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+                and supervisor_matches(supervisor_args(supervisor.pid, proc_root), run.path, run.supervisor.cwd))
+
+    if kept(process):
         return RunIdentityChanged(run)
     if build_hold.process_start_time(identity.pid, proc_root) != identity.start_time:
         return RunIdentityChanged(run)
@@ -517,12 +582,7 @@ def stop_waiting_run(
         return RunIdentityChanged(run)
     if isinstance(detached, DetachedRun):
         override_guard.require_shared_state_write(Path(__file__), "build_hold/hold_enforcer.py", detached.path)
-        supervisor = detached.supervisor.identity
-        if isinstance(keeping_holder(detached.supervisor, build_hold.audit_ancestors(detached.supervisor, processes),
-                                     processes, holders), build_hold.Holder):
-            return RunIdentityChanged(run)
-        if (build_hold.process_start_time(supervisor.pid, proc_root) != supervisor.start_time
-                or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
+        if kept(detached.supervisor) or not supervisor_is_current(detached):
             return RunIdentityChanged(run)
     classification: build_hold.BuildClass = "other_session" if isinstance(run.owner, OwningSession) else "no_session"
     build = build_hold.AuditedBuild(process, run.owner, classification, ())
@@ -531,14 +591,15 @@ def stop_waiting_run(
     def gate_is_current() -> bool:
         return build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
 
-    def verify_group(run: DetachedRun) -> detached_runs.CommandGroup | detached_runs.CommandGroupUnverified:
-        supervisor = run.supervisor.identity
+    def verify_gate(run: DetachedRun) -> bool:
+        if build_hold.natedev_holds(holder_directory).in_force != holders:
+            return False
+        if not gate_is_current() or not supervisor_is_current(run) or kept(process) or kept(run.supervisor):
+            return False
+        if signal_group is None:
+            return True
         command = detached_runs.command_group(run.path)
-        if (command is not None and gate_is_current()
-                and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
-                and build_hold.process_start_time(command.group, proc_root) == command.started):
-            return command
-        return detached_runs.CommandGroupUnverified()
+        return command is not None and build_hold.process_start_time(command.group, proc_root) == command.started
 
     ancestors = build_hold.audit_ancestors(process, processes)
     recipients = notice_recipients(run.owner, build_hold.run_agent(process, ancestors))
@@ -549,9 +610,9 @@ def stop_waiting_run(
     def stop(request_id: str) -> bool:
         if isinstance(detached, DetachedRun):
             supervised = detached
-            return detached_runs.stop_with_reason(
-                supervised.path, reason, verify_group=lambda: verify_group(supervised), signal_group=signal_group,
-                hold_request_id=request_id)
+            return detached_runs.stop_command(
+                supervised.path, reason, check=lambda: verify_gate(supervised), stop_pass=False,
+                signal_group=signal_group, hold_request_id=request_id)
         if not gate_is_current():
             return False
         signal_process(identity.pid, signal.SIGTERM)
