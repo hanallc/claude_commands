@@ -338,36 +338,49 @@ class BuildSlotsTests(unittest.TestCase):
             self.assertEqual(copy.path, second)
         self.assertFalse(first.exists())
 
-    def take_free_copy(self, notices: io.StringIO) -> AbstractContextManager[build_slots.LeasedCopy]:
-        _ = self.enterContext(redirect_stderr(notices))
+    def take_queue_copy(self) -> AbstractContextManager[build_slots.LeasedCopy]:
         return build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue",
                                      work="reuse", purpose="test")
+
+    def rescue_refs(self) -> str:
+        return self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/")
 
     def test_free_copy_with_an_ignored_folder_is_taken_again(self) -> None:
         _ = (self.source / ".gitignore").write_text("target/\nbuilt/\n")
         self.base = commit_repository(self.source, "ignore tool output")
         notices = io.StringIO()
-        with self.take_free_copy(notices) as copy:
+        _ = self.enterContext(redirect_stderr(notices))
+        with self.take_queue_copy() as copy:
             path = copy.path
             (path / "built").mkdir()
             _ = (path / "built/output").write_text("tool output\n")
             _ = (copy.cargo_dir / "keep").write_text("cached build output\n")
-        with self.take_free_copy(notices) as reused:
+        refs = self.rescue_refs()
+        with self.take_queue_copy() as reused:
             self.assertEqual(reused.path, path)
             self.assertEqual((path / "built/output").read_text(), "tool output\n")
             self.assertEqual((reused.cargo_dir / "keep").read_text(), "cached build output\n")
+        self.assertEqual(self.rescue_refs(), refs)
         self.assertNotIn("untracked folders", notices.getvalue())
 
     def test_free_copy_with_an_untracked_folder_is_kept(self) -> None:
+        exclude = self.source / ".git/info/exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        with exclude.open("a") as output:
+            _ = output.write("saved/\n")
         notices = io.StringIO()
-        with self.take_free_copy(notices) as copy:
-            path = copy.path
-            (path / "notes").mkdir()
-            _ = (path / "notes/draft.txt").write_text("unsaved work\n")
-        with self.take_free_copy(notices) as other:
-            self.assertNotEqual(other.path, path)
-        self.assertIn(f"kept for a manual removal list: {path} (build_slots, untracked folders)", notices.getvalue())
-        self.assertEqual((path / "notes/draft.txt").read_text(), "unsaved work\n")
+        _ = self.enterContext(redirect_stderr(notices))
+        for folder in ("notes", "saved"):
+            with self.subTest(folder=folder):
+                with self.take_queue_copy() as copy:
+                    path = copy.path
+                    (path / folder).mkdir()
+                    _ = (path / folder / "draft.txt").write_text("unsaved work\n")
+                with self.take_queue_copy() as other:
+                    self.assertNotEqual(other.path, path)
+                self.assertIn(f"kept for a manual removal list: {path} (build_slots, untracked folders)",
+                              notices.getvalue())
+                self.assertEqual((path / folder / "draft.txt").read_text(), "unsaved work\n")
 
     def test_two_slots_share_one_git_config_migration(self) -> None:
         common = self.source / ".git"
