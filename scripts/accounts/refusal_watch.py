@@ -774,8 +774,8 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RequestedMove]]:
-    latest: dict[str, tuple[datetime, moves.RequestedMove]] = {}
+def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[datetime, moves.RecordedMoveRequest]]:
+    latest: dict[str, tuple[datetime, moves.RecordedMoveRequest]] = {}
     for entry in entries:
         if entry["kind"] != "requested" or entry["tool"] != "claude":
             continue
@@ -787,13 +787,14 @@ def _latest_claude_requests(entries: list[moves.MoveEntry]) -> dict[str, tuple[d
     return latest
 
 
-def _newer_by_hand_move(latest: tuple[datetime, moves.RequestedMove] | None,
+def _newer_by_hand_move(latest: tuple[datetime, moves.RecordedMoveRequest] | None,
                        target: str, selected_at: datetime | None) -> bool:
     if latest is None:
         return False
     at, request = latest
     destination = request["to"]
-    return (request.get("cause") == "by hand" and isinstance(destination, str) and destination != target
+    return (request.get("cause") == "by hand" and request.get("scope", "session") == "session"
+            and isinstance(destination, str) and destination != target
             and (selected_at is None or at > selected_at))
 
 
@@ -1108,74 +1109,233 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                                 if selected_groups.get(group) != before_rules.get(group))
             state = _load_state()
             original_state = deepcopy(state)
-    # A committed group choice is stable. Complete its off-target members without choosing again.
-    if not proof_group and selected_groups:
-        eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
-                    if group not in moved_groups | waiting_groups | no_room_groups
-                    and (group != "producers" or group in selected_groups)
-                    and isinstance(accounts.group_label(selected_groups, group), str)}
-        def completion_members(observed: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]],
-                               group_name: accounts.ClaudeGroup, target: str) -> list[accounts.LiveGroupMember]:
-            return [session for session in observed.get(group_name, ())
-                       if not accounts.session_on_account(session, target)
-                       and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"
-                                and isinstance(detected.get(session.session_id), TranscriptRefusal)
-                                and state["sessions"][session.session_id]["entry_id"] == cast(TranscriptRefusal, detected[session.session_id]).entry_id)]
-
-        if eligible:
-            # Reports can suggest work. A changed registry also finds late arrivals.
-            cached = accounts.live_group_members()
-            previous = _report_sessions.get()
-            changed = isinstance(previous, NoSessionObservation) or previous != _session_identities()
-            needs_completion = changed or any(completion_members(cached, group, target)
-                for group in eligible if isinstance(target := accounts.group_label(selected_groups, group), str))
-        else:
-            needs_completion = False
-        if needs_completion:
-            latest_requests = None
-            with herdr.process_action():
-                all_members = accounts.live_group_members()
-                for group_name in accounts.CLAUDE_GROUPS:
-                    if group_name not in eligible:
-                        continue
-                    target = accounts.group_label(selected_groups, group_name)
-                    if isinstance(target, accounts.GroupNotConfigured):
-                        continue
-                    members = completion_members(all_members, group_name, target)
-                    available = set(_available_members(tuple(session.session_id for session in members)))
-                    members = [session for session in members if session.session_id in available]
-                    if not members:
-                        continue
-                    if latest_requests is None:
-                        # A move can reach its target after the first journal read.
-                        latest_requests = _latest_claude_requests(moves.read_moves())
-                    transition = accounts.group_transition(group_name)
-                    selected_at = transition.at if isinstance(transition, accounts.GroupTransition) else None
-                    members = [session for session in members if not _newer_by_hand_move(
-                        latest_requests.get(session.session_id), target, selected_at)]
-                    if not members:
-                        continue
-                    directory = accounts.claude_account_dir(target)
-                    login = accounts.claude_login(directory)
-                    held = refusals.load().get(refusals.key("claude", login))
-                    if held is not None and not refusals.resolved(held, refusals.stored_reading_with_age("claude", login, now, stale_after), now):
-                        lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
-                        continue
-                    if dry_run:
-                        lines.extend(accounts.move_preview_line(session, target) for session in members)
-                    else:
-                        why = f"complete {group_name} move to {target}"
-                        if isinstance(transition, accounts.NoGroupTransition):
-                            transition = accounts.set_group_account(group_name, target, why=why, now=now)
-                        if isinstance(transition.origin, accounts.AutoOrigin):
-                            why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
-                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
-                            cause=accounts.move_origin_fields(transition.origin)["cause"],
-                            intent=moves.FollowGroupAccount(group_name))
-                        lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
+    if not proof_group:
+        skipped = frozenset(moved_groups | waiting_groups | no_room_groups)
+        if not dry_run:
+            # The Mac age rule covers a plan that is not saved, so the save never stops this pass.
+            try:
+                _save_completion_plan(now, selected_groups, skipped, stale_after)
+            except (OSError, ValueError) as error:
+                lines.append(f"group completion: the completion plan is not saved: {error}")
+        lines.extend(_complete_groups(now, dry_run=dry_run, selected_groups=selected_groups, skipped=skipped, state=state,
+                                      refusals_of=lambda ids: {session_id: detected[session_id] for session_id in ids
+                                                               if session_id in detected},
+                                      stale_after=stale_after))
     if not dry_run and state != original_state:
         _save_state(state)
     return lines
+
+
+SessionRefusals = Mapping[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]
+
+
+def _eligible_groups(selected_groups: accounts.GroupAccounts,
+                     skipped: frozenset[accounts.ClaudeGroup]) -> dict[accounts.ClaudeGroup, str]:
+    """Map each committed group that this pass may complete to its selected account."""
+    return {group: target for group in accounts.CLAUDE_GROUPS
+            if group not in skipped and (group != "producers" or group in selected_groups)
+            and isinstance(target := accounts.group_label(selected_groups, group), str)}
+
+
+def _completion_members(observed: Mapping[accounts.ClaudeGroup, list[accounts.LiveGroupMember]],
+                        group_name: accounts.ClaudeGroup, target: str, state: WatchState,
+                        refusals_of: Callable[[list[str]], SessionRefusals]) -> list[accounts.LiveGroupMember]:
+    off_target = [session for session in observed.get(group_name, ())
+                  if not accounts.session_on_account(session, target)]
+    # A cancelled refusal stays on its account until a new refusal entry.
+    cancelled = {session.session_id for session in off_target
+                 if (watched := state["sessions"].get(session.session_id)) is not None and watched["state"] == "cancelled"}
+    current: SessionRefusals = refusals_of(sorted(cancelled)) if cancelled else {}
+    return [session for session in off_target
+            if not (session.session_id in cancelled
+                    and isinstance(refusal := current.get(session.session_id), TranscriptRefusal)
+                    and state["sessions"][session.session_id]["entry_id"] == refusal.entry_id)]
+
+
+def _available_group_members(members: list[accounts.LiveGroupMember]) -> list[accounts.LiveGroupMember]:
+    available = set(_available_members(tuple(session.session_id for session in members)))
+    return [session for session in members if session.session_id in available]
+
+
+def _target_refused(target: str, now: datetime, stale_after: timedelta) -> bool:
+    login = accounts.claude_login(accounts.claude_account_dir(target))
+    held = refusals.load().get(refusals.key("claude", login))
+    return held is not None and not refusals.resolved(held, refusals.stored_reading_with_age("claude", login, now, stale_after), now)
+
+
+def _completion_why(group_name: accounts.ClaudeGroup, target: str, transition: accounts.GroupTransition) -> str:
+    if isinstance(transition.origin, accounts.AutoOrigin):
+        return transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
+    return f"complete {group_name} move to {target}"
+
+
+def _complete_groups(now: datetime, *, dry_run: bool, selected_groups: accounts.GroupAccounts,
+                     skipped: frozenset[accounts.ClaudeGroup], state: WatchState,
+                     refusals_of: Callable[[list[str]], SessionRefusals], stale_after: timedelta) -> list[str]:
+    """A committed group choice is stable. Complete its off-target local members without choosing again."""
+    lines: list[str] = []
+    eligible = _eligible_groups(selected_groups, skipped)
+    if not eligible:
+        return lines
+    # Reports can suggest work. A changed registry also finds late arrivals.
+    cached = accounts.live_group_members()
+    previous = _report_sessions.get()
+    changed = isinstance(previous, NoSessionObservation) or previous != _session_identities()
+    if not changed and not any(_completion_members(cached, group, target, state, refusals_of)
+                               for group, target in eligible.items()):
+        return lines
+    latest_requests = None
+    with herdr.process_action():
+        all_members = accounts.live_group_members()
+        for group_name, target in eligible.items():
+            members = _available_group_members(_completion_members(all_members, group_name, target, state, refusals_of))
+            if not members:
+                continue
+            if latest_requests is None:
+                # A move can reach its target after the first journal read.
+                latest_requests = _latest_claude_requests(moves.read_moves())
+            transition = accounts.group_transition(group_name)
+            selected_at = transition.at if isinstance(transition, accounts.GroupTransition) else None
+            members = [session for session in members if not _newer_by_hand_move(
+                latest_requests.get(session.session_id), target, selected_at)]
+            if not members:
+                continue
+            if _target_refused(target, now, stale_after):
+                lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
+                continue
+            if dry_run:
+                lines.extend(accounts.move_preview_line(session, target) for session in members)
+            else:
+                if isinstance(transition, accounts.NoGroupTransition):
+                    transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
+                outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target,
+                    why=_completion_why(group_name, target, transition),
+                    cause=accounts.move_origin_fields(transition.origin)["cause"],
+                    intent=moves.FollowGroupAccount(group_name))
+                lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
+    return lines
+
+
+@dataclass(frozen=True)
+class PlannedCompletion:
+    """One group that natedev permits another machine to complete."""
+
+    target: str
+    cause: moves.MoveCause
+    why: str
+    selected_at: datetime | None
+
+
+@dataclass(frozen=True)
+class CompletionPlan:
+    at: datetime
+    groups: Mapping[accounts.ClaudeGroup, PlannedCompletion]
+
+
+class PlannedCompletionDocument(TypedDict):
+    target: str
+    cause: moves.MoveCause
+    why: str
+    selected_at: NotRequired[str]
+
+
+class CompletionPlanDocument(TypedDict):
+    at: str
+    groups: dict[str, PlannedCompletionDocument]
+
+
+def _save_completion_plan(now: datetime, selected_groups: accounts.GroupAccounts,
+                          skipped: frozenset[accounts.ClaudeGroup], stale_after: timedelta) -> None:
+    """Save the groups that this pass would complete, for the machines that natedev does not run."""
+    groups: dict[str, PlannedCompletionDocument] = {}
+    for group_name, target in _eligible_groups(selected_groups, skipped).items():
+        transition = accounts.group_transition(group_name)
+        # This pass records a transition for a legacy selection before it moves a local member.
+        if isinstance(transition, accounts.NoGroupTransition):
+            continue
+        # An unreadable refusal store leaves the group out, so the Mac does not move to a refused account.
+        try:
+            if _target_refused(target, now, stale_after):
+                continue
+        except (accounts.AccountsError, OSError, ValueError):
+            continue
+        entry = PlannedCompletionDocument(target=target, cause=accounts.move_origin_fields(transition.origin)["cause"],
+                                          why=_completion_why(group_name, target, transition))
+        if transition.at is not None:
+            entry["selected_at"] = transition.at.isoformat()
+        groups[group_name] = entry
+    _atomic_json(role_map.completion_plan_file(), CompletionPlanDocument(at=now.isoformat(), groups=groups))
+
+
+def decode_completion_plan(text: str) -> CompletionPlan:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, dict):
+        raise ValueError("completion plan must contain an object")
+    fields = cast(dict[str, object], value)
+    at, raw_groups = fields.get("at"), fields.get("groups")
+    if not isinstance(at, str) or not isinstance(raw_groups, dict):
+        raise ValueError("invalid completion plan")
+    groups: dict[accounts.ClaudeGroup, PlannedCompletion] = {}
+    for group_name, raw in cast(dict[str, object], raw_groups).items():
+        group: accounts.ClaudeGroup | None = next((known for known in accounts.CLAUDE_GROUPS if known == group_name), None)
+        if group is None or not isinstance(raw, dict):
+            raise ValueError("invalid completion plan group")
+        entry = cast(dict[str, object], raw)
+        target, cause, why, selected_at = entry.get("target"), entry.get("cause"), entry.get("why"), entry.get("selected_at")
+        if (not isinstance(target, str) or cause not in ("refusal", "credits off", "by hand", "auto")
+                or not isinstance(why, str) or not isinstance(selected_at, (str, type(None)))):
+            raise ValueError("invalid completion plan group")
+        groups[group] = PlannedCompletion(target, cause, why,
+                                          _aware_time(selected_at) if selected_at is not None else None)
+    return CompletionPlan(_aware_time(at), groups)
+
+
+def _aware_time(text: str) -> datetime:
+    at = datetime.fromisoformat(text)
+    if at.tzinfo is None:
+        raise ValueError("completion plan time needs a zone")
+    return at
+
+
+def complete_local_groups(now: datetime, *, max_age: timedelta,
+                          account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> list[str]:
+    """Complete this machine's off-target group members from natedev's current completion plan.
+
+    Each machine reads only its own registry, so it moves only the members that it runs.
+    It writes no group selection. The move batch reads the current group account again under the row lock.
+    """
+    account_config = accounts.read_account_settings(account_config)
+    with herdr.process_action():
+        observed = accounts.live_group_members()
+        if not any(observed.values()):
+            return []
+        try:
+            plan = decode_completion_plan(role_map.ssh_role_map(("completion-plan-read",)))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+            return [f"group completion: the completion plan is unavailable: {reason}"]
+        if now - plan.at > max_age:
+            return [f"group completion: the completion plan from {plan.at.isoformat()} is too old"]
+        lines: list[str] = []
+        with _watch_lock():
+            state = _load_state()
+            latest_requests = None
+            for group_name, planned in plan.groups.items():
+                members = _available_group_members(_completion_members(
+                    observed, group_name, planned.target, state,
+                    lambda ids: session_refusals(ids, account_config=account_config)))
+                if not members:
+                    continue
+                if latest_requests is None:
+                    latest_requests = _latest_claude_requests(moves.read_moves())
+                members = [session for session in members if not _newer_by_hand_move(
+                    latest_requests.get(session.session_id), planned.target, planned.selected_at)]
+                if not members:
+                    continue
+                outcomes = accounts.move_sessions(tuple(session.session_id for session in members), planned.target,
+                    why=planned.why, cause=planned.cause, intent=moves.FollowGroupAccount(group_name))
+                lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
+        return lines
 
 
 # Preserve the watcher API while sharing replay evidence with quota_alert.

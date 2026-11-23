@@ -25,7 +25,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import new_item_dialog
+from scripts.review_links import new_item_dialog, reply_tokens
 from scripts.review_links.review_events import ReviewMark
 from scripts.style import rules
 
@@ -71,8 +71,11 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
+        _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
-                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners")}))
+                                                     "XDG_STATE_HOME": str(home / "key-state"),
+                                                     "SHOWRUNNER_STATE_DIR": str(home / "showrunners"),
+                                                     "REVIEW_LINKS_ROOT": str(home / "review-links")}))
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
             ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
@@ -92,10 +95,14 @@ class ProposalIssueTests(unittest.TestCase):
         _ = original.write_text(VAULT_ISSUE)
         self.assertEqual(proposal_issue.number([original], date(2026, 11, 17)), ["number a proposal.md: P1"])
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        token = "r" + "b" * 42
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), token)
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
+        note = issue.path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(reply_tokens.digest(token), note)
         self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
         archive = self.root / proposal_issue.ARCHIVE
         archive.mkdir(parents=True)
@@ -148,8 +155,23 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(approved.value(proposal_issue.REVIEW_MARK_FIELD), "")
         key = new_item_dialog.ScopedSubmissionKey(new_item_dialog.SubmissionKind.PROPOSAL, recipient,
                                                    issue.value("proposal_id"), details.request_id)
+        self.assertFalse(reply_tokens.path().exists())
         with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
             _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
+
+    def test_number_replaces_a_legacy_reply_token_with_its_hash(self) -> None:
+        token = "r" + "b" * 42
+        fields: dict[str, object] = {"request_id": "request-1", "request_digest": "a" * 64,
+                                     "evidence": {"kind": "none"}, "images": [], "reply_token": token}
+        text, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": json.dumps(fields)}, self.issue)
+        _ = self.issue.write_text(text)
+
+        self.assertEqual(proposal_issue.number([self.issue], date(2026, 11, 17)), ["number a proposal.md: P1"])
+        note = self.issue.read_text()
+        self.assertNotIn(token, note)
+        origin = proposal_issue.review_submission(Issue(self.issue, frontmatter(self.issue)))
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertTrue(new_item_dialog.matches_reply_token(origin, token))
 
     def test_f060_number_scans_the_folder_of_a_selected_numbered_proposal(self) -> None:
         today = date(2026, 11, 17)

@@ -161,15 +161,39 @@ def run_bound_fixture(message: send.Message, timeout: float, command: list[str],
                                        target.to, send.RelayRequestForwarded("t1", send.agent_text(target, via_relay=True)))
 
 
-def approve_relay_call(command: list[str], target: str, text: str, summary: str, tool_id: str = "t1") -> int:
+STAND_IN = send.RELAY_MESSAGE_STAND_IN
+
+
+def relay_guard_command(command: list[str]) -> list[str]:
+    """The guard command that send.py put in the relay's --settings."""
     settings = send.as_dict(send.loads(command[command.index("--settings") + 1]))
-    hooks = send.as_dict(settings.get("hooks"))
-    group = send.as_dict(send.as_list(hooks["PreToolUse"])[0])
-    hook = send.as_dict(send.as_list(group["hooks"])[0])
-    result = subprocess.run(shlex.split(send.as_str(hook["command"])), text=True, capture_output=True, check=False,
+    group = send.as_dict(send.as_list(send.as_dict(settings.get("hooks"))["PreToolUse"])[0])
+    return shlex.split(send.as_str(send.as_dict(send.as_list(group["hooks"])[0])["command"]))
+
+
+def run_relay_guard(command: list[str], target: str, text: str, summary: str,
+                    tool_id: str = "t1") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(relay_guard_command(command), text=True, capture_output=True, check=False,
         input=json.dumps({"tool_name": "SendMessage", "tool_use_id": tool_id,
                           "tool_input": {"to": target, "message": text, "summary": summary}}))
-    return result.returncode
+
+
+def approve_relay_call(command: list[str], target: str, text: str, summary: str, tool_id: str = "t1") -> int:
+    return run_relay_guard(command, target, text, summary, tool_id).returncode
+
+
+def expected_relay_text(command: list[str]) -> str:
+    """Read the approved message that send.py gave the relay guard."""
+    expected = Path(relay_guard_command(command)[-2])
+    return send.as_str(send.as_dict(send.loads(expected.read_text()))["message"])
+
+
+def guarded_payload(command: list[str], target: str, summary: str) -> str:
+    """Run the guard on a stand-in call, as Claude does, and return the message that Claude then sends."""
+    result = run_relay_guard(command, target, STAND_IN, summary)
+    assert result.returncode == 0, result.stderr
+    output = send.as_dict(send.loads(result.stdout))
+    return send.as_str(send.as_dict(send.as_dict(output["hookSpecificOutput"])["updatedInput"])["message"])
 
 
 RELAY_FIXTURE_TARGET = "uds:/fixture/private/delivery.sock"
@@ -320,8 +344,8 @@ send._bound_relay(message, 2, [], {}, attempt)
                                                        if line.startswith("- to: "))))
                 self.assertNotEqual(destination, message.to)
                 text = send.agent_text(message, via_relay=True)
-                self.assertEqual(approve_relay_call(command, message.to, text + " changed", message.summary), 0)
-                self.assertEqual(approve_relay_call(command, destination, text, message.summary, "t2"), 2)
+                self.assertEqual(approve_relay_call(command, message.to, STAND_IN + " changed", message.summary), 0)
+                self.assertEqual(approve_relay_call(command, destination, STAND_IN, message.summary, "t2"), 2)
                 with socket.socket(socket.AF_UNIX) as client:
                     client.settimeout(2)
                     client.connect(destination.removeprefix("uds:"))
@@ -332,14 +356,14 @@ send._bound_relay(message, 2, [], {}, attempt)
                     client.shutdown(socket.SHUT_WR)
                     if expect_no_write:
                         self.assertEqual(client.recv(1), b"")
-                        return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
+                        return 0, stream(INIT, call(STAND_IN + " changed", target=message.to), answer(OK)), ""
                     with listener.accept()[0] as checked:
                         checked.settimeout(2)
                         with checked.makefile("rb") as request:
                             self.assertEqual(request.read(), wire)
                         checked.sendall(b"fixture reply")
                     self.assertEqual(client.recv(40), b"fixture reply")
-                return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
+                return 0, stream(INIT, call(STAND_IN + " changed", target=message.to), answer(OK)), ""
 
             pid = os.getpid()
             registered = record(pid)
@@ -482,7 +506,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                   if line.startswith("- to: "))))
                 text = send.agent_text(message, via_relay=True)
-                self.assertEqual(approve_relay_call(command, target, text, message.summary), 0)
+                self.assertEqual(approve_relay_call(command, target, STAND_IN, message.summary), 0)
                 partial = stream({"type": "auth", "token": "fixture"}).encode() + relay_wire(text)[:-3]
                 client.settimeout(2)
                 client.connect(target[4:])
@@ -493,7 +517,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                     peer.setblocking(False)
                     with self.assertRaises(BlockingIOError):
                         _ = peer.recv(1)
-                    return 0, stream(INIT, call(text, target=target), answer(OK)), ""
+                    return 0, stream(INIT, call(STAND_IN, target=target), answer(OK)), ""
 
             with mock.patch.object(send, "run", side_effect=launch):
                 result = send.relay(message, 2)
@@ -558,7 +582,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                                _environment: dict[str, str], _cwd: Path) -> tuple[int, str, str]:
                         target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                           if line.startswith("- to: "))))
-                        self.assertEqual(approve_relay_call(command, target, text, message.summary), 0)
+                        self.assertEqual(approve_relay_call(command, target, STAND_IN, message.summary), 0)
                         with socket.socket(socket.AF_UNIX) as client:
                             client.settimeout(2)
                             client.connect(target[4:])
@@ -570,7 +594,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                                     with peer.makefile("rb") as reader:
                                         self.assertEqual(reader.read(), wire)
                             self.assertEqual(client.recv(1), b"")
-                        return 0, stream(INIT, call(text, target=target), answer(OK)), ""
+                        return 0, stream(INIT, call(STAND_IN, target=target), answer(OK)), ""
 
                     with mock.patch.object(send, "run", side_effect=launch):
                         result = send.relay(message, 2)
@@ -600,8 +624,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             publish_relay_identity(os.getpid(), "fixture", send.STATE / "relay_senders")
             attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), os.getpid(), started), os.getpid(), started, path)
             message = send.Message(f"uds:{path}", "fixture", "Preview", "body", None, claude_attempt=attempt)
-            text = send.agent_text(message, via_relay=True)
-            with mock.patch.object(send, "run", return_value=(0, stream(INIT, call(text), answer(OK)), "")):
+            with mock.patch.object(send, "run", return_value=(0, stream(INIT, call(STAND_IN), answer(OK)), "")):
                 result = send.relay(message, 2)
         self.assertNotIsInstance(result, send.UncertainRelayDelivery)
         self.assertEqual(result, send.Result("failed", "cannot forward through the checked socket: fixture broken pipe"))
@@ -738,8 +761,7 @@ send._bound_relay(message, 2, [], {}, attempt)
         at = datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)
         changed_message = {
             "time": at.isoformat(), "to": RELAY_FIXTURE_TARGET, "to_truncated": False,
-            "text_difference": {"first_difference": 37, "approved_window": displayed[5:69],
-                                "sent_window": original[5:]},
+            "text_difference": {"first_difference": 0, "approved_window": STAND_IN, "sent_window": original[:32]},
         }
         other_target = "session:other"
         with tempfile.TemporaryDirectory() as directory:
@@ -749,20 +771,20 @@ send._bound_relay(message, 2, [], {}, attempt)
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
             for label, code, events, outcome, detail, mismatches in (
-                ("approved", 0, stream(INIT, call(displayed), answer(OK)), "sent", "; verbatim;", []),
+                ("approved", 0, stream(INIT, call(STAND_IN), answer(OK)), "sent", "; verbatim;", []),
                 ("changed message", 0, stream(INIT, call(original), answer(OK)), "sent",
                  "guard set the approved input", [changed_message]),
-                ("changed target", 0, stream(INIT, call(displayed, target=other_target), answer(OK)), "sent",
+                ("changed target", 0, stream(INIT, call(STAND_IN, target=other_target), answer(OK)), "sent",
                  "guard set the approved input", [{"time": at.isoformat(), "to": other_target, "to_truncated": False}]),
-                ("changed summary", 0, stream(INIT, call(displayed, summary="Different"), answer(OK)), "sent",
+                ("changed summary", 0, stream(INIT, call(STAND_IN, summary="Different"), answer(OK)), "sent",
                  "guard set the approved input", [{"time": at.isoformat(), "to": RELAY_FIXTURE_TARGET,
                                                    "to_truncated": False, "summary_changed": True}]),
-                ("timeout", None, stream(INIT, call(displayed)), "failed",
+                ("timeout", None, stream(INIT, call(STAND_IN)), "failed",
                  "relay timed out after 10 s; delivery unconfirmed", []),
                 ("timeout with changed message", None, stream(INIT, call(original)), "failed",
                  "relay timed out after 10 s; delivery unconfirmed", [changed_message]),
                 ("second call refused", 0,
-                 stream(INIT, call(original), answer(OK), call(displayed, "refused"),
+                 stream(INIT, call(original), answer(OK), call(STAND_IN, "refused"),
                         answer("already approved", "refused", error=True)),
                  "sent", "guard set the approved input; forwarded 1 of 2 SendMessage calls", [changed_message]),
             ):
@@ -778,8 +800,10 @@ send._bound_relay(message, 2, [], {}, attempt)
                     mock.patch.object(send, "run", return_value=(code, events, "")) as launch,
                 ):
                     _ = write_send_config(config / "send.conf", "")
-                    result = send.relay(fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
-                                                             "sdlc · roles · worker test"), 10)
+                    message = fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
+                                                    "sdlc · roles · worker test")
+                    self.assertEqual(send.agent_text(message, via_relay=True), displayed)
+                    result = send.relay(message, 10)
                     self.assertEqual(result.outcome, outcome, result.detail)
                     self.assertIn(detail, result.detail)
                     self.assertEqual(relay_mismatches(state), mismatches)
@@ -788,12 +812,23 @@ send._bound_relay(message, 2, [], {}, attempt)
                     command = cast(list[str], launch.call_args.args[0])
                     self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
                     self.assertEqual(command[4], "sender-address")
-                    self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+                    prompt = cast(str, launch.call_args.args[1])
+                    self.assertNotIn("body", prompt)
+                    self.assertIn(f"- message: {json.dumps(STAND_IN)}", prompt)
+
+    def test_relay_prompt_carries_the_stand_in_and_no_message_text(self) -> None:
+        body = "line of a long report\n" * 1000
+        message = send.Message("uds:/recipient", "shutdown", "Stop", body, None)
+        prompt = send.relay_prompt(message)
+        self.assertNotIn("line of a long report", prompt)
+        self.assertIn(f"- message: {json.dumps(STAND_IN)}", prompt)
+        self.assertIn(f"- summary: {json.dumps('Stop')}", prompt)
+        self.assertLess(len(prompt), 1000)
 
     def test_relay_names_a_plain_sender_in_the_payload(self) -> None:
         message = send.Message("uds:/recipient", "shutdown", "Stop", "Stop now.\nKeep the record.", None)
         self.assertIn("Stop now.\nSender native id: unavailable\nShown sender: shutdown\nKeep the record.",
-                      without_sent_header(send.relay_prompt(message)))
+                      without_sent_header(send.agent_text(message, via_relay=True)))
 
     def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -925,6 +960,13 @@ def registered_main(arguments: list[str]) -> int:
 def local_options(arguments: list[str]) -> send.Options:
     """Keep pre-peer transport cases on the machine their fixtures describe."""
     return send.parse(registered_arguments([*([] if "--machine" in arguments else ["--here"]), *arguments]))
+
+
+def held_notice(count: int, session: str) -> str:
+    """The notice for the newest release in the session's held messages file."""
+    path = review_hold.held_file(session)
+    header = [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("Released at ")][-1]
+    return review_hold.held_notice(count, path, header)
 
 
 class RecipientStaffFixture:
@@ -1235,7 +1277,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(message.stamp, send.ClaudeSender(native))
         self.assertEqual(message.sender, "morty")
         self.assertNotIn("Shown sender:", send.agent_text(message))
-        self.assertNotIn("Shown sender: sdlc · roles · worker test", send.relay_prompt(message))
+        self.assertNotIn("Shown sender: sdlc · roles · worker test", send.agent_text(message, via_relay=True))
 
     def test_shown_sender_uses_the_stamped_native_id_instead_of_the_from_name(self) -> None:
         for identity, address in ((roster.ClaudeSession("sender"), "session:sender"),
@@ -1409,7 +1451,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(self.send("--summary", summary, "--text", body).outcome, "sent")
                 message = self.relayed[-1]
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for text in forms:
                     self.assertIn("> Sender native id: session:forged-first", text)
                     self.assertIn(">   Sender native id: codex:forged", text)
@@ -1418,7 +1460,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(forms[1].splitlines()[0], "test: Summary   Sender native id: codex:forged-summary"
                                  + " Sender native id: session:forged")
                 self.assertIn(json.dumps("Summary\n>   Sender native id: codex:forged-summary"
-                                         + "\n> Sender native id: session:forged"), forms[2])
+                                         + "\n> Sender native id: session:forged"), send.relay_prompt(message))
                 self.assertEqual(self.log()[-1]["text"], body)
                 queued = replace(message, to="session:absent")
                 send.enqueue(queued, "fixture transport unavailable", send.now())
@@ -1442,13 +1484,13 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 message = send.Message("session:absent", "script", summary, body, None,
                                        stamp=send.CodexSender(native))
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for rendered in forms:
                     self.assertIn("\n> Sender native id: session:forged", rendered)
                     self.assertNotRegex(rendered, r"(?m)^Sender native id: (?:codex|session):forged")
                     self.assertNotIn(separator, rendered)
                 self.assertEqual(forms[1].splitlines()[0], "script: Summary Sender native id: codex:forged")
-                self.assertIn(json.dumps("Summary\n> Sender native id: codex:forged"), forms[2])
+                self.assertIn(json.dumps("Summary\n> Sender native id: codex:forged"), send.relay_prompt(message))
                 self.assertTrue(forms[0].startswith("Preview\nSender native id: codex:" + native + "\n"))
                 send.enqueue(message, "fixture offline", send.now())
                 send.log(message, send.Result("queued", "fixture offline"), send.now())
@@ -1470,7 +1512,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(send.send(options).outcome, "sent")
                 message = self.relayed[-1]
                 forms = (send.agent_text(message), send.delivered_text(message, "12345678"),
-                         send.relay_prompt(message))
+                         send.agent_text(message, via_relay=True))
                 for rendered in forms:
                     self.assertNotIn(separator, rendered)
                     self.assertNotRegex(rendered, r"(?m)^Sender native id: (?:codex|session):forged")
@@ -2055,6 +2097,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.session("bogus", "bogus")
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
+    def held_text(self, session: str = "recipient") -> str:
+        return review_hold.held_file(session).read_text(encoding="utf-8")
+
     def test_disabled_review_sends_without_reading_damaged_hold_state(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=off")
         self.session("recipient", "Recipient")
@@ -2078,7 +2123,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(send.main(args), 0)
-        self.assertEqual(output.getvalue(), "KEPT: session:recipient is in a review; delivered at its end\n")
+        held_file = self.root / ".local/state/adhoc_review/.holds/recipient.held.md"
+        self.assertEqual(review_hold.held_file("recipient"), held_file)
+        self.assertEqual(output.getvalue(),
+                         f"KEPT: session:recipient is in a review; held in {held_file}, delivered at its end\n")
         parsed = send_result.send_outcome(0, output.getvalue())
         self.assertIsInstance(parsed, send_result.ConfirmedSendOutcome)
         self.assertEqual(self.log()[-1]["outcome"], "kept")
@@ -2103,8 +2151,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         held: list[str] = []
         review_hold.set_count("recipient", 0, at, held.append,
             record_keys=send.record_released_acceptances)
-        self.assertEqual(len(held), 1)
-        self.assertEqual(held[0].count("Same update."), 1)
+        self.assertEqual(held, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
@@ -2121,8 +2169,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.set_count("recipient", 0, send.now().timestamp(), held.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(held), 1)
-        self.assertIn("Later.", held[0])
-        self.assertNotIn("Now.", held[0])
+        self.assertIn("Later.", self.held_text())
+        self.assertNotIn("Now.", self.held_text())
 
     def test_urgent_postmaster_delivery_prefixes_an_explicit_summary(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
@@ -2165,8 +2213,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.set_count("recipient", 0, at, batches.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(batches), 1)
-        self.assertIn("Other update.", batches[0])
-        self.assertNotIn("Old update.", batches[0])
+        self.assertIn("Other update.", self.held_text())
+        self.assertNotIn("Old update.", self.held_text())
 
     def test_urgent_send_releases_the_remaining_messages_when_the_review_ends_in_transport(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
@@ -2196,9 +2244,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         urgent, release = self.relayed
         self.assertEqual(urgent.text, "New urgent update.")
         self.assertTrue(release.review_batch)
-        self.assertLess(release.text.index("First saved update."), release.text.index("Last saved update."))
-        self.assertNotIn("Old urgent update.", release.text)
-        self.assertNotIn("New urgent update.", release.text)
+        self.assertEqual(release.text, held_notice(2, "recipient"))
+        self.assertFalse(release.urgent)
+        filed = self.held_text()
+        self.assertLess(filed.index("First saved update."), filed.index("Last saved update."))
+        self.assertNotIn("Old urgent update.", filed)
+        self.assertNotIn("New urgent update.", filed)
         review_hold.set_count("recipient", 0, urgent_at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
 
@@ -2226,8 +2277,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     case "session-start":
                         review_hold.deliver_at_session_start(trigger, batches.append,
                             record_keys=send.record_released_acceptances)
-                self.assertEqual(len(batches), 1)
-                self.assertIn("Timer report.", batches[0])
+                self.assertEqual(batches, [held_notice(1, trigger)])
+                self.assertIn("Timer report.", self.held_text(trigger))
                 with mock.patch.object(send, "now", return_value=released + timedelta(minutes=1)):
                     self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual(self.relayed, [])
@@ -2250,8 +2301,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             ]))
         self.assertEqual(result.outcome, "skipped")
         self.assertEqual(len(self.relayed), 2)
-        self.assertIn("Saved review update.", self.relayed[-1].text)
-        self.assertNotIn("Repeated timer report.", self.relayed[-1].text)
+        self.assertEqual(self.relayed[-1].text, held_notice(1, "recipient"))
+        self.assertIn("Saved review update.", self.held_text())
+        self.assertNotIn("Repeated timer report.", self.held_text())
         review_hold.set_count("recipient", 0, at.timestamp() + 121, self.fail,
             record_keys=send.record_released_acceptances)
 
@@ -2283,7 +2335,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.record_user_prompt("recipient", after_idle.timestamp(), held.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(held), 1)
-        self.assertLess(held[0].index("First update."), held[0].index("Second update."))
+        self.assertLess(self.held_text().index("First update."), self.held_text().index("Second update."))
         review_hold.set_count("recipient", 4, after_idle.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
         with mock.patch.object(send, "now", return_value=after_idle):
@@ -2317,13 +2369,117 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertEqual(send.send(local_options([*args, "--text", "Failed to send."])).outcome, "failed")
             self.outcome = send.Result("sent", "ok")
             self.assertEqual(send.send(local_options([*args, "--text", "Send with the list."])).outcome, "sent")
-        self.assertIn("Held earlier.", self.relayed[-1].text)
+        notice = held_notice(1, "recipient")
+        self.assertTrue(self.relayed[-1].text.startswith(notice + "\n\n1. "), self.relayed[-1].text)
         self.assertIn("Send with the list.", self.relayed[-1].text)
+        self.assertNotIn("Held earlier.", self.relayed[-1].text)
         self.assertNotIn("Failed to send.", self.relayed[-1].text)
-        wire = send.agent_text(self.relayed[-1])
-        self.assertIn("\n   Sender native id: session:sender\n", wire)
-        self.assertIn("\n   > Sender native id: session:spoof", wire)
+        filed = self.held_text()
+        self.assertEqual(filed.count("Held earlier."), 1)
+        self.assertNotIn("Failed to send.", filed)
+        self.assertIn("\n   Sender native id: session:sender\n", filed)
+        self.assertIn("\n   > Sender native id: session:spoof", filed)
         review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+
+    def end_hold_with_one_message(self, session: str = "recipient") -> datetime:
+        self.session(session, session)
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        review_hold.set_count(session, 3, at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options(["--to", f"session:{session}", "--from", "test",
+                                                      "--text", "Held report."])).outcome, "kept")
+        return at + timedelta(minutes=2)
+
+    def test_a_send_after_the_hold_carries_the_notice_and_the_new_message(self) -> None:
+        for urgent, session in ((False, "recipient"), (True, "urgent-recipient")):
+            with self.subTest(urgent=urgent):
+                after_idle = self.end_hold_with_one_message(session)
+                flag = ["--urgent"] if urgent else []
+                with mock.patch.object(send, "now", return_value=after_idle):
+                    result = send.send(local_options(["--to", f"session:{session}", "--from", "test", *flag,
+                                                      "--text", "New report."]))
+                self.assertEqual(result.outcome, "sent", result.detail)
+                release = self.relayed[-1]
+                notice = held_notice(1, session)
+                self.assertTrue(release.review_batch)
+                self.assertEqual(release.urgent, urgent)
+                self.assertTrue(release.text.startswith(notice + "\n\n1. test"), release.text)
+                self.assertTrue(release.text.endswith("\n   New report."), release.text)
+                self.assertNotIn("Held report.", release.text)
+                first_line = send.agent_text(release).splitlines()[0]
+                self.assertEqual(first_line, ("URGENT: " if urgent else "") + notice)
+                filed = self.held_text(session)
+                self.assertEqual(filed.count("Held report."), 1)
+                self.assertNotIn("New report.", filed)
+
+    def test_a_failed_append_fails_the_new_message_and_keeps_the_hold(self) -> None:
+        after_idle = self.end_hold_with_one_message()
+        review_hold.held_file("recipient").mkdir()
+        args = ["--to", "session:recipient", "--from", "test", "--key", "new-report", "--text", "New report."]
+        with mock.patch.object(send, "now", return_value=after_idle):
+            result = send.send(local_options(args))
+        self.assertEqual(result.outcome, "failed")
+        self.assertTrue(result.detail.startswith("review hold for "), result.detail)
+        self.assertEqual(self.relayed, [])
+        with send.key_states() as states:
+            self.assertNotIn("new-report", states)
+        review_hold.held_file("recipient").rmdir()
+        with mock.patch.object(send, "now", return_value=after_idle + timedelta(seconds=1)):
+            retried = send.send(local_options(args))
+        self.assertEqual(retried.outcome, "sent", retried.detail)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertTrue(self.relayed[0].text.startswith(held_notice(1, "recipient") + "\n\n1. "))
+        self.assertEqual(self.held_text().count("Held report."), 1)
+
+    def test_a_failed_append_keeps_the_hold_and_the_result_of_a_skipped_send(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        args = ["--to", "session:recipient", "--from", "test"]
+        repeated = [*args, "--key", "repeat", "--repeat-minutes", "60", "--text", "Timer report."]
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options(repeated)).outcome, "sent")
+            review_hold.set_count("recipient", 2, at.timestamp(), self.fail,
+                record_keys=send.record_released_acceptances)
+            self.assertEqual(send.send(local_options([*args, "--text", "Saved review update."])).outcome, "kept")
+        review_hold.held_file("recipient").mkdir()
+        errors = io.StringIO()
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)), redirect_stderr(errors):
+            result = send.send(local_options(repeated))
+        self.assertEqual(result.outcome, "skipped")
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, errors.getvalue())
+        self.assertTrue(lines[0].startswith("review hold for "), lines[0])
+        self.assertEqual(len(self.relayed), 1)
+        review_hold.held_file("recipient").rmdir()
+        held: list[str] = []
+        review_hold.set_count("recipient", 0, (at + timedelta(minutes=3)).timestamp(), held.append,
+            record_keys=send.record_released_acceptances)
+        self.assertEqual(held, [held_notice(1, "recipient")])
+        self.assertIn("Saved review update.", self.held_text())
+
+    def test_an_urgent_message_that_replaces_every_held_message_goes_plain(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        args = ["--to", "session:recipient", "--from", "test", "--key", "update"]
+        review_hold.set_count("recipient", 2, at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options([*args, "--text", "Old update."])).outcome, "kept")
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)):
+            result = send.send(local_options([*args, "--urgent", "--text", "New update."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        plain, = self.relayed
+        self.assertEqual(plain.text, "New update.")
+        self.assertFalse(plain.review_batch)
+        self.assertTrue(plain.urgent)
+        self.assertEqual(send.agent_text(plain).splitlines()[0], "URGENT: New update.")
+        self.assertFalse(review_hold.held_file("recipient").exists())
+        review_hold.set_count("recipient", 0, (at + timedelta(minutes=3)).timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
 
     def test_released_review_keys_start_a_new_repeat_window_for_each_original_recipient(self) -> None:
@@ -2345,8 +2501,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "Release the list."]))
             self.assertEqual(result.outcome, "sent", result.detail)
         self.assertEqual(len(self.relayed), 1)
-        self.assertIn("Held staff update.", self.relayed[0].text)
-        self.assertIn("Held session update.", self.relayed[0].text)
+        self.assertIn("Held staff update.", self.held_text())
+        self.assertIn("Held session update.", self.held_text())
         with mock.patch.object(send, "now", return_value=released_at + timedelta(minutes=1)):
             for options in held_options:
                 self.assertEqual(send.send(options).outcome, "skipped")
@@ -2367,13 +2523,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(send.main(list(command[script + 1:])), 0)
-            self.assertIn("is in a review; delivered at its end", output.getvalue())
+            self.assertIn(f"is in a review; held in {review_hold.held_file('recipient')}, delivered at its end",
+                          output.getvalue())
         self.assertEqual(self.relayed, [])
         held: list[str] = []
         review_hold.set_count("recipient", 0, at.timestamp(), held.append,
             record_keys=send.record_released_acceptances)
-        self.assertIn("Report the current status.", held[0])
-        self.assertIn("Read the phase report.", held[0])
+        self.assertEqual(held, [held_notice(2, "recipient")])
+        self.assertIn("Report the current status.", self.held_text())
+        self.assertIn("Read the phase report.", self.held_text())
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
@@ -2592,8 +2750,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                    _cwd: Path) -> tuple[int, str, str]:
             destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                    if line.startswith("- to: "))))
-            payload = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
-            self.assertEqual(approve_relay_call(command, destination, payload, "Private"), 0)
+            payload = guarded_payload(command, destination, "Private")
             _ = canonical.write_text(json.dumps({**row, "sessionId": "replacement"}))
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
@@ -2601,7 +2758,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 client.sendall(relay_wire(payload))
                 client.shutdown(socket.SHUT_WR)
                 self.assertEqual(client.recv(1), b"")
-            return 0, stream(INIT, call(payload, target=destination), answer(OK)), ""
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
 
         with (socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
               mock.patch.object(send, "relay", REAL_RELAY),
@@ -2633,8 +2790,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                    _cwd: Path) -> tuple[int, str, str]:
             destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                    if line.startswith("- to: "))))
-            payload = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
-            self.assertEqual(approve_relay_call(command, destination, payload, "Private"), 0)
+            payload = guarded_payload(command, destination, "Private")
             self.staff_rows[producer.id] = replace(producer, retirement=staff.RetiredProducer("claude:sonnet:high"))
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
@@ -2642,7 +2798,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 client.sendall(relay_wire(payload))
                 client.shutdown(socket.SHUT_WR)
                 self.assertEqual(client.recv(1), b"")
-            return 0, stream(INIT, call(payload, target=destination), answer(OK)), ""
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
 
         with (socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "relay", REAL_RELAY),
@@ -3095,10 +3251,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         relayed = self.relayed[0]
         self.assertEqual(relayed.to, f"uds:{self.root / 'recipient.sock'}")
         self.assertEqual(relayed.sender, "sender-address")
-        prompt = send.relay_prompt(relayed)
-        self.assertIn("----- BEGIN MESSAGE -----\nMessage from sender-address: Preview\n"
-                      + "Sender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----",
-                      without_sent_header(prompt))
+        self.assertEqual("Message from sender-address: Preview\n"
+                         + "Sender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody",
+                         without_sent_header(send.agent_text(relayed, via_relay=True)))
         self.assertEqual(self.log()[0]["from"], "sender-address")
 
     def test_remote_forwarding_keeps_sending_machine_display_despite_receiver_name_collision(self) -> None:
@@ -3787,14 +3942,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         def launch(command: list[str], prompt: str, _timeout: float, _env: dict[str, str] | None,
                    _cwd: Path | None, *, fault: str = "") -> tuple[int | None, str, str]:
             target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith("- to: "))))
-            text = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
+            text = expected_relay_text(command)
             wire = relay_wire(text)
             with socket.socket(socket.AF_UNIX) as client, listener.accept()[0] as peer:
                 if fault != "empty-timeout":
                     client.settimeout(3)
                     client.connect(target[4:])
                 if fault not in ("empty-timeout", "accept"):
-                    self.assertEqual(approve_relay_call(command, target, text, "Notice"), 0)
+                    self.assertEqual(approve_relay_call(command, target, STAND_IN, "Notice"), 0)
                     client.sendall(wire[:-3] if fault in ("buffered-timeout", "exit", "command") else wire)
                     client.shutdown(socket.SHUT_WR)
                 if fault in ("", "confirmed-timeout", "forwarded-timeout", "review-rejection-timeout"):
@@ -3804,7 +3959,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(accepted[-1], wire)
                     peer.sendall(b"k")
                     self.assertEqual(client.recv(1), b"k")
-                    request_call = call(text, target=target)
+                    request_call = call(STAND_IN, target=target)
                     if fault == "forwarded-timeout":
                         return None, stream(INIT, request_call), ""
                     if fault == "review-rejection-timeout":
@@ -8109,18 +8264,18 @@ class ReadRelayTests(ShutdownTestCase):
         return send.read_relay(send.RelayTransportResponse(0, stdout, "", RELAY_FIXTURE_TARGET, forward), "hello")
 
     def test_delivered_verbatim(self) -> None:
-        result = self.read_relay(stream(INIT, call("hello"), answer(OK)))
+        result = self.read_relay(stream(INIT, call(STAND_IN), answer(OK)))
         self.assertEqual(result, send.CheckedRelayAcceptance("t1", "mode auto; verbatim; queued there (msg_id m1)"))
         self.assertEqual(relay_mismatches(self.state), [])
 
     def test_forwarded_changed_call_is_accepted_and_records_the_difference(self) -> None:
         for text, target, logged_target, truncated, difference in (
-            ("hi", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
-             {"first_difference": 1, "approved_window": "hello", "sent_window": "hi"}),
-            ("hell", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
-             {"first_difference": 4, "approved_window": "hello", "sent_window": "hell"}),
-            ("hello", "session:other", "session:other", False, None),
-            ("hello", "a" * 257, "a" * 256, True, None),
+            ("hello", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 0, "approved_window": STAND_IN, "sent_window": "hello"}),
+            ("approved", RELAY_FIXTURE_TARGET, RELAY_FIXTURE_TARGET, False,
+             {"first_difference": 8, "approved_window": STAND_IN, "sent_window": "approved"}),
+            (STAND_IN, "session:other", "session:other", False, None),
+            (STAND_IN, "a" * 257, "a" * 256, True, None),
         ):
             with self.subTest(text=text, target=target):
                 result = self.read_relay(stream(INIT, call(text, target=target), answer(OK)))
@@ -8138,7 +8293,7 @@ class ReadRelayTests(ShutdownTestCase):
         self.assertEqual(len(relay_mismatches(self.state)), 1)
 
     def test_multiple_changed_calls_are_logged_before_the_forward_result(self) -> None:
-        events = stream(INIT, call("changed", target="session:first"), call("hello", "t2", target="session:second"))
+        events = stream(INIT, call("changed", target="session:first"), call(STAND_IN, "t2", target="session:second"))
         refused = send.RefusedRelayRequest("failed", "the relay tool call has no approval")
         for forward, expected in (
             (send.RelayRequestNotForwarded(), send.Result("failed", "2 SendMessage calls")),
@@ -8156,23 +8311,23 @@ class ReadRelayTests(ShutdownTestCase):
 
     def test_error_result_is_not_delivered(self) -> None:
         no_write = send.RelayRequestNotForwarded()
-        result = self.read_relay(stream(INIT, call("hello"), answer("No agent named bogus", error=True)), no_write)
+        result = self.read_relay(stream(INIT, call(STAND_IN), answer("No agent named bogus", error=True)), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus"))
         refused = answer('{"success":false,"message":"No agent named bogus is reachable. Use ListAgents."}')
-        result = self.read_relay(stream(INIT, call("hello"), refused), no_write)
+        result = self.read_relay(stream(INIT, call(STAND_IN), refused), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus is reachable. Use ListAgents."))
 
     def test_recipient_refusal_after_the_write_is_unconfirmed(self) -> None:
         for refused in (answer("recipient refused", error=True),
                         answer('{"success":false,"message":"recipient refused"}')):
             with self.subTest(result=refused):
-                result = self.read_relay(stream(INIT, call("hello"), refused))
+                result = self.read_relay(stream(INIT, call(STAND_IN), refused))
                 self.assertIsInstance(result, send.UncertainRelayDelivery)
                 self.assertEqual(result, send.Result("failed", "recipient refused; delivery unconfirmed"))
 
     def test_review_relay_preserves_an_explicit_rejection_after_forwarding(self) -> None:
         refusal = answer('{"success":false,"message":"No agent named bogus is reachable."}')
-        events = stream(INIT, call("hello"), refusal)
+        events = stream(INIT, call(STAND_IN), refusal)
         observed = send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, self.FORWARDED)
         ordinary = send.read_relay(observed, "hello")
         self.assertIsInstance(ordinary, send.UncertainRelayDelivery)
@@ -8180,8 +8335,8 @@ class ReadRelayTests(ShutdownTestCase):
         self.assertEqual(result, send.Result("failed", "No agent named bogus is reachable."))
 
     def test_multiple_calls_with_missing_or_failed_forward_evidence_cannot_confirm_delivery(self) -> None:
-        events = stream(INIT, call("hello"), answer("matched two sessions", error=True),
-                        call("hello", "t2"), answer(OK, "t2"))
+        events = stream(INIT, call(STAND_IN), answer("matched two sessions", error=True),
+                        call(STAND_IN, "t2"), answer(OK, "t2"))
         for forward, expected in (
             (send.RelayRequestForwarded("t3", "hello"),
              send.UncertainRelayDelivery("failed", "2 SendMessage calls; delivery unconfirmed")),
@@ -8203,13 +8358,13 @@ class ReadRelayTests(ShutdownTestCase):
         for label, events, forward in (
             ("wrong forward for changed call", stream(INIT, call("hi"), answer(OK)),
              send.RelayRequestForwarded("t2", "hello")),
-            ("missing result", stream(INIT, call("hello")), self.FORWARDED),
-            ("wrong result", stream(INIT, call("hello"), answer(OK, "t2")), self.FORWARDED),
-            ("implicit result", stream(INIT, call("hello"), answer("queued there")), self.FORWARDED),
-            ("missing forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestNotForwarded()),
-            ("wrong forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t2", "hello")),
-            ("wrong forwarded payload", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t1", "hi")),
-            ("interrupted forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestInterrupted("write interrupted")),
+            ("missing result", stream(INIT, call(STAND_IN)), self.FORWARDED),
+            ("wrong result", stream(INIT, call(STAND_IN), answer(OK, "t2")), self.FORWARDED),
+            ("implicit result", stream(INIT, call(STAND_IN), answer("queued there")), self.FORWARDED),
+            ("missing forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestNotForwarded()),
+            ("wrong forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestForwarded("t2", "hello")),
+            ("wrong forwarded payload", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestForwarded("t1", "hi")),
+            ("interrupted forward", stream(INIT, call(STAND_IN), answer(OK)), send.RelayRequestInterrupted("write interrupted")),
         ):
             with self.subTest(label=label):
                 result = self.read_relay(events, forward)
@@ -8392,17 +8547,16 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         executable.parent.mkdir(parents=True)
         _ = executable.write_text(python_tool_source(
             "import json, socket, sys\n"
-            + "from scripts.message.test_send import INIT, OK, answer, approve_relay_call, call, relay_wire, stream\n"
+            + "from scripts.message.test_send import INIT, OK, STAND_IN, answer, call, guarded_payload, relay_wire, stream\n"
             + "prompt = sys.stdin.read()\n"
             + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
-            + "text = prompt.split('----- BEGIN MESSAGE -----\\n', 1)[1].rsplit('\\n----- END MESSAGE -----', 1)[0]\n"
             + "summary = json.loads(next(line[11:] for line in prompt.splitlines() if line.startswith('- summary: ')))\n"
-            + "assert approve_relay_call(sys.argv, target, text, summary) == 0\n"
+            + "text = guarded_payload(sys.argv, target, summary)\n"
             + "with socket.socket(socket.AF_UNIX) as connection:\n"
             + "    connection.connect(target.removeprefix('uds:'))\n"
             + "    connection.sendall(relay_wire(text))\n"
             + "    connection.shutdown(socket.SHUT_WR)\n"
-            + "print(stream(INIT, call(text, target=target), answer(OK)), end='')\n"))
+            + "print(stream(INIT, call(STAND_IN, target=target), answer(OK)), end='')\n"))
         executable.chmod(0o755)
         question, response = "Can you confirm the survey?", "The survey is confirmed."
         sender_id = fixture_runtime_id("account-daemon-reply-sender")
@@ -8640,8 +8794,11 @@ class PaneWorkerMessageTests(unittest.TestCase):
             self.assertEqual(send.send(repeated).outcome, "skipped")
             prompt, = [command for command in world.commands if command[:2] == ("agent", "prompt")]
             self.assertEqual(prompt[2], "w1:p1")
-            self.assertIn("Saved review update.", prompt[3])
+            self.assertIn(held_notice(1, session), prompt[3])
+            filed = review_hold.held_file(session).read_text(encoding="utf-8")
+            self.assertEqual(filed.count("Saved review update."), 1)
             self.assertNotIn("Skip this report.", prompt[3])
+            self.assertNotIn("Skip this report.", filed)
             review_hold.set_count(session, 0, (at + timedelta(minutes=2)).timestamp(), self.fail,
                 record_keys=send.record_released_acceptances)
 
