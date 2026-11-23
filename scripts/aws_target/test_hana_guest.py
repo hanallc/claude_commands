@@ -97,9 +97,8 @@ mount_timeout_seconds=15
         self.assertEqual(settings.guard_grace_seconds, self.settings.guard_grace_seconds)
         self.assertIn(f"{self.config_path}: guard_grace_seconds='0'", warnings.getvalue())
 
-    def test_image_build_refuses_an_invalid_switch_that_unattended_readers_count_as_off(self) -> None:
+    def test_image_build_refuses_an_invalid_switch(self) -> None:
         _ = self.config_path.write_text(self.config_path.read_text().replace('enabled=off', 'enabled=of'))
-        self.assertFalse(guest.read_settings(conf.read(self.config_path)).enabled)
         with self.assertRaisesRegex(conf.Unusable, "enabled='of'"):
             _ = guest.read_settings(conf.read(self.config_path), recover_invalid=False)
 

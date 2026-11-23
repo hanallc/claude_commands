@@ -63,10 +63,12 @@ AWS is off when both keys are `off`.
 Then `aws-target.service` reads no account charges, and the hourly job reads no prices or quotas.
 The hourly job also skips the hours-gap check, because a bill that no charge refresh updates stays provisional.
 
-`aws_switch()` in `scripts/aws_target/config.py` is the one function that reads these keys.
-Each caller gives the settings of the machine that it serves; Hana placement, spending and the controller read the Hana key only through it.
+`aws_switch()` in `scripts/aws_target/config.py` is the one function that unattended code uses to read these keys.
+Each caller gives the settings of the machine that it serves.
+Unattended code decides on a key only through `aws_switch()`.
 An invalid live value counts as `off`, and a missing key or a missing live file takes the committed value.
-The Hana image build refuses an invalid live value, so no image holds a switch value that the user did not set.
+`hana_guest.read_settings()` also reads the Hana key, but only the image build (`hana_render.py`) uses that value, and it refuses an invalid live value.
+So no image holds a switch value that the user did not set, and the image files do not import `config.py`.
 
 With `enabled=off` in `hana_aws.conf`, the controller still observes and stops the box when the lifecycle record shows that the box can run: a state other than `idle-stopped` or `unprovisioned`, a claim, a replacement stop duty, open Hana compute in the cost ledger, or an operation other than `observe`.
 With `enabled=off` in `cloud_gate.conf`, the gate route launches no new box, also for a retry after a Spot interruption or a box failure.
