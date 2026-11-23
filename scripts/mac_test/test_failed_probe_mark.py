@@ -28,7 +28,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import eligibility, mac_test, offload, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
@@ -49,7 +49,8 @@ class FailedProbeTests(OffloadCommandFixture):
             + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n"
+            + UNREACHABLE_WAIT_FIXTURE)
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
@@ -649,7 +650,7 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         state = self.root / "mac-state"
         state.mkdir()
         _ = (state / "failed_probe").write_text("failed\n")
@@ -697,7 +698,8 @@ class StepRecoveryTests(VerifyLintScopeFixture):
             + "parity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+            + UNREACHABLE_WAIT_FIXTURE)
         state = Path(self.environment["HOME"]) / ".local/state/build-targets/linux"
         state.mkdir(parents=True)
         book = ledger.CostLedger(state)

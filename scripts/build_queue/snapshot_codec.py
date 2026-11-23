@@ -92,6 +92,12 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         return {**record, "source_key": source}
     if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
         del record["verify"]
+    if writing and schema.__name__ == "KnownPlacementStatus":
+        # A status reply carries the launch facts only when the caller asks for them.
+        if record.get("permission") == {"kind": "LaunchPermissionNotReported"}:
+            del record["permission"]
+        if record.get("report") == {"kind": "NoTerminalReport"}:
+            del record["report"]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.

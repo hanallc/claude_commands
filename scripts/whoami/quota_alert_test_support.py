@@ -531,6 +531,12 @@ always=director
         return [push for call in self.phone.call_args_list
                 if (push := cast(RenderedPush, call.args[0])).id != "quota.codex_next_move"]
 
+    def select_units(self, label: str) -> None:
+        """Write the role map's units selection."""
+        path = role_map.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": label}) + "\n", encoding="utf-8")
+
     def relayed_texts(self) -> list[str]:
         return [cast(str, call.args[1]) for call in self.relay.call_args_list]
 
