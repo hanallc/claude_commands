@@ -4181,6 +4181,81 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.reply.read_text().strip(), self.agent.replies[-1])
             self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
 
+    def test_answer_and_end_read_one_receipt_for_a_result_after_the_done(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+        self.assertIsInstance(self.receipt(), worker.DispatchComplete)
+        path, record = self.detached_record(row, "after-done")
+        record.update(pane_dispatch_id=instance, delivery=f"sent: worker {row.name} at {pane}", delivered_at=time.time(),
+                      finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.agent.append(pane, "user", "Detached run: after-done\nRun finished: private verification\nResult: FAIL")
+        self.agent.append(pane, "assistant", "Run after-done failed. Tests: 0 passed, 0 failed.")
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        stopped = (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+                   patch("scripts.production.staff_sources.require_worker_stopped"))
+        with stopped[0], stopped[1]:
+            code, output, errors = self.command("end", row.name)
+        self.assertEqual((code, output), (worker.ExitCode.KEPT, ""))
+        self.assertEqual(errors, "a detached run result awaits a matching DONE. Run worker.py answer "
+                         + f"{row.name} --text TEXT from the {self.fixture.parent.name} session to ask the worker for the DONE.\n")
+        self.assertEqual(staff.by_id(row.id), row)
+        run = self.fixture.world.run
+
+        def accept_followup(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", pane):
+                self.agent.submitted.append((pane, arguments[3]))
+                self.agent.append(pane, "user", arguments[3])
+            return result
+
+        with patch.object(self.fixture.world, "run", side_effect=accept_followup):
+            self.assertEqual(self.command("answer", row.name, "--text", "Report the run result."), (0, "done\n", ""))
+        self.assertIn(f"DONE {instance}", self.agent.submitted[-1][1])
+        self.agent.complete(pane)
+        with stopped[0], stopped[1]:
+            self.assertEqual(self.command("end", row.name), (0, "done\n", ""))
+        self.assertIsNone(staff.by_id(row.id))
+
+    def test_waiting_recovery_names_reap_a_live_run_or_a_new_done(self) -> None:
+        reply = worker.DispatchSubmitted()
+        awaiting = worker.DispatchAwaitingReply("reply", ("late",), worker.NoMatchingDone.UNRECORDED)
+        for receipt, expected in (
+                (awaiting, worker.CompletionRecovery.WAITING_ON_REPLY),
+                (worker.DispatchWaitingForRuns(("late",), False, awaiting), worker.CompletionRecovery.WAITING_ON_REPLY),
+                (worker.DispatchWaitingForRuns(("live",), True, reply), worker.CompletionRecovery.WAITING_ON_RUNS),
+                (worker.DispatchWaitingForRuns(("reap",), False, reply, reap_required=frozenset({"reap"})),
+                 worker.CompletionRecovery.WAITING_ON_REAP)):
+            with self.subTest(receipt=receipt):
+                self.assertIs(worker.waiting_recovery(receipt), expected)
+
+    def test_end_gives_no_answer_step_while_a_detached_run_is_live(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.agent.row(self.agent.submitted[-1][0])
+        self.assertIsInstance(self.receipt(), worker.DispatchComplete)
+        with pane_fixtures.live_detached_run(self.run_dir, row):
+            code, output, errors = self.command("end", row.name)
+        self.assertEqual((code, output, errors), (worker.ExitCode.KEPT, "", "a detached run is live\n"))
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_names_the_answer_step_after_recovery_only_for_an_open_pass(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.agent.row(self.agent.submitted[-1][0])
+        self.assertIsInstance(self.receipt(), worker.DispatchComplete)
+        waiting = f"{row.name}: a detached run result awaits a matching DONE"
+        step = f". Run worker.py answer {row.name} --text TEXT from the {self.fixture.parent.name} session to ask the worker for the DONE."
+        for open_pass, expected in ((True, waiting + step + "\n"), (False, waiting + "\n")):
+            with (self.subTest(open_pass=open_pass), ExitStack() as context):
+                _ = context.enter_context(patch.object(
+                    turn_end, "recover_completion", return_value=worker.CompletionRecovery.WAITING_ON_REPLY))
+                if not open_pass:
+                    _ = context.enter_context(patch.object(
+                        progress_history, "active_dispatch", return_value=progress_history.NoActiveDispatch()))
+                self.assertEqual(self.command("end", row.name), (worker.ExitCode.KEPT, "", expected))
+                self.assertEqual(staff.by_id(row.id), row)
+
     def test_answer_refuses_during_detached_compaction(self) -> None:
         opened = self.opened()
         backend = staff.backend(opened.row)

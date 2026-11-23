@@ -649,16 +649,17 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
         raise ValueError(completion.reason)
     if completion == TurnOutcome.WAITING_ON_RUNS:
         return worker.CompletionRecovery.WAITING_ON_RUNS
-    if completion == TurnOutcome.WAITING_ON_REAP or (
-            isinstance(completion, worker.DispatchWaitingForRuns) and completion.waits_only_for_reap):
+    if completion == TurnOutcome.WAITING_ON_REAP:
         return worker.CompletionRecovery.WAITING_ON_REAP
-    if completion == TurnOutcome.WAITING_ON_REPLY or isinstance(completion, worker.DispatchAwaitingReply):
+    if completion == TurnOutcome.WAITING_ON_REPLY:
         return worker.CompletionRecovery.WAITING_ON_REPLY
-    if isinstance(completion, worker.DispatchWaitingForRuns) and not completion.has_live_run:
-        return worker.CompletionRecovery.WAITING_ON_REPLY
-    if (isinstance(completion, worker.DispatchWaitingForRuns) and completion.has_live_run
-            and isinstance(completion.reply, (worker.DispatchComplete, worker.DispatchAwaitingReply))):
-        return worker.CompletionRecovery.WAITING_ON_RUNS
+    if isinstance(completion, (worker.DispatchWaitingForRuns, worker.DispatchAwaitingReply)):
+        waiting = worker.waiting_recovery(completion)
+        before_done = (isinstance(completion, worker.DispatchWaitingForRuns)
+                       and isinstance(completion.reply, worker.DispatchSubmitted))
+        # A live run before the first DONE leaves no completion to recover.
+        return (worker.CompletionRecovery.NO_PENDING_NOTICE
+                if waiting is worker.CompletionRecovery.WAITING_ON_RUNS and before_done else waiting)
     if completion == TurnOutcome.IGNORED:
         raise ValueError(f"{row.name}: the saved DONE has no accepted dispatch receipt")
     if not isinstance(completion, progress_history.HookCompletion):

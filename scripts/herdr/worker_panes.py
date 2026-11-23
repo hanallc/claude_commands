@@ -211,9 +211,22 @@ class CloseAllowed:
     """The close checks permit closure; the pane remains open."""
 
 
+class CompletionRecovery(Enum):
+    NO_PENDING_NOTICE = "no pending completion notice"
+    RECOVERED = "completion recovery finished"
+    PENDING_CLOSE = "completion has pending pane cleanup"
+    WAITING_ON_RUNS = "the completion waits for a detached run"
+    WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
+    WAITING_ON_REAP = "reap must record the run result"
+
+
 @dataclass(frozen=True)
 class Kept:
-    blocker: str
+    reason: str | CompletionRecovery
+
+    @property
+    def blocker(self) -> str:
+        return self.reason if isinstance(self.reason, str) else self.reason.value
 
 
 @dataclass(frozen=True)
@@ -896,8 +909,12 @@ def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
 
 @dataclass(frozen=True)
 class DispatchHoldsWorker:
-    blocker: str
+    reason: str | CompletionRecovery
     parked: bool = False
+
+    @property
+    def blocker(self) -> str:
+        return self.reason if isinstance(self.reason, str) else self.reason.value
 
 
 @dataclass(frozen=True)
@@ -1023,7 +1040,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, Kept):
-            return DispatchHoldsWorker(hold.blocker, parked=progress_history.parked_worker_pass(passed))
+            return DispatchHoldsWorker(hold.reason, parked=progress_history.parked_worker_pass(passed))
         if active:
             return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
@@ -1050,7 +1067,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
 def _idle_checks(row: staff.StaffRow, run: Path,
                  lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     state = worker_dispatch_state(row, run, lock)
-    return Kept(state.blocker) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
+    return Kept(state.reason) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
 
 
 def stage_two_completion_id(dispatch_id: str) -> str:
@@ -1092,7 +1109,7 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         return _idle_checks(worker.row, directory, lock)
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
-        return Kept(state.blocker)
+        return Kept(state.reason)
 
     working = isinstance(worker, OpenWorker) and worker.status == herdr.AgentStatus.WORKING
     if isinstance(state, CompletedWorkerPass):

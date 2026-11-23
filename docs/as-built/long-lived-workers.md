@@ -1064,6 +1064,12 @@ The stop report names each pane that stays open.
 `worker.py end` recovers a matching DONE before it retires the worker.
 It also retries a saved unfinished completion.
 It keeps the staff row if the notice or role release remains pending.
+`worker.py end` and `worker.py answer` read the same receipt, `dispatch_receipt`, for the active pass.
+A detached run result that arrives after the DONE needs a new matching DONE.
+Until that DONE, `end` keeps the worker and `answer` sends input with the DONE instruction.
+When the pass is open, the `end` refusal names the next step: `worker.py answer <name> --text TEXT` from the parent session.
+That command asks the worker for the DONE.
+`end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
 `worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.
 If it finds a verified reply, it saves the reply and completes the hook before retirement.
 A canceled pass requires no future DONE.

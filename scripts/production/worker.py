@@ -56,6 +56,7 @@ StaffId = staff.StaffId
 WorkerName = staff.WorkerName
 WorkerRole = staff.WorkerRole
 ExitCode = worker_panes.ExitCode
+CompletionRecovery = worker_panes.CompletionRecovery
 
 
 @dataclass(frozen=True)
@@ -875,6 +876,15 @@ def is_stage_one_review(delivery: pass_recorder.DispatchDelivery, instance: str)
     return bool(delivery.early_ready) and delivery.completion_id == instance
 
 
+def waiting_recovery(receipt: DispatchWaitingForRuns | DispatchAwaitingReply) -> CompletionRecovery:
+    """Name what an unfinished receipt waits for: reap, a live run, or a new matching DONE."""
+    if isinstance(receipt, DispatchAwaitingReply):
+        return CompletionRecovery.WAITING_ON_REPLY
+    if receipt.waits_only_for_reap:
+        return CompletionRecovery.WAITING_ON_REAP
+    return CompletionRecovery.WAITING_ON_RUNS if receipt.has_live_run else CompletionRecovery.WAITING_ON_REPLY
+
+
 def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                         run: Path, reply_file: str, require_completion: bool,
                         detached_results: worker_panes.PassDetachedResults) -> worker_panes.CloseAllowed | worker_panes.Kept:
@@ -884,7 +894,7 @@ def pass_reply_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDel
     if isinstance(receipt, DispatchEvidenceUnknown):
         return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
     if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
-        return worker_panes.Kept("a detached run result awaits a matching DONE")
+        return worker_panes.Kept(waiting_recovery(receipt))
     if require_completion:
         if (detached_results.live_runs_checked and isinstance(receipt, DispatchComplete)
                 and not is_stage_one_review(delivery, detached_results.instance_id)
@@ -1218,15 +1228,6 @@ class KeepCompletedPane(Enum):
 @dataclass(frozen=True)
 class ReuseCompletedPane:
     held_role: str
-
-
-class CompletionRecovery(Enum):
-    NO_PENDING_NOTICE = "no pending completion notice"
-    RECOVERED = "completion recovery finished"
-    PENDING_CLOSE = "completion has pending pane cleanup"
-    WAITING_ON_RUNS = "the completion waits for a detached run"
-    WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
-    WAITING_ON_REAP = "reap must record the run result"
 
 
 class CompletionNotices(Protocol):
@@ -2248,6 +2249,16 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         return ExitCode.OK
 
 
+def _end_refusal(row: staff.StaffRow, record: staff.StaffSnapshot, reason: str | CompletionRecovery) -> str:
+    """Name the next step when an open pass waits on a DONE."""
+    text = reason if isinstance(reason, str) else reason.value
+    owner = record.parent_of(row)
+    if reason is not CompletionRecovery.WAITING_ON_REPLY or owner is None or not isinstance(
+            progress_history.active_dispatch(row.id, worker_panes.worker_run(row, record=record)), progress_history.ActiveDispatch):
+        return text
+    return f"{text}. Run worker.py answer {row.name} --text TEXT from the {owner.name} session to ask the worker for the DONE."
+
+
 def end(parent: StaffId, name: WorkerName, *,
         lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
         retire: bool = True) -> ExitCode:
@@ -2290,13 +2301,13 @@ def end(parent: StaffId, name: WorkerName, *,
                     no_late_reply = canceled_without_hook and recovery is CompletionRecovery.WAITING_ON_REPLY
                     if (recovery not in (CompletionRecovery.NO_PENDING_NOTICE, CompletionRecovery.RECOVERED)
                             and not delivered_stop and not no_late_reply):
-                        reason = recovery.value
+                        reason: str | CompletionRecovery = recovery
                         if recovery is CompletionRecovery.PENDING_CLOSE:
                             saved = progress_history.hook_completion(worker_panes.worker_pass(row, run))
                             if isinstance(saved, progress_history.HookCompletion) and saved.details:
                                 detail = " ".join(saved.details[-1].splitlines())
-                                reason = f"{reason}: {detail}"
-                        print(f"{row.name}: {reason}", file=sys.stderr)
+                                reason = f"{recovery.value}: {detail}"
+                        print(f"{row.name}: {_end_refusal(row, record, reason)}", file=sys.stderr)
                         return ExitCode.KEPT
             except (OSError, ValueError, recorder_state.OldRecorderState, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
@@ -2304,7 +2315,7 @@ def end(parent: StaffId, name: WorkerName, *,
                 return ExitCode.KEPT
         result = worker_panes.close(parent, name, lock=hold)
         if isinstance(result, worker_panes.Kept):
-            print(result.blocker, file=sys.stderr)
+            print(_end_refusal(row, record, result.reason), file=sys.stderr)
             return ExitCode.KEPT
         if isinstance(result, worker_panes.UncertainWorker):
             return ExitCode.UNCERTAIN
