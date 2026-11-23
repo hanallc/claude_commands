@@ -792,8 +792,7 @@ shutil.rmtree(path)""", []),
                               + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
                               + textwrap.indent(action, "        ") + "\n")
                     _ = (root / "tests/test_listing.py").write_text(source)
-                    entry = "import runpy, sys; runpy.run_path(sys.argv.pop(1))['main']()"
-                    result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                    result = subprocess.run([sys.executable, str(runner), str(root / "tests"), "test_listing.py"],
                                             cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
                                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

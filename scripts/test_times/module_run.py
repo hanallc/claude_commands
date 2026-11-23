@@ -718,12 +718,13 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
-        if isinstance(TimedRunner.destination, TimesOutput):
-            TimedRunner.scanned_folders = set()
-            TimedRunner.read_contents = set()
-            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
-                                                TimedRunner.read_contents))
+        # The guard reads this file, so the read audit starts after it.
         with guard_live_config(Path.home() / ".claude" / "config", run_root, violation_log):
+            if isinstance(TimedRunner.destination, TimesOutput):
+                TimedRunner.scanned_folders = set()
+                TimedRunner.read_contents = set()
+                sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                    TimedRunner.read_contents))
             suite = unittest.defaultTestLoader.loadTestsFromNames(names)
             result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
