@@ -2558,8 +2558,8 @@ So each step of one CI job ranks at the job start, ahead of steps that arrived a
 Queue priority remains the first ordering field.
 A step with `NoJobStart` keeps its arrival place.
 `state.json` saves the job start with the waiter place, so the place survives a service restart.
-The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
-Its hover shows the same time and age under `Job start`.
+The Builds page shows the job start only in the hover of the waiting row, under `Job start`.
+The hover shows the time in the user zone and the age.
 The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.

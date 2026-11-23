@@ -331,7 +331,7 @@ class MemoryHoverTests(unittest.TestCase):
             self.assertEqual(row.findtext("th[@class='step']/span"), name)
             self.assertEqual(row.findtext("td[@class='unit']/span"), "builder")
 
-    def test_a_waiting_row_note_shows_its_reason_and_the_job_start(self) -> None:
+    def test_a_waiting_row_note_shows_only_its_reason_and_the_hover_shows_the_job_start(self) -> None:
         started = "10:14 PST · 1 h 10 min ago"
         held = "natedev is held by fps for Phase 3 timing; waiting for release"
         data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [],
@@ -345,8 +345,9 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
         self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-2']//span[@class='wait-note']"),
                          "waits for a machine choice")
-        for key, note in (("wait:fixture-wait-0", f"job started {started}"),
-                          ("wait:fixture-wait-1", f"{held} · job started {started}")):
+        self.assertNotIn("job started", str(rendered))
+        self.assertNotIn(started, str(rendered))
+        for key, note in (("wait:fixture-wait-0", None), ("wait:fixture-wait-1", held)):
             with self.subTest(key=key):
                 self.assertEqual(root.findtext(f".//div[@data-tip='{key}']//span[@class='wait-note']"), note)
                 grid = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
@@ -469,7 +470,7 @@ class MemoryHoverTests(unittest.TestCase):
             ("Reading age", "<1 min"), ("In queue cap", "no"), ("Testing", "7 of 10 tests"), ("Done", "70.0%")])
 
     def test_a_queued_run_with_an_empty_part_list_shows_its_own_use(self) -> None:
-        data = {"read_at": 400, "walk": [{"name": "merge gate", "unit": "fixture", "showrunner": "fixture-production",
+        data = {"read_at": 400, "walk": [{"name": "gate", "unit": "fixture", "showrunner": "fixture-production",
             "started_at": 100, "used": 4.7, "reserved": 0.5, "counted": 5.2, "queued": True, "keep_text": "",
             "parts": list[dict[str, object]]()}]}
         rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('row:fixture-run-0', data)", data))
@@ -495,8 +496,7 @@ class MemoryHoverTests(unittest.TestCase):
         hold = room.runs[0]
         for name, counter, ordering_note in (
             ("gate", module_counter, True),
-            ("merge gate", module_counter, True),
-            ("fixture-project merge gate", module_counter, True),
+            ("fixture-project gate", module_counter, True),
             ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
@@ -657,7 +657,7 @@ class MemoryHoverTests(unittest.TestCase):
                 running: list[dict[str, object]] = [
                     {"name": "local build", "queued": True, "slot": 2,
                      "progress": {"kind": "RowProgress", "phase": "building"}},
-                    {"name": "merge gate", "queued": True,
+                    {"name": "gate", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
                     {"name": "Mac builds", "kind": "cloud", "machine": "mac", "slot": 3,
                      "progress": {"kind": "NoProgress"}},

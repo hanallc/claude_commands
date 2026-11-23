@@ -390,7 +390,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=merge gate\n"
+            + "names.gate=gate\n"
             + "owned.default={unit} {step}\n"
             + "owned.test-affected={unit} {step}\n"
             + "owned.ci-default=CI {step}\n"
@@ -569,7 +569,7 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
             job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.TemporaryExclusion("not answering"))))
         reading = replace(base, view=replace(base.view, running=(step,)))
-        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
         other = replace(build, pid=8203, gate_placement="episode/other-attempt")
         mac = queue_view.MacBuildReading(now, (build, other))
@@ -603,7 +603,7 @@ class MemoryFeedTests(unittest.TestCase):
             0, 0, 0, owner=str(step.pid)) for step in running)
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "merge gate", "claude_commands",
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
         mac = queue_view.MacBuildReading(now, (native,))
         with (mock.patch.object(admission_client, "view", return_value=reading),
