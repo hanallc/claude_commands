@@ -23,6 +23,7 @@ import time
 from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, cancellation, conf
+from scripts.build_hold.shared_state_defaults import holder_directory, release_directory
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import program_start as startup
@@ -509,8 +510,8 @@ def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> Pl
     output = admission_client.WaitOutput()
     directory = store.root() / "admission"
     try:
-        with admission_client.placement_acquisition(), local_release_waiter(directory, directory,
-                wake_files=(directory / "state.json", directory / "queue.json")) as events:
+        with admission_client.placement_acquisition(), local_release_waiter(holder_directory(), release_directory(),
+                wake_files=(directory / "queue.json",)) as events:
             while True:
                 events.arm()
                 answer = admission_client.acquire_placement(request)

@@ -28,6 +28,7 @@ class NoQueueSnapshot:
 @dataclass(frozen=True)
 class PublishedView:
     written_at: float
+    fresh_until: float
     reading: admission_records.QueueRead
 
 
@@ -47,9 +48,10 @@ def write_queue_snapshot(directory: Path, inputs: admission_records.QueueInputs,
                                                "policy": codec.snapshot_value(policy)})
 
 
-def write_view_snapshot(directory: Path, written_at: float, reply: bytes) -> None:
+def write_view_snapshot(directory: Path, written_at: float, fresh_until: float, reply: bytes) -> None:
     """Publish the same encoded reply that the socket serves."""
-    _write_snapshot(directory / VIEW_NAME, {"written_at": written_at, "reply": reply.decode("utf-8")})
+    _write_snapshot(directory / VIEW_NAME, {"written_at": written_at, "fresh_until": fresh_until,
+                                           "reply": reply.decode("utf-8")})
 
 
 def read_view_snapshot(directory: Path) -> PublishedView:
@@ -60,13 +62,14 @@ def read_view_snapshot(directory: Path) -> PublishedView:
             raise ValueError("invalid view file")
         fields = cast(dict[str, object], raw)
         written_at = cast(float, codec.parse_snapshot_value(fields["written_at"], float))
+        fresh_until = cast(float, codec.parse_snapshot_value(fields.get("fresh_until", written_at), float))
         encoded = fields["reply"]
         if not isinstance(encoded, str):
             raise ValueError("invalid view reply")
         reply = wire.parse_reply(encoded)
         if not isinstance(reply, wire.ViewReply):
             raise ValueError("invalid view reply")
-        return PublishedView(written_at, reply.reading)
+        return PublishedView(written_at, fresh_until, reply.reading)
     except (OSError, ValueError, KeyError, RecursionError, OverflowError) as error:
         raise wire.AdmissionUnavailable("The queue did not answer.") from error
 

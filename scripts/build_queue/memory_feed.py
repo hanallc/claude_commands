@@ -266,13 +266,18 @@ def build_limit_icons() -> dict[str, str]:
     return {kind: page_frame.icon_svg(icon) for kind, icon in BUILD_LIMIT_ICONS.items()}
 
 
-def publish_page(configuration: FeedConfiguration) -> None:
-    """Publish the repository page with the configured refresh interval."""
+def page_html(interval_seconds: float) -> str:
+    """Set the refresh interval and use the view deadline for the Late status."""
     source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
+    source = source.replace("return {readAt:d.read_at,", "return {readAt:d.read_at,answeredAt:d.fresh_until,", 1)
     page = page_frame.template(source, "Builds", "builds").replace(
-        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(interval_seconds))
     page = page.replace("__BUILD_LIMIT_ICONS__", json.dumps(build_limit_icons()))
-    page = page.replace('</head>', staff_names.script({}) + '</head>', 1)
+    return page.replace('</head>', staff_names.script({}) + '</head>', 1)
+
+
+def publish_page(configuration: FeedConfiguration) -> None:
+    page = page_html(configuration.interval_seconds)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
@@ -1147,6 +1152,7 @@ class MemoryPage(TypedDict):
     staff_names: NotRequired[dict[str, str]]
     ok: bool
     read_at: float
+    fresh_until: float
     render_seconds: float
     total: float
     available: float
@@ -3293,7 +3299,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(),
-        "ok": True, "read_at": published.written_at, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
+        "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",

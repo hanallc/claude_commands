@@ -153,7 +153,7 @@ def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProc
 
 
 def fixture_published_view(reading: admission_records.QueueRead) -> queue_snapshot.PublishedView:
-    return queue_snapshot.PublishedView(reading.explanation.now, reading)
+    return queue_snapshot.PublishedView(reading.explanation.now, reading.explanation.now, reading)
 
 
 class MemoryFeedTests(unittest.TestCase):
@@ -400,6 +400,7 @@ class MemoryFeedTests(unittest.TestCase):
             + "owned.ci-default=CI {step}\n"
             + "owned.showrunner-default=showrunner {step}\n")
         self.configure()
+        self.configure_console()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
         proc.mkdir()
@@ -481,12 +482,15 @@ class MemoryFeedTests(unittest.TestCase):
                                  + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
                                  + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
 
+    def configure_console(self, age_limit: int = 15) -> None:
+        settings = {"round_trip_limit": 1, "render_limit": 1, "reading_delay": 1, "builds.age_limit": age_limit}
+        _ = (self.root / "console.conf").write_text("".join(
+            f"# range: 0.001..86400\nstatus.{key}_seconds={value}\n" for key, value in settings.items()))
+
     def expected_page(self, seconds: float = 0.125) -> str:
-        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        page = memory_feed.page_html(seconds)
         self.assertIn(console_theme.TOKENS, page)
-        return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons()))
-                .replace('</head>', staff_names.script({}) + '</head>', 1))
+        return page
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -1435,7 +1439,7 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
+                self.configure_console(stale)
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -1456,12 +1460,14 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
+                self.configure_console(stale)
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
                     _ = memory_feed.main(["--once"])
                 page = (self.output / "memory_live.html").read_text()
                 payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+                # The shared browser test sets the data time for each response.
+                del payload["fresh_until"]
                 test_page_frame.assert_status_states(self, page, seconds, payload)
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
@@ -1538,11 +1544,11 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(target.read_text(), "previous page")
         self.assertEqual(list(self.output.iterdir()), [target])
 
-    def write_view_file(self, written_at: float) -> None:
+    def write_view_file(self, written_at: float, pass_interval: float = 30) -> None:
         folder = self.root / "buildlog" / "admission"
         folder.mkdir(parents=True, exist_ok=True)
         reply = wire.encode_reply(wire.ViewReply(captured_reading())).encode()
-        queue_snapshot.write_view_snapshot(folder, written_at, reply)
+        queue_snapshot.write_view_snapshot(folder, written_at, written_at + pass_interval, reply)
 
     def test_feed_uses_published_view_when_the_socket_does_not_answer(self) -> None:
         written_at = 200_001.0
@@ -1555,9 +1561,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(page["read_at"], written_at)
         query.assert_not_called()
 
-    def test_old_view_file_makes_the_page_late(self) -> None:
-        age_limit = 7
-        _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={age_limit}\n")
+    def test_view_is_late_only_after_the_pass_interval_and_page_limit(self) -> None:
         written_at = 200_000.0
         self.write_view_file(written_at)
         self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -1569,16 +1573,22 @@ process.stdout.write(JSON.stringify({
         payload = (self.output / "memory.json").read_text()
         script = test_page_frame.PageStatusTests.environment(unescape(options[1])) + page_frame.REFRESH_SCRIPT + loader + f"""
 const data = {payload};
-now = {(written_at + age_limit + 1) * 1000};
 const fetch = async () => ({{ok:true, json:async()=>data}});
 const consoleHidden = () => false, paused = false;
 const render = () => {{}}, level = () => "ok", latest = data, $ = () => node();
 const reportVersion = data.report_version;
-createPageRefresh(tick).refresh().then(() => console.log(line.dataset.state));
+const refresh = createPageRefresh(tick);
+(async () => {{
+    for (const age of [20, 45, 46]) {{
+        now = ({written_at} + age) * 1000;
+        await refresh.refresh();
+        console.log(line.dataset.state);
+    }}
+}})();
 """
         result = subprocess.run([executable, "-e", script], text=True, capture_output=True, check=False,
                                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        self.assertEqual((result.returncode, result.stdout.strip()), (0, "Late"), result.stderr)
+        self.assertEqual((result.returncode, result.stdout.splitlines()), (0, ["Live", "Live", "Late"]), result.stderr)
 
     def test_missing_or_unreadable_view_file_keeps_the_queue_error(self) -> None:
         folder = self.root / "buildlog" / "admission"

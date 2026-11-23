@@ -3355,8 +3355,11 @@ class AdmissionServer:
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         view_bytes = wire.encode_reply(view).encode()
         self.published = PublishedReplies(view, explain, positions, view_bytes)
+        config = self.configuration.config
+        written_at = self.clock.now()
+        longest_interval = max(config.running_pass_seconds, config.waiting_pass_seconds, config.min_pass_gap_seconds)
         try:
-            queue_snapshot.write_view_snapshot(self.state_dir, self.clock.now(), view_bytes)
+            queue_snapshot.write_view_snapshot(self.state_dir, written_at, written_at + longest_interval, view_bytes)
         except OSError:
             # Keep the last complete file when publication fails.
             pass
@@ -4975,6 +4978,9 @@ done
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
         self.persist()
+        if destination.target == mac_linux.TARGET:
+            self.pass_stale = True
+            self.next_pass = self.clock.monotonic()
         return wire.FirstAuthorization(assignment, reference)
 
     def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:

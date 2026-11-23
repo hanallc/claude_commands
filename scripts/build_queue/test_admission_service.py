@@ -1996,17 +1996,51 @@ class ReplyPublicationTests(unittest.TestCase):
     def test_publish_writes_the_view_reply_and_publication_time(self) -> None:
         with AdmissionFixture() as fixture:
             server = fixture.server
-            path = fixture.state_dir / "view.json"
-            for _ in range(2):
+            path = fixture.state_dir / queue_snapshot.VIEW_NAME
+            for running, waiting, gap in ((30, 3, 0.25), (3, 30, 0.25), (3, 2, 30)):
+                fixture.configure(running_pass_seconds=running, waiting_pass_seconds=waiting, min_pass_gap_seconds=gap)
                 fixture.clock.advance(1)
                 _ = server.run_pass()
                 reply, = server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
                 saved = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(saved["written_at"], fixture.clock.now())
+                fresh_until = fixture.clock.now() + max(running, waiting, gap)
+                self.assertEqual(saved["fresh_until"], fresh_until)
                 self.assertEqual(saved["reply"], wire.encode_reply(reply))
                 self.assertEqual(queue_snapshot.read_view_snapshot(fixture.state_dir),
-                                 queue_snapshot.PublishedView(fixture.clock.now(), reply.reading))
+                                 queue_snapshot.PublishedView(fixture.clock.now(), fresh_until, reply.reading))
+
+    def test_next_loop_pass_publishes_consumed_guest_permission(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate,
+            mac_linux_and_natedev_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            server = fixture.server
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            configuration = server.configuration
+            assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+            gap = configuration.config.min_pass_gap_seconds
+            fixture.clock.advance(gap)
+            server.run_once()
+            before = queue_snapshot.read_view_snapshot(fixture.state_dir)
+            guest, = (row for row in before.reading.view.running if row.assignment_target == "mac-linux")
+            self.assertEqual(guest.started_at, 0)
+            self.assertGreater(server.next_pass, fixture.clock.monotonic() + gap)
+            consumed_at = fixture.clock.now()
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+            fixture.clock.advance(gap)
+            server.run_once()
+            after = queue_snapshot.read_view_snapshot(fixture.state_dir)
+            guest, = (row for row in after.reading.view.running if row.assignment_target == "mac-linux")
+            self.assertEqual(guest.started_at, consumed_at)
+            self.assertIsNone(guest.confirmed_guest_run)
 
     def test_view_request_does_not_run_a_pending_or_stale_pass(self) -> None:
         for reason in ("pending configuration", "stale pass"):

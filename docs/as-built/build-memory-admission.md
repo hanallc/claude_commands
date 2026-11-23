@@ -637,11 +637,14 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 Each publication of the view also replaces `admission/view.json` atomically.
-The file holds the publication time and the encoded socket reply.
+The file holds the publication time, `fresh_until`, and the encoded socket reply.
+`fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
 A socket `ViewRequest` returns the last published view without starting a pass.
+Consuming a Mac Linux permission schedules a pass that publishes the guest row.
+Placement waiters watch the hold and release directories and accept `queue.json` changes from the admission directory.
 
 The Builds feed reads `view.json` and uses its publication time as the data time.
-The page shows `Late` when the data age exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
+The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
 A missing or unreadable view file gives the queue read error.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
