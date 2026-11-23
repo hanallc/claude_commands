@@ -918,7 +918,7 @@ function stepTooltip(key, data) {
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
   const guestFields = guestRow(row) ? [field('Runs on', row.machine),
-    field('Guest attempt', row.guest_run?.attempt || guestState(row))] : [];
+    field('Guest attempt', row.guest_run?.attempt || guestState(row)), ...progressRows(row)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && namesGuest
     ? [field('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
@@ -2302,14 +2302,15 @@ async function loadReport(version,current) {
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
-const pageStamp = Date.parse(document.lastModified);
+const pageVersion = document.querySelector('meta[name="builds-page-version"]')?.content;
 let pageReloading = false;
 async function reloadWhenPageChanges() {
   if (consoleHidden() || paused || pageReloading) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     if (!r.ok || consoleHidden() || paused || pageReloading) return;
-    if (Date.parse(r.headers.get("Last-Modified")) > pageStamp) {
+    const version = r.headers.get("X-Builds-Page-Version");
+    if (pageVersion && version && version !== pageVersion) {
       pageReloading = true;
       location.reload();
     }

@@ -2979,7 +2979,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "state": "running" if guest_gate or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": owner.labels.unit, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
-                "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
+                "progress": (cloud_row_progress(step.counter) if guest_gate
+                             else row_progress((step,), progress.TOKEN_WAIT_REASON)),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),

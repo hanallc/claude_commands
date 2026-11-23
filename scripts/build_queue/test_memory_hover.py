@@ -1034,7 +1034,8 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
         javascript = """
 const [initial, shown] = JSON.parse(process.argv[1]);
 let stamp = initial, reloads = 0;
-const document = {lastModified: "11/23/2026 10:00:00", visibilityState: "hidden"};
+const document = {visibilityState: "hidden", querySelector: selector =>
+  selector === 'meta[name="builds-page-version"]' ? {content: "v1"} : null};
 const location = {pathname: "/memory_live.html", reload: () => { reloads++; }};
 const window = {frameElement: null};
 const visibility = [];
@@ -1044,8 +1045,8 @@ const page = {refresh() {}};
 const createPageRefresh = () => page;
 const setInterval = () => 0;
 const fetch = async () => {
-  const modified = stamp;
-  return {ok: true, headers: {get: () => modified}};
+  const version = stamp;
+  return {ok: true, headers: {get: name => name === "X-Builds-Page-Version" ? version : null}};
 };
 """ + loop + """
 async function check() {
@@ -1062,13 +1063,12 @@ async function check() {
 void check();
 """
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        current = "Mon, 23 Nov 2026 10:00:00 GMT"
-        newer = "Mon, 23 Nov 2026 10:00:01 GMT"
-        for initial, shown, expected in ((current, current, [0, 0, 0]), (current, newer, [0, 1, 1]),
-                                         (newer, newer, [1, 1, 1])):
+        current, changed = "v1", "v2"
+        for initial, shown, expected in ((current, current, [0, 0, 0]), (current, changed, [0, 1, 1]),
+                                         (changed, changed, [1, 1, 1]), (None, current, [0, 0, 0])):
             with self.subTest(initial=initial, shown=shown):
                 result = subprocess.run([executable, "-e", javascript, json.dumps([initial, shown])],
-                    env={"TZ": "UTC"}, text=True, capture_output=True,
+                    text=True, capture_output=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)

@@ -602,6 +602,55 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual((row.get("caller"), row.get("machine"), row["state"]),
                          ("phases", "mac-linux", "running"))
 
+    def test_guest_gate_progress_comes_from_the_placement_sidecar(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate, mac_linux_and_natedev_request,
+            publish_candidate,
+        )
+
+        for sidecar_state in ("empty", "missing file", "written counter"):
+            with self.subTest(sidecar=sidecar_state):
+                readings: list[admission_records.QueueRead] = []
+                with PlacementFixture() as fixture:
+                    request = mac_linux_and_natedev_request(fixture, natedev=False)
+                    assert isinstance(request.local, wire.LocalAdmissionContext)
+                    sidecar = fixture.root / "gate.cgroup"
+                    request = replace(request, identity=replace(request.identity, step="gate",
+                        unit="phases", job=StepJob("test-affected")), local=replace(request.local,
+                        sidecar="" if sidecar_state == "empty" else str(sidecar)))
+                    if sidecar_state == "written counter":
+                        progress_profile.publish_counter(sidecar, progress_profile.ProgressCounter("modules", 7, 12))
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                    assert isinstance(granted, wire.FirstAuthorization), granted
+                    _ = fixture.run_pass()
+                    execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                        assignment.destination.host, "host-generation-a", 700001, "guest-start"))
+                    for confirmed in (False, True):
+                        if confirmed:
+                            _ = fixture.server.handle_request(
+                                wire.ExecutionReport("guest-running", assignment, granted.claim, execution))
+                        reply, = fixture.server.handle_request(wire.ViewRequest())
+                        decoded = wire.parse_reply(wire.encode_reply(reply))
+                        assert isinstance(decoded, wire.ViewReply)
+                        readings.append(decoded.reading)
+
+                for confirmed, reading in zip((False, True), readings, strict=True):
+                    with self.subTest(confirmed=confirmed):
+                        with mock.patch.object(admission_client, "view", return_value=reading):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("machine") == "mac-linux"]
+                        self.assertEqual(bool(row.get("guest_run")), confirmed)
+                        self.assertEqual(bool(row.get("guest_unconfirmed")), not confirmed)
+                        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                        tips, table = self.render_assignment_table(payload)
+                        if sidecar_state == "written counter":
+                            self.assertIn('<td class="place">testing</td><td class="done">58.3%</td>', table)
+                            self.assertIn("Testing  7 of 12 modules", "\n".join(tips["walk"][page["walk"].index(row)]))
+                        else:
+                            self.assertIn('<td class="place">—</td><td class="done">—</td>', table)
+
     def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
         now = 200_000.0
         step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,

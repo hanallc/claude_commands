@@ -296,12 +296,18 @@ A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the
 The Builds page shows both in Running with the recorded job, unit, and caller.
 The Target cell lists the named machines and marks the running machine.
 It shows `mac-linux (not confirmed)` until confirmation, then `mac-linux (running)`.
-The memory column shows `on mac-linux`. Stage, Done, and vCPU show `—`.
+The memory column shows `on mac-linux`. The vCPU column shows `—`.
+The admission service reads the module counter from the current guest's placement request sidecar.
+It publishes the counter before and after the guest confirms the attempt.
+The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
+Without a counter, Stage and Done show `—`.
 If a queue read fails, the page keeps the guest row from the last successful reading.
 The row key (`memory_feed.step_key`) is `mac-linux` and the consume time, so an open hover stays when the queue confirms the attempt.
 The `mac-linux` machine name has the Mac color in light and dark, because the guest runs on the Mac.
-The Builds page compares the server's HTML modification time with the loaded page's time at startup and on its timer.
-It also checks when the tab becomes visible.
+The console server sends `X-Builds-Page-Version` on GET and HEAD for the published Builds page.
+The server puts the same version in the HTML. Nanosecond file times distinguish writes in the same second.
+At startup and on its timer, the page compares the HEAD version with its loaded version.
+The page checks again when the tab becomes visible. It reloads once when the versions differ.
 Manual pause and a hidden console frame stop these checks.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
