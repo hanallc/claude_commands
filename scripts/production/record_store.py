@@ -22,6 +22,7 @@ from typing import NamedTuple, cast
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
 from scripts.lib import git_files
+from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
@@ -31,11 +32,6 @@ from scripts.production.production_doc import Refusal, production_field
 class RecordText(NamedTuple):
     fields: dict[str, str]
     body: str
-
-
-def state_root() -> Path:
-    """Return the shared root for records owned by staff."""
-    return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 
 
 class RecordKind(StrEnum):

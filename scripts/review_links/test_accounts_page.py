@@ -286,7 +286,7 @@ class AccountsPageTests(unittest.TestCase):
         with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
               patch.object(accounts, "read_status", return_value=sort_reading())):
             page = accounts_page.page()
-            mac_section = page.split(b'<section class="token-steps">', 1)[1].split(b"</section>", 1)[0]
+            mac_section = page.split(b'<details class="token-steps" data-token="mac_fallback">', 1)[1].split(b"</details>", 1)[0]
             self.assertIn(b"<p>Set <code>mac_token.account</code> first.</p>", mac_section)
             self.assertNotIn(b"<ol>", mac_section)
             _ = config.write_text("mac_token.account=claude2\n" + dates, encoding="utf-8")
@@ -305,8 +305,14 @@ class AccountsPageTests(unittest.TestCase):
         )):
             for value in expected:
                 self.assertIn(value, row)
-        renewal, linux, macos = (section.split(b"</section>", 1)[0].decode()
-                             for section in page.split(b'<section class="token-steps">')[1:])
+        sections = [section.split(b"</details>", 1)[0].decode()
+                    for section in page.split(b'<details class="token-steps" ')[1:]]
+        self.assertEqual([section.split("<ol>", 1)[0] for section in sections], [
+            'data-token="mac_fallback"><summary>Replace the token on the Mac</summary>',
+            'data-token="token_expiry.hana_linux_runners.ends"><summary>Renew hana-linux-runners</summary>',
+            'data-token="token_expiry.hana_macos_runner_query.ends"><summary>Renew hana-macos-runner-query</summary>',
+        ])
+        renewal, linux, macos = sections
         steps = [match[1] for match in re.finditer(r"<li>(.*?)</li>", renewal)]
         self.assertEqual(steps, [
             "In a plain Terminal or iTerm window, not in a herdr pane, run <code>mac-token-renew</code>.",
@@ -330,6 +336,54 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn(b"tbody tr td{border-top:1px solid var(--line)}", page)
         self.assertIn(b".roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}", page)
         self.assertNotIn(b"tbody tr:last-child td{border-top:", page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_open_renewal_steps_stay_open_through_refresh(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        _ = config.write_text("mac_token.account=claude2\ntoken_expiry.lead_days=30 7\n"
+                              + "token_expiry.hana_linux_runners.ends=2026-11-22\n"
+                              + "token_expiry.hana_macos_runner_query.ends=2026-11-14\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.review_root.parent / "agents")}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
+        setup = '''<script>
+Date.now=()=>200000;
+const realFetch=fetch;let reads=0;
+window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PAGE});};
+</script>'''.replace("FRESH_PAGE", json.dumps(rendered).replace("</", "<\\/"))
+        probe = '''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const steps=()=>[...document.querySelectorAll('.tokens-card details.token-steps')];
+ const opened=()=>steps().filter(node=>node.open).map(node=>node.dataset.token).join(',');
+ try{
+  check(steps().length===3 && opened()==='','each token has closed renewal steps');
+  const linux=steps().find(node=>node.dataset.token==='token_expiry.hana_linux_runners.ends');
+  const summary=linux.querySelector('summary');
+  check(getComputedStyle(summary).cursor==='pointer','the summary shows a pointer');
+  check(!linux.querySelector('ol').checkVisibility(),'closed steps are hidden');
+  summary.click();await flush();
+  check(opened()==='token_expiry.hana_linux_runners.ends' && linux.querySelector('ol').checkVisibility(),
+   'a click opens one token');
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(reads>0 && !linux.isConnected,'refresh replaces the steps');
+  check(opened()==='token_expiry.hana_linux_runners.ends','refresh keeps the open steps open and the others closed');
+  const fresh=()=>steps().find(node=>node.dataset.token==='token_expiry.hana_linux_runners.ends');
+  const oldSummary=fresh().querySelector('summary');oldSummary.focus();
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(!oldSummary.isConnected && document.activeElement===fresh().querySelector('summary'),
+   'refresh keeps focus on the summary');
+  const oldCommand=fresh().querySelector('.token-command');oldCommand.focus();
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(!oldCommand.isConnected && document.activeElement===fresh().querySelector('.token-command'),
+   'refresh keeps focus on the command');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     def test_page_marks_old_mac_token_metadata_stale(self) -> None:
         notes = self.review_root.parent / "agents"

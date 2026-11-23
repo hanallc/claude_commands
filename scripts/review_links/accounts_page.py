@@ -813,7 +813,8 @@ def _token_steps(token: token_expiry.TokenExpiry) -> str:
     heading = "Replace the token on the Mac" if token.key == token_expiry.MAC_TOKEN else f"Renew {token.name}"
     content = ("<ol>" + "".join(f"<li>{_step_markup(step)}</li>" for step in token.renewal_steps) + "</ol>"
                if token.renewal_steps else "<p>Set <code>mac_token.account</code> first.</p>")
-    return f'<section class="token-steps"><h3>{html.escape(heading)}</h3>{content}</section>'
+    return (f'<details class="token-steps" data-token="{html.escape(token.key)}">'
+            + f'<summary>{html.escape(heading)}</summary>{content}</details>')
 
 
 def tokens_board(reading: accounts.StatusReading) -> str:
@@ -913,7 +914,11 @@ h2{margin:16px 0 4px}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
 .models-card,.tokens-card{margin-top:24px}
 .token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
-.token-steps h3{font-size:.93rem;margin:0 0 7px}
+.token-steps summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;
+font-size:.93rem;font-weight:700;cursor:pointer}
+.token-steps summary::marker{color:var(--ink-2)}
+.token-steps summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.token-steps[open] summary{margin-bottom:5px}
 .token-steps ol{margin:0;padding-left:1.5rem}
 .token-steps li + li{margin-top:5px}
 .token-steps li::marker,.token-steps p{color:var(--ink-2)}
@@ -1252,6 +1257,19 @@ document.addEventListener('keydown',event=>{
  if(header && (event.key==='Enter' || event.key===' ')){event.preventDefault();chooseSort(header);}
 });
 applySorts();
+// A refresh keeps each token's renewal steps open or closed as the viewer left them.
+function keepOpenSteps(fresh){
+ const open=new Set([...view.querySelectorAll('details[data-token][open]')].map(node=>node.dataset.token));
+ for(const node of fresh.querySelectorAll('details[data-token]')) node.open=open.has(node.dataset.token);
+}
+// A refresh keeps focus on the same summary or command of a token's renewal steps.
+function keepStepFocus(){
+ const steps=document.activeElement?.closest('details[data-token]');
+ if(!steps) return null;
+ const index=[...steps.querySelectorAll('summary,.token-command')].indexOf(document.activeElement);
+ return ()=>[...view.querySelectorAll('details[data-token]')].find(node=>node.dataset.token===steps.dataset.token)
+  ?.querySelectorAll('summary,.token-command')[index]?.focus({preventScroll:true});
+}
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -1262,7 +1280,8 @@ async function refresh(supersede=false,current=()=>true) {
   if (request !== newestRequest || !current() || hold()) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
-  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : null;
+  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus();
+  keepOpenSteps(fresh);
   view.replaceWith(fresh);view = fresh;
   applySorts();
   scrollTo({top, behavior: 'instant'});

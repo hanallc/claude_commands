@@ -905,6 +905,10 @@ It stores the viewer's sort choice separately and starts in model order.
 The card shows the model ID and its swatch at the start of each consecutive group of that model.
 The model ID and swatch use the theme ink color when no model color is set.
 The two tables have the same total.
+The Tokens card below Models shows the renewal steps of each token in a closed `details` element.
+Each `details` element carries its token key in `data-token`.
+Before a refresh replaces the view, `keepOpenSteps()` opens the fresh steps of each token that the viewer opened.
+A refresh also keeps focus on the same summary or command in a token's steps.
 A swatch shows for each board span with a `color_key`.
 An account has one when `config/statusline.conf` has a valid `account.<label>` color.
 The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
