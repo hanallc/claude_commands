@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.shell_test_support import refusing_bash_startup, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment

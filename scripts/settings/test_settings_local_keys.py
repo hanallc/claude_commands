@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 KEYS = Path(__file__).with_name("settings_local_keys.sh")
 BASH = shutil.which("bash") or "/bin/bash"

@@ -342,7 +342,7 @@ It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
-Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
+Targeted tests select modules by direct and indirect imports, file tokens, changed test modules, and folders of changed Python source files.
 File tokens can occur in a test or its imported test-support modules.
 A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.
 A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
@@ -514,10 +514,13 @@ The changed set includes changes from the base to `HEAD`, plus dirty paths.
 A static Python graph selects a test module under four rules:
 
 1. The test module changed.
-2. The test module directly imports a changed Python file.
-3. The test or an imported test-only helper names a changed file through tokens, or imports a changed file.
+2. The test module imports a changed Python file, directly or through other modules.
+3. The test or an imported test-only helper names a changed file through tokens.
 4. The test module shares a folder with a changed non-test Python file and names its stem as a whole word.
 
+The second rule follows every import, production modules included. Imports inside a function also count.
+The selector reverses the import graph and walks it from the changed files, not once for each test.
+No file in the current graph imports a removed Python file, so the second rule also walks the base graph from it.
 The third rule follows imports only through test modules and test-only helpers.
 A test-only helper is a non-test module that only test modules and other test-only helpers import.
 A module that nothing imports, or whose text holds the `__main__` token, is production code.
@@ -564,7 +567,7 @@ A loop has no filter when it has an `else`, or when code outside the loop reads 
 A loop or a comprehension has no filter when a lambda or a nested function reads the loop name.
 A loop or a comprehension has no filter when a `global` or `nonlocal` statement names the loop name.
 
-Only test modules have graph rows. All Python paths can resolve imports.
+Every Python file has a graph row, and all Python paths can resolve imports.
 A removed Python file uses import facts from the base.
 A syntax error in a test module requires a full run. Non-test syntax errors do not block selection.
 The selector reads source without importing or evaluating it.

@@ -1,7 +1,7 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 
 from scripts.agents import remote
 

@@ -19,7 +19,8 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger

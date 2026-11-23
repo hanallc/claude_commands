@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib.shell_test_support import shell_function
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.memory_kill_test_support import (
     EARLYOOM_MESSAGE, KILL_AT, failed_compile_log, install_journal, journal_event,

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
-from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lib.fixture_environment_test_support import FIXTURE_OWNER
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig

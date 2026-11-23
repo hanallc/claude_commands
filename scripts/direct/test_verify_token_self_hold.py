@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 

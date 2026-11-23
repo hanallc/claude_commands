@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_lint_diagnostics_test_support import (

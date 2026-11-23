@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.direct import tree_watch
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.git_test_support import commit_repository
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 WATCHER = Path(tree_watch.__file__)

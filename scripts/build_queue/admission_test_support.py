@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lib.fixture_environment_test_support import FIXTURE_OWNER
 from scripts.lib import cancellation, test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config

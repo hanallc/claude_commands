@@ -40,7 +40,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress

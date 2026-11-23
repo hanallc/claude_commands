@@ -725,7 +725,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(actual[0]["scripts/component/test_adapter.py"], {"scripts/component/subject.py"})
         self.assertEqual(actual[0]["scripts/component/test_link.py"], {"scripts/component/subject.py"})
 
-    def test_bare_imports_select_each_matching_source_without_transitive_selection(self) -> None:
+    def test_bare_imports_select_each_matching_source_and_imports_select_through_each_step(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/duplicate/subject.py", "VALUE = 1\n")
         self.write("scripts/component/adapter.py", "from scripts.component import subject\n")
@@ -738,7 +738,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.commit()
         result = self.selection()
         self.assertCountEqual([path.name for path in result.modules],
-                              ["test_bare.py"])
+                              ["test_bare.py", "test_qualified.py"])
         self.assertEqual(result.changed_files, ("scripts/component/subject.py",))
         # Bare imports conservatively cover every same-named source.
         self.certify()
@@ -930,7 +930,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertIn("graph error:", result.reason)
         self.assertIn("broken.py", result.reason)
 
-    def test_direct_imports_and_same_folder_select_without_a_second_import_step(self) -> None:
+    def test_imports_through_each_step_and_same_folder_select(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
         self.write("scripts/adapters/adapter.py", "import scripts.component.subject\n")
         self.write("scripts/adapters/adapter_cli.py", "import scripts.adapters.adapter\n")
@@ -952,7 +952,7 @@ class AffectedModulesTests(unittest.TestCase):
                     _ = self.commit()
                 self.assertCountEqual(self.selection().modules,
                                       [self.repo / "scripts" / path for path in
-                                       ("checks/test_direct.py", "component/test_named.py",
+                                       ("checks/test_direct.py", "checks/test_indirect.py", "component/test_named.py",
                                         "component/test_plain.py", "component/test_comment.py")])
 
     def test_complete_path_tokens_select_only_the_test_that_names_the_path(self) -> None:
@@ -1005,6 +1005,17 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/data/input.txt", "after\n")
         _ = self.commit()
         self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_copy.py",))
+
+    def test_a_change_selects_through_a_helper_and_two_production_modules(self) -> None:
+        self.write("scripts/component/second.py", "VALUE = 1\n")
+        self.write("scripts/component/first.py", "from scripts.component import second\n")
+        self.write("scripts/component/cli.py", "from scripts.component import first\nif __name__ == '__main__':\n    pass\n")
+        self.write("scripts/fixtures/first_test_support.py", "from scripts.component import first\n")
+        self.add_test("checks/test_through.py", "from scripts.fixtures import first_test_support\n")
+        self.certify()
+        self.write("scripts/component/second.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_through.py",))
 
     def test_a_module_that_production_imports_is_not_followed(self) -> None:
         self.write("scripts/data/input.txt", "before\n")

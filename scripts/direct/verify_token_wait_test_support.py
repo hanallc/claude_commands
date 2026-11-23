@@ -1,7 +1,8 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement

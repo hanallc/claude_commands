@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying

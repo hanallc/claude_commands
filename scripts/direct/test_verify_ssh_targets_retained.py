@@ -12,7 +12,7 @@ import sys
 from typing import cast
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, placement

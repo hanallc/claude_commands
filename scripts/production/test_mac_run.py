@@ -16,7 +16,8 @@ from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
+from scripts.lib.fixture_environment_test_support import FIXTURE_OWNER
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib import copy_record, scratch
 from scripts.lib.git_test_support import fixture_git_environment
 

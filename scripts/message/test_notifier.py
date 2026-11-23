@@ -24,7 +24,7 @@ from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib.runtime_copy_test_support import copy_runtime
 from scripts.lib import user_zone
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 

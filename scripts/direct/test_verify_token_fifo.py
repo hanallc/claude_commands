@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import unittest
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
 from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS

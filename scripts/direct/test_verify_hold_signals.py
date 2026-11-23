@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.process_group import send_process_group
 from scripts.direct.verify_token_wait_test_support import VERIFY

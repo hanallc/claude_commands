@@ -6,7 +6,7 @@ import signal
 import subprocess
 import sys
 from unittest.mock import patch
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.wait_for_test_state import wait_until

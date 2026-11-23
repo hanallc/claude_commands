@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_function
-from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.fixture_environment_test_support import verify_test_environment
 from scripts.direct.tree_watch_test_support import TreeWatchFixture, write_workspace
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture

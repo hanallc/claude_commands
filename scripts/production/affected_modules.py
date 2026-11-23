@@ -1155,6 +1155,30 @@ def names_path(tokens: frozenset[str], source: str, paths: set[str],
                for folder, names in folder_names.items())
 
 
+def importers_by_file(imports: dict[str, set[str]]) -> defaultdict[str, set[str]]:
+    """Give the files that import each file directly."""
+    importers: defaultdict[str, set[str]] = defaultdict(set)
+    for source, dependencies in imports.items():
+        for dependency in dependencies:
+            importers[dependency].add(source)
+    return importers
+
+
+def reaching_files(imports: dict[str, set[str]], changed: set[str]) -> set[str]:
+    """Give the changed files and each file that imports one, directly or through other files.
+
+    One walk over the reversed graph gives the answer for all tests at once.
+    """
+    importers = importers_by_file(imports)
+    found = set(changed)
+    pending = list(changed)
+    while pending:
+        for importer in importers.get(pending.pop(), set()) - found:
+            found.add(importer)
+            pending.append(importer)
+    return found
+
+
 def test_only_helpers(graph: SourceGraph) -> frozenset[str]:
     """Return the non-test modules that only test modules and other test-only helpers import.
 
@@ -1162,10 +1186,7 @@ def test_only_helpers(graph: SourceGraph) -> frozenset[str]:
     A module that production code imports is production code too.
     A `*_test_support.py` module is always a test-only helper, so no current selection drops.
     """
-    importers: dict[str, set[str]] = defaultdict(set)
-    for source, dependencies in graph.imports.items():
-        for dependency in dependencies:
-            importers[dependency].add(source)
+    importers = importers_by_file(graph.imports)
     supports = {path for path in graph.imports if path.endswith("_test_support.py")}
     helpers = supports | {path for path in importers
                           if not is_test_module(path) and "__main__" not in graph.tokens.get(path, frozenset())}
@@ -1191,9 +1212,8 @@ def fixture_sources(imports: dict[str, set[str]], helpers: frozenset[str], path:
 
 def names_changed_file(graph: SourceGraph, sources: set[str], changed: set[str],
                        folder_names: dict[str, set[str]]) -> bool:
-    """Match a changed fixture, its imports, or its named paths."""
-    return any(source in changed or graph.imports.get(source, set()) & changed
-               or names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names)
+    """Match the paths that a fixture names."""
+    return any(names_path(graph.tokens.get(source, frozenset()), source, changed, folder_names)
                for source in sources)
 
 
@@ -1335,6 +1355,8 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         named = changed | script_callers(repo, set(blobs) | dirty, changed)
         folder_names = folder_names_of(named)
         helpers = test_only_helpers(graph)
+        # A removed file has no edges in the current graph, so the base graph gives its importers.
+        reaching = reaching_files(graph.imports, changed) | reaching_files(old_graph, removed)
         selected: list[Path] = []
         no_reads = ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord())
         for module in modules:
@@ -1352,8 +1374,7 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 and scans_changed_paths(reads.folder_scans, changed, scanned_parents))
             content_changed = bool(content_changes) and bool(known_contents) and (path not in known_contents
                 or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & content_changes))
-            if (path in changed or graph.imports.get(path, set()) & python
-                    or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
+            if (path in reaching or names_changed_file(graph, sources, named, folder_names)
                     or scans_repository_changes(graph, sources, changed, path, declarations)
                     or config_changed or folder_changed or content_changed):
                 selected.append(module)
