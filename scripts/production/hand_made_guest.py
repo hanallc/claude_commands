@@ -117,7 +117,7 @@ def mac_claim(repo: Path) -> Generator[None]:
 
     with ExitStack() as stack:
         try:
-            stack.enter_context(mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE))
+            _ = stack.enter_context(mac_linux.mac_linux_reservation(repo, HAND_MADE, HAND_MADE))
         except MacRunRefused as error:
             raise took_no_run(str(error)) from error
         yield

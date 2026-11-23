@@ -65,7 +65,8 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import (AdmissionFixture, FixedSystemReader, GIB, InjectedCrash, SocketPeer,
+                                                     caller_admission, only_admitted)
 
 
 def setUpModule() -> None:
@@ -1932,26 +1933,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         assert isinstance(reading, records.ReadingUnavailable)
                         self.assertIn("swap-in reading unavailable", reading.reason)
                         self.assertIn(str(path), reading.reason)
-
-
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class ReferenceActivityReader(ScopeActivityReader):
@@ -6381,7 +6362,7 @@ class ServiceTests(unittest.TestCase):
                         "since": request.since, "need": GIB, "step": "nextest", "session_name": caller,
                         "unit": unit, "folder": folder}
                     waiting = service.WaitingAdmission(request, row, service.NO_CONNECTION)
-                    self.assertEqual(service.wait_line_name(waiting), f"{expected} · nextest")
+                    self.assertEqual(service.wait_line_name(waiting), f"{expected}: nextest")
 
     def test_wait_lines_then_ranked_admissions_and_release_frees_charge(self) -> None:
         for owner_name in ("session", "CI", "unit", "folder", "pid", "continuation"):
@@ -6395,20 +6376,20 @@ class ServiceTests(unittest.TestCase):
                 fixture.hold_starts()
                 request = fixture.request(need=12 * GIB if owner_name == "continuation" else 8 * GIB, run=run)
                 head: wire.AdmitRequest | wire.ServiceEstimateRequest = request
-                label = "fixture · nextest"
+                label = "fixture: nextest"
                 if owner_name == "CI":
                     head = replace(fixture.service_request(runner="hana-linux-2"), argv=("cargo", "test"))
-                    label = "hana CI · hana-linux-2 · compile · test"
+                    label = "hana CI · hana-linux-2 · compile: test"
                 elif owner_name == "unit":
                     head = replace(request, identity=replace(request.identity, unit="compiler"))
-                    label = "compiler · nextest"
+                    label = "compiler: nextest"
                 elif owner_name in ("folder", "pid"):
                     head = replace(request, identity=replace(request.identity, session_id="", name="",
                         folder="/builds/hana" if owner_name == "folder" else "/"))
-                    label = "terminal · hana · nextest" if owner_name == "folder" else "unregistered session · nextest"
+                    label = "hana: nextest" if owner_name == "folder" else "unregistered session: nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
-                    label = "ordinary · nextest"
+                    label = "ordinary: nextest"
                     ordinary = fixture.request(need=8 * GIB, since=fixture.clock.now() - 1)
                     ordinary = replace(ordinary, identity=replace(ordinary.identity, name="ordinary"))
                     ordinary_peer = fixture.connect(ordinary)
@@ -6431,7 +6412,7 @@ class ServiceTests(unittest.TestCase):
                             self.assertIn("this build is the queue head", output.getvalue())
                         else:
                             self.assertEqual(waits[-1].snapshot.head_need, 8 * GIB)
-                            self.assertIn("head ordinary · nextest needs 8.0 GiB", output.getvalue())
+                            self.assertIn("head ordinary: nextest needs 8.0 GiB", output.getvalue())
                             self.assertNotIn("this build is the queue head", output.getvalue())
                 fixture.free((20 if owner_name == "continuation" else 60) * GIB)
                 if owner_name == "continuation":

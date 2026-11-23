@@ -23,6 +23,8 @@ from scripts.message.unit_labels import UnitLabels
 
 GIB = records.GIB
 WORDS = "/build:bump 2"
+# The bumps in these tests come from one session.
+BUMP_SESSION = {"CLAUDE_CODE_SESSION_ID": "bump-session", "CODEX_THREAD_ID": ""}
 
 class LabelReadMock(Protocol):
     return_value: dict[str, UnitLabels]
@@ -43,7 +45,7 @@ class QueueTests(NotificationGuardedTestCase):
         write_memory_config(config)
         self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
         self.enterContext(mock.patch.dict(os.environ, {"MAC_IDLE_STATE_DIR": str(self.root / "mac-idle")}))
-        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "bump-session", "CODEX_THREAD_ID": ""}))
+        self.enterContext(mock.patch.dict(os.environ, BUMP_SESSION))
         _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
     def test_bare_bump_prints_usage_and_the_builds_page_link(self) -> None:
@@ -270,6 +272,8 @@ class QueueTests(NotificationGuardedTestCase):
         """Serve the waiters; a waiter whose pid is in `run_pids` waits in its own run."""
         files = {path: path.read_bytes() for path in self.fixture.directory.glob("*.waiting")}
         admission = self.enterContext(AdmissionFixture(root=self.root, log_dir=self.root / "buildlog"))
+        # The fixture drops the caller's session, so the bump session comes back after it.
+        self.enterContext(mock.patch.dict(os.environ, BUMP_SESSION))
         for path, contents in files.items():
             _ = path.write_bytes(contents)
         admission.clock.epoch = NOW

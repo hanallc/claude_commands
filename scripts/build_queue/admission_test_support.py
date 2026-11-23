@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 from scripts.lib import cancellation, test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -360,6 +361,26 @@ class SocketPeer:
 
 class RefillMark(threading.local):
     clear_pending: bool = False
+
+
+class FixedSystemReader:
+    """Publish private evidence without an operating-system reader."""
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 class GaplessRefill:
@@ -1281,6 +1302,9 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
 
     fixture.server.host_probe = provider
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
+    if not records.owner_given(environment):
+        # A child process with no owner says the fixture started it, so the queue never refuses it.
+        environment["CLAUDE_SESSION_NAME"] = FIXTURE_OWNER
     for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]

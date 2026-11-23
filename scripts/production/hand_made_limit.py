@@ -95,14 +95,15 @@ def bound_output(checkout: Path, environment: Mapping[str, str]) -> Path:
 
 
 def held_output(argv: Sequence[str], checkout: Path, environment: Mapping[str, str],
-                held: ExitStack) -> tuple[int, ...]:
+                held: ExitStack, *, note_outside: bool) -> tuple[int, ...]:
     """For a cargo run, the folder steps of the build-hold cargo wrapper, before cargo starts with the program
     environment: make or check the checkout target link to the assigned build folder, hold the build folder lock
     until held closes, and write the use stamp.
 
     The run does the steps when the wrapper does them (cargo_folder.folder_step_due). The wrapper reads its own
     environment, so CARGO_FOLDER_CHECKED and BUILDLOG_STEP_SCOPE come from the environment of this process:
-    the program environment does not pass them.
+    the program environment does not pass them. With note_outside False, the steps give no note for a path
+    outside the build folders (cargo_folder.checked_step).
 
     The descriptor of the held lock, which the program also gets, as the wrapper gives it to cargo; empty when
     the run holds no lock. A refusal of the folder check raises Refused.
@@ -112,7 +113,7 @@ def held_output(argv: Sequence[str], checkout: Path, environment: Mapping[str, s
     try:
         if not cargo_folder.folder_step_due(argv[1:], os.environ):
             return ()
-        output = cargo_folder.checked_step(list(argv[1:]), checkout, held, environment)
+        output = cargo_folder.checked_step(list(argv[1:]), checkout, held, environment, note_outside=note_outside)
     except cargo_folder.STEP_ERRORS as error:
         raise Refused(FOLDER_STEP_REFUSAL.format(reason=error)) from error
     return (output.descriptor,) if isinstance(output, cargo_folder.CheckedOutputLock) else ()
@@ -165,10 +166,10 @@ def tools_refusal(checkout: Path, environment: Mapping[str, str]) -> str:
 def start_refusal(argv: Sequence[str], checkout: Path, environment: Mapping[str, str]) -> str:
     """The refusal of a run that the limit cannot take, at the attempt start. As at the run start, the folder steps
     of a cargo run come first, so the limit judges the target link that the steps repair; the lock ends with this
-    check."""
+    check. The run start gives the note for a path outside the build folders, so this check gives none."""
     with ExitStack() as held:
         try:
-            _ = held_output(argv, checkout, environment, held)
+            _ = held_output(argv, checkout, environment, held, note_outside=False)
         except Refused as refusal:
             return str(refusal)
         return limit_refusal(argv, checkout, environment)
