@@ -28,12 +28,13 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
+from scripts.lib import cancellation, process_stat
 from scripts.lib.descendants import adopt_descendants
 
 
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
+PROC_ROOT = process_stat.PROC_ROOT
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,24 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
+def job_start(pid: int, proc_root: Path) -> float | None:
+    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None without a readable Runner.Worker ancestor.
+
+    A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
+    """
+    seen: set[int] = set()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            name, fields = process_stat.name_and_fields(pid, proc_root)
+            if name == "Runner.Worker":
+                return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+            pid = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
 def remove_abandoned_folders(shared_folder: Path) -> None:
     """Remove this user's shared admission folders when their owners are not live."""
     uid = os.getuid()
@@ -128,6 +147,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
+    if os.environ.get("GITHUB_ACTIONS") == "true" and job_start(pid, PROC_ROOT) is None:
+        print("::warning::build queue: no readable Runner.Worker ancestor, so this step has no job start", file=sys.stderr)
     argv = [command, *arguments]
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)

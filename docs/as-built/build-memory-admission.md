@@ -2465,6 +2465,14 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
+`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
+`process_stat.name_and_fields` reads each process name and stat fields.
+A parent cycle in `/proc` ends the walk without a job start.
+When `GITHUB_ACTIONS=true`, each building call reads its job start in CLOCK_BOOTTIME seconds.
+Without a readable `Runner.Worker` ancestor, the call prints one `::warning::` line on stderr.
+No other behavior uses the job start yet.
+
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
 Unregistered CI use counts once in the cap and has no memory reservation.
