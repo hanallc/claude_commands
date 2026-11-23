@@ -3831,8 +3831,8 @@ class ChangePageTests(unittest.TestCase):
   const stubSave=outcome=>{
    let sent;
    window.fetch=async(url,request)=>{
-    if(request.method!=='POST') return {ok:false};
-    sent=request.body;return {ok:true,json:async()=>({answer:outcome})};
+    if(request.method!=='POST') return {headers:new Headers(),ok:false};
+    sent=request.body;return {headers:new Headers(),ok:true,json:async()=>({answer:outcome})};
    };
    return ()=>sent;
   };

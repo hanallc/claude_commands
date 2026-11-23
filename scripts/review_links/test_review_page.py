@@ -3382,7 +3382,7 @@ window.clearInterval=()=>{};
 window.refreshRequests=[];
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST') return {ok:true,json:async()=>({answer:'saved'})};
+ if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};
  window.refreshRequests.push(url);
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  return {ok:true,text:async()=>showPages[show]};
@@ -3724,7 +3724,7 @@ const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST'){window.didSave=true;return {ok:true,json:async()=>({answer:'saved'})};}
+ if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};}
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  const page=new DOMParser().parseFromString(showPages[show],'text/html');
  if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
@@ -4974,7 +4974,7 @@ window.fetch=async(url,options={})=>{
  if(options.method!=='POST') return {ok:true,text:async()=>window.refreshMarkup};
  if(url==='/results') return nativeFetch(url,options);
  window.posts.push(new URLSearchParams(options.body));
- return {ok:true,json:async()=>({answer:'approved',state:'Done'})};
+ return {headers:new Headers(),ok:true,json:async()=>({answer:'approved',state:'Done'})};
 };
 </script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
         page = source.replace('<script>', setup+'<script>', 1)
@@ -6421,7 +6421,7 @@ window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
   window.posts.push(new URLSearchParams(options.body));
   if(nextPost){const post=nextPost;nextPost=null;return post;}
-  return {ok:true,json:async()=>({answer:'works'})};
+  return {headers:new Headers(),ok:true,json:async()=>({answer:'works'})};
  }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };

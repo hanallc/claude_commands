@@ -785,8 +785,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             connection.request(method, path, body, {"Host": host, "Origin": f"http://{host}",
                                                     "Content-Type": "application/json", **(headers or {})})
             response = connection.getresponse()
+            body = response.read()
+            json_answer = (response.getheader("Content-Type") or "").startswith("application/json")
             return (response.status, response.getheader("X-Send-Hold", ""),
-                    cast(dict[str, object], json.loads(response.read() or b"{}")))
+                    cast(dict[str, object], json.loads(body)) if json_answer and body else {})
         finally:
             connection.close()
 
@@ -7271,6 +7273,7 @@ class ReviewLinksConfigTests(unittest.TestCase):
         server.next_attachment_retry = 105.0
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         server.page_captures = serve.PageCaptures(root / "captures")
+        server.send_holds = send_hold.Holds(root / send_hold.HOLD_FOLDER, send_hold.replay_to("127.0.0.1", 1))
         server.next_tailscale_check = 200.0
         server.next_sweep = 300.0
         server.next_code_check = 400.0

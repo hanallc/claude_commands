@@ -26,7 +26,7 @@ window.fetch=(path,options={})=>{
   return new Promise(()=>{});
  }
  return new Promise((resolve,reject)=>{
-  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
+  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({headers:new Headers(),ok:true,json:async()=>({
    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
   })});
  });
