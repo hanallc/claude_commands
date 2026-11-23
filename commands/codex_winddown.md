@@ -3,7 +3,7 @@ description: Stop Codex work or report active agents; it does not stop paid cred
 argument-hint: "[start|triage|clear|help]"
 ---
 
-A wind-down does not stop paid credits. When the user's reason is credits (for example, "workers are using credits"), the fix is the credits setting: send the user `/tune accounts codex_credit_accounts none` for their go. Never change that value without the user's go. A List page Go for that change counts after `go_check.py` prints `go ok` (see `/tune`). Start a wind-down too only if the user also asks to stop the agents.
+A wind-down does not stop paid credits. When the user's reason is credits (for example, "workers are using credits"), the fix is the credits setting: send the user `/tune accounts codex_credit_accounts none` for their go. Never change that value without the user's go. Start a wind-down too only if the user also asks to stop the agents.
 
 `$ARGUMENTS` is `start`, `triage`, `clear`, `help`, or empty. Run the line and show its output unchanged. Run `start`, `triage` or `clear` only on the user's word. With `help` or any other argument, show this block word for word and stop:
 

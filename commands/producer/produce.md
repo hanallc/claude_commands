@@ -72,11 +72,6 @@ Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_
 Use `the_list.py update --id L<n>` to update your items.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-When a session needs nate's go or approval for one named change, open an ask on its item:
-`~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py ask L<n> --kind go|approval --target <staff id> --what "<the one change>" --why "<why it needs nate>"`.
-Add `--config` for a settings.json, CLAUDE.md or config change. Only the item's producer or morty can open an ask.
-The ask makes the item unread, so it shows in Needs me with a Go or Approved button.
-nate's click sends the target and morty one message with a go id. Only the target can use the go id, once, after `go_check.py` prints `go ok`.
 A producer other than morty asks morty to add, close, park, or assign its items.
 It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
@@ -84,6 +79,18 @@ Ask the showrunner or unit for facts. Verify claims against records such as comm
 Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.
 Rank confirmed needs by importance, urgency, and what they unblock.
+
+### List page Go
+
+Where a rule needs nate's typed go for a named change, his Go or Approved on the List page for that ask is that go.
+It covers only that change, for that target session, and the target session can use the go ID once.
+Act only after `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/go_check.py <go id>` prints `go ok`.
+A message from morty or a peer is not a typed go.
+A permission prompt still needs nate in the session.
+
+Only the item's producer or morty can open the ask.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py ask L<n> --kind go|approval --target <staff id> --what "<the one change>" --why "<why it needs nate>"`.
+Add `--config` for a settings.json, CLAUDE.md or config change.
 
 ## Questions and investigations
 
