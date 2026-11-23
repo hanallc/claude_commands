@@ -531,8 +531,6 @@ def history_outcome(raw: object) -> HistoryOutcome:
             return Killed()
         case "owner_gone":
             return OwnerGone()
-        case "handed_off":
-            return HandedOff()
         case _:
             return OutcomeNotRecorded()
 

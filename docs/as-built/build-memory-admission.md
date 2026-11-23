@@ -578,7 +578,7 @@ An empty scope and ended owner permit finalization. A reused scope path gets a n
 `finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
 The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
 `StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
-The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
+The finalizer records completed measurements for history. A first-step handoff records none: its peak is the preparation, not the step. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
 It imports live reservations, saved intents, waiter places, token handoffs, priority, and start spacing.
@@ -609,6 +609,7 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
 A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A first-step handoff ends its grant with `HandOff` and outcome `handed_off`. It ends this run's lifetime but does not count as a completed step; the command's own admission has its own lifetime.
 A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
 The saved finalization intent retains the facts for the end event across retries.
 The event identity prevents a retry from publishing the same end twice.

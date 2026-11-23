@@ -5050,6 +5050,25 @@ class QueueLifecycleTests(unittest.TestCase):
                 self.assertEqual(len(lifetime.token_gaps), 1)
                 self.assertIsInstance(lifetime.end, gate.StepStillOpen)
 
+    def test_a_handoff_saved_before_a_crash_ends_as_a_handoff_after_the_restart(self) -> None:
+        for boundary in ("after_state_write", "after_finalization_intent"):
+            with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
+                request = fixture.request()
+                request = replace(request, sidecar=str(fixture.scope(request.owner)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grant)
+                fixture.clock.advance(2)
+                handoff = wire.ReleaseRequest("handoff-crash", grant.reservation, 0, "handed_off")
+                fixture.fault.stage = boundary
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(handoff)
+                fixture.restart()
+                self.assertEqual(fixture.server.handle_request(handoff), [wire.Ok()])
+                ended, = self.events(fixture, "ended")
+                self.assertEqual((ended["reservation_id"], ended["outcome"], ended["end_kind"]),
+                                 (grant.reservation, "handed_off", {"kind": "HandOff"}))
+                self.assertFalse(fixture.history())
+
     def test_an_end_append_retry_preserves_the_saved_time_and_publishes_once(self) -> None:
         for sampled in (False, True):
             with self.subTest(sampled=sampled), AdmissionFixture() as fixture:

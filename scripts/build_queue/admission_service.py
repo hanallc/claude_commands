@@ -477,7 +477,12 @@ class NotEnding:
 class ReleaseStatus:
     request_id: str
     status: int
-    ending: wire.ReleaseEnding = "result"
+
+
+@dataclass(frozen=True)
+class FirstStepHandOff:
+    """The caller gave its first-step grant to its command, which sends its own first step; no step ended."""
+    request_id: str
 
 
 @dataclass(frozen=True)
@@ -501,7 +506,9 @@ class TokenWaiting:
     left_at: float
 
 
-ReservationEnding = NotEnding | ReleaseStatus | OwnerExited | LocalGrantReturned | TokenWaiting
+ReservationEnding = NotEnding | ReleaseStatus | FirstStepHandOff | OwnerExited | LocalGrantReturned | TokenWaiting
+# The caller ended the grant itself, with a status or at a handoff.
+CallerRelease = ReleaseStatus | FirstStepHandOff
 
 
 @dataclass(frozen=True)
@@ -1616,8 +1623,8 @@ def finalization_outcome(ending: ReservationEnding
                                     gate.StepEnd | gate.TokenReturn | gate.HandOff]:
     if isinstance(ending, TokenWaiting):
         return step_estimator.Completed(), 0, gate.TokenReturn()
-    if isinstance(ending, ReleaseStatus) and ending.ending == "handed_off":
-        # The handoff status is not a step result: the step goes on under the command's own admission.
+    if isinstance(ending, FirstStepHandOff):
+        # The step goes on under the command's own admission.
         return step_estimator.HandedOff(), gate.OUTCOME_NOT_RECORDED, gate.HandOff()
     if isinstance(ending, ReleaseStatus):
         return (step_estimator.Completed() if ending.status == 0 else
@@ -1702,7 +1709,7 @@ class StateIntents:
         key = _place_key(record.owner, record.queue_waiter["since"])
         place = self.places.get(key)
         # A placement release can precede a refusal before launch.
-        awaiting_report = (isinstance(record.ending, ReleaseStatus) and place is not None
+        awaiting_report = (isinstance(record.ending, CallerRelease) and place is not None
                            and place.episode == self.episode and bool(place.move_id))
         if not isinstance(record.ending, TokenWaiting) and not awaiting_report:
             _ = self.places.pop(key, None)
@@ -3799,7 +3806,7 @@ class AdmissionServer:
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
-        started = isinstance(ending, ReleaseStatus)
+        started = isinstance(ending, CallerRelease)
         if not started and "verify" in record.queue_waiter and record.sidecar:
             try:
                 started = bool(Path(record.sidecar).read_text().strip())
@@ -3819,7 +3826,7 @@ class AdmissionServer:
                 self._watch_scope(lifetime, episode)
                 return
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
-        elif isinstance(ending, ReleaseStatus) and episode not in self.placement_requests:
+        elif isinstance(ending, CallerRelease) and episode not in self.placement_requests:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
@@ -3860,7 +3867,7 @@ class AdmissionServer:
         previous = self.ledger.get(episode)
         if previous is not None:
             self.ledger[episode] = replace(previous, ended_at=self.clock.now())
-        if isinstance(ending, (ReleaseStatus, TokenWaiting)):
+        if isinstance(ending, (ReleaseStatus, FirstStepHandOff, TokenWaiting)):
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
@@ -5736,7 +5743,8 @@ done
                     self._handed_off(record.run, _local_step(record))
                 else:
                     self._released(record.run, _local_step(record), request.status)
-                self._end(episode, ReleaseStatus(key, request.status, request.ending))
+                self._end(episode, FirstStepHandOff(key) if request.ending == "handed_off"
+                          else ReleaseStatus(key, request.status))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         elif isinstance(request, wire.WidthRequest):
             if request.width <= 0:
