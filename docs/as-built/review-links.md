@@ -240,7 +240,7 @@ When the fetched page has another version, it reloads the page.
 Accounts, Images, The List, Review, the Changes and Questions pages, and Investigations call it.
 An open page then never runs an old script on a fragment from a changed page script. No page has a second reload rule.
 Review reads its snapshot version as JSON, so that answer names the script version as `script`, and Review passes the string.
-A Review refresh reads only the index and the card bodies. Its version also hashes `SHELL_PARTS`, the fixed shell markup: the search field, the Type and State chips, the notices and the table head.
+A Review refresh reads only the index and the card bodies. Its version also hashes `SHELL_PARTS`, the fixed shell markup: the search field, the Type and State chips, the notices, the table head and the open-row template (`record_table.render_inline_detail()`).
 Only a visible edit or a save in flight holds the reload. The shared `pageHoldsInput` finds a visible edit:
 - a shown text field with unsaved text,
 - an open dialog, menu or date picker,
@@ -1576,7 +1576,7 @@ When Unpark clears parking and removes the row from Parked, the page shows “It
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-If All is active when Unpark saves, the item dialog stays open.
+If All is active when Unpark saves, the item row stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
