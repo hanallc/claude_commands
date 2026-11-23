@@ -46,8 +46,7 @@ if TYPE_CHECKING:
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-# The guest route holds a repository claim on this Mac target while its run lasts.
-GUEST_CLAIM_TARGET = 'mac'
+GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',

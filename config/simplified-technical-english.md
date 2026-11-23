@@ -14,6 +14,8 @@ workers and helpers.
 - Write steps as a numbered list, with one action in each step. Use a list for
   three or more items.
 - Say each point once. Cut flourish and accounts of your own diligence.
+- Say a change in the fewest plain words that stay accurate, for example "Not
+  Approved button removed".
 - Keep technical names (functions, files, commands, finding ids) as they are.
 - When you change older text, rewrite it to this standard.
 
