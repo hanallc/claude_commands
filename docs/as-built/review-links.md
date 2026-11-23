@@ -1038,7 +1038,7 @@ An unconfirmed action keeps the row expanded.
 If the current state is unavailable, the row shows the last confirmed state.
 If a refresh removes an open item, its row closes.
 
-`/console/list.html` reads the producer's numbered List records on each request.
+`/console/list.html` reads the numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
@@ -1139,7 +1139,9 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
-A new item without the option, and an old record without the field, belong to the record keeper, morty.
+Morty's CLI adds assign the item to morty by default.
+Other producers' CLI adds assign the item to the caller.
+Old records without the field use their record keeper.
 The terminal list shows a Producer column after Owner.
 The CLI shows producers only their assigned items. Morty can see every item.
 See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
