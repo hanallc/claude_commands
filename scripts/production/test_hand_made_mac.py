@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.mac_test.mac_transport import MacPlacement, RemoteRun, RemoteState
 from scripts.production import hand_made, hand_made_mac
@@ -506,7 +507,7 @@ class CopiedCheckoutTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
         _ = (repo / ".gitignore").write_text("secret.sh\n")
         _ = (repo / "secret.sh").write_text("echo natedev only\n")
-        settings = eligibility.SshConnectionSettings("mac-host", 7.0, 30.0)
+        settings = eligibility.SshConnectionSettings("mac-host", 7.0, 30.0, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         copied: list[tuple[list[str], str]] = []
 
         def rsync(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
