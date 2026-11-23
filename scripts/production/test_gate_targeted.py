@@ -9,6 +9,7 @@ import sys
 from typing import ClassVar, override
 from unittest import mock
 
+from scripts.build_queue import admission_records
 from scripts.production import gate
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib import build_folders
@@ -71,6 +72,22 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("gate module identity: True", result.stdout)
             self.assertIn("--affected", result.stdout)
+
+    def test_a_targeted_run_with_no_session_names_the_worktree_owner(self) -> None:
+        # targeted_test under systemd, or with no session, still names who started its queue requests.
+        observed: list[dict[str, str]] = []
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            observed.append({name: os.environ[name] for name in admission_records.OWNER_VARIABLES
+                             if os.environ.get(name)})
+            return gate.GateRun((), 0, 0, tests_reused=True)
+
+        self.environment.update(dict.fromkeys(admission_records.OWNER_VARIABLES, ""))
+        with mock.patch.dict(os.environ, dict.fromkeys(admission_records.OWNER_VARIABLES, "")), \
+             mock.patch.object(gate, "run_suites", side_effect=suites):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, [{"CLAUDE_SESSION_NAME": "verify"}])
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()

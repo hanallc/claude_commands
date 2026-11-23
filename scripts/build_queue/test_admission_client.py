@@ -322,7 +322,7 @@ class ClientTests(unittest.TestCase):
                 "since": head.since, "need": 2 * GIB, "session_name": "builder", "unit": "panes",
                 "folder": "/private/widget", "step": "nextest"}
             service_name = service.wait_line_name(service.WaitingAdmission(head, waiter, service.NO_CONNECTION))
-            self.assertEqual(service_name, "panes · nextest")
+            self.assertEqual(service_name, "panes: nextest")
 
             older: records.Waiter = {"pid": head.owner.pid, "start_time": head.owner.start_time,
                                      "since": head.since, "need": 2 * GIB}
@@ -341,13 +341,13 @@ class ClientTests(unittest.TestCase):
 
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
         for position, label, expected, reason in (
-            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
-            (2, "compiler · check", "head compiler · check needs 12.3 GiB", ""),
-            (2, "hana · test", "head hana · test needs 12.3 GiB", ""),
-            (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
-            (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
-            (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
-            (3, "first · nextest", "behind #2 · compiler · nextest", ""),
+            (2, "hana CI · hana-linux-2: test", "head hana CI · hana-linux-2: test needs 12.3 GiB", ""),
+            (2, "compiler: check", "head compiler: check needs 12.3 GiB", ""),
+            (2, "hana: test", "head hana: test needs 12.3 GiB", ""),
+            (2, "42: test", "head 42: test needs 12.3 GiB", ""),
+            (1, "hana CI · hana-linux-2: test", "this build is the queue head", ""),
+            (1, "hana: test", "this build is the queue head", "it edits the merged checkout"),
+            (3, "first: nextest", "behind #2 · compiler: nextest", ""),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
@@ -1095,6 +1095,83 @@ class ClientTests(unittest.TestCase):
                         constraints = fixture.server.placement_requests[request.episode].constraints
                 self.assertEqual(constraints.command_kind, kind)
 
+    def queued_mac_row(self, fixture: AdmissionFixture, place: Callable[[Callable[[list[str]], tuple[int, str, str]]], None]
+                       ) -> str:
+        """Place a Mac step for this process through the real place-step path; return its queue row text."""
+        from scripts.build_queue import placement
+        from scripts.build_queue.queue_lines import step_text
+        from scripts.lib.build_steps import RECORDED_STEP_NAMES
+
+        _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+        _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+        _ = write_config_fixture(fixture.root / "mac_test.conf",
+            f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+        _ = (fixture.root / "build_targets.conf").write_text(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+        fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+            key, fixture.clock.now(), "the test has not published provider evidence")
+        start = records.process_start_time(os.getpid())
+        assert start is not None
+        fixture.proc.register(wire.Owner(os.getpid(), start))
+        profile = fixture.request(step="check").profile
+        rows: list[str] = []
+
+        def place_step(arguments: list[str]) -> tuple[int, str, str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                code = client.main(arguments)
+            with fixture.loop_turn():
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            rows.extend(step_text(step, RECORDED_STEP_NAMES) for step in reply.reading.view.waiting
+                        if step.pid == os.getpid())
+            return code, output.getvalue(), errors.getvalue()
+
+        with fixture.serving(), mock.patch.dict(os.environ, {"CLAUDE_SESSION_NAME": "cargo-liner",
+                "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "BUILDLOG_OWNER_STAFF_ID": "",
+                records.BUILDLOG_UNIT: "", "MAC_TEST_STATE_DIR": str(fixture.root / "mac-test")}), \
+             mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                 profile, step_estimator.ReusableEstimate())):
+            place(place_step)
+        row, = rows
+        return row
+
+    def test_the_mac_queue_run_what_text_names_the_queue_row(self) -> None:
+        from scripts.mac_test import mac_queue_run
+
+        def run(place_step: Callable[[list[str]], tuple[int, str, str]]) -> None:
+            def queue(command: list[str], *, capture_stderr: bool) -> tuple[int, str, str]:
+                _ = capture_stderr
+                return place_step(command[1:])
+
+            args = mac_queue_run.Arguments()
+            args.what, args.kind, args.package, args.worktree = "run 6 installs", "run", "sample", fixture.root
+            args.no_wait, args.argv = True, ["--", "/bin/zsh", "-c", "true"]
+            # The fixture command `true` stands in for the client, so the cancel at the end leaves the fixture.
+            with mock.patch.object(mac_queue_run, "admission_command", return_value=["true"]), \
+                 mock.patch.object(mac_queue_run, "capture_command", side_effect=queue), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(mac_queue_run.run_attempt(args, time.time(), NoOwningSession()), 78, errors.getvalue())
+
+        real_socket = socket.socket
+        with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+             AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+            self.assertEqual(self.queued_mac_row(fixture, run), "cargo-liner: run 6 installs")
+
+    def test_an_assignment_file_with_no_what_keeps_the_step_row(self) -> None:
+        def run(place_step: Callable[[list[str]], tuple[int, str, str]]) -> None:
+            assignment = fixture.root / "assignment.json"
+            _ = assignment.write_text(json.dumps({"episode": "no-what", "pid": os.getpid()}))
+            code, _output, errors = place_step(["place-step", "--once", "--wait-events", "--target", "mac",
+                "--kind", "run", "--pid", str(os.getpid()), "--episode", "no-what", "--since", str(time.time()),
+                "--repo-root", str(fixture.root), "--package", "sample", "--assignment-file", str(assignment),
+                "--", "/bin/zsh", "-c", "true"])
+            self.assertEqual(code, 78, errors)
+
+        real_socket = socket.socket
+        with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+             AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+            self.assertEqual(self.queued_mac_row(fixture, run), "cargo-liner: check")
+
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
@@ -1109,15 +1186,17 @@ class ClientTests(unittest.TestCase):
                     launch = wire.LaunchRequest(request.episode, request.owner, request.since,
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
-                    self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
+                    self.assertEqual(records.waiter_identity("nextest", "tree", records.request_owner("tree")).get("unit", ""), unit)
 
-    def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
-        # A terminal family gives no name, so the worktree folder names the caller.
+    def test_request_owner_takes_the_worktree_owner_after_a_family_with_no_owner(self) -> None:
+        # With no owner variable and a family that names no owner, the worktree record names the owner.
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
                 "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}), \
-                mock.patch.object(records, "family_owner_name", return_value=""):
+                mock.patch.object(records, "family_owner",
+                                  return_value=records.OwnerNotGiven("systemd · run-p1-i2.service")), \
+                mock.patch.object(records, "folder_owner", return_value="verify"):
             identity = client.step_identity("nextest", "/work/queue-fixture")
-        self.assertEqual(identity.name, "terminal · queue-fixture")
+        self.assertEqual(identity.name, "verify")
 
     def test_step_identity_names_each_caller_kind(self) -> None:
         with AdmissionFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
@@ -1133,12 +1212,12 @@ class ClientTests(unittest.TestCase):
                 ("", worker.id, "", "impl", "navigation"),
                 ("unlisted", worker.id, "research", "research", ""),
                 ("unlisted", "", "", "unregistered session", ""),
-                ("", "", "", f"terminal · {Path.cwd().name}", ""),
+                ("", "", "", "terminal", ""),
             ):
                 with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
                     **environment, "CLAUDE_CODE_SESSION_ID": session,
                     "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
-                }), mock.patch.object(records, "family_owner_name", return_value=""):
+                }), mock.patch.object(records, "family_owner", return_value=records.TERMINAL_OWNER):
                     identity = client.step_identity("nextest", "")
                     self.assertEqual((identity.name, identity.unit), (name, owner_unit))
                     self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)

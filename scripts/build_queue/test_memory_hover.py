@@ -99,10 +99,10 @@ class MemoryHoverTests(unittest.TestCase):
         page = fixture.caller_selection_page()
         expected = (
             (700001, "recorded cloud", "recorded cloud", "recorded cloud"),
-            (50, "CI nextest", "hana CI", "hana CI"),
+            (50, "hana CI: nextest", "hana CI", "hana CI"),
             (301, "held caller", "held caller", "held caller"),
             (302, "unregistered session", "unregistered session", "unregistered session"),
-            (304, "hana nextest", "unregistered session", "hana nextest"),
+            (304, "hana: nextest", "unregistered session", "hana: nextest"),
             (200, "recorded local", "recorded local", "recorded local"),
             (700002, "recorded cloud", "recorded cloud", "recorded cloud"),
             (303, "recorded slot", "recorded slot", "recorded slot"),

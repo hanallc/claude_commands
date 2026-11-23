@@ -4369,7 +4369,7 @@ class QueueApiTests(MemoryQueueFixture):
 
     def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
         with patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
-            identity = admission_records.waiter_identity("gate", "tree")
+            identity = admission_records.waiter_identity("gate", "tree", admission_records.request_owner("tree"))
             self.assertEqual(identity.get("unit"), "queue-unit")
             self.assertEqual(identity["session_id"], "showrunner")
             self.assertEqual(gate.waiter_unit_name(identity), "queue-unit")
@@ -4380,7 +4380,7 @@ class QueueApiTests(MemoryQueueFixture):
              patch("os.getcwd", return_value="/tmp/hana-tree"):
             for step in ("nextest", "clippy", "mend", "doc"):
                 with self.subTest(step=step):
-                    self.assertEqual(admission_records.waiter_identity(step, "hana-tree"), {
+                    self.assertEqual(admission_records.waiter_identity(step, "hana-tree", admission_records.request_owner("hana-tree")), {
                         "session_id": "worker-id", "session_name": "recorded-name",
                         "step": step, "folder": "/tmp/hana-tree",
                     })

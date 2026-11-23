@@ -172,11 +172,15 @@ def select_queue_name(*candidates: object) -> str:
     return next((name for value in candidates if (name := public_queue_text(value))), UNKNOWN_CALLER)
 
 
-def wait_line_name(unit: str, caller: str, folder: str, step: str, *, fallback_name: str = "") -> str:
-    """Name a waiting step in queue order."""
-    owner = select_queue_name(unit, caller, Path(folder).name, fallback_name)
-    shown_step = public_queue_text(step)
-    return f"{owner} · {shown_step}" if shown_step else owner
+ROW_SEPARATOR = ": "
+
+
+def row_text(owner: object, what: object) -> str:
+    """Name a queue row `<owner>: <what>`: who started the work, then what it does.
+
+    An unusable owner shows the unknown caller label; an unusable or repeated what shows the owner alone."""
+    shown_owner, shown_what = select_queue_name(owner), public_queue_text(what)
+    return shown_owner + ROW_SEPARATOR + shown_what if shown_what and shown_what != shown_owner else shown_owner
 
 
 def ci_label(template: str, runner: str, job: str) -> str:

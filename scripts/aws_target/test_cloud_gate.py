@@ -57,7 +57,6 @@ from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
 from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
-from scripts.lib.build_steps import read_step_names
 from scripts.message.unit_labels import OwnerRole, UnitLabels
 
 
@@ -4051,17 +4050,29 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
     def test_service_commands_forward_only_set_owner_variables(self) -> None:
         owner = {'CODEX_THREAD_ID': 'fixture-codex', 'CLAUDE_CODE_SESSION_ID': 'fixture-claude',
-                 'CLAUDE_SESSION_NAME': 'fixture caller', 'BUILDLOG_UNIT': 'fixture-unit'}
+                 'BUILDLOG_OWNER_STAFF_ID': 'fixture-staff', 'CLAUDE_SESSION_NAME': 'fixture caller',
+                 'BUILDLOG_UNIT': 'fixture-unit'}
+        unowned = admission_records.OwnerNotGiven('systemd · fixture.service')
         for paired in (False, True):
-            for values in ({}, owner, {'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}, {'BUILDLOG_UNIT': ''}):
-                with self.subTest(paired=paired, values=values), mock.patch.dict(os.environ):
+            for values, family, expected in (
+                ({}, unowned, {}), (owner, unowned, owner),
+                ({'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}, unowned, {'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}),
+                ({'BUILDLOG_UNIT': ''}, unowned, {}),
+                # A terminal caller names its owner, so the service request says who started it.
+                ({'BUILDLOG_UNIT': 'fixture-unit'}, admission_records.TERMINAL_OWNER,
+                 {'BUILDLOG_UNIT': 'fixture-unit', 'CLAUDE_SESSION_NAME': 'terminal'}),
+                # A state-root script of a staff member passes the staff id, so the staff link stays.
+                ({}, admission_records.StaffOwner('fixture-staff', 'impl'), {'BUILDLOG_OWNER_STAFF_ID': 'fixture-staff'}),
+            ):
+                with (self.subTest(paired=paired, values=values), mock.patch.dict(os.environ),
+                      mock.patch.object(admission_records, 'family_owner', return_value=family)):
                     for key in owner:
                         _ = os.environ.pop(key, None)
                     os.environ.update(values)
                     command = cloud_gate.service_command('scripts.aws_target.aws_trial',
                         ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                     forwarded = service_environment(command)
-                    self.assertEqual({key: value for key, value in forwarded.items() if key in owner}, values)
+                    self.assertEqual({key: value for key, value in forwarded.items() if key in owner}, expected)
                     self.assertEqual(set(forwarded) - set(owner), {'AWS_SHARED_CREDENTIALS_FILE', 'CONF_DIR'})
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
@@ -4090,7 +4101,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                             identity.get('session_name', ''), record.step, record.worktree, identity['since'],
                             record.need, admission_records.ReadyForAdmission(), unit=identity.get('unit', ''))
                         self.assertEqual(queue_evidence.step_labels(step, {'fixture-owner': owner}), owner)
-                        self.assertEqual(read_step_names().for_owner(step.step, owner.unit, owner.role), 'fixture-unit merge')
 
     def test_paired_trial_admission_records_its_named_test_job(self) -> None:
         pid = os.getpid()

@@ -391,8 +391,18 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
 
-The Builds page shows the owner unit with the step name, such as `nateroids nextest`.
-A step without a project name shows only the step.
+Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `nateroids: nextest`.
+`snapshot_codec.row_text(owner, what)` is the one function that makes this text.
+`snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
+The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
+`queue_lines.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
+1. The recorded unit, then the staff unit.
+2. The staff showrunner, or the session name for a session with no production.
+3. The stored caller name, then the repository or package.
+A CI row uses `hana CI` as the owner.
+A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
+So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
+`slot_wait.QueueRowName.owned` and `memory_feed.row_name_parts` use `row_text`, so the name and its parts agree.
 An absolute repository path does not supply a project name.
 Matching and history retain the original step name.
 The queue omits a live unowned scope when its run has no reservation and keeps no memory.
@@ -984,30 +994,67 @@ BRP launches use `launch`; launch permission creates no reservation.
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
 The client checks the staff name, the exported name, and the session folder name in that order.
-A caller with no session and no staff reference gets its exported name from `family_owner_name(pid, proc_root)`.
-That function reads the process and its parents in `/proc` once.
+`admission_records.request_owner(worktree)` finds who started a request. It uses the first rule that matches:
+1. A session (`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`), `BUILDLOG_OWNER_STAFF_ID`, or `CLAUDE_SESSION_NAME`.
+2. The process family, through `family_owner(pid, proc_root)`: a state-root script, a terminal, or a desktop or login scope.
+3. The recorded owner of an absolute worktree, through `copies.recorded_owner`: an active gate, the copy record, or the staff worktree.
+   `admission_records.folder_owner` reads with `RemovalIntentAccess.READ_ONLY`, so a queue request never clears a removal intent.
+   `copies.source_owner` keeps the default `RECOVER` read, so its other callers still clear a stale removal intent.
+4. Otherwise the result is `OwnerNotGiven(program)`, which says only which program asked.
+`family_owner` reads the process and its parents in `/proc` once, with the cgroup unit of each process.
 The read stops at the first `claude` or `codex` process, so a session launcher never names the work.
 A read error stops the read, and the next rule applies.
 The script of a process is its first argument that is not an option and ends in `.py`, `.sh`, `.zsh` or `.bash`.
 The read skips the value of `-X`, `-W`, `-o`, `+o`, `-O` and `+O`.
 A relative script path starts at the `/proc/<pid>/cwd` folder of that process.
-The function uses the first rule that matches:
-1. No process can be read, for example on macOS, which has no `/proc`. The name stays `terminal · <folder>`.
+The function returns one type for each result, and uses the first rule that matches:
+1. No process can be read, for example on macOS, which has no `/proc`. The result is `TERMINAL_OWNER`, named `terminal`.
 2. A family process runs a script under the showrunner state root, in `<root>/<id>/...`.
-   The name is `<staff name> · <script file>`, for example `cargo-liner · install_rest.sh`.
-   When no staff member has that id, the name uses the first 8 characters of the id.
+   The result is `StaffOwner(member_id, name)`, for example the staff member `cargo-liner`.
+   `request_owner` and the service resolve the staff id, so the row keeps the staff unit.
+   When no staff member has that id, the result is `StateSessionOwner`, named with the first 8 characters of the id.
    `scripts/lib/showrunner_state.py` `state_root()` gives the root for this rule, `record_store` and `showrunners`.
-3. A family process has a tty, and the read did not stop at an agent: the user's terminal.
-   The client then uses `terminal · <folder>` for a direct command with a known folder.
-4. The process runs in a unit that `systemd-run` made (`run-*.service`).
-   The name is `systemd · <outermost script file>`, else `systemd · <folder of the process cwd>`.
-5. The process runs in another systemd `.service` unit: `systemd · <unit>`.
-6. Other callers: `script · <outermost script file>`, else `script · <command of the process>`.
-The service uses the same function for a scope with no recorded caller.
+3. A family process has a tty, and the read did not stop at an agent: `TERMINAL_OWNER`.
+   A user terminal can run under a service, such as the `herdr-agents.service` terminal server, so this rule comes first.
+4. A family process runs in a systemd `.service` unit. A timer that runs `systemd-run --user --scope` matches here.
+   For a unit that `systemd-run` made (`run-*.service`), the result is `OwnerNotGiven("systemd · <outermost script file>")`,
+   else `systemd · <folder of the process cwd>`. For another service, the result is `OwnerNotGiven("systemd · <unit>")`.
+5. The process runs in an `app-*.scope` or a `session-*.scope`, and the read did not stop at an agent: `TERMINAL_OWNER`.
+   A desktop app or a login session started the work, so the user owns it.
+   For example, Zed starts rust-analyzer through `queue_place.py` in an `app-dev.zed.Zed-*.scope` with no tty.
+   A desktop that starts an app in an `app-*.scope` puts no service in the family.
+   KDE starts some apps as an `app-*.service`. Rule 4 matches that family, so it does not say who started the work.
+   The flycheck cargo calls of rust-analyzer run in its `builds.slice` scope, so the cargo wrapper starts them with no queue request.
+6. Other callers: `OwnerNotGiven("script · <outermost script file>")`, else `script · <command of the process>`.
+The service uses the same function for a scope with no recorded caller, and shows the program text.
 It reads the family of the oldest scope process.
-The Builds page and the queue evidence lines never make a `terminal ·` name from a folder alone.
-When the stored name is empty, they show the staff name or `unregistered session`.
-On Linux, a caller with no tty gets a `terminal ·` name only when its family cannot be read, for example when its process ended during the read.
+These callers always give an owner, also under systemd or with no session:
+- The merge gate and the nightly gate: `default_owner(<unit>)` around the suites.
+- `gate.py --tests-only` and `--affected` (targeted_test): `default_owner(copies.source_owner(repo))`.
+  `run_tests_only` reads `copies.source_owner` only when `request_owner("")` gives `OwnerNotGiven`:
+  the caller set no owner variable and its process family names no owner, so a run from a terminal keeps `terminal`.
+- `cloud_gate.service_command`: `owner_environment()` passes the owner variables to the systemd unit.
+  A state-root staff caller started the work, so it passes its staff id in `BUILDLOG_OWNER_STAFF_ID`.
+  Another family owner passes `CLAUDE_SESSION_NAME`.
+- A gate test module: `test_module_environment` sets `CLAUDE_SESSION_NAME=gate module` when it inherits no owner.
+- A test fixture: `verify_test_environment` and `gate_isolation_environment` always set `CLAUDE_SESSION_NAME=test fixture`.
+  `gate_isolation_environment` also sets `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` and `BUILDLOG_OWNER_STAFF_ID` to empty.
+  `verify_test_environment` copies only an allowed list of variables, and no owner variable is on it.
+  So these fixtures never read the owner from the environment around them.
+- A child process of `admission_test_support.caller_admission`: the fixture sets `CLAUDE_SESSION_NAME=test fixture`
+  in its environment when that environment names no owner.
+`verify.sh` and the cargo wrapper give no owner variable of their own.
+Their requests take the owner from the caller variables, the process family, or the worktree owner record.
+`default_owner(reference)` sets `CLAUDE_SESSION_NAME` to the staff name of the reference, or else to the reference.
+When the reference is a staff unit or a worker of a unit, it also sets `BUILDLOG_UNIT` to that unit if `BUILDLOG_UNIT` is empty.
+It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads that variable for a run with no session.
+A hold that stops the run sends a restart notice to that staff member when the hold ends.
+The default owner did not start the run, so it must not get that notice.
+It does nothing when an owner variable is already set, and it puts back the earlier values at the end.
+`queue_lines.wait_line_name` names a waiting step for the client wait line, the service head label, and the Builds page "behind" text.
+It takes the owner from `owner_name`, with the staff labels when the caller has them, so a wait line and a row show the same owner.
+It uses the folder name, and then the head name, only when `owner_name` finds no usable name.
+When the stored name is empty, the Builds page shows the staff name or `unregistered session`.
 The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
 The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
 It returns `unregistered session` when no candidate is usable.

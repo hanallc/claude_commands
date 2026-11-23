@@ -28,6 +28,7 @@ from scripts.build_queue import (admission_client, admission_protocol as wire, a
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made
@@ -958,7 +959,8 @@ class BuildsPageTests(unittest.TestCase):
                 yield queue_place.PlaceSetup(folder, folder / "sidecar", step_estimator.memory_config(),
                                              queue_place.ProgramPurpose.BATCH, (), request)
 
-            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog")}), \
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog"),
+                                              "CLAUDE_SESSION_NAME": FIXTURE_OWNER}), \
                     mock.patch.object(queue_place, "place_setup", side_effect=setup):
                 for machines in (("natedev", "mac"), ("mac",), ("natedev", "mac-linux")):
                     with self.subTest(machines=machines), hand_made.placement_line(
@@ -1003,9 +1005,9 @@ class BuildsPageTests(unittest.TestCase):
         self.assertEqual(names.shown(build_steps.HAND_MADE.step), "hand made")
         self.assertEqual(names.queue_name(build_steps.HAND_MADE.step), "hand made")
         self.assertTrue(build_steps.is_recorded_step("hand-made"))
-        step = mock.Mock(spec=["session_id", "unit", "project", "step"], session_id="", unit="aws-unit",
-                         project="claude", step="hand-made")
-        self.assertEqual(queue_lines.step_text(step, names), "aws-unit hand made")
+        step = mock.Mock(spec=["session_id", "session_name", "unit", "project", "step"], session_id="",
+                         session_name="", unit="aws-unit", project="claude", step="hand-made")
+        self.assertEqual(queue_lines.step_text(step, names), "aws-unit: hand made")
 
     def test_a_hand_made_run_counts_in_the_run_limit_of_its_repository(self) -> None:
         limits = admission_records.RepositoryRunLimits({"natedev.hana": 2})

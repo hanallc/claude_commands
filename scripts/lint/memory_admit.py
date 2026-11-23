@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
-from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records as records, placement, progress_profile as progress, queue_lines, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -1716,7 +1716,7 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
 
 
 def waiter_unit_name(identity: WaiterIdentity) -> str:
-    return codec.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
+    return queue_lines.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
 
 
 class QueueIdentityReader:
@@ -2513,7 +2513,8 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            run=row.get("build_run", NoLiveBuildRun()),
                            package=row["package"] if "package" in row else PackageNotRecorded(),
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
-                           route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""))
+                           route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""),
+                           what=row.get("what", ""))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
@@ -2854,7 +2855,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    job=row.get("job", GATE_JOB_NOT_RECORDED),
                                    ci_runner=row.get("queue_waiter", {}).get("ci_runner", ""),
                                    route=(records.waiter_route(row["queue_waiter"]) if "queue_waiter" in row
-                                          else ANY_ELIGIBLE_TARGET)))
+                                          else ANY_ELIGIBLE_TARGET),
+                                   what=row.get("queue_waiter", {}).get("what", "")))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value,
                    pid=value.pid if isinstance(value, CompilerServiceMemory) else PidNotRecorded())

@@ -1601,9 +1601,7 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
     """Use the installed scaler environment for each gate controller."""
     credential = str(admin_secrets.credentials_file())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
-    owner = ['--setenv=' + name + '=' + os.environ[name] for name in
-             ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_NAME', admission_records.BUILDLOG_UNIT)
-             if name in os.environ]
+    owner = ['--setenv=' + name + '=' + value for name, value in admission_records.owner_environment().items()]
     cleanup: list[str] = []
     stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
     if '--cleanup' not in arguments:
