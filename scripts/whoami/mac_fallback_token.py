@@ -20,8 +20,9 @@ from scripts.whoami import note_file
 
 ENV_NAME = "CLAUDE_CODE_OAUTH_TOKEN"
 NOTE_NAME = "Mac fallback token.md"
-OBSERVATION_INTERVAL = timedelta(hours=1)
 OBSERVATION_MAX_AGE = timedelta(days=1)
+# The note changes rarely, so the vault sync commits it rarely; a missed write still leaves half the stale limit.
+OBSERVATION_INTERVAL = OBSERVATION_MAX_AGE / 2
 
 
 class Unknown(Enum):

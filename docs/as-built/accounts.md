@@ -845,7 +845,7 @@ The `mac_token.account` key in `config/showrunners.conf` sets the Claude account
 A blank or invalid label prompts the user to set the account.
 The relay and timer use no account probe.
 The note stores the token file's modification time and the times of relay results.
-The timer records a fresh observation at most once an hour for the same file.
+The timer records a fresh observation at most once in 12 hours for the same file: half the 24-hour stale limit (`OBSERVATION_INTERVAL = OBSERVATION_MAX_AGE / 2`).
 The page marks data stale when the observation is more than one day old, missing, or in the future.
 Replacing the file starts a new record.
 The page estimates expiry as 365 days after the modification time.
