@@ -630,6 +630,54 @@ sweep_after_step test-step
                     _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
+    def forced_sweep_launches(self, state: str) -> str:
+        """Run a forced step, as verify.sh doc runs it, and return the commands its sweep starts."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "lint-sweep").mkdir(parents=True)
+            tools = root / "bin"
+            tools.mkdir()
+            tool = tools / "systemd-cat"
+            _ = tool.write_text("#!/bin/sh\nexec cat >/dev/null\n")
+            tool.chmod(0o755)
+            lint_config = root / "lint.conf"
+            _ = lint_config.write_text(f"sweep={state}\n")
+            reader, writer = os.pipe()
+            try:
+                command = ('source "$1"; run_once() { printf "%s\\n" "${2##*/}" >&"$SWEEP_TEST_FD"; }; '
+                           "sweep_after_step test-step")
+                result = subprocess.run(
+                    ("bash", "-c", command, "sweep-test", str(INVOKE)), cwd=root, capture_output=True,
+                    text=True, check=False, pass_fds=(writer,), timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                    env={**invoke_test_environment(), **config_environment(root / "config"), "HOME": directory,
+                         "TMPDIR": directory, "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
+                         "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}", "LINT_INVOKE_SOURCED": "",
+                         "LINT_SKIP_SWEEP": "", "LINT_CONFIG_FORCE": "1", "LINT_CONFIG_FILE": str(lint_config),
+                         "SWEEP_TEST_FD": str(writer)})
+                os.close(writer)
+                writer = -1
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                launches = b""
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
+                while True:
+                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
+                    self.assertTrue(ready, "the background sweep still holds its pipe")
+                    chunk = os.read(reader, 4096)
+                    if not chunk:
+                        return launches.decode()
+                    launches += chunk
+            finally:
+                if writer >= 0:
+                    os.close(writer)
+                os.close(reader)
+
+    def test_forced_step_starts_no_sweep_when_sweep_is_off(self) -> None:
+        self.assertEqual(self.forced_sweep_launches("off"), "")
+
+    def test_forced_step_starts_the_sweep_when_sweep_is_on(self) -> None:
+        self.assertEqual(self.forced_sweep_launches("on"), "sweep.py\n")
+
     def test_offload_switch_starts_no_detached_sweep(self) -> None:
         self.assertEqual(self.sweep_run("1"), SweepRun("", ""))
 
