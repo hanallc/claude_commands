@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import gzip
 import io
@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 
-from scripts.test_times import gate_record
+from scripts.test_times import gate_record, recent_gate_times, show
 from scripts.buildlog import index, record, store
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
@@ -28,6 +28,7 @@ class GateRecordTests(unittest.TestCase):
     timing_path: Path = Path()
     config: Path = Path()
     buildlog: Path = Path()
+    recent_path: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -36,18 +37,31 @@ class GateRecordTests(unittest.TestCase):
         self.config = self.root / "config"
         self.config.mkdir()
         self.buildlog = self.root / "buildlog"
+        self.recent_path = self.buildlog / "recent-gate-times.json"
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.config), "BUILDLOG_DIR": str(self.buildlog),
             "HOME": str(self.root / "home"),
         }))
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5\nTOP_RUNS=2")
+        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=1")
+
+    def fixture_index(self) -> sqlite3.Connection:
+        self.buildlog.mkdir(exist_ok=True)
+        connection = sqlite3.connect(index.index_path())
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        return connection
+
+    def seed_times(self, connection: sqlite3.Connection) -> int:
+        connection.commit()
+        with closing(index.read_only()) as snapshot:
+            return recent_gate_times.seed(snapshot)
 
     def test_time_limits_use_passing_history_on_the_same_vcpu_count(self) -> None:
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3")
-        connection = sqlite3.connect(":memory:")
-        self.addCleanup(connection.close)
-        index.create_schema(connection)
+        connection = self.fixture_index()
         rows = [("a", 8, 0, 0, "full", 10), ("b", 8, 0, 0, "full", 20),
                 ("c", 8, 0, 0, "full", 30), ("d", 8, 1, 0, "full", 1000),
                 ("e", 16, 0, 0, "full", 1000), ("f", 8, 0, 1, "full", 1000),
@@ -58,8 +72,10 @@ class GateRecordTests(unittest.TestCase):
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
                 VALUES (?, ?, 'gate', ?, ?, ?, ?, ?, 2, 1)""",
                 (identity, identity, vcpus, status, aborted, selection, seconds)).close()
-        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(40))
-        self.assertIsInstance(gate_record.history_time_limit(connection, 4, (), 2, False), gate_record.NoGateTimeLimit)
+        _ = self.seed_times(connection)
+        read = recent_gate_times.read_time_limit
+        self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(40))
+        self.assertIsInstance(read(4, (), 2, False), gate_record.NoGateTimeLimit)
         for run, suite, module, seconds, status in (
                 ("a", "lib", "test_a.py", 6, 0), ("b", "lib", "test_a.py", 10, 0),
                 ("c", "lib", "test_a.py", 8, 0), ("c", "lib", "test_b.py", 7, 0),
@@ -68,54 +84,188 @@ class GateRecordTests(unittest.TestCase):
             connection.execute("""INSERT INTO gate_modules (run_id, suite, module, attempt, wall_s, status, restart)
                                 VALUES (?, ?, ?, 1, ?, ?, '')""", (run, suite, module, seconds, status)).close()
         modules = ["scripts/lib/test_a.py", "scripts/lib/test_b.py", "scripts/lib/nested/test_c.py"]
-        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 2, True), gate_record.GateTimeLimit(21))
-        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 8, True), gate_record.GateTimeLimit(16))
-        self.assertIsInstance(gate_record.history_time_limit(connection, 8, ["lib/test_bad.py"], 2, True), gate_record.NoGateTimeLimit)
+        _ = self.seed_times(connection)
+        self.assertEqual(read(8, modules, 2, True), gate_record.GateTimeLimit(21))
+        self.assertEqual(read(8, modules, 8, True), gate_record.GateTimeLimit(16))
+        self.assertIsInstance(read(8, ["lib/test_bad.py"], 2, True), gate_record.NoGateTimeLimit)
         for missing in (["lib/test_missing.py"], ["lib/test_missing.py", "lib/test_other.py"]):
             with self.subTest(missing=missing):
-                self.assertIsInstance(gate_record.history_time_limit(connection, 8, [*modules, *missing], 2, True),
+                self.assertIsInstance(read(8, [*modules, *missing], 2, True),
                                       gate_record.NoGateTimeLimit)
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=3")
-        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
+        self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(60))
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
-        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
+        self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(90))
 
     def test_full_time_limit_uses_only_runs_with_the_same_job_count(self) -> None:
         """A 16-job run on natedev never takes its limit from 32-job cloud runs on the same vCPU count."""
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
-        connection = sqlite3.connect(":memory:")
-        self.addCleanup(connection.close)
-        index.create_schema(connection)
+        connection = self.fixture_index()
         for identity, jobs, seconds in (("a", 32, 210), ("b", 32, 212), ("c", 32, 209)):
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
                 VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, ?, 790)""",
                 (identity, identity, seconds, jobs)).close()
-        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 32, False), gate_record.GateTimeLimit(315))
-        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+        _ = self.seed_times(connection)
+        read = recent_gate_times.read_time_limit
+        self.assertEqual(read(32, (), 32, False), gate_record.GateTimeLimit(315))
+        self.assertEqual(read(32, (), 16, False), gate_record.NoGateTimeLimit(
             "no passing full gate history for 32 vCPUs at 16 jobs"))
         connection.execute("""INSERT INTO gate_runs
             (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
             VALUES ('d', 'd', 'gate', 32, 0, 0, 'full', 420, 16, 790)""").close()
-        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(630))
+        _ = self.seed_times(connection)
+        self.assertEqual(read(32, (), 16, False), gate_record.GateTimeLimit(630))
 
     def test_full_time_limit_skips_runs_of_the_type_check_alone(self) -> None:
         """Five passing --full runs of the type check alone set a 175 s limit that cut the 11-15 nightly."""
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
-        connection = sqlite3.connect(":memory:")
-        self.addCleanup(connection.close)
-        index.create_schema(connection)
+        connection = self.fixture_index()
         for identity, seconds, modules_run in (("a", 600, 790), ("b", 117, 0), ("c", 104, 0), ("d", 127, 0)):
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
                 VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, 16, ?)""",
                 (identity, identity, seconds, modules_run)).close()
-        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(900))
+        _ = self.seed_times(connection)
+        read = recent_gate_times.read_time_limit
+        self.assertEqual(read(32, (), 16, False), gate_record.GateTimeLimit(900))
         connection.execute("DELETE FROM gate_runs WHERE id = 'a'").close()
-        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+        self.recent_path.unlink()
+        _ = self.seed_times(connection)
+        self.assertEqual(read(32, (), 16, False), gate_record.NoGateTimeLimit(
             "no passing full gate history for 32 vCPUs at 16 jobs"))
+
+    def test_record_updates_match_the_read_only_seed(self) -> None:
+        connection = self.fixture_index()
+        run = gate_run()
+        module = {**run["modules"][0], "restart": "", "status": 0}
+        passing = {**run, "vcpus": 8, "selection": "full", "status": 0}
+        older = {**passing, "id": "d", "started_at": "2026-01-01", "wall_s": 100,
+                 "modules": [{**module, "wall_s": 100}]}
+        first = {**passing, "id": "a", "started_at": "2026-01-02", "wall_s": 20,
+                 "modules": [{**module, "wall_s": 4}, {**module, "wall_s": 8, "attempt": 2}]}
+        second = {**passing, "id": "b", "started_at": "2026-01-02", "wall_s": 30,
+                  "modules": [{**module, "wall_s": 14}]}
+        restarted = {**passing, "id": "c", "started_at": "2026-01-03", "selection": "subset",
+                     "modules": [{**module, "wall_s": 200, "restart": "hold"}]}
+        rejected = ({**second, "id": "failed", "status": 1}, {**second, "id": "aborted", "aborted": True},
+                    {**second, "id": "reused", "selection": "reused"}, restarted)
+        for record_row in (second, older, first, second, *rejected):
+            index.add_gate_run(connection, record_row, "fixture")
+            recent_gate_times.update_recent_times(record_row)
+
+        path = self.recent_path
+        expected = {"full": {"8/2": [["2026-01-02", "b", 0, 30], ["2026-01-02", "a", 0, 20]]},
+                    "modules": {"8/scripts/test_example.py": [["2026-01-02", "b", 1, 14], ["2026-01-02", "a", 2, 8]]}}
+        self.assertEqual(json.loads(path.read_text()), expected)
+        read = recent_gate_times.read_time_limit
+        self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(50))
+        self.assertEqual(read(8, ["scripts/scripts/test_example.py"], 2, True), gate_record.GateTimeLimit(22))
+        path.unlink()
+        connection.execute("INSERT INTO meta (key, value) VALUES ('updated_at', '100')").close()
+        connection.commit()
+        connection.close()
+        current_index = index.index_path()
+        _ = current_index.rename(current_index.with_name("index-fixture.sqlite"))
+        self.fixture_index().commit()
+        output = io.StringIO()
+        with (mock.patch.object(index, "update", side_effect=AssertionError("seed updated the index")),
+              redirect_stdout(output)):
+            self.assertEqual(show.main(["seed-gate-times"]), 0)
+        self.assertEqual(output.getvalue(), "Recent gate time keys: 2\n")
+        self.assertEqual(json.loads(path.read_text()), expected)
+        self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(50))
+        self.assertEqual(read(8, ["scripts/scripts/test_example.py"], 2, True), gate_record.GateTimeLimit(22))
+
+    def test_seed_requires_a_completed_index_refresh(self) -> None:
+        self.fixture_index().commit()
+        stderr = io.StringIO()
+        with (mock.patch.object(index, "update", side_effect=AssertionError("seed updated the index")),
+              redirect_stderr(stderr)):
+            self.assertEqual(show.main(["seed-gate-times"]), 1)
+        self.assertEqual(stderr.getvalue(),
+                         "recent gate times not seeded: no complete index has compatible gate tables\n")
+        self.assertFalse(self.recent_path.exists())
+
+    def test_seed_rejects_an_index_replaced_after_selection(self) -> None:
+        with closing(self.fixture_index()) as original:
+            original.execute("INSERT INTO meta (key, value) VALUES ('updated_at', '100')").close()
+            original.commit()
+        open_index = show.open_read_only_index
+
+        def replace_then_open(path: Path) -> sqlite3.Connection:
+            self.assertEqual(path, index.index_path())
+            path.unlink()
+            with closing(self.fixture_index()) as replacement:
+                replacement.commit()
+            return open_index(path)
+
+        stderr = io.StringIO()
+        with (mock.patch.object(show, "open_read_only_index", side_effect=replace_then_open),
+              mock.patch.object(recent_gate_times, "seed", side_effect=AssertionError("seed queried an incomplete index")),
+              mock.patch.object(gate_record, "seed_latest_module_reads",
+                                side_effect=AssertionError("read seed queried an incomplete index")),
+              redirect_stderr(stderr)):
+            self.assertEqual(show.main(["seed-gate-times"]), 1)
+        self.assertEqual(stderr.getvalue(), "recent gate times not seeded: the opened index has no completed refresh\n")
+        self.assertFalse(self.recent_path.exists())
+
+    def test_missing_and_corrupt_times_disable_the_limit(self) -> None:
+        path = self.recent_path
+        path.parent.mkdir()
+        for contents in ("", "{", '{"full":{"8/2":[["start","id",0,NaN]]},"modules":{}}'):
+            with self.subTest(contents=contents):
+                if contents:
+                    _ = path.write_text(contents)
+                limit = recent_gate_times.read_time_limit(8, (), 2, False)
+                self.assertIsInstance(limit, gate_record.NoGateTimeLimit)
+
+    def test_read_error_disables_the_limit_and_preserves_the_file(self) -> None:
+        run = {**gate_run(), "id": "first", "status": 0, "vcpus": 8, "selection": "full"}
+        recent_gate_times.update_recent_times(run)
+        contents = self.recent_path.read_bytes()
+        run.update(id="newer", wall_s=30)
+        read_text = Path.read_text
+
+        def read_with_error(path: Path, encoding: str | None = None) -> str:
+            if path == self.recent_path:
+                raise PermissionError("cannot read the timing file")
+            return read_text(path, encoding=encoding)
+
+        stderr = io.StringIO()
+        with (mock.patch.object(Path, "read_text", autospec=True, side_effect=read_with_error),
+              redirect_stderr(stderr)):
+            limit = recent_gate_times.read_time_limit(8, (), 2, False)
+            self.assertIsInstance(limit, gate_record.NoGateTimeLimit)
+            recent_gate_times.update_recent_times(run)
+
+        self.assertEqual(stderr.getvalue(), "recent gate times not written: cannot read the timing file\n")
+        self.assertEqual(self.recent_path.read_bytes(), contents)
+
+    def test_update_replaces_a_corrupt_timing_file(self) -> None:
+        self.recent_path.parent.mkdir()
+        _ = self.recent_path.write_text("{")
+        run = {**gate_run(), "id": "first", "status": 0, "vcpus": 8, "selection": "full"}
+        recent_gate_times.update_recent_times(run)
+        self.assertEqual(recent_gate_times.read_time_limit(8, (), 2, False), gate_record.GateTimeLimit(10))
+
+    def test_passing_record_updates_times_and_a_failed_update_keeps_the_record(self) -> None:
+        run = gate_run()
+        run.update(status=0, vcpus=8, selection="full")
+        run["modules"][0].update(status=0, restart="")
+        gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(recent_gate_times.read_time_limit(8, (), 2, False), gate_record.GateTimeLimit(10))
+        path = self.recent_path
+        contents = path.read_bytes()
+        stderr = io.StringIO()
+        with (mock.patch.object(recent_gate_times, "write_text_atomic", side_effect=OSError("first line\nsecond line")),
+              redirect_stderr(stderr)):
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(stderr.getvalue(), "recent gate times not written: first line second line\n")
+        self.assertEqual(path.read_bytes(), contents)
+        self.assertEqual(sum(len(path.read_text().splitlines()) for path in self.buildlog.glob("*/*.jsonl")), 2)
 
     def write_json(self, value: object) -> None:
         _ = self.timing_path.write_text(json.dumps(value), encoding="utf-8")
@@ -402,6 +552,56 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(run["modules"][0]["log"], "")
         self.assertEqual(len(stderr.getvalue().splitlines()), 1, stderr.getvalue())
         self.assertIn("gate run not written:", stderr.getvalue())
+
+    def test_local_gate_keeps_read_lists_out_of_the_gate_record(self) -> None:
+        run = gate_run()
+        run["selection"] = "full"
+        run["modules"][0].update(config_reads=["limits"], folder_scans=[], content_reads=["docs/guide.md"])
+        gate_record.write_gate_run(run, fixture_executions(run))
+
+        latest_path = gate_record.latest_module_reads_path(store.host_name())
+        previous = latest_path.read_bytes()
+        module_path = "scripts/scripts/test_example.py"
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(["limits"], [], ["docs/guide.md"])},
+            {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+        ))
+        run["started_at"] = "2030-01-01"
+        run["modules"][0].update(config_reads=["ignored"], folder_scans=["/"], content_reads=[])
+        for selection, aborted in (("full", True), ("affected", False)):
+            with self.subTest(selection=selection, aborted=aborted):
+                run.update(selection=selection, aborted=aborted)
+                gate_record.write_gate_run(run, fixture_executions(run))
+                self.assertEqual(latest_path.read_bytes(), previous)
+
+        records = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
+        self.assertEqual(len(records), 3)
+        for record in records:
+            module = cast(list[dict[str, object]], record["modules"])[0]
+            self.assertTrue(module.keys().isdisjoint(gate_record.READ_FIELDS))
+            self.assertEqual(module["wall_s"], run["modules"][0]["wall_s"])
+            self.assertEqual(module["peak_mib"], run["modules"][0]["peak_mib"])
+            self.assertEqual(module["status"], run["modules"][0]["status"])
+
+    def test_local_snapshot_write_failure_prevents_the_stripped_append(self) -> None:
+        run = gate_run()
+        run["selection"] = "full"
+        run["modules"][0]["config_reads"] = ["limits"]
+        gate_record.write_gate_run(run, fixture_executions(run))
+        snapshot = gate_record.latest_module_reads_path(store.host_name())
+        previous = snapshot.read_bytes()
+        month, = self.buildlog.glob("*/*.jsonl")
+        records = month.read_bytes()
+        run["started_at"] = "2030-01-01"
+        run["modules"][0]["config_reads"] = ["tools"]
+        stderr = io.StringIO()
+        with (mock.patch.object(gate_record, "write_text_atomic", side_effect=OSError("fixture snapshot write failed")),
+              redirect_stderr(stderr)):
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertEqual(month.read_bytes(), records)
+        self.assertEqual(run["modules"][0]["config_reads"], ["tools"])
+        self.assertIn("fixture snapshot write failed", stderr.getvalue())
 
     def test_gate_write_failure_reports_one_line_and_returns(self) -> None:
         _ = self.buildlog.write_text("This file blocks the output directory.\n", encoding="utf-8")

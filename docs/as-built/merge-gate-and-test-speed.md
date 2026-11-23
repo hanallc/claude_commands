@@ -79,16 +79,22 @@ After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` 
 This one setting is for every machine. The `mac-linux` and AWS routes read it.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The route takes the Mac repository claim before the first SSH request.
+Then the gate consumes the launch permission of its assignment (`ConsumePermission`) before the first SSH request.
+The gate process is the claim holder, and the Mac claim id is the claim reference.
+The queue keeps a consumed guest assignment current while the gate process lives.
+So the queue places no other run on the busy guest, and the Builds page shows a running guest row.
+A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
 The route sends no more cleanup requests.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
-This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
+This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
 The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
+The queue also accepts the claim failure after the gate consumed the launch permission, when a new process read shows that the gate process ended.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
 If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
@@ -111,7 +117,7 @@ The root of the limit is read only, and each entry under `/etc`, `/bin` and `/us
 The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
 For a `cargo` run, `hand_made_limit.start_refusal` (the natedev check at the attempt start) and `NatedevRun.run` (before the program starts) call `hand_made_limit.held_output` before the limit checks the output folder, so the limit binds the target link that the steps repair. The lock of the start check ends with that check. `held_output` runs `cargo_folder.checked_step` with the program environment, the code of the wrapper `--exec-checked` route. That code makes or checks the `target` link to the assigned build folder, holds the build folder lock until the program ends, and writes the use stamp. The lock is exclusive only while the step makes the folder and the link; then it is shared, so a parallel cargo step in the checkout runs. The program also gets the lock descriptor, as the wrapper gives it to cargo.
 `held_output` does the steps only when `cargo_folder.folder_step_due` gives true, the rule of the wrapper: a build subcommand other than `install`, no help or version word, and no `CARGO_FOLDER_CHECKED=1` or `BUILDLOG_STEP_SCOPE` in the environment of `hand_made.py`. The value option and build subcommand lists are one line each in the wrapper, and `cargo_folder.wrapper_words` reads them, so the wrapper starts no python for a word that is not a build subcommand.
-With `folders.check=report`, the live value, a path outside the build folders gives a stderr note and the run goes on; an unassigned checkout holds no lock. With `enforce`, it is a refusal. Each other check error, and each refusal under `enforce`, ends the attempt with no run (`FOLDER_STEP_REFUSAL`).
+With `folders.check=report`, the live value, a path outside the build folders gives one stderr note at the run start, not at the attempt start check, and the run goes on; an unassigned checkout holds no lock. With `enforce`, it is a refusal. Each other check error, and each refusal under `enforce`, ends the attempt with no run (`FOLDER_STEP_REFUSAL`).
 The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
 natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
 The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
@@ -566,6 +572,12 @@ The nightly-red marker widens only a merge gate. It does not block targeted test
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
 A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
+
+The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
+Each kind comes from the newest full, non-aborted gate that recorded it.
+A changed config file selects each module that reads it in its source or in its config read record. A module with no record is selected.
+The targeted gate keeps the caller's build log, and it writes its own gate record there. Each test module has its own private build log.
+Only a direct test run (`start_test_run`) moves an unset `BUILDLOG_DIR` into its run folder.
 
 Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
 It prints module names when ten or fewer modules are selected.

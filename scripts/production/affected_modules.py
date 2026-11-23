@@ -7,7 +7,6 @@ from __future__ import annotations
 import ast
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import closing
 import copy
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -20,7 +19,6 @@ import math
 import os
 import posixpath
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,9 +26,9 @@ from typing import cast, override
 
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
-    ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
-    NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
-    RecursiveDirectory, WholeRepository, module_read_record,
+    ListedDirectory, LocalModuleReadsUnavailable, ModuleReadHistory, ModuleReadRecord, NoConfigReadRecord,
+    NoContentReadRecord, NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
+    RecursiveDirectory, WholeRepository, read_latest_module_reads,
 )
 from scripts.production.gate_modules import is_test_module
 from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
@@ -1076,55 +1074,9 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
 
 
-def latest_module_reads() -> dict[str, ModuleReadRecord]:
-    """Read each field from its newest full, non-aborted gate."""
-    from scripts.buildlog import index
-
-    _ = index.update()
-    with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
-            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
-            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
-        ).fetchall())
-    recorded: dict[str, ModuleReadRecord] = {}
-    for suite, module, config_json, folder_json, content_json in rows:
-        path = f"scripts/{suite}/{module}"
-        reads = module_read_record(json.loads(config_json) if config_json is not None else None,
-                                   json.loads(folder_json) if folder_json is not None else None,
-                                   json.loads(content_json) if content_json is not None else None)
-        previous = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
-        configs = previous.config_reads
-        if isinstance(reads.config_reads, RecordedConfigReads):
-            stems = reads.config_reads.stems
-            if isinstance(configs, RecordedConfigReads):
-                stems |= configs.stems
-            configs = RecordedConfigReads(stems)
-        folders = previous.folder_scans
-        if isinstance(reads.folder_scans, RecordedFolderScans):
-            scans = reads.folder_scans.folders
-            if isinstance(folders, RecordedFolderScans):
-                scans |= folders.folders
-            folders = RecordedFolderScans(scans)
-        contents = previous.content_reads
-        if isinstance(reads.content_reads, RecordedContentReads):
-            paths = reads.content_reads.paths
-            if isinstance(contents, RecordedContentReads):
-                paths |= contents.paths
-            contents = RecordedContentReads(paths)
-        recorded[path] = ModuleReadRecord(configs, folders, contents)
-    return recorded
+def latest_module_reads() -> ModuleReadHistory | LocalModuleReadsUnavailable:
+    """Read the latest evidence from all hosts."""
+    return read_latest_module_reads()
 
 
 def changed_path_parents(repo: Path, changed: set[str], base_paths: set[str]) -> set[str]:
@@ -1329,6 +1281,9 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             differences.append((candidate, set(changes.split("\0")) - {""}))
         base, committed_changes = min(differences, key=lambda item: len(item[1]))
         changed = committed_changes | dirty
+        recorded = latest_module_reads()
+        if isinstance(recorded, LocalModuleReadsUnavailable):
+            return FullSuite("local module read snapshot unavailable")
         paths, blobs = worktree_files(repo, dirty)
         cache_path = state_dir / "affected-module-facts.json" if state_dir is not None else None
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
@@ -1336,18 +1291,19 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
         config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
         configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
-        recorded = latest_module_reads() if changed else {}
-        has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
-        has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
+        known_configs = recorded.known_modules.get("config_reads", frozenset())
+        known_folders = recorded.known_modules.get("folder_scans", frozenset())
+        known_contents = recorded.known_modules.get("content_reads", frozenset())
         content_changes = {path for path in changed if not path.startswith("config/")}
-        base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
-        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
+        check_folder_history = bool(changed and known_folders)
+        base_blobs = revision_files(repo, base.commit) if check_folder_history else {}
+        scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if check_folder_history else set()
         retained = source_blobs(paths | dirty, blobs)
         python = {path for path in changed if path.endswith(".py")}
         removed = {path for path in python if not (repo / path).is_file()}
         old_graph: dict[str, set[str]] = {}
         if removed:
-            old_blobs = base_blobs if has_folder_records else revision_files(repo, base.commit)
+            old_blobs = base_blobs if check_folder_history else revision_files(repo, base.commit)
             old_paths = {path for path in old_blobs if path.endswith(".py")}
             old_graph = graph_for_files(repo, old_paths, old_blobs, set(), cached, worktree=False).imports
             retained.update(source_blobs(old_paths, old_blobs))
@@ -1359,19 +1315,22 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         named = changed | script_callers(repo, set(blobs) | dirty, changed)
         folder_names = folder_names_of(named)
         selected: list[Path] = []
+        no_reads = ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord())
         for module in modules:
             path = module.relative_to(repo).as_posix()
-            reads = recorded.get(path, ModuleReadRecord(NoConfigReadRecord(), NoFolderScanRecord(), NoContentReadRecord()))
+            reads = recorded.positive_reads.get(path, no_reads)
             sources = fixture_sources(graph.imports, path)
             static_configs = {name for source in sources for name in graph.config_reads.get(source, frozenset())}
             config_reads = reads.config_reads
-            config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
-                or bool(config_reads.stems & configs) or bool(static_configs & configs) or "*" in static_configs
+            config_changed = bool(configs) and (path not in known_configs
+                or isinstance(config_reads, RecordedConfigReads) and bool(config_reads.stems & configs)
+                or bool(static_configs & configs) or "*" in static_configs
                 or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
-            folder_changed = path not in declarations and has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
-                or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
-            content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
-                or bool(reads.content_reads.paths & content_changes))
+            folder_changed = check_folder_history and path not in declarations and (path not in known_folders
+                or isinstance(reads.folder_scans, RecordedFolderScans)
+                and scans_changed_paths(reads.folder_scans, changed, scanned_parents))
+            content_changed = bool(content_changes) and bool(known_contents) and (path not in known_contents
+                or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & content_changes))
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
                     or scans_repository_changes(graph, sources, changed, path, declarations)
@@ -1384,5 +1343,5 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                 if any(re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems):
                     selected.append(module)
         return AffectedSelection(base, tuple(sorted(changed)), tuple(selected))
-    except (GraphError, OSError, ValueError, SyntaxError, sqlite3.Error) as error:
+    except (GraphError, OSError, ValueError, SyntaxError) as error:
         return FullSuite(f"graph error: {error}")
