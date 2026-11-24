@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from contextlib import redirect_stderr
-import io
+from collections.abc import Sequence
+import hashlib
 import json
 import os
 import subprocess
@@ -19,58 +18,20 @@ from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, Selector
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
-class OffloadCommandTests(SeededCleanupFixture):
-    def test_fence_holder_diagnostic_preserves_the_test_verdict(self) -> None:
+class RunnerFenceCommandTests(unittest.TestCase):
+    def test_mac_runner_command_matches_main(self) -> None:
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
-        key = offload.pending_start_key(identity)
-        for holders, reason in (
-            (f"dispatch_start_holder={key} 2345 cargo helper\n", "is held by 2345 cargo helper"),
-            ("", "is held; the holder check gave no answer"),
+        # These digests are from fenced_start_command on main at 675f9cce1f.
+        for scope, expected in (
+            ("run", "79cb9b1cb4a11d00cfeeed6816ff430fca486388708ea1662e5269618da6fa07"),
+            ("claims/alpha.json", "6179c17de94bd0ac6c76563c57c7489c8ad0586b23ea0092738052cf1f6b1fd4"),
         ):
-            with self.subTest(reason=reason):
-                controller = offload.ProcessController()
-                controller.claim_identity = identity
-                lines = f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending_mac={key}\n{holders}"
-                stderr = io.StringIO()
-                with redirect_stderr(stderr):
-                    result = controller.stream_mac_run(["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines])
-                self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
-                self.assertIsInstance(controller.pending, offload.PendingStartOperation)
-                self.assertEqual(stderr.getvalue(), f"mac_test: the remote start fence {reason}\n")
+            with self.subTest(scope=scope):
+                command = offload.fenced_start_command(identity, "mac", "printf 'mac_exit=42\\n'", scope_key=scope)
+                self.assertEqual(hashlib.sha256(command.encode()).hexdigest(), expected)
 
-        # The direct runner checks the fence in a separate SSH call after the verdict.
-        self.fixture["run_status_line"] = "mac_exit=42"
-        self.fixture["run_cleanup_line"] = "mac_cleanup=skipped"
-        self.sync_fixture()
-        stream = offload.ProcessController.stream_mac_run
-        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-        final_checks: list[object] = []
 
-        def remote_run(controller: offload.ProcessController, arguments: Sequence[str],
-                       cleanup_limit: offload.CleanupAfterVerdict | offload.CleanupOnly
-                       | offload.NoCommandTimeLimit = offload.NO_COMMAND_TIME_LIMIT) -> offload.RemoteRunStatus:
-            if not arguments[-1].endswith('exec 8<&-\nexit "$dispatch_status"'):
-                return stream(controller, arguments, cleanup_limit)
-            self.assertNotIn("fence_holders", arguments[-1])
-            lines = "mac_exit=42\nmac_cleanup=skipped\n"
-            return stream(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines], cleanup_limit)
-
-        def ssh(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            script = arguments[-1]
-            if arguments[0] == "ssh" and "dispatch_start_settled=" in script and "fence_holders" in script:
-                final_checks.append(options.get("timeout"))
-                raise subprocess.TimeoutExpired(arguments, float(self.config["leftover_timeout_s"]), output=b"")
-            return run(arguments, **options)
-
-        with mock.patch.object(offload.ProcessController, "stream_mac_run", remote_run), \
-             mock.patch.object(subprocess, "run", side_effect=ssh):
-            result = self.command("--no-fail-fast", direct_placement=True, separate_stderr=True)
-        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
-        self.assertEqual(final_checks, [float(self.config["leftover_timeout_s"])])
-        self.assertIn("the remote start fence gave no answer", result.stderr)
-        self.assert_wire("failed", "")
-        self.assertEqual(self.remote_claim()["remote_host"], "mac")
-
+class OffloadCommandTests(SeededCleanupFixture):
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()

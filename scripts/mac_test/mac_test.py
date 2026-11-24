@@ -2681,7 +2681,7 @@ def release_exact_claims(
                     command = ""
                 if fence_pending:
                     command += offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
-                                                         report_holders=True) + "\n"
+                                                         report_holders=paths.platform == "macos") + "\n"
                 if isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,

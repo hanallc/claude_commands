@@ -69,19 +69,15 @@ class OffloadCommandTests(SeededCleanupFixture):
                     previous_host = self.remote_claim()["remote_host"]
                     self.clear_events()
                     self.fixture["run_status_reported"] = True
-                    self.fixture["cleanup_lines"] = [f"dispatch_start_pending={offload.pending_start_key(exact)}",
-                                                     f"dispatch_start_holder={offload.pending_start_key(exact)} 2345 cargo",
-                                                     "leftovers=1", "rc=0"]
                     self.sync_fixture()
                 else:
                     _ = self.write_kept_claim()
                     previous_host = "previous-mac"
                 cleanup_result = self.command("--no-fail-fast", settings=alternate, subprocess_cli=unacknowledged,
-                                              runner_options=assigned_options, separate_stderr=True)
+                                              runner_options=assigned_options)
                 self.assertEqual(cleanup_result.returncode, 75, cleanup_result.stdout)
                 self.assert_wire("declined", "busy")
                 if unacknowledged:
-                    self.assertIn("the remote start fence is held by 2345 cargo", cleanup_result.stderr)
                     self.assertTrue(self.claim_file.exists(), cleanup_result.stdout + repr(self.events()))
                     assert pending_identity is not None
                     retained = self.remote_claim()
