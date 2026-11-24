@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import IO, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.production import session_staff, staff, showrunners
 from scripts.production.production_doc import read_production
@@ -785,6 +786,25 @@ class QuestionIdentityTests(RegistrationFixture):
         repeated = self.run_command("migrate-questions")
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.store_snapshot(), before)
+
+    def test_native_next_releases_a_question_in_the_repeated_dst_hour(self) -> None:
+        self.file_question()
+        state = self.question_state([{"text": "Choose the layout", "after": "2026-11-01T01:45"}])
+        deferred = self.run_command("questions", "--state", str(state))
+        self.assertEqual(deferred.returncode, 0, deferred.stdout + deferred.stderr)
+        zone = ZoneInfo("America/Los_Angeles")
+        for fold, next_text, table_state in (
+                (0, "no question is open", "deferred until 2026-11-01T01:45"),
+                (1, "Keep the layout?", "waiting for your answer")):
+            now = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=fold)
+            clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+            with self.subTest(fold=fold), mock.patch.object(registration, "datetime", clock):
+                following = self.run_command("next")
+                self.assertEqual(following.returncode, 0, following.stdout + following.stderr)
+                self.assertIn(next_text, following.stdout)
+                table = self.run_command("questions-table")
+                self.assertEqual(table.returncode, 0, table.stdout + table.stderr)
+                self.assertIn(table_state, table.stdout)
 
     def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
