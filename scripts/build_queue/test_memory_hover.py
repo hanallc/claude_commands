@@ -2079,7 +2079,10 @@ class MemoryHoverTests(unittest.TestCase):
     def test_repository_slot_wait_has_no_memory_group(self) -> None:
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
                 "waiters": [{"kind": "repository-slot", "name": "gate", "detail": "widget", "need": 0,
-                             "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
+                             "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"},
+                            {"kind": "repository-slot", "name": "builder: gate", "detail": "widget", "need": 0,
+                             "unit": "builder", "showrunner": "builds", "title": {"unit": "builder", "step": "gate"},
+                             "since": 101, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
         rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
         self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
         self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
@@ -2089,6 +2092,11 @@ class MemoryHoverTests(unittest.TestCase):
                          "gate · widget")
         self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "gate · widget")
         self.assertEqual(rows[0]["label"], "gate · widget")
+        owned = root.find(".//div[@data-tip='wait:fixture-wait-1']/span[@class='row-label']")
+        assert owned is not None
+        self.assertEqual(owned.findtext("./span/span[@class='name']"), "builder")
+        self.assertEqual(owned.findtext("./span[@class='owner']"), "builds")
+        self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-1']/th[@class='step']"), "gate · widget")
 
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},

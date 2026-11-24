@@ -1274,6 +1274,12 @@ try {
         assert.ok(Math.abs(outOfViewTop-outOfView.top)<1, 'A focused row out of view moves the rows in view: '+JSON.stringify({outOfView,outOfViewTop}));
         servedReading = base;
         await navigate('memory_live.html');
+        for (const width of [600, 800, 1200, 1600]) {
+          await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.step_unknown);
+          const text = await evaluate("document.querySelector('#walk').textContent");
+          assert.ok(!text.includes('owner not recorded'), `The walk shows an unknown owner at ${width} px.`);
+        }
         // A reload of the same page keeps its scroll; the pixel checks below read the page from its top.
         await evaluate('scrollTo(0,0)');
         for (const theme of themes) {
@@ -3577,41 +3583,49 @@ try {
             {open:true,recipient:'fixture-builds',kind:'question',sameTip:true,fits:true,evidence:undefined});
           assert.ok(dialog.evidence.includes(gateAbout) && dialog.evidence.includes('Overall memory'));
         };
+        const submitRowAsk = async row => {
+          submittedItem = undefined;
+          await rowAskStep('Send New item evidence', `(async () => {
+            const dialog = document.querySelector('#review-new-item');
+            const created = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
+            const words = dialog.querySelector('textarea');
+            words.value = 'Can we check this gate?';
+            words.dispatchEvent(new Event('input', {bubbles:true}));
+            const saved = dialog.querySelector('#new-item-saved');
+            const shown = new Promise(resolve => new MutationObserver((_, observer) => {
+              if (saved.textContent === 'Saved Q1.') { observer.disconnect(); resolve(); }
+            }).observe(saved, {childList:true, characterData:true, subtree:true}));
+            dialog.querySelector('[type="submit"]').click();
+            await shown;
+            // The dialog announces the saved item when Done closes it.
+            dialog.querySelector('[data-done]').click();
+            await created;
+          })()`);
+          assert.equal(submittedItem.recipient_id, 'fixture-builds');
+          assert.equal(submittedItem.words, 'Can we check this gate?');
+          const evidence = submittedItem.evidence;
+          assert.equal(evidence.kind, 'build-step');
+          assert.equal(evidence.step_id, row.key);
+          assert.equal(evidence.title, row.name);
+          assert.equal(evidence.owner, row.showrunner);
+          assert.ok(evidence.cells.some(cell => cell.label === 'Machine' && cell.value === 'natedev'));
+          assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
+          assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
+          assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
+          assert.ok(evidence.tip.some(entry => entry.kind === 'detail' && entry.text === gateAbout));
+        };
+        checkRowAsk(await openRowAsk());
+        if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
+        await submitRowAsk(gateRow);
+
         const evidenceReading = structuredClone(gateReading);
         const evidenceRow = evidenceReading.walk[gateIndex];
-        Object.assign(evidenceRow, {name:'Builds gate', unit:'', title:{unit:'', step:'Builds gate'}, showrunner:'builds'});
+        Object.assign(evidenceRow, {key:'gate-without-unit', name:'Builds gate', unit:'',
+          title:{unit:'', step:'Builds gate'}, showrunner:'builds'});
         delete evidenceRow.started_by;
         await show(evidenceReading);
         checkRowAsk(await openRowAsk());
-        if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
-        await rowAskStep('Send New item evidence', `(async () => {
-          const dialog = document.querySelector('#review-new-item');
-          const created = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
-          const words = dialog.querySelector('textarea');
-          words.value = 'Can we check this gate?';
-          words.dispatchEvent(new Event('input', {bubbles:true}));
-          const saved = dialog.querySelector('#new-item-saved');
-          const shown = new Promise(resolve => new MutationObserver((_, observer) => {
-            if (saved.textContent === 'Saved Q1.') { observer.disconnect(); resolve(); }
-          }).observe(saved, {childList:true, characterData:true, subtree:true}));
-          dialog.querySelector('[type="submit"]').click();
-          await shown;
-          // The dialog announces the saved item when Done closes it.
-          dialog.querySelector('[data-done]').click();
-          await created;
-        })()`);
-        assert.equal(submittedItem.recipient_id, 'fixture-builds');
-        assert.equal(submittedItem.words, 'Can we check this gate?');
-        const evidence = submittedItem.evidence;
-        assert.equal(evidence.kind, 'build-step');
-        assert.equal(evidence.step_id, evidenceRow.key);
-        assert.equal(evidence.title, evidenceRow.name);
-        assert.equal(evidence.owner, evidenceRow.showrunner);
-        assert.ok(evidence.cells.some(cell => cell.label === 'Machine' && cell.value === 'natedev'));
-        assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
-        assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
-        assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
-        assert.ok(evidence.tip.some(entry => entry.kind === 'detail' && entry.text === gateAbout));
+        await submitRowAsk(evidenceRow);
         if (!gateMode) {
           await call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
           const mobileActions = await evaluate(`(async () => {

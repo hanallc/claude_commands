@@ -1463,8 +1463,8 @@ function ownerFields(row) {
   if (row.caller && row.caller !== starter) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
-function stepDisplayName(row) {
-  return row.kind === "repository-slot" && row.detail ? `${row.name} · ${row.detail}` : row.name;
+function stepDisplayName(row, name = row.name) {
+  return row.kind === "repository-slot" && row.detail ? `${name} · ${row.detail}` : name;
 }
 function olderStepTitle(row) {
   if (ciRow(row)) return {unit: '', step: row.ci_label || `hana CI · ${row.detail || row.name}`};
@@ -1697,7 +1697,7 @@ function queueRowLabels(row) {
     repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
-  if (row.kind === "repository-slot") {
+  if (!unit && row.kind === "repository-slot") {
     const name = stepDisplayName(row);
     return {name, step: name, verify};
   }
@@ -1709,8 +1709,9 @@ function queueRowLabels(row) {
       step: split < 0 ? "" : row.name.slice(split + 2), verify};
   }
   const showrunner = ownerText(row.showrunner);
+  const step = row.title?.unit ? row.title.step : "";
   return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: row.title?.unit ? row.title.step : "", verify};
+    step: row.kind === "repository-slot" ? stepDisplayName(row, step || row.name) : step, verify};
 }
 // A unit always shows in the unit color, by its role, also when it has no staff entry. Python makes the span.
 function unitName(text) {
