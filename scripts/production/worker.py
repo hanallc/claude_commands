@@ -2765,6 +2765,7 @@ def end(parent: StaffId, name: WorkerName, *,
         if row is None:
             return ExitCode.OK
         director = record.parent_of(row)
+        recovery = CompletionRecovery.NO_PENDING_NOTICE
         if retire and director is not None:
             run = worker_panes.worker_run(row, record=record)
             passed = worker_panes.worker_pass(row, run, record=record)
@@ -2799,12 +2800,13 @@ def end(parent: StaffId, name: WorkerName, *,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
                 print(f"{row.name}: completion recovery failed: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 return ExitCode.KEPT
-        result = worker_panes.close(parent, name, lock=hold)
-        if isinstance(result, worker_panes.Kept):
-            print(_end_refusal(row, record, result.reason), file=sys.stderr)
-            return ExitCode.KEPT
-        if isinstance(result, worker_panes.UncertainWorker):
-            return ExitCode.UNCERTAIN
+        if recovery is not CompletionRecovery.RECOVERED:
+            result = worker_panes.close(parent, name, lock=hold)
+            if isinstance(result, worker_panes.Kept):
+                print(_end_refusal(row, record, result.reason), file=sys.stderr)
+                return ExitCode.KEPT
+            if isinstance(result, worker_panes.UncertainWorker):
+                return ExitCode.UNCERTAIN
         if retire:
             _ = staff.retire(row.id)
         return ExitCode.OK

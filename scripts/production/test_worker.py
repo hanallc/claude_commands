@@ -3942,6 +3942,50 @@ class WorkerCommandTests(unittest.TestCase):
                             self.assertEqual(self.agent.notices, notices)
                             self.assertEqual(self.fixture.world.closed, closes)
 
+    def test_cancel_preserves_the_second_stage_reply_for_end(self) -> None:
+        parent = self.fixture.parent.id
+        name = staff.WorkerName.parse("review")
+        self.assertIs(worker.dispatch(parent, name, "review", self.prompt, session_dir=self.run_dir,
+            slot=name.value, phase="8", kind="review", launcher_command=["assign.sh"], reply=self.reply),
+            worker.DispatchSubmission.SUBMITTED)
+        pane, line = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        instance = str(passed["instance_id"])
+        second_id = worker_panes.stage_two_completion_id(instance)
+        second_line = "Stage 2: " + line.replace(instance, second_id)
+        delivery = pass_recorder.dispatch_delivery(passed)
+        progress_history.save_dispatch_delivery(self.run_dir, instance,
+            replace(delivery, line=second_line, completion_id=second_id))
+        self.agent.append(pane, "user", second_line)
+        self.agent.append(pane, "assistant", f"DONE {instance}")
+        self.assertTrue(self.fixture.world.stop(row, self.fixture.world))
+        self.assertEqual(progress_history.cancel_worker_passes(self.run_dir, row.id), 1)
+        receipt, = progress_history.stopped_pass_receipts(self.run_dir, row.id)
+        self.assertEqual((receipt.instance_id, receipt.completion_id, receipt.line),
+                         (instance, second_id, second_line))
+
+        membership = staff.snapshot()
+        first_stage = f"DONE {instance}"
+        worker.save_reply(self.reply, first_stage)
+        final = f"The second stage is complete.\nDONE {second_id}"
+        self.agent.append(pane, "assistant", final)
+        with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch("scripts.production.staff_sources.require_worker_stopped"),
+              redirect_stderr(io.StringIO())):
+            with patch.object(worker, "save_reply", side_effect=OSError("reply storage failed")):
+                self.assertIs(worker.end(parent, name), worker.ExitCode.KEPT)
+            self.assertIn(pane, self.fixture.world.locations)
+            self.assertIs(worker.end(parent, name), worker.ExitCode.OK)
+        saved = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir, record=membership))
+        assert isinstance(saved, progress_history.HookCompletion)
+        self.assertEqual(saved.outcome, turn_end.TurnOutcome.STOPPED)
+        self.assertTrue(saved.finished)
+        self.assertEqual(Path(saved.reply_file).read_text(), final + "\n")
+        self.assertEqual(self.reply.read_text(), first_stage + "\n")
+        self.assertNotIn(pane, self.fixture.world.locations)
+        self.assertIsNone(staff.by_id(row.id))
+
     def test_only_a_live_run_or_a_result_sent_to_this_worker_can_hold_its_receipt(self) -> None:
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         pane, line = self.agent.submitted[-1]
@@ -6911,6 +6955,26 @@ class WorkerCommandTests(unittest.TestCase):
         with self.subTest(pending="verified late DONE after restore"):
             self.check_end_after_delivered_stop(late_done=True)
 
+    def test_end_closes_once_when_stopped_recovery_retires_the_worker(self) -> None:
+        parent = self.fixture.parent.id
+        name = staff.WorkerName.parse("impl")
+        self.agent.finish_after = 1
+        self.assertIs(worker.dispatch(parent, name, "impl", self.prompt, session_dir=self.run_dir,
+            slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh"], reply=self.reply,
+            completion_actions=progress_history.CompletionActions(end_worker=True)),
+            worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        self.assertEqual(progress_history.cancel_worker_passes(self.run_dir, row.id), 1)
+        self.agent.complete(pane)
+        with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch("scripts.production.staff_sources.require_worker_stopped"),
+              patch.object(worker_panes, "close", wraps=worker_panes.close) as close):
+            self.assertIs(worker.end(parent, name), worker.ExitCode.OK)
+            close.assert_called_once()
+        self.assertNotIn(pane, self.fixture.world.locations)
+        self.assertIsNone(staff.by_id(row.id))
+
     def check_end_after_delivered_stop(self, *, late_done: bool) -> None:
         name = staff.WorkerName.parse("late-done-after-stop" if late_done else "restored-after-stop")
         parent = self.fixture.parent.id
@@ -6930,11 +6994,16 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(path, json.dumps(record))
         self.agent.append(pane, "user", f"Detached run: {run_id}")
 
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        event = turn_end.WorkerEvent(str(row.current_session), turn_end.EventKind.RUN_FINISHED)
+        self.assertIs(turn_end.handle(event), turn_end.TurnOutcome.STOPPED)
+        self.assertTrue(pass_notices.is_settled(self.run_dir, instance, "stopped"))
+        self.assertIn(pane, self.fixture.world.locations)
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertIs(worker.restore(parent), worker.ExitCode.OK)
         self.assertNotIn(pane, self.fixture.world.locations)
         self.assertIsNotNone(staff.by_id(row.id))
-        self.assertTrue(pass_notices.is_settled(self.run_dir, instance, "stopped"))
         completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
         assert isinstance(completion, progress_history.HookCompletion)
         self.assertFalse(completion.finished)

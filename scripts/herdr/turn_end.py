@@ -680,8 +680,13 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                 raise ValueError(recovered.reason)
             if recovered == StoppedReplyRecovery.WAITING_ON_RUNS:
                 return worker.CompletionRecovery.WAITING_ON_RUNS
-            if recovered == StoppedReplyRecovery.WAITING_ON_REPLY:
-                return worker.CompletionRecovery.WAITING_ON_REPLY
+            if recovered is StoppedReplyRecovery.WAITING_ON_REPLY:
+                if not isinstance(pane, worker.ReuseCompletedPane):
+                    return worker.CompletionRecovery.WAITING_ON_REPLY
+                state = worker_panes.observe_worker(parent.id, row, record)
+                wait = _stopped_reply_wait(recovered, state, receipt, pane)
+                if isinstance(wait, worker.CompletionRecovery):
+                    return wait
             if recovered == StoppedReplyRecovery.WAITING_ON_REAP:
                 return worker.CompletionRecovery.WAITING_ON_REAP
             completion = recovered if isinstance(recovered, progress_history.HookCompletion) else stopped
