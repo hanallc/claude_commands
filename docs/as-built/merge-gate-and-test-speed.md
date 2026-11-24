@@ -1496,7 +1496,7 @@ Their final checks require the signal status, no runner or local work, no token 
 Fixed sleeps and retries cannot replace these ordering checks.
 A group-signal test uses `scripts.lib.process_group.send_process_group`.
 
-`OffloadSettingsTests`, `OffloadCommandFixture`, and `RepositorySlotTests` use `copies_environment` for private mirror leases.
+`OffloadSettingsTests`, `OffloadCommandFixture`, and `RepositoryClaimTests` use `copies_environment` for private mirror leases.
 `COPIES_CONFIG` selects that root.
 `CONF_DIR` and a patched `Path.home` cannot replace `COPIES_CONFIG` for this purpose.
 The Linux fake `df` selects units from option arguments only.

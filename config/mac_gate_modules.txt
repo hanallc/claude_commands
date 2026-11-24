@@ -212,7 +212,7 @@ scripts/mac_test/test_offload_cleanup_takeover.py
 scripts/mac_test/test_offload_forward.py
 scripts/mac_test/test_offload_lifecycle.py
 scripts/mac_test/test_offload.py
-scripts/mac_test/test_target_slots.py
+scripts/mac_test/test_repository_claims.py
 scripts/message/test_notifier.py
 scripts/message/test_process_test_support.py
 scripts/message/test_rca.py
