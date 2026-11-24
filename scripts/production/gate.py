@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -3585,26 +3585,43 @@ def unwind_gate_on_sigterm() -> Generator[None]:
             signal.raise_signal(signal.SIGTERM)
 
 
-def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
+def run_with_gate_cleanup(run: Callable[[], int], *scopes: AbstractContextManager[object]) -> int:
+    """Keep the placement status if cleanup fails."""
+    status = 1
     try:
-        with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
-            repo = Path(args.repo).expanduser().resolve()
-            # The copy record names the owner only when the caller and its process family name none,
-            # so a bad copy record never refuses a run whose caller gave an owner.
-            unowned = isinstance(admission_records.request_owner(""), admission_records.OwnerNotGiven)
-            owner = copies.source_owner(repo) if unowned else ""
-            with gate_recovery(repo), admission_records.default_owner(owner):
-                run = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
-                                      mode=mode, gate_job=args.gate_job, target=target, named=args.modules)
-            if run.time_limit_report:
-                tell_time_limit(copies.source_owner(repo), repo, run)
-            return 0 if run.passed else 1
-    except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
-        print(error, file=sys.stderr, flush=True)
-        return GATE_PRELAUNCH_REFUSED_STATUS
-    except GateSettlementPending as error:
-        print(error, file=sys.stderr, flush=True)
-        return GATE_UNSETTLED_LAUNCH_STATUS
+        with ExitStack() as cleanup:
+            for scope in scopes:
+                _ = cleanup.enter_context(scope)
+            try:
+                status = run()
+            except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
+                status = GATE_PRELAUNCH_REFUSED_STATUS
+                print(error, file=sys.stderr, flush=True)
+            except GateSettlementPending as error:
+                status = GATE_UNSETTLED_LAUNCH_STATUS
+                print(error, file=sys.stderr, flush=True)
+    except Exception as error:
+        if status not in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+            raise
+        print(f"Gate cleanup failed. {error}", file=sys.stderr, flush=True)
+    return status
+
+
+def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
+    def run() -> int:
+        # Read the copy owner only when the caller and its process family have no owner.
+        unowned = isinstance(admission_records.request_owner(""), admission_records.OwnerNotGiven)
+        owner = copies.source_owner(repo) if unowned else ""
+        with admission_records.default_owner(owner):
+            result = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
+                                     mode=mode, gate_job=args.gate_job, target=target, named=args.modules)
+        if result.time_limit_report:
+            tell_time_limit(copies.source_owner(repo), repo, result)
+        return 0 if result.passed else 1
+
+    try:
+        repo = Path(args.repo).expanduser().resolve()
+        return run_with_gate_cleanup(run, scratch.copy_lock(repo), gate_recovery(repo))
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3716,7 +3733,11 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
     if not isinstance(target, NoGateAssignment):
         return run_tests_only(args, mode, target)
 
-    with first_step.admitted_run(args.command, source) as admitted:
+    admission = ExitStack()
+
+    def run_admitted() -> int:
+        admitted = admission.enter_context(first_step.admitted_run(args.command, source))
+
         def assigned_target() -> GateTarget:
             grant = admitted.grant
             if not isinstance(grant, first_step.GatePlacement):
@@ -3741,21 +3762,25 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
         result = admitted.run_gate(run)
         if result.stderr:
             _ = sys.stderr.write(result.stderr)
-        if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
+        if mode is SuiteMode.GATE and result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
             return 1
         return result.returncode
+
+    return run_with_gate_cleanup(run_admitted, admission)
 
 
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
-        with test_run_folder():
-            return run_direct_tests(args, SuiteMode.TARGETED, target)
+        return run_with_gate_cleanup(partial(run_direct_tests, args, SuiteMode.TARGETED, target), test_run_folder())
     if args.tests_only:
         return run_direct_tests(args, SuiteMode.GATE, target)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        if not (args.nightly or args.promote_only):
+            return run_with_gate_cleanup(partial(merge_checkpoint, args, target),
+                                         scratch.copy_lock(checkout), gate_recovery(checkout))
         with scratch.copy_lock(checkout):
             if args.nightly:
                 with admission_records.default_owner(args.unit):
@@ -3763,14 +3788,11 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
                         return nightly(args, target)
                     finally:
                         _sweep_nightly_build_folders()
-            if args.promote_only:
-                promote(args)
-                production, review_list = change_review_list(args)
-                if review_list is not None:
-                    record_changes(checkout, review_list, production, args.merge_branch)
-                return 0
-            with gate_recovery(checkout):
-                return merge_checkpoint(args, target)
+            promote(args)
+            production, review_list = change_review_list(args)
+            if review_list is not None:
+                record_changes(checkout, review_list, production, args.merge_branch)
+            return 0
     except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
         print(error, file=sys.stderr, flush=True)
         return GATE_PRELAUNCH_REFUSED_STATUS
