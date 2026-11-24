@@ -25,6 +25,7 @@ from scripts.build_queue import test_placement as placement_fixture
 from scripts.build_queue.admission_test_support import Exchange, FakeClock, ScriptedTransport, reply_bytes
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
+from scripts.buildlog import treekey
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import conf, process_group, scratch
@@ -200,6 +201,11 @@ class MacGateSuitesTests(GateSuitesFixture):
                                               full=False, module_time_limit_s=1,
                                               selected=TreeSelection((LIB_FIRST,), "tree"))
 
+    def checkout_source_key(self) -> execution_identity.SourceKeyKnown:
+        key = treekey.tree_key(str(self.checkout))
+        assert key is not None
+        return execution_identity.SourceKeyKnown(key)
+
     def gate_assignment(self, target: str, *,
                         provider: Literal["ssh", "scaler"] = "ssh") -> placement.PlacementAssignment:
         pid = os.getpid()
@@ -207,7 +213,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         assert start is not None
         destination = placement.PlacementDestination(provider, target, "fixture-host", claim_state.WHOLE_MAC)
         return placement.PlacementAssignment("episode", "attempt", destination,
-            execution_identity.SourceKeyKnown("fixture-source"), placement.SubmittingOwner(host_name(), pid, start),
+            self.checkout_source_key(), placement.SubmittingOwner(host_name(), pid, start),
             NoOwningSession(), 1.0)
 
     def write_gate_assignment(self, assignment: placement.PlacementAssignment) -> Path:
@@ -247,6 +253,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 guest_target = placement.PlacementDestination("ssh", "mac-linux", "fixture-mac", claim_state.WHOLE_MAC)
                 request = replace(request, profile=replace(request.profile, step="gate"), local=replace(
                     request.local, argv=command), constraints=replace(request.constraints, command=command,
+                    source_key=self.checkout_source_key(),
                     repository=str(self.checkout), candidates=(placement.PlacementCandidate(guest_target),
                                                                placement_fixture.local_candidate(queue))))
                 _ = placement_fixture.publish_candidate(queue, request, eligibility)
@@ -298,6 +305,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                       if candidate.destination.target in targets)
         request = replace(request, profile=replace(request.profile, step="gate"), local=replace(
             request.local, argv=command), constraints=replace(request.constraints, command=command,
+            source_key=self.checkout_source_key(),
             repository=str(self.checkout), candidates=named))
         if guest in named:
             _ = placement_fixture.publish_candidate(queue, request, placement.TemporaryExclusion("disk"))

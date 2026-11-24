@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement, queue_place
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
@@ -71,17 +71,27 @@ class GateModuleOwnerTests(unittest.TestCase):
 
 
 class DirectGatePlacementTests(unittest.TestCase):
+    def checkout(self, folder: str) -> Path:
+        source = Path(folder).resolve()
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                            "commit", "-qm", "Fixture", "--allow-empty"], check=True)
+        return source
+
     def admission(self, source: Path, command: tuple[str, ...], *, target: str = "aws"
                   ) -> first_step.FirstStepAdmission:
-        grant = placed(target)
-        assignment = grant.assignment
+        key = treekey.tree_key(str(source))
+        assert key is not None
+        assignment = replace(placed(target).assignment, source_key=execution_identity.SourceKeyKnown(key))
+        grant = admission_wire.Assignment(assignment)
         position = SlotQueuePosition(assignment.episode, assignment.since)
         profile = admission_records.ProgramProfile("gate", str(source), str(source),
             admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
         constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
             (placement.PlacementCandidate(assignment.destination), placement.PlacementCandidate(placed("natedev").assignment.destination)))
         request = admission_wire.PlacementRequest(position.episode, assignment.owner, position.since, profile, constraints)
-        path = source / "assignment.json"
+        path = source / ".git" / "assignment.json"
         admission_client.write_assignment(path, grant)
         return first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request), path)
 
@@ -89,7 +99,7 @@ class DirectGatePlacementTests(unittest.TestCase):
         for flag, mode in (("--tests-only", gate.SuiteMode.GATE), ("--affected", gate.SuiteMode.TARGETED)):
             for blocked in (False, True):
                 with self.subTest(flag=flag, blocked=blocked), tempfile.TemporaryDirectory() as folder:
-                    source = Path(folder).resolve()
+                    source = self.checkout(folder)
                     arguments = (flag, "--repo", str(source))
                     admitted = self.admission(source, ("gate.py", *arguments))
                     original = admission_wire.read_assignment(admitted.assignment_file).assignment
@@ -123,9 +133,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                         if blocked:
                             raise admission_wire.AdmissionUnavailable("fixture settlement failure")
 
-                    with (mock.patch.dict(os.environ, clear=True),
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
                           mock.patch.object(first_step, "admitted_run", side_effect=admit),
-                          mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
                           mock.patch.object(admission_client, "request_settlement", side_effect=settle),
                           mock.patch.object(queue_place, "wait_for_placement", return_value=admission_wire.Assignment(replacement)),
                           mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
@@ -138,15 +147,14 @@ class DirectGatePlacementTests(unittest.TestCase):
 
     def test_unproven_guest_end_requests_settlement_through_run_gate(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder).resolve()
+            source = self.checkout(folder)
             arguments = ("--tests-only", "--repo", str(source))
             admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
             assignment = admission_wire.read_assignment(admitted.assignment_file).assignment
             armed = mac_linux.ArmedGuestAttempt("fixture-arm", "f" * 32, "boot-id", 10, "user", "/fixture")
             failure = mac_linux.GuestEndUnproven("fixture guest end remains unproven", armed)
-            with (mock.patch.dict(os.environ, clear=True),
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
-                  mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
                   mock.patch.object(conf, "read", return_value=mock.Mock(value=mock.Mock(return_value=True))),
                   mock.patch.object(gate, "read_gate_checkout", return_value=("fixture-tree", set())),
                   mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
@@ -163,12 +171,13 @@ class DirectGatePlacementTests(unittest.TestCase):
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder).resolve()
+            source = self.checkout(folder)
             arguments = ("--tests-only", "--repo", str(source / ".." / source.name))
             admitted = self.admission(source, ("gate.py", *arguments))
-            with (mock.patch.dict(os.environ, clear=True),
+            _ = (source / "edit.txt").write_text("Changed since placement.\n")
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as open_admission,
-                  mock.patch.object(treekey, "tree_key", return_value="different-source") as key,
+                  mock.patch.object(treekey, "tree_key", wraps=treekey.tree_key) as key,
                   mock.patch.object(gate, "run_tests_only", return_value=0) as run,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(gate.main(arguments), 1)

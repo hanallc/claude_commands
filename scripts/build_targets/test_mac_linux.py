@@ -809,8 +809,8 @@ fi
         destination = assignment.destination
         claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
                                                  'claim-fixture', assignment.episode, assignment.attempt)
-        dispatch = mac_linux.GuestGateDispatch(assignment, claim)
         armed = mac_linux.ArmedGuestAttempt('different-guest-arm-id', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        dispatch = mac_linux.GuestGateDispatch(assignment, claim, started=armed, settled=True)
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
         path.parent.mkdir(parents=True)
         partial = b'{"unfinished":'
@@ -841,7 +841,7 @@ fi
               patch.object(os, 'fsync', side_effect=sync),
               patch.object(mac_linux, 'send_guest_execution', side_effect=failed_send) as send,
               redirect_stderr(io.StringIO()) as errors):
-            mac_linux.report_guest_end(armed, dispatch, 0)
+            mac_linux.settle_guest_dispatch(dispatch, 0)
         send.assert_called_once()
         self.assertIn('fixture socket outage', errors.getvalue())
         self.assertEqual(mac_linux.settlement(assignment.episode, 16), placement.Settled())
@@ -906,11 +906,14 @@ fi
         assert isinstance(identity, execution_identity.CloudExecution)
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
 
-    def test_guest_without_a_start_line_reports_no_execution(self) -> None:
+    def test_guest_without_a_start_line_saves_end_proof_and_reports_no_execution(self) -> None:
+        attempt = 16
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         with patch.object(mac_linux, 'send_guest_execution') as report:
-            result = self.route('disconnect-before-copy')
-        self.assertIsInstance(result, mac_linux.GuestNotStarted)
+            reason = self.not_started(self.route('disconnect-before-copy'))
+        self.assertIn('Guest cleanup: ended', reason)
         report.assert_not_called()
+        self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
 
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,

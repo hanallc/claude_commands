@@ -1805,6 +1805,23 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(states['expired'], ledger.GateTerminated(int(self.now), 'i-expired'))
         self.assertEqual(self.fake.terminated_instances, {'i-expired'})
 
+    def test_reconcile_skips_a_deep_launch_journal_and_closes_the_next_booking(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.book.gate_owner('orphan', ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder)))
+        path = self.folder / 'launch.json'
+        depth = 10_000
+        _ = path.write_text('{"deep":' + '[' * depth + '0' + ']' * depth + '}')
+        self.record_running_gate('expired', 'm7a.8xlarge', 'fixture-region')
+        self.advance(1200)
+        with (mock.patch.object(cloud_gate, 'process_start', return_value=Gone()),
+              redirect_stderr(StringIO()) as errors):
+            worker.reconcile()
+        self.assertIn(f'Gate cleanup could not read {path}', errors.getvalue())
+        states = {row.attempt: row.state for row in self.book.read_snapshot().gate_reservations}
+        self.assertIsInstance(states['orphan'], ledger.GateLaunchPending)
+        self.assertEqual(states['expired'], ledger.GateTerminated(int(self.now), 'i-expired'))
+        self.assertEqual(self.fake.terminated_instances, {'i-expired'})
+
     def test_reconcile_preserves_live_and_unreadable_worker_owners(self) -> None:
         worker = self.worker_with_pending_gate()
         owner = ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder))

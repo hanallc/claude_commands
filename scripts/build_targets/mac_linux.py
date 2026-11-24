@@ -1131,17 +1131,20 @@ def settlement(episode: str, attempt: int) -> Settled | Pending:
     return Pending('The Mac Linux guest end remains unproven')
 
 
-def report_guest_end(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, status: int) -> None:
-    """Report the exact guest attempt after the guest proves that it ended."""
+def settle_guest_dispatch(dispatch: GuestGateDispatch, status: int) -> None:
+    """Save the end proof and report any execution observed for this attempt."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     assignment = dispatch.assignment
-    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
-    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
-        execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
-        placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
     try:
         _append_guest_end(dispatch, 'proven', 'The guest confirmed the run ended')
+        if dispatch.started is None:
+            return
+        execution = execution_identity.CloudExecution(
+            TARGET, dispatch.started.boot_id, dispatch.started.machine_id, assignment.attempt)
+        request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+            execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
+            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
         with conf.diagnostics(report=False):
             timeout = conf.read('build_admission').number('query_timeout_seconds')
         reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
@@ -1727,8 +1730,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
     finally:
-        if dispatch is not None and dispatch.settled and dispatch.started is not None:
-            report_guest_end(dispatch.started, dispatch, status)
+        if dispatch is not None and dispatch.settled:
+            settle_guest_dispatch(dispatch, status)
 
 
 def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:

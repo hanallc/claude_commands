@@ -676,7 +676,7 @@ class GateWorker:
                     with suppress(FileNotFoundError):
                         launch = read(launch_path)
                     checked = (folder / 'request.json').exists()
-                except (OSError, ValueError) as error:
+                except (OSError, ValueError, RecursionError) as error:
                     detail = ' '.join(str(error).split())
                     print(f'Gate cleanup could not read {launch_path}: {detail}', file=sys.stderr)
                     continue

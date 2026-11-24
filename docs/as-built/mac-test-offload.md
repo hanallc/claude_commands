@@ -98,7 +98,9 @@ The current API also releases the claim at `unreachable_wait_seconds` (`build_ta
 The guest run lock still refuses another guest run until the first run ends.
 When the proof wait expires, the gate returns status 80 to its placement retry loop.
 The route appends one record to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
-It records `proven` before sending the end report or `unproven` when the proof wait expires.
+It records `proven` when cleanup confirms the end, even when the stream gives no start marker.
+It records `unproven` when the proof wait expires.
+The route sends the end report only if the stream gave the start marker.
 Each record contains the queue attempt key, the Mac claim ID, the result, the detail, and the wall time.
 The writer locks the file during the append and syncs the record to disk.
 A failed report send leaves the proof available on disk.
