@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.admission_wire import cloud_queue_order
+from scripts.build_queue.admission_wire import WaitingForCloudSlot, cloud_queue_time
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
@@ -867,18 +867,27 @@ class WaitingBuild:
 
 
 def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
-    """Insert cloud waits in admission order. Keep the local queue order."""
+    """Keep the queue order within each machine."""
     rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
 
-    def order(row: wire.CloudRow) -> tuple[float, int, str]:
-        return cloud_queue_order(row.place, row.since)
+    def time_key(row: wire.CloudRow) -> tuple[float, int, str]:
+        return cloud_queue_time(row.place, row.since)
 
-    for cloud in sorted((row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), key=order):
-        order_time = order(cloud)[0]
+    cloud_waits = [row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)]
+    for cloud in sorted(cloud_waits, key=time_key):
+        order_time = time_key(cloud)[0]
         position = next((index for index, row in enumerate(rows)
-                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
+                         if (row.step.since if isinstance(row, WaitingBuild) else time_key(row)[0]) > order_time),
+                        len(rows))
         rows.insert(position, cloud)
+
+    # Keep the positions of the local waits and the waits with a reserved cloud slot.
+    cloud_order = (row for row in cloud_waits if isinstance(row.wait, wire.CloudSlotWait)
+                   and isinstance(row.wait.state, WaitingForCloudSlot))
+    for index, row in enumerate(rows):
+        if isinstance(row, wire.CloudRow) and isinstance(row.wait, wire.CloudSlotWait) and isinstance(row.wait.state, WaitingForCloudSlot):
+            rows[index] = next(cloud_order)
     return rows
 
 

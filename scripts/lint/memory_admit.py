@@ -462,16 +462,20 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 
 def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, RankedWaiter]], QueuePriority | NoQueuePriority]:
-    ranked: list[tuple[Path, RankedWaiter]] = []
-    entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
-    for path, row in rows:
-        unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        run = row.get("build_run", NoLiveBuildRun())
-        # A waiter takes the first entry that covers its run or its unit.
-        position = next((index for index, entry in enumerate(entries) if records.entry_covers(entry, unit, run)), -1)
-        order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
-        ranked.append((path, rank_waiter(row, order)))
+    ranked = ((path, rank_waiter(row, unit_order(row.get("unit", ""), row.get("session_id", ""), context,
+                                               run=row.get("build_run"))))
+              for path, row in rows)
     return sort_waiters(ranked), context.priority
+
+
+def unit_order(unit: str, session_id: str, context: QueueOrderContext, *,
+               run: LiveBuildRun | NoLiveBuildRun | None = None) -> PriorityUnit | NormalOrder:
+    unit = queue_unit(unit, session_id, context.labels)
+    entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
+    identity = run if run is not None else NoLiveBuildRun()
+    return next((PriorityUnit(unit, index) for index, entry in enumerate(entries)
+                 if records.entry_covers(entry, unit, identity)),
+                NormalOrder())
 
 
 def sort_waiters(rows: Iterable[tuple[Path, RankedWaiter]]) -> list[tuple[Path, RankedWaiter]]:
@@ -1486,10 +1490,12 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
+def priority_rank(order: PriorityUnit | NormalOrder) -> int:
+    return order.position if isinstance(order, PriorityUnit) else sys.maxsize
+
+
 def waiter_order(row: Waiter) -> tuple[int, float, float, int]:
-    order = records.waiter_priority(row)
-    rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
-    return rank, row.get("order_since", row["since"]), row["since"], row["pid"]
+    return priority_rank(records.waiter_priority(row)), row.get("order_since", row["since"]), row["since"], row["pid"]
 
 
 @dataclass(frozen=True)
