@@ -27,7 +27,7 @@ import time
 from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
+from scripts.aws_target import admin_secrets, gate_box, key_refusal, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
@@ -1478,6 +1478,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         reason = cloud_gate_off_reason(switch)
         end_open_gates(attempt.directory, service)
         return LocalFallback(reason)
+    if isinstance(key_refusal.read(attempt.directory), key_refusal.KeyRefused):
+        # AWS refuses every call with this key, so the gate makes none.
+        return LocalFallback(key_refusal.REFUSED_REASON)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'

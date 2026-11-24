@@ -3783,13 +3783,13 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = mac_test.read_config()
         shipped = mac_test.idle_config(conf.read(path))
         committed = path.read_text()
-        _ = write_config_fixture(path, "alert_seconds=7\npush_seconds=11\nstale_seconds=13\n"
+        _ = write_config_fixture(path, "alert_seconds=7\nstale_seconds=13\n"
                                  + "repeat_minutes=17\nsend_timeout_s=19\n")
         _ = mac_test.read_config()
         configured = mac_test.idle_config(conf.read(path))
-        self.assertEqual((configured.alert_seconds, configured.push_seconds, configured.stale_seconds,
-                          configured.repeat_minutes, configured.send_timeout_s), (7, 11, 13, 17, 19))
-        _ = write_config_fixture(path, "alert_seconds=nan\npush_seconds=0\nstale_seconds=-1\n"
+        self.assertEqual((configured.alert_seconds, configured.stale_seconds,
+                          configured.repeat_minutes, configured.send_timeout_s), (7, 13, 17, 19))
+        _ = write_config_fixture(path, "alert_seconds=nan\nstale_seconds=-1\n"
                                  + "repeat_minutes=bad\nsend_timeout_s=inf\n")
         with mock.patch.object(conf, "_committed_files", return_value=(committed,)), conf.diagnostics(report=False):
             _ = mac_test.read_config()
@@ -3834,15 +3834,17 @@ class MachineOffOnPurposeTests(unittest.TestCase):
         state = self.root / "mac-state"
         state.mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(state)})))
+            "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(state),
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "targets"), "BUILD_HOLD_DIR": str(self.root / "holds")})))
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         _ = write_config_fixture(self.root / "build_targets.conf")
+        _ = write_config_fixture(self.root / "hana_aws.conf")
         since = datetime.fromtimestamp(1000, timezone.utc)
         mac_test.write_block(state / "block.json", mac_test.ActiveMacBlock(
             "hana", "nate closes the Mac", since, since + timedelta(hours=1), mac_test.HolderQueue("hana"),
             mac_test.NO_SHOWRUNNER, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
 
-    def test_a_target_other_than_the_mac_reads_only_its_enabled_key(self) -> None:
+    def test_the_mac_block_and_offload_turn_off_only_the_mac(self) -> None:
         self.assertIsInstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
         for target in ("natedev", "hana-aws"):
             with self.subTest(target=target):
@@ -3850,6 +3852,29 @@ class MachineOffOnPurposeTests(unittest.TestCase):
                 _ = write_config_fixture(self.root / "build_targets.conf", f"enabled.{target}=off\n")
                 self.assertEqual(mac_test.machine_off_on_purpose(target),
                                  mac_test.OffOnPurpose(f"enabled.{target}=off"))
+
+    def test_a_natedev_hold_in_force_turns_off_only_the_local_target(self) -> None:
+        holds = self.root / "holds"
+        holds.mkdir()
+        _ = (holds / "research").write_text("2026-11-23T00:00:00Z image work\n")
+        self.assertEqual(mac_test.machine_off_on_purpose("natedev"),
+                         mac_test.OffOnPurpose("research holds it: image work"))
+        self.assertIs(mac_test.machine_off_on_purpose("hana-aws"), mac_test.MACHINE_IN_USE)
+        (holds / "research").unlink()
+        self.assertIs(mac_test.machine_off_on_purpose("natedev"), mac_test.MACHINE_IN_USE)
+        holds.rmdir()
+        _ = holds.write_text("not a folder\n")
+        # An unreadable hold state counts as in use.
+        self.assertIs(mac_test.machine_off_on_purpose("natedev"), mac_test.MACHINE_IN_USE)
+
+    def test_the_gpu_route_switch_turns_off_only_the_gpu_target(self) -> None:
+        cloud_gate_conf = self.root / "cloud_gate.conf"
+        for value, expected in (("on", mac_test.MACHINE_IN_USE), ("bad", mac_test.MACHINE_IN_USE),
+                                ("off", mac_test.OffOnPurpose("hana_gpu_route_enabled=off"))):
+            _ = write_config_fixture(cloud_gate_conf, f"hana_gpu_route_enabled={value}\n")
+            with self.subTest(value=value):
+                self.assertEqual(mac_test.machine_off_on_purpose("hana-gpu"), expected)
+                self.assertIs(mac_test.machine_off_on_purpose("hana-aws"), mac_test.MACHINE_IN_USE)
 
     def off_on_purpose(self, *arguments: str) -> int:
         with mock.patch.object(sys, "argv", ["mac_test.py", "off-on-purpose", *arguments]):
