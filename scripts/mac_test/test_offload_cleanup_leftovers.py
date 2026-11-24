@@ -19,12 +19,12 @@ from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class RunnerFenceCommandTests(unittest.TestCase):
-    def test_mac_runner_command_matches_main(self) -> None:
+    def test_mac_runner_command_pins_the_fence_descriptor(self) -> None:
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
-        # These digests are from fenced_start_command on main at 675f9cce1f.
+        # Pin all command bytes, including the export that appends fd 8 to COPIES_MIRROR_LEASE_FDS.
         for scope, expected in (
-            ("run", "79cb9b1cb4a11d00cfeeed6816ff430fca486388708ea1662e5269618da6fa07"),
-            ("claims/alpha.json", "6179c17de94bd0ac6c76563c57c7489c8ad0586b23ea0092738052cf1f6b1fd4"),
+            ("run", "a7c69949c03746503691afd99d8833096047070cdbfc3d06d849c3727e15f4d2"),
+            ("claims/alpha.json", "bc44cbea9f76c188499e7dc534f7e98bd3b9b5d1bba0d5fb934d52f4280ca4c8"),
         ):
             with self.subTest(scope=scope):
                 command = offload.fenced_start_command(identity, "mac", "printf 'mac_exit=42\\n'", scope_key=scope)
