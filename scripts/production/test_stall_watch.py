@@ -57,7 +57,8 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.agents import pane_record
 from scripts.production import session_staff, unit_lookup
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -264,9 +265,6 @@ class StallWatchTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-", dir="/tmp")))
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
-        defaults = self.root / "watch-defaults.conf"
-        _ = defaults.write_text(WATCH_DEFAULTS)
-        _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
         configuration = {
             "build_targets": "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n",
             "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
@@ -278,7 +276,7 @@ class StallWatchTests(unittest.TestCase):
         for name, contents in configuration.items():
             _ = (self.root / f"{name}.conf").write_text(contents)
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root),
-            "STAFF_CONFIG": str(self.root / "staff.conf"), "STALL_WATCH_CONFIG": str(self.root / "stall_watch.conf")}))
+            "STAFF_CONFIG": str(self.root / "staff.conf")}))
         self.environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "pane-records")
         self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.bin = self.root / "bin"
@@ -297,7 +295,8 @@ class StallWatchTests(unittest.TestCase):
         self.rca_log = self.root / "rca-sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
-        _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=0\n")
+        _ = self.watch_settings()
+        _ = write_config_fixture(self.root / "user_zone.conf")
         self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
@@ -330,8 +329,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
             "BUILD_HOLD_DIR": str(self.root / "build-holders"),
-            "STALL_WATCH_CONFIG": str(self.root / "stall_watch.conf"),
-            "STALL_TEST_WATCH_DEFAULTS": str(defaults),
             "STALL_WATCH_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_PROJECTS_DIR": str(self.projects),
             "STALL_WATCH_PS": "ps",
@@ -359,9 +356,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.unit("unit-one")
 
     def watch_settings(self, **values: str) -> Path:
-        """Write only the test overrides; production supplies omitted status vocabulary."""
+        """Write the test settings and replace any earlier overrides."""
         path = self.root / "stall_watch.conf"
-        _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        overrides = {"prompt_grace_seconds": "0", **values}
+        _ = write_config_fixture(path, WATCH_DEFAULTS + "".join(f"{key}={value}\n" for key, value in overrides.items()))
         return path
 
     def test_prompt_alert_seconds_reads_changed_config(self) -> None:
@@ -642,17 +640,12 @@ with socket.socket(socket.AF_UNIX) as sock:
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at)}
         if subprocess_cli:
             checkout = SCRIPT.resolve().parents[2]
-            wrapper = """import os, runpy, sys
+            wrapper = """import runpy, sys
 from pathlib import Path
-from scripts.lib import conf_reads, unit_runs
+from scripts.lib import unit_runs
 unit_runs.RUN_ROOT = Path(sys.argv[1])
 unit_runs.FORMER_RUN_ROOT = Path(sys.argv[2])
 script = Path(sys.argv[3]).resolve()
-defaults = (script.parents[2] / 'config/stall_watch.conf').resolve()
-read_text = conf_reads.read_text
-conf_reads.read_text = lambda path: read_text(
-    os.environ['STALL_TEST_WATCH_DEFAULTS'] if Path(path).resolve() == defaults else path
-)
 runpy.run_path(str(script), run_name='__main__')
 """
             return subprocess.run([str(checkout / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
@@ -3261,7 +3254,13 @@ runpy.run_path(str(script), run_name='__main__')
                 except ProcessLookupError:
                     pass
 
-    def test_invalid_sender_limits_use_packaged_limits_and_deliver_pending_work(self) -> None:
+    def test_invalid_sender_limits_recover_and_deliver_pending_work(self) -> None:
+        git_environment = fixture_git_environment(self.root)
+        _ = subprocess.run(["git", "-C", str(self.root), "init", "-q"], env=git_environment, check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(self.root, "Set sender limits", "stall_watch.conf", env=git_environment)
+        reads = self.root / "reads"
+        self.environment["CONF_READ_LOG"] = str(reads)
         for key in ("sender_cleanup_seconds", "sender_batch_seconds"):
             for value in ("oops", "nan", "0"):
                 with self.subTest(key=key, value=value):
@@ -3291,7 +3290,7 @@ runpy.run_path(str(script), run_name='__main__')
                                             wraps=stall_watch.sender_configuration) as configuration):
                         result = self.tick(START)
                     self.assertLessEqual(time.monotonic(), deadline)
-                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.returncode, 1)
                     self.assertEqual(configuration.call_count, 1)
                     self.assertEqual(result.stderr.count("stall-watch: sender config:"), 1, result.stderr)
                     self.assertIn(key, result.stderr)
@@ -3300,6 +3299,7 @@ runpy.run_path(str(script), run_name='__main__')
                     self.assertTrue(stall_watch.saved_stretch(relay)["bump_sent"])
                     self.assertEqual({item["key"] for item in self.sent()[before:]},
                                      {"old-alert", "pending-relay"})
+        self.assertIn("stall_watch", reads.read_text().splitlines())
 
     def test_sender_batch_and_cleanup_budgets_are_reread_from_config(self) -> None:
         for batch, cleanup, delivered in (("0.1", "0.1", False), ("1", "0.1", True),

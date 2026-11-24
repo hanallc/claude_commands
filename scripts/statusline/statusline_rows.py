@@ -14,9 +14,9 @@ def main() -> None:
     source = sys.argv[1]
     if source == "--for-you-console":
         args = assignment.status_action_args(remote=True)
-        rebuild = rebuild_row.read(rebuild_row.DEFAULT_CONFIG)
+        rebuild = rebuild_row.read("statusline")
     else:
-        rebuild = rebuild_row.read(rebuild_row.DEFAULT_CONFIG)
+        rebuild = rebuild_row.read("statusline")
         args = assignment.status_action_args(remote=False, rebuild=rebuild)
     sys.argv[1:2] = args
     assignment.main(rebuild)

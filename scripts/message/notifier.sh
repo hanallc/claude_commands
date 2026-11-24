@@ -533,8 +533,8 @@ cmd_tick() {
     local -a drain_command
     drain_command=(/usr/bin/env "HOME=$HOME" "PATH=$PATH"
       "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}"
-      "SEND_REPEAT_STATE=$repeat_state"
-      "SEND_REPEAT_CONFIG=${SEND_REPEAT_CONFIG:-$HOME/.claude/config/send_repeat_guard.conf}")
+      "SEND_REPEAT_STATE=$repeat_state")
+    [[ -z ${CONF_DIR:-} ]] || drain_command+=("CONF_DIR=$CONF_DIR")
     drain_command+=("$PY" "${SEND:h}/repeat_guard.py" notices)
     if [[ -n ${NOTIFIER_SEND:-} ]]; then
       drain_command+=("$NOTIFIER_SEND" repeat-notices)

@@ -12,6 +12,7 @@ import unittest
 
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -201,10 +202,10 @@ class VerifyNixShellTests(NixFixture):
         self.script(self.bin / "python3", PYTHON_SHIM)
         self.script(self.bin / "date", 'import os\nprint(os.environ["TZ"])\n')
         configuration = self.root / "user_zone.conf"
-        _ = configuration.write_text("zone=Europe/Paris\n", encoding="utf-8")
+        _ = write_config_fixture(configuration, "zone=Europe/Paris\n")
         result = subprocess.run(["bash", str(clock)], cwd=self.work,
                                 env={**self.env, "PY": str(self.bin / "python3"),
-                                     "USER_ZONE_CONF": str(configuration)},
+                                     "CONF_DIR": str(configuration.parent)},
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Europe/Paris\n")

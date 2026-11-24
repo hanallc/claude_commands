@@ -4,14 +4,16 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from subprocess import run as run_fixture_git
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.for_you.action import ActionStore
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import staff
 from scripts.rebuild import need
 from scripts.review_links import change_browser, for_you
@@ -228,12 +230,15 @@ class ForYouTests(unittest.TestCase):
         self.write_comparison("rebuild natedev")
         need.add_need("mac", "b" * 40, "Apply Mac settings.", "console", "staff-a")
         _ = self.add_action()
-        with (patch.object(rebuild_row, "DEFAULT_CONFIG", self.config),
+        with (patch.dict(os.environ, {"CONF_DIR": str(self.config.parent)}),
               patch.object(rebuild_row, "read_compared_changes", return_value={}) as changes):
+            for source, load in (("explicit", lambda: for_you.read_for_status_line(self.config)),
+                                 ("default", for_you.read_for_status_line)):
+                with self.subTest(source=source):
+                    actions = load().status_line_actions()
+                    self.assertEqual(actions, for_you.StatusLineActions(("natedev", "mac"), 1))
             self.assertEqual(for_you.global_action_count(), "3")
             self.assertEqual(for_you_count.global_action_count(self.config), "3")
-            actions = for_you.read_for_status_line(self.config).status_line_actions()
-            self.assertEqual(actions, for_you.StatusLineActions(("natedev", "mac"), 1))
         changes.assert_not_called()
 
     def test_comparison_uses_only_commits_for_its_running_system_and_configured_revision(self) -> None:
@@ -304,7 +309,15 @@ class ForYouTests(unittest.TestCase):
     def test_failed_config_preserves_open_need_without_inventing_cwd(self) -> None:
         need.add_need("mac", "a" * 40, "Apply settings.", "console", "staff-a")
         self.config.unlink()
-        snapshot = self.read()
+        environment = {**fixture_git_environment(self.root), "GIT_CEILING_DIRECTORIES": str(self.root.parent)}
+
+        def find_checkout(command: list[str], *, capture_output: bool, text: Literal[True],
+                          check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command, ["git", "-C", str(self.root), "rev-parse", "--show-toplevel"])
+            return run_fixture_git(command, capture_output=capture_output, text=text, check=check, env=environment)
+
+        with patch.object(subprocess, "run", side_effect=find_checkout):
+            snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "open")
         self.assertEqual(snapshot.rows[0].cwd, "")
         self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))

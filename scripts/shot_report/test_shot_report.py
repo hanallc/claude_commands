@@ -29,6 +29,7 @@ from scripts.shot_report.transcripts import (
     AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, PersistentScanCache, scan_calls,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def setUpModule() -> None:
@@ -675,9 +676,9 @@ class ShotReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             configuration = state_dir / "user_zone.conf"
-            _ = configuration.write_text("zone=Asia/Kolkata\n", encoding="utf-8")
+            _ = write_config_fixture(configuration, "zone=Asia/Kolkata\n")
             environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
-            environment["USER_ZONE_CONF"] = str(configuration)
+            environment["CONF_DIR"] = str(configuration.parent)
             result = subprocess.run([
                 str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir),
                 "--since", "2026-01-10", "--until", "2026-01-11",

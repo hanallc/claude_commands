@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cas
 from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import conf_reads, models_registry, nix_env
+from scripts.lib import conf, models_registry, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -58,20 +58,8 @@ EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
 
 
 def review_timeout_seconds() -> float:
-    """Read the reviewer limit once; configuration faults use the 60 s default."""
-    try:
-        contents = conf_reads.read_text(NOTIFY_CONFIG)
-        for line in contents.splitlines():
-            key, separator, value = line.partition("#")[0].partition("=")
-            if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
-                seconds = float(value.strip())
-                if not math.isfinite(seconds) or seconds <= 0:
-                    raise ValueError("REVIEW_TIMEOUT_SECONDS must be positive and finite")
-                return seconds
-        raise ValueError("missing REVIEW_TIMEOUT_SECONDS")
-    except (OSError, ValueError) as error:
-        print(f"review: {NOTIFY_CONFIG}: {error}; using REVIEW_TIMEOUT_SECONDS=60", file=sys.stderr)
-        return 60.0
+    """Read the current reviewer time limit."""
+    return conf.read("notify").number("REVIEW_TIMEOUT_SECONDS")
 
 
 @dataclass(frozen=True)

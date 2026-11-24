@@ -25,13 +25,14 @@ staff="${STAFF_FILE:-$HOME/.local/state/staff/staff.json}"
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
 
-colors="$statusline/../../config/statusline.conf"
+config_dir="${CONF_DIR:-$statusline/../../config}"
+colors="$config_dir/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
 [ -z "${CONF_READ_LOG:-}" ] || [ "$colors" = /dev/null ] || conf_record statusline
 
 zone=${USER_ZONE:-}
 if [ -z "$zone" ]; then
-  zone_conf=${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}
+  zone_conf="$config_dir/user_zone.conf"
   zone_stem=${zone_conf##*/}
   [ -z "${CONF_READ_LOG:-}" ] || conf_record "${zone_stem%.conf}"
   {
@@ -45,7 +46,7 @@ export TZ="${zone:-America/New_York}"
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
-STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" \
+CONF_DIR="$config_dir" STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" \
   -r --arg pwd "$PWD" --arg account "$account" --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

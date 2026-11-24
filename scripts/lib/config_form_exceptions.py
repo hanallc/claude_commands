@@ -69,10 +69,11 @@ class InternalLiteral:
     reason: str
 
 
-_RAW_READER_PHASE = RemoveInPhase("Raw readers to conf.read")
 _FILE_VARIABLE_PHASE = RemoveInPhase("Per-file config environment variables to CONF_DIR")
 _TOML_PHASE = RemoveInPhase("TOML tunables to .conf")
 _SECTION_PHASE = RemoveInPhase("Remove section lines")
+_CLI_PHASE = RemoveInPhase("config/cli.conf")
+_CONTEXT_DEFERRAL_PHASE = RemoveInPhase("Context deferral rules to the common form")
 
 READER_EXCEPTIONS: tuple[ReaderException, ...] = (
     ReaderException(
@@ -95,28 +96,14 @@ READER_EXCEPTIONS: tuple[ReaderException, ...] = (
         ExceptionLifetime.PERMANENT,
     ),
     ReaderException(
-        "scripts/build_hold/cargo", ("build_folders.conf",),
-        "Parse layout keys in config/build_folders.conf.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
-        "scripts/buildlog/rust_release.py", ("lint.conf",), "Parse config/lint.conf directly.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
         "scripts/direct/pass_record.py", ("direct.conf", "models.conf"),
         "Hash the exact bytes of config/models.conf and config/direct.conf.",
         ExceptionLifetime.PERMANENT,
     ),
     ReaderException(
-        "scripts/hooks/mac_files.py", ("production.conf",),
-        "Parse config/production.conf to find the Mac.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
         "scripts/hooks/stop-context-deferral.py", ("context_deferral.conf",),
-        "Parse the rule list in config/context_deferral.conf; its form waits for a showrunner decision.",
-        ExceptionLifetime.NO_REMOVAL_PHASE,
-    ),
-    ReaderException(
-        "scripts/lib/user_zone.py", ("*",), "Parse the selected user zone config file.", _RAW_READER_PHASE,
+        "Parse the rule list in config/context_deferral.conf.",
+        _CONTEXT_DEFERRAL_PHASE,
     ),
     ReaderException(
         "scripts/lint/lint_config.sh", ("lint.conf",),
@@ -132,25 +119,13 @@ READER_EXCEPTIONS: tuple[ReaderException, ...] = (
         "Read tunables from config/agent_notes.toml.", _TOML_PHASE,
     ),
     ReaderException(
-        "scripts/message/repeat_guard.py", ("send_repeat_guard.conf",),
-        "Parse config/send_repeat_guard.conf directly.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
         "scripts/message/session_records.py", ("session_retries.toml",),
         "Read tunables from config/session_retries.toml.", _TOML_PHASE,
     ),
     ReaderException(
-        "scripts/notify/review.py", ("notify.conf",), "Parse config/notify.conf directly.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
-        "scripts/production/stall_watch.py", ("*",), "Parse the selected stall watch config file.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
-        "scripts/statusline/rebuild_row.py", ("*",), "Parse the selected statusline config file.", _RAW_READER_PHASE,
-    ),
-    ReaderException(
-        "scripts/statusline/statusline.sh", ("user_zone.conf",),
-        "Parse config/user_zone.conf directly.", _RAW_READER_PHASE,
+        "scripts/statusline/statusline.sh", ("statusline.conf", "user_zone.conf"),
+        "Read the zone in POSIX sh and pass the full color file to jq for color lookups.",
+        ExceptionLifetime.PERMANENT,
     ),
     *(
         ReaderException(path, (file.rsplit("/", 1)[-1],), f"Read {file} as data.", ExceptionLifetime.PERMANENT)
@@ -181,8 +156,6 @@ READER_EXCEPTIONS: tuple[ReaderException, ...] = (
 )
 
 VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
-    VariableException("SEND_REPEAT_CONFIG", "Select config/send_repeat_guard.conf.", _RAW_READER_PHASE),
-    VariableException("STALL_WATCH_CONFIG", "Select config/stall_watch.conf.", _RAW_READER_PHASE),
     VariableException("MODELS_CONFIG_FILE", "Select config/models.conf.", _FILE_VARIABLE_PHASE),
     VariableException("COPIES_CONFIG", "Select config/copies.conf.", _FILE_VARIABLE_PHASE),
     VariableException("STAFF_CONFIG", "Select config/staff.conf.", _FILE_VARIABLE_PHASE),
@@ -300,11 +273,11 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     ),
     TunableLiteral(
         "scripts/direct/plan_history.py", "RATE_FACTOR_LIMIT", "2.0",
-        "direct", "plan_history.rate_factor_limit", "# range: 1..", _PRODUCTION_BATCH,
+        "direct", "plan_history.max_rate_factor", "# range: 1..", _PRODUCTION_BATCH,
     ),
     TunableLiteral(
         "scripts/direct/progress_history.py", "BOARD_NOTE_CHARS", "72",
-        "direct", "board.note_chars", "# whole: 1..", _PRODUCTION_BATCH,
+        "direct", "board.max_note_chars", "# whole: 1..", _PRODUCTION_BATCH,
     ),
     TunableLiteral(
         "scripts/hooks/context_usage.py", "TAIL_BYTES", "512 * 1024",
@@ -340,7 +313,7 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     ),
     TunableLiteral(
         "scripts/notify/pushover.py", "SOURCE_MAX", "80",
-        "notify", "pushover.source_max_chars", "# whole: 1..", _MESSAGE_BATCH,
+        "notify", "pushover.max_source_chars", "# whole: 1..", _MESSAGE_BATCH,
     ),
     TunableLiteral(
         "scripts/orphans/orphans.py", "MAXIMUM_CORPUS_FILE_BYTES", "2_000_000",
@@ -360,7 +333,7 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     ),
     TunableLiteral(
         "scripts/production/hand_made_limit.py", "TAIL_BYTES", "64 * 1024",
-        "cli", "hand_made.output_tail_bytes", "# whole: 1..", _PRODUCTION_BATCH,
+        "cli", "hand_made.output_tail_bytes", "# whole: 1..", _CLI_PHASE,
     ),
     InternalLiteral(
         "scripts/production/hand_made_route.py", "CHUNK_BYTES",
@@ -464,7 +437,7 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     ),
     TunableLiteral(
         "scripts/usage/waste_watch.py", "WAIT_SHARE_LIMIT", "0.10",
-        "waste_watch", "alert.wait_share_limit", "# range: 0..1", _MESSAGE_BATCH,
+        "waste_watch", "alert.max_wait_share", "# range: 0..1", _MESSAGE_BATCH,
     ),
     TunableLiteral(
         "scripts/whoami/codex_pacer.py", "MAX_STEP", "3.0",
@@ -503,8 +476,8 @@ PENDING_TOML_FILES: tuple[FileException, ...] = tuple(
 FORMAT_FILES: tuple[FileException, ...] = (
     FileException(
         "config/context_deferral.conf",
-        "A rule list with repeated kind: value rows that conf.read cannot read; its form waits for a showrunner decision.",
-        ExceptionLifetime.NO_REMOVAL_PHASE,
+        "A rule list with repeated kind: value rows that conf.read cannot read.",
+        _CONTEXT_DEFERRAL_PHASE,
     ),
 )
 
@@ -791,9 +764,7 @@ COMMENT_LIMIT_FILES: tuple[FileException, ...] = tuple(
         ("mac_linux", "Some numeric rows lack a limit line."),
         ("memory_feed", "Some numeric rows lack a limit line."),
         ("models", "Some key blocks lack comments or numeric limits."),
-        ("notify", "Some numeric rows lack a limit line."),
         ("production", "Some numeric rows lack a limit line."),
-        ("send_repeat_guard", "Some numeric rows lack a limit line."),
         ("stall_watch", "Some numeric rows lack a limit line."),
         ("statusline", "Some numeric rows lack a limit line."),
     )

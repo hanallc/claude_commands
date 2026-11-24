@@ -14,7 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast
 
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.production import staff
 from scripts.statusline import adhoc_items, rebuild_row
 
@@ -150,7 +150,7 @@ def status_action_args(*, remote: bool, rebuild: rebuild_row.RebuildAnswer | Non
     if for_you is not None:
         try:
             actions = (for_you.console_status_line_actions() if remote
-                       else for_you.read_for_status_line(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).status_line_actions())
+                       else for_you.read_for_status_line(rebuild=rebuild).status_line_actions())
             names = rebuild_row.rebuild_names(actions.rebuild_machines)
             count = str(actions.other_count)
         except Exception:
@@ -169,17 +169,17 @@ def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
     pwd = next((value for option, name, value in zip(sys.argv, sys.argv[1:], sys.argv[2:])
                 if option == "--arg" and name == "pwd"), os.getcwd())
     branch = current_branch(payload, pwd) if role == "unit-director" else ""
-    rebuild_config = rebuild_row.DEFAULT_CONFIG
     action_args: list[str] = []
     if rebuild is None:
         system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
         action_args = status_action_args(remote=system == "Darwin")
         # The cache can expire during the count. Read it again without reading the needs.
-        rebuild = rebuild_row._read_cache(rebuild_config, time.time)  # pyright: ignore[reportPrivateUsage]
+        rebuild = rebuild_row._read_cache("statusline", time.time)  # pyright: ignore[reportPrivateUsage]
     if rebuild.refresh_due:
         try:
             _ = subprocess.Popen(
-                [sys.executable, "-I", str(Path(rebuild_row.__file__).resolve()), "refresh", "--config", str(rebuild_config)],
+                [sys.executable, "-I", str(Path(rebuild_row.__file__).resolve()), "refresh",
+                 "--config", str(conf.path("statusline"))],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )

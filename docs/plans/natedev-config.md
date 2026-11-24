@@ -155,7 +155,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Ruled out:** a token-rule redesign of the literal scan (the AST scan with scope analysis is correct and fast enough).
 
-### Phase 4 — Raw readers to conf.read  · status: todo
+### Phase 4 — Raw readers to conf.read  · status: done
 **Depends on:** Phase 3
 
 #### Work Order

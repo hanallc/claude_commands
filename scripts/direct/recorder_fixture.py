@@ -25,10 +25,9 @@ import unittest
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
-# Initialize dependencies before invoke_cli swaps HOME. The recorder currently
-# imports user_zone eagerly; its production integrations remain real children.
+# Initialize the registry before invoke_cli swaps HOME.
 from scripts.direct import progress_history
-from scripts.lib import models_registry, user_zone
+from scripts.lib import models_registry
 from scripts.lib.test_models_registry import write_registry
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import session_staff, staff
@@ -235,11 +234,8 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
         return 0
 
     with (
-        patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
         patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
         patch.object(pass_recorder, "DEFAULT_MODELS_CONFIG_PATH", home / ".claude/config/models.conf"),
-        patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
-                                           str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
     ):
         result = invoke_cli(recorder, main, list(arguments), environment, cwd)
     if check:

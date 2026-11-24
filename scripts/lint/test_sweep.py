@@ -40,6 +40,7 @@ from scripts.lib import build_folders, conf, copy_record, removal_guard
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
+from scripts.lib.sizes import MIB, gib
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -4378,9 +4379,9 @@ class FloorTests(SweepCase):
         self.assertIn("The sweep keeps their output.", message)
         self.assertNotIn("Free ", message)
         lock_path = busy_tree / sweep.LOCK_NAMES[0]
-        self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
+        self.assertIn(f"- {busy_tree.parent} ({gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
                       + " no session found", message)
-        self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertIn(f"Not swept: CI's targets ({gib(ci_bytes)})", message)
         self.assertIn("No phone alert was attempted for this event.", message)
         self.assertNotIn("phone", send.call_args.kwargs)
         self.assertNotIn("Could not remove", message)
@@ -5003,7 +5004,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     else:
                         self.finalize_crossing(140, removed=2 * GIB)
                 choices.assert_called_once()
-                shortfall = sweep.gib(150 * GIB - free)
+                shortfall = gib(150 * GIB - free)
                 if links == "held-only":
                     recommendation = ("Every measured folder holds output a build is using. "
                                       "The sweep frees it when the build ends.")
@@ -5042,7 +5043,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 held_effect = "A build is using output inside it; deleting it can break that build."
                 other_effect = "Deleting it removes its contents; their use is unknown."
                 lines = [
-                    f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
+                    f"Free disk space fell below the 150.0 GiB alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine == "Mac" else ""),
                     "Cleanup removed 2.0 GiB.",
                     *([f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect)]
@@ -5929,10 +5930,8 @@ raise SystemExit(int(os.environ[variable]))
                              sweep.FloorChannelOutcome.FAILED)
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
-        config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
-        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
-              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+        _ = write_config_fixture(conf.path("notify"), "REVIEW_TIMEOUT_SECONDS=90\n")
+        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
@@ -7901,7 +7900,7 @@ class BudgetTests(unittest.TestCase):
         target = root / "target"
         target.mkdir()
         repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),

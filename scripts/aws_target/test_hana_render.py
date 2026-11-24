@@ -40,6 +40,7 @@ UNSHIPPED_IMPORTS = {
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/conf.py': {'lib/models_registry.py'},
     'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},

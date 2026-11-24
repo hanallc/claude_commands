@@ -139,11 +139,17 @@ _SHELL_SUFFIXES = {".sh", ".bash", ".zsh"}
 _SHELL_SPECIAL = re.compile(r"""['"\\#]""")
 _SHELL_VARIABLE = re.compile(r"(?<!\\)\$(?:\{[!#]?)?([a-zA-Z_][a-zA-Z0-9_]*)")
 _SHELL_ASSIGNMENT = re.compile(r"(?:^|\s)([a-zA-Z_][a-zA-Z0-9_]*)=")
+_SHELL_OPERAND = re.compile(r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s;'"<>&])+""")
 _SHELL_READ = re.compile(
     r"(?<![\w./-])(?:awk|cat|cut|grep|head|mapfile|rg|sed|source|tail)\s|(?<![<:\w-])<(?=[\s\"'$/.]|config/)"
 )
+# Consume other words whole so quoted text cannot start a file read.
+_SHELL_JQ_FILE_READ = re.compile(
+    r"""(?P<quote>['"]?)--(?:raw|slurp)file(?P=quote)"""
+    + rf"\s+{_SHELL_OPERAND.pattern}\s+(?P<path>{_SHELL_OPERAND.pattern})"
+    + r"""|(?:'[^']*(?:'|$)|"(?:\\.|[^"\\])*(?:"|$)|\\.|[^\s;'"<>&|()\\])+"""
+)
 _SHELL_HEREDOC = re.compile(r"""(?<!<)<<-?\s*(?P<quote>['"]?)(?P<end>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)""")
-_SHELL_OPERAND = re.compile(r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s;'"<>&])+""")
 _CONFIG_PATH = re.compile(r"(?:^|[/:'\"=\s])config/([\w.*-]+(?:/[\w.*-]+)*)?")
 _CONFIG_FILENAME = re.compile(r"[\w.-]+\.(?:conf|toml)")
 _CONFIG_PATH_HINT = r"""\bconfig/|["']config["']|/config\b|\.conf(?=["'}/\s]|$)"""
@@ -530,12 +536,15 @@ class _ShellLine(NamedTuple):
     number: int
     code: str
     expansions: str
+    continuations: tuple[int, ...] = ()
+    opening_quote: str = ""
 
 
 def _shell_lines(source: _SourceFile) -> Iterator[_ShellLine]:
     heredoc_end = ""
     heredoc_expands = False
     quote = ""
+    opening_quote = ""
     first = 1
     code_parts: list[str] = []
     expansions: list[str] = []
@@ -548,6 +557,7 @@ def _shell_lines(source: _SourceFile) -> Iterator[_ShellLine]:
             continue
         if not code_parts:
             first = number
+            opening_quote = quote
         code, expanded, quote, continued = _shell_line_text(raw, quote)
         code_parts.append(code)
         expansions.append(expanded)
@@ -557,7 +567,12 @@ def _shell_lines(source: _SourceFile) -> Iterator[_ShellLine]:
         if not quote and (marker := _SHELL_HEREDOC.search(logical)):
             heredoc_end = marker["end"]
             heredoc_expands = not marker["quote"]
-        yield _ShellLine(first, logical, "".join(expansions))
+        offsets: list[int] = []
+        offset = 0
+        for part in code_parts[:-1]:
+            offset += len(part)
+            offsets.append(offset)
+        yield _ShellLine(first, logical, "".join(expansions), tuple(offsets), opening_quote)
         code_parts.clear()
         expansions.clear()
 
@@ -585,7 +600,15 @@ def _shell_config_files(text: str, names: dict[str, frozenset[str]], known_filen
 
 def _shell_reader_lines(lines: Sequence[_ShellLine], known_filenames: set[str]) -> Iterator[tuple[int, frozenset[str]]]:
     names: dict[str, frozenset[str]] = {}
-    for number, line, _ in lines:
+    for number, line, _, continuations, opening_quote in lines:
+        if "--rawfile" in line or "--slurpfile" in line:
+            # Start in the quote that the shell scan carried from the previous line.
+            for read in _SHELL_JQ_FILE_READ.finditer(opening_quote + line):
+                position = read.start() - len(opening_quote)
+                if position < 0 or not (path := read["path"]):
+                    continue
+                if files := _shell_config_files(path, names, known_filenames):
+                    yield number + sum(offset <= position for offset in continuations), files
         if _SHELL_READ.search(line) and (files := _shell_config_files(line, names, known_filenames)):
             yield number, files
         if assignment := _SHELL_ASSIGNMENT.search(line):
@@ -1029,6 +1052,21 @@ class ConfigFormTests(unittest.TestCase):
                                              exceptions.ExceptionLifetime.PERMANENT)
             problems = list(_reader_problems(check_config_readers(root, [path]), [row]))
             self.assertEqual(problems, [f"{path}:3: reader: path.read_text() [notify.conf]"])
+
+        continued_jq = 'settings="config/statusline.conf"\njq \\\n'
+        for prefix, command, number in (
+            (continued_jq, '  --rawfile settings "$settings" .', 3),
+            (continued_jq, '  --slurpfile settings "$settings" .', 3),
+            ("", "printf '%s\\n' 'jq --rawfile colors config/statusline.conf .'", 0),
+            ("", 'jq "--rawfile" settings config/statusline.conf \'.\'', 1),
+        ):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                path = Path("example.sh")
+                _ = (root / path).write_text(f"{prefix}{command}\n", encoding="utf-8")
+                self.assertEqual(check_config_readers(root, [path]), [
+                    _ReaderRead(Violation(path, number, "reader", command), frozenset({"statusline.conf"})),
+                ] if number else [])
 
     def test_key_form_accepts_names_from_fixture_config(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
