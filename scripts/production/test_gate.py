@@ -1,4 +1,4 @@
-"""Merge gate checkpoint contracts."""
+"""Gate checkpoint contracts."""
 
 from __future__ import annotations
 

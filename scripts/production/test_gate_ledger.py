@@ -1,4 +1,4 @@
-"""Merge gate ledger contracts."""
+"""Gate ledger contracts."""
 
 from __future__ import annotations
 

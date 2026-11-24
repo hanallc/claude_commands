@@ -188,7 +188,7 @@ class LimitTests(unittest.TestCase):
                      and shutil.which("sccache", path=program_path()) is None,
                      "sccache is not on PATH, and this host is not natedev")
     def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
-        # A C compile: the merge gate fails a module that starts cargo or rustc.
+        # A C compile: the gate fails a module that starts cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
         cache = self.root / "sccache"
         cache.mkdir()

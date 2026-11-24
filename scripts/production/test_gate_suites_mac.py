@@ -513,7 +513,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_mac_linux_runs_the_affected_modules_that_natedev_selects(self) -> None:
-        # The fixture's main branch has no merge gate pass, and no module declares a scan root.
+        # The fixture's main branch has no full gate pass. No module declares a scan root.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")
         self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
