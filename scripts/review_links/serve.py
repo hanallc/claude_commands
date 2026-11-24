@@ -45,7 +45,7 @@ from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -1603,6 +1603,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields = cast(dict[str, object], payload)
             token = fields.get("token")
             valid_token = self.valid_request_token(token)
+            if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
+                if not valid_token:
+                    self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                    return
+                scheduled = new_item_dialog.read_scheduled_request(fields)
+                self.scheduled_item_post(server, scheduled)
+                return
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
@@ -1673,6 +1680,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     raise
                 # Check for a saved List draft before validating a new capture.
                 key, refusal = "", error
+        except new_item_dialog.ScheduledDraftRequired as error:
+            self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
+            return
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
@@ -1738,6 +1748,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 response = {"id": saved.id, "key": created.key, "version": created.version}
+                if isinstance(saved.attachments, review_submissions.UnavailableAttachments):
+                    if not valid_token:
+                        self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                        return
+                    warnings = list(dict.fromkeys(
+                        "The saved screenshot is missing or damaged." if reference == review_submissions.PAGE_SCREENSHOT
+                        else "A saved pasted image is missing or damaged."
+                        for reference in saved.attachments.references))
+                    if edited:
+                        warnings.append("The item keeps the values from the first Send.")
+                    response["attachment_warning"] = "\n".join(warnings)
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
                 if list_draft_id and edited:
                     request = None
@@ -1782,6 +1803,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 # The dialog refreshes the token and retries the same draft.
                 self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
             return
+        except review_submissions.DraftAlreadyFiled as error:
+            self.new_item_saved({"id": error.id}, error.id, True)
+            return
+        except review_submissions.DraftPending:
+            self.pending_draft_response()
+            return
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
@@ -1822,8 +1849,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
                                                  attached=review_submissions.PAGE_SCREENSHOT in details.images)
 
+    def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
+        """File or recover a Scheduled item under the shared draft lock."""
+        try:
+            with server.list_store_access(), server.staff_read_scope():
+                saved = new_item.submit_scheduled(request)
+        except review_submissions.DraftAlreadyFiled as error:
+            self.new_item_saved({"id": error.id}, error.id, True)
+            return
+        except review_submissions.DraftPending:
+            self.pending_draft_response()
+            return
+        except new_item.FilingRefused as error:
+            status = 400 if error.reason is new_item.FilingRefusal.INVALID_SCHEDULE else 409
+            self.json_response(status, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionConflict as error:
+            self.json_response(409, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        except (OSError, ValueError, TypeError, staff.StaffRefused) as error:
+            print(f"review-links Scheduled Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
+            return
+        claim = saved.claim
+        response = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
+                    "receipt": new_item.filing_receipt(claim.assignment, saved.id), "readback": claim.readback,
+                    "notice_warning": claim.notice_warning}
+        self.new_item_saved(response, saved.id, False)
+
+    def pending_draft_response(self) -> None:
+        self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
+
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
-        if edited:
+        if edited and "attachment_warning" not in response:
             self.json_response(409, {
                 **response, "code": "already_filed",
                 "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
