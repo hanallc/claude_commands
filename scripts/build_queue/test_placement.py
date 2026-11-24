@@ -667,6 +667,24 @@ def read_aws_gate_evidence(fixture: PlacementFixture, request: wire.PlacementReq
 
 
 class AwsGatePlacementTests(unittest.TestCase):
+    def test_absent_scaler_grants_no_aws_place_and_makes_no_aws_call(self) -> None:
+        with PlacementFixture() as fixture:
+            request = aws_gate_request(fixture)
+            registry = fixture.root / "build_targets.conf"
+            _ = registry.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+            with mock.patch("scripts.aws_target.aws_cli.AwsCli.call",
+                            side_effect=AssertionError("Admission must make no AWS call")) as aws_call:
+                evidence = read_aws_gate_evidence(fixture, request)
+                self.assertIsInstance(evidence.eligibility, placement.FixedExclusion)
+                reply, = fixture.server.handle_request(request)
+                self.assertNotIsInstance(reply, wire.Assignment)
+                self.assertNotIn(request.episode, fixture.server.current_assignments)
+                aws_call.assert_not_called()
+            local = request.local
+            assert isinstance(local, wire.LocalAdmissionContext)
+            self.assertFalse(aws_ledger.gate_dispatch_binding_path(Path(local.sidecar)).exists())
+
     def assigned_gate(self, fixture: PlacementFixture) -> tuple[wire.PlacementRequest, placement.PlacementAssignment,
                                                                 aws_ledger.GateDispatchBinding]:
         request = aws_gate_request(fixture)
