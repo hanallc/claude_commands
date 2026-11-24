@@ -4,12 +4,10 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from importlib import import_module
 import os
 from pathlib import Path
 import subprocess
 import time
-from typing import cast
 from uuid import uuid4
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
@@ -25,7 +23,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
-    VerifyCommand, command_job, command_program, parse_command_program, verify_command,
+    VerifyCommand, command_job, command_program, parse_command_program, read_step_names, verify_command,
 )
 from scripts.mac_test import claim_state
 
@@ -87,6 +85,8 @@ class FirstStepAdmission:
         # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
+        if isinstance(grant.request.local, wire.LocalAdmissionContext):
+            os.environ['BUILDLOG_PLACEMENT_SIDECAR'] = grant.request.local.sidecar
 
     def place_again(self, request: wire.PlacementRequest) -> None:
         """Place the gate again with its original request and pass the new assignment to the next run."""
@@ -160,6 +160,7 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
     name = 'test-affected' if affected else 'gate'
     resolved_job = command_job(command)
     job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
+    what = read_step_names().shown(job.step) if isinstance(job, StepJob) else ""
     config = records.read_memory_config()
     first = config.program_first_peaks.get(name)
     if first is None:
@@ -180,7 +181,7 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
             break
     def refresh() -> wire.AdmitRequest:
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
-        return replace(request, identity=replace(request.identity, job=job))
+        return replace(request, identity=replace(request.identity, job=job, what=what))
     return queue_place.RefreshedRequest(refresh)
 
 
@@ -256,17 +257,25 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
-def gate_targets(command: Sequence[str], requested: str = "") -> tuple[str, ...]:
-    """Read the targets for a gate from the caller."""
+def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
+    """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
-    return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    if names:
+        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
+
+    selected = eligible_gate_targets(source, tuple(command))
+    if isinstance(selected, NoEnabledTarget):
+        raise FirstStepRefused(selected.reason)
+    return selected
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
-                  owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity) -> wire.PlacementRequest:
-    local = _program_request(command, source, owner, position, run).refresh()
+                  owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
+                  sidecar: Path) -> wire.PlacementRequest:
+    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
                   else execution_identity.SourceKeyUnavailable('source key is unavailable'))
@@ -274,8 +283,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     # Keep the registry order when more than one named target can start.
     configured = target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT)
     ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets), *targets))
-    builder = cast(client.PlacementConstraintBuilder,
-        getattr(import_module('scripts.build_targets.build_targets'), 'fixed_placement_constraints'))
+    builder = client.placement_constraint_builder()
     arguments = tuple(command)
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
@@ -308,6 +316,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
     position = SlotQueuePosition(uuid4().hex, time.time())
     keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
             'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE',
+            'BUILDLOG_PLACEMENT_SIDECAR',
             'BUILDLOG_PREPARED_COPY', 'UNIT_DETACHED_RUN')
     previous = {key: os.environ.get(key) for key in keys}
     os.environ['BUILDLOG_RUN'] = f'{owner.pid}:{owner.start_time}'
@@ -318,6 +327,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
     if gate:
         _ = os.environ.pop('BUILDLOG_PLACEMENT_FILE', None)
         _ = os.environ.pop('BUILDLOG_PLACEMENT_EPISODE', None)
+        _ = os.environ.pop('BUILDLOG_PLACEMENT_SIDECAR', None)
     try:
         with build_folders.tool_folder('copies-admission') as folder:
             assignment_file = folder / 'assignment.json'
@@ -327,7 +337,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
             elif targets:
-                gate_request = _gate_request(command, source, targets, owner, position, run)
+                gate_request = _gate_request(command, source, targets, owner, position, run, folder / 'placement.cgroup')
                 grant = GatePlacement(_placement_grant(gate_request), gate_request)
             else:
                 grant = _program_grant(command, source, owner, position, run)
