@@ -185,6 +185,7 @@ Loop/verbose only:
    The command requires both arguments and releases only the named step.
 
    After every successful checkpoint commit, enrolled or not, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
+   Add `--closed` with `--phase-id <id>` to record a missed checkpoint for a finished phase.
    It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
    To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id <event id> --reason "<reason>"`.
    A failed commit is an unsuccessful ending: do not invoke release, leave

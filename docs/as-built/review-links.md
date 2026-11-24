@@ -1852,26 +1852,30 @@ The page loads three.js from cdnjs. Served page documents send no Content-Securi
 The status line names each waiting rebuild in the `For you:` row.
 The same row shows the count of other open actions or `Unavailable` when the count fails.
 Each render checks whether the rebuild cache needs a refresh.
-The page combines the cached system comparison with open rebuild needs.
+The page combines the cached system comparison with open rebuild needs and completed requests.
 The server serves it only in a folder that holds the browser manifest.
 It has no navigation entry; `?page=rebuilds` opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
-Each owner shows once, as a heading, and the owner with the newest change comes first.
-Under an owner, the changes go newest first, and changes with the same shown time share one time.
-The time is a column at the left, with the reasons of that time beside it.
-The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
-`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
-A commit's reason is its subject and its time is the author time.
-Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
-A filed need is a change with its requester (else the affected session) as owner, its creation time and its reason.
-A need covers its own commit, so that commit shows once.
+Each machine block shows open request reasons and groups them by requester.
+The affected session appears when a request has no requester.
+The Commits section lists subjects for commits without an open request.
+The section lists commits on the configured ref after the verified running revision.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`.
+The status line refresh writes that file.
+The commit author time appears beside the subject.
+The `Claude-Session` line identifies the author through the transcript for that Remote Control session.
+Each section groups entries by owner.
+The owner with the newest entry appears first.
+Entries with the same owner and displayed time share one time.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
 The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray text that keeps at least 4.5:1 contrast.
 A listed machine without a recorded change list shows `The change list is not available yet.`
-When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
+When no machine needs a rebuild, the page shows `No rebuilds needed.`, with a count of 0 and an empty label.
+Completed requests remain available below the waiting machines.
+They appear once per machine and commit, newest completion first.
+The page names each damaged archive and shows the valid records.
 
 Machine headings use 20px text; owner headings use 17px; the changes use 15px.
 The content column is up to 1060px wide.
