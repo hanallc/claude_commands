@@ -24,7 +24,7 @@ from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, time as ClockTime, timezone
+from datetime import datetime, time as ClockTime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.process_failure import failure_detail
-from scripts.lib import process_start
+from scripts.lib import conf, process_start
 from scripts.lib.user_zone import user_zone
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
@@ -231,6 +231,18 @@ class ReleaseWorkerClosed:
 @dataclass(frozen=True)
 class ReleaseSendFailed:
     reason: str
+
+
+@dataclass(frozen=True)
+class RestartNoticeChecks:
+    released_at: datetime
+    max_age: timedelta
+    clock: Callable[[], datetime]
+    cycle_id: str
+    newest: dict[str, str]
+
+    def expired(self) -> bool:
+        return self.clock() - self.released_at > self.max_age
 
 
 @dataclass(frozen=True)
@@ -1430,9 +1442,19 @@ def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
 def save_release_intent(intent: ReleaseIntent) -> None:
     path = release_directory() / "pending-release.json"
     require_hold_write(path, Path(intent["holder_directory"]))
+    try:
+        previous = read_release_intent(path)
+    except (OSError, ValueError):
+        previous = NoReleaseIntent()
+    notices = intent["notices"]
+    same_cycle = (not isinstance(previous, NoReleaseIntent) and notices["kind"] == "cycle"
+                  and previous["notices"]["kind"] == "cycle"
+                  and previous["notices"]["cycle_id"] == notices["cycle_id"]
+                  and previous["holder_directory"] == intent["holder_directory"])
     temporary = path.with_suffix(".tmp")
     _ = temporary.write_text(json.dumps(intent, ensure_ascii=False) + "\n")
-    retain_release_record(path)
+    if not same_cycle:
+        retain_release_record(path)
     os.replace(temporary, path)
 
 
@@ -1492,9 +1514,10 @@ def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
                     saved_runs: Sequence[ReleaseEntry] = ()) -> list[ReleaseEntry]:
     first = first_release_entries(cycle)
     runs = stopped_run_entries([*cycle["entries"], *(read_restart_entry(entry) for entry in saved_runs)])
-    owners = {entry["session_id"].removeprefix("codex:") for entry in runs.values()}
+    notified = {entry["session_id"].removeprefix("codex:") for entry in runs.values()
+                if entry["delivery"] in ("Delivered", "QueuedUnconfirmed")}
     return [*runs.values(), *(first[session_id] if session_id in first else new_entry(session_id, name)
-                             for session_id, name in recipients.items() if session_id.removeprefix("codex:") not in owners)]
+                             for session_id, name in recipients.items() if session_id.removeprefix("codex:") not in notified)]
 
 
 def release_notice_pending(entry: ReleaseEntry) -> bool:
@@ -1504,11 +1527,7 @@ def release_notice_pending(entry: ReleaseEntry) -> bool:
             or delivery == "RecipientGone" and ("run" in entry or entry["session_id"].startswith("codex:")))
 
 
-def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
-    """Read and select a release's unsent entries without changing its files or cycle."""
-    notices = intent["notices"]
-    if notices["kind"] == "broadcast":
-        return notices
+def read_release_cycle(notices: CycleReleaseNotices) -> HoldCycle:
     path = release_directory() / notices["cycle_id"] / "cycle.json"
     try:
         cycle = read_hold_cycle(path)
@@ -1516,6 +1535,15 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
             raise ValueError("release intent does not match its hold cycle")
     except (OSError, ValueError) as error:
         raise ReleaseNoticeReadError(path, str(error)) from error
+    return cycle
+
+
+def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
+    """Read and select a release's unsent entries without changing its files or cycle."""
+    notices = intent["notices"]
+    if notices["kind"] == "broadcast":
+        return notices
+    cycle = read_release_cycle(notices)
     runs = list(notices.get("runs", []))
     unresolved = 0
     absent_confirmations: list[ReleaseEntry] = []
@@ -1662,7 +1690,7 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
     return NoReleaseIntent()
 
 
-def finish_release_intent(held: ReleaseLockHeld, intent: ReleaseIntent) -> str:
+def finish_release_intent(held: ReleaseLockHeld, intent: ReleaseIntent, clock: Callable[[], datetime]) -> str:
     """Drain all unfinished releases for this holder directory under release.lock."""
     directory = Path(intent["holder_directory"])
     held.require()
@@ -1672,19 +1700,83 @@ def finish_release_intent(held: ReleaseLockHeld, intent: ReleaseIntent) -> str:
         raise ValueError(resume_refusal(state.holders))
     result = "released, builds may resume."
     failures: list[str] = []
-    for record in recorded_releases(held):
-        if record.state == "pending" and record.intent["holder_directory"] == intent["holder_directory"]:
-            try:
-                result += finish_recorded_notices(held, record)
-            except Exception as error:
-                # A failed record must not stop notices for another release.
-                failures.append(f"{record.intent['holder_name']}: {error}")
+    records = [record for record in recorded_releases(held)
+               if record.intent["holder_directory"] == intent["holder_directory"]]
+    oldest_pending = min((aware_instant(record.intent["released_at"]) for record in records
+                          if record.state == "pending"), default=None)
+    if oldest_pending is None:
+        return result
+    newest: dict[str, str] = {}
+    for record in sorted(records, key=lambda item: aware_instant(item.intent["released_at"]), reverse=True):
+        if aware_instant(record.intent["released_at"]) < oldest_pending:
+            break
+        try:
+            expired, checks = prune_pending_restarts(held, record, newest, clock)
+            if expired:
+                result += f" Expired {expired} restart notices."
+            if record.state == "pending":
+                result += finish_recorded_notices(held, record, checks)
+        except Exception as error:
+            # A failed record must not stop notices for another release.
+            failures.append(f"{record.intent['holder_name']}: {error}")
     if failures:
         raise OSError(result + " Release notices remain pending: " + "; ".join(failures))
     return result
 
 
-def discard_restart_notices(held: ReleaseLockHeld, record: RecordedRelease, cycle: HoldCycle,
+def release_restart_entries(notices: CycleReleaseNotices, cycle: HoldCycle | None) -> dict[str, ReleaseEntry]:
+    return stopped_run_entries([*(cycle["entries"] if cycle is not None else ()), *notices.get("runs", []),
+                                *(request["entry"] for request in notices.get("stop_requests", []))])
+
+
+def restart_notice_max_age() -> timedelta:
+    limit = conf.read("build_targets").value("restart_notice.max_age_seconds", conf.positive_whole)
+    return timedelta(seconds=limit)
+
+
+def prune_pending_restarts(held: ReleaseLockHeld, record: RecordedRelease, newest: dict[str, str],
+                           clock: Callable[[], datetime]) -> tuple[int, RestartNoticeChecks | None]:
+    """Remove expired or superseded restarts and record delivered restarts."""
+    notices = record.intent["notices"]
+    if notices["kind"] == "broadcast":
+        return 0, None
+    try:
+        cycle = read_release_cycle(notices)
+    except ReleaseNoticeReadError:
+        cycle = None
+    runs = release_restart_entries(notices, cycle)
+    for entry in runs.values():
+        if entry["delivery"] in ("Delivered", "QueuedUnconfirmed"):
+            _ = newest.setdefault(entry["session_id"], notices["cycle_id"])
+    if record.state == "completed":
+        return 0, None
+    pending = {run_id: entry for run_id, entry in runs.items() if release_notice_pending(entry)}
+    if not pending:
+        return 0, None
+    try:
+        checks = RestartNoticeChecks(aware_instant(record.intent["released_at"]), restart_notice_max_age(),
+                                     clock, notices["cycle_id"], newest)
+        expired: set[str] = set(pending) if checks.expired() else set()
+        dropped = expired | {run_id for run_id, entry in pending.items()
+                             if newest.get(entry["session_id"], notices["cycle_id"]) != notices["cycle_id"]}
+        discard_restart_notices(held, record, cycle, dropped)
+    except (OSError, conf.Unusable):
+        _ = finish_recorded_notices(held, record, ordinary_only=True)
+        raise
+    return len(expired), checks
+
+
+def discarded_stop_waits(runs: Mapping[str, ReleaseEntry], dropped: set[str], recipients: Mapping[str, str],
+                         independent_waits: Mapping[str, bool], stop_waits: set[str]) -> list[str]:
+    owners = {entry["session_id"].removeprefix("codex:") for run_id, entry in runs.items() if run_id in dropped}
+    owners.difference_update(entry["session_id"].removeprefix("codex:")
+                             for run_id, entry in runs.items() if run_id not in dropped)
+    return [session for session in recipients if session.removeprefix("codex:") in owners
+            and independent_waits.get(session) is not True
+            and (independent_waits.get(session) is False or session in stop_waits)]
+
+
+def discard_restart_notices(held: ReleaseLockHeld, record: RecordedRelease, cycle: HoldCycle | None,
                             dropped: set[str]) -> None:
     """Remove discarded notices from both release records."""
     if not dropped:
@@ -1693,27 +1785,22 @@ def discard_restart_notices(held: ReleaseLockHeld, record: RecordedRelease, cycl
     notices = record.intent["notices"]
     assert notices["kind"] == "cycle"
     stop_waits = set(notices.get("stop_waits", []))
-    first = first_release_entries(cycle)
-    independent_waits = cycle.get("independent_waits", {})
-    restart_entries = [*cycle["entries"], *notices.get("runs", []),
-                       *(request["entry"] for request in notices.get("stop_requests", []))]
-    discarded = [entry for entry in restart_entries if "run" in entry and entry["run"]["id"] in dropped]
-    owners = {entry["session_id"].removeprefix("codex:") for entry in discarded}
-    for session in tuple(notices["recipients"]):
-        owner = session.removeprefix("codex:")
-        independent = independent_waits.get(session)
-        if owner in owners and independent is not True and (independent is False or session in stop_waits):
-            wait = first.get(session)
-            del notices["recipients"][session]
+    first = first_release_entries(cycle) if cycle is not None else {}
+    independent_waits = cycle.get("independent_waits", {}) if cycle is not None else {}
+    runs = release_restart_entries(notices, cycle)
+    for session in discarded_stop_waits(runs, dropped, notices["recipients"], independent_waits, stop_waits):
+        del notices["recipients"][session]
+        if cycle is not None:
             _ = cycle["recipients"].pop(session, None)
             _ = independent_waits.pop(session, None)
-            if wait is not None:
+            if (wait := first.get(session)) is not None:
                 cycle["entries"].remove(wait)
     notices["runs"] = [entry for entry in notices.get("runs", [])
                        if "run" not in entry or entry["run"]["id"] not in dropped]
     notices["stop_requests"] = [request for request in notices.get("stop_requests", [])
                                 if "run" not in (entry := request["entry"]) or entry["run"]["id"] not in dropped]
-    forget_restart_notices(cycle, dropped)
+    if cycle is not None:
+        forget_restart_notices(cycle, dropped)
     write_text_atomic(record.path, json.dumps(record.intent, ensure_ascii=False) + "\n")
 
 
@@ -1733,7 +1820,8 @@ def invalid_pending_restarts(pending: CycleNoticesToSend) -> set[str]:
             and restart_evidence(entry, confirmed=run_id in confirmed) == "invalid"}
 
 
-def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> str:
+def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease, checks: RestartNoticeChecks | None = None,
+                            *, ordinary_only: bool = False) -> str:
     intent = record.intent
     directory = Path(intent["holder_directory"])
     held.require()
@@ -1783,25 +1871,29 @@ def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> s
             changed = True
         if changed:
             save_cycle(cycle)
-        dropped = invalid_pending_restarts(pending)
-        if dropped:
-            discard_restart_notices(held, record, cycle, dropped)
-            pending = release_notices(intent)
-            assert isinstance(pending, CycleNoticesToSend)
-            cycle = pending.cycle
-        attempted_waits = {entry["session_id"] for entry in pending.entries if "run" not in entry}
-        expired = send_cycle_notices(cycle, pending.entries)
-        if expired:
-            discard_restart_notices(held, record, cycle, expired)
-            pending = release_notices(intent)
-            assert isinstance(pending, CycleNoticesToSend)
-            _ = send_cycle_notices(pending.cycle, [entry for entry in pending.entries
-                                                   if "run" not in entry and entry["session_id"] not in attempted_waits])
-            pending = release_notices(intent)
-            assert isinstance(pending, CycleNoticesToSend)
+        dropped: set[str] = set()
+        rejected: set[str] = set()
+        expired: set[str] = set()
+        if not ordinary_only:
+            dropped = invalid_pending_restarts(pending)
+            if dropped:
+                discard_restart_notices(held, record, cycle, dropped)
+                pending = release_notices(intent)
+                assert isinstance(pending, CycleNoticesToSend)
+                cycle = pending.cycle
+            rejected, expired = send_cycle_notices(cycle, [entry for entry in pending.entries if "run" in entry], checks)
+            discard_restart_notices(held, record, cycle, rejected | expired)
+        _ = send_cycle_notices(cycle, [entry for entry in release_entries(cycle, notices["recipients"])
+                                      if "run" not in entry and release_notice_pending(entry)])
+        if ordinary_only:
+            return ""
+        pending = release_notices(intent)
+        assert isinstance(pending, CycleNoticesToSend)
         result = not_reached_detail(pending.cycle)
-        if dropped or expired:
-            result = f" Dropped {len(dropped | expired)} invalid restart notices." + result
+        if dropped or rejected:
+            result = f" Dropped {len(dropped | rejected)} invalid restart notices." + result
+        if expired:
+            result = f" Expired {len(expired)} restart notices." + result
         if pending.unresolved_stops:
             return result + f" Pending stop confirmations: {pending.unresolved_stops}."
         if any(release_notice_pending(entry) for entry in pending.entries):
@@ -1881,10 +1973,13 @@ def register_wait(session_id: str, name: str = "", *, independent: bool = True) 
         cycle = read_cycle()
         if isinstance(cycle, NoCycle):
             return "no hold cycle: wait for the release broadcast"
+        entries = first_release_entries(cycle)
+        if independent:
+            cycle.setdefault("independent_waits", {})[session_id] = True
+        elif session_id not in cycle["recipients"] and session_id not in entries:
+            _ = cycle.setdefault("independent_waits", {}).setdefault(session_id, False)
         _ = cycle["recipients"].setdefault(session_id, name or session_id)
-        independent_waits = cycle.setdefault("independent_waits", {})
-        independent_waits[session_id] = independent or independent_waits.get(session_id, False)
-        if session_id not in first_release_entries(cycle):
+        if session_id not in entries:
             cycle["entries"].append(new_entry(session_id, cycle["recipients"][session_id]))
         save_cycle(cycle)
         return f"registered {session_id}; wait for release before building"
@@ -1961,14 +2056,20 @@ def collect_stop_notices(cycle: HoldCycle, notices: CycleReleaseNotices) -> None
         for name in logs:
             for row in store.locked_rows(folder / name):
                 restart, status = row.get("restart"), row.get("stop_status")
-                if row.get("kind") != "hold_build" or status not in ("stopped", "requested") or not isinstance(restart, dict):
+                if row.get("kind") != "hold_build" or not isinstance(restart, dict):
+                    continue
+                request_id = row.get("stop_request_id")
+                if (status == "not_stopped" and isinstance(request_id, str) and re.fullmatch(r"[0-9a-f]{32}", request_id)
+                        and read_stop_confirmation_state(request_id) == "stopped"):
+                    status = "stopped"
+                if status not in ("stopped", "requested"):
                     continue
                 entry = read_restart_entry(cast(dict[str, object], restart))
                 if status == "stopped":
                     run = entry.get("run")
                     assert run is not None
                     _ = runs.setdefault(run["id"], entry)
-                elif isinstance(request_id := row.get("stop_request_id"), str):
+                elif isinstance(request_id, str):
                     request: StopRequest = {"id": request_id, "entry": entry}
                     if isinstance(runner_record := row.get("runner_record"), str):
                         request["runner_record"] = runner_record
@@ -2030,7 +2131,8 @@ def send_release_to(entries: Sequence[ReleaseEntry], address: str, notice: str) 
     sessions = list(dict.fromkeys(entry["session_id"] for entry in entries))
     notice += f" Session {sessions[0]}." if len(sessions) == 1 else f" Sessions {', '.join(sessions)}."
     try:
-        options = ("--skip-closed",) if address.startswith("codex:") else ()
+        flag = "--exact-thread" if "run" in entries[0] else "--skip-closed"
+        options = (flag,) if address.startswith("codex:") else ()
         result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
                                 capture_output=True, text=True)
     except OSError as error:
@@ -2041,7 +2143,7 @@ def send_release_to(entries: Sequence[ReleaseEntry], address: str, notice: str) 
         return ReleaseQueued()
     if options and result.returncode == SEND_CLOSED_EXIT:
         return ReleaseWorkerClosed()
-    if options and result.returncode == SEND_ABSENT_EXIT:
+    if options == ("--skip-closed",) and result.returncode == SEND_ABSENT_EXIT:
         return RecipientGone()
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
@@ -2116,7 +2218,7 @@ RestartEvidence = Literal["matches", "invalid", "unreadable"]
 
 
 def staff_session_evidence(staff_id: str, session: str) -> RestartEvidence:
-    """Check which session the recorded staff member owns."""
+    """Check the saved session against the current staff records."""
     if not staff_id:
         return "matches"
     from scripts.production import staff
@@ -2125,8 +2227,11 @@ def staff_session_evidence(staff_id: str, session: str) -> RestartEvidence:
         membership = staff.initial_snapshot()
     except staff.StaffUnreadable:
         return "unreadable"
+    saved = session.removeprefix("codex:")
     owner = membership.by_id(staff.StaffId(staff_id))
-    return "matches" if owner is not None and owner.current_session == session.removeprefix("codex:") else "invalid"
+    if owner is not None and owner.current_session == saved:
+        return "matches"
+    return "invalid" if membership.by_current_session(saved) is not None else "unreadable"
 
 
 def restart_environment(pid: int, proc_root: Path) -> dict[str, str]:
@@ -2181,40 +2286,50 @@ def restart_evidence(entry: ReleaseEntry, *, confirmed: bool) -> RestartEvidence
             return "unreadable"
         if current == process_start.Started(start) or (
                 confirmed and (current == process_start.Zombie(start) or isinstance(current, process_start.Gone))):
-            return staff_session_evidence(run["staff_id"], session)
+            return "matches"
         return "invalid"
     except (OSError, ValueError):
         return "unreadable"
 
 
-def ready_restart_notices(cycle: HoldCycle, batch: Sequence[ReleaseEntry], dropped: set[str]) -> list[ReleaseEntry]:
-    """Check each run after address lookup."""
+def ready_restart_notices(cycle: HoldCycle, batch: Sequence[ReleaseEntry], checks: RestartNoticeChecks,
+                          dropped: set[str], expired: set[str]) -> list[ReleaseEntry]:
+    """Check each run after address lookup and check the age before delivery."""
     ready: list[ReleaseEntry] = []
     unreadable: list[ReleaseEntry] = []
+    unverified: list[ReleaseEntry] = []
     for entry in batch:
+        run = entry.get("run")
+        assert run is not None
         match restart_evidence(entry, confirmed=True):
             case "invalid":
-                run = entry.get("run")
-                assert run is not None
                 dropped.add(run["id"])
             case "unreadable":
                 unreadable.append(entry)
             case "matches":
-                ready.append(entry)
+                match staff_session_evidence(run["staff_id"], entry["session_id"]):
+                    case "matches":
+                        ready.append(entry)
+                    case "invalid":
+                        dropped.add(run["id"])
+                    case "unreadable":
+                        unverified.append(entry)
     if unreadable:
         save_outcome(cycle, unreadable, ReleaseSendFailed("restart evidence is unreadable"))
+    if unverified:
+        save_outcome(cycle, unverified, ReleaseSendFailed("the saved staff session could not be verified"))
+    if ready and checks.expired():
+        expired.update(stopped_run_entries(ready))
+        return []
     return ready
 
 
-def send_stopped_runs_release(batch: Sequence[ReleaseEntry], notice: str, membership: staff.StaffSnapshot | None,
-                              recipient: RecipientLive | RecipientGone | RecipientLookupFailed | None) -> ReleaseNoticeResult:
-    """Send checked notices to the saved session."""
-    notice += stopped_runs_text(batch, membership)
-    if recipient is None:
-        return send_release_to(batch, batch[0]["session_id"], notice)
-    if isinstance(recipient, RecipientLive):
-        return send_release_to(batch, f"uds:{recipient.socket}", notice)
-    return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
+def send_checked_restarts(batch: Sequence[ReleaseEntry], address: str, notice: str,
+                          membership: staff.StaffSnapshot | None, checks: RestartNoticeChecks) -> ReleaseNoticeResult:
+    """Record the checked sessions and send their restart notices."""
+    for entry in batch:
+        _ = checks.newest.setdefault(entry["session_id"], checks.cycle_id)
+    return send_release_to(batch, address, notice + stopped_runs_text(batch, membership))
 
 
 def run_director(entry: ReleaseEntry, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None | ReleaseSendFailed:
@@ -2257,11 +2372,14 @@ def not_reached_detail(cycle: HoldCycle) -> str:
     # Name each session once, however many of its runs are listed.
     missing = list({entry["session_id"]: f"{entry['name']} (session gone)" for entry in entries
                     if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)}.values())
-    pending = list({entry["session_id"]: entry["name"] for entry in entries if release_notice_pending(entry)}.values())
+    pending: dict[str, str] = {}
+    for entry in entries:
+        if release_notice_pending(entry):
+            _ = pending.setdefault(entry["session_id"], entry["name"])
     failed = " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
     if not pending:
         return failed
-    return failed + ("." if failed else "") + " Release notices still pending for " + ", ".join(pending) + "."
+    return failed + ("." if failed else "") + " Release notices still pending for " + ", ".join(pending.values()) + "."
 
 
 def notify_release(cycle: HoldCycle) -> str:
@@ -2277,22 +2395,42 @@ def notify_release(cycle: HoldCycle) -> str:
 def notify_released_cycle(cycle: HoldCycle) -> str:
     if has_holder_file(holder_directory()):
         return ""
-    entries = [entry for entry in release_entries(cycle, cycle["recipients"])
-               if entry["delivery"] == "NotAttempted"]
-    dropped = send_cycle_notices(cycle, entries)
+    runs = stopped_run_entries(cycle["entries"])
+    pending = {run_id for run_id, entry in runs.items() if release_notice_pending(entry)}
+    checks = (RestartNoticeChecks(aware_instant(cycle["release_started_at"]), restart_notice_max_age(),
+                                  lambda: datetime.now(timezone.utc), cycle["id"], {}) if pending else None)
+    expired: set[str] = pending if checks is not None and checks.expired() else set()
+    dropped, expired_during_send = send_cycle_notices(
+        cycle, [entry for run_id, entry in runs.items()
+                if entry["delivery"] == "NotAttempted" and run_id not in expired], checks)
+    expired |= expired_during_send
+    if expired:
+        independent_waits = cycle.get("independent_waits", {})
+        first = first_release_entries(cycle)
+        for session in discarded_stop_waits(runs, expired, cycle["recipients"], independent_waits, set()):
+            del cycle["recipients"][session]
+            _ = independent_waits.pop(session, None)
+            if (wait := first.get(session)) is not None:
+                cycle["entries"].remove(wait)
+    if expired or dropped:
+        forget_restart_notices(cycle, expired | dropped)
+    _ = send_cycle_notices(cycle, [entry for entry in release_entries(cycle, cycle["recipients"])
+                                  if "run" not in entry and entry["delivery"] == "NotAttempted"])
+    detail = f" Expired {len(expired)} restart notices." if expired else ""
     if dropped:
-        forget_restart_notices(cycle, dropped)
-        return f" Dropped {len(dropped)} invalid restart notices." + not_reached_detail(cycle)
-    return not_reached_detail(cycle)
+        detail += f" Dropped {len(dropped)} invalid restart notices."
+    return detail + not_reached_detail(cycle)
 
 
-def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> set[str]:
+def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry],
+                       checks: RestartNoticeChecks | None = None) -> tuple[set[str], set[str]]:
     from scripts.production import staff
 
     # The release lock prevents a same-session re-hold between this check and a send.
     dropped: set[str] = set()
+    expired: set[str] = set()
     if not entries or has_holder_file(holder_directory()):
-        return dropped
+        return dropped, expired
 
     without_staff: set[str] = set()
     try:
@@ -2307,31 +2445,39 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> set
     fallbacks: dict[str, list[ReleaseEntry]] = {}
     for batch in notice_batches(entries):
         if has_holder_file(holder_directory()):
-            return dropped
+            return dropped, expired
         save_attempt(cycle, batch)
         first = batch[0]
         if "run" not in first:
             save_outcome(cycle, batch, send_session_release(first, notice), without_staff)
             continue
+        assert checks is not None
         session = first["session_id"]
         recipient = None if session.startswith("codex:") else socket_for(session)
-        ready = ready_restart_notices(cycle, batch, dropped)
+        ready = ready_restart_notices(cycle, batch, checks, dropped, expired)
         if not ready:
             continue
-        result = send_stopped_runs_release(ready, notice, membership, recipient)
+        if isinstance(recipient, RecipientLookupFailed):
+            result = ReleaseSendFailed(recipient.reason)
+        elif isinstance(recipient, RecipientGone):
+            result = recipient
+        else:
+            address = session if recipient is None else f"uds:{recipient.socket}"
+            result = send_checked_restarts(ready, address, notice, membership, checks)
         if isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
             queue_director_notices(cycle, ready, membership, result, fallbacks)
         else:
             save_outcome(cycle, ready, result)
     for address, group in fallbacks.items():
+        assert checks is not None
         for chunk in notice_chunks(group):
             if has_holder_file(holder_directory()):
-                return dropped
-            ready = ready_restart_notices(cycle, chunk, dropped)
+                return dropped, expired
+            ready = ready_restart_notices(cycle, chunk, checks, dropped, expired)
             if ready:
-                result = send_release_to(ready, address, notice + stopped_runs_text(ready, membership))
+                result = send_checked_restarts(ready, address, notice, membership, checks)
                 save_outcome(cycle, ready, result)
-    return dropped
+    return dropped, expired
 
 
 def queue_director_notices(cycle: HoldCycle, batch: Sequence[ReleaseEntry], membership: staff.StaffSnapshot | None,
@@ -2402,10 +2548,10 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
                     continue
                 if record.state == "completed":
                     if not has_holder_file(directory):
-                        detail = finish_release_intent(held, intent).removeprefix("released, builds may resume.")
+                        detail = finish_release_intent(held, intent, clock).removeprefix("released, builds may resume.")
                         return "hold is already released." + detail
                     return "hold is already released."
-                return finish_release_intent(held, intent)
+                return finish_release_intent(held, intent, clock)
             raise ValueError(f"{name} held nothing")
         cycle = read_cycle_for_change(held)
         if resume and not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -2420,8 +2566,10 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
                 collect_stop_notices(cycle, notices)
-                notices["stop_waits"] = [session for session, independent in cycle.get("independent_waits", {}).items()
-                                         if not independent]
+                stop_waits = [session for session, independent in cycle.get("independent_waits", {}).items()
+                              if not independent]
+                if stop_waits:
+                    notices["stop_waits"] = stop_waits
             intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}
@@ -2439,7 +2587,7 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
                 return result
             if isinstance(intent, NoReleaseIntent):
                 raise ValueError("last holder has no release intent")
-            return finish_release_intent(held, intent)
+            return finish_release_intent(held, intent, clock)
         remaining = live_holds(cycle, directory)
         if remaining:
             now = clock()
@@ -2448,7 +2596,7 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
         save_cycle(cycle)
         if isinstance(intent, NoReleaseIntent):
             raise ValueError("last holder has no release intent")
-        return finish_release_intent(held, intent)
+        return finish_release_intent(held, intent, clock)
 
 
 def quiet_verdict(processes: Sequence[Process], user: str) -> Quiet | Busy:

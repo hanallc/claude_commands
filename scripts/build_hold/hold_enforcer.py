@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -42,7 +43,26 @@ from scripts.direct import step_record
 from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import process_group, process_start, process_stop
 from scripts.lib.user_zone import user_zone
+
+
+STOP_GRACE_S = 2.0
+
+
+def detached_command_ended(command: build_hold.ProcessIdentity, proc_root: Path) -> bool:
+    """Check if the detached command exits within the stop grace period."""
+    if proc_root == process_stop.PROC and process_stop.supported():
+        try:
+            with process_stop.pin_process(process_stop.ProcessLifetime(command.pid, command.start_time)) as descriptor:
+                events = select.poll()
+                events.register(descriptor, select.POLLIN)
+                if any(event & select.POLLIN for _, event in events.poll(int(STOP_GRACE_S * 1000))):
+                    return True
+        except OSError:
+            pass
+    current = process_start.proc_table_start(command.pid, proc_root)
+    return isinstance(current, process_start.Gone) or current == process_start.Zombie(command.start_time)
 
 
 def ci_placement_lines(proc_root: Path) -> list[str]:
@@ -559,17 +579,21 @@ def stop_with_restart_notice(
             sent = stop(request_id)
         except ProcessLookupError:
             sent = False
-        status = "stopped" if sent else "not_stopped"
-        if request_id:
-            try:
-                build_hold.save_stop_confirmation(held, request_id, status)
-            except OSError as error:
-                print(f"build_hold: could not save stop confirmation {request_id}: {error}", file=sys.stderr)
-        try:
-            set_stop_status(holder, build.process.identity, status, request_id=request_id)
-        except OSError as error:
-            print(f"build_hold: could not update the stop audit for pid {identity.pid}: {error}", file=sys.stderr)
+        record_stop_outcome(held, holder, build.process.identity, request_id, "stopped" if sent else "not_stopped")
         return sent
+
+
+def record_stop_outcome(held: build_hold.ReleaseLockHeld, holder: build_hold.Holder,
+                        identity: build_hold.ProcessIdentity, request_id: str, status: build_hold.StopStatus) -> None:
+    if request_id:
+        try:
+            build_hold.save_stop_confirmation(held, request_id, status)
+        except OSError as error:
+            print(f"build_hold: could not save stop confirmation {request_id}: {error}", file=sys.stderr)
+    try:
+        set_stop_status(holder, identity, status, request_id=request_id)
+    except OSError as error:
+        print(f"build_hold: could not update the stop audit for pid {identity.pid}: {error}", file=sys.stderr)
 
 
 def stop_waiting_run(
@@ -637,9 +661,22 @@ def stop_waiting_run(
     def stop(request_id: str) -> bool:
         if isinstance(detached, DetachedRun):
             supervised = detached
+            send_group = signal_group
+            saved_run = entry.get("run") if isinstance(entry, dict) else None
+            if saved_run is not None and not process_stop.supported():
+                command = build_hold.ProcessIdentity(saved_run.get("pid", 0), saved_run.get("proc_start", ""))
+
+                def signal_and_confirm_exit(pid: int, signum: int) -> None:
+                    if pid != command.pid or process_start.proc_table_start(pid, proc_root) != process_start.Started(command.start_time):
+                        raise ProcessLookupError("the detached command changed before TERM")
+                    (signal_group or process_group.send_process_group)(pid, signum)
+                    if not detached_command_ended(command, proc_root):
+                        raise ProcessLookupError("the detached command did not exit after TERM")
+
+                send_group = signal_and_confirm_exit
             return detached_runs.stop_command(
                 supervised.path, reason, check=lambda: verify_gate(supervised), stop_pass=False,
-                signal_group=signal_group, hold_request_id=request_id)
+                signal_group=send_group, hold_request_id=request_id)
         if not gate_is_current():
             return False
         signal_process(identity.pid, signal.SIGTERM)
@@ -1087,7 +1124,8 @@ def set_stop_status(holder: build_hold.Holder, identity: build_hold.ProcessIdent
         for line in path.read_text().splitlines():
             entry = cast(dict[str, object], json.loads(line))
             if (entry.get("pid") == identity.pid and entry.get("proc_start") == identity.start_time
-                    and entry.get("stop_status") == "requested"
+                    and (entry.get("stop_status") == "requested"
+                         or (request_id and status == "stopped" and entry.get("stop_status") == "not_stopped"))
                     and entry.get("stop_request_id", "") == request_id):
                 entry["stop_status"] = status
                 entry["action"] = status
@@ -1170,6 +1208,14 @@ def write_refusal(proc_root: Path, build: WouldStopBuild) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class EscalatingStop:
+    holder: build_hold.Holder
+    audited: build_hold.ProcessIdentity
+    request_id: str
+    command: build_hold.ProcessIdentity
+
+
 class StopBuildsAndTests:
     def __init__(
         self, proc_root: Path, *, signal_process: Callable[[int, int], None] = os.kill,
@@ -1180,6 +1226,7 @@ class StopBuildsAndTests:
         self.signal_process: Callable[[int, int], None] = signal_process
         self.clock: Callable[[], float] = clock
         self.terminating: dict[build_hold.ProcessIdentity, float] = {}
+        self.escalating: dict[build_hold.ProcessIdentity, EscalatingStop] = {}
         self.register: Callable[[str], str] = register
 
     def signal_if_current(self, identity: build_hold.ProcessIdentity, signum: int) -> bool:
@@ -1199,6 +1246,7 @@ class StopBuildsAndTests:
         now = self.clock()
         enforcer = processes.get(enforcer_pid)
         protected: set[build_hold.ProcessIdentity] = {item.identity for item in (enforcer, *build_hold.audit_ancestors(enforcer, processes))} if enforcer else set()
+        survivors: dict[build_hold.ProcessIdentity, EscalatingStop | None] = {}
         for identity, deadline in tuple(self.terminating.items()):
             process = processes.get(identity.pid)
             ancestors = build_hold.audit_ancestors(process, processes) if process is not None else ()
@@ -1209,10 +1257,29 @@ class StopBuildsAndTests:
                     or process is not None and isinstance(
                         keeping_holder(process, ancestors, processes, holders), build_hold.Holder)):
                 del self.terminating[identity]
+                _ = self.escalating.pop(identity, None)
                 continue
             if now >= deadline:
-                _ = self.signal_if_current(identity, signal.SIGKILL)
                 del self.terminating[identity]
+                survivors[identity] = self.escalating.pop(identity, None)
+        if all(stop is None for stop in survivors.values()):
+            for identity in survivors:
+                _ = self.signal_if_current(identity, signal.SIGKILL)
+            return
+        with build_hold.release_lock() as held:
+            active = build_hold.natedev_holds(build_hold.holder_directory()).in_force
+            if not active:
+                return
+            signaled: dict[str, EscalatingStop] = {}
+            for identity, stop in survivors.items():
+                command_live = (stop is not None
+                                and process_start.proc_table_start(stop.command.pid, self.proc_root)
+                                == process_start.Started(stop.command.start_time))
+                if self.signal_if_current(identity, signal.SIGKILL) and command_live and stop is not None:
+                    signaled[stop.request_id] = stop
+            for stop in signaled.values():
+                if detached_command_ended(stop.command, self.proc_root):
+                    record_stop_outcome(held, stop.holder, stop.audited, stop.request_id, "stopped")
 
     def stop(self, build: WouldStopBuild, processes: Mapping[int, build_hold.AuditProcess],
              holders: Sequence[build_hold.Holder], enforcer_pid: int,
@@ -1247,11 +1314,33 @@ class StopBuildsAndTests:
                               root, self.proc_root, ancestors=build_hold.audit_ancestors(root, processes))
         if isinstance(detached, DetachedRun) and isinstance(entry, dict):
             recipients = (entry["session_id"],)
-        def stop_family(_request_id: str) -> bool:
+
+        def stop_family(request_id: str) -> bool:
+            run = entry.get("run") if isinstance(entry, dict) else None
+            command = (build_hold.ProcessIdentity(run.get("pid", 0), run.get("proc_start", ""))
+                       if run is not None else None)
+            detached_live = (isinstance(detached, DetachedRun) and command is not None
+                             and process_start.proc_table_start(command.pid, self.proc_root)
+                             == process_start.Started(command.start_time))
             signaled = self.stop_family(root, processes, holders, enforcer_pid, claimed)
-            if not isinstance(entry, dict) or (run := entry.get("run")) is None:
+            if command is None:
                 return bool(signaled)
-            return build_hold.ProcessIdentity(run.get("pid", 0), run.get("proc_start", "")) in signaled
+            if not isinstance(detached, DetachedRun):
+                return command in signaled
+            related = {
+                identity for identity in signaled
+                if (process := processes.get(identity.pid)) is not None and process.identity == identity
+                and (identity == command or any(
+                    ancestor.identity == command for ancestor in build_hold.audit_ancestors(process, processes)))
+            }
+            if not detached_live or not related:
+                return False
+            if detached_command_ended(command, self.proc_root):
+                return True
+            escalation = EscalatingStop(build.holder, build.process.identity, request_id, command)
+            for identity in related:
+                self.escalating[identity] = escalation
+            return False
 
         _ = stop_with_restart_notice(audited, build.holder, self.proc_root, root.identity,
                                      entry, recipients, stop_family, self.register)
@@ -1284,7 +1373,7 @@ class StopBuildsAndTests:
             if isinstance(keeping_holder(process, parents, processes, holders), build_hold.Holder):
                 continue
             if process.identity not in self.terminating and self.signal_if_current(process.identity, signal.SIGTERM):
-                self.terminating[process.identity] = self.clock() + 2
+                self.terminating[process.identity] = self.clock() + STOP_GRACE_S
                 stopped.add(process.identity)
             pending.extend(child for child in children.get(process.identity.pid, [])
                            if int(child.identity.start_time) >= int(process.identity.start_time))

@@ -70,8 +70,10 @@ Release skips a recipient when it confirms that both the staff row and the sessi
 Release lists a missing session with a staff row under `Not reached`.
 The sender skips closed Codex workers with no route. Their next assignment resumes them.
 Release sends a restart notice to the original session when the stop is confirmed and the saved evidence matches.
+For a Codex owner, release sends to the exact saved thread.
 If that session is closed or gone, release tries the director.
 An unsent restart notice stays pending while its evidence is valid or unreadable.
+Release expires a pending restart notice after `restart_notice.max_age_seconds` (24 hours by default).
 Release removes invalid restart notices from the pending record and reports the count.
 On `No hold cycle: broadcast this release to every session.`, use `/notify_top_level --here`.
 On `Not reached, tell them yourself: ...`, tell each named session.

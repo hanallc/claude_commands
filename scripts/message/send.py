@@ -1095,6 +1095,7 @@ class Options(NamedTuple):
     review_delivery: bool = False
     urgent: bool = False
     skip_closed: bool = False
+    exact_thread: bool = False
     user_asked: bool = False
 
     @property
@@ -3204,31 +3205,35 @@ def matching_recipients(
 @overload
 def matching_recipients(
     to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
-    membership: staff.StaffSnapshot | None = None, skip_closed: bool,
+    membership: staff.StaffSnapshot | None = None, skip_closed: bool, exact_thread: bool = False,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed | RecipientClosed | RecipientAbsent: ...
 
 
 def matching_recipients(
     to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
-    membership: staff.StaffSnapshot | None = None, skip_closed: bool = False,
+    membership: staff.StaffSnapshot | None = None, skip_closed: bool = False, exact_thread: bool = False,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed | RecipientClosed | RecipientAbsent:
     """Find routes here and check the peer when there is no usable local match."""
     from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
     native = to.startswith("session:")
-    member = NoStaffRecipient() if native else _staff_recipient_match(to, membership, observed=observed.entries)
+    thread = roster.CodexThread(to[6:]) if skip_closed and to.startswith("codex:") else roster.NoCodexThread()
+    if isinstance(thread, roster.CodexThread):
+        member = membership.by_current_session(thread.thread_id) or NoStaffRecipient()
+    else:
+        member = NoStaffRecipient() if native else _staff_recipient_match(to, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [member.reason])
     staff_alias = (resolve_staff_recipient(to, membership, observed=observed.entries)
-                   if isinstance(member, NoStaffRecipient) and not native else member)
+                   if isinstance(member, NoStaffRecipient) and not native and isinstance(thread, roster.NoCodexThread)
+                   else member)
     if isinstance(staff_alias, RecipientLookupFailed):
         return RecipientSearchFailed(staff_alias.reason, [staff_alias.reason])
     if isinstance(member, staff.StaffRow):
         for anomaly in observed.row_anomalies:
             if anomaly.row.id == member.id:
                 return RecipientSearchFailed(anomaly.diagnostic, observed.diagnostics)
-    thread = roster.CodexThread(to[6:]) if skip_closed and to.startswith("codex:") else roster.NoCodexThread()
 
     def matches_in(entries: list[roster.RosterEntry], owner: staff.StaffRow | NoStaffRecipient) -> list[roster.RosterEntry]:
         if isinstance(thread, roster.CodexThread):
@@ -3246,6 +3251,8 @@ def matching_recipients(
                  *sources: roster.Roster) -> RecipientMatches | RecipientSearchFailed | RecipientClosed | RecipientAbsent:
         problems = [problem for source in sources for problem in source.diagnostics]
         if isinstance(thread, roster.CodexThread) and not matches:
+            if exact_thread:
+                return RecipientSearchFailed(f"no live Codex session has address {to}", problems)
             if any(source.problems for source in sources) or _recipient_roster_problems(to, problems, observed, membership):
                 return RecipientSearchFailed(f"recipient lookup failed for {to!r}", problems)
             if any(entry.kind == "codex" and isinstance(entry.thread, roster.NoCodexThread)
@@ -3279,7 +3286,8 @@ def matching_recipients(
         return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
     problems = [*observed.diagnostics, *peer.diagnostics]
-    member = NoStaffRecipient() if native else _staff_recipient_match(to, membership, observed=[*observed.entries, *peer.entries])
+    if not native and isinstance(thread, roster.NoCodexThread):
+        member = _staff_recipient_match(to, membership, observed=[*observed.entries, *peer.entries])
     if isinstance(member, RecipientLookupFailed):
         return RecipientSearchFailed(member.reason, [*problems, member.reason])
     if isinstance(member, staff.StaffRow) and isinstance(thread, roster.NoCodexThread):
@@ -3303,7 +3311,7 @@ def _local_worker(member: staff.StaffRow, membership: staff.StaffSnapshot) -> bo
 def resolve_recipient(
     target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
-    skip_closed: bool = False,
+    skip_closed: bool = False, exact_thread: bool = False,
 ) -> DeliveryRoute:
     """Resolve locally first and require a current staff row for a fixed staff lookup."""
     from scripts.message import roster
@@ -3315,7 +3323,7 @@ def resolve_recipient(
         usage_error(fixed_member.reason)
     problems = observed.diagnostics
     native = not isinstance(target, FixedStaffLookup) and to.startswith("session:")
-    check_closed = skip_closed and to.startswith("codex:")
+    check_closed = (skip_closed or exact_thread) and to.startswith("codex:")
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
@@ -3324,8 +3332,13 @@ def resolve_recipient(
         if not isinstance(target, FixedStaffLookup) and to.startswith("uds:"):
             socket_records = sessions.live_sessions() if records is None else records
             return socket_recipient(to, socket_records, membership)
-        member = (fixed_member if native or isinstance(fixed_member, staff.StaffRow)
-                  else _staff_recipient_match(to, membership, observed=observed.entries))
+        if exact_thread:
+            if isinstance(scope, NamedMachine):
+                return RemoteDelivery(scope.host, to)
+            member = membership.by_current_session(to[6:]) or NoStaffRecipient()
+        else:
+            member = (fixed_member if native or isinstance(fixed_member, staff.StaffRow)
+                      else _staff_recipient_match(to, membership, observed=observed.entries))
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not check_closed and not isinstance(scope, NamedMachine)
@@ -3345,14 +3358,15 @@ def resolve_recipient(
             thread_id = to.removeprefix("codex:")
             if not thread_id:
                 usage_error("codex: needs a thread id")
-        if isinstance(member, NoStaffRecipient) and not native:
+        if isinstance(member, NoStaffRecipient) and not native and not exact_thread:
             fallback = resolve_staff_recipient(to, membership, observed=observed.entries)
             if isinstance(fallback, RecipientLookupFailed):
                 usage_error(fallback.reason)
             if isinstance(fallback, staff.StaffRow):
                 return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         resolution_scope = LocalOnly() if native and sessions.addressed(to, records or []) is not None else scope
-        result = matching_recipients(to, resolution_scope, observed, membership=membership, skip_closed=check_closed)
+        result = matching_recipients(to, resolution_scope, observed, membership=membership,
+                                     skip_closed=check_closed, exact_thread=exact_thread)
         if isinstance(result, (RecipientClosed, RecipientAbsent)):
             return result
         problems = result.problems
@@ -3366,6 +3380,9 @@ def resolve_recipient(
                             and member.kind == "worker"):
                         return PaneWorkerRecipient(member)
             route = _matched_recipient(to, result.entries, result.destination)
+            if exact_thread and (not isinstance(route, (CodexSessionRecipient, CodexPaneRecipient))
+                                 or route.thread_id != to[6:]):
+                return RecipientLookupFailed(f"no exact Codex route for {to}")
             if (isinstance(route, RemoteDelivery) and route.selected_conversation
                     and isinstance(member, staff.StaffRow)):
                 return RemoteDelivery(route.host, staff_queue_key(member.id))
@@ -4577,7 +4594,9 @@ def remote(message: Message, host: str, options: Options) -> Result:
     forwarded += ["--forwarded-sender-stamp", sender_native_id(message.stamp)]
     if isinstance(options.selection, ForwardedConversation):
         forwarded += ["--forwarded-conversation"]
-    if options.skip_closed:
+    if options.exact_thread:
+        forwarded += ["--exact-thread"]
+    elif options.skip_closed:
         forwarded += ["--skip-closed"]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
@@ -4636,7 +4655,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
     parsed = outcome.header
-    if parsed.outcome == "absent" and not options.skip_closed:
+    if parsed.outcome == "absent" and (options.exact_thread or not options.skip_closed):
         return Result("failed", f"ssh {host}: unexpected ABSENT result")
     detail = parsed.detail
     if parsed.payload:
@@ -4858,6 +4877,8 @@ def parse(argv: list[str]) -> Options:
                             help="require a current staff row of this kind at the fixed staff ID in --to")
     _ = parser.add_argument("--urgent", action="store_true", help="send now through a Claude review hold")
     _ = parser.add_argument("--skip-closed", action="store_true", help="return CLOSED for a closed Codex worker or ABSENT for a confirmed missing Codex thread")
+    _ = parser.add_argument("--exact-thread", action="store_true",
+                            help="deliver only to the named Codex thread without forwarding to its holder")
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
@@ -5035,9 +5056,11 @@ def parse(argv: list[str]) -> Options:
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
                       review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True,
-                      skip_closed=get["skip_closed"] is True, user_asked=get["user_asked"] is True)
-    if options.skip_closed and (not to.startswith("codex:") or not isinstance(selection, RosterLookup)):
-        parser.error("--skip-closed needs a codex: thread address")
+                      skip_closed=get["skip_closed"] is True or get["exact_thread"] is True,
+                      exact_thread=get["exact_thread"] is True, user_asked=get["user_asked"] is True)
+    if options.skip_closed and (not to.startswith("codex:") or not to[6:] or not isinstance(selection, RosterLookup)):
+        flag = "--exact-thread" if options.exact_thread else "--skip-closed"
+        parser.error(f"{flag} needs a codex: thread address")
     if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -5404,6 +5427,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     raw_socket = not fixed and target.startswith("uds:")
     if isinstance(options.selection, FixedStaffLookup):
         member = options.selection.member(membership)
+    elif options.exact_thread:
+        member = membership.by_current_session(target[6:]) or NoStaffRecipient()
     elif raw_socket or native and not forwarded_conversation:
         member = NoStaffRecipient()
     else:
@@ -5431,7 +5456,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         try:
             selected = options.selection if isinstance(options.selection, FixedStaffLookup) else target
             route = resolve_recipient(selected, options.scope, observed, membership=membership, records=running,
-                                      skip_closed=options.skip_closed)
+                                      skip_closed=options.skip_closed, exact_thread=options.exact_thread)
         except RecipientNameMissing as error:
             from scripts.message import failed_lookup
 
@@ -5596,7 +5621,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         if isinstance(route, RecipientLookupFailed):
             from scripts.message import failed_lookup
 
-            failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
+            if not options.exact_thread:
+                failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
             result = Result("failed", route.reason)
         elif isinstance(route, RemoteDelivery):
             forwarded = options._replace(selection=ForwardedConversation(route.address)) if route.selected_conversation else options
@@ -5629,7 +5655,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             review_text = agent_text(transport_message) if transport_message.review_batch and not batch_only else ""
             result = deliver_worker_text(route.row, membership, agent_text(worker_message),
                                          sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                         review_text=review_text, allow_holder_fallback=not batch_only,
+                                         review_text=review_text, allow_holder_fallback=not (batch_only or options.exact_thread),
                                          skip_closed=options.skip_closed)
         else:
             claude_started = time.monotonic()
