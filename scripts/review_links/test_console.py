@@ -4,7 +4,6 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import replace
-import subprocess
 import threading
 import json
 import os
@@ -24,11 +23,11 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
+from scripts.review_links.browser_test_support import firefox_probe_results, load_firefox
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
     review_submissions,
 )
-from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 class ConsoleMarkup(HTMLParser):
@@ -184,7 +183,7 @@ class ConsoleTests(unittest.TestCase):
  } catch(error) {failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
-        self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
+        self.assertEqual(firefox_probe_results(self, source.replace(b"</body>", probe + b"</body>")), [[]])
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         output = self.root / "snapshots/aws"
@@ -708,17 +707,12 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+    with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            profile = Path(temporary) / 'profile'
-            profile.mkdir()
-            _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
-            result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                     '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
-                                     f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
-                                    capture_output=True, text=True, timeout=40)
+            result = load_firefox(case, f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept',
+                                  complete, size=(width, 800), dark=True, timeout=40)
             case.assertEqual(result.returncode, 0, result.stderr)
         finally:
             server.shutdown()

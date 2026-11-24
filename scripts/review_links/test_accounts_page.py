@@ -337,7 +337,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_page_marks_old_mac_token_metadata_stale(self) -> None:
         notes = self.review_root.parent / "agents"
@@ -493,7 +493,7 @@ window.fetch=(url,options)=>options?.method==='POST'
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         page = source.replace("</head>", setup + "</head>").replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_board_draws_the_table_and_problems_without_the_upcoming_list(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
@@ -900,7 +900,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
         markup = accounts_page.board(sort_reading())
@@ -1060,7 +1060,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_model_counts_show_session_names_on_hover_and_focus(self) -> None:
@@ -1143,7 +1143,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_models_table_sorts_and_previews_and_saves_a_model_color(self) -> None:
@@ -1297,7 +1297,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_each_sort_keeps_the_next_cell_with_its_role_row(self) -> None:
@@ -1372,7 +1372,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
@@ -1397,7 +1397,7 @@ try{
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 </script>'''.replace("EXPECTED_COLUMN", json.dumps("left" if saved == "left" and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_producer_rows_follow_existing_roles_and_show_details_once(self) -> None:
         rows = tuple(replace(status_row(label), tool=tool, roles=("producers", role), selected_roles=(role,),
@@ -1639,7 +1639,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>' + boards + probe + '</body></html>').encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
     def test_clear_removes_only_the_first_group_entry_and_refuses_an_empty_group(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1691,7 +1691,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         probe = MENU_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(initial).replace("</", "<\\/"))
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
     def test_page_reads_stored_status_and_holds_the_refresh_root(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
@@ -1829,7 +1829,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         page = markup.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
         for browser in WINDOW_BROWSERS:
             with self.subTest(browser=browser):
-                self.assertEqual(window_probe_results({"/console/accounts.html": page}, "/console/accounts.html", browser),
+                self.assertEqual(window_probe_results(self, {"/console/accounts.html": page}, "/console/accounts.html", browser),
                                  [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
@@ -2132,7 +2132,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
 
 class ConsoleThemeTests(unittest.TestCase):

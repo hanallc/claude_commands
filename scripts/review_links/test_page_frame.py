@@ -6,26 +6,148 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import page_frame, review_submissions, serve
-from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
+from scripts.review_links.browser_test_support import (
+    STATUS_PAGES, Firefox, ModuleFirefox, firefox_probe_results, load_firefox, status_configuration,
+)
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 STICKY_ACTIONS = b'position:sticky;top:var(--page-actions-space);'
 PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
                             current_session=staff.StaffId("session-owner"))
+
+
+@unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+class FirefoxTestSupportTests(unittest.TestCase):
+    def test_reaper_removes_firefox_after_the_test_process_dies(self) -> None:
+        script = """
+from threading import Event
+from scripts.review_links.browser_test_support import ModuleFirefox
+
+with ModuleFirefox().page("about:blank", 800, 600) as browser:
+    _ = browser.command("Marionette:SetContext", value="chrome")
+    print(browser.script("return Services.appinfo.processID;"), flush=True)
+    print(browser.log.parent, flush=True)
+    _ = Event().wait(30)
+"""
+        with tempfile.TemporaryDirectory() as run_tmp:
+            for stop_group in (False, True):
+                with self.subTest(stop_group=stop_group), subprocess.Popen(
+                    [sys.executable, "-c", script], cwd=SCRIPTS.parent, start_new_session=True,
+                    env={**os.environ, "TMPDIR": run_tmp}, stdout=subprocess.PIPE, text=True,
+                ) as child:
+                    assert child.stdout is not None
+                    output = cast(TextIO, child.stdout)
+                    try:
+                        pid = int(output.readline())
+                        root = Path(output.readline().strip())
+                        self.assertEqual(root.parent, Path(run_tmp))
+                        self.assertTrue((root / "profile").is_dir())
+                        if stop_group:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        else:
+                            child.kill()
+                        # The reaper closes the inherited output pipe when cleanup finishes.
+                        _ = child.communicate(timeout=10)
+                        self.assertEqual(child.returncode, -signal.SIGKILL)
+                        self.assertFalse(root.exists())
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                    finally:
+                        child.kill()
+
+    def test_firefox_closes_probe_windows_and_clears_site_state(self) -> None:
+        module = ModuleFirefox()
+        self.addCleanup(module.close)
+        with module.page("about:blank", 800, 600) as first:
+            self.assertEqual(self.site_state(first, write=True), [1, 1.5])
+            for kind in ("window", "tab"):
+                _ = first.command("WebDriver:NewWindow", type=kind, focus=True)
+            self.assertEqual(len(cast(list[str], first.command("WebDriver:GetWindowHandles"))), 4)
+        with module.page("about:blank", 800, 600) as second:
+            self.assertIs(second, first)
+            self.assertEqual(len(cast(list[str], second.command("WebDriver:GetWindowHandles"))), 2)
+            self.assertEqual(self.site_state(second), [0, None])
+
+    def site_state(self, browser: Firefox, *, write: bool = False) -> object:
+        _ = browser.command("Marionette:SetContext", value="chrome")
+        try:
+            return browser.script("""
+const [write, done] = arguments;
+const site = "https://firefox-probe.example/";
+const name = "firefox-probe-zoom";
+const principal = Services.scriptSecurityManager.createContentPrincipal(Services.io.newURI(site), {});
+const prefs = Cc["@mozilla.org/content-pref/service;1"].getService(Ci.nsIContentPrefService2);
+const read = () => {
+    let zoom = null;
+    prefs.getByDomainAndName(site, name, null, {
+        handleResult: result => { zoom = result.value; },
+        handleCompletion: () => done([Services.perms.testPermissionFromPrincipal(principal, "geo"), zoom]),
+    });
+};
+if (write) {
+    Services.perms.addFromPrincipal(principal, "geo", Services.perms.ALLOW_ACTION);
+    prefs.set(site, name, 1.5, null, {handleCompletion: read});
+} else {
+    read();
+}
+""", write, asynchronous=True)
+        finally:
+            _ = browser.command("Marionette:SetContext", value="content")
+
+    def browser_pid(self, browser: Firefox) -> int:
+        _ = browser.command("Marionette:SetContext", value="chrome")
+        pid = cast(int, browser.script("return Services.appinfo.processID;"))
+        _ = browser.command("Marionette:SetContext", value="content")
+        return pid
+
+    def test_firefox_detects_a_crash_during_the_result_wait(self) -> None:
+        module = ModuleFirefox()
+        self.addCleanup(module.close)
+        with module.page("about:blank", 800, 600) as first:
+            pid = self.browser_pid(first)
+        start = time.monotonic()
+        with self.assertRaisesRegex(ConnectionError, "Firefox exited during the probe"):
+            with module.page("about:blank", 800, 600) as browser:
+                os.kill(pid, signal.SIGKILL)
+                browser.wait_for_result(threading.Event())
+        self.assertLess(time.monotonic() - start, 3)
+        with module.page("about:blank", 800, 600) as second:
+            self.assertIsNot(second, first)
+
+    def test_firefox_retires_a_browser_that_hangs_during_cleanup(self) -> None:
+        module = ModuleFirefox()
+        self.addCleanup(module.close)
+        with module.page("about:blank", 800, 600) as first:
+            pid = self.browser_pid(first)
+        stopped = False
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            with module.page("about:blank", 800, 600, timeout=2):
+                os.kill(pid, signal.SIGSTOP)
+                stopped = True
+        self.assertTrue(stopped)
+        self.assertLess(time.monotonic() - start, 3)
+        self.assertTrue(first.closed)
+        with module.page("about:blank", 800, 600) as second:
+            self.assertIsNot(second, first)
+
 
 
 class PageStatusTests(unittest.TestCase):
@@ -207,7 +329,7 @@ class PageStatusTests(unittest.TestCase):
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''.replace(b'MAIN_PAGE', reference)
-        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, page.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner under a sticky status.")
     def test_late_or_failed_status_never_covers_the_owner(self) -> None:
@@ -286,7 +408,7 @@ class PageStatusTests(unittest.TestCase):
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
     def test_aws_region_filter_sticks_below_the_action_area(self) -> None:
@@ -324,7 +446,7 @@ class PageStatusTests(unittest.TestCase):
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
     def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
@@ -342,7 +464,7 @@ class PageStatusTests(unittest.TestCase):
         still = markup.replace(b'<head>', b'<head><script>window.fetch=()=>new Promise(()=>{});</script>', 1)
         for width in (1440, 320):
             with self.subTest(width=width):
-                self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(main_heading(still), width, 800),
+                self.assertTrue(firefox_screenshot(self, still, width, 800) == firefox_screenshot(self, main_heading(still), width, 800),
                                 "At scroll zero the paused page must match the page without the sticky action area.")
         probe = b'''<script>
 (async()=>{
@@ -371,7 +493,7 @@ class PageStatusTests(unittest.TestCase):
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -574,18 +696,13 @@ def main_heading(page: bytes) -> bytes:
     return page.replace(STICKY_ACTIONS, b'', 1)
 
 
-def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
-    """Load one page in a headless Firefox window and return its PNG."""
+def firefox_screenshot(case: unittest.TestCase, page: bytes, width: int, height: int) -> bytes:
+    """Load one page in Firefox and return its PNG."""
     with tempfile.TemporaryDirectory(prefix="page-frame-shot-") as temporary:
         root = Path(temporary)
-        (root / "profile").mkdir()
         document = root / "page.html"
         _ = document.write_bytes(page)
-        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
-                              "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
-                              document.as_uri()],
-                             capture_output=True, text=True, timeout=45,
-                             env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
+        run = load_firefox(case, document.as_uri(), size=(width, height), screenshot=root / "page.png")
         if run.returncode:
             raise AssertionError(run.stderr)
         return (root / "page.png").read_bytes()
@@ -739,7 +856,7 @@ async function report(){await realFetch('/results',{method:'POST',body:JSON.stri
 '''
 
 
-def window_probe_results(documents: dict[str, bytes], start: str, browser: str) -> list[list[str]]:
+def window_probe_results(case: unittest.TestCase, documents: dict[str, bytes], start: str, browser: str) -> list[list[str]]:
     """Serve the documents, show the start path in a 1100 x 700 frame and return the failure lists of the probe."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -779,21 +896,21 @@ def window_probe_results(documents: dict[str, bytes], start: str, browser: str) 
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with tempfile.TemporaryDirectory(prefix='page-window-') as temporary, \
-            ThreadingHTTPServer(('127.0.0.1', 0), WindowProbe) as server:
+    with ThreadingHTTPServer(('127.0.0.1', 0), WindowProbe) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
         thread.start()
         url = f'http://127.0.0.1:{server.server_port}/'
         try:
-            # Each browser takes its screenshot after the load event, and /complete holds that event for the results.
-            profile, shot = Path(temporary) / 'profile', Path(temporary) / 'page.png'
-            profile.mkdir()
-            command = (['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run',
-                        f'--user-data-dir={profile}', '--window-size=1440,900', f'--screenshot={shot}', url]
-                       if browser == 'chrome' else
-                       ['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                        '--window-size', '1440,900', '--screenshot', str(shot), url])
-            done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            if browser == 'firefox':
+                done = load_firefox(case, url, complete, size=(1440, 900), timeout=60)
+            else:
+                # The /complete response holds the load event until the probe reports.
+                with tempfile.TemporaryDirectory(prefix='page-window-') as temporary:
+                    profile, shot = Path(temporary) / 'profile', Path(temporary) / 'page.png'
+                    profile.mkdir()
+                    command = ['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run',
+                               f'--user-data-dir={profile}', '--window-size=1440,900', f'--screenshot={shot}', url]
+                    done = subprocess.run(command, capture_output=True, text=True, timeout=60)
             if done.returncode or not complete.is_set():
                 raise AssertionError(f'{browser} did not report the window probe: {done.stderr}')
         finally:
@@ -834,7 +951,7 @@ class PageWindowTests(unittest.TestCase):
             page = window_page(probe, actions, before_title, after_title)
         for browser in WINDOW_BROWSERS:
             with self.subTest(browser=browser):
-                self.assertEqual(window_probe_results({'/fixture/page.html': page, '/fixture/picture.svg': PICTURE},
+                self.assertEqual(window_probe_results(self, {'/fixture/page.html': page, '/fixture/picture.svg': PICTURE},
                                                       '/fixture/page.html', browser), [[]])
 
     def test_new_item_opens_above_a_picture_and_its_screenshot_shows_the_picture(self) -> None:

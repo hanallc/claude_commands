@@ -5,8 +5,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import shutil
-import subprocess
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast, override
@@ -20,6 +18,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
+from scripts.review_links.firefox_test_support import load_firefox
 from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
 from scripts.review_links import question_record
 
@@ -375,11 +374,8 @@ class ReviewRepairsTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever,daemon=True)
             thread.start()
             try:
-                with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
-                        '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
-                        timeout=probe_timeout+30)
+                done = load_firefox(self, f'http://127.0.0.1:{server.server_port}' + place,
+                                    complete, size=(width, 1100), timeout=probe_timeout + 30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()

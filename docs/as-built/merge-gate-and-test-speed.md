@@ -1176,6 +1176,17 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 
 **Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
+**Shared Firefox for browser tests** (`scripts/review_links/firefox_test_support.py`).
+Each test module starts Firefox on its first probe.
+Marionette closes the probe windows and tabs.
+It clears the profile data before it opens the next tab with the requested viewport.
+The page still posts its result to the fixture server.
+A separate process stops Firefox and removes its profile when the test process closes its pipe or exits.
+One deadline covers browser startup, navigation, the probe result, and tab cleanup.
+The fixture permits one restart after a browser failure.
+The paused badge test captures PNGs through Marionette.
+The page capture test still uses the production capture path.
+
 ### Wait and sync overrides
 
 | Override | File | Production default | How tests use it |
