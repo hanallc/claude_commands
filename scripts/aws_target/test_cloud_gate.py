@@ -49,7 +49,7 @@ from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import GatePlacementIncomplete
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
@@ -1318,6 +1318,26 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(launches, ['us-east-2', 'us-east-2', 'us-west-2'])
         self.assertIn('Cloud gate skips us-east-2:', output.getvalue())
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].region, 'us-west-2')
+
+    def test_connect_failure_after_an_uncertain_launch_keeps_the_first_token(self) -> None:
+        regional = ledger.rows(self.deployment, 'regions')[0]
+        self.deployment['regions'] = [{**regional, 'region': region} for region in ('us-east-2', 'us-west-2')]
+        self.fake.refusals = ['An error occurred (InternalFailure)', 'EndpointConnectionError']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        first = cloud_gate.read(self.folder / 'launch.json')
+        self.assertEqual(first['region'], 'us-east-2')
+        self.assertEqual(self.fake.launches, [first['arguments']] * 2)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+        self.fake.refusals = ['InsufficientInstanceCapacity']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json'), first)
+        self.assertEqual(self.fake.launches, [first['arguments']] * 3)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual(self.fake.launches, [first['arguments']] * 4)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
 
     def test_unreachable_last_region_still_falls_back(self) -> None:
         def outage(arguments: list[str]) -> bool:
@@ -2994,6 +3014,66 @@ class GateDispatchJournalTests(unittest.TestCase):
                                       else placement.DispatchPathSettled)
 
 
+    def dispatch_fixture(self, root: Path) -> cloud_gate.AssignedCloudGate:
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        binding = ledger.GateDispatchBinding(claim, root / 'queue' / 'claim.json', root / 'aws')
+        dispatch = cloud_gate.AssignedCloudGate(binding, placement.ClaimHolderIdentity('host', 1, '1'))
+        dispatch.journal.begin(binding, dispatch.holder)
+        return dispatch
+
+    def test_recovery_releases_a_booking_saved_before_worker_identity(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dispatch = self.dispatch_fixture(root)
+            book = ledger.CostLedger(dispatch.binding.directory)
+            folder = root / 'worker'
+            dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
+            with book.transaction() as state:
+                state.gate_reservations.append(ledger.GateReservation(folder.name, 1, 600, Decimal(1), Decimal(1)))
+
+            self.assertIsInstance(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder),
+                                  placement.DispatchPathPending)
+            self.assertIsInstance(book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+            cloud_gate.save(folder / 'request.json', {'attempt': folder.name})
+            self.assertEqual(dispatch.journal.settle(dispatch.binding.claim, dispatch.holder), 'no launch')
+            self.assertIsInstance(book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+
+    def test_worker_uses_the_ledger_named_by_the_queue(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            install_aws_fixture_settings(root)
+            dispatch = self.dispatch_fixture(root)
+            folder = root / 'worker'
+            dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
+            command = ['cloud_gate.py', '--worker', str(folder), '--sidecar', str(folder / 'progress'),
+                       '--placement-journal', str(dispatch.journal.path), '--settings', str(root / 'aws_target.conf')]
+
+            def execute(registered: Path, worker: Callable[[], cloud_gate.GateWorker]) -> int:
+                self.assertEqual(registered, folder)
+                self.assertEqual(worker().book.directory, dispatch.binding.directory)
+                return 0
+
+            with (mock.patch.dict(os.environ, {'CONF_DIR': str(root)}),
+                  mock.patch.object(cloud_gate, 'execute_gate_worker', side_effect=execute) as execute_worker):
+                with mock.patch.object(sys, 'argv', [*command, '--directory', str(root / 'different-ledger')]):
+                    self.assertEqual(cloud_gate.main(), 0)
+                    execute_worker.assert_not_called()
+                with mock.patch.object(sys, 'argv', [*command, '--directory', str(dispatch.binding.directory)]):
+                    self.assertEqual(cloud_gate.main(), 0)
+                    execute_worker.assert_called_once()
+
+    def test_a_saved_closure_requires_a_new_directory_sync(self) -> None:
+        with TemporaryDirectory() as directory:
+            dispatch = self.dispatch_fixture(Path(directory))
+            journal = dispatch.journal
+            with mock.patch.object(atomic_file, 'sync_folder', side_effect=OSError('fixture directory sync failed')):
+                self.assertIsInstance(journal.settle(dispatch.binding.claim, dispatch.holder), placement.DispatchPathPending)
+            self.assertEqual(journal.read().state, 'no launch')
+
+            with mock.patch.object(ledger, 'sync_folder', wraps=atomic_file.sync_folder) as sync:
+                self.assertEqual(journal.settle(dispatch.binding.claim, dispatch.holder), 'no launch')
+                sync.assert_called_once_with(journal.path.parent)
+
     def test_a_late_worker_cannot_start_after_local_closure(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3049,6 +3129,44 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
+
+    def test_same_request_waits_for_the_earlier_dispatch_to_settle(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        holder = placement.ClaimHolderIdentity('host', 1, '1')
+        workers: list[Path] = []
+
+        def dispatch_for(attempt: str) -> cloud_gate.AssignedCloudGate:
+            claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, attempt, 'episode', attempt)
+            binding = ledger.GateDispatchBinding(claim, self.root / f'{attempt}.json', self.state)
+            dispatch = cloud_gate.AssignedCloudGate(binding, holder)
+            dispatch.journal.begin(binding, holder)
+            return dispatch
+
+        def service(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            workers.append(folder)
+            cloud_gate.save(folder / 'launch.json', {'arguments': {'ClientToken': folder.name}})
+            return 0
+
+        def run(dispatch: cloud_gate.AssignedCloudGate) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+            return cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
+                                  module_time_limit_s=1800, dispatch=dispatch, service=service)
+
+        earlier = dispatch_for('earlier')
+        self.assertIsInstance(run(earlier), cloud_gate.LocalFallback)
+        first, = workers
+        self.assertEqual(run(dispatch_for('while-current')),
+                         cloud_gate.LocalFallback('The previous AWS dispatch for this gate remains current'))
+        self.assertEqual(workers, [first])
+
+        book = ledger.CostLedger(self.state)
+        with book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(first.name, 1, 600, Decimal(0), Decimal(0),
+                                                                  state=ledger.GateAbsent(2)))
+        self.assertEqual(earlier.journal.settle(earlier.binding.claim, holder), 'no launch')
+        self.assertIsInstance(run(dispatch_for('after-closure')), cloud_gate.LocalFallback)
+        self.assertEqual(len(workers), 2)
+        self.assertNotEqual(workers[0], workers[1])
 
     def test_old_checkout_modes_reach_the_box(self) -> None:
         runner = self.repo / 'scripts/production/gate.py'

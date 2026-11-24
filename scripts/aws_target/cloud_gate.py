@@ -749,7 +749,8 @@ class GateWorker:
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         unreachable: set[str] = set()
         for offset in range(index, stop):
-            if launch.get('arguments') and offset == index:
+            earlier_call_may_have_launched = bool(launch.get('arguments')) and offset == index
+            if earlier_call_may_have_launched:
                 arguments = ledger.mapping(launch['arguments'])
                 self.box_region = str(launch.get('region', self.api.region))
                 size = ledger.text(arguments, 'InstanceType')
@@ -833,8 +834,11 @@ class GateWorker:
                         self.record_launch(request, size, zone, 'launched')
                         break
                     except AwsUnavailable as error:
-                        self.record_launch(request, size, zone, 'refused', str(error))
-                        if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
+                        reason = str(error)
+                        if not (not_sent(reason) or definite_refusal(reason) or capacity_error(reason)):
+                            earlier_call_may_have_launched = True
+                        self.record_launch(request, size, zone, 'refused', reason)
+                        if not aws_down(reason) or retry + 1 == settings().whole('launch_reply_tries'):
                             raise
                     except subprocess.SubprocessError as error:
                         self.record_launch(request, size, zone, 'refused',
@@ -843,7 +847,9 @@ class GateWorker:
                 else:
                     raise AssertionError('The launch retry count must be positive')
             except AwsUnavailable as error:
-                # A saved request keeps its token and bytes after an uncertain reply.
+                # A later refusal cannot settle an earlier uncertain call.
+                if earlier_call_may_have_launched:
+                    raise
                 if capacity_error(str(error)):
                     launch = {**saved_order, 'variant': offset + 1}
                     save(path, launch)
@@ -1493,17 +1499,26 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         dispatch = attempt.dispatch
-        current = (root / f'{dispatch.binding.claim.claim_id}.json' if isinstance(dispatch, AssignedCloudGate)
-                   else root / 'current.json')
-        if not current.exists() and not deployment_path.exists():
+        current = root / 'current.json'
+        if not deployment_path.exists() and (isinstance(dispatch, AssignedCloudGate) or not current.exists()):
             return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
         require_selected_tree(repo, tree, selected)
-        previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.wire, 'full': full, 'module_time_limit_s': module_time_limit_s,
                                       'modules': list(selected.paths) if isinstance(selected, gate.TreeSelection) else 'all',
                                       'selection_tree': selected.tree if isinstance(selected, gate.TreeSelection) else 'all'}
+        if isinstance(dispatch, AssignedCloudGate):
+            request_key = sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            current = root / f'current-{request_key}.json'
+        previous = read(current) if current.exists() else {}
+        if isinstance(dispatch, AssignedCloudGate) and previous:
+            prior = cast(ledger.GateDispatchBinding, snapshot_codec.parse_snapshot_value(
+                previous['dispatch'], ledger.GateDispatchBinding))
+            if prior.claim != dispatch.binding.claim:
+                if not ledger.GateDispatchJournal(prior.journal).previous_dispatch_closed(prior):
+                    return LocalFallback('The previous AWS dispatch for this gate remains current')
+                previous = {}
         if previous.get('mode') == mode.value:
             previous['mode'] = mode.wire
         same_request = all(previous.get(key) == value for key, value in identity.items())
@@ -1586,6 +1601,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
                     'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
                     'box_retry_limit': box_retry_limit, 'last_box_failure': last_box_failure}
+                if isinstance(dispatch, AssignedCloudGate):
+                    state['dispatch'] = snapshot_codec.snapshot_value(dispatch.binding)
                 save(current, state)
                 result_path = folder / 'outcome.json'
                 result = read(result_path) if result_path.exists() else {}

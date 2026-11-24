@@ -21,7 +21,7 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, sync_folder, write_text_atomic
 from scripts.lib import conf
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.build_queue import placement, snapshot_codec
@@ -244,6 +244,7 @@ class GateDispatchJournal:
             saved = self.require_open(binding.claim, holder)
             if saved.directory != binding.directory:
                 raise LedgerUnavailable('The AWS journal names a different accounting directory')
+            sync_folder(self.path.parent)
 
     def require_open(self, claim: placement.ProviderClaimReference,
                      holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
@@ -265,6 +266,15 @@ class GateDispatchJournal:
             if folder not in record.folders:
                 write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
 
+    def previous_dispatch_closed(self, binding: GateDispatchBinding) -> bool:
+        record = self.read()
+        if (record.claim, record.directory) != (binding.claim, binding.directory):
+            raise LedgerUnavailable('The saved AWS request names a different dispatch')
+        if record.state == "prelaunch":
+            return False
+        sync_folder(self.path.parent)
+        return True
+
     def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> GateDispatchSettlement | placement.DispatchPathPending:
         """Use only local evidence to close a dispatch and fence its workers."""
         try:
@@ -275,6 +285,7 @@ class GateDispatchJournal:
                 if (record.claim, record.holder) != (claim, holder):
                     raise LedgerUnavailable('The AWS journal names a different claim or caller')
                 if record.state != "prelaunch":
+                    sync_folder(self.path.parent)
                     return record.state
                 state: GateDispatchSettlement = "no launch"
                 if record.folders:
@@ -283,12 +294,17 @@ class GateDispatchJournal:
                                     if book.path.exists() else {})
                     for folder in record.folders:
                         reservation = reservations.get(folder.name)
-                        if reservation is not None and gate_is_open(reservation):
-                            return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
                         try:
                             launch = mapping(cast(object, json.loads((folder / 'launch.json').read_text())))
                         except FileNotFoundError:
                             launch = {}
+                        if reservation is not None and gate_is_open(reservation):
+                            if not isinstance(reservation.state, GateLaunchPending) or 'arguments' in launch or 'instance' in launch:
+                                return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
+                            request = mapping(cast(object, json.loads((folder / 'request.json').read_text())))
+                            if request.get('attempt') != folder.name:
+                                raise LedgerUnavailable('The AWS service folder names a different attempt')
+                            book.resolve_gate(folder.name, GateAbsent(int(time.time())))
                         if reservation is not None and isinstance(reservation.state, GateTerminated):
                             state = "launch ended"
                         if 'instance' in launch:
