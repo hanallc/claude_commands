@@ -182,13 +182,17 @@ The Cargo seed is absent. The first test build of a new Hana worktree takes abou
 ## Numbered copies and removal
 
 Use a numbered copy for tests and proofs that need a source copy.
-Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 The director creates a model worktree for a trial project.
 Workers use `scratch.py new --worker` only for downloads and other files unrelated to builds, tests, gates, or source copies.
 
-`build_slots.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
+`build_copies.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
 
-Copy `1` has sibling files `1.lock` and `1.lease.json`. The lease records the holder, source, commit, and checkout and Git directory identities. The kernel lock alone determines when the copy is free. The owner passes the lock descriptor to children and keeps the lease through use. The lock remains held until the last holder closes its descriptor.
+Copy `1` has sibling files `1.lock` and `1.lease.json`.
+The lease records the checkout path, holder, source, commit, and directory identities.
+The kernel lock determines when the copy is free.
+The owner passes the lock descriptor to children.
+The last holder releases the lock when it closes the descriptor.
 
 The Nix environment check uses the lease to verify the numbered copy's `.envrc` against the recorded commit in a trusted source. Style lint passes its copy lease to the verifier. Legacy temporary cleanup excludes these folders and their lock and lease files.
 
@@ -196,7 +200,6 @@ The Hana AWS guest fetches verified bundles into its main checkout at `~/rust/ha
 The command uses its assigned copy number under `~/build/hana/aws-hana`.
 Each copy keeps its Cargo output under `target`.
 The guest keeps the shell cache under `~/build/hana/main/shells` and holds the main output lock during use.
-No code makes or uses the old repository slot folders under `/build/slot` or `~/build/slot`.
 
 `lint/sweep.py --unused-folders` uses each folder's `.lint-sweep-used` stamp. The cutoff is two days. The sweep checks the stamp again under the folder lock. It keeps unstamped folders, folders in use, and CI folders. It lists eligible folders and keeps unit and repository parents. The nightly gate invokes the sweep.
 

@@ -18,7 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_view, queue_evidence
-from scripts.build_queue.slot_wait import recorded_step
+from scripts.build_queue.queue_wait import recorded_step
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_wire import CloudGroup

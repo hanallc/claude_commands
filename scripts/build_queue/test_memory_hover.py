@@ -2395,7 +2395,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
-    def test_repository_slot_wait_has_no_memory_group(self) -> None:
+    def test_repository_copy_wait_has_no_memory_group(self) -> None:
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
                 "waiters": [{"kind": "repository-slot", "name": "gate", "detail": "widget", "need": 0,
                              "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"},

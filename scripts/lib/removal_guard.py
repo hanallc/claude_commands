@@ -28,13 +28,14 @@ from typing import Protocol, cast, final
 
 from scripts.buildlog.repository import repo_name
 from scripts.lib import conf
-from scripts.lib.build_folders import OWNER_MARKER
+from scripts.lib.build_folders import OWNER_MARKER, USER_REMOVAL_ROOTS
 from scripts.production import staff
 
 PATH_TEMPLATES_KEY = "removal.path_templates"
 CARGO_TAG = "CACHEDIR.TAG"
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-LEGACY_TOP = frozenset(("cargo", "slot", "paths", "claude", "hana-ci", "session"))
+LEGACY_TOP = frozenset(("cargo", "paths", "claude", "hana-ci", "session"))
+PROTECTED_TOP = LEGACY_TOP | USER_REMOVAL_ROOTS
 RESERVED_UNIT_NAMES = frozenset(("main", "ci"))
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
@@ -79,7 +80,7 @@ class Form(Enum):
     MAIN = ("<repo>", "main")
 
     def matches(self, parts: Sequence[str], names: KnownNames) -> bool:
-        if (len(parts) != len(self.value) or parts[0].casefold() in LEGACY_TOP
+        if (len(parts) != len(self.value) or parts[0].casefold() in PROTECTED_TOP
                 or not all(NAME.fullmatch(part) and ".." not in part for part in parts)):
             return False
         for token, part in zip(self.value, parts, strict=True):
@@ -231,6 +232,10 @@ class RemovalGuard:
     def checked_location(self, path: Path) -> tuple[Path, Form]:
         if not path.is_absolute() or ".." in path.parts:
             raise Refused(RefusalReason.OUTSIDE_ROOT, str(path))
+        if path.is_relative_to(self.root):
+            parts = path.relative_to(self.root).parts
+            if parts and parts[0].casefold() in USER_REMOVAL_ROOTS:
+                raise Refused(RefusalReason.OUTSIDE_ROOT, str(path))
         try:
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(self.root):

@@ -1757,7 +1757,7 @@ The bootstrap downloads the payload inside the main checkout.
 The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
 Systemd mounts that path as a bounded filesystem for each command.
 The runner stages the verified bundle in the main checkout's Git directory.
-`build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+`build_copies.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
 The maker rescues source edits before reset and retains Cargo output within the configured size limit.
 The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
 The shell cache lives at `~/build/hana/main/shells`.

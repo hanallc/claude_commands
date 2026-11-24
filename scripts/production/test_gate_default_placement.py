@@ -29,7 +29,7 @@ from scripts.buildlog import treekey
 from scripts.copies import copies
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folders, conf, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -65,7 +65,7 @@ def scaler_registry(root: Path) -> dict[str, str]:
 
 def inherited_admission(grant: wire.Assignment) -> first_step.FirstStepAdmission:
     assignment = grant.assignment
-    return first_step.FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since),
+    return first_step.FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since),
         first_step.InheritedGatePlacement(grant), Path('/fixture/assignment.json'))
 
 

@@ -33,7 +33,7 @@ from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import conf, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -91,7 +91,7 @@ class DirectGatePlacementTests(unittest.TestCase):
         assignment = replace(placed(target).assignment, owner=owner,
                              source_key=execution_identity.SourceKeyKnown(key))
         grant = admission_wire.Assignment(assignment)
-        position = SlotQueuePosition(assignment.episode, assignment.since)
+        position = CopyQueuePosition(assignment.episode, assignment.since)
         profile = admission_records.ProgramProfile("gate", str(source), str(source),
             admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
         constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
@@ -539,7 +539,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         @contextmanager
         def admit() -> Generator[first_step.FirstStepAdmission]:
             try:
-                position = SlotQueuePosition(assignment.episode, assignment.since)
+                position = CopyQueuePosition(assignment.episode, assignment.since)
                 yield first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request),
                                                    self.root / "assignment.json")
             finally:

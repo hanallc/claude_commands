@@ -17,7 +17,7 @@ from scripts.lib.helper_tree_test_support import copy_helpers
 from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
@@ -94,7 +94,7 @@ class DailySimplifyTests(NixFixture):
         registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
-        self.env.update(private_slot_config(self.root, repository="origin").environment)
+        self.env.update(private_copy_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
         _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
@@ -228,11 +228,11 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual((self.artifacts() / "diff").read_text().strip(), self.git("diff", self.first, self.tip))
         self.assertEqual(self.reviews()[0]["head"], self.tip)
         review = self.reviews()[0]
-        slot = Path(cast(str, review["cwd"]))
-        self.assertEqual(slot.parent.parent, self.root / "build/origin")
-        self.assertTrue(slot.name.isdecimal())
+        copy = Path(cast(str, review["cwd"]))
+        self.assertEqual(copy.parent.parent, self.root / "build/origin")
+        self.assertTrue(copy.name.isdecimal())
         self.assertTrue(review["inherited_lease"])
-        self.assertEqual(build_folders.build_folder_state(slot), "free")
+        self.assertEqual(build_folders.build_folder_state(copy), "free")
         self.assertEqual(self.git("rev-parse", "HEAD"), local_tip)
         self.assertEqual(self.refs()["refs/simplify/last"], self.tip)
 
@@ -295,7 +295,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual((call["head"], call["branch"], call["content"]), (self.tip, "", "origin tip\n"))
         clone = Path(cast(str, call["cwd"]))
         self.assertNotEqual(clone, self.work)
-        self.assertEqual(build_folders.build_folder_state(clone), "free", "The launcher must release its slot")
+        self.assertEqual(build_folders.build_folder_state(clone), "free", "The launcher must release its copy")
         self.assertEqual((self.work / "payload.txt").read_text(), "uncommitted unit work\n")
         rows = [cast(dict[str, object], json.loads(line)) for line in
                 (Path(self.env["USAGE_STATE_DIR"]) / "agents.jsonl").read_text().splitlines()]

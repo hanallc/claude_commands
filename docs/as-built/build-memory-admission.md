@@ -471,7 +471,7 @@ The "what" is the caller's own text when the request identity has a `what` field
 A CI row uses `hana CI` as the owner.
 A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
 So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
-`slot_wait.QueueRowName.owned` and `memory_feed.row_name_parts` use `row_text`, so the name and its parts agree.
+`queue_wait.QueueRowName.owned` and `memory_feed.row_name_parts` use `row_text`, so the name and its parts agree.
 An absolute repository path does not supply a project name.
 Matching and history retain the original step name.
 The queue omits a live unowned scope when its run has no reservation and keeps no memory.
@@ -664,7 +664,6 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
 The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
 Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
 The Mac resolves the repository before it takes the claim lock.
