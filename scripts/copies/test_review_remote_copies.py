@@ -391,6 +391,51 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertTrue(authority.is_file())
         self.assertEqual(payload.read_text(), "keep")
 
+    def test_receive_recovers_the_mirror_left_by_sigkill_after_staging(self) -> None:
+        original = self.mirror_record()
+        self.assertEqual(publish_mirror(original), 0)
+        tree = self.mirror
+        _ = (tree / "old-payload").write_text("old content")
+        authority = floor_claims.removal_authority_path(tree)
+        record = tree / floor_claims.MIRROR_RECORD
+        write_text_atomic(authority, record.read_text())
+        receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
+        rename = build_folders._rename_without_replacing  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_staging(directory: int, source: str, destination: str) -> None:
+            rename(directory, source, destination)
+            if source == tree.name:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        def interrupted_receive() -> int:
+            with mock.patch.object(build_folders, "_rename_without_replacing", side_effect=stop_after_staging):
+                return copies.mirror_run(receive)
+
+        with ForkChildren() as children:
+            answer = children.start(interrupted_receive).result()
+        self.assertEqual(answer.returncode, -signal.SIGKILL, answer.stderr)
+        self.assertFalse(tree.exists())
+        [staged] = [path for path in tree.parent.glob(".removing-*") if path.is_dir()]
+        status = staged.stat()
+        self.assertEqual((staged / "old-payload").read_text(), "old content")
+        self.assertEqual(build_folders.StagedRemoval.read(floor_claims.read_mirror_record(authority)),
+                         build_folders.StagedRemoval(staged.name, status.st_dev, status.st_ino))
+
+        with staged.with_suffix(".lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(copies.CopyError, "the staged mirror could not be removed"):
+                _ = copies.mirror_run(receive)
+            self.assertFalse(tree.exists())
+            self.assertTrue(authority.exists())
+
+        self.assertEqual(copies.mirror_run(receive), 0)
+        self.assertFalse(staged.exists())
+        self.assertFalse(staged.with_suffix(".lock").exists())
+        self.assertFalse(build_folders.lease_path(staged).exists())
+        self.assertFalse(authority.exists())
+        self.assertFalse((tree / "old-payload").exists())
+        self.assertEqual(floor_claims.read_mirror_record(record)["owner"], original.owner)
+
     def test_receive_refills_interrupted_removal_before_another_owner_uses_and_removes(self) -> None:
         for moment in ("payload", "record"):
             with self.subTest(moment=moment):
@@ -498,8 +543,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
         clear = copies.clear_mirror_content
         unlink = Path.unlink
 
-        def clear_content(path: Path) -> None:
-            clear(path)
+        def clear_content(path: Path, pending: dict[str, object]) -> None:
+            clear(path, pending)
             if stage == "clear":
                 raise InterruptedError("receive stopped")
 

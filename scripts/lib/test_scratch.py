@@ -832,6 +832,58 @@ scratch.remove_task_copy(Path(sys.argv[1]), sys.argv[2], time.time())
         self.assertFalse(lock.exists())
         self.assertFalse((source / ".git/worktrees" / path.name).exists())
 
+    def test_retry_clears_the_git_registration_left_by_sigkill_after_staging(self) -> None:
+        source, _ = self.copy_with_published_head("linked-source")
+        path = self.base / "linked"
+        self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+        registration = source / ".git/worktrees" / path.name
+        program = """import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+from scripts.lib import build_folders, scratch
+
+path = Path(sys.argv[1])
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == path.name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+    scratch.remove_folder(path)
+"""
+        answer = subprocess.run([sys.executable, "-c", program, str(path)],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(answer.returncode, -signal.SIGKILL, answer.stderr)
+        self.assertFalse(path.exists())
+        self.assertTrue(registration.is_dir())
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git(source, "worktree", "add", "-q", str(self.base / "branch-in-use"), "side")
+        mark = scratch.removal_mark(path)
+        self.assertTrue(mark.is_file())
+        [staged] = [entry for entry in path.parent.glob(".removing-*") if entry.is_dir()]
+        checks: list[Path] = []
+
+        def check_removal(*args: object, **_kwargs: object) -> object:
+            if args and args[0] == ["git", "--git-dir", str(source / ".git"), "worktree", "remove",
+                                    "--force", "--force", str(path)]:
+                with build_folders.folder_removal_lease(path, wait=False) as lease:
+                    self.assertIsInstance(lease, build_folders.RemovalLockHeld)
+                self.assertTrue(mark.is_file())
+                checks.append(path)
+            return cast(object, mock.DEFAULT)
+
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run, side_effect=check_removal):
+            self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertEqual(checks, [path])
+        self.assertFalse(staged.exists())
+        self.assertFalse(registration.exists())
+        self.assertFalse(mark.exists())
+        self.git(source, "worktree", "add", "-q", str(path), "side")
+
     def test_retry_keeps_a_new_commit_held_only_by_a_new_tag(self) -> None:
         for reference in ("new-work", "HEAD"):
             with self.subTest(reference=reference):

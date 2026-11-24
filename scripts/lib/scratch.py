@@ -1826,20 +1826,92 @@ def check_removal_work(path: Path, request: TaskRemoval | SelectedCopyRemoval | 
     return RemovalWorkSaved() if work.name == "SAVED" else KeptFolder(path, work.value)
 
 
+@dataclass(frozen=True)
+class WorktreeRemoval:
+    """Identify the Git registration of the source to remove."""
+
+    git_dir: Path
+    device: int
+    inode: int
+    run_cleanup: bool
+
+    @classmethod
+    def read(cls, fields: dict[str, object]) -> WorktreeRemoval | None:
+        if "worktree_removal" not in fields:
+            return None
+        value = fields["worktree_removal"]
+        if isinstance(value, dict):
+            saved = cast(dict[str, object], value)
+            name, device, inode, run_cleanup = (saved.get(key) for key in ("git_dir", "device", "inode", "run_cleanup"))
+            if isinstance(name, str) and type(device) is int and type(inode) is int and isinstance(run_cleanup, bool):
+                git_dir = Path(name)
+                if git_dir.is_absolute() and ".." not in git_dir.parts and git_dir.parent.name == "worktrees":
+                    return cls(git_dir, device, inode, run_cleanup)
+        raise ScratchError("invalid Git registration in the removal intent")
+
+    def fields(self) -> dict[str, object]:
+        return {"git_dir": str(self.git_dir), "device": self.device, "inode": self.inode,
+                "run_cleanup": self.run_cleanup}
+
+    def exists(self) -> bool:
+        try:
+            current = self.git_dir.lstat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (self.device, self.inode):
+            raise ScratchError(f"{self.git_dir}: the saved Git registration changed")
+        return True
+
+    def remove(self, path: Path, parent: int) -> None:
+        if not self.exists():
+            return
+        if not build_folder_lock.parent_current(path, parent) or os.path.lexists(path):
+            raise ScratchError(f"{path}: the original path is not free for Git registration cleanup")
+        common = self.git_dir.parent.parent
+        if self.run_cleanup:
+            run = cast(_RunSourceRemoval, cast(object, import_module("scripts.direct.remove_run_scratch")))
+            if not run.git(common, "remove", "--force", "--force", str(path)):
+                _ = run.git(common, "prune")
+        else:
+            _remove_worktree_registration(path, common)
+        if self.exists():
+            raise ScratchError(f"{path}: the Git registration could not be removed")
+
+
+def finish_worktree_removal(path: Path, registration: WorktreeRemoval, *, source_replaced: bool) -> None:
+    if not registration.exists():
+        return
+    if source_replaced:
+        raise ScratchError(f"{path}: previous copy needs Git registration cleanup before path reuse")
+    held = _held_removal_lock(path)
+    if held is not None and isinstance(held.lease, HeldFolderRemovalLease):
+        if not build_folder_lock.lock_current(path, held.lease.directory, held.lease.descriptor):
+            raise ScratchError(f"{path}: the source lease changed")
+        registration.remove(path, held.lease.directory)
+        return
+    with folder_removal_lease(path, wait=False, create=True, transient_lock=True) as lease:
+        if not isinstance(lease, HeldFolderRemovalLease):
+            raise ScratchError(f"{path}: the source lease is unavailable for Git registration cleanup")
+        registration.remove(path, lease.directory)
+
+
 def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: bool = False) -> None:
-    """Finish Cargo recovery before discarding the task's deletion intent."""
+    """Finish staged source, Git and Cargo cleanup before clearing the intent."""
     if not source_replaced and os.path.lexists(path):
         raise ScratchError(f"{path}: source still exists; removal completion refused")
     pending = copy_record.read_record(removal_mark(path))
     if isinstance(pending, copy_record.UnreadableRecord):
         raise ScratchError(pending.reason)
-    if isinstance(pending, copy_record.Registered) and "removal_stage" in pending.fields:
-        name = pending.fields.get("removal_stage")
-        device = pending.fields.get("copy_device")
-        inode = pending.fields.get("copy_inode")
-        if (not isinstance(name, str) or type(device) is not int or type(inode) is not int
-                or not build_folders.recover_staged_folder(path, name, device, inode)):
+    if isinstance(pending, copy_record.Registered):
+        try:
+            stage = build_folders.StagedRemoval.read(pending.fields)
+        except ValueError as error:
+            raise ScratchError(f"{path}: {error}") from error
+        if stage is not None and not stage.recover(path):
             raise ScratchError(f"{path}: the staged source could not be removed")
+        registration = WorktreeRemoval.read(pending.fields)
+        if registration is not None:
+            finish_worktree_removal(path, registration, source_replaced=source_replaced)
     if source_replaced:
         if cargo_removal_mark(path).exists():
             raise ScratchError(f"{path}: previous copy needs Cargo recovery before path reuse")
@@ -2086,13 +2158,18 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 return KeptFolder(path, "source identity changed before removal")
             if held is None or not isinstance(held.lease, build_folders.FreeFolderRemovalLease):
                 return KeptFolder(path, BUSY_REASON)
-            registration = git.checkout.common_dir if isinstance(git, GitDirectory) and (path / ".git").is_file() else None
+            registration = None
+            if isinstance(git, GitDirectory) and git.checkout.git_dir.parent == git.checkout.common_dir / "worktrees":
+                status = git.checkout.git_dir_status
+                registration = WorktreeRemoval(git.checkout.git_dir, status.st_dev, status.st_ino,
+                                               source_deletion is SourceDeletion.RUN)
+                fields["worktree_removal"] = registration.fields()
 
             def record_stage(staged: build_folders.CheckedRemovalTree) -> None:
                 if not build_folder_lock.parent_current(staged.path, staged.parent):
                     raise ScratchError(f"{path}: the source parent changed")
-                atomic_record(removal_mark(path), {**fields, "removal_stage": staged.path.name,
-                              "copy_device": staged.info.st_dev, "copy_inode": staged.info.st_ino})
+                stage = build_folders.StagedRemoval.from_tree(staged)
+                atomic_record(removal_mark(path), {**fields, **stage.fields()})
 
             def delete(staged: build_folders.CheckedRemovalTree) -> None:
                 if not build_folder_lock.parent_current(staged.path, staged.parent):
@@ -2107,15 +2184,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         remove(staged.path)
                     finally:
                         held.staged = None
-                if (prepare_staged is None and registration is not None
-                        and build_folder_lock.parent_current(path, staged.parent)
-                        and not os.path.lexists(path)):
-                    if source_deletion is SourceDeletion.RUN:
-                        run = cast(_RunSourceRemoval, cast(object, import_module("scripts.direct.remove_run_scratch")))
-                        if not run.git(registration, "remove", "--force", "--force", str(path)):
-                            _ = run.git(registration, "prune")
-                    else:
-                        _remove_worktree_registration(path, registration)
+                if registration is not None:
+                    registration.remove(path, staged.parent)
 
             expected = path.lstat()
             if removal_guard.identity(expected) != source:

@@ -1814,6 +1814,35 @@ class CheckedRemovalTree:
 RemovalTreeAction = Callable[[CheckedRemovalTree], None]
 
 
+@dataclass(frozen=True)
+class StagedRemoval:
+    """Identify a removal stage independently of the source path."""
+
+    name: str
+    device: int
+    inode: int
+
+    @classmethod
+    def from_tree(cls, tree: CheckedRemovalTree) -> StagedRemoval:
+        return cls(tree.path.name, tree.info.st_dev, tree.info.st_ino)
+
+    @classmethod
+    def read(cls, fields: Mapping[str, object]) -> StagedRemoval | None:
+        if "removal_stage" not in fields:
+            return None
+        name = fields.get("removal_stage")
+        device, inode = fields.get("copy_device"), fields.get("copy_inode")
+        if not isinstance(name, str) or type(device) is not int or type(inode) is not int:
+            raise ValueError("invalid removal stage")
+        return cls(name, device, inode)
+
+    def fields(self) -> dict[str, object]:
+        return {"removal_stage": self.name, "copy_device": self.device, "copy_inode": self.inode}
+
+    def recover(self, source: Path) -> bool:
+        return recover_staged_folder(source, self.name, self.device, self.inode)
+
+
 def _staging_identity(info: os.stat_result) -> dict[str, object]:
     return {"device": info.st_dev, "inode": info.st_ino}
 
@@ -2175,7 +2204,8 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
 @contextmanager
 def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True,
                          create: bool = False, root: Path | None = None,
-                         probe_fds: list[int] | None = None) -> Generator[FolderRemovalLease]:
+                         probe_fds: list[int] | None = None,
+                         transient_lock: bool = False) -> Generator[FolderRemovalLease]:
     """Hold the collector's locks and return the reservation for a folder."""
     metadata = _METADATA.fullmatch(path.name)
     folder = path.with_name(metadata[1]) if metadata else path
@@ -2185,7 +2215,8 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                 directory = stack.enter_context(build_folder_lock.folder_parent(
                     folder, root or folder.parent, create=create and root is not None))
                 try:
-                    lease = _hold_free_lease(folder, directory, stack, wait=wait, create=create, mark=create)
+                    lease = _hold_free_lease(folder, directory, stack, wait=wait, create=create,
+                                             mark=create and not transient_lock, transient_lock=transient_lock)
                 except BuildFolderParentChanged:
                     if attempt == 1:
                         raise
@@ -2193,6 +2224,8 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                     break
             else:
                 raise AssertionError("the lease attempt must resolve")
+            if isinstance(lease, HeldFolderRemovalLease) and lease.created:
+                _ = stack.callback(_unlink_transient_lock, lease)
             if probe_fds is not None:
                 probe_fds.append(directory)
                 if isinstance(lease, HeldFolderRemovalLease):
