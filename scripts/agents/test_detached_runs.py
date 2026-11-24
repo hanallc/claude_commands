@@ -651,6 +651,15 @@ class DetachedRunsTests(unittest.TestCase):
                     self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
                     self.assertEqual(completed, [f"cancelled-{status}"])
 
+    def test_reap_clears_delivered_completion_without_a_staff_owner(self) -> None:
+        delivery = "sent: private stopped result"
+        path = self.finished_run("unowned-stop", staff_id="", pid=DEAD_PID, exit_code=143,
+                                 stop_pass_requested=True, completion_pending=True, delivery=delivery)
+        with isolated_staff_file(self.root / "unavailable-staff.json", {}):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual((saved["exit_code"], saved["delivery"], saved["completion_pending"]), (143, delivery, False))
+
     def test_start_completes_cancelled_run_after_releasing_start_lock(self) -> None:
         self.set_pass("active", 0)
         settings = self.root / "config/detached_runs.conf"

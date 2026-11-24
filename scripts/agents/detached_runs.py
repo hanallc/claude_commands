@@ -1170,7 +1170,7 @@ def _result_pass_changed(record: RunRecord) -> bool:
 
 def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
     """Recheck the pass after the finished record becomes visible."""
-    if _result_pass_changed(record):
+    if not record["staff_id"] or _result_pass_changed(record):
         return CompletionReplay.HANDLED
     member = _run_owner(record, staff.local_snapshot())
     if isinstance(member, staff.StaffRow) and member.kind == "worker":
