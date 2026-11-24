@@ -691,6 +691,9 @@ try {
               const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
               const box = walk.closest('.card').getBoundingClientRect();
               const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
+              const keptDeadline = keptTable?.querySelector('.duration');
+              const deadlineRange = document.createRange();
+              if (keptDeadline) deadlineRange.selectNodeContents(keptDeadline);
               const scroll = walk.closest('.walk-scroll');
               const waitingName = chart(keys[4]).querySelector('.name');
               const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
@@ -700,6 +703,8 @@ try {
                 tight:walk.classList.contains('tight'),
                 keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
                   .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
+                keptDeadline:keptDeadline?.textContent,
+                keptDeadlineLines:deadlineRange.getClientRects().length,
                 walkOverflow:scroll.scrollWidth - scroll.clientWidth,
                 trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
@@ -737,6 +742,8 @@ try {
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
+              assert.equal(rows.keptDeadline, 'until 23:37');
+              if (width === 1440) assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
               if (width === 900) {
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);

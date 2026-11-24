@@ -357,7 +357,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
-.walk-table tr.held .duration { max-width: var(--duration); white-space: normal; }
 .walk-table .step { width: var(--step); min-width: var(--step); }
 .walk-table td.machine > * + * { margin-left: 10px; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
@@ -1988,7 +1987,8 @@ function renderWalk(d) {
       const unit = ownerText(w.unit);
       const tip = `held:${esc(w.key)}`, rowClass = `held${i === 0 ? " wait-first" : ""}`;
       const target = targetCell("", w.targets);
-      cells(String(w.position), {step:"", verify:""}, `until ${w.kept_until}`, null, target, null, tip, rowClass);
+      const deadline = w.kept_until.split(" ", 1)[0];
+      cells(String(w.position), {step:"", verify:""}, `until ${deadline}`, null, target, null, tip, rowClass);
       const labels = {unit, name: "", nameSuffix: ": kept place",
         repository: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
       rows.push(`<div class="wrow ${rowClass}" data-tip="${tip}">${rowLabel(labels)}</div>`);
@@ -2128,8 +2128,7 @@ function fitWalkDetails() {
     const tight = name === "step" && walk.classList.contains("tight");
     const widths = [...table.querySelectorAll(`tr > .${name}`)].map(cell => {
       context.font = canvasFont(cell);
-      const wraps = (tight && cell.closest("tr.wait")) || (name === "duration" && cell.closest("tr.held"));
-      const parts = wraps ? cell.textContent.split(/\s+/) : [cell.textContent];
+      const parts = tight && cell.closest("tr.wait") ? cell.textContent.split(/\s+/) : [cell.textContent];
       return Math.max(...parts.map(part => context.measureText(part).width)) + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
