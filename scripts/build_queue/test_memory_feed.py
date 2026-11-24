@@ -14,7 +14,8 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
 import shutil
@@ -26,8 +27,12 @@ import time
 import unittest
 from typing import Literal, cast, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
-from scripts.buildlog import charts, cost_actions, costs, machine_facts, parse
+from scripts.aws_target import config as aws_config, hana_result, ledger
+from scripts.aws_target.hana_generation import HanaHostGeneration
+from scripts.aws_target.ledger_test_support import install_cost_settings, numeric_settings, text_setting
+from scripts.buildlog import aws_costs, charts, cost_actions, costs, machine_facts, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -70,6 +75,58 @@ def needs_all_page_proof_views(repo: Path) -> bool:
 
 class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
+
+
+AWS_COST_TIME = int(datetime(2026, 1, 2, 12, tzinfo=UTC).timestamp())
+AWS_COST_JOB = StepJob("integrate", "research", "sdlc")
+PRIVATE_AWS_FIELDS = {
+    "account_id": "111122223333", "instance_id": "i-0123abcdef", "subnet": "subnet-0123abcdef",
+    "volume": "vol-0123abcdef", "snapshot": "snap-0123abcdef",
+    "arn": "arn:aws:ec2:us-east-1:111122223333:snapshot/snap-0123abcdef",
+    "recipient": "recipient@example.invalid", "email": "notification@example.invalid",
+}
+
+
+def write_aws_cost_fixture(root: Path, *, unknown_unit: str = "", instant: int = AWS_COST_TIME,
+                           first_job: StepJob | GateJobNotRecorded | None = AWS_COST_JOB) -> ledger.CostLedger:
+    """Save a bill, three finished runs, and the latest fixed costs."""
+    settings = root / "aws_target.conf"
+    install_cost_settings(settings)
+    text_setting(settings, "notification_recipient", PRIVATE_AWS_FIELDS["recipient"])
+    _ = (root / "build_steps.conf").write_text(
+        "[names]\nnames.test-affected=test affected\nnames.integrate=integrate\nnames.merge-gate=gate\n")
+    book = ledger.CostLedger(root / "target-state" / "aws")
+    midnight, _ = ledger.period_bounds(datetime.fromtimestamp(instant, UTC).date(), ZoneInfo("UTC"))
+    start = midnight - 86400
+    book.record_inventory(ledger.ResourceInventory(start,
+        (ledger.PricedResource("gate-shared", Decimal("1.00")),
+         ledger.PricedResource(PRIVATE_AWS_FIELDS["volume"], Decimal("24.80"))),
+         PRIVATE_AWS_FIELDS["snapshot"], builder_removed=True))
+    with book.transaction() as state:
+        state.hana_storage.append(ledger.HanaStorageExposure(start, Decimal("27.20")))
+        state.charge_refresh_at = midnight
+    charges = book.directory / "charges"
+    charges.mkdir(exist_ok=True)
+    bill_day = datetime.fromtimestamp(start, UTC).date().isoformat()
+    bill = ledger.ChargeRead(bill_day, midnight, start, midnight, Decimal(12), Decimal("13.57"), Decimal(0),
+        (ledger.UsageTypeCost("USE1-SpotUsage:m7a.8xlarge", Decimal(8), Decimal(1), "Hrs"),
+         ledger.UsageTypeCost("USE1-EBS:SnapshotUsage", Decimal(4))), provisional=False)
+    _ = (charges / (bill.day + ".json")).write_text(json.dumps(ledger.charge_record(bill)))
+    rows: list[dict[str, object]] = []
+    for index, (unit, mode, job, seconds) in enumerate((("", "merge-gate", first_job, 120),
+            (unknown_unit, "merge-gate", GATE_JOB_NOT_RECORDED, 60),
+            ("report", "targeted-test", StepJob("test-affected", unit="other"), 60))):
+        launch: dict[str, object] = {**PRIVATE_AWS_FIELDS, "attempt": f"fixture-{index}", "instance_type": "m7a.8xlarge",
+            "region": "us-east-1", "time": start + 60, "mode": mode, "result": "launched"}
+        if not index:
+            launch["availability_zone"] = "us-east-1a"
+        if job is not None:
+            launch["gate_job"] = codec.snapshot_value(job)
+        if unit:
+            launch["unit"] = unit
+        rows.extend((launch, {**launch, "time": start + 60 + seconds, "result": "finished", "gate_s": 20}))
+    _ = book.launch_history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return book
 
 
 def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = (),
@@ -406,6 +463,8 @@ class MemoryFeedTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "target-state"),
+            "AWS_TARGET_CONFIG": str(self.root / "aws_target.conf"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "UTC",
@@ -4546,6 +4605,286 @@ process.stdout.write(JSON.stringify({
                                return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
             stale = memory_feed.reading()
         self.assertNotIn("move_revision", stale)
+
+    def test_aws_cost_feed_uses_saved_bills_and_box_time(self) -> None:
+        _ = write_aws_cost_fixture(self.root)
+        numeric_settings(self.root / "aws_target.conf", {"cost_explorer_interval_seconds": "82800"})
+        with (mock.patch.object(subprocess, "run", side_effect=AssertionError("AWS costs only read saved records")),
+              mock.patch.object(subprocess, "Popen", side_effect=AssertionError("AWS costs only read saved records"))):
+            costs = aws_costs.read_saved_costs(AWS_COST_TIME)
+            report = memory_feed.report_file(charts.IndexUnavailable("no index"), costs)
+        self.assertEqual(cast(dict[str, object], json.loads(report.text))["aws_costs"], costs)
+        self.assertEqual(costs["read_at"], AWS_COST_TIME - 43200)
+        self.assertEqual(costs["next_read_at"], AWS_COST_TIME - 43200 + 82800)
+        self.assertEqual(costs["records_start"], "2026-01-01")
+        self.assertEqual(costs["price_day"], "2026-01-01")
+        self.assertEqual(costs["today"], "2026-01-02")
+        self.assertEqual(costs["limits"], {"day_usd": "20.00", "month_usd": "400.00", "reserve_usd": "3.00"})
+        today, billed = costs["days"]
+        self.assertEqual(today["state"], "estimate")
+        self.assertEqual(today["amount_usd"], "4.00")
+        self.assertEqual(billed["state"], "final")
+        self.assertEqual(billed["amount_usd"], "12.00")
+        self.assertNotIn("estimate_before_usd", billed)
+        self.assertEqual(billed["runs"], 3)
+        self.assertEqual(billed["jobs"], [
+            {"job": "test affected", "runs": 1, "cost_usd": "2.00", "per_run_usd": "2.00"},
+            {"job": "integrate", "runs": 1, "cost_usd": "4.00", "per_run_usd": "4.00"},
+            {"job": None, "runs": 1, "cost_usd": "2.00", "per_run_usd": "2.00"},
+        ])
+        self.assertEqual(billed["units"], [
+            {"unit": "report", "runs": 1, "cost_usd": "2.00"},
+            {"unit": "research", "runs": 1, "cost_usd": "4.00"},
+            {"unit": None, "runs": 1, "cost_usd": "2.00"},
+        ])
+        self.assertEqual(billed["no_run_usd"], "4.00")
+        self.assertEqual(billed["unrecorded_compute_usd"], "0.00")
+        self.assertEqual(billed["runs_list"][0], {
+            "id": "fixture-0", "start": AWS_COST_TIME - 43200 - 86400 + 60,
+            "kind": "gate", "job": "integrate", "unit": "research", "seconds": 120, "cost_usd": "4.00",
+            "region": "us-east-1", "zone": "us-east-1a", "machine": "m7a.8xlarge", "mode": "Spot",
+        })
+        self.assertIsNone(billed["runs_list"][1]["zone"])
+        self.assertEqual(costs["kept"], {"month_usd": "53.00", "items": [
+            {"name": "Hana data disk", "month_usd": "27.20"},
+            {"name": "shared storage for AWS runs", "month_usd": "1.00"},
+            {"name": "Other kept resources", "month_usd": "24.80"},
+        ]})
+
+    def test_aws_cost_feed_leaves_unrecorded_and_unknown_jobs_blank(self) -> None:
+        for job in (GATE_JOB_NOT_RECORDED, None, StepJob("unknown"), StepJob("merge-gate")):
+            with self.subTest(job=job), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                root = Path(folder)
+                _ = write_aws_cost_fixture(root, first_job=job)
+                with mock.patch.dict(os.environ, {
+                    "CONF_DIR": str(root), "AWS_TARGET_CONFIG": str(root / "aws_target.conf"),
+                    "BUILD_TARGETS_STATE_DIR": str(root / "target-state"),
+                }):
+                    billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+                self.assertEqual(billed["runs_list"][0]["kind"], "gate")
+                self.assertIsNone(billed["runs_list"][0]["job"])
+                self.assertEqual(billed["jobs"], [
+                    {"job": "test affected", "runs": 1, "cost_usd": "2.00", "per_run_usd": "2.00"},
+                    {"job": None, "runs": 2, "cost_usd": "6.00", "per_run_usd": "3.00"},
+                ])
+
+    def test_aws_cost_feed_names_the_job_from_the_mode_when_the_row_has_no_gate_job(self) -> None:
+        book = write_aws_cost_fixture(self.root, first_job=None)
+        with (self.root / "build_steps.conf").open("a") as names:
+            _ = names.write("names.test-all=test all\n")
+        modes = {"fixture-0": "gate", "fixture-1": "gate", "fixture-2": "test-affected"}
+        rows = [cast(dict[str, object], json.loads(line)) for line in book.launch_history_path.read_text().splitlines()]
+        for row in rows:
+            row["mode"] = modes[str(row["attempt"])]
+            if row["attempt"] == "fixture-2":
+                del row["gate_job"]
+        _ = book.launch_history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        # fixture-1 keeps a gate_job that says the job is not recorded, so its mode does not name a job.
+        self.assertEqual([(run["id"], run["job"]) for run in billed["runs_list"]],
+                         [("fixture-0", "test all"), ("fixture-1", None), ("fixture-2", "test affected")])
+
+    def test_aws_cost_feed_uses_the_same_day_amount_as_the_guard(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        settings = aws_config.read_settings(self.root / "aws_target.conf")
+        state = book.priced_snapshot(AWS_COST_TIME)
+        guard = ledger.gate_spend_days(state, settings, book.read_bills(), AWS_COST_TIME, reserve=True)
+        daily, _ = ledger.spending_periods(tuple(charge for day in guard for charge in day.intervals),
+                                           settings.accounting_zone)
+        actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+        billed = next(row for row in actual["days"] if row["day"] == "2026-01-01")
+        self.assertEqual(billed["amount_usd"], f'{daily[billed["day"]]:.2f}')
+        self.assertEqual(billed["amount_usd"], "12.00")
+
+    def test_aws_cost_feed_excludes_the_query_fee_from_the_billed_amount(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        with book.transaction() as state:
+            state.reconciliations.append(ledger.CostReconciliation(
+                bill.at, bill.period_start, bill.period_end, bill.actual_usd, "Cost Explorer", Decimal("0.01")))
+        settings = aws_config.read_settings(self.root / "aws_target.conf")
+        priced = book.priced_snapshot(AWS_COST_TIME)
+        days = ledger.gate_spend_days(priced, settings, (bill,), AWS_COST_TIME)
+        self.assertEqual(aws_costs.daily_charge_totals(days, settings.accounting_zone)[bill.day], Decimal("12.01"))
+        billed = next(row for row in aws_costs.read_saved_costs(AWS_COST_TIME)["days"] if row["day"] == bill.day)
+        self.assertEqual(billed["amount_usd"], "12.00")
+        self.assertEqual(billed["no_run_usd"], "4.00")
+
+    def test_aws_cost_feed_separates_compute_without_a_run_from_other_costs(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        unmatched = ledger.UsageTypeCost("USE2-SpotUsage:m7a.8xlarge", Decimal("4.24"), Decimal(1), "Hrs")
+        bill = replace(bill, actual_usd=bill.actual_usd + unmatched.usd, usage_types=(*bill.usage_types, unmatched))
+        bill_path, = book.bill_paths()
+        _ = bill_path.write_text(json.dumps(ledger.charge_record(bill)))
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        self.assertEqual(billed["amount_usd"], "16.24")
+        self.assertEqual(billed["unrecorded_compute_usd"], "4.24")
+        self.assertEqual(billed["no_run_usd"], "4.00")
+
+    def test_aws_cost_feed_counts_hana_compute_with_and_without_an_attempt(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        bill = replace(bill, actual_usd=Decimal(14), usage_types=(*bill.usage_types,
+            ledger.UsageTypeCost("USE2-SpotUsage:m7a.4xlarge", Decimal(2), Decimal(1), "Hrs")))
+        bill_path, = book.bill_paths()
+        _ = bill_path.write_text(json.dumps(ledger.charge_record(bill)))
+        start = bill.period_start + 300
+        with book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(start, start + 3600, 1, Decimal(2),
+                ledger.HanaExposureClosed(start + 3600), "m7a.4xlarge", region="us-east-2"))
+
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        self.assertEqual(billed["hana"], {
+            "runs": 0, "cost_usd": "2.00", "per_run_usd": "0.00", "idle_usd": "2.00", "idle_seconds": 3600})
+        self.assertEqual(billed["units"][-1], {"unit": None, "runs": 1, "cost_usd": "4.00"})
+        self.assertEqual(billed["no_run_usd"], "4.00")
+
+        generation = HanaHostGeneration("fixture", "token", "boot")
+        for attempt, begin, end in (("short", 10, 10.21), ("first", 30, 50), ("second", 60, 100.25)):
+            book.record_hana_attempt(hana_result.HanaAttemptCharge(
+                hana_result.HanaAttemptKey("episode", attempt, "claim", generation),
+                hana_result.LogicalStepLink("call", "episode"), 0, 0, 0,
+                start + begin, start + end, ("hana_compute:1",)))
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        self.assertEqual(billed["hana"], {
+            "runs": 3, "cost_usd": "2.00", "per_run_usd": "0.01", "idle_usd": "1.97", "idle_seconds": 3540})
+        self.assertEqual(billed["units"][-1], {"unit": None, "runs": 4, "cost_usd": "4.00"})
+        self.assertEqual([(row["id"], row["seconds"], row["cost_usd"])
+                          for row in billed["runs_list"] if row["kind"] == "hana"],
+                         [("short", 0, "0.00"), ("first", 20, "0.01"), ("second", 40, "0.02")])
+        self.assertEqual(billed["runs_list"][-1], {
+            "id": "second", "start": start + 60, "kind": "hana", "job": None, "unit": None,
+            "region": "us-east-2", "zone": None,
+            "machine": "m7a.4xlarge", "mode": "Spot", "seconds": 40, "cost_usd": "0.02",
+        })
+
+    def test_aws_cost_feed_counts_hana_idle_seconds_in_each_bill_day(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        midnight = bill.period_end
+        with book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(midnight - 1800, midnight + 3600, 1, Decimal(2),
+                ledger.HanaExposureClosed(midnight + 600), "m7a.4xlarge", region="us-east-2"))
+        book.record_hana_attempt(hana_result.HanaAttemptCharge(
+            hana_result.HanaAttemptKey("episode", "crossing", "claim", HanaHostGeneration("fixture", "token", "boot")),
+            hana_result.LogicalStepLink("call", "episode"), 0, 0, 0, midnight - 100, midnight + 50, ("hana_compute:1",)))
+
+        today, billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][:2]
+        # The machine has 1800 s before midnight and 600 s after it. The run has 100 s and 50 s.
+        self.assertEqual((billed["day"], billed["hana"] and billed["hana"]["idle_seconds"]), (bill.day, 1700))
+        self.assertEqual(today["hana"] and today["hana"]["idle_seconds"], 550)
+        self.assertIsNone(aws_costs.hana_idle_seconds({}, []))
+
+    def test_aws_cost_feed_counts_overlapping_hana_attempts_once_in_the_idle_seconds(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        start = bill.period_start + 300
+        with book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(start, start + 3600, 1, Decimal(2),
+                ledger.HanaExposureClosed(start + 3600), "m7a.4xlarge", region="us-east-2"))
+        generation = HanaHostGeneration("fixture", "token", "boot")
+        # Two attempts share 100 s. The third starts after the machine stops.
+        for attempt, begin, end in (("first", 100, 400), ("second", 300, 600), ("late", 4000, 4100)):
+            book.record_hana_attempt(hana_result.HanaAttemptCharge(
+                hana_result.HanaAttemptKey("episode", attempt, "claim", generation),
+                hana_result.LogicalStepLink("call", "episode"), 0, 0, 0,
+                start + begin, start + end, ("hana_compute:1",)))
+
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        self.assertEqual(billed["hana"] and (billed["hana"]["runs"], billed["hana"]["idle_seconds"]), (3, 3100))
+
+    def test_aws_cost_feed_does_not_copy_private_fields_or_unit_identifiers(self) -> None:
+        joined = "research" + PRIVATE_AWS_FIELDS["instance_id"] + "report"
+        book = write_aws_cost_fixture(self.root, unknown_unit=joined)
+        report = memory_feed.report_file(charts.IndexUnavailable("no index"), aws_costs.read_saved_costs(AWS_COST_TIME))
+        for field, value in {**PRIVATE_AWS_FIELDS, "joined unit": joined}.items():
+            with self.subTest(field=field):
+                self.assertIn(value, book.launch_history_path.read_text())
+                self.assertNotIn(value, report.text)
+                self.assertNotIn(json.dumps(field), report.text)
+                self.assertEqual(aws_costs.recorded_unit(value), "")
+
+    def test_aws_cost_feed_keeps_the_caps_when_evidence_is_missing(self) -> None:
+        install_cost_settings(self.root / "aws_target.conf")
+        actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+        self.assertEqual(actual, {**aws_costs.empty_costs(AWS_COST_TIME), "limits": {
+            "day_usd": "20.00", "month_usd": "400.00", "reserve_usd": "3.00"}})
+
+        book = write_aws_cost_fixture(self.root)
+        book.path.unlink()
+        actual = aws_costs.read_saved_costs(AWS_COST_TIME + 86400)
+        self.assertIsNone(actual["kept"])
+        self.assertIsNone(actual["read_at"])
+        self.assertEqual([(row["day"], row["state"], row["amount_usd"]) for row in actual["days"]], [
+            ("2026-01-03", "none", None), ("2026-01-02", "none", None), ("2026-01-01", "final", "12.00"),
+        ])
+
+    def test_aws_cost_feed_counts_zero_and_subcent_aws_bills(self) -> None:
+        instant = int(datetime(2026, 1, 4, 12, tzinfo=UTC).timestamp())
+        book = write_aws_cost_fixture(self.root, instant=instant)
+        bill, = book.read_bills()
+        for day, value in (("2026-01-01", Decimal(0)), ("2026-01-02", Decimal("0.00004"))):
+            start, end = ledger.period_bounds(date.fromisoformat(day), ZoneInfo("UTC"))
+            earlier = replace(bill, day=day, at=end, period_start=start, period_end=end, actual_usd=value,
+                              usage_types=(), provisional=True)
+            _ = (book.directory / "charges" / (day + ".json")).write_text(json.dumps(ledger.charge_record(earlier)))
+        actual = aws_costs.read_saved_costs(instant)
+        self.assertEqual([(row["day"], row["state"], row["amount_usd"]) for row in actual["days"]], [
+            ("2026-01-04", "estimate", "4.00"), ("2026-01-03", "final", "12.00"),
+            ("2026-01-02", "billed", "0.00"), ("2026-01-01", "billed", "0.00"),
+        ])
+
+    def test_aws_cost_feed_splits_open_box_time_at_utc_midnight(self) -> None:
+        midnight = int(datetime(2026, 1, 5, tzinfo=UTC).timestamp())
+        instant = midnight + 1800
+        book = write_aws_cost_fixture(self.root, instant=midnight - 1800)
+        with book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                "crossing-midnight", midnight - 1800, midnight + 3600, Decimal(8), Decimal(0),
+                state=ledger.GateRunning("i-fixture"), instance_type="m7a.8xlarge", region="us-east-1"))
+        actual = aws_costs.read_saved_costs(instant)
+        today, yesterday = actual["days"][:2]
+        for row in (today, yesterday):
+            self.assertEqual(row["state"], "estimate")
+            self.assertEqual(row["amount_usd"], "8.00")
+            self.assertEqual(row["no_run_usd"], "4.00")
+            self.assertEqual(row["runs_list"], [
+                {"id": "crossing-midnight", "start": midnight - 1800, "kind": "gate", "job": None, "unit": None,
+                 "seconds": 1800, "cost_usd": "4.00",
+                 "region": "us-east-1", "zone": None, "machine": "m7a.8xlarge", "mode": "Spot"}
+            ])
+
+    def test_aws_cost_feed_names_the_user_zone_and_the_failed_read(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        read_at = int(datetime(2026, 1, 2, tzinfo=UTC).timestamp())
+
+        def refused(at: int, code: str, operation: str) -> dict[str, object]:
+            return {"time": at, "attempt": f"refused-{at}", "result": "fallback", "error_code": code,
+                    "reason": f"aws: [ERROR]: An error occurred ({code}) when calling the {operation} "
+                              + "operation: The security token included in the request is invalid."}
+
+        with book.launch_history_path.open("a") as history:
+            for row in (refused(read_at - 60, "Throttling", "GetCostAndUsage"),
+                        refused(read_at + 60, "UnrecognizedClientException", "GetCostAndUsage"),
+                        refused(read_at + 120, "Blocked", "RunInstances")):
+                _ = history.write(json.dumps(row) + "\n")
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}):
+            actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+        self.assertEqual((actual["zone"], actual["read_at"], actual["read_error"]),
+                         ("America/Los_Angeles", read_at, "AWS refuses the key"))
+        self.assertEqual(aws_costs.read_error([refused(read_at + 60, "Throttling", "GetCostAndUsage")], read_at),
+                         "AWS refuses the read (Throttling)")
+        self.assertIsNone(aws_costs.read_error([refused(read_at - 60, "Throttling", "GetCostAndUsage")], read_at))
+
+    def test_aws_cost_feed_keeps_bill_days_in_utc(self) -> None:
+        instant = int(datetime(2026, 2, 1, 2, tzinfo=UTC).timestamp())
+        _ = write_aws_cost_fixture(self.root, instant=instant)
+        text_setting(self.root / "aws_target.conf", "accounting_zone", "America/New_York")
+        actual = aws_costs.read_saved_costs(instant)
+        self.assertEqual([(row["day"], row["state"], row["amount_usd"]) for row in actual["days"]], [
+            ("2026-02-01", "estimate", "4.00"), ("2026-01-31", "final", "12.00"),
+        ])
 
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):

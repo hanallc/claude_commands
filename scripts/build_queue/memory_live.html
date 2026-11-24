@@ -438,6 +438,86 @@ body.queue-unavailable .card { display: none; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
 .report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+.aws-title, .aws-history-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+.aws-title .pill { font-size: 0.86rem; cursor: default; }
+.aws-title .pill[hidden] { display: none; }
+.aws-title .pill:hover { background: var(--card); }
+.aws-note { color: var(--ink-2); font-size: 0.86rem; margin: 6px 0 0; }
+.aws-rule { max-width: 130ch; }
+.aws-rule b { color: var(--ink); }
+.aws-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 12px; margin-top: 14px; }
+.aws-total { padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.aws-total-label { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; color: var(--ink-2); font-size: 0.86rem; }
+.aws-total-value { display: block; font-size: 1.5rem; line-height: 1.3; }
+.aws-total-value small { font-size: 0.95rem; font-weight: 600; color: var(--ink-2); }
+.aws-total-note, .aws-dim { color: var(--ink-3); font-size: 0.82rem; }
+.aws-total-note { margin-top: 4px; line-height: 1.4; }
+.aws-meter, .aws-bar { display: flex; height: 10px; border-radius: 3px; overflow: hidden; }
+.aws-meter { height: 6px; margin: 6px 0 8px; background: var(--hover); }
+.aws-meter i, .aws-bar i { background: var(--accent); }
+.aws-bar .estimate { background: repeating-linear-gradient(135deg, var(--accent) 0 2px, transparent 2px 5px);
+  box-shadow: inset 0 0 0 1px var(--accent); }
+.aws-state { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 0.82rem; font-weight: 600; }
+.aws-state::before { content: ""; flex: 0 0 10px; height: 10px; border-radius: 50%; border: 1px solid currentColor; }
+.aws-state.estimate::before { border-style: dashed; }
+.aws-state.billed::before { background: linear-gradient(90deg, currentColor 50%, transparent 50%); }
+.aws-state.final { color: var(--room); }
+.aws-state.final::before { background: currentColor; }
+.aws-state span { font-weight: 400; }
+.aws-key { display: flex; flex-wrap: wrap; gap: 4px 28px; margin: 10px 0 2px; }
+.aws-key-item { display: inline-flex; flex-wrap: wrap; gap: 2px 8px; }
+.aws-history { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.aws-history h3 { margin: 0; font-size: 1rem; font-weight: 600; }
+#aws-costs .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+#aws-costs .filter button + button { border-left: 1px solid var(--line); }
+#aws-costs .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+#aws-costs .filter button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+.aws-scroll { overflow: auto; }
+.aws-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; }
+.aws-table th, .aws-table td { padding: 6px 0; text-align: left; border-bottom: 1px solid var(--line); }
+.aws-table th { color: var(--ink-2); font-weight: 600; }
+.aws-table .num { text-align: right; white-space: nowrap; padding-left: 16px; }
+.aws-history .aws-table .aws-bar-cell, .aws-history .aws-table .aws-states { padding-left: 28px; }
+.aws-history .aws-states > span { display: flex; }
+.aws-history-table { min-width: 32rem; }
+.aws-history-table thead .aws-period { width: 30%; }
+.aws-history-table thead .aws-bar-cell { width: 28%; }
+.aws-history-table thead .aws-states { width: 19%; }
+.aws-history:has([data-aws-view]:not([data-aws-view="day"])[aria-pressed="true"]) .aws-history-table thead .aws-states { width: 26%; }
+.aws-history-table tbody tr[data-period] { cursor: pointer; }
+.aws-history-table tbody tr[data-period]:hover { background: var(--hover); }
+.aws-toggle { background: transparent; color: var(--ink); border: 0; padding: 0; font: inherit; text-align: left; cursor: pointer; }
+.aws-toggle[aria-expanded="true"] { font-weight: 600; }
+.aws-point { text-decoration: underline dotted var(--ink-3); text-underline-offset: 4px; }
+small .aws-point { cursor: help; }
+.aws-chev { display: inline-block; margin: 0 9px 0 4px; border-left: 6px solid var(--ink-3); border-block: 4px solid transparent; }
+[aria-expanded="true"] > .aws-chev { transform: rotate(90deg); }
+.aws-period .aws-dim { margin-left: 8px; }
+.aws-history-table .aws-detail-cell { padding-top: 2px; padding-bottom: 14px; }
+.aws-day-detail { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 10px 16px 12px; }
+.aws-day-detail > .aws-note { margin: 0 0 2px; }
+.aws-day-detail > .aws-unit-note { margin: 8px 0 0; }
+.aws-run-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 2px; }
+.aws-run-controls .aws-more { margin: 0 0 0 auto; }
+.aws-run-scroll { overflow: auto; contain: inline-size; }
+.aws-run-scroll .aws-table { min-width: 47rem; }
+.aws-run-scroll .aws-table :is(th, td) { padding-right: 12px; }
+.aws-run-scroll .aws-table :is(th, td):last-child { padding-right: 0; }
+.aws-group-scroll { min-width: 0; overflow: auto; contain: inline-size; }
+.aws-group-scroll > .aws-table { min-width: 27rem; }
+.aws-group-scroll tr[data-aws-group] { cursor: pointer; }
+.aws-group-scroll tr[data-aws-group]:hover { background: var(--hover); }
+.aws-group-detail > td { padding: 0 0 8px 24px; }
+.aws-group-detail .aws-run-scroll { padding: 0 12px 0 8px; background: var(--hover); }
+.aws-table .aws-hint { display: block; }
+.aws-table .aws-total-row td { font-weight: 700; border-bottom: 0; }
+.aws-more { margin-top: 8px; font: inherit; font-size: 0.86rem; font-weight: 600; color: var(--ink-2); background: transparent;
+  border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer; }
+.aws-kept { margin-top: 14px; }
+@media (max-width: 800px) {
+  .aws-history .aws-table .aws-bar-cell, .aws-history .aws-table .aws-states { padding-left: 12px; }
+}
 </style>
 </head>
 <body>
@@ -569,6 +649,13 @@ body.queue-unavailable .card { display: none; }
     <p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
+  </section>
+  <section class="card" id="aws-costs" aria-label="AWS costs">
+    <div class="aws-title">
+      <div class="section-head">AWS costs</div>
+      <span class="pill" id="aws-cost-read" hidden></span>
+    </div>
+    <div id="aws-cost-content">no record</div>
   </section>
   <section class="card" id="report-charts">
     <div class="section-head">Top 3 costs</div>
@@ -713,6 +800,356 @@ function reserveTargetRows(covered, target) {
 function legendTip(name, bytes, caption, parts = []) {
   const title = field(name, ramAmount(bytes), 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
+}
+const AWS_DAY_MS = 86400000;
+const AWS_HISTORY_DAYS = 14;
+const AWS_PERIODS = {
+  day: ["Day", "AWS day (UTC)"],
+  week: ["Week", "Week, Monday to Sunday (UTC)", "day"],
+  month: ["Month", "Month (UTC)", "week"],
+  year: ["Year", "Year (UTC)", "month"],
+};
+const AWS_STATES = {
+  final: ["Billed, final", "The amount from AWS. AWS does not change it."],
+  billed: ["Billed, not final", "The amount from AWS. AWS can change it."],
+  estimate: ["Estimate", "From our run records. AWS has no amount yet."],
+};
+const AWS_DAY_NAME = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", weekday:"short", month:"short", day:"numeric"});
+const AWS_SHORT_DAY = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"short", day:"numeric"});
+const AWS_MONTH = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"long"});
+// The user zone from the feed. renderAwsCosts sets it before the pane shows a time.
+let awsZone = "UTC";
+const awsZoneFormats = new Map();
+function awsZoneParts(date, locale, options) {
+  const key = `${awsZone} ${locale} ${JSON.stringify(options)}`;
+  if (!awsZoneFormats.has(key)) awsZoneFormats.set(key, new Intl.DateTimeFormat(locale, {...options, timeZone:awsZone}));
+  return Object.fromEntries(awsZoneFormats.get(key).formatToParts(date).map(({type,value}) => [type,value]));
+}
+const AWS_LOCAL = {weekday:"short", month:"short", day:"numeric", hour:"numeric", minute:"2-digit", timeZoneName:"short"};
+const awsDate = day => new Date(day + "T00:00:00Z");
+const awsIso = time => time.toISOString().slice(0,10);
+const awsDayName = date => AWS_DAY_NAME.format(date).replace(",", "");
+const awsLocal = date => {
+  const parts = awsZoneParts(date, "en-US", AWS_LOCAL);
+  return {day:parts.weekday, clock:`${parts.hour}:${parts.minute} ${parts.dayPeriod}`, zone:parts.timeZoneName,
+    date:`${parts.weekday} ${parts.month} ${parts.day}`, shortDate:`${parts.month} ${parts.day}`,
+    dayNumber:Number(parts.day)};
+};
+// The zone as a word: "Pacific" for America/Los_Angeles. A zone with no such name keeps its IANA name.
+function awsZoneName() {
+  const name = awsZoneParts(new Date(), "en-US", {timeZoneName:"longGeneric"}).timeZoneName ?? "";
+  return name.endsWith(" Time") ? name.slice(0, -5) : awsZone;
+}
+function awsDateTime(date) {
+  const time = awsLocal(date);
+  return `${time.date}, ${time.clock} ${time.zone}`;
+}
+const awsCents = amount => Math.round(Number(amount) * 100);
+const awsMoney = (cents, estimate = false, digits = 2) => cents == null ? "no record" :
+  `${estimate ? "~" : ""}$${(cents / 100).toLocaleString("en-US", {minimumFractionDigits:digits, maximumFractionDigits:digits})}`;
+const awsCount = count => count.toLocaleString("en-US");
+const awsPercent = (amount, limit) => limit > 0 ? Math.max(0, Math.min(100, amount / limit * 100)) : 0;
+
+function awsPeriodStart(period, day) {
+  if (period === "year") return awsDate(day.slice(0,4) + "-01-01");
+  if (period === "month") return awsDate(day.slice(0,7) + "-01");
+  const start = awsDate(day);
+  if (period === "week") start.setUTCDate(start.getUTCDate() - (start.getUTCDay() + 6) % 7);
+  return start;
+}
+function awsPeriodEnd(period, start) {
+  const end = new Date(start);
+  if (period === "year") end.setUTCFullYear(end.getUTCFullYear() + 1);
+  else if (period === "month") end.setUTCMonth(end.getUTCMonth() + 1);
+  else end.setUTCDate(end.getUTCDate() + (period === "week" ? 7 : 1));
+  return end;
+}
+function awsSum(days) {
+  const states = new Map();
+  const runIds = new Set();
+  let cents = null, runs = 0;
+  for (const day of days) {
+    runs += day.runs;
+    for (const run of day.runs_list ?? []) {
+      if (run.id == null) continue;
+      if (runIds.has(run.id)) runs--;
+      runIds.add(run.id);
+    }
+    if (day.amount_usd == null) continue;
+    const amount = awsCents(day.amount_usd);
+    cents = (cents ?? 0) + amount;
+    const total = states.get(day.state) ?? {days:0, cents:0};
+    total.days++;
+    total.cents += amount;
+    states.set(day.state, total);
+  }
+  return {cents, runs, states};
+}
+function awsPeriods(period, days, parent) {
+  const groups = new Map();
+  for (const day of days) {
+    const start = awsPeriodStart(period, day.day);
+    const key = awsIso(start);
+    if (!groups.has(key)) groups.set(key, {start, days:[]});
+    groups.get(key).days.push(day);
+  }
+  return [...groups.values()].map(group => {
+    let {start} = group;
+    let end = awsPeriodEnd(period, start);
+    if (period === "week" && parent) {
+      if (parent.start > start) start = parent.start;
+      if (parent.end < end) end = parent.end;
+    }
+    return {period, start, end, id:`${period}-${awsIso(start)}`, days:group.days, ...awsSum(group.days)};
+  });
+}
+function awsPeriodName(row) {
+  if (row.period === "day") return awsDayName(row.start);
+  if (row.period === "year") return awsIso(row.start).slice(0,4);
+  if (row.period === "month") return `${AWS_MONTH.format(row.start)} ${awsIso(row.start).slice(0,4)}`;
+  const first = AWS_SHORT_DAY.format(row.start), last = AWS_SHORT_DAY.format(new Date(+row.end - AWS_DAY_MS));
+  return first === last ? first : `${first} to ${last}`;
+}
+function awsState(state, extra = "") {
+  return AWS_STATES[state] ? `<span class="aws-state ${state}">${AWS_STATES[state][0]}${extra}</span>` :
+    '<span class="aws-dim">no record</span>';
+}
+const awsJob = job => job ?? "Job not recorded";
+const awsUnit = unit => unit ?? "Unit not recorded";
+const awsEstimated = total => total.states.has("estimate");
+const awsAmount = total => awsMoney(total.cents, awsEstimated(total));
+const awsDateRange = (label, start, end) => [field(label + " (UTC)", "", "title"),
+  field("Starts", awsDateTime(start)), field("Ends", awsDateTime(end))];
+
+let awsCostView = "day", awsShowAll = false, awsCostReport, awsCostGroups, awsUnitStart = null;
+const awsCostOpen = new Map(Object.keys(AWS_PERIODS).map(period => [period, new Map()]));
+const awsRunViews = new Map();
+const awsLimitTips = new Map(), awsPeriodTips = new Map();
+function awsCostTip(id) {
+  return awsLimitTips.get(id) ?? awsPeriodTips.get(id) ?? [];
+}
+function awsLimitTip(title, limit, reserve, end) {
+  return [field(title, "", "title"), field("Limit", awsMoney(limit)),
+    field("New work stops at", awsMoney(limit - reserve)), field("Starts again", awsDateTime(end))];
+}
+function awsTile(label, amount, note, state, limit) {
+  return `<div class="aws-total"><div class="aws-total-label"><span>${label}</span>${state ? awsState(state) : ""}</div>
+    <strong class="aws-total-value num">${amount}${limit ? ` <small><span class="aws-point" tabindex="0"
+      data-tip="aws-cost:${limit.id}">of ${awsMoney(limit.cents)} limit</span></small>` : ""}</strong>
+    ${limit ? `<span class="aws-meter" aria-hidden="true"><i style="width:${awsPercent(limit.used, limit.cents)}%"></i></span>` : ""}
+    <div class="aws-total-note">${note}</div></div>`;
+}
+// The UTC bill day in the user zone. West of UTC it starts on the day before; east of UTC it ends on the next day.
+function awsDayRule(today) {
+  const start = awsDate(today), first = awsLocal(start), last = awsLocal(awsPeriodEnd("day", start));
+  const zoneChange = first.zone !== last.zone;
+  const [from, to] = [first, last].map(time => time.clock + (zoneChange ? " " + time.zone : ""));
+  const before = first.dayNumber !== start.getUTCDate();
+  return `In ${awsZoneName()} time, a day starts at <b>${from}${before ? " on the day before" : ""}</b> and ends at
+    ${to}${before ? "" : " on the next day"}.`;
+}
+// When the next read time is past, the read failed: name the last read day and the recorded AWS error.
+function awsNextRead(costs) {
+  if (costs.next_read_at * 1000 > Date.now()) {
+    return `The next AWS read is due ${awsDateTime(new Date(costs.next_read_at * 1000))}`;
+  }
+  const since = costs.read_at == null ? "" : ` since ${awsLocal(new Date(costs.read_at * 1000)).shortDate}`;
+  return `No AWS read${since}${costs.read_error ? ": " + esc(costs.read_error) : ""}`;
+}
+function awsCostTiles(costs, monthTotal, tips) {
+  const start = awsDate(costs.today), end = awsPeriodEnd("day", start);
+  const yesterday = new Date(+start - AWS_DAY_MS);
+  const current = costs.days.find(day => day.day === costs.today);
+  const previous = costs.days.find(day => day.day === awsIso(yesterday));
+  const month = awsPeriodStart("month", costs.today);
+  const [first, last, before] = [start, end, yesterday].map(awsLocal);
+  const change = before.zone === first.zone ? "" : " " + before.zone;
+  const nextRead = costs.next_read_at != null && previous?.state === "estimate" ? " · " + awsNextRead(costs) : "";
+  const tileAmount = row => awsMoney(row?.amount_usd == null ? null : awsCents(row.amount_usd), row?.state === "estimate");
+  const limit = (id, title, amount, used, reset) => {
+    const cents = awsCents(amount);
+    tips.set(id, awsLimitTip(title, cents, awsCents(costs.limits.reserve_usd), reset));
+    return {id, cents, used};
+  };
+  const monthNote = Object.keys(AWS_STATES).filter(state => monthTotal.states.has(state)).map(state =>
+    `${state === "estimate" ? "estimate" : AWS_STATES[state][0]} ${awsMoney(monthTotal.states.get(state).cents, state === "estimate")}`).join(" + ");
+  return `<div class="aws-totals">
+    ${awsTile("Today so far", tileAmount(current),
+      `${awsDayName(start)} · started ${first.day} ${first.clock} ${first.zone} · ends ${last.day} ${last.clock} ${last.zone}`,
+      current?.state, limit("day-limit", "Daily limit", costs.limits.day_usd, awsCents(current?.amount_usd ?? "0.00"), end))}
+    ${awsTile("Yesterday", tileAmount(previous),
+      `${awsDayName(yesterday)} · ${before.day} ${before.clock}${change} to ${first.day} ${first.clock} ${first.zone}${nextRead}`, previous?.state)}
+    ${awsTile(AWS_MONTH.format(month) + " to date", awsAmount(monthTotal), monthNote, "",
+      limit("month-limit", "Monthly limit", costs.limits.month_usd, monthTotal.cents, awsPeriodEnd("month", month)))}
+    </div>`;
+}
+
+const AWS_RUN_GROUPS = {job:"Job", unit:"Unit", region:"Region", machine:"Machine", none:"None"};
+const awsRunHeaders = () =>
+  [`Start (${awsZoneName()})`, "Job", "Unit", "Region", "Zone", "Machine type", "Mode", "Time on AWS", "Cost"];
+const AWS_CSV_TIME = {timeZoneName:"longOffset", year:"numeric", month:"2-digit", day:"2-digit",
+  hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"};
+const AWS_HANA_LABEL = "Hana check and lint";
+const AWS_HANA_IDLE = "Hana machine with no run";
+const AWS_HANA_GROUP = JSON.stringify(["hana"]);
+const AWS_NO_RUN_COSTS = 'Costs with no run<span class="aws-dim aws-hint">Storage, addresses and data transfer</span>';
+const awsNewRunView = () => ({groupBy:"job", openGroups:new Set()});
+const awsRunJob = run => run.kind === "hana" ? AWS_HANA_LABEL : run.job;
+const awsRunFields = run => [awsRunJob(run), run.unit, run.region, run.zone, run.machine, run.mode];
+// The Unit column and the Unit group show only on a day where a run has a unit.
+const AWS_UNIT_COLUMN = 2;
+const awsDayHasUnits = day => day.runs_list.some(run => run.unit);
+// The first UTC bill day where a run has a unit, or null when no run has a unit.
+const awsFirstUnitDay = days => days.filter(awsDayHasUnits).map(day => day.day).sort()[0] ?? null;
+// The unit line shows only on a day with a gate run, before the first unit day or when no unit day exists.
+function awsUnitNote(day, unitStart) {
+  const gate = day.runs_list.some(run => run.kind === "gate");
+  if (!gate || awsDayHasUnits(day) || (unitStart != null && day.day >= unitStart)) return "";
+  const before = unitStart == null ? "" : ` before ${awsDayName(awsDate(unitStart))}`;
+  return `<p class="aws-note aws-unit-note">Runs${before} have no unit record.</p>`;
+}
+
+function awsRunTime(seconds) {
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
+  return [hours && `${hours} h`, minutes && `${minutes} min`, `${seconds % 60} s`].filter(Boolean).join(" ");
+}
+
+function awsTable(headers, rows, numeric) {
+  const cell = (tag, value, index) => `<${tag}${tag === "th" ? ' scope="col"' : ""}${numeric.includes(index) ? ' class="num"' : ""}>${value}</${tag}>`;
+  const body = rows.map(({values, total, group, detail}) => {
+    const attrs = total ? ' class="aws-total-row"' : group == null ? "" : ` data-aws-group="${esc(group)}"`;
+    return `<tr${attrs}>${values.map((value, index) => cell("td", value, index)).join("")}</tr>${detail ?
+      `<tr class="aws-group-detail"><td colspan="${headers.length}">${detail}</td></tr>` : ""}`;
+  }).join("");
+  return `<table class="aws-table"><thead><tr>${headers.map((value,index) => cell("th", value,index)).join("")}</tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+function awsRunTable(runs, estimated, extraRows, units) {
+  const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
+  const rows = runs.map(run => {
+    const [job, unit, region, zone, machine, mode] = awsRunFields(run);
+    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), esc(awsUnit(unit)),
+      ...[region, zone, machine, mode].map(value => value ? esc(value) : "—"),
+      awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
+  });
+  const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
+  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
+    ${awsTable(columns(awsRunHeaders()), tableRows, units ? [7,8] : [6,7])}</div>`;
+}
+
+function awsRunGroups(runs, groupBy, hanaIdle) {
+  const groups = new Map();
+  if (groupBy === "job" && hanaIdle) {
+    groups.set(AWS_HANA_GROUP,
+      {key:AWS_HANA_GROUP, name:AWS_HANA_LABEL, unitUnknown:false, runs:[], seconds:0, cents:0, idle:hanaIdle});
+  }
+  for (const run of runs) {
+    const hana = groupBy === "job" && run.kind === "hana";
+    const value = run[groupBy] || null;
+    const key = hana ? AWS_HANA_GROUP : JSON.stringify([groupBy, value]);
+    if (!groups.has(key)) groups.set(key, {
+      key, name:hana ? AWS_HANA_LABEL : value ?? `${AWS_RUN_GROUPS[groupBy]} not recorded`,
+      unitUnknown:groupBy === "unit" && value == null, runs:[], seconds:0, cents:0, idle:0,
+    });
+    const group = groups.get(key);
+    group.runs.push(run);
+    group.seconds += run.seconds;
+    group.cents += awsCents(run.cost_usd);
+  }
+  return [...groups.values()].sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function awsDayRuns(day, view) {
+  const estimated = day.state === "estimate";
+  const amount = usd => awsMoney(usd == null ? null : awsCents(usd), estimated);
+  const hanaIdle = awsCents(day.hana?.idle_usd ?? (day.hana?.runs === 0 ? day.hana.cost_usd : "0.00"));
+  const {groupBy, openGroups} = view;
+  const units = awsDayHasUnits(day);
+  const idleSeconds = day.hana?.idle_seconds;
+  const idleCharge = {name:AWS_HANA_IDLE, cents:hanaIdle, time:idleSeconds == null ? "—" : awsRunTime(idleSeconds)};
+  const charges = [
+    ...(groupBy === "job" ? [] : [idleCharge]),
+    {name:"Compute with no run record", cents:awsCents(day.unrecorded_compute_usd ?? "0.00"), time:"no record"},
+    {name:AWS_NO_RUN_COSTS, cents:awsCents(day.no_run_usd), time:"—"},
+  ].filter(charge => charge.cents !== 0);
+  const charge = (name, cost, {total = false, time = ""} = {}) =>
+    ({total, values:[name, "", "", "", "", "", "", time, cost]});
+  const runCharge = ({name, cents, time}) => charge(name, awsMoney(cents, estimated), {time});
+  if (groupBy === "none") {
+    const extraRows = [...charges.map(runCharge),
+      charge(`Total · ${awsCount(day.runs)} runs`, amount(day.amount_usd), {total:true})];
+    return awsRunTable(day.runs_list, estimated, extraRows, units);
+  }
+
+  const rows = awsRunGroups(day.runs_list, groupBy, hanaIdle).map(group => {
+    const open = openGroups.has(group.key), count = group.runs.length;
+    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}"><span class="aws-chev"
+      aria-hidden="true"></span>${esc(group.name)}</button>`;
+    const note = group.unitUnknown ?
+      '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
+    const time = count ? awsRunTime(group.seconds) : "—";
+    const idleRows = group.idle ? [runCharge(idleCharge)] : [];
+    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
+      values:[name + note, count ? awsCount(count) : "—", time,
+        awsMoney(group.cents + group.idle, estimated),
+        count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
+  });
+  rows.push(...charges.map(({name, cents, time}) => ({values:[name, "—", time, awsMoney(cents, estimated), "—"]})));
+  const seconds = day.runs_list.reduce((total, run) => total + run.seconds, 0);
+  rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
+    day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
+  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
+    ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
+}
+
+function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
+  if (day.state === "none") return '<div class="aws-day-detail"><p class="aws-note">no record</p></div>';
+  const price = priceDay ? ` and the prices from the newest AWS amount (${AWS_SHORT_DAY.format(awsDate(priceDay))})` : "";
+  const estimate = day.state === "estimate" ? `<p class="aws-note">This amount is our estimate. It uses our run records${price}.
+    AWS has no amount for this day yet.</p>` : "";
+  const units = awsDayHasUnits(day);
+  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) =>
+    `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}">${label}</button>`).join("");
+  return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
+    <div class="aws-run-controls"><span class="aws-dim">Group by</span>
+      <div class="filter" role="group" aria-label="Group by">${controls}</div>
+      <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
+    <div class="aws-run-content">${awsDayRuns(day, view)}</div>${awsUnitNote(day, unitStart)}</div>`;
+}
+
+function awsRunsCsv(days) {
+  const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const start = seconds => {
+    const time = awsZoneParts(new Date(seconds * 1000), "en-CA", AWS_CSV_TIME);
+    return `${time.year}-${time.month}-${time.day}T${time.hour}:${time.minute}:${time.second}${time.timeZoneName.slice(3)}`;
+  };
+  const header = ["UTC day", ...awsRunHeaders().slice(0,6), "Time on AWS (seconds)", "Cost (USD)", "Mode"].map(quote).join(",");
+  const runs = new Map();
+  for (const {day, runs_list} of days) {
+    for (const run of runs_list) {
+      const id = run.id ?? Symbol();
+      const previous = runs.get(id);
+      const first = !previous || day < previous.day || (day === previous.day && run.start < previous.run.start);
+      runs.set(id, {day:first ? day : previous.day, run:first ? run : previous.run,
+        seconds:(previous?.seconds ?? 0) + run.seconds, cents:(previous?.cents ?? 0) + awsCents(run.cost_usd)});
+    }
+  }
+  const rows = [...runs.values()].sort((a,b) => b.day.localeCompare(a.day)).map(({day, run, seconds, cents}) => {
+    const [job, unit, region, zone, machine, mode] = awsRunFields(run);
+    return [...[day, start(run.start), job, unit, region, zone, machine].map(quote),
+      seconds, (cents / 100).toFixed(2), quote(mode)].join(",");
+  });
+  return [header, ...rows, ""].join("\r\n");
+}
+
+function downloadAwsRuns(costs) {
+  const url = URL.createObjectURL(new Blob([awsRunsCsv(costs.days)], {type:"text/csv;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `aws-runs-${costs.today}.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
@@ -1063,6 +1500,7 @@ function tipDuration(key, row, data) {
 function tooltipRows(key, data) {
   data = shownReading(data);
   const [kind, index] = key.split(':');
+  if (kind === 'aws-cost') return awsCostTip(index);
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
@@ -1639,11 +2077,168 @@ let reportStamp = "";
 function reportDate(value, zone) {
   return new Date(value).toLocaleDateString("en-US", {timeZone: zone, month: "short", day: "numeric", year: "numeric"});
 }
+function awsCurrentNote(row, today, recordsStart) {
+  if (!row.days.some(day => day.day === today)) return "";
+  if (row.period === "day") return "today, so far";
+  if (row.period === "week") return "this week, so far";
+  const label = row.period === "month" ? "so far" : "year to date";
+  if (recordsStart == null || recordsStart <= awsIso(row.start)) return label;
+  return `${label}, from ${AWS_SHORT_DAY.format(awsDate(recordsStart))}`;
+}
+function awsHistoryRow(row, depth, costs, largest, openPeriods, tips) {
+  const name = awsPeriodName(row), note = awsCurrentNote(row, costs.today, costs.records_start);
+  const open = openPeriods.get(row.id) ?? (depth === 0 && note !== "");
+  const indent = depth * 26;
+  tips.set(row.id, awsDateRange(name, row.start, row.end));
+  const parts = Object.keys(AWS_STATES).filter(state => row.states.has(state));
+  const states = parts.map(state => {
+    const {days, cents} = row.states.get(state);
+    return awsState(state, row.period === "day" ? "" :
+      ` <span class="aws-dim">· ${days} ${days === 1 ? "day" : "days"} · ${awsMoney(cents, state === "estimate")}</span>`);
+  }).join("") || awsState("none");
+  const segments = parts.map(state =>
+    `<i class="${state}" style="width:${awsPercent(row.states.get(state).cents, largest[row.period])}%"></i>`).join("");
+  let children = "";
+  if (open) {
+    if (row.period === "day") {
+      const day = row.days[0];
+      children = `<tr><td class="aws-detail-cell" colspan="5" style="padding-left:${indent + 30}px">
+        ${awsDayDetail(day, costs.price_day, awsRunViews.get(day.day), awsUnitStart)}</td></tr>`;
+    } else {
+      const lower = AWS_PERIODS[row.period][2];
+      children = awsPeriods(lower, row.days, row).map(child =>
+        awsHistoryRow(child, depth + 1, costs, largest, openPeriods, tips)).join("");
+    }
+  }
+  return `<tr data-period="${row.id}">
+    <td class="aws-period" style="padding-left:${indent}px"><button type="button" class="aws-toggle" aria-expanded="${open}"
+      data-tip="aws-cost:${row.id}"><span class="aws-chev" aria-hidden="true"></span><span class="aws-point">${name}</span></button>${note ? `<small class="aws-dim">${note}</small>` : ""}</td>
+    <td class="num${row.runs ? "" : " aws-dim"}">${row.runs || row.cents != null ? awsCount(row.runs) : "no record"}</td>
+    <td class="num"><strong>${awsAmount(row)}</strong></td>
+    <td class="aws-bar-cell"><span class="aws-bar" aria-hidden="true">${segments}</span></td>
+    <td class="aws-states">${states}</td></tr>${children}`;
+}
+function awsHistoryRows(view, costs, periods, largest, openPeriods, tips, showAll) {
+  const shown = view === "day" && !showAll ? periods.slice(0, AWS_HISTORY_DAYS) : periods;
+  return shown.map(row => awsHistoryRow(row, 0, costs, largest, openPeriods, tips)).join("") ||
+    '<tr><td colspan="5">no record</td></tr>';
+}
+function renderAwsHistory() {
+  const {groups, largest} = awsCostGroups;
+  awsPeriodTips.clear();
+  $("aws-period-head").textContent = AWS_PERIODS[awsCostView][1];
+  $("aws-history-rows").innerHTML = awsHistoryRows(awsCostView, awsCostReport, groups[awsCostView], largest,
+    awsCostOpen.get(awsCostView), awsPeriodTips, awsShowAll);
+  const older = $("aws-older"), extra = groups.day.length - AWS_HISTORY_DAYS;
+  older.hidden = awsCostView !== "day" || extra <= 0;
+  older.textContent = awsShowAll ? "Show fewer days" : `Show ${extra} older ${extra === 1 ? "day" : "days"}`;
+}
+function renderAwsCosts(costs) {
+  awsCostReport = costs?.limits && costs?.today ? costs : null;
+  awsLimitTips.clear();
+  awsPeriodTips.clear();
+  const read = $("aws-cost-read"), content = $("aws-cost-content");
+  read.hidden = !awsCostReport;
+  if (!awsCostReport) {
+    content.textContent = "no record";
+    return;
+  }
+  awsZone = costs.zone;
+  awsUnitStart = awsFirstUnitDay(costs.days);
+  read.textContent = costs.read_at == null ? "AWS amounts not read yet" :
+    `AWS amounts read ${awsDateTime(new Date(costs.read_at * 1000))}`;
+  const groups = Object.fromEntries(Object.keys(AWS_PERIODS).map(period => [period, awsPeriods(period, costs.days)]));
+  const largest = Object.fromEntries(Object.entries(groups).map(([period, rows]) =>
+    [period, rows.reduce((max, row) => Math.max(max, row.cents ?? 0), 0)]));
+  awsCostGroups = {groups, largest};
+  const month = groups.month.find(row => row.id === "month-" + costs.today.slice(0,7) + "-01") ?? awsSum([]);
+  const key = Object.entries(AWS_STATES).reverse().map(([state, [,meaning]]) =>
+    `<span class="aws-key-item">${awsState(state)}<span>${meaning}</span></span>`).join("");
+  const controls = Object.entries(AWS_PERIODS).map(([period, [name]]) =>
+    `<button type="button" data-aws-view="${period}" aria-pressed="${period === awsCostView}">${name}</button>`).join("");
+  const records = costs.records_start == null ? "" :
+    `<p class="aws-note">Records start ${awsDayName(awsDate(costs.records_start))}, ${costs.records_start.slice(0,4)}.
+      The pane has no amounts before that day.</p>`;
+  const kept = costs.kept ? `<p class="aws-note aws-kept">Kept resources now cost ${awsMoney(awsCents(costs.kept.month_usd))} each month${costs.kept.items.length ?
+    ": " + costs.kept.items.map(item => `${esc(item.name)} ${awsMoney(awsCents(item.month_usd))}`).join(", ") : ""}.
+    These costs continue when no run is active.</p>` : "";
+  content.innerHTML = `<p class="aws-note aws-rule">Each day on this pane is <b>one AWS bill day</b>. AWS counts days in <b>UTC</b>.
+    ${awsDayRule(costs.today)} Weeks, months and the year are sums of these days.</p>
+    ${awsCostTiles(costs, month, awsLimitTips)}
+    <div class="aws-history"><div class="aws-history-head"><h3>History</h3>
+      <div class="filter" role="group" aria-label="Period of each row">${controls}</div></div>
+      <div class="aws-key aws-dim">${key}</div>
+      <div class="aws-scroll" tabindex="0" aria-label="AWS cost history">
+        <table class="aws-table aws-history-table"><thead><tr><th scope="col" class="aws-period" id="aws-period-head"></th>
+        <th scope="col" class="num">Runs</th><th scope="col" class="num">Amount</th>
+        <th scope="col" class="aws-bar-cell" aria-label="Relative amount"></th><th scope="col" class="aws-states">State</th></tr></thead>
+        <tbody id="aws-history-rows"></tbody></table>
+      </div><button type="button" class="aws-more" id="aws-older" hidden></button>${records}</div>${kept}`;
+  renderAwsHistory();
+}
+$("aws-costs").addEventListener("click", event => {
+  const dayDetail = event.target.closest("[data-aws-day]");
+  if (dayDetail) {
+    if (event.target.closest("[data-aws-csv]")) {
+      downloadAwsRuns(awsCostReport);
+      return;
+    }
+    const groupBy = event.target.closest("[data-aws-group-by]");
+    const group = event.target.closest("tr[data-aws-group]");
+    if (!groupBy && !group) return;
+    const date = dayDetail.dataset.awsDay;
+    const day = awsCostReport.days.find(row => row.day === date);
+    const view = awsRunViews.get(date) ?? awsNewRunView();
+    if (groupBy) {
+      if (view.groupBy === groupBy.dataset.awsGroupBy) return;
+      view.groupBy = groupBy.dataset.awsGroupBy;
+      view.openGroups.clear();
+      for (const control of groupBy.parentElement.children) {
+        control.setAttribute("aria-pressed", String(control === groupBy));
+      }
+    } else {
+      const key = group.dataset.awsGroup;
+      if (!view.openGroups.delete(key)) view.openGroups.add(key);
+    }
+    awsRunViews.set(date, view);
+    const content = dayDetail.querySelector(".aws-run-content");
+    const focused = group?.contains(document.activeElement);
+    content.innerHTML = awsDayRuns(day, view);
+    if (focused) {
+      content.querySelector(`[data-aws-group="${CSS.escape(group.dataset.awsGroup)}"] button`)?.focus({preventScroll:true});
+    }
+    return;
+  }
+  const button = event.target.closest("[data-aws-view]");
+  if (button) {
+    if (button.dataset.awsView === awsCostView) return;
+    awsCostView = button.dataset.awsView;
+    for (const control of button.parentElement.children) {
+      control.setAttribute("aria-pressed", String(control === button));
+    }
+  } else if (event.target.closest("#aws-older")) {
+    awsShowAll = !awsShowAll;
+  } else {
+    const row = event.target.closest("tr[data-period]");
+    if (!row) return;
+    const toggle = row.querySelector(".aws-toggle");
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    awsCostOpen.get(awsCostView).set(row.dataset.period, !open);
+    const focused = document.activeElement === toggle;
+    hideTip();
+    renderAwsHistory();
+    if (focused) document.querySelector(`[data-tip="${toggle.dataset.tip}"]`)?.focus({preventScroll:true});
+    return;
+  }
+  hideTip();
+  renderAwsHistory();
+});
 function renderReport(report) {
   const stamp = JSON.stringify(report);
   if (stamp === reportStamp) return;
   const view = captureReportView();
   reportStamp = stamp;
+  renderAwsCosts(report?.aws_costs);
   if (!report || report.kind === "IndexUnavailable") {
     const reason = report?.reason || "Report data unavailable";
     $("top-costs").textContent = reason;

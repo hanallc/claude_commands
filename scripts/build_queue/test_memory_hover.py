@@ -3,8 +3,10 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import unittest
@@ -43,6 +45,78 @@ def step_text(element: ElementTree.Element, path: str) -> str:
     cell = element.find(path)
     assert cell is not None
     return "".join(cell.itertext())
+
+
+def aws_cost_fixture() -> dict[str, object]:
+    """Supply the same bill days to the page checks and the browser proof."""
+    def money(cents: int) -> str:
+        return f"{cents // 100}.{cents % 100:02}"
+
+    prices: tuple[tuple[str, int | None, int], ...] = (
+        ("estimate", 525, 193), ("estimate", 903, 359), ("billed", 253, 169),
+        ("billed", 306, 214), ("billed", 471, 359), ("billed", 397, 216),
+        ("billed", 835, 276), ("billed", 1319, 347), ("billed", 1029, 342),
+        ("billed", 617, 145), ("billed", 1422, 325), ("billed", 770, 42),
+        ("billed", 687, 0), ("final", 367, 0), ("billed", 286, 0),
+        ("billed", 260, 0), ("none", None, 0), ("billed", 0, 0),
+    )
+    days: list[dict[str, object]] = []
+    no_run_costs = {19: 127, 18: 128, 17: 37}
+    for number, (state, cents, count) in zip(range(19, 1, -1), prices, strict=True):
+        start = int(datetime(2026, 11, number, 9, 7, tzinfo=UTC).timestamp())
+        no_run = no_run_costs.get(number, min(cents or 0, 56)) if count else cents or 0
+        unrecorded_compute = 424 if number == 7 else 0
+        if number == 7:
+            no_run -= 103 + unrecorded_compute
+        work_cost = (cents or 0) - no_run if count else 0
+        work: list[tuple[str | None, int, int]] = (
+            [("integrate", 84, 152), ("test all", 35, 62), ("test named", 8, 13),
+             ("test affected", 58, 91), ("test nightly", 1, 2)] if number == 19 else
+            [(None, count, work_cost)] if count else [])
+        hana: dict[str, object] | None = {
+            "runs": 7, "cost_usd": "0.78", "per_run_usd": "0.07", "idle_usd": "0.30", "idle_seconds": 8575,
+        } if number == 19 else {
+            "runs": 0, "cost_usd": "1.03", "per_run_usd": "0.00", "idle_usd": "1.03", "idle_seconds": None,
+        } if number == 7 else None
+        runs: list[dict[str, object]] = []
+        hana_work: list[tuple[str | None, int, int]] = [(None, 7, 48)] if number == 19 else []
+        for kind, (job, jobs, cost) in [("gate", row) for row in work] + [("hana", row) for row in hana_work]:
+            offset = len(runs)
+            group_start = start - offset * 20
+            cents_per_run, remainder = divmod(cost, jobs)
+            east = job != "test all"
+            region = "us-east-1" if east else "us-west-2"
+            runs.extend({"id": f"{number}-{offset + index}", "start": group_start - index * 20,
+                         "job": job, "unit": "report" if job == "integrate" else None,
+                         "kind": kind, "region": region, "zone": region + "a" if job else None,
+                         "machine": "c7i.8xlarge" if east else "m7a.8xlarge",
+                         "mode": "Spot" if east else "On-Demand",
+                         "seconds": index if kind == "hana" else 574,
+                         "cost_usd": money(cents_per_run + int(index < remainder))}
+                        for index in range(jobs))
+        if number in (17, 18):
+            split_start = int(datetime(2026, 11, 18, tzinfo=UTC).timestamp())
+            runs[0].update(id="midnight", start=split_start - (60 if number == 17 else 0), seconds=60)
+        days.append({
+            "day": f"2026-11-{number:02}", "state": state,
+            "amount_usd": money(cents) if cents is not None else None,
+            "runs": count,
+            "jobs": [{"job": job, "runs": jobs, "cost_usd": money(cost),
+                      "per_run_usd": money((cost + jobs // 2) // jobs)} for job, jobs, cost in work],
+            "hana": hana, "units": [
+                {"unit": "report", "runs": 84, "cost_usd": "1.52"},
+                {"unit": None, "runs": 109, "cost_usd": "2.46"},
+            ] if number == 19 else [{"unit": None, "runs": count, "cost_usd": money(
+                work_cost if count else 103)}] if count or number == 7 else [],
+            "unrecorded_compute_usd": money(unrecorded_compute), "no_run_usd": money(no_run), "runs_list": runs,
+        })
+    return {"zone": "America/New_York", "read_at": int(datetime(2026, 11, 18, 18, 43, tzinfo=UTC).timestamp()),
+            "next_read_at": int(datetime(2026, 11, 19, 17, 43, tzinfo=UTC).timestamp()), "read_error": None,
+            "price_day": "2026-11-17", "records_start": "2026-11-02", "today": "2026-11-19",
+            "limits": {"day_usd": "35.00", "month_usd": "400.00", "reserve_usd": "3.00"},
+            "days": days, "kept": {"month_usd": "28.20", "items": [
+                {"name": "Hana data disk", "month_usd": "27.20"},
+                {"name": "shared storage for AWS runs", "month_usd": "1.00"}]}}
 
 
 class MemoryHoverTests(unittest.TestCase):
@@ -1170,10 +1244,199 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
+    def test_aws_cost_hover_uses_the_label_and_value_grid(self) -> None:
+        cases = (
+            ("(awsCostTiles(data, awsSum(data.days), awsLimitTips), tooltipHtml('aws-cost:day-limit', data))",
+             [("Daily limit", ""), ("Limit", "$35.00"), ("New work stops at", "$32.00"),
+              ("Starts again", "Thu Nov 19, 7:00 PM EST")]),
+            ("(awsCostTiles(data, awsSum(data.days), awsLimitTips), tooltipHtml('aws-cost:month-limit', data))",
+             [("Monthly limit", ""), ("Limit", "$400.00"), ("New work stops at", "$397.00"),
+              ("Starts again", "Mon Nov 30, 7:00 PM EST")]),
+            ("(awsPeriodTips.set('day', awsDateRange('Sun Nov 1', awsDate('2026-11-01'),"
+             + " awsDate('2026-11-02'))), tooltipHtml('aws-cost:day', data))",
+             [("Sun Nov 1 (UTC)", ""), ("Starts", "Sat Oct 31, 8:00 PM EDT"), ("Ends", "Sun Nov 1, 7:00 PM EST")]),
+        )
+        for expression, expected in cases:
+            with self.subTest(title=expected[0]):
+                grid = ElementTree.fromstring(str(self.page_expression(expression, aws_cost_fixture(), walk=True)))
+                self.assertEqual((grid.tag, grid.get("class")), ("dl", "tip"))
+                labels, values = grid.findall("dt"), grid.findall("dd")
+                self.assertEqual((labels[0].get("class"), values[0].get("class")), ("title", "title"))
+                fields = [(label.text or "", value.text or "") for label, value in zip(labels, values, strict=True)]
+                self.assertEqual(fields, expected)
+
+    def test_aws_cost_breakdowns_use_bill_day_states_and_recorded_job_and_unit_names(self) -> None:
+        estimate, units, billed, no_attempt, older, zero = cast(list[str], self.page_expression(
+            "[awsDayDetail(data.days[0], data.price_day, {groupBy:'job', openGroups:new Set(['[\"hana\"]'])}),"
+            + " awsDayRuns(data.days[0], {groupBy:'unit', openGroups:new Set()}),"
+            + " awsDayDetail(data.days[2], data.price_day),"
+            + """ awsDayDetail(data.days[12], data.price_day, {groupBy:'job', openGroups:new Set(['["hana"]'])}),"""
+            + " awsDayDetail(data.days[16], data.price_day), awsDayDetail(data.days[17], data.price_day)]",
+            aws_cost_fixture(), walk=True))
+        for words in ("Hana check and lint", "integrate", "For one run", "Run time", "Group by", "Download CSV",
+                      "us-east-1", "c7i.8xlarge", "Spot", "9 min 34 s", "newest AWS amount (Nov 17)", "~$5.25", "~$1.27"):
+            self.assertIn(words, estimate)
+        self.assertIn("<td class=\"num\">~$1.52</td><td class=\"num\">~$0.018</td>", estimate)
+        self.assertIn('Hana check and lint</button></td><td class="num">7</td><td class="num">21 s</td>'
+                      + '<td class="num">~$0.78</td><td class="num">—</td>', estimate)
+        self.assertRegex(estimate, r'Hana machine with no run</td>.*<td class="num">2 h 22 min 55 s</td>.*~\$0\.30</td>')
+        self.assertRegex(estimate, r'Total</td><td class="num">193</td><td class="num">29 h 39 min 45 s</td>')
+        self.assertIn('Unit not recorded</button><span class="aws-dim aws-hint">Run records before this release have no unit.',
+                      units)
+        self.assertRegex(units, r'Hana machine with no run</td>.*<td class="num">2 h 22 min 55 s</td>.*~\$0\.30</td>')
+        self.assertRegex(units, r'Costs with no run.*<td class="num">~\$1\.27</td>')
+        self.assertIn("Job not recorded", billed)
+        self.assertNotIn("Our estimate before the AWS amount", billed)
+        self.assertNotIn("Start (Eastern)", billed)
+        self.assertIn('Hana check and lint</button></td><td class="num">—</td><td class="num">—</td>', no_attempt)
+        self.assertRegex(no_attempt, r'Hana machine with no run</td>.*<td class="num">—</td>.*\$1\.03</td>')
+        self.assertRegex(no_attempt, r'Compute with no run record</td>.*\$4\.24</td>')
+        self.assertRegex(no_attempt, r'Costs with no run.*<td class="num">\$1\.60</td>')
+        self.assertNotIn("with no run", zero)
+        self.assertIn("no record", older)
+        for detail in (estimate, billed, older):
+            self.assertNotRegex(detail, r"(?i)\bgate\b|targeted test")
+
+    def test_aws_cost_day_with_no_unit_leaves_out_the_unit_column_and_names_the_first_unit_day(self) -> None:
+        first, no_first, no_unit, no_unit_job, unit_day, no_record = cast(list[str], self.page_expression(
+            "[awsFirstUnitDay(data.days), awsFirstUnitDay(data.days.slice(1)),"
+            + " awsDayDetail(data.days[2], data.price_day, {groupBy:'none', openGroups:new Set()}, '2026-11-19'),"
+            + """ awsDayRuns(data.days[2], {groupBy:'job', openGroups:new Set(['["job",null]'])}),"""
+            + " awsDayDetail(data.days[0], data.price_day, {groupBy:'none', openGroups:new Set()}, '2026-11-19'),"
+            + " awsDayDetail(data.days[2], data.price_day, undefined, null)]",
+            aws_cost_fixture(), walk=True))
+        hana_only, no_run, no_run_no_first = cast(list[str], self.page_expression(
+            "[awsDayDetail({...data.days[0], day:'2026-11-20', runs_list:data.days[0].runs_list.filter(run => run.kind === 'hana')},"
+            + " data.price_day, undefined, '2026-11-19'),"
+            + " awsDayDetail({...data.days[2], day:'2026-11-21', runs:0, runs_list:[]}, data.price_day, undefined, '2026-11-19'),"
+            + " awsDayDetail({...data.days[2], runs:0, runs_list:[]}, data.price_day, undefined, null)]",
+            aws_cost_fixture(), walk=True))
+        self.assertEqual((first, no_first), ("2026-11-19", None))
+        for detail in (no_unit, no_unit_job):
+            self.assertNotIn(">Unit</th>", detail)
+            self.assertNotIn("Unit not recorded", detail)
+            # Each run row has one cell for each header.
+            table = detail[detail.index('<table class="aws-table"><thead>', detail.index("aws-run-scroll")):]
+            row = table[table.index("<tbody>"):table.index("</tr>", table.index("<tbody>"))]
+            self.assertEqual(row.count("<td"), table[:table.index("</thead>")].count("<th "))
+        self.assertNotIn('data-aws-group-by="unit"', no_unit)
+        self.assertIn('<p class="aws-note aws-unit-note">Runs before Thu Nov 19 have no unit record.</p>', no_unit)
+        self.assertIn(">Unit</th>", unit_day)
+        self.assertIn('data-aws-group-by="unit"', unit_day)
+        self.assertNotIn("no unit record", unit_day)
+        self.assertIn('<p class="aws-note aws-unit-note">Runs have no unit record.</p>', no_record)
+        # A Hana-only day and a day with no run have no unit line.
+        for detail in (hana_only, no_run, no_run_no_first):
+            self.assertNotIn("aws-unit-note", detail)
+
+    def test_aws_cost_hana_idle_row_shows_the_machine_time_with_no_run(self) -> None:
+        details = cast(list[str], self.page_expression(
+            "[data.days[0], data.days[12], {...data.days[12], hana:{...data.days[12].hana, idle_seconds:3521}}]"
+            + """.map(day => awsDayRuns(day, {groupBy:'job', openGroups:new Set(['["hana"]'])}))""",
+            aws_cost_fixture(), walk=True))
+        cells = r"((?:<td[^>]*>[^<]*</td>)+)</tr>"
+        # The cell before the cost is the Time on AWS cell of the idle row, and the Run time cell of the group row.
+        idle = [re.findall(r"<td[^>]*>([^<]*)</td>", match[1])[-2] if (match := re.search(
+            "<td>Hana machine with no run</td>" + cells, detail)) else None for detail in details]
+        group = [re.findall(r"<td[^>]*>([^<]*)</td>", match[1])[1] if (match := re.search(
+            "Hana check and lint</button></td>" + cells, detail)) else None for detail in details]
+        self.assertEqual(idle, ["2 h 22 min 55 s", "—", "58 min 41 s"])
+        # A group with no run has no run time, as other groups with no run.
+        self.assertEqual(group, ["21 s", "—", "—"])
+
+    def test_aws_cost_times_use_the_user_zone(self) -> None:
+        for zone, rule, start, header in (
+            ("America/Los_Angeles", "In Pacific time, a day starts at <b>4:00 PM on the day before</b> and ends at 4:00 PM.",
+             "Sun Nov 22, 4:00 PM PST", "Start (Pacific)"),
+            ("America/New_York", "In Eastern time, a day starts at <b>7:00 PM on the day before</b> and ends at 7:00 PM.",
+             "Sun Nov 22, 7:00 PM EST", "Start (Eastern)"),
+            ("Europe/Berlin", "In Central European time, a day starts at <b>1:00 AM</b> and ends at 1:00 AM on the next day.",
+             "Mon Nov 23, 1:00 AM GMT+1", "Start (Central European)"),
+        ):
+            with self.subTest(zone=zone):
+                actual = cast(list[str], self.page_expression(
+                    "[awsDayRule('2026-11-23'), awsDateTime(awsDate('2026-11-23')), awsRunHeaders()[0]]",
+                    {"zone": zone}))
+                self.assertEqual([" ".join(actual[0].split()), *actual[1:]], [rule, start, header])
+
+    def test_aws_cost_tile_names_a_late_read_and_its_recorded_error(self) -> None:
+        read_at = int(datetime(2026, 11, 19, 21, 43, tzinfo=UTC).timestamp())
+        due_at = read_at + 86400
+        cases = (
+            (due_at - 60, None, "The next AWS read is due Fri Nov 20, 1:43 PM PST"),
+            (due_at + 60, None, "No AWS read since Nov 19"),
+            (due_at + 60, "AWS refuses the key", "No AWS read since Nov 19: AWS refuses the key"),
+        )
+        for now, error, expected in cases:
+            with self.subTest(expected=expected):
+                actual = self.page_expression(f"(Date.now = () => {now * 1000}, awsNextRead(data))", {
+                    "zone": "America/Los_Angeles", "read_at": read_at, "next_read_at": due_at, "read_error": error},
+                    walk=True)
+                self.assertEqual(actual, expected)
+
+    def test_aws_cost_history_shows_zero_runs_as_a_count(self) -> None:
+        days: list[dict[str, object]] = [{"day": "2026-11-21", "state": "estimate", "amount_usd": "1.21", "runs": 0, "runs_list": []},
+                {"day": "2026-11-20", "state": "none", "amount_usd": None, "runs": 0, "runs_list": []},
+                {"day": "2026-11-19", "state": "none", "amount_usd": None, "runs": 5, "runs_list": []}]
+        cells = cast(list[str], self.page_expression(
+            "awsPeriods('day', data.days).map(row => awsHistoryRow(row, 0, data, {day:121}, new Map(), new Map())"
+            + ".match(/<td class=\"num[^\"]*\">([^<]*)<\\/td>/)[1])",
+            {"zone": "America/New_York", "today": "2026-11-21", "records_start": "2026-11-19", "price_day": None,
+             "days": days}, history=True))
+        self.assertEqual(cells, ["0", "no record", "5"])
+
+    def test_aws_cost_csv_joins_run_parts_across_bill_days(self) -> None:
+        fixture = aws_cost_fixture()
+        csv_text = cast(str, self.page_expression("awsRunsCsv(data.days)", fixture, walk=True))
+        # The run that crosses midnight has one part on Nov 17 and one on Nov 18. Its CSV row costs both parts.
+        parts = [run for day in cast(list[dict[str, list[dict[str, object]]]], fixture["days"])
+                 for run in day["runs_list"] if run["id"] == "midnight"]
+        joined_cents = sum(round(float(str(run["cost_usd"])) * 100) for run in parts)
+        self.assertEqual((len(parts), joined_cents), (2, 5))
+        lines = csv_text.splitlines()
+        self.assertEqual(lines[0], '"UTC day","Start (Eastern)","Job","Unit","Region","Zone","Machine type",'
+                                    + '"Time on AWS (seconds)","Cost (USD)","Mode"')
+        self.assertEqual(len(lines), 2987)
+        self.assertTrue(lines[1].startswith('"2026-11-19","2026-11-19T04:07:00-05:00",'))
+        self.assertIn('"integrate","report","us-east-1","us-east-1a","c7i.8xlarge",574,0.02,"Spot"', lines[1])
+        self.assertRegex(csv_text, r'"m7a\.8xlarge",574,\d+\.\d{2},"On-Demand"')
+        self.assertIn('"2026-11-17","2026-11-17T18:59:00-05:00","","","us-east-1","","c7i.8xlarge",120,0.05,"Spot"',
+                      lines)
+        self.assertIn('"2026-11-08"', lines[-1])
+        self.assertNotIn("Costs with no run", csv_text)
+        self.assertNotIn("Hana machine with no run", csv_text)
+
+    def test_aws_cost_period_sums_use_utc_weeks_and_clip_a_week_under_its_month(self) -> None:
+        actual = self.page_expression("""(() => {
+          const totals = rows => rows.map(row => [awsPeriodName(row), awsAmount(row), row.runs]);
+          const months = awsPeriods('month', data.days);
+          return {
+            weeks: totals(awsPeriods('week', data.days)),
+            months: totals(months),
+            years: totals(awsPeriods('year', data.days)),
+            clipped: months.map(month => totals(awsPeriods('week', month.days, month))),
+          };
+        })()""", {"days": [
+            {"day": "2027-01-02", "amount_usd": "0.30", "runs": 2, "state": "estimate"},
+            {"day": "2027-01-01", "amount_usd": "0.00", "runs": 0, "state": "billed"},
+            {"day": "2026-12-31", "amount_usd": "0.10", "runs": 3, "state": "final"},
+            {"day": "2026-12-30", "amount_usd": None, "runs": 0, "state": "none"},
+            {"day": "2026-12-27", "amount_usd": "0.20", "runs": 1, "state": "billed"},
+        ]}, walk=True)
+        self.assertEqual(actual, {
+            "weeks": [["Dec 28 to Jan 3", "~$0.40", 5], ["Dec 21 to Dec 27", "$0.20", 1]],
+            "months": [["January 2027", "~$0.30", 2], ["December 2026", "$0.30", 4]],
+            "years": [["2027", "~$0.30", 2], ["2026", "$0.30", 4]],
+            "clipped": [[["Jan 1 to Jan 3", "~$0.30", 2]],
+                        [["Dec 28 to Dec 31", "$0.10", 3], ["Dec 21 to Dec 27", "$0.20", 1]]],
+        })
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
-                        limits: bool = False) -> object:
+                        limits: bool = False, history: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
+        if history:
+            functions += html[html.index("function awsCurrentNote("):html.index("function renderAwsCosts(")]
         constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
@@ -1195,6 +1458,7 @@ function fitLabels() {}
             functions += html[start:html.index('document.addEventListener("click", (e) => {', start)]
             constants += "function placeLimitLabels() {}\nconst document = {querySelectorAll: () => []};\n"
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
+            "if (data.zone) awsZone = data.zone;\n") + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         payload: dict[str, object] = {"walk": [], "waiters": [], "swap_by": [], "ram": RAM_FIXTURE,
