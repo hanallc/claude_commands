@@ -3,6 +3,11 @@
 #
 # Usage:
 #   verify <command> [<package>] [flags]
+#   verify test,lint,doc [<package>]
+#
+# A verb list accepts test, lint, and doc once each, in any order.
+# Give one package or omit it for the workspace.
+# On Linux, the verbs share a run identity. The first failure ends the list.
 #
 # Commands:
 #   check [<package>]      check every workspace target, test code included
@@ -511,6 +516,24 @@ fi
 # Read-only queries run before environment setup and build admission.
 VERIFY_QUERY_ARGS=("$@")
 [[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
+VERIFY_VERBS=()
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
+    verify_list_verbs='test|lint|doc'
+    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^($verify_list_verbs)(,($verify_list_verbs))+$ ||
+            ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ]]; then
+        echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
+        exit 2
+    fi
+    IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
+    seen_verbs=,
+    for verb in "${VERIFY_VERBS[@]}"; do
+        if [[ "$seen_verbs" == *",$verb,"* ]]; then
+            printf 'verify.sh: repeated verb: %s\n' "$verb" >&2
+            exit 2
+        fi
+        seen_verbs+="$verb,"
+    done
+fi
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
     exit 2
@@ -545,6 +568,9 @@ if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" ]] &&
 fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
+    if [[ -f "$VERIFY_REPO_ROOT/scripts/copies/copies.py" ]]; then
+        printf '%s\n' 'claude_commands: run tests with copies.py --affected or --module' >&2
+    fi
     exit 2
 fi
 # Create the inherited temporary parent before environment commands use it.
@@ -607,6 +633,37 @@ remove_tool_folder() {
     verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || status=$?
     (( status <= 2 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
     return 0
+}
+
+# shellcheck disable=SC2329 # The EXIT trap calls this function.
+finish_verify_verb_list() {
+    local status=$1 child=${!:-}
+    # Use the interrupted status when Bash reports no signal status to EXIT.
+    if (( status == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then status=128; fi
+    if [[ -n "$child" && "$child" != "$VERIFY_VERB_PREVIOUS_JOB" ]]; then collect_child "$child" TERM; fi
+    finish_verify_run "$status"
+    exit "$status"
+}
+
+run_verify_verbs() {
+    local verb status
+    # Close the startup helper before the children open their own helpers.
+    exec 70>&- 71<&-
+    unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
+    [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
+    VERIFY_VERB_PREVIOUS_JOB=${!:-}
+    trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
+    for verb in "${VERIFY_VERBS[@]}"; do
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" "$verb" "$@" <&0 &
+        status=0
+        wait "$!" || status=$?
+        VERIFY_VERB_PREVIOUS_JOB=$!
+        (( status == 0 )) || exit "$status"
+        # A request probe prepares only the first step for its caller.
+        [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || break
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        unset BUILDLOG_FIRST_STEP_EPISODE BUILDLOG_FIRST_STEP_PID
+    done
 }
 
 # One parent-owned helper serves command substitutions and cleanup traps.
@@ -1545,6 +1602,7 @@ fi
 CMD="${1:-}"
 case "$CMD" in
     check|test|lint|doc|build|example|final|example-test) ;;
+    *,*) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -1572,14 +1630,15 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != 
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
-if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
-    BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
-    if [[ -n "$BUILDLOG_RUN_START" ]]; then
-        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
-    fi
-fi
+# shellcheck source=/dev/null
+source "$VERIFY_START_DIR/../lib/buildlog_run.sh"
+buildlog_initialize_run verify_helper "$STEP_RECORD_SCRIPT"
 
 shift
+if (( ${#VERIFY_VERBS[@]} )); then
+    run_verify_verbs "$@"
+    exit 0
+fi
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
     exit 2
@@ -2344,7 +2403,7 @@ try_mac_test() {
     LAST_TARGET_OUTCOME="" LAST_TARGET_REASON=""
     selected_target=$(target_for_settings "$1")
     if [[ "$(target_platform "$selected_target")" == macos ]]; then selected_is_mac=1; fi
-    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
     MAC_PASSED=0
     local caller_traps
     caller_traps="$(trap -p INT TERM HUP)"
@@ -2519,7 +2578,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
         if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else
             BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
-            step_state waiting_ssh
+            step_state waiting_ssh "$selected_target"
         fi
         return
     fi
@@ -2552,7 +2611,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
                 exit 2
             fi
-            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
             return
             ;;
         failed|prelaunch_failed)

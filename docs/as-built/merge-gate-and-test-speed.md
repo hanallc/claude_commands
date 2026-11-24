@@ -107,7 +107,10 @@ A second decline from the guest in the same run ends the guest for that run, so 
 If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
 A failure after the first test started is not placed again: the gate fails.
-`copies.py run` with named gate targets does not place the gate again yet.
+`copies.py run` does not place a gate again after a guest decline.
+Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
@@ -117,19 +120,20 @@ If AWS refuses that unassigned run, natedev runs the selection.
 
 On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.
 The rule set is in `scripts/build_targets/mac_linux.py` (`limit_words`), because the guest runner can read only that module; `scripts/production/hand_made_limit.py` adds the natedev paths.
-The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
-A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
+The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
+The read limit sets `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` to empty strings on both routes. It removes `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE` and `SCCACHE_SERVER_UDS`. It adds no sccache cache bind. Hand made Cargo builds compile cold without sccache.
+The read limit hides `~/.ssh`, the SSH agent and `~/.config/git`.
 The system folders are `/nix/store`, `/usr`, `/bin`, `/sbin`, `/run/current-system` and `/etc`; a missing one is not bound.
 The root of the limit is read only, and each entry under `/etc`, `/bin`, `/usr` and `/sbin` that root does not own is hidden.
 The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
 For a `cargo` run, `hand_made_limit.start_refusal` (the natedev check at the attempt start) and `NatedevRun.run` (before the program starts) call `hand_made_limit.held_output` before the limit checks the output folder, so the limit binds the target link that the steps repair. The lock of the start check ends with that check. `held_output` runs `cargo_folder.checked_step` with the program environment, the code of the wrapper `--exec-checked` route. That code makes or checks the `target` link to the assigned build folder, holds the build folder lock until the program ends, and writes the use stamp. The lock is exclusive only while the step makes the folder and the link; then it is shared, so a parallel cargo step in the checkout runs. The program also gets the lock descriptor, as the wrapper gives it to cargo.
-`held_output` does the steps only when `cargo_folder.folder_step_due` gives true, the rule of the wrapper: a build subcommand other than `install`, no help or version word, and no `CARGO_FOLDER_CHECKED=1` or `BUILDLOG_STEP_SCOPE` in the environment of `hand_made.py`. The value option and build subcommand lists are one line each in the wrapper, and `cargo_folder.wrapper_words` reads them, so the wrapper starts no python for a word that is not a build subcommand.
+`held_output` does the steps only when `cargo_folder.folder_step_due` gives true, the rule of the wrapper: a build subcommand other than `install`, no help or version word, no `CARGO_FOLDER_CHECKED=1` in the environment of `hand_made.py`, and no `BUILDLOG_STEP_SCOPE` equal to the cgroup folder of `hand_made.py`. A value from another scope is stale and does not skip the steps. The value option and build subcommand lists are one line each in the wrapper, and `cargo_folder.wrapper_words` reads them, so the wrapper starts no python for a word that is not a build subcommand.
 With `folders.check=report`, the live value, a path outside the build folders gives one stderr note at the run start, not at the attempt start check, and the run goes on; an unassigned checkout holds no lock. With `enforce`, it is a refusal. Each other check error, and each refusal under `enforce`, ends the attempt with no run (`FOLDER_STEP_REFUSAL`).
 The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
-natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
+natedev refuses a run when a path that it writes (the checkout, the cargo folders or the output folder) holds, or is in, a tool folder.
 The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
 When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
-When the first word is `cargo` and its first match on `PATH` is the build-hold cargo wrapper of the checker repository, outside the checkout (`hand_made.installed_wrapper`), the check and the run take the next match that is not the wrapper (`hand_made.exec_path`), as the wrapper does in the `builds.slice` scope of the run. `run_attempt` finds this start file once and gives it to the check and to the run. The run starts that file by its path, so the wrapper does not run. The wrapper stays the start file and a program file, which the model reads, when there is no next match and for the wrapper of a unit worktree. It also stays the start file for a later word `clean`, because the real `cargo clean` can remove the assigned build folder; `checked_files` then refuses the run before the model call (`CLEAN_REFUSAL`), because the wrapper clean rule needs files that the read limit hides. For a checkout that is the checker repository, the wrapper is in the checkout, so the write path refusal below ends the attempt before the model call. A later word `cargo` reads the wrapper and each later match that is a program file. The run-start check finds the start file again with `exec_path` and refuses a different one, and names the old and the new start file. A `PATH` folder, a start file from `PATH`, a start file named with a slash that is not a checkout file, or a `PATH` match of a later word, whose real path is in a path that the run writes (the checkout, the cargo registry and git folders, `SCCACHE_DIR` or the output folder), is refused (`write_refusal`; `checked_files` finds these paths once with `written_paths`). The limit does not bind the wrapper folder or its `lib` folder.
+When the first word is `cargo` and its first match on `PATH` is the build-hold cargo wrapper of the checker repository, outside the checkout (`hand_made.installed_wrapper`), the check and the run take the next match that is not the wrapper (`hand_made.exec_path`), as the wrapper does in the `builds.slice` scope of the run. `run_attempt` finds this start file once and gives it to the check and to the run. The run starts that file by its path, so the wrapper does not run. The wrapper stays the start file and a program file, which the model reads, when there is no next match and for the wrapper of a unit worktree. It also stays the start file for a later word `clean`, because the real `cargo clean` can remove the assigned build folder; `checked_files` then refuses the run before the model call (`CLEAN_REFUSAL`), because the wrapper clean rule needs files that the read limit hides. For a checkout that is the checker repository, the wrapper is in the checkout, so the write path refusal below ends the attempt before the model call. A later word `cargo` reads the wrapper and each later match that is a program file. The run-start check finds the start file again with `exec_path` and refuses a different one, and names the old and the new start file. A `PATH` folder, a start file from `PATH`, a start file named with a slash that is not a checkout file, or a `PATH` match of a later word, whose real path is in a path that the run writes (the checkout, the cargo registry and git folders, or the output folder), is refused (`write_refusal`; `checked_files` finds these paths once with `written_paths`). The limit does not bind the wrapper folder or its `lib` folder.
 When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
 
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
@@ -153,7 +157,7 @@ The check reads PATH outside the limit; the limit `/tmp` and `/dev/shm` start em
 The guest prints a lock line with the attempt to stderr when it has taken the run lock.
 A failed lock step exits with `GUEST_NOT_LOCKED_STATUS`.
 The guest runs the argv under the read limit (`run_limited`), not in the gate sandbox.
-The limit binds the system folders, the shown guest PATH folders, the numbered copy, the cargo folders and `SCCACHE_DIR` of the program environment, and the run temp folder as `/tmp`.
+The limit binds the system folders, the shown guest PATH folders, the numbered copy, the Cargo folders of the program environment, and the run temp folder as `/tmp`.
 The program environment puts the run home, `CARGO_HOME`, `RUSTUP_HOME` and `CARGO_TARGET_DIR` in the copy, so the rest of the guest home, the other numbered copies and the main checkout are hidden.
 The limit binds no path that holds the guest home (`Path.home()` of the runner).
 When `bwrap` is missing or does not set up the limit (`setup_failed`), the guest prints the cause and the refused line, so `wait_for_start` raises `GuestRefusedCommand` and the attempt ends as a refusal that names `bwrap`.
@@ -721,7 +725,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  At the first unittest load or run, the bootstrap disables bytecode writes for the test.
+  Python child processes inherit `PYTHONDONTWRITEBYTECODE=1`.
+  The bootstrap then checks whether the process already runs under a test limit.
   On Linux, the bootstrap first checks for a verified gate parent.
   It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
   If neither check proves a gate launch, it reads the cgroup name once.
@@ -730,15 +736,29 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
   Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
   Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
+  Before it reports that it is ready, the watchdog closes each descriptor above standard error that it inherits from the test.
+  Thus the watchdog holds no build folder lock of the test.
   At the deadline the watchdog stops the test first and then prints the limit line. The watchdog stops only the test process, not its children.
   Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/r*`.
+  A modeled checkout keeps each `r*` run folder in `test-runs` in its build output.
+  Worktree and main checkouts use their `target` link to the build output.
+  On natedev, a modeled `~/.claude` uses `/build/claude/main/test-runs`.
+  Numbered copies use their own `target` folder.
+  A checkout without a model output uses `$TMPDIR/test-runs`.
+  A nested legacy run uses the parent of the current run folder.
+  A gate job without `MERGE_GATE_MODULE_DIR` keeps the timed runner folders in its `TMPDIR`.
+  A direct timed runner selects the output from the checkout that contains `start_dir`.
+  It gives `config-reads-*` and `test-run-roots-*` unique names in that checkout's `test-runs` folder.
+  A new direct test run in that runner also puts its `TMPDIR` there.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
+  Before allocation, each run that prepares a `test-runs` parent sweeps its free folders, including older `test-run-*` folders.
+  This includes a direct run and the `gate.py --affected` outer run.
+  `test_run_folder()` uses the checkout output even when TMPDIR names a gate module folder.
+  The sweep does not wait for held folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -966,7 +986,10 @@ It also removes unpublished formatter commits.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
-An ancestry hold names the first unmerged commit by its short hash and subject.
+Ancestry uses each pending commit's first parent as the test merge base.
+It skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
+Ancestry holds on a root commit, a tree change, a conflict, or a configured custom merge driver.
+The hold names the first such commit by its short hash and subject.
 A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
 `test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
