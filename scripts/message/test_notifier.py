@@ -26,6 +26,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib import user_zone
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -54,7 +55,7 @@ class NotifierTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = write_config_fixture(self.root / "config/user_zone.conf")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"__ETC_ZSHENV_SOURCED": "1"})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, fixture_zsh_environment())))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
         self.addCleanup(self.owned.finish)

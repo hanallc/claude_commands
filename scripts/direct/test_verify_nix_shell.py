@@ -73,6 +73,7 @@ class VerifyNixShellTests(NixFixture):
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
         (scripts / "lib/conf_record.sh").symlink_to(SCRIPTS / "lib/conf_record.sh")
+        _ = shutil.copy2(SCRIPTS / "lib/buildlog_run.sh", scripts / "lib/buildlog_run.sh")
         (scripts / "lint").mkdir()
         _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
         _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")

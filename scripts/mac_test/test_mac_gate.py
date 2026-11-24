@@ -28,6 +28,7 @@ from scripts.lib import scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
 from scripts.mac_test.test_mac_queue_run import queue_fixture
@@ -99,8 +100,7 @@ LOCAL_MAC_SSH = """\
 import os, shlex, signal, subprocess, sys
 command = shlex.split(sys.argv[-1])
 environment = {
-    # Keep the fixture PATH when the NixOS startup file runs.
-    **os.environ, '__ETC_ZSHENV_SOURCED': '1',
+    **os.environ,
     'ZDOTDIR': os.environ['FAKE_QUEUE_STATE'],
 }
 signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -828,6 +828,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
                      prepare_bundle: bool = False, force_signal_to_sender: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
+                       **fixture_zsh_environment(),
                        **copies_environment(root),
                        'PATH': os.pathsep.join((str(root), os.defpath)),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
