@@ -1745,9 +1745,9 @@ fi
                          + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
         self.assert_guest_clean()
 
-    def test_setup_mac_linux_creates_the_state_root_and_syncs_its_parent(self) -> None:
-        root = self.root / 'target-state'
-        root.rmdir()
+    def test_setup_mac_linux_syncs_existing_ancestors_of_the_state_root(self) -> None:
+        root = self.root / '.local/state/build-targets'
+        root.parent.mkdir(parents=True)
         sync_folder = atomic_file.sync_folder
 
         def sync_parent(folder: Path) -> None:
@@ -1755,9 +1755,10 @@ fi
             sync_folder(folder)
 
         with (patch.object(sys, 'argv', ['build_targets.py', 'setup-mac-linux']),
+              patch.dict(os.environ, {'HOME': str(self.root), 'BUILD_TARGETS_STATE_DIR': str(root)}),
               patch.object(atomic_file, 'sync_folder', side_effect=sync_parent) as sync):
             self.assertEqual(build_targets.main(), 0)
-        sync.assert_called_once_with(root.parent)
+        self.assertEqual(sync.call_args_list, [call(root.parent), call(root.parent.parent), call(self.root)])
 
     def test_a_failed_journal_directory_sync_does_not_consume_permission(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'

@@ -1668,6 +1668,16 @@ def _guest_wait_timeout(attempt: str, limit: int | GuestWaitLimitUnavailable) ->
     return f"Mac Linux did not confirm the end of attempt {attempt} within {limit} seconds."
 
 
+@dataclass(frozen=True)
+class MacLinuxStateReady:
+    root: Path
+
+
+@dataclass(frozen=True)
+class MacLinuxStateUnavailable:
+    reason: str
+
+
 def _holds_consumed_guest_slot(saved: records.SavedPlacementAssignment) -> bool:
     # A consumed guest holds the slot until the service records closure.
     return (isinstance(saved.state, placement.CurrentAssignment)
@@ -1913,6 +1923,8 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
+        self.mac_linux_state: MacLinuxStateReady | MacLinuxStateUnavailable = MacLinuxStateUnavailable(
+            "The Mac Linux state root setup has not run.")
         self.manual_guest_settlement: set[str] = set()
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
@@ -4658,6 +4670,9 @@ done
                 permitted = placement.FixedExclusion(retry.reason)
             elif isinstance(retry, placement.RetryAt) and retry.deadline > self.clock.now():
                 permitted = placement.TemporaryExclusion("retry deadline has not passed")
+            if (isinstance(permitted, placement.AllowedHost) and is_mac_linux_guest(destination)
+                    and isinstance(state := self.mac_linux_state, MacLinuxStateUnavailable)):
+                permitted = placement.FixedExclusion(state.reason)
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination, keys)
                 if destination.provider == "local" and isinstance(evidence, placement.FreshHostEvidence):
@@ -4850,7 +4865,7 @@ done
         return assignment
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
-                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.Refused:
         if (reason := self._reused_guest_timeout(request)) is not None:
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                 placement.ClosedAssignment(reason), placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
@@ -4949,6 +4964,9 @@ done
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
+            if (is_mac_linux_guest(saved.assignment.destination)
+                    and isinstance(setup := self.mac_linux_state, MacLinuxStateUnavailable)):
+                return wire.Refused(setup.reason)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
         terminal = [saved for saved in self.assignments.values() if isinstance(saved.state, placement.ClosedAssignment)
                     and saved.state.reason in ("completed", "cancelled")
@@ -5225,6 +5243,10 @@ done
             return self._placement_status(assignment, "the attempt is no longer current")
         if isinstance(saved.permission, placement.PermissionConsumed):
             return self._placement_status(assignment, "launch permission was already consumed")
+        if (is_mac_linux_guest(assignment.destination)
+                and isinstance(setup := self.mac_linux_state, MacLinuxStateUnavailable)):
+            return replace(self._placement_status(assignment, setup.reason),
+                           permission=placement.NoLaunchPermission(setup.reason))
         if is_mac_linux_guest(assignment.destination) and any(
                 _holds_consumed_guest_slot(other) for other in self.assignments.values()):
             return self._placement_status(assignment, "the Mac Linux slot is busy")
@@ -5684,6 +5706,14 @@ done
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
             self._recover_abandoned_attempt(request)
+            if (isinstance(self.mac_linux_state, MacLinuxStateUnavailable)
+                    and any(is_mac_linux_guest(candidate.destination)
+                            and isinstance(candidate.eligibility, placement.AllowedHost)
+                            for candidate in request.constraints.candidates)):
+                setup = self._prepare_mac_linux_state()
+                if setup != self.mac_linux_state:
+                    self.mac_linux_state = setup
+                    self.pass_stale = True
             if (isinstance(connection, Connection) and previous == request
                     and not isinstance(self.system_reader, NoSystemReader)
                     and self.system_reader.latest.started_monotonic <= self.last_pass_started
@@ -6316,6 +6346,19 @@ done
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
                           else select.EPOLLIN | select.EPOLLOUT)
 
+    def _prepare_mac_linux_state(self) -> MacLinuxStateReady | MacLinuxStateUnavailable:
+        root: Path | None = None
+        try:
+            root = target_config.build_targets_state_root()
+            self.writes.require(root)
+            target_config.provision_mac_linux_state_root(root)
+        except (OSError, RuntimeError) as error:
+            path = root if root is not None else os.environ.get("BUILD_TARGETS_STATE_DIR") or "~/.local/state/build-targets"
+            detail = " ".join(str(error).splitlines())
+            return MacLinuxStateUnavailable(f"Cannot prepare the Mac Linux state root {path}: {detail}. "
+                                            + "Run build_targets.py setup-mac-linux on natedev.")
+        return MacLinuxStateReady(root)
+
     def start(self) -> None:
         self.writes.require(self.socket_path)
         if not isinstance(self.listener, NoConnection):
@@ -6352,15 +6395,11 @@ done
         listener.setblocking(False)
         self.listener = listener
         self.epoll.register(listener.fileno(), select.EPOLLIN)
-        try:
-            root = target_config.build_targets_state_root()
-            self.writes.require(root)
-            target_config.provision_mac_linux_state_root(root)
-        except (OSError, RuntimeError) as error:
-            detail = " ".join(str(error).splitlines())
-            print(f"memory admission: Cannot prepare the Mac Linux state root. {detail}", file=sys.stderr)
+        self.mac_linux_state = self._prepare_mac_linux_state()
+        if isinstance(self.mac_linux_state, MacLinuxStateUnavailable):
+            print(f"memory admission: {self.mac_linux_state.reason}", file=sys.stderr)
         else:
-            print(f"memory admission: Mac Linux state root ready at {root}", file=sys.stderr)
+            print(f"memory admission: Mac Linux state root ready at {self.mac_linux_state.root}", file=sys.stderr)
         self.listener_started_at = self.clock.monotonic()
         if self.next_source_check == float("inf"):
             first_check = "after the first usable configuration"

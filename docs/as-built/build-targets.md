@@ -52,6 +52,8 @@ A nested named module can use its parent reservation. Promotion without tests us
 A Hana gate without requested targets uses its existing unassigned cloud route.
 
 The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
+The admission service requires a synced [Mac Linux state root](mac-test-offload.md#mac-linux-guest-folders) before guest placement.
+If setup fails, the next guest placement request retries it. Other targets remain available.
 To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.
 Set `settings.<name>=cloud_gate.conf`. The scaler also requires `enabled=on` in that settings file.
 The queue checks whether the scaler is available on each placement pass.

@@ -97,12 +97,14 @@ The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
 When the proof wait expires, the gate returns status 80 after it records the holder's release.
-The admission service on natedev creates the state root at startup and on reload.
-The service syncs the existing parent directory and logs the result before it accepts placement requests.
-The service continues if this step fails.
 The default root is `~/.local/state/build-targets`. The `BUILD_TARGETS_STATE_DIR` setting can supply a different root.
+The admission service creates each missing directory at startup and on reload.
+It syncs each directory entry from the state root up to the home directory, or to the filesystem root for paths outside home.
+The service logs the result before it accepts placement requests.
+If setup fails, the service retries on the next guest placement request.
+Until setup succeeds, the service refuses guest placement and launch permission. Other targets remain available.
 The gate refuses the launch before it consumes permission if the state root is missing or is a file.
-For a repair, run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev.
+Run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev to perform the same setup manually.
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.

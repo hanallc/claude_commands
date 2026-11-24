@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum, auto
 from pathlib import Path
@@ -208,21 +208,18 @@ def build_targets_state_root() -> Path:
 
 
 def provision_mac_linux_state_root(root: Path) -> None:
-    """Create the root and sync its entry in the existing parent directory."""
-    created = False
-    try:
-        root.mkdir()
-        created = True
-    except FileExistsError:
-        if not root.is_dir():
-            raise
-    try:
-        atomic_file.sync_folder(root.parent)
-    except OSError:
-        if created:
-            with suppress(OSError):
-                root.rmdir()
-        raise
+    """Create the root and sync each directory entry up to home or the filesystem root."""
+    root = root.absolute()
+    home = Path.home().absolute()
+    boundary = home if root.is_relative_to(home) else Path(root.anchor)
+    folders = (root, *root.parents)
+    for folder in reversed(folders):
+        if not folder.is_dir():
+            folder.mkdir(exist_ok=True)
+    for folder in folders:
+        if folder == boundary:
+            break
+        atomic_file.sync_folder(folder.parent)
 
 
 def mac_linux_end_proof_journal() -> Path:
