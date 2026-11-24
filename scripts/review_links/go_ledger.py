@@ -14,9 +14,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib import atomic_file, file_lock
 from scripts.production import staff, the_list
-from scripts.review_links import change_page
+from scripts.review_links import change_page, review_link
 
 GO_PATH = f"/{change_page.CONSOLE_FOLDER}/list-go"
 GO_CHECK_PATH = f"/{change_page.CONSOLE_FOLDER}/go-check"
@@ -53,27 +53,23 @@ def token_prefix(ask_id: str) -> str:
     return "go:" + ask_id
 
 
-def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | str:
-    try:
-        address = ipaddress.ip_address(text)
-    except ValueError:
-        return text
+def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    address = ipaddress.ip_address(text)
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         return address.ipv4_mapped
     return address
 
 
 def host_owns(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Find an address that this host owns: a bind of a socket to an owned address works.
-
-    Only EADDRNOTAVAIL means that the host does not own the address. Each other error counts as owned, so the Go is refused.
-    """
+    """Check if this host can bind the address. Raise when ownership is unknown."""
     family = socket.AF_INET6 if isinstance(address, ipaddress.IPv6Address) else socket.AF_INET
-    try:
-        with socket.socket(family, socket.SOCK_STREAM) as probe:
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        try:
             probe.bind((str(address), 0))
-    except OSError as error:
-        return error.errno != errno.EADDRNOTAVAIL
+        except OSError as error:
+            if error.errno == errno.EADDRNOTAVAIL:
+                return False
+            raise
     return True
 
 
@@ -83,12 +79,13 @@ def natedev_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> b
 
 
 def refused_address(client: str) -> bool:
-    """Refuse a Go from natedev or from an extra address in the conf; read the conf at each click."""
-    address = _address(client)
-    if isinstance(address, str) or natedev_address(address):
+    """Read both local Tailscale addresses and refuse a click from natedev."""
+    try:
+        address = _address(client)
+    except ValueError:
         return True
-    extra = conf.read("review_links").words("go_refused_addresses")
-    return address in {_address(text) for text in extra}
+    tailscale = (_address(review_link.tailscale_ip(4)), _address(review_link.tailscale_ip(6)))
+    return address in tailscale or natedev_address(address)
 
 
 def _path(root: Path, go_id: str) -> Path:

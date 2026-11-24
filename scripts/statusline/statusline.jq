@@ -171,7 +171,7 @@ def usage($config; $label; $window; $fmt):
 | ($render.for_you // "") as $actions
 | ([($render.rebuild // ""),
     (if $actions == "unavailable" then "Unavailable"
-     elif ($actions | test("\\A[1-9][0-9]*\\z")) then
+     elif ($actions | test("\\A([1-9][0-9]*|[0-9]+\\+)\\z")) then
        "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
      else "" end)]
    | map(select(. != ""))

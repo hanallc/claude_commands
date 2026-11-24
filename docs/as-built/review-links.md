@@ -33,7 +33,7 @@ The flow:
 
 The URL form is `http://<host>:<port>/<id>/<file name>`, with the name percent-encoded.
 The `server_port` setting starts at 8765.
-For example, a rendered link is `http://100.103.14.30:8765/k3x9qa/herdr-issue-draft.html`.
+For example, a rendered link is `http://192.0.2.254:8765/k3x9qa/herdr-issue-draft.html`.
 The URL of a `.md` input names its rendered `<stem>.html`.
 The host comes from `tailscale ip -4`, parsed as IPv4.
 The `tailscale_timeout_seconds` setting starts at 10.
@@ -1876,11 +1876,12 @@ Small muted text next to the button names the target: “Pressing Go sends your 
 For an approval ask, it says “Pressing Approved sends your approval to <agent>.”
 The button has `aria-describedby` on that text. The keyboard and a screen reader use it like the other row buttons.
 A click sends a signed POST to `/console/list-go` with the item, the ask id and the page address.
-The server refuses a click from natedev with 403 and writes nothing.
-natedev's addresses are each loopback address and each address that natedev owns.
-A bind of a test socket to the client address shows that natedev owns it.
-The server also refuses each extra address in `go_refused_addresses`, and a client address that does not parse.
-A bind error other than EADDRNOTAVAIL counts as owned, so the server refuses the click.
+For each click, the server reads natedev's current Tailscale IPv4 and IPv6 addresses.
+It refuses a client address that matches either address, is loopback, or belongs to natedev.
+A successful socket bind to the client address proves that natedev owns it.
+The server returns 403 for these addresses or for an invalid client address.
+It returns 503 if a Tailscale read fails or the bind fails with an error other than `EADDRNOTAVAIL`.
+A refusal writes no ledger record.
 The row shows a refusal in its normal status place, as for the other row actions.
 An accepted click does these steps in this order:
 
@@ -2063,26 +2064,30 @@ The page loads three.js from cdnjs. Served page documents send no Content-Securi
 The status line names each waiting rebuild in the `For you:` row.
 The same row shows the count of other open actions or `Unavailable` when the count fails.
 Each render checks whether the rebuild cache needs a refresh.
-The page combines the cached system comparison with open rebuild needs.
+The page combines the cached system comparison with open rebuild needs and completed requests.
 The server serves it only in a folder that holds the browser manifest.
 It has no navigation entry; `?page=rebuilds` opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
-Each owner shows once, as a heading, and the owner with the newest change comes first.
-Under an owner, the changes go newest first, and changes with the same shown time share one time.
-The time is a column at the left, with the reasons of that time beside it.
-The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
-`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
-A commit's reason is its subject and its time is the author time.
-Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
-A filed need is a change with its requester (else the affected session) as owner, its creation time and its reason.
-A need covers its own commit, so that commit shows once.
+Each machine block shows open request reasons and groups them by requester.
+The affected session appears when a request has no requester.
+The Commits section lists subjects for commits without an open request.
+The section lists commits on the configured ref after the verified running revision.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`.
+The status line refresh writes that file.
+The commit author time appears beside the subject.
+The `Claude-Session` line identifies the author through the transcript for that Remote Control session.
+Each section groups entries by owner.
+The owner with the newest entry appears first.
+Entries with the same owner and displayed time share one time.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
 The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray text that keeps at least 4.5:1 contrast.
 A listed machine without a recorded change list shows `The change list is not available yet.`
-When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
+When no machine needs a rebuild, the page shows `No rebuilds needed.`, with a count of 0 and an empty label.
+Completed requests remain available below the waiting machines.
+They appear once per machine and commit, newest completion first.
+The page names each damaged archive and shows the valid records.
 
 Machine headings use 20px text; owner headings use 17px; the changes use 15px.
 The content column is up to 1060px wide.
@@ -2530,7 +2535,6 @@ The server returns 403 when the host or origin check fails.
 - The server renders a published `changes.html` with a private manifest from the review record. A published console page, such as `memory_live.html`, gets HTTP 200 with no validator. For other regular files, it sends `ETag` and `Last-Modified` with HTTP 200 or 304. A matching `If-None-Match` gives HTTP 304. HTTP 200 also includes `Content-Type`, `Content-Length` and `X-Content-Type-Options: nosniff`.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - `POST /console/list-go` takes a List Go. It passes the same host and origin check as the other POST requests.
-  It refuses with 403 a loopback client address, an address that natedev owns and each extra address in `go_refused_addresses`.
   It writes the ledger record in `<state folder>/go-ledger/` before it closes the ask; see [Asks for nate's Go](#asks-for-nates-go).
 - `GET /console/go-check?id=<go id>&caller=<staff id>` answers `go_check.py` with JSON `ok` and `text`.
   It gives 200 and marks the record used for the first check by the target, and 403 for each refusal.
@@ -2733,9 +2737,6 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
-`go_refused_addresses` lists extra client addresses whose List Go the server refuses, separated by spaces.
-The server always refuses loopback addresses and addresses that natedev owns.
-The list holds natedev's Tailscale IPv4 and IPv6 addresses. The server reads it at each click.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `undo_seconds` sets how long a send waits for Undo, from 0 to 60 seconds, and starts at 10. Zero turns Undo off. Each send reads it.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.

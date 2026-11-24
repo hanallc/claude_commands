@@ -14,7 +14,6 @@ from functools import lru_cache, partial
 import html
 import gzip
 import hashlib
-import ipaddress
 import json
 import os
 import re
@@ -47,7 +46,7 @@ from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names
-from scripts.review_links.review_link import private_name
+from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
 
@@ -790,12 +789,6 @@ def restart(server: ReviewLinksServer) -> None:
     os.execve(sys.executable, sys.orig_argv, os.environ | {LISTEN_FD: str(descriptor)})
 
 
-def tailscale_ip() -> str:
-    result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                            text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
-    return str(ipaddress.IPv4Address(result.stdout.strip()))
-
-
 def sweep_snapshots(root: Path, now: float) -> int:
     """Expire flat snapshots and legacy session snapshots without following symlinks."""
     retention = conf.read("review_links").number("snapshot_retention_seconds")
@@ -988,7 +981,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 with server.staff_read_scope():
                     if route.query == "view=count":
                         try:
-                            snapshot = for_you.read(include_comparison_reason=False)
+                            snapshot = for_you.read(include_running_revision=False)
                         except RecursionError as error:
                             rebuild = rebuild_row.read()
                             snapshot = for_you.ForYouSnapshot(
@@ -2385,8 +2378,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         client = self.client_address[0]
         try:
             refused = go_ledger.refused_address(client)
-        except (OSError, ValueError) as error:
-            self.browser_failure(503, "The Go settings are not available.", error)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.browser_failure(503, "Could not check natedev's addresses. Try again.", error)
             return
         if refused:
             self.json_response(403, {"reason": "Press Go from your own device. A Go from natedev is refused."})
