@@ -939,6 +939,7 @@ NumberedCopyRecord = (NumberedCopySource | NumberedCopyRemovalPending
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_CARGO_REMOVAL = "cargo_removal"
 
 
 def _record_numbered_copy_path(path: Path) -> BuildCopy:
@@ -952,7 +953,7 @@ def _record_numbered_copy_path(path: Path) -> BuildCopy:
     return form
 
 
-def _recorded_directory(fields: dict[str, object], key: str) -> CopyDirectoryIdentity:
+def _recorded_directory(fields: Mapping[str, object], key: str) -> CopyDirectoryIdentity:
     device, inode = fields.get(key + "_device"), fields.get(key + "_inode")
     if type(device) is not int or type(inode) is not int:
         raise ValueError(f"missing {key} identity")
@@ -1120,10 +1121,12 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
     form = BuildCopy(spec.repository, spec.unit, spec.slot)
     assert isinstance(spec.slot_checkout, SlotCheckout)
     try:
-        record = _numbered_copy_record(path, form, directory)
+        lease = _read_folder_lease(path, directory)
+        record = _validate_numbered_copy_record(path, form, directory, lease)
         if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
                 or not may_remove_folder_tree(path, record.git_directory)):
             raise ValueError("copy has no matching source record")
+        _recover_copy_cargo(path, lease)
         _copy_identity_fields(fields, record)
         fields["commit"] = record.commit
         return True
@@ -1152,6 +1155,45 @@ def _current_copy_lock(path: Path, directory: int) -> None:
         raise ValueError(f"{path}: the numbered copy lock is required") from None
     if not build_folder_lock.lock_current(path, directory, descriptor):
         raise ValueError(f"{path}: the numbered copy lock changed")
+
+
+def _recover_copy_cargo(path: Path, fields: Mapping[str, object]) -> None:
+    if _CARGO_REMOVAL not in fields:
+        return
+    raw = fields[_CARGO_REMOVAL]
+    if not isinstance(raw, dict) or (stage := StagedRemoval.read(cast(dict[str, object], raw))) is None:
+        raise ValueError(f"{path}: invalid Cargo removal record")
+    target = path / "target"
+    if not stage.recover(target, parent_identity=_recorded_directory(fields, "copy")):
+        raise FileExistsError(f"{target}: the staged Cargo output could not be removed")
+    if release_removed_folder(target) not in (FolderPairRelease.RELEASED, FolderPairRelease.PAIR_ABSENT,
+                                              FolderPairRelease.FOLDER_PRESENT):
+        raise FileExistsError(f"{target}: the Cargo removal lock could not be released")
+
+
+def reset_numbered_copy_cargo(path: Path) -> bool:
+    """Remove Cargo output and record its stage under the numbered copy lock."""
+    root = build_root()
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
+        _current_copy_lock(path, directory)
+        fields = _read_folder_lease(path, directory)
+        identity = _recorded_directory(fields, "copy")
+        target = path / "target"
+        _recover_copy_cargo(path, fields)
+
+        def record_stage(tree: CheckedRemovalTree) -> None:
+            if (CopyDirectoryIdentity.from_stat(os.fstat(tree.parent)) != identity
+                    or not build_folder_lock.parent_current(target, tree.parent)):
+                raise ValueError(f"{target}: the numbered copy changed")
+            fields[_CARGO_REMOVAL] = StagedRemoval.from_tree(tree).fields()
+            _publish_lease(path, directory, fields)
+
+        if not remove_build_folder(target, wait=False, before_stage=record_stage):
+            return False
+        if _CARGO_REMOVAL in fields:
+            del fields[_CARGO_REMOVAL]
+            _publish_lease(path, directory, fields)
+        return True
 
 
 def record_numbered_copy_source(path: Path, source: Path, commit: str) -> None:
@@ -1839,8 +1881,8 @@ class StagedRemoval:
     def fields(self) -> dict[str, object]:
         return {"removal_stage": self.name, "copy_device": self.device, "copy_inode": self.inode}
 
-    def recover(self, source: Path) -> bool:
-        return recover_staged_folder(source, self.name, self.device, self.inode)
+    def recover(self, source: Path, *, parent_identity: CopyDirectoryIdentity | None = None) -> bool:
+        return recover_staged_folder(source, self.name, self.device, self.inode, parent_identity=parent_identity)
 
 
 def _staging_identity(info: os.stat_result) -> dict[str, object]:
@@ -2472,7 +2514,8 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     return remove_build_folder(path, dir_fd=directory, wait=wait)
 
 
-def recover_staged_folder(source: Path, name: str, device: int, inode: int) -> bool:
+def recover_staged_folder(source: Path, name: str, device: int, inode: int, *,
+                          parent_identity: CopyDirectoryIdentity | None = None) -> bool:
     """Resolve the staging folder recorded in the source removal intent."""
     if _HIDDEN_REMOVAL.fullmatch(name) is None or name == source.name:
         return False
@@ -2481,6 +2524,8 @@ def recover_staged_folder(source: Path, name: str, device: int, inode: int) -> b
         try:
             directory = parents.enter_context(build_folder_lock.folder_parent(path, source.parent, create=False))
         except FileNotFoundError:
+            return False
+        if parent_identity is not None and parent_identity != CopyDirectoryIdentity.from_stat(os.fstat(directory)):
             return False
         return _recover_staged_folder(path, directory, wait=False, identity=(device, inode))
 

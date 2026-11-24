@@ -395,6 +395,51 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn(str(path), output.getvalue())
 
+    def test_assigned_copy_recovers_cargo_reset_after_sigkill(self) -> None:
+        reset = """
+import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+
+from scripts.lib import build_folders, build_slots
+
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == "target" and destination.startswith(".removing-"):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with build_slots.take_copy(Path(sys.argv[1]), sys.argv[2], showrunner="builds", unit="queue",
+                           work="reset", purpose="test", selection=build_slots.ExactSlotRequest(2)) as copy:
+    (copy.cargo_dir / "old").write_text("old Cargo output")
+    with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+        build_slots.limit_copy_size(copy, 0)
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        stopped = subprocess.run([sys.executable, "-c", reset, str(self.source), self.base],
+                                 cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout)},
+                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        path = build_folders.copy_path("widget", "queue", 2)
+        stage, = (entry for entry in path.glob(".removing-*") if entry.is_dir())
+        identity = stage.stat()
+        self.assertEqual(self.lease(path).get("cargo_removal"),
+                         {"removal_stage": stage.name, "copy_device": identity.st_dev, "copy_inode": identity.st_ino})
+        self.assertEqual((stage / "old").read_text(), "old Cargo output")
+        self.assertFalse((path / "target").exists())
+
+        with build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                                  work="next", purpose="test", selection=build_slots.ExactSlotRequest(2)) as copy:
+            self.assertEqual(copy.path, path)
+            self.assertEqual(list(copy.cargo_dir.iterdir()), [])
+            self.assertEqual(list(path.glob(".removing-*")), [])
+            self.assertFalse((path / "target.lock").exists())
+            self.assertNotIn("cargo_removal", self.lease(path))
+        self.assertEqual(self.rescue_refs(), "")
+
     def test_run_gives_the_child_the_cargo_environment_and_lock_and_keeps_its_exit_code(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         probe = f"import sys\nsys.path.insert(0, {str(checkout)!r})\n" + """import fcntl, json, os, pathlib
