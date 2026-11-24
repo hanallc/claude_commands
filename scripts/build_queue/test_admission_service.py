@@ -1561,6 +1561,7 @@ class MacDiskSweepFixture:
     started: threading.Event
     release: threading.Event
     inline: threading.Event
+    disk_ready: threading.Event
     readings: Queue[placement.HostEvidence]
 
     def subscribe(self, key: placement.HostEvidenceKey) -> service.HostEvidenceReader:
@@ -1973,13 +1974,14 @@ class LocalHoldPlacementTests(unittest.TestCase):
 
     @contextmanager
     def mac_disk_sweep_fixture(self) -> Generator[MacDiskSweepFixture]:
-        from scripts.mac_test import eligibility, offload
+        from scripts.mac_test import offload
 
-        started, release, inline, swept, finished = (threading.Event() for _ in range(5))
+        started, release, inline, disk_ready = (threading.Event() for _ in range(4))
         readings: Queue[placement.HostEvidence] = Queue()
+        recoveries: list[threading.Thread] = []
         guard = test_hang_guard.TEST_HANG_GUARD_SECS
         caller = threading.current_thread()
-        ensure = offload.ensure_mac_disk_floor
+        start = threading.Thread.start
 
         class ObservedWorker(service.HostEvidenceWorker):
             @override
@@ -1996,36 +1998,33 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     inline.set()
                 elif not release.wait(guard):
                     raise AssertionError("the test did not release the sweep")
-                swept.set()
+                disk_ready.set()
                 return offload.CommandOutput(0, "", "")
-            free = 60 if swept.is_set() else 59
+            free = 60 if disk_ready.is_set() else 59
             return offload.CommandOutput(0, f"free_gib={free}\nhost=fixture-mac\nrc=0\n", "")
 
-        def observe_sweep(controller: offload.ProcessController,
-                          config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
-                          repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot, target: str = "mac",
-                          slot: int = 1) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
-            try:
-                return ensure(controller, config, repository, probe, target, slot)
-            finally:
-                finished.set()
+        def start_thread(thread: threading.Thread) -> None:
+            start(thread)
+            if thread.name == "mac-disk-recovery":
+                recoveries.append(thread)
 
         with (self.mac_backoff_fixture(backoff=False) as fixture,
               mock.patch.object(service, "HostEvidenceWorker", ObservedWorker),
-              mock.patch.object(offload, "ensure_mac_disk_floor", side_effect=observe_sweep)):
+              mock.patch.object(threading.Thread, "start", start_thread)):
             fixture.probe.answer = capture
             server = fixture.admission.server
             server.host_probe = server.read_provider_evidence
             try:
-                yield MacDiskSweepFixture(fixture.admission, fixture.key, started, release, inline, readings)
+                yield MacDiskSweepFixture(fixture.admission, fixture.key, started, release, inline, disk_ready, readings)
             finally:
                 release.set()
-                if started.is_set():
-                    self.assertTrue(finished.wait(guard))
                 server.close()
                 for worker in server.host_targets.values():
                     worker.thread.join(guard)
-                    self.assertFalse(worker.thread.is_alive())
+                for recovery in recoveries:
+                    recovery.join(guard)
+                self.assertFalse(any(worker.thread.is_alive() for worker in server.host_targets.values()))
+                self.assertFalse(any(recovery.is_alive() for recovery in recoveries))
 
     def test_mac_disk_probe_returns_pending_before_the_sweep_ends(self) -> None:
         from scripts.mac_test import offload
@@ -2056,6 +2055,22 @@ class LocalHoldPlacementTests(unittest.TestCase):
             self.assertIsInstance(evidence, service.MacDiskRecoveryPendingEvidence)
             self.assertEqual(evidence.observed_at, fixture.admission.clock.now())
             self.assertEqual(server.host_evidence(other), evidence)
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_at_the_disk_floor_stays_excluded_until_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            first = server.read_provider_evidence(fixture.key)
+            assert isinstance(first, service.MacDiskRecoveryPendingEvidence)
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            fixture.disk_ready.set()
+            second = server.read_provider_evidence(fixture.other_key())
+            assert isinstance(second, placement.FreshHostEvidence)
+            self.assertEqual(second.eligibility, placement.TemporaryExclusion("disk"))
+            assert isinstance(second, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(second.disk, offload.MacDiskShort(59, 60))
             self.assertFalse(fixture.release.is_set())
 
     def test_mac_sweep_completion_refreshes_every_key_during_a_probe(self) -> None:

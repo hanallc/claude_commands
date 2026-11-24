@@ -878,6 +878,7 @@ The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
 An admission probe publishes a pending disk reading that excludes the Mac.
 One recovery thread per host runs the sweep while the evidence worker reads other keys.
+The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock during removal.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.

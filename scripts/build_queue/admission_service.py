@@ -74,6 +74,7 @@ from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
     from scripts.aws_target import ledger as aws_ledger
+    from scripts.build_targets.build_targets import MacDiskSweep
     from scripts.mac_test import offload
     from scripts.mac_test.claim_state import RemoteJobClaim
 
@@ -2011,6 +2012,7 @@ class AdmissionServer:
         self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
         self.mac_recovery_lock: threading.Lock = threading.Lock()
         self.mac_recovery_retry_at: dict[str, float] = {}
+        self.mac_disk_recoveries: dict[str, offload.MacDiskShort] = {}
         self.mac_disk_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
@@ -4506,8 +4508,8 @@ class AdmissionServer:
             self.mac_recovery_retry_at[target] = float("inf")
             return True
 
-    def _request_mac_disk_recovery(self, host: str, sweep: Callable[[], None]) -> bool:
-        """Start one sweep per host and report whether recovery is pending."""
+    def _request_mac_disk_recovery(self, host: str, request: MacDiskSweep | None) -> offload.MacDiskShort | None:
+        """Return the disk shortage for a pending sweep or start a requested sweep."""
         def recover() -> None:
             try:
                 sweep()
@@ -4515,6 +4517,7 @@ class AdmissionServer:
                 print(f"memory admission: Mac disk recovery failed: {error}", file=sys.stderr)
             finally:
                 with self.mac_recovery_lock:
+                    del self.mac_disk_recoveries[host]
                     # The immediate probe can still report low disk space.
                     self.mac_disk_retry_at[host] = self.clock.monotonic() + self._waiting_pass_interval()
                     for (provider, _), worker in self.host_targets.items():
@@ -4522,20 +4525,20 @@ class AdmissionServer:
                             worker.expedite_all()
 
         with self.mac_recovery_lock:
-            if self.closed:
-                return False
-            retry_at = self.mac_disk_retry_at.get(host)
-            if retry_at == float("inf"):
-                return True
-            if retry_at is not None and self.clock.monotonic() < retry_at:
-                return False
-            self.mac_disk_retry_at[host] = float("inf")
+            active = self.mac_disk_recoveries.get(host)
+            if active is not None:
+                return active if request is None else request[0]
+            if (request is None or self.closed
+                    or self.clock.monotonic() < self.mac_disk_retry_at.get(host, 0)):
+                return None
+            reading, sweep = request
+            self.mac_disk_recoveries[host] = reading
             try:
                 threading.Thread(target=recover, name="mac-disk-recovery", daemon=True).start()
             except RuntimeError:
-                del self.mac_disk_retry_at[host]
+                del self.mac_disk_recoveries[host]
                 raise
-            return True
+            return reading
 
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
