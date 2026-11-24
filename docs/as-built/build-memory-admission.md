@@ -2799,8 +2799,7 @@ A move gives the moved row a new anchor and keeps its former successor in place.
 Absent and unnamed waits stay in the full order.
 The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
-`queue.json` records the local queue order for memory admission.
-The head-stall check uses only rows that can run on natedev.
+The head-stall check uses the first waiter that can run on natedev.
 The grant pass shows a newly granted row in Waiting without a move handle.
 The first pass that counts its reservation shows the row in Running and includes the memory charge.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
@@ -2812,17 +2811,9 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
-An older request with a temporary exclusion can hold the Mac if it uses `route=MacOnly` with `ConfiguredOrder`.
-An older Mac pin can also hold the Mac.
-The hold applies when a later request has a newer free reading for an overlapping scope.
-Disk, off, and state exclusions prevent this hold.
-The next probe or its time limit ends the hold.
-A blocked Mac probe immediately refuses `--mac-only`.
-A disk exclusion immediately refuses all Mac-only requests.
-Other requests can hold a remote destination for one probe when a reading is missing or the destination is busy.
+A Mac disk exclusion refuses a request that selects or pins the Mac as its only target.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
-The Machine cell uses the existing Mac icon for a Mac-only wait.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
 A speculative Mac copy waits for placement outside the table while its parent holds local memory.

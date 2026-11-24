@@ -1356,12 +1356,6 @@ def mac_only_request(request: wire.PlacementRequest) -> bool:
             or isinstance(route, target_config.PinnedTarget) and route.target == "mac")
 
 
-def _probe_hold_exclusion(eligibility: placement.HostEligibility, *, mac_only: bool) -> bool:
-    """Check if a temporary exclusion permits a hold for one probe."""
-    return isinstance(eligibility, placement.TemporaryExclusion) and (
-        eligibility.reason == "busy" or mac_only and eligibility.reason not in ("disk", "off", "state"))
-
-
 @dataclass(frozen=True)
 class PlacementHold:
     """An older waiting request that permits a remote destination but has no current free reading for it."""
@@ -4682,8 +4676,7 @@ done
         row = self._row(admission, place)
         if isinstance(request.run, wire.RunIdentity):
             row["build_run"] = _live_run(request.run)
-        row["route"] = (target_config.MAC_ONLY if isinstance(request.constraints.selection, placement.MacOnlyHost)
-                        else request.route)
+        row["route"] = request.route
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)
@@ -4729,7 +4722,7 @@ done
             retry = self._target_retry(request, destination, keys)
             if isinstance(selection, placement.PinnedHost) and selection.target != destination.target:
                 permitted = placement.FixedExclusion("another target is pinned")
-            elif mac_only_request(request) and destination.target != "mac":
+            elif isinstance(selection, placement.MacOnlyHost) and destination.target != "mac":
                 permitted = placement.FixedExclusion("only the Mac is selected")
             elif isinstance(retry, placement.EvidenceNeeded):
                 permitted = retry
@@ -4775,7 +4768,8 @@ done
         selection, route = request.constraints.selection, request.route
         return (isinstance(request.local, wire.LocalAdmissionContext)
             and isinstance(request.purpose, placement.NormalStep)
-            and not mac_only_request(request)
+            and not isinstance(selection, placement.MacOnlyHost)
+            and not isinstance(route, target_config.MacOnly)
             and any(candidate.destination.provider == "local"
                     and isinstance(candidate.eligibility, placement.AllowedHost)
                     and (not isinstance(selection, placement.PinnedHost) or selection.target == candidate.destination.target)
@@ -5001,9 +4995,7 @@ done
                 if candidate.destination.target == "mac"
                 and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
                 and (candidate.eligibility.reason == "disk"
-                     or isinstance(selection, placement.MacOnlyHost)
-                     and (isinstance(candidate.eligibility, placement.FixedExclusion)
-                          or candidate.eligibility.reason != "busy"))), "")
+                     or isinstance(selection, placement.MacOnlyHost) and candidate.eligibility.reason != "busy")), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
@@ -5196,24 +5188,25 @@ done
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
-        """Keep a remote destination for one probe of an older request.
+        """Return the hold that keeps a remote destination for a waiting request that can use it now.
 
-        A reading that ended a hold does not start another hold.
+        The request can use it when its last reading allowed it or said busy, or when it has no reading.
+        A reading that answered an earlier hold starts no new hold: the request cannot use the destination now.
         """
         destination = candidate.destination
         eligibility = candidate.eligibility
         key = self.placement_host_keys.get((request.episode, destination))
-        if key is None or not isinstance(request.purpose, placement.NormalStep) or destination.provider in ("local", "scaler"):
-            return None
-        mac_only = destination.target == "mac" and mac_only_request(request)
-        if not isinstance(eligibility, placement.EvidenceNeeded) and not _probe_hold_exclusion(eligibility, mac_only=mac_only):
+        if (key is None or not isinstance(request.purpose, placement.NormalStep)
+                or destination.provider in ("local", "scaler")
+                or not (isinstance(eligibility, placement.EvidenceNeeded)
+                        or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
             return None
         reader = self.host_readers.get(key)
         if reader is None:
             return None
         latest = reader.latest
         if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
-                and not _probe_hold_exclusion(latest.eligibility, mac_only=mac_only)):
+                and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
             return None
         pair = (request.episode, destination)
         observed_at = self.host_evidence(key).observed_at
@@ -5229,7 +5222,7 @@ done
                         held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
         """Keep a destination for an older request whose last reading predates this request's reading.
 
-        The worker probes the older key next. The reply or the probe time limit ends the hold.
+        The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
         """
         key = self.placement_host_keys.get((request.episode, destination))
         observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()
