@@ -9,7 +9,7 @@ import re
 import shlex
 import subprocess
 
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_STEP_NAMES, RECORDED_VERBS,
+from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_VERBS,
                                      VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
@@ -21,9 +21,8 @@ SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "t
 
 
 class QueueKind(Enum):
-    """A kind of queue work without a verify or script name."""
+    """A fixed name for queue work without a verify or script name."""
 
-    MERGE_GATE = "gate"
     CI = "hana CI"
     COMPILER_CACHE = "compiler cache"
     MAC = "Mac builds"
@@ -37,9 +36,8 @@ class QueueRowName(str):
         raise TypeError("Choose a queue name source")
 
     @classmethod
-    def fixed(cls, kind: QueueKind, names: StepNames = RECORDED_STEP_NAMES) -> QueueRowName:
-        name = names.queue_name(kind.value) if kind is QueueKind.MERGE_GATE else kind.value
-        return str.__new__(cls, name)
+    def fixed(cls, kind: QueueKind) -> QueueRowName:
+        return str.__new__(cls, kind.value)
 
     @classmethod
     def owner_only(cls, *candidates: object) -> QueueRowName:

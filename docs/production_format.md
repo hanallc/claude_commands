@@ -272,6 +272,23 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed.
 
+   In the `~/.claude` repository, prove each row on its tip joined with main
+   before the notice goes to the merge unit:
+
+   1. Run `git fetch origin`, then `git merge --no-ff origin/main` on the tip.
+      Push the join commit. Do not fetch again before step 3.
+   2. Run the affected tests of the join through the queue, with no `--module`:
+      `python3 ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ./scripts/lib/py scripts/production/gate.py --affected`.
+      The selector finds each module that imports, embeds, copies or reads a
+      changed file. Do not choose the modules by hand. Single cases do not
+      replace this run.
+   3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/fixture_conf_keys.py --repo ~/.claude --base origin/main --tip <join>`.
+      It names each literal test fixture of a config file that lacks a key
+      the row adds. Add the key to each named fixture.
+
+   Send the notice only when both runs are green. Name the join hash and both
+   results in it.
+
    ```
    phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>

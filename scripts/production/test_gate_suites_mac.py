@@ -512,6 +512,37 @@ class MacGateSuitesTests(GateSuitesFixture):
         local.assert_not_called()
 
     @gate_suites("lib")
+    def test_mac_linux_runs_the_affected_modules_that_natedev_selects(self) -> None:
+        # The fixture's main branch has no full gate pass. No module declares a scan root.
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
+        self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
+        self.write(self.checkout / LIB_SECOND, (self.checkout / LIB_SECOND).read_text() + "\n# Changed test module.\n")
+        _ = self.commit(self.checkout, "change one test module")
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        assignment = self.gate_assignment("mac-linux")
+        path = self.write_gate_assignment(assignment)
+        self.set_placement_status(assignment, placement.CurrentAssignment())
+        tree, _ = cloud_gate.working_tree(self.checkout)
+        result = gate.GateRun((gate.GateJobResult("lib", "test_second.py", 0, 1, ""),), 1, 0)
+        job = StepJob("test-affected")
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=result) as guest,
+              mock.patch.object(gate, "run_suites") as local):
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, gate_job=job,
+                                       target=checked_target(SuiteMode.TARGETED, job))
+        self.assertIs(run, result)
+        guest.assert_called_once_with(self.checkout, mode=SuiteMode.TARGETED, full=False,
+                                     module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                                     selected=TreeSelection((LIB_SECOND,), tree), gate_job=job, type_dirs=(),
+                                     assignment=assignment)
+        output = self.output.getvalue()
+        self.assertEqual(output.count("affected: "), 1, output)
+        self.assertIn("affected: 1 of 2 modules (base ", output)
+        self.cloud_route.assert_not_called()
+        local.assert_not_called()
+
+    @gate_suites("lib")
     def test_mac_linux_reuses_the_pass_without_starting_a_runner(self) -> None:
         self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")

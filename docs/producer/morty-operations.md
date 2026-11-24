@@ -2,8 +2,9 @@
 
 State root: `~/rust/hanadocs/morty`.
 Write List items through `the_list.py`.
-The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+The assigned producer writes the title, done when, unit, latest status, next step, ETA, state, next check and evidence.
+Each producer adds, parks, closes and reopens its own items.
+Morty keeps reassign, and add, park, close and reopen for all items.
 Read status for items assigned to another producer from The List.
 `checkins.json` holds the current schedule, outstanding inquiries, and the active timer. Keep only its latest state.
 
