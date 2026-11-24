@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
+from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 import json
 
 
@@ -26,7 +27,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
                 _ = (self.root / "src/lib.rs").write_text(original, encoding="utf-8")
                 _ = self.verify("lint", "sample")
                 # Two passes change the source; the third confirms no change.
-                self.assert_fix_and_judgment_calls(fix_passes=3)
+                assert_clippy_calls(self, fix_passes=3)
                 self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), final_fix)
                 self.assertEqual(self.calls("doc"), [])
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
