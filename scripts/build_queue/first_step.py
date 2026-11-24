@@ -23,7 +23,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
-    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
+    CLAIM_FAILURE_SUFFIX, GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
     VerifyCommand, command_job, command_program, gate_natedev_only_flag, parse_command_program, read_step_names,
     verify_command,
 )
@@ -111,7 +111,8 @@ class FirstStepAdmission:
     def report_gate_end(self, status: int) -> None:
         """Report the final exit of the guest gate child."""
         grant = self.grant
-        if not isinstance(grant, GatePlacement) or status == MAC_LINUX_PRELAUNCH_REFUSED_STATUS:
+        if not isinstance(grant, GatePlacement) or status in (
+                MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
             return
         try:
             assignment = read_assignment(self.assignment_file).assignment
