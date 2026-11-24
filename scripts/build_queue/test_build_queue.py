@@ -238,8 +238,24 @@ class QueueTests(unittest.TestCase):
     def test_bump_without_a_published_order_reports_unavailable(self) -> None:
         (self.fixture.state_dir / "queue.json").unlink()
         (self.fixture.state_dir / queue_snapshot.VIEW_NAME).unlink()
-        self.assertEqual(self.bump_output("1"), (2, "", "build queue: no published queue order\n"))
+        self.assertEqual(self.bump_output("1"),
+                         (2, "", "build queue: a numeric selector requires the published queue view\n"))
         self.assertEqual(self.bumps(), [])
+
+    def test_numeric_bump_requires_the_published_view(self) -> None:
+        _ = self.waiter(100, "head")
+        worker = self.waiter(200, "worker")
+        (self.fixture.state_dir / queue_snapshot.VIEW_NAME).unlink()
+
+        self.assertEqual(self.bump_output("2"),
+                         (2, "", "build queue: a numeric selector requires the published queue view\n"))
+        self.assertEqual(self.bumps(), [])
+
+        with mock.patch.object(unit_labels, "unit_labels_for", return_value={}):
+            self.assertEqual(self.bump_output(worker.identity.folder)[0], 0)
+        bump, = self.bumps()
+        step_key = self.fixture.server.waiters[worker.episode].row.get("move_id", "")
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(step_key, 2), "worker"))
 
 
 class ServiceQueryTests(unittest.TestCase):

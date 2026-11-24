@@ -43,9 +43,12 @@ def waiting_positions(reading: admission_records.QueueRead) -> dict[int, admissi
 
 
 def select_step(directory: Path, selector: str) -> SelectedStep | admission_records.HeldPlace | admission_records.NoWaiter:
+    numeric = selector.isdecimal()
     try:
         reading = queue_snapshot.read_view_snapshot(directory).reading
     except admission_protocol.AdmissionUnavailable:
+        if numeric:
+            raise admission_protocol.AdmissionUnavailable("a numeric selector requires the published queue view") from None
         snapshot = queue_snapshot.read_queue_snapshot(directory)
         if isinstance(snapshot, queue_snapshot.NoQueueSnapshot):
             raise admission_protocol.AdmissionUnavailable("no published queue order") from None
@@ -58,7 +61,7 @@ def select_step(directory: Path, selector: str) -> SelectedStep | admission_reco
         ranked = {(row["pid"], row["since"]): row for _, row in rows}
         positions = {place: SelectedStep(row, place) for place, step in waiting_positions(reading).items()
                      if (row := ranked.get((step.pid, step.since))) is not None}
-    if selector.isdecimal():
+    if numeric:
         position = int(selector)
         if position in kept:
             return kept[position]
