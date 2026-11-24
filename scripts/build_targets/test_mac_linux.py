@@ -1121,11 +1121,16 @@ fi
     def test_guest_end_report_accepts_pending_settlement_and_warns_on_refusal(self) -> None:
         dispatch = self.guest_dispatch()
         dispatch.started = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
-        pending = wire.DispatchStatus(dispatch.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+        permission = placement.PermissionConsumed(1.0)
+        pending = wire.DispatchStatus(dispatch.assignment, placement.CurrentAssignment(), permission)
+        saved = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+            dispatch.assignment, pending.state, dispatch.claim, permission,
+            placement.TerminalAttemptReport(placement.AttemptCompleted(0), placement.DispatchPathPending('pending'), 1.0)))
 
         for reason in ('', 'fixture refusal'):
             with (self.subTest(reason=reason), redirect_stderr(io.StringIO()) as errors,
-                  patch.object(mac_linux, 'send_guest_execution', return_value=replace(pending, reason=reason)) as send):
+                  patch.object(mac_linux, 'send_guest_execution', return_value=replace(pending, reason=reason)) as send,
+                  patch.object(mac_linux, '_guest_queue_query', return_value=saved) as query):
                 mac_linux.settle_guest_dispatch(dispatch, placement.AttemptCompleted(0))
                 send.assert_called_once()
                 request = cast(wire.ExecutionReport, send.call_args.args[0])
@@ -1134,6 +1139,12 @@ fi
                 self.assertEqual(request.path, placement.DispatchPathSettled())
                 expected = f'Mac Linux guest completion report failed: {reason}\n' if reason else ''
                 self.assertEqual(errors.getvalue(), expected)
+                if reason:
+                    query.assert_not_called()
+                else:
+                    query.assert_called_once_with(admission_wire.PlacementStatusRequest(
+                        dispatch.assignment.episode, dispatch.assignment.attempt, include_permission=True,
+                        code_version=admission_client.LOADED_ADMISSION_CODE_VERSION), **send.call_args.kwargs)
 
     def test_guest_settlement_reads_only_a_complete_matching_proof(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
@@ -1165,6 +1176,8 @@ fi
     def test_guest_reports_start_and_completion_for_its_placement(self) -> None:
         self.placed = replace(self.placed, attempt=f'{16:032x}')
         reports: list[wire.ExecutionReport] = []
+        permission = placement.PermissionConsumed(1.0)
+        pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), permission)
 
         def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
             self.assertGreater(deadline, time.monotonic())
@@ -1180,17 +1193,29 @@ fi
                 self.assertEqual(proof['claim'], self.consumed[0][0].claim.claim_id)
                 self.assertEqual(proof['result'], 'proven')
                 self.assertIsInstance(mac_linux.settlement(self.placed.episode, 16), placement.Pending)
-                return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+                return pending
             with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
                 mac_linux.reconcile_unproven(self.placed.episode, 16)
             submit.assert_not_called()
             mac_linux.reconcile_guest_end(self.placed.episode, 16)
             self.assertIsInstance(mac_linux.settlement(self.placed.episode, 16), placement.Pending)
-            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+            return pending
+
+        def status(_request: admission_wire.PlacementStatusRequest, *, deadline: float,
+                   timeout: float) -> admission_wire.PlacementStatusReply:
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
+            completion = reports[-1]
+            assert isinstance(completion.outcome, placement.AttemptCompleted)
+            saved = placement.TerminalAttemptReport(completion.outcome, placement.DispatchPathPending('pending'), 1.0)
+            return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                self.placed, pending.state, completion.claim, permission, saved))
 
         with (patch.object(mac_linux, 'send_guest_execution', report),
+              patch.object(mac_linux, '_guest_queue_query', side_effect=status) as query,
               redirect_stderr(io.StringIO()) as errors):
             result = self.route()
+        query.assert_called_once()
         self.assertIsInstance(result, GateRun)
         self.assertEqual(errors.getvalue(), '')
         report_row, completion = reports
@@ -1207,6 +1232,35 @@ fi
         self.assertIsInstance(mac_linux.settlement(self.placed.episode, 16), placement.Pending)
         with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
             self.assertEqual(mac_linux.settlement(self.placed.episode, 16), placement.Settled())
+
+    def test_checkout_change_blocks_the_guest_route_after_a_completion_report_timeout(self) -> None:
+        completed_run = mac_linux.completed_run
+        completions: list[wire.ExecutionReport] = []
+
+        def change_checkout(reply: mac_linux.GuestReply, request: mac_linux.GuestRequest,
+                            source: mac_linux.CandidateSource) -> mac_linux.MacLinuxGateRun:
+            run = completed_run(reply, request, source)
+            self.assertTrue(run.passed)
+            _ = (self.repo / 'history.txt').write_text('changed source\n')
+            return run
+
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            if isinstance(request.outcome, placement.AttemptCompleted):
+                completions.append(request)
+                raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s')
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        with (patch.object(mac_linux, 'completed_run', side_effect=change_checkout),
+              patch.object(mac_linux, 'send_guest_execution', report),
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.route()
+        self.assertEqual(result, GuestGateBlocked('the checkout changed during the guest run'))
+        completion, = completions
+        self.assertEqual((completion.assignment, completion.claim), (self.placed, self.consumed[0][0].claim))
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(1))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
+        self.assertEqual(errors.getvalue(), 'Mac Linux guest completion report failed: no answer in 1 s\n')
 
     def test_guest_that_ran_without_a_received_start_line_reports_an_unknown_result(self) -> None:
         attempt = 16
@@ -1731,6 +1785,31 @@ fi
         self.assertTrue(result.passed)
         self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed: fixture refusal'), 1)
         self.assertEqual(errors.getvalue().count('Mac Linux guest completion report failed: fixture refusal'), 1)
+
+    def test_unsaved_guest_completion_warns_once_and_keeps_the_result(self) -> None:
+        permission = placement.PermissionConsumed(1.0)
+        pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), permission)
+
+        def status(_request: admission_wire.PlacementStatusRequest, *, deadline: float,
+                   timeout: float) -> admission_wire.PlacementStatusReply:
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
+            return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                self.placed, pending.state, self.consumed[0][0].claim, permission))
+
+        with (patch.object(mac_linux, 'send_guest_execution', return_value=pending) as send,
+              patch.object(mac_linux, '_guest_queue_query', side_effect=status) as query,
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        _start, completion = send.call_args_list
+        report = cast(wire.ExecutionReport, completion.args[0])
+        self.assertEqual(report.outcome, placement.AttemptCompleted(0))
+        query.assert_called_once_with(admission_wire.PlacementStatusRequest(
+            self.placed.episode, self.placed.attempt, include_permission=True,
+            code_version=admission_client.LOADED_ADMISSION_CODE_VERSION), **completion.kwargs)
+        self.assertEqual(errors.getvalue(), 'Mac Linux guest completion report failed: the queue did not save the guest completion\n')
 
     def test_closed_stderr_keeps_the_failed_guest_verdict_after_a_report_timeout(self) -> None:
         completions: list[wire.ExecutionReport] = []

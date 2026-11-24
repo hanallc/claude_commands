@@ -50,7 +50,8 @@ from scripts.production.gate_routes import (
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
-    from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
+    from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport, Reply
+    from scripts.build_queue.admission_wire import PlacementStatusRequest
     from scripts.build_queue.placement import AttemptCompleted, NoTerminalReport, Pending, PlacementAssignment, ProviderClaimReference, Settled
 
 
@@ -1340,8 +1341,8 @@ def guest_link() -> Generator[int]:
         os.close(link)
 
 
-def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: float) -> DispatchStatus:
-    """Send one execution report within the queue query deadline."""
+def _guest_queue_query(request: ExecutionReport | PlacementStatusRequest, *, deadline: float, timeout: float) -> Reply:
+    """Send one request within the queue query deadline."""
     from scripts.build_queue import admission_protocol as wire
 
     def remaining() -> float:
@@ -1373,6 +1374,14 @@ def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: 
         raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s') from error
     if isinstance(response, wire.Refused):
         raise wire.AdmissionUnavailable(response.reason)
+    return response
+
+
+def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: float) -> DispatchStatus:
+    """Send one execution report within the queue query deadline."""
+    from scripts.build_queue import admission_protocol as wire
+
+    response = _guest_queue_query(request, deadline=deadline, timeout=timeout)
     if not isinstance(response, wire.DispatchStatus):
         raise wire.AdmissionUnavailable('invalid execution report answer')
     return response
@@ -1667,6 +1676,7 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
 def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted | NoTerminalReport) -> None:
     """Save the end proof before reporting the result."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+    from scripts.build_queue import admission_wire as status_wire
 
     try:
         _append_guest_end(dispatch, GuestEndProven(), 'The guest confirmed the run ended')
@@ -1691,6 +1701,16 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
                 or not (isinstance(reply.state, placement.CurrentAssignment)
                         or reply.state == placement.ClosedAssignment('completed'))):
             raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
+        if isinstance(reply.state, placement.CurrentAssignment):
+            query = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt, include_permission=True,
+                                                      code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+            response = _guest_queue_query(query, deadline=deadline, timeout=timeout)
+            if (not isinstance(response, status_wire.PlacementStatusReply)
+                    or not isinstance(saved := response.status, status_wire.KnownPlacementStatus)
+                    or saved.assignment != assignment or saved.claim != dispatch.claim
+                    or not isinstance(saved.permission, placement.PermissionConsumed)
+                    or not isinstance(saved.report, placement.TerminalAttemptReport) or saved.report.outcome != result):
+                raise wire.AdmissionUnavailable('the queue did not save the guest completion')
 
     def warn(reason: str) -> None:
         with suppress(OSError, ValueError):
@@ -2411,7 +2431,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                             or cloud_gate.working_tree(repo)[0] != source.tree)
         completion = placement.AttemptCompleted((status or 1) if checkout_changed else status)
         if checkout_changed:
-            return f'{TARGET}: the checkout changed during the guest run'
+            return GuestGateBlocked('the checkout changed during the guest run')
         return run
     except mac_run.MacRunRefused as error:
         return refused(str(error))
