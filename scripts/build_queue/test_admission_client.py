@@ -860,6 +860,9 @@ class ClientTests(unittest.TestCase):
                                 self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
                                     str(assignment_file), "--token", "after-grant"]), 0)
                                 fixture.free(60 * GIB)
+                            elif execution_target != "mac-retry-notice":
+                                self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
+                                    str(assignment_file), "--token", "required"]), 0)
                             self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
                                                           "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
                             if execution_target == "mac-handoff":
@@ -878,9 +881,10 @@ class ClientTests(unittest.TestCase):
 
                                 def free_after_first_reply(request: wire.Request,
                                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+                                    replies = previous(request, connection)
                                     if isinstance(request, wire.PrerequisiteReport):
                                         fixture.free(60 * GIB)
-                                    replies = previous(request, connection)
+                                        _ = fixture.run_pass()
                                     if isinstance(request, wire.PlacementRequest):
                                         observed.extend(replies)
                                     return replies
@@ -893,16 +897,11 @@ class ClientTests(unittest.TestCase):
                                 self.assertEqual(output.getvalue().count("retry verify.sh: Mac attempt ended (lost); "), 1)
                                 self.assertIn("waiting 180 s before each retry", output.getvalue())
                             else:
-                                def release_before_retry() -> None:
-                                    fixture.free(60 * GIB)
-
+                                fixture.free(60 * GIB)
                                 token_arguments = [*arguments[:arguments.index("--")], "--token", "after-grant",
                                                    *arguments[arguments.index("--"):]]
-                                # After its first pass, a caller without its token can get a local grant;
-                                # it takes the token after the grant. The service marks every TokenRequired
-                                # row token-waiting, as a service from before this client does.
-                                with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
-                                    self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                                # The new prerequisite schedules a pass with the available memory.
+                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)
                             self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
                             assert isinstance(retry_grant, wire.LocalPlacementGranted)

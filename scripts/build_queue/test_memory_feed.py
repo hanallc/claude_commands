@@ -3944,7 +3944,7 @@ const refresh = createPageRefresh(tick);
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
                     page = memory_feed.reading()
-                names_read.assert_called_once_with(self.root / "buildlog" / "admission")
+                names_read.assert_called_once_with()
                 self.assertEqual(page["walk"][0]["name"],
                     queue_lines.step_text(reading.view.running[0], read_step_names()))
                 self.assertEqual(page["waiters"][0]["name"],

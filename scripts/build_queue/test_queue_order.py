@@ -613,6 +613,8 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(moved, wire.QueueMoved)
             self.assertEqual(ids(moved.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+            self.assertEqual(move_line(fixture), line)
+            _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), moved.line)
 
             lifted, = fixture.server.handle_request(wire.QueueMoveRequest(
