@@ -428,6 +428,7 @@ A missing or malformed value gives the step its own place.
 The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
+When a returning step uses the saved rank, its first step's arrival time and PID break ties on `order_since`.
 Durable waiter records retain only the step arrival time.
 An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
@@ -436,10 +437,16 @@ Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
+If a run starts with a local gate request, the grant saves its queue row ID and repository name in `RunPlace`.
+Each later step receives its own queue row ID.
+The service uses the rank to sort queued steps of the run.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
+A younger run that fits in memory can start during the gap.
+The service logs each such grant once with both run IDs, the earlier gate's repository, and the machine.
 When the run ends, waiting steps use their own arrival times for order again.
 The service persists run places with waiter places through the generic codec in `state.json`.
 After a restart, the service restores live run places and removes ended run places.
+Older run records use empty defaults for the queue row ID and repository name.
 
 ### The admission service
 

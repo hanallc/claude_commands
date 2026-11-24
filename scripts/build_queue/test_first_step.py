@@ -548,6 +548,31 @@ class FirstStepTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
                 self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
 
+    def test_first_step_submits_the_registered_scaler(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            _ = write_config_fixture(fixture.root / "build_targets.conf",
+                "targets=mac-linux,natedev,claude-aws\nkind.claude-aws=scaler\n"
+                + "settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n")
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+            owner = fixture.fixture_owner(os.getpid(), "123")
+
+            def grant(request: wire.PlacementRequest, _reason: str) -> wire.Assignment:
+                candidate, = request.constraints.candidates
+                self.assertEqual(candidate.destination.target, "claude-aws")
+                self.assertEqual(candidate.destination.provider, "scaler")
+                self.assertEqual(candidate.settings, placement.ExplicitProviderSettings(fixture.root / "cloud_gate.conf"))
+                self.assertEqual(candidate.eligibility, placement.AllowedHost())
+                raise first_step.FirstStepRefused("The fixture checked the gate request")
+
+            with (mock.patch.object(records, "process_start_time", return_value=owner.start_time),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(queue_place, "wait_for_placement", side_effect=grant) as place,
+                  self.assertRaisesRegex(first_step.FirstStepRefused, "The fixture checked the gate request")):
+                with first_step.admitted_run(GATE_COMMAND, source, targets=("claude-aws",)):
+                    self.fail("The gate received a placement")
+            place.assert_called_once()
+
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "hana")

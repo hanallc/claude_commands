@@ -438,13 +438,9 @@ class AdmissionFixture(ExitStack):
             self.enter_context(mock.patch.dict(os.environ, gate_isolation_environment(self.root)))
             self.temporary: Path = self.root / "tmp"
             self.temporary.mkdir(parents=True, exist_ok=True)
-            # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
-            self.socket_dir: Path = Path(self.enter_context(
-                short_socket_directory()))
             logs = log_dir if log_dir is not None else self.root / "log"
             self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
             self.state_dir.mkdir(parents=True, exist_ok=True)
-            self.socket_path: Path = self.socket_dir / "admission.sock"
             self.scenery_reservations: set[str] = set()
             self.skip_idle_spacing: bool = skip_idle_spacing
             self.clock: FakeClock = FakeClock()
@@ -465,7 +461,7 @@ class AdmissionFixture(ExitStack):
                 "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
                 "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
                 "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
-                "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
+                "BUILDLOG_DIR": str(logs),
                 "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
                 "BUILDLOG_RUN": "",
                 "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
@@ -478,6 +474,10 @@ class AdmissionFixture(ExitStack):
             self.enter_context(mock.patch.dict(os.environ, environment))
             _ = os.environ.pop("BUILD_TARGETS_STATE_DIR", None)
             (self.root / ".local/state").mkdir(parents=True, exist_ok=True)
+            # Use private settings for socket allocation. AF_UNIX limits the path length.
+            self.socket_dir: Path = Path(self.enter_context(short_socket_directory()))
+            self.socket_path: Path = self.socket_dir / "admission.sock"
+            os.environ["ADMISSION_SOCKET"] = str(self.socket_path)
             if not (self.root / "build_admission.conf").exists():
                 write_memory_config(self.root / "build_admission.conf")
             self.readings: PrivateReadings = PrivateReadings(self.root)
