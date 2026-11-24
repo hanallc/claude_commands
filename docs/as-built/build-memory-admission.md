@@ -2343,7 +2343,20 @@ The badge is CSS text from the icon's `data-badge`, so it is not page text.
 Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
 A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
-The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
+The row hover names the running machine under `Runs on`.
+The `Folder` field follows `Runs on` and shows the full working path.
+The page shortens the machine's home directory to `~`.
+The path preserves spaces and wraps only at slashes.
+The feed carries the local, Mac, and confirmed Mac Linux working paths in `run_folder`.
+Between steps and on remote runs without a working path, the field shows `not reported yet`.
+Mac Linux gates report their numbered copy paths and account homes at start.
+The gate continues to read SSH output while the queue accepts the report.
+The queue saves the start report with the consumed assignment and restores it after restart.
+The folder appears once the queue confirms that attempt.
+The page fits and positions the open hover again after a feed refresh.
+The AWS progress record has no working path.
+The CI summary and hand-made Mac Linux runs have no `Folder` field.
+The hover lists the other machines that the step named under `Named targets`.
 A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.

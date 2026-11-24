@@ -58,7 +58,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.snapshot_codec import owner_name, row_what
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.admission_jobs import HAND_MADE, StepJob
 from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
                                      CopiesRunCommand, OtherCommand, StepNames, build_call_arguments, command_script,
                                      copies_run_command, live_process_arguments,
@@ -735,6 +735,33 @@ class SlotPlace(TypedDict):
     slot_machine: NotRequired[str]
 
 
+@dataclass(frozen=True)
+class RecordedRunFolder:
+    """The full execution path and its matching home, if known."""
+
+    path: str
+    home: str = ""
+
+
+@dataclass(frozen=True)
+class RunFolderNotReported:
+    """The run has an execution folder that the feed cannot name."""
+
+
+class RunFolderField(TypedDict, total=False):
+    """A row omits this field when it has no execution folder."""
+
+    run_folder: RecordedRunFolder | RunFolderNotReported
+
+
+def run_folder(folder: str, home: str) -> RecordedRunFolder | RunFolderNotReported:
+    path = Path(folder)
+    if not path.is_absolute():
+        return RunFolderNotReported()
+    matching_home = home if home and path.is_relative_to(Path(home)) else ""
+    return RecordedRunFolder(folder, matching_home)
+
+
 class ProcessName(str):
     """The script or program of a process outside the queue."""
 
@@ -807,7 +834,7 @@ def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -
         facts.project if isinstance(facts.project, str) else "", facts.folder if isinstance(facts.folder, str) else "", names)
 
 
-class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
@@ -1030,7 +1057,7 @@ class MemoryWaitRow(WaitRow):
     job_start: NotRequired[str]
 
 
-class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
     kind: Literal["mac-build"]
     row_owner: QueueRowName
     row_step: str
@@ -1080,7 +1107,7 @@ class CloudWorkRow(RowQueueNotes, NamedQueueRow):
     late_age: str
 
 
-class CloudRunRow(CloudWorkRow):
+class CloudRunRow(CloudWorkRow, RunFolderField):
     started_at: float
 
 
@@ -1614,6 +1641,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
             **build_slot(build.folder, slot_machine, slot_roots, home=reading.home),
+            "run_folder": run_folder(build.folder, reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
@@ -2960,13 +2988,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pid = (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid) if step is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
+        step_host = admission_records.execution_host(step, machine) if step is not None else machine
+        step_home = slot_homes.get(step_host, "")
         walk.append({**row_labels,
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     **(build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
-                        home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))
+                     **(build_slot(step.folder, step_host, slot_roots, home=step_home)
                         if step is not None else SlotPlace()),
+                     "run_folder": run_folder(step.folder, step_home) if step is not None else RunFolderNotReported(),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": step.started_at if step is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
@@ -3009,6 +3039,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if isinstance(named, NoNamedStep):
                 continue
             remote_groups.add(key)
+            evidence = step.execution
+            folder = RunFolderNotReported()
+            if (guest and isinstance(evidence, execution_identity.ObservedExecution)
+                    and isinstance(execution := evidence.identity, execution_identity.GuestExecution)
+                    and execution.attempt == guest["attempt"]):
+                folder = run_folder(execution.folder, execution.home)
             remote_row: RunRow = {**queue_row_labels(named.title, named.name, unit=owner.unit, caller=owner.caller),
                 "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                 **owner.fields(),
@@ -3025,6 +3061,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                             ci=step.unit in ci_runners),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
+            if step.step != HAND_MADE.step or step.assignment_target != MAC_LINUX_TARGET:
+                remote_row["run_folder"] = folder
             if placed := gate_placement_notes(step):
                 remote_row["runs_on"] = placed["runs_on"]
                 remote_row["targets"] = placed["targets"]
@@ -3285,7 +3323,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
             else:
-                work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
+                work_rows.append({**values, "started_at": cloud.started_at or cloud.since,
+                                  "run_folder": RunFolderNotReported()})
         work_rows.sort(key=lambda row: row["started_at"])
     visible_waits = limits_view.visible_waits(model, {place: row["name"] for place, row in waiters.items()},
                                               {owner: row["name"] for owner, row in cloud_waiters.items()})

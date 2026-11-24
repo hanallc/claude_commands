@@ -46,7 +46,7 @@ from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
@@ -342,6 +342,10 @@ class MemoryFeedTests(unittest.TestCase):
                     page = memory_feed.reading()
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
+                self.assertIn("run_folder", rows[0])
+                run_folder = rows[0].get("run_folder")
+                assert isinstance(run_folder, memory_feed.RecordedRunFolder)
+                self.assertEqual(run_folder.path, str(folder))
                 self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
                 # The feed sends no slot number; the slot folder ends with it.
                 self.assertNotIn("slot", rows[0])
@@ -684,6 +688,8 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
             mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
+            execution=execution_identity.ObservedExecution(execution_identity.GuestExecution(
+                "mac-linux", "guest-attempt", "/home/gate-runner/build/claude/guest/8", "/home/gate-runner")),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # The queue names no Mac placement for an unconfirmed guest attempt.
         pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
@@ -706,9 +712,14 @@ class MemoryFeedTests(unittest.TestCase):
         row = next(row for row in page["walk"] if row["pid"] == 8200)
         self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
         self.assertEqual((row.get("machine"), row.get("state")), ("mac-linux", "running"))
+        self.assertIn("run_folder", row)
+        self.assertEqual(row.get("run_folder"), memory_feed.RecordedRunFolder(
+            "/home/gate-runner/build/claude/guest/8", "/home/gate-runner"))
         self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
+        self.assertIn("run_folder", unconfirmed)
+        self.assertIsInstance(unconfirmed.get("run_folder"), memory_feed.RunFolderNotReported)
         self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
                          ("mac-linux", True, "running"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
@@ -717,7 +728,48 @@ class MemoryFeedTests(unittest.TestCase):
         text = "\n".join(tips["walk"][page["walk"].index(row)])
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Guest attempt  guest-attempt", text)
+        self.assertIn("Folder  ~/build/claude/guest/8", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
+
+        from scripts.build_queue import mac_run
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission,
+            mac_linux_and_natedev_request, publish_candidate,
+        )
+
+        for job in (StepJob("gate"), HAND_MADE):
+            with self.subTest(guest=job.step, check="admission restart"), PlacementFixture() as fixture:
+                request = mac_linux_and_natedev_request(fixture, natedev=False)
+                request = replace(request, identity=replace(request.identity, step=job.step, job=job))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                with mock.patch.object(mac_run, "claim_held", return_value=True):
+                    granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
+                self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
+                folder = "/home/gate-runner/build/claude/guest/8"
+                started = execution_identity.GuestExecution("mac-linux", assignment.attempt, folder, "/home/gate-runner")
+                report = wire.ExecutionReport("guest-started", assignment, claim, execution_identity.ObservedExecution(started))
+                _ = fixture.server.handle_request(wire.parse_request(wire.encode_request(report)))
+                before, = fixture.server.handle_request(wire.ViewRequest())
+                fixture.restart()
+                after, = fixture.server.handle_request(wire.ViewRequest())
+
+                for read in (before, after):
+                    assert isinstance(read, wire.ViewReply), read
+                    with mock.patch.object(admission_client, "view", return_value=read.reading):
+                        page = memory_feed.reading()
+                    guest_row, = (item for item in page["walk"] if item.get("machine") == "mac-linux")
+                    self.assertEqual(guest_row.get("guest_run"), {"target": "mac-linux", "attempt": assignment.attempt})
+                    payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                    tips, _ = self.render_assignment_table(payload)
+                    hover = "\n".join(tips["walk"][page["walk"].index(guest_row)]).splitlines()
+                    if job == HAND_MADE:
+                        self.assertNotIn("run_folder", guest_row)
+                        self.assertFalse(any(line.startswith("Folder  ") for line in hover), hover)
+                    else:
+                        self.assertEqual(guest_row.get("run_folder"), memory_feed.RecordedRunFolder(folder, started.home))
+                        self.assertIn("Folder  ~/build/claude/guest/8", hover)
 
     def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
         # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
@@ -895,6 +947,7 @@ process.stdout.write(JSON.stringify({
                       mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
                     page = memory_feed.reading()
                 row, = [row for row in page["walk"] if row.get("ci")]
+                self.assertNotIn("run_folder", row)
                 self.assertEqual(cast(memory_feed.RunRow, row).get("ci_runners", [])[0]["state"], "busy" if busy else "idle")
                 self.assertEqual(page["ci_ram"], 0.125)
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
@@ -3177,6 +3230,8 @@ process.stdout.write(JSON.stringify({
                 remote, = [row for row in rows if row.get("kind") == "cloud"]
                 expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
                 self.assertEqual(remote["status"], expected)
+                self.assertEqual(remote.get("run_folder"), {"kind": "RunFolderNotReported"})
+                self.assertTrue(all("run_folder" not in row for row in page["waiters"]))
 
     def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels | None = None, *,
                          identity: wire.Identity | None = None) -> memory_feed.MemoryPage:
