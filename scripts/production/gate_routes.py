@@ -6,13 +6,15 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, Protocol, override
+from typing import TYPE_CHECKING, Literal, Protocol, override
 
-from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
+
+if TYPE_CHECKING:
+    from scripts.build_queue import placement
 
 
 class GatePlacementIncomplete(GateRefused, ABC):
