@@ -546,7 +546,7 @@ Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field use their record keeper.
 `record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -566,13 +566,13 @@ The List ends a delivery park automatically when the producer sets the item stat
 Linked changes supply review information on the List.
 The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
-The `the_list.py list` command still shows the item.
-The saved recipient uses `the_list.py answer` to save an answer and mark the item unread.
-Morty can answer any List question.
-Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
-Only morty can name a keeper other than itself or the caller.
-Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
-Without `--keeper`, `update` uses morty's folder. Only `--keeper` selects another folder.
+The `the_list.py list` command still shows the item when it is in morty's folder.
+The `the_list.py answer` command accepts answers from the saved recipient, the record keeper, or morty.
+A saved answer marks the item unread.
+Use `answer --keeper` to select the item's folder.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
 A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
 Each command refuses a `--keeper` that has no List folder.
 In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
@@ -614,14 +614,16 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can update their own items with `--title`, `--done-when`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
-Only morty can change the owner or producer of an existing item.
+Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
 Their updates use the caller's staff name as the log source.
-Their add can set `--producer` to their own name or staff ID; without it, the item goes to the caller.
-The CLI refuses another producer and `--number` on their add.
-The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
-Producers can park and close their own items. The CLI uses the caller's staff name as the log source.
+Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
+The CLI refuses another producer and `--number` on their `add`.
+The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
+`park`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands use the `--source` words as the log source.
 The writer checks the assigned producer under the same lock as the save.
+Only morty can change the owner or producer of an existing item.
+Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
 New items that morty adds without `--producer` default to morty.
@@ -654,7 +656,7 @@ The CLI refuses a write if the applicable setting is missing, invalid, or too sm
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in morty's List folder.
+References use numbers in the folder of the item that the command edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.

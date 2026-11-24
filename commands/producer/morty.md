@@ -27,14 +27,15 @@ Release the hold when nate is back and gives approval.
 ## Persistent state
 
 Read The List records and morty's other `checkins.json` state at startup and after compaction.
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item in morty's folder.
 Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
-Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
+Use `--producer <name or staff ID>` with `add` or `update` to assign an item in morty's folder.
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
-New items that morty adds without `--producer` default to morty.
-The assigned producer writes the latest status, next step, and ETA.
-Each producer adds, parks and closes its own items. Morty keeps every command for all items, and only morty reassigns an item.
+Items that you add without `--producer` go to morty.
+You can use every List command on items in morty's folder.
+Only `answer` and `update` accept `--keeper <staff ID>` to select a legacy keeper's folder.
+See `commands/producer/produce.md` for the commands that each producer uses on its own items.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.

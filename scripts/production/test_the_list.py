@@ -464,8 +464,8 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(producer, (OTHER.id, f"You are the producer of item {number}: Build plan. "
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
                     + f"Run `{launcher} update --id L{number}` to update it. "
-                    + "Use any of `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, "
-                    + "`--evidence`, `--add-evidence`, `--title`, `--done-when`."))
+                    + "Use any of `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, "
+                    + "`--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
@@ -681,10 +681,12 @@ class TheListTests(unittest.TestCase):
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
             for option, value in (("--eta", "Paused"), ("--state", "Working"), ("--next-check", START.isoformat()),
                                   ("--title", "New title"), ("--done-when", "The plan is public."),
-                                  ("--evidence", "An updated result."), ("--add-evidence", "An additional result.")):
+                                  ("--unit", "unit-board"), ("--evidence", "An updated result."),
+                                  ("--add-evidence", "An additional result.")):
                 with self.subTest(option=option):
-                    self.assertEqual(self.command("update", "--id", item.id, option, value),
-                                     (1, "", f"the_list: {item.id} is assigned to another producer\n"))
+                    self.assertEqual(self.command("update", "--id", item.id, option, value), (1, "", (
+                        f"the_list: {item.id} is assigned to another producer. "
+                        + "A producer can change only its own items.\n")))
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_updates_and_appends_its_evidence(self) -> None:
@@ -702,18 +704,29 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(saved.log[-1].what, the_list.FieldChange("Updated", {"evidence": expected}))
                 self.assertEqual(saved.log[-1].source, OTHER.name)
 
+    def test_producer_updates_the_title_done_when_and_unit_of_its_item(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--title", "Ship the page",
+                                          "--done-when", "The page is live.", "--unit", "unit-board"), (0, "", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual((saved.title, saved.done_when, saved.unit), ("Ship the page", "The page is live.", "unit-board"))
+        self.assertEqual(saved.log[-1].what, the_list.FieldChange("Updated", {
+            "title": "Ship the page", "unit": "unit-board", "done_when": "The page is live."}))
+        self.assertEqual(saved.log[-1].source, OTHER.name)
+
     def test_producer_cannot_update_other_fields(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
-        fields = (("--owner", RUNNER.id), ("--producer", BOB.id), ("--unit", "unit-board"),
-                  ("--requested-by", "nate"),
+        fields = (("--owner", RUNNER.id), ("--owner", "invalid owner"),
+                  ("--producer", BOB.id), ("--producer", "invalid producer"), ("--requested-by", "nate"),
                   ("--blocked-by",), ("--related-to",))
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
             for field, *values in fields:
                 with self.subTest(field=field):
                     result, output, error = self.command("update", "--id", item.id, "--eta", "Paused", field, *values)
                     self.assertEqual((result, output), (1, ""))
-                    self.assertIn("producers can update only --latest-status, --next-step, --eta, --state, --next-check, "
-                                  + "--evidence, --add-evidence, --title, --done-when.", error)
+                    self.assertIn("producers can update only --title, --done-when, --unit, --latest-status, "
+                                  + "--next-step, --eta, --state, --next-check, --evidence, --add-evidence.", error)
                     self.assertIn(f"Refused options: {field}", error)
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual(self.notices, [])
@@ -820,22 +833,61 @@ class TheListTests(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
             for command, options in (("park", ("--until", until.isoformat())), ("close", ("--words", "Accepted"))):
                 with self.subTest(command=command):
-                    self.assertEqual(self.command(command, "--id", other.id, *options),
-                                     (1, "", f"the_list: {other.id} is assigned to another producer\n"))
-            self.assertEqual(self.command("park", "--id", item.id, "--until", until.isoformat()), (0, "", ""))
+                    self.assertEqual(self.command(command, "--id", other.id, *options, "--source", "nate"),
+                                     (1, "", f"the_list: {other.id} is assigned to another producer. "
+                                      + "A producer can change only its own items.\n"))
+            self.assertEqual(self.command("park", "--id", item.id, "--until", until.isoformat(),
+                                          "--source", BOB.name), (0, "", ""))
             parked = the_list.load(MORTY.id, item.id)
             self.assertEqual((parked.parked_until, parked.log[-1].source), (until, BOB.name))
             self.assertEqual(self.command("close", "--id", item.id, "--words", "Accepted", "--source", "nate"),
                              (0, "", ""))
         closed = the_list.load(MORTY.id, item.id)
         self.assertEqual((closed.state, closed.closing_words, closed.log[-1].source),
-                         (the_list.ItemState.CLOSED, "Accepted", BOB.name))
+                         (the_list.ItemState.CLOSED, "Accepted", "nate"))
         self.assertEqual(the_list.load(MORTY.id, other.id), other)
+
+    def test_producer_parks_closes_and_reopens_its_own_item(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        until = START + timedelta(days=1)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for name, *args in (("park", "--until", until.isoformat()), ("close", "--words", "Done")):
+                with self.subTest(command=name), self.assertRaises(SystemExit) as refused:
+                    _ = self.command(name, "--id", item.id, *args)
+                self.assertEqual(refused.exception.code, 2)
+            self.assertEqual(self.command("park", "--id", item.id, "--until", until.isoformat(),
+                                          "--source", "nate: park it till tomorrow"), (0, "", ""))
+            self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
+            self.assertEqual(self.command("close", "--id", item.id, "--words", "Done",
+                                          "--source", "nate: close it"), (0, "", ""))
+            closed = the_list.load(MORTY.id, item.id)
+            self.assertEqual((closed.state, closed.closing_words), (the_list.ItemState.CLOSED, "Done"))
+            self.assertEqual(self.command("reopen", "--id", item.id, "--source", "nate: reopen it"), (0, "", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.NEW)
+        self.assertEqual([entry.source for entry in saved.log[1:]],
+                         ["nate: park it till tomorrow", "nate: close it", "nate: reopen it"])
+
+    def test_producer_cannot_park_close_or_reopen_another_producers_item(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        closed = the_list.close(MORTY.id, self.add(changes={"producer": BOB.id}).id, "Done", source="nate")
+        commands = (
+            ("park", "--id", item.id, "--until", START.isoformat()),
+            ("close", "--id", item.id, "--words", "Done"),
+            ("reopen", "--id", closed.id),
+        )
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for name, _, identity, *args in commands:
+                with self.subTest(command=name):
+                    self.assertEqual(self.command(name, "--id", identity, *args, "--source", "nate: do it"), (1, "", (
+                        f"the_list: {identity} is assigned to another producer. "
+                        + "A producer can change only its own items.\n")))
+        self.assertEqual(the_list.records(MORTY.id, include_closed=True), [item, closed])
+        self.assertEqual(self.notices, [])
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         commands = (
-            ("reopen", "--id", item.id),
             ("mark-read", "--id", item.id),
             ("clean-evidence",),
             ("link", item.id, "--review", "C1"),
@@ -848,8 +900,17 @@ class TheListTests(unittest.TestCase):
                                      (1, "", f"the_list: only morty can run {name}\n"))
             self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
                                           "--keeper", BOB.id),
-                             (1, "", "the_list: only the record keeper or morty can answer\n"))
+                             (1, "", f"the_list: no List folder for keeper {BOB.id}\n"))
         self.assertEqual(the_list.records(MORTY.id), [item])
+        legacy = self.legacy_item(BOB, the_list.ItemState.WORKING)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(BOB.id, legacy.id, the_list.PageRequest("ask", "question", "Ready?"), status)
+        opened = the_list.load(BOB.id, legacy.id)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("answer", legacy.id, "--question", "Q1", "--text", "Answer",
+                                          "--keeper", BOB.id),
+                             (1, "", "the_list: Only the question recipient or morty can answer.\n"))
+        self.assertEqual(the_list.load(BOB.id, legacy.id), opened)
         self.assertEqual(self.notices, [])
 
     def test_two_producers_add_to_mortys_sequence(self) -> None:
@@ -1257,30 +1318,68 @@ class TheListTests(unittest.TestCase):
                          (1, "", "the_list: This question already has an answer.\n"))
         self.assertEqual(path.read_bytes(), before)
 
-        for legacy, answerer in ((False, OTHER), (False, MORTY), (True, MORTY)):
-            with self.subTest(legacy=legacy, answerer=answerer.name):
-                assigned = self.add(changes={"producer": OTHER.id})
+        cases = ((MORTY.id, False, OTHER), (MORTY.id, False, MORTY), (MORTY.id, True, MORTY),
+                 (BOB.id, False, OTHER))
+        for keeper, legacy_question, answerer in cases:
+            with self.subTest(keeper=keeper, legacy_question=legacy_question, answerer=answerer.name):
+                assigned = (self.add(changes={"producer": OTHER.id}) if keeper == MORTY.id
+                            else self.legacy_item(OTHER, the_list.ItemState.WORKING))
                 words = "Which check passed?"
-                if legacy:
+                args = ("answer", assigned.id, "--question", "Q1", "--text", "The check passed.")
+                if legacy_question:
                     self.write_legacy_question(assigned, question_record.Question("Q1", START.isoformat(), words))
                 else:
                     with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")) as place:
-                        _ = the_list.ask_question(MORTY.id, assigned.id,
+                        delivery = the_list.ask_question(keeper, assigned.id,
                             the_list.PageRequest("ask", "question", words), status)
                     place.assert_called_once_with(OTHER.current_session)
-                reassigned = the_list.update(MORTY.id, assigned.id, {"producer": BOB.id}, source="morty")
-                args = ("answer", assigned.id, "--question", "Q1", "--text", "The check passed.")
-                for refused in ((BOB, OTHER) if legacy else (BOB,)):
+                    if keeper != MORTY.id:
+                        assert isinstance(delivery, change_page.MessageDelivery)
+                        self.assertEqual(delivery.recipients, (answerer.id,))
+                        _, _, *command = shlex.split(delivery.message.splitlines()[-1].removeprefix(
+                            "Answer with this command: "))
+                        self.assertEqual(command[2:4], ["--keeper", keeper])
+                        args = tuple("The check passed." if value == "<answer>" else value for value in command)
+                reassigned = the_list.update(keeper, assigned.id, {"producer": BOB.id}, source="morty")
+                refused_producers = ((BOB, OTHER) if legacy_question else (BOB,)) if keeper == MORTY.id else ()
+                for refused in refused_producers:
                     with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": refused.current_session}):
                         self.assertEqual(self.command(*args),
                             (1, "", "the_list: Only the question recipient or morty can answer.\n"))
-                self.assertEqual(the_list.load(MORTY.id, assigned.id), reassigned)
+                self.assertEqual(the_list.load(keeper, assigned.id), reassigned)
+                morty_item = the_list.load(MORTY.id, assigned.id)
                 with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": answerer.current_session}):
                     self.assertEqual(self.command(*args), (0, f"answered {assigned.id} Q1\n", ""))
-                saved = the_list.load(MORTY.id, assigned.id)
+                saved = the_list.load(keeper, assigned.id)
                 self.assertEqual(saved.log[-1].source, answerer.name)
-                self.assertEqual(saved.questions[0].recipient_id(MORTY.id), MORTY.id if legacy else OTHER.id)
+                self.assertEqual(saved.questions[0].recipient_id(keeper), keeper if legacy_question else OTHER.id)
                 self.assertIsInstance(saved.questions[0].answer, question_record.Answer)
+                if keeper != MORTY.id:
+                    self.assertEqual(the_list.load(MORTY.id, assigned.id), morty_item)
+
+    def test_legacy_keeper_and_saved_recipient_can_answer_without_morty(self) -> None:
+        members = staff.snapshot()
+        without_morty = replace(members, rows=tuple(row for row in members.rows if row.id != MORTY.id))
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        for caller, route in ((BOB, ()), (OTHER, ("--keeper", BOB.id))):
+            with self.subTest(caller=caller.name):
+                item = self.legacy_item(OTHER, the_list.ItemState.WORKING)
+                morty_item = the_list.load(MORTY.id, item.id)
+                with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+                    _ = the_list.ask_question(BOB.id, item.id,
+                        the_list.PageRequest("ask", "question", "Which check passed?"), status)
+                with staff.supplied_snapshot(without_morty), patch.dict(
+                        os.environ, {"CLAUDE_CODE_SESSION_ID": caller.current_session}):
+                    self.assertEqual(self.command("answer", item.id, "--question", "Q1",
+                                                  "--text", "The check passed.", *route),
+                                     (0, f"answered {item.id} Q1\n", ""))
+                saved = the_list.load(BOB.id, item.id)
+                self.assertEqual(saved.questions[0].recipient_id(BOB.id), OTHER.id)
+                answer = saved.questions[0].answer
+                assert isinstance(answer, question_record.Answer)
+                self.assertEqual(answer.text, "The check passed.")
+                self.assertEqual(saved.log[-1].source, caller.name)
+                self.assertEqual(the_list.load(MORTY.id, item.id), morty_item)
 
     def test_answer_round_trips_unicode_separators(self) -> None:
         item = self.add()
@@ -1813,7 +1912,8 @@ class TheListTests(unittest.TestCase):
         item = self.legacy_item(BOB, the_list.ItemState.WORKING)
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER.current_session}):
             self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, "--next-step", "Check it."),
-                             (1, "", f"the_list: {item.id} is assigned to another producer\n"))
+                             (1, "", f"the_list: {item.id} is assigned to another producer. "
+                              + "A producer can change only its own items.\n"))
         self.assertEqual(the_list.load(BOB.id, item.id), item)
         self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, "--next-step", "Check it.",
                                       "--source", "morty"), (0, "", ""))
@@ -1841,12 +1941,14 @@ class TheListTests(unittest.TestCase):
         item = self.legacy_item(BOB, the_list.ItemState.WORKING)
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
             self.assertEqual(self.command("update", "--id", item.id, "--next-step", "Check it."), (0, "", ""))
+            self.assertEqual(self.command("update", "--id", item.id, "--unit", "example"), (0, "", ""))
             updated = the_list.load(MORTY.id, item.id)
             self.assertEqual(updated.next_step, "Check it.")
-            status, output, errors = self.command("update", "--id", item.id, "--unit", "example")
+            self.assertEqual(updated.unit, "example")
+            status, output, errors = self.command("update", "--id", item.id, "--owner", RUNNER.id)
         self.assertEqual((status, output), (1, ""))
         self.assertIn("producers can update only", errors)
-        self.assertIn("Refused options: --unit", errors)
+        self.assertIn("Refused options: --owner", errors)
         self.assertEqual(the_list.load(MORTY.id, item.id), updated)
         self.assertEqual(the_list.load(BOB.id, item.id), item)
 

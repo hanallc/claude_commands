@@ -20,7 +20,7 @@ from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -1292,7 +1292,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         else:
             fields, body = store.read(identity)
             if staff_id(fields.get("producer", keeper), "producer") != assigned_to:
-                raise ListError(f"{identity} is assigned to another producer")
+                raise ListError(f"{identity} is assigned to another producer. "
+                                + "A producer can change only its own items.")
             item = _read_item(store, identity, fields, body)
         request = page_action
         if isinstance(page_action, PageItemNotice):
@@ -1410,8 +1411,8 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
 
 
 _LAUNCHER = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
-_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence",
-                           "title", "done_when")
+_PRODUCER_UPDATE_FIELDS = ("title", "done_when", "unit", "latest_status", "next_step", "eta", "state", "next_check",
+                           "evidence", "add_evidence")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
 
 
@@ -1599,12 +1600,13 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
                    unread=False, page_action=notice, assigned_to=assigned_to).item
 
 
-def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
+def reopen(keeper: staff.StaffId, identity: str, *, source: str,
+           assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
         if item.state != ItemState.CLOSED:
             return item
         return replace(item, state=ItemState.NEW, closed=NoTimestamp.UNSET, closing_words="", parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Reopened(), source).item
+    return _change(keeper, identity, edit, Reopened(), source, assigned_to=assigned_to).item
 
 
 def _unread_log_content(content: LogContent) -> str | dict[str, object]:
@@ -1820,11 +1822,15 @@ class NoQuestionAnswerer(StrEnum):
     ABSENT = "absent"
 
 
+class _NoActiveMorty(Enum):
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class _QuestionAnswerer:
-    """The staff member who answers; morty can answer every question."""
+    """The caller and the active morty ID, if available."""
     member: staff.StaffRow
-    morty: staff.StaffId
+    morty: staff.StaffId | _NoActiveMorty
 
 
 @dataclass(frozen=True)
@@ -2190,28 +2196,28 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
 _KEEPER_HELP = "the staff ID of the record keeper"
 
 
-def _record_keeper(members: staff.StaffSnapshot, caller: staff.StaffRow, identity: str,
-                   chosen: staff.StaffId | None, *, command: str, any_keeper: bool) -> staff.StaffId:
-    """Return the record keeper whose folder a command on one item edits.
+class _KeeperRouting(StrEnum):
+    ANSWER = "answer"
+    UPDATE = "update"
 
-    The chosen keeper comes first, and its List folder must exist.
-    With any_keeper, the default is morty, and the edit must check under the lock that the caller produces the item.
-    Without any_keeper, a legacy keeper's own folder comes before morty, as in change_page's question recovery.
-    Then only morty can name a keeper other than itself or the caller.
+
+def _record_keeper(morty: staff.StaffId | _NoActiveMorty, caller: staff.StaffId, identity: str,
+                   chosen: staff.StaffId | None, *, policy: _KeeperRouting) -> staff.StaffId:
+    """Select the folder for an answer or an update.
+
+    The locked write checks the caller against the saved record.
     """
-    morty = producer_id(members, "morty")
-    if any_keeper:
-        keeper = chosen if chosen is not None else morty
-    else:
-        own = _store(caller.id)
-        held = own.valid_id(identity) and os.path.lexists(own.path(identity))
-        keeper = chosen if chosen is not None else caller.id if held else morty
-        if keeper not in (morty, caller.id) and caller.id != morty:
-            raise ListError(f"only the record keeper or morty can {command}")
-    # A missing folder is refused here, so the store lock creates no folder for an unknown keeper.
-    if chosen is not None and not _store(chosen).folder().is_dir():
-        raise ListError(f"no List folder for keeper {chosen}")
-    return keeper
+    if chosen is not None:
+        if not _store(chosen).folder().is_dir():
+            raise ListError(f"no List folder for keeper {chosen}")
+        return chosen
+    if policy is _KeeperRouting.ANSWER:
+        own = _store(caller)
+        if own.valid_id(identity) and os.path.lexists(own.path(identity)):
+            return caller
+    if morty is _NoActiveMorty.UNAVAILABLE:
+        raise ListError("default List routing requires one active morty staff row")
+    return morty
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2226,7 +2232,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
-            _ = command.add_argument("--source", required=name not in ("update", "park", "close"))
+            _ = command.add_argument("--source", required=name != "update")
         if name in ("link", "unlink"):
             _ = command.add_argument("id")
             _ = command.add_argument("--review", dest="reviews", action="append", type=ReviewByShownId, default=[])
@@ -2274,9 +2280,13 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
-            keeper = _record_keeper(record, caller, identity, cast(staff.StaffId | None, args.keeper), command=name,
-                                    any_keeper=False)
-            answerer = _QuestionAnswerer(caller, producer_id(record, "morty"))
+            try:
+                answer_morty = producer_id(record, "morty")
+            except ListError:
+                answer_morty = _NoActiveMorty.UNAVAILABLE
+            keeper = _record_keeper(answer_morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
+                                    policy=_KeeperRouting.ANSWER)
+            answerer = _QuestionAnswerer(caller, answer_morty)
             result = page_question.answer(_ListQuestionStore(keeper, answerer=answerer), identity, question,
                                           cast(str, args.text))
             if isinstance(result, page_question.AnswerRefused):
@@ -2305,9 +2315,8 @@ def main(argv: list[str] | None = None) -> int:
             identity = cast(str, args.id)
             if identity.isascii() and identity.isdecimal():
                 identity = f"L{identity}"
-            # A producer can name any keeper; _update with assigned_to=caller refuses items it does not produce.
-            keeper = _record_keeper(record, caller, identity, cast(staff.StaffId | None, args.keeper), command=name,
-                                    any_keeper=True)
+            keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
+                                    policy=_KeeperRouting.UPDATE)
             reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
             # A producer gets the field refusal below, because it never changes these fields.
             if assigned_to is AllItems.INCLUDED and keeper != morty and reassigns:
@@ -2326,13 +2335,8 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, morty, caller=caller.id)
-        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close"):
+        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
-        if name in ("park", "close"):
-            if assigned_to is not AllItems.INCLUDED:
-                source = caller.name
-            elif source is None:
-                parser.error(f"{name} requires --source for morty")
         assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
@@ -2385,11 +2389,12 @@ def main(argv: list[str] | None = None) -> int:
             print(item.id)
             return _notify_producer_assignment(item, keeper, keeper, caller=caller.id)
         elif name == "park":
-            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source, assigned_to=assigned_to)
+            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source,
+                     assigned_to=assigned_to)
         elif name == "close":
             _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
         elif name == "reopen":
-            _ = reopen(keeper, cast(str, args.id), source=source)
+            _ = reopen(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         else:
             _ = mark_read(keeper, cast(str, args.id), source=source)
         return 0
