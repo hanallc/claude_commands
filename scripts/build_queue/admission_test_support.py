@@ -37,7 +37,7 @@ from scripts.lint.memory_test_support import admission_policy_fixture, config_en
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
-from scripts.build_queue import placement
+from scripts.build_queue import placement, queue_snapshot
 from scripts.mac_test import claim_state, mac_test
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -1038,6 +1038,13 @@ class ScriptedTransport:
 
 def reply_bytes(reply: wire.Reply) -> bytes:
     return wire.encode_reply(reply).encode()
+
+
+def publish_fixture_view(directory: Path, reading: records.QueueRead, written_at: float,
+                         pass_interval: float = 30) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    queue_snapshot.write_view_snapshot(directory, written_at, written_at + pass_interval,
+                                       reply_bytes(wire.ViewReply(reading)))
 
 
 def queue_decision(available: int, total: int | records.UnknownHostTotal, need: int,

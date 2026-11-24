@@ -146,6 +146,22 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertEqual((status, output, errors), (3, "build queue: no waiting step matches berth\n", ""))
         self.assertIsInstance(admission.server.priority, records.NoQueuePriority)
 
+    def test_bump_uses_the_place_numbers_that_include_a_kept_place(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        reading = self.fixture.read()
+        kept = records.HeldPlace("queue", "fixture", "lint", NOW, NOW, NOW + 60, "4242-99",
+                                 ("natedev",), 1, "failed", position=2)
+        reading = replace(reading, held_places=(kept,))
+        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
+        with (mock.patch.object(memory_admit, "queue_read", return_value=reading),
+              mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as priority):
+            self.assertEqual(self.bump_output("2"), (3, "build queue: place #2 is kept for queue\n", ""))
+            priority.assert_not_called()
+            status, output, errors = self.bump_output("3")
+            self.assertEqual((status, errors), (0, ""))
+            self.assertIn("berth (step #3): first step now #3", output)
+
     def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
         for selectors in (("berth", "other"), ("two words",)):
             with self.subTest(selectors=selectors), \

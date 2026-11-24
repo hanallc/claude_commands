@@ -483,6 +483,12 @@ class ReleaseStatus:
 
 
 @dataclass(frozen=True)
+class FirstStepHandOff:
+    """The caller gave its first-step grant to its command, which sends its own first step; no step ended."""
+    request_id: str
+
+
+@dataclass(frozen=True)
 class OwnerExited:
     pass
 
@@ -503,7 +509,9 @@ class TokenWaiting:
     left_at: float
 
 
-ReservationEnding = NotEnding | ReleaseStatus | OwnerExited | LocalGrantReturned | TokenWaiting
+ReservationEnding = NotEnding | ReleaseStatus | FirstStepHandOff | OwnerExited | LocalGrantReturned | TokenWaiting
+# The caller ended the grant itself, with a status or at a handoff.
+CallerRelease = ReleaseStatus | FirstStepHandOff
 
 
 @dataclass(frozen=True)
@@ -805,6 +813,7 @@ class ServiceState:
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     queue_pins: QueuePins = ()
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
+    held_places: tuple[records.HeldPlace, ...] = field(default=(), kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1576,6 +1585,32 @@ def _place_key(owner: wire.Owner | placement.SubmittingOwner, since: float) -> s
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
+@dataclass(frozen=True)
+class RunStep:
+    """One step of a run, as rule 20 counts it."""
+    key: str
+    # The step runs test binaries (records.TEST_BINARY_STEPS).
+    tests: bool
+
+
+def _run_step(owner: wire.Owner | placement.SubmittingOwner, since: float, step: str, scope: str) -> RunStep:
+    """Name one step of a run: verify.sh sends every step with one owner and one arrival time.
+
+    The local grant and the Mac start of one step give the same name, so a step that moves counts once.
+    """
+    return RunStep("\t".join((_place_key(owner, since), step, scope)), step in records.TEST_BINARY_STEPS)
+
+
+def _local_step(record: ReservationRecord) -> RunStep:
+    return _run_step(record.owner, record.queue_waiter["since"], record.step, record.test_scope)
+
+
+def _placed_step(request: wire.PlacementRequest) -> RunStep:
+    profile = request.profile
+    scope = profile.scope if isinstance(profile, records.StepProfile) else "full"
+    return _run_step(request.owner, request.since, profile.step, scope)
+
+
 def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
     """A new estimate for the same episode keeps its connection, so the waiter keeps its place."""
     same_kind = ((isinstance(first, wire.AdmitRequest) and isinstance(request, wire.AdmitRequest))
@@ -1600,9 +1635,13 @@ def _notify(message: str) -> None:
 
 
 def finalization_outcome(ending: ReservationEnding
-                         ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded, gate.StepEnd | gate.TokenReturn]:
+                         ) -> tuple[step_estimator.FinalOutcome, int | step_estimator.OutcomeNotRecorded,
+                                    gate.StepEnd | gate.TokenReturn | gate.HandOff]:
     if isinstance(ending, TokenWaiting):
         return step_estimator.Completed(), 0, gate.TokenReturn()
+    if isinstance(ending, FirstStepHandOff):
+        # The step goes on under the command's own admission.
+        return step_estimator.HandedOff(), gate.OUTCOME_NOT_RECORDED, gate.HandOff()
     if isinstance(ending, ReleaseStatus):
         return (step_estimator.Completed() if ending.status == 0 else
                 step_estimator.Killed() if ending.status >= 128 else step_estimator.Failed()), ending.status, gate.StepEnd()
@@ -1686,7 +1725,7 @@ class StateIntents:
         key = _place_key(record.owner, record.queue_waiter["since"])
         place = self.places.get(key)
         # A placement release can precede a refusal before launch.
-        awaiting_report = (isinstance(record.ending, ReleaseStatus) and place is not None
+        awaiting_report = (isinstance(record.ending, CallerRelease) and place is not None
                            and place.episode == self.episode and bool(place.move_id))
         if not isinstance(record.ending, TokenWaiting) and not awaiting_report:
             _ = self.places.pop(key, None)
@@ -1774,6 +1813,7 @@ class AdmissionServer:
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
+        self.held_places: tuple[records.HeldPlace, ...] = ()
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
@@ -1919,6 +1959,7 @@ class AdmissionServer:
             self.spacing, self.priority = state.spacing, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
+            self.held_places = state.held_places
             self.verify_run_slots = saved_verify_run_slots(state)
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
@@ -2009,7 +2050,7 @@ class AdmissionServer:
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
-            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
+            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots, held_places=self.held_places)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2286,12 +2327,21 @@ class AdmissionServer:
             if (not self._run_alive(gate.between_steps(slot).run)
                     or not gate.slot_in_force(slot, now)):
                 del self.slots[key]
+        held_before = self.held_places
+        ended: list[wire.RunPlace] = []
         for key, place in list(self.run_places.items()):
             owner = wire.Owner(place.run.pid, place.run.start_time)
             if self._live(owner):
                 self._watch_owner(owner)
             else:
                 del self.run_places[key]
+                ended.append(place)
+        for place in ended:
+            self._keep_place(place, now)
+        self._end_held_places(now)
+        # Save each held place change at once, so a restart writes no second end event.
+        if self.held_places is not held_before:
+            self.persist()
 
     def _free_claim(self, owner: str) -> None:
         for key, slot in list(self.slots.items()):
@@ -2409,15 +2459,204 @@ class AdmissionServer:
     def _held_owners(self) -> set[str]:
         return {records.waiter_owner(self.waiters[episode].row) for episode in self.local_holds if episode in self.waiters}
 
-    def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> None:
+    def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace,
+                   machines: tuple[str, ...]) -> None:
         if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
             return
         if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
             return
         run = request.run
         key = records.run_owner(run.pid, run.start_time)
-        if key not in self.run_places and self._run_alive(run):
-            self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
+        current = self.run_places.get(key)
+        if current is not None:
+            line = current.unit_place
+            if isinstance(line, status_wire.UnitPlace) and not set(machines) <= set(line.machines):
+                named = tuple(dict.fromkeys((*line.machines, *machines)))
+                self.run_places[key] = replace(current, unit_place=replace(line, machines=named))
+        elif self._run_alive(run):
+            new = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
+            job = records.run_job_name(request.identity.job, request.identity.verify)
+            self.run_places[key] = self._take_place(new, profile_repository_name(request.profile), job, machines)
+
+    def _take_place(self, new: wire.RunPlace, repository: str, job: str,
+                    machines: tuple[str, ...]) -> wire.RunPlace:
+        """Rules 13 and 20: a new run takes the oldest place of the waiting run and the held place of its key."""
+        config = self.last_usable_configuration
+        exempt = config.policy.repository_runs.exempt_unit if isinstance(config, records.MemoryConfig) else ""
+        if not new.unit or not repository or not job or new.unit == exempt:
+            return new
+        waiting = self._waiting_runs(new.unit, repository, job)
+        key = (new.unit, repository, records.place_kind(job))
+        held = [kept for kept in self.held_places
+                if (kept.unit, kept.repository, records.place_kind(kept.job)) == key]
+        self.held_places = tuple(kept for kept in self.held_places if kept not in held)
+        took_place: status_wire.TookPlace = "failed" if held else "waiting" if waiting else ""
+        line = status_wire.UnitPlace(repository, job, machines,
+            replaces=max((0, *(line.replaces for _, line in waiting), *(kept.replaces for kept in held))),
+            took_place=took_place)
+        for place, older in waiting:
+            self.run_places[records.run_owner(place.run.pid, place.run.start_time)] = replace(
+                place, unit_place=replace(older, replaced_by=new.run))
+            self._end_replaced_run(place.run)
+        since = min((new.since, *(place.since for place, _ in waiting), *(kept.since for kept in held)))
+        return replace(new, since=since, unit_place=line)
+
+    def _waiting_runs(self, unit: str, repository: str,
+                      job: str) -> list[tuple[wire.RunPlace, status_wire.UnitPlace]]:
+        """Each live run of the key that has no grant and no newer run in its place."""
+        assigned = {request.run for request in self.placement_requests.values()
+                    if request.episode in self.current_assignments}
+        return [(place, line) for place in self.run_places.values()
+                if place.unit == unit and isinstance(line := place.unit_place, status_wire.UnitPlace)
+                and line.repository == repository and records.place_kind(line.job) == records.place_kind(job)
+                and line.reservations == 0
+                and isinstance(line.replaced_by, status_wire.NotReplaced) and place.run not in assigned
+                and self._live(wire.Owner(place.run.pid, place.run.start_time))]
+
+    def _replaced(self, run: wire.RunIdentity | wire.NoRun) -> bool:
+        if not isinstance(run, wire.RunIdentity):
+            return False
+        place = self.run_places.get(records.run_owner(run.pid, run.start_time))
+        return (place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace)
+                and isinstance(line.replaced_by, wire.RunIdentity))
+
+    def _end_replaced_run(self, run: wire.RunIdentity) -> None:
+        """Answer each open request of a replaced run, and take its steps out of the line."""
+        self._schedule_pass()
+        refused = wire.Refused(status_wire.REPLACED_REASON)
+        episodes = {episode for episode, request in self.placement_requests.items() if request.run == run}
+        for episode, waiting in tuple(self.waiters.items()):
+            if isinstance(waiting.request, wire.AdmitRequest) and waiting.request.run == run:
+                episodes.add(episode)
+        for episode in episodes:
+            submitted = self.placement_requests.pop(episode, None)
+            if submitted is not None:
+                _ = self.placement_request_digests.pop(episode, None)
+                self._end_placement_rank(submitted)
+            waiting = self.waiters.get(episode)
+            if waiting is not None:
+                self._end_move(waiting)
+                self.ledger[episode] = ReplayEntry(refused, self.clock.now())
+                self._remove_waiter(waiting, refused)
+        parked = [item for item in self.parked_placements if item.request.episode in episodes]
+        self.parked_placements = [item for item in self.parked_placements if item not in parked]
+        for item in parked:
+            self._send(item.connection, refused)
+
+    def _granted(self, run: wire.RunIdentity | wire.NoRun, step: RunStep) -> None:
+        """Count a grant of the run. A new grant of its first step does not count again.
+
+        The caller can give a grant back before its command runs and then wait again for the same step.
+        The status of that give-back is not the result of the step, so the new grant clears it.
+        """
+        if not isinstance(run, wire.RunIdentity):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        place = self.run_places.get(key)
+        if place is None or not isinstance(line := place.unit_place, status_wire.UnitPlace):
+            return
+        if line.reservations == 0:
+            line = replace(line, reservations=1, first_step=step.key)
+        elif step.key == line.first_step:
+            line = replace(line, first_status=status_wire.NO_FIRST_STATUS)
+        else:
+            line = replace(line, reservations=line.reservations + 1)
+        if step.key == line.failed_step:
+            line = replace(line, failed_step="")
+        if step.tests:
+            line = replace(line, tests_started=True)
+        self.run_places[key] = replace(place, unit_place=line)
+
+    def _released(self, run: wire.RunIdentity | wire.NoRun, step: RunStep, status: int) -> None:
+        """Keep the status of the first step while it is the only step of the run.
+
+        Also keep the latest step that failed before the tests started. A failed test step keeps no place.
+        """
+        if not isinstance(run, wire.RunIdentity):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        place = self.run_places.get(key)
+        if place is None or not isinstance(line := place.unit_place, status_wire.UnitPlace):
+            return
+        if (line.reservations == 1 and line.first_step == step.key
+                and isinstance(line.first_status, status_wire.NoFirstStatus)):
+            line = replace(line, first_status=status)
+        if status != 0 and not step.tests and not line.tests_started:
+            line = replace(line, failed_step=step.key)
+        self.run_places[key] = replace(place, unit_place=line)
+
+    def _handed_off(self, run: wire.RunIdentity | wire.NoRun, step: RunStep) -> None:
+        """A grant that only held the place until the command sent its own first step is not a step.
+
+        The caller does not call _released for a handoff, so its status is not the result of a step.
+        """
+        if not isinstance(run, wire.RunIdentity):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        place = self.run_places.get(key)
+        # Only a handoff before any other step is known: copies.py starts a new run for each command.
+        if (place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace)
+                and line.reservations == 1 and line.first_step == step.key):
+            self.run_places[key] = replace(place, unit_place=replace(line, reservations=0, first_step="",
+                first_status=status_wire.NO_FIRST_STATUS, tests_started=False))
+
+    def _copy_passed(self, run: wire.RunIdentity | wire.NoRun) -> None:
+        """A passed copy is the result of its step.
+
+        The copy watch then stops the local step, so the status of that local release is not the result.
+        A copy has its own owner and arrival time, so it cannot name its step. A copy runs only while
+        its local step holds a grant, so in a run of one step it is a copy of that step.
+        The copy watch copies only a test step (cargo nextest), so its local release never sets failed_step.
+        """
+        if not isinstance(run, wire.RunIdentity):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        place = self.run_places.get(key)
+        if (place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace)
+                and line.reservations == 1):
+            self.run_places[key] = replace(place, unit_place=replace(line, first_status=0))
+
+    def _keep_place(self, ended: wire.RunPlace, now: float) -> None:
+        """Rule 20: keep the place of a run that failed before its tests, or failed or ended with no result in its only step."""
+        line = ended.unit_place
+        rules = self.last_usable_configuration
+        if (not isinstance(line, status_wire.UnitPlace) or not isinstance(rules, records.MemoryConfig)
+                or not isinstance(limits := rules.replace_after_fail, records.ReplaceAfterFail)
+                or isinstance(line.replaced_by, wire.RunIdentity) or line.replaces >= limits.max_times
+                or not (line.failed_step or (line.reservations == 1 and line.first_status != 0))):
+            return
+        replaces = line.replaces + 1
+        waiting = self._waiting_runs(ended.unit, line.repository, line.job)
+        for place, older in waiting:
+            self.run_places[records.run_owner(place.run.pid, place.run.start_time)] = replace(
+                place, since=min(place.since, ended.since),
+                unit_place=replace(older, replaces=max(older.replaces, replaces), took_place="failed"))
+        if waiting:
+            return
+        key = (ended.unit, line.repository, records.place_kind(line.job))
+        same = [kept for kept in self.held_places
+                if (kept.unit, kept.repository, records.place_kind(kept.job)) == key]
+        end: records.HeldPlaceEnd = ("no_result" if not line.failed_step
+            and isinstance(line.first_status, status_wire.NoFirstStatus) else "failed")
+        step_key = (line.failed_step or line.first_step) if end == "failed" else ""
+        failed_step = step_key.split("\t", 2)[1] if "\t" in step_key else step_key
+        held = records.HeldPlace(ended.unit, line.repository, line.job,
+            min((ended.since, *(kept.since for kept in same))), now, now + limits.time_limit_seconds,
+            records.run_owner(ended.run.pid, ended.run.start_time),
+            line.machines, max((replaces, *(kept.replaces for kept in same))), end, failed_step=failed_step)
+        self.held_places = (*(kept for kept in self.held_places if kept not in same), held)
+
+    def _end_held_places(self, now: float) -> None:
+        """A held place that no new run took ends at its time limit."""
+        ended = [held for held in self.held_places if held.ends_at <= now]
+        if not ended:
+            return
+        self.held_places = tuple(held for held in self.held_places if held not in ended)
+        for held in ended:
+            gate.append_queue_time(self.state_dir, {"kind": "held_place_ended", "unit": held.unit,
+                "repository": held.repository, "job": held.job, "since": held.since, "failed_at": held.failed_at,
+                "ends_at": held.ends_at, "failed_run": held.failed_run,
+                "ended": held.ended}, now)
 
     def _order_since(self, since: float, run: wire.RunIdentity | wire.NoRun, job_start: records.CiJobStart) -> float:
         """Rank a step at the earliest of its arrival, the first step of its run, and the start of its CI job."""
@@ -3346,11 +3585,13 @@ class AdmissionServer:
                   and place.episode == request.episode}
         visible: list[records.WaitingStep] = []
         positions: dict[str, int] = {}
+        took_places = self._took_places()
         for position, (path, row) in enumerate(ordered, 1):
             owner = records.waiter_owner(row)
             positions[owner] = position
+            took_place = took_places.get(owner, "")
             if path in local:
-                visible.append(local[path])
+                visible.append(replace(local[path], took_place=took_place) if took_place else local[path])
                 continue
             request = routed.get(row.get("move_id", ""))
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
@@ -3367,11 +3608,12 @@ class AdmissionServer:
                 ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
-                what=row.get("what", "")))
+                took_place=took_place, what=row.get("what", "")))
         move_line = self._current_move_line(ordered, self._movable_wait_ids())
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
-        reading = self._cloud_reading(reading, self.configuration)
+        reading = replace(self._cloud_reading(reading, self.configuration),
+                          held_places=records.number_held_places(reading.view.waiting, self.held_places))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
@@ -3406,6 +3648,21 @@ class AdmissionServer:
             if not isinstance(reply, wire.DispatchStatus):
                 replies[episode] = PublishedPlacement(input_event_count, request_digest, reply)
         return replies
+
+    def _took_places(self) -> dict[str, str]:
+        """Name each waiting step whose run took the place of an older run of its unit."""
+        requests: list[tuple[wire.Owner | placement.SubmittingOwner, wire.RunIdentity | wire.NoRun]] = [
+            (waiting.request.owner, waiting.request.run)
+            for waiting in self.waiters.values() if isinstance(waiting.request, wire.AdmitRequest)]
+        requests.extend((request.owner, request.run) for request in self.placement_requests.values())
+        took: dict[str, str] = {}
+        for owner, run in requests:
+            if not isinstance(run, wire.RunIdentity):
+                continue
+            place = self.run_places.get(records.run_owner(run.pid, run.start_time))
+            if place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace) and line.took_place:
+                took[records.run_owner(owner.pid, owner.start_time)] = line.took_place
+        return took
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3585,6 +3842,8 @@ class AdmissionServer:
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
+                if isinstance(request, wire.AdmitRequest) and isinstance(admission.place, wire.LocalPlace):
+                    self._granted(request.run, _local_step(admission))
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
                 if slot is not None:
                     current = self.verify_run_slots.get(slot.key)
@@ -3622,7 +3881,7 @@ class AdmissionServer:
     def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
         self.input_event_count += 1
-        started = isinstance(ending, ReleaseStatus)
+        started = isinstance(ending, CallerRelease)
         if not started and "verify" in record.queue_waiter and record.sidecar:
             try:
                 started = bool(Path(record.sidecar).read_text().strip())
@@ -3642,7 +3901,7 @@ class AdmissionServer:
                 self._watch_scope(lifetime, episode)
                 return
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
-        elif isinstance(ending, ReleaseStatus) and episode not in self.placement_requests:
+        elif isinstance(ending, CallerRelease) and episode not in self.placement_requests:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
@@ -3683,7 +3942,7 @@ class AdmissionServer:
         previous = self.ledger.get(episode)
         if previous is not None:
             self.ledger[episode] = replace(previous, ended_at=self.clock.now())
-        if isinstance(ending, (ReleaseStatus, TokenWaiting)):
+        if isinstance(ending, (ReleaseStatus, FirstStepHandOff, TokenWaiting)):
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
@@ -4588,7 +4847,9 @@ done
                     self._remove_waiter(previous, claim_disposition=WaiterClaimDisposition.TRANSFER)
                 waiting = WaitingAdmission(admission, row, NO_CONNECTION, continuation_claim=claim)
                 self.waiters[request.episode] = waiting
-                self._run_place(admission, waiter_place(row, request.episode))
+                self._run_place(admission, waiter_place(row, request.episode), tuple(dict.fromkeys(
+                    candidate.destination.target for candidate in request.constraints.candidates
+                    if not isinstance(candidate.eligibility, placement.FixedExclusion))))
         for episode, waiting in tuple(self.waiters.items()):
             if episode in self.placement_requests and episode not in prepared:
                 self._remove_waiter(waiting)
@@ -5021,6 +5282,9 @@ done
                 return self._placement_status(assignment, "the exact claim is not adopted")
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
+        # A speculative copy repeats a step of the run, so it is not a step of its own.
+        if destination.provider != "local" and not isinstance(submitted.purpose, placement.SpeculativeCopy):
+            self._granted(submitted.run, _placed_step(submitted))
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
@@ -5173,6 +5437,12 @@ done
             if assignment.episode in self.reservations:
                 return
         if isinstance(outcome, placement.AttemptCompleted):
+            submitted = self.placement_requests.get(assignment.episode)
+            if submitted is not None and assignment.destination.provider != "local":
+                if not isinstance(submitted.purpose, placement.SpeculativeCopy):
+                    self._released(submitted.run, _placed_step(submitted), outcome.status)
+                elif outcome.status == 0:
+                    self._copy_passed(submitted.run)
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
@@ -5238,6 +5508,8 @@ done
                     and published.input_event_count == self.input_event_count
                     and published.request_digest == digest):
                 return [published.reply]
+            if self._replaced(request.run):
+                return [wire.Refused(status_wire.REPLACED_REASON)]
             previous = self.placement_requests.get(request.episode)
             identity = self._placement_identity(request)
             members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
@@ -5556,6 +5828,8 @@ done
             if any(waiting.request.owner == request.owner and episode != key
                    for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
+            if isinstance(request, wire.AdmitRequest) and self._replaced(request.run):
+                return self._mutation_reply(key, wire.Refused(status_wire.REPLACED_REASON))
             if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
                     and isinstance(group := request.place.group, status_wire.CloudGroup)):
                 if (refused := self._register_cloud_group(request.place, group)) is not None:
@@ -5567,7 +5841,7 @@ done
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
             place = waiter_place(row, key)
-            self._run_place(request, place)
+            self._run_place(request, place, (self.host,))
             previous = self.waiters.get(key)
             claim = previous.continuation_claim if previous is not None else NoContinuationClaim()
             if previous is not None and previous.connection is not connection:
@@ -5583,7 +5857,14 @@ done
         elif isinstance(request, wire.ReleaseRequest):
             episode = next((episode for episode, record in self.reservations.items() if record.reservation_id == request.reservation), None)
             if episode is not None:
-                self._end(episode, ReleaseStatus(key, request.status))
+                record = self.reservations[episode]
+                # Before _end, so that its save keeps the change. The status of a handoff is not a step result.
+                if request.ending == "handed_off":
+                    self._handed_off(record.run, _local_step(record))
+                else:
+                    self._released(record.run, _local_step(record), request.status)
+                self._end(episode, FirstStepHandOff(key) if request.ending == "handed_off"
+                          else ReleaseStatus(key, request.status))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         elif isinstance(request, wire.WidthRequest):
             if request.width <= 0:

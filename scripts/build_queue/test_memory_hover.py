@@ -833,6 +833,71 @@ class MemoryHoverTests(unittest.TestCase):
                 for row in table.findall("./tbody/tr"):
                     self.assertEqual(len(row), len(headers) - int(row.get("class", "").startswith(("wait", "queue-head"))))
 
+    def test_kept_place_row_has_a_number_and_leaves_the_wait_bars_in_order(self) -> None:
+        unit_open = '<span class="staff-name" data-color-text="role.unit-director">'
+        setup = ("globalThis.window=globalThis;" + staff_names.script({})[8:-9]
+            + f"staffNames.set({{}}, {json.dumps(unit_open)});")
+        held = self.kept_place_row()
+        reading = {"total": 64, "read_at": 200, "queueControls": {"canMove": True},
+            "held_places": [held],
+            "waiters": [{"name": "phases", "unit": "phases", "since": 40, "need": 2,
+                         "targets": held["targets"], "move": {"row_id": "first"}},
+                        {"name": "research", "since": 60, "need": 3, "move": {"row_id": "last"}}]}
+        render = "(()=>{" + setup + "renderWalk(data); return $('walk').innerHTML;})()"
+        html = self.page_expression(render, reading, walk=True)
+        grid = ElementTree.fromstring(f"<root>{html}</root>")
+        kept = grid.find(".//div[@data-tip='held:4242-99']")
+        assert kept is not None
+        self.assertNotIn("wait", kept.get("class", "").split())
+        self.assertIsNone(kept.find(".//button"))
+        self.assertIsNone(kept.find(".//div[@class='track']"))
+        self.assertEqual(step_text(kept, ".//span[@class='name']"), "queue: kept place")
+        colored = kept.find(".//span[@class='name']/span[@data-color-text='role.unit-director']")
+        assert colored is not None
+        self.assertEqual(colored.text, "queue")
+        self.assertEqual(colored.tail, ": kept place")
+        self.assertEqual(kept.findtext(".//span[@class='owner']"), "last run failed in lint")
+        self.assertEqual(grid.findall(".//*[@class='unit']"), [])
+        table = grid.find(".//tr[@data-tip='held:4242-99']")
+        assert table is not None
+        self.assertNotIn("wait", table.get("class", "").split())
+        self.assertEqual([table.findtext(f"./td[@class='{name}']") for name in ("place", "duration")],
+                         ["2", "until 22:37 PST"])
+        self.assertEqual(len(table), len(grid.findall(".//tr[@class='queue-head']/th")))
+        machine = table.find("./td[@class='machine']")
+        waiting_machine = grid.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
+        assert machine is not None and waiting_machine is not None
+        self.assertEqual(ElementTree.tostring(machine), ElementTree.tostring(waiting_machine))
+        self.assertEqual([(icon.attrib["class"], icon.attrib["aria-label"]) for icon in machine],
+                         [("machine machine-icon dim", "natedev"), ("machine machine-icon dim", "mac-linux")])
+        wait_rows = [row for row in grid.findall(".//div") if "wait" in row.get("class", "").split()]
+        self.assertEqual([row.get("data-tip") for row in wait_rows], ["wait:fixture-wait-0", "wait:fixture-wait-1"])
+        self.assertTrue(all(row.find(".//div[@class='track']") is not None for row in wait_rows))
+        self.assertEqual(grid.findtext(".//tr[@data-tip='wait:fixture-wait-1']/td[@class='place']"), "3")
+        reading["held_places"] = [{**held, "failed_step": ""}]
+        html = self.page_expression(render, reading, walk=True)
+        self.assertNotIn("last run failed in", str(html))
+
+    def test_kept_place_hover_names_the_failure_and_the_deadline(self) -> None:
+        reading = {"held_places": [self.kept_place_row()]}
+        html = self.page_expression("tooltipHtml('held:4242-99', data)", reading, walk=True)
+        tip = ElementTree.fromstring(str(html))
+        self.assertEqual([(node.tag, node.get("class"), node.text) for node in tip[:2]],
+                         [("dt", "title", "Kept place"), ("dd", "title", "place 2")])
+        fields = {"Unit": "queue", "Failed run": "4242-99", "Failed step": "lint",
+                  "Failed at": "22:07 PST", "Kept until": "22:37 PST"}
+        self.assertEqual({node.text: tip[index + 1].text for index, node in enumerate(tip)
+                          if node.tag == "dt" and index > 0}, fields)
+        self.assertEqual(tip.findtext("dd[@class='long']"),
+            "If the next run of unit queue (same repository and job) arrives before 22:37 PST, "
+            + "it starts from place 2. Runs behind place 2 do not wait for it.")
+
+    @staticmethod
+    def kept_place_row() -> dict[str, object]:
+        return {"kind": "held", "key": "4242-99", "since": 50, "position": 2, "unit": "queue",
+                "failed_run": "4242-99", "failed_step": "lint", "failed_at": "22:07 PST",
+                "kept_until": "22:37 PST", "targets": ["natedev", "mac-linux"]}
+
     def test_guest_row_shows_confirmation_and_caller(self) -> None:
         for guest, state in (({"guest_run": {"attempt": "fixture"}}, "running"),
                              ({"guest_unconfirmed": True}, "not confirmed")):

@@ -26,18 +26,36 @@ class NoWaitingStep:
     pass
 
 
+def waiting_positions(reading: admission_records.QueueRead) -> dict[int, admission_records.WaitingStep]:
+    """Use the same place numbers as the Builds page."""
+    kept = {place.position for place in reading.numbered_held_places()}
+    waiting = iter(reading.view.waiting)
+    return {position: next(waiting) for position in range(1, len(reading.view.waiting) + len(kept) + 1)
+            if position not in kept}
+
+
 def bump(selector: str, actor: str) -> int:
     reading = memory_admit.queue_read()
+    positions = waiting_positions(reading)
     labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
-    matches = [position for position, step in enumerate(reading.view.waiting, 1)
+    matches = [position for position, step in positions.items()
                if queue_evidence.step_labels(step, labels).session == selector]
-    if not matches:
-        matches = memory_admit.match_waiters(selector, reading.view)
+    if not matches and selector.isdecimal():
+        position = int(selector)
+        for kept in reading.numbered_held_places():
+            if kept.position == position:
+                print(f"build queue: place #{position} is kept for {kept.unit}")
+                return 3
+        if position in positions:
+            matches = [position]
+    elif not matches:
+        numbers = tuple(positions)
+        matches = [numbers[index - 1] for index in memory_admit.match_waiters(selector, reading.view)]
     if not matches:
         print(f"build queue: no waiting step matches {selector}")
         return 3
     selected_place = matches[0]
-    step = reading.view.waiting[selected_place - 1]
+    step = positions[selected_place]
     unit = memory_admit.queue_unit(step.unit, step.session_id, labels)
     if unit == unit_labels.UnitLabels("").unit or not unit:
         print(f"build queue: waiting step #{selected_place} has no unit")
@@ -47,7 +65,7 @@ def bump(selector: str, actor: str) -> int:
         print(f"build queue: {result.reason}")
         return 3
     reading = memory_admit.queue_read()
-    first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
+    first = next((WaitingPosition(place) for place, step in waiting_positions(reading).items()
                   if memory_admit.queue_unit(step.unit, step.session_id, labels) == unit), NoWaitingStep())
     detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
     priority = reading.explanation.priority

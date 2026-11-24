@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from http.client import HTTPConnection
 from pathlib import Path
 import shutil
@@ -37,7 +38,9 @@ from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
-from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted, publish_fixture_view,
+)
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
@@ -658,6 +661,23 @@ class MemoryFeedTests(unittest.TestCase):
                             self.assertIn("Testing  7 of 12 modules", "\n".join(tips["walk"][page["walk"].index(row)]))
                         else:
                             self.assertIn('<td class="place">—</td><td class="done">—</td>', table)
+
+    def test_kept_place_feed_keeps_its_number_and_formats_times_in_the_user_zone(self) -> None:
+        reading = queued_reading(reservation_reading(), ())
+        waiting = reading.view.waiting
+        reading = replace(reading, view=replace(reading.view, waiting=(replace(waiting[0], took_place="failed"), *waiting[1:])))
+        failed_at = datetime(2026, 11, 24, 6, 7, tzinfo=UTC).timestamp()
+        kept = admission_records.HeldPlace("queue", "fixture", "lint", 85, failed_at, failed_at + 1800,
+            "4242-99", ("natedev", "mac"), 1, "failed", failed_step="lint", position=2)
+        reading = replace(reading, held_places=(kept,))
+        publish_fixture_view(self.root / "buildlog" / "admission", reading, failed_at)
+        with mock.patch.object(memory_feed, "user_zone", return_value=ZoneInfo("America/Los_Angeles")):
+            page = memory_feed.reading()
+        row, = page["held_places"]
+        self.assertEqual((row["unit"], row["position"], row["targets"]), ("queue", 2, ("natedev", "mac")))
+        self.assertEqual((row["failed_step"], row["failed_at"], row["kept_until"]), ("lint", "22:07 PST", "22:37 PST"))
+        self.assertEqual([row.get("place") for row in page["waiters"]], [1, 3, 4, 5])
+        self.assertEqual(page["waiters"][0].get("order_note"), "Took the place of its failed run.")
 
     def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
         now = 200_000.0
@@ -1606,10 +1626,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(list(self.output.iterdir()), [target])
 
     def write_view_file(self, written_at: float, pass_interval: float = 30) -> None:
-        folder = self.root / "buildlog" / "admission"
-        folder.mkdir(parents=True, exist_ok=True)
-        reply = wire.encode_reply(wire.ViewReply(captured_reading())).encode()
-        queue_snapshot.write_view_snapshot(folder, written_at, written_at + pass_interval, reply)
+        publish_fixture_view(self.root / "buildlog" / "admission", captured_reading(), written_at, pass_interval)
 
     def test_feed_uses_published_view_when_the_socket_does_not_answer(self) -> None:
         written_at = 200_001.0

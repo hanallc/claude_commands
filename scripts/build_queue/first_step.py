@@ -67,11 +67,11 @@ class FirstStepAdmission:
             self._hand_gate(grant)
             return
         if isinstance(grant, wire.Admitted):
-            answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing)
+            answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing, 'handed_off')
             if isinstance(answer, wire.Refused):
                 raise FirstStepRefused(answer.reason)
         elif isinstance(grant, wire.LocalPlacementGranted):
-            _ = client.finish_step(self.assignment_file, 0)
+            _ = client.finish_step(self.assignment_file, 0, ending='handed_off')
         elif isinstance(grant, wire.Assignment):
             destination = grant.assignment.destination
             os.environ['BUILDLOG_FIRST_STEP_ASSIGNMENT'] = str(self.assignment_file)
@@ -186,11 +186,17 @@ def _program_request(command: Sequence[str], source: Path, owner: wire.Owner,
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    request = _program_request(command, source, owner, position, run)
+    program = _program_request(command, source, owner, position, run)
+    unit = ''
+    def refresh() -> wire.AdmitRequest:
+        nonlocal unit
+        request = program.refresh()
+        unit = request.identity.unit
+        return request
     output = client.WaitOutput()
-    answer = queue_place.request_place(request, output)
+    answer = queue_place.request_place(queue_place.RefreshedRequest(refresh), output)
     if isinstance(answer, wire.Refused):
-        raise FirstStepRefused(answer.reason)
+        raise FirstStepRefused(client.replaced_line(answer.reason, unit) or answer.reason)
     if not isinstance(answer, wire.Admitted):
         raise FirstStepRefused('the caller left before first-step admission', 75)
     output.finished()

@@ -307,7 +307,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
    and the row hover gives the full text. */
 .row-label :is(.owner, .wait-note) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* When the queue shows reorder handles, every waiting row keeps the handle space, so a fixed row lines up with the others. */
-#walk:has(.queue-grip) .wrow.wait .row-label { padding-inline-start: 30px; }
+#walk:has(.queue-grip) .wrow:is(.wait, .held) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
   color: var(--ink-3); cursor: grab; touch-action: none; }
@@ -337,13 +337,15 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
 .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
+.wrow.held .row-label { grid-column: 1 / -1; }
+.walk.beside .wrow.held .row-label { max-width: calc(var(--table-left) - var(--gap)); }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
 .queue-title { display: flex; min-width: 0; white-space: nowrap; }
 .queue-title > :first-child { overflow: hidden; text-overflow: ellipsis; }
 .queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
-.walk-table tr.wait { color: var(--ink-2); }
+.walk-table tr:is(.wait, .held) { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
 .walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
@@ -1065,6 +1067,18 @@ function tooltipRows(key, data) {
   data = shownReading(data);
   const [kind, index] = key.split(':');
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'held') {
+    const row = data.held_places?.find(place => place.key === index);
+    if (!row) return [];
+    const unit = ownerText(row.unit);
+    return [field('Kept place', `place ${row.position}`, 'title'),
+      field('', `Kept for the next run of unit ${unit}`, 'caption'),
+      field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
+      field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
+      field('Kept until', row.kept_until),
+      field('', `If the next run of unit ${unit} (same repository and job) arrives before ${row.kept_until}, ` +
+        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
+  }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
@@ -1172,8 +1186,8 @@ function unitName(text) {
   return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
-function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(starter || name)}</span></span>` +
+function rowLabel({name, unit = "", owner = "", starter = "", repository = "", nameSuffix = ""}, note = "") {
+  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(starter || name)}${esc(nameSuffix)}</span></span>` +
     `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
@@ -1765,9 +1779,10 @@ function previewQueueMove(neighbor) {
   drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
   drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
     : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-  const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
+  const preview = {...drag.reading, waiters:drag.rows};
+  const place = queuePlace(preview, drag.row.move.row_id, preview.move_revision);
   queueMessage(drag.pointer === null ? `Place ${place}` : "");
-  showWalk({...drag.reading, waiters:drag.rows});
+  showWalk(preview);
 }
 
 function finishQueueDrag(commit) {
@@ -1790,7 +1805,8 @@ function queueRequestId() {
 
 function queuePlace(reading, id, revision) {
   if (reading.queueReady === false || reading.move_revision !== revision) return 0;
-  return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
+  return queueRows(reading.waiters, reading.held_places || []).filter(row => row.kind !== "cloud")
+    .findIndex(row => row.move?.row_id === id) + 1;
 }
 
 async function sendQueueMove(row, reading, request, id = queueRequestId()) {
@@ -1893,6 +1909,7 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
+  const held = d.held_places || [];
   const {canMove, lifted, highlighted} = d.queueControls ?? {};
   const grip = row => {
     if (!canMove || !row.move || row.move.movable === false) return "";
@@ -1902,7 +1919,8 @@ function renderWalk(d) {
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
   };
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th>` +
+    `<th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
   // A step that runs shows the bright icon of its machine; the row tooltip names the other targets.
   // A step that waits shows a dim icon for each machine that can take it.
@@ -1914,10 +1932,12 @@ function renderWalk(d) {
   const stepText = (step, waiting) => waiting && step.includes(" ")
     ? step.split(" ").map(word => `<span class="word">${esc(word)}</span>`).join(" ") : esc(step);
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
+    const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, className.startsWith("wait"))}</span></th><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, waiting)}</span></th>` +
+      `<td class="pid">${kept ? "" : typeof pid === "number" ? pid : "—"}</td>` +
+      target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : waiting ? "" : "—"}</td>` +
+      (waiting ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
@@ -1942,8 +1962,8 @@ function renderWalk(d) {
   const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel({name: "Free"})}` + rowMemory("room") + `</div>`);
-  const waitingCount = d.waiters.length;
-  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const waitingCount = d.waiters.length, heldCount = held.length;
+  if (waitingCount || heldCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
   const title = d.move_revision ? "Waiting, in queue order"
     : !units.length ? "Queued, in order of submission"
@@ -1951,9 +1971,20 @@ function renderWalk(d) {
     : `Queued, ${units.join(" followed by ")} and then in submission order`;
   const titleHtml = d.move_revision || !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount + heldCount})</span></span></div>`);
   let localPosition = 0;
-  d.waiters.forEach((w, i) => {
+  queueRows(d.waiters, held).forEach((w, i) => {
+    if (w.kind === "held") {
+      localPosition = w.position;
+      const unit = ownerText(w.unit);
+      const tip = `held:${esc(w.key)}`, rowClass = `held${i === 0 ? " wait-first" : ""}`;
+      const target = targetCell("", w.targets);
+      cells(String(w.position), {step:"", verify:""}, `until ${w.kept_until}`, null, target, null, tip, rowClass);
+      const labels = {unit, name: "", nameSuffix: ": kept place",
+        repository: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
+      rows.push(`<div class="wrow ${rowClass}" data-tip="${tip}">${rowLabel(labels)}</div>`);
+      return;
+    }
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
@@ -1989,6 +2020,21 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
+}
+
+// Cloud waits have no numbered place.
+function queueRows(waiters, held) {
+  const rows = [];
+  let next = 0, position = 1;
+  for (const row of waiters) {
+    while (held[next]?.position === position) {
+      rows.push(held[next++]);
+      position++;
+    }
+    rows.push(row);
+    if (row.kind !== "cloud") position++;
+  }
+  return [...rows, ...held.slice(next)];
 }
 
 function fitAxisLabels() {
@@ -2276,7 +2322,9 @@ function placeMemoryBars(d) {
   placeDivider(roomRow, dividerTop);
   const dividerOffset = Math.floor(roomTrack.getBoundingClientRect().top) - dividerTop;
   for (const row of document.querySelectorAll(".wrow.wait-first")) {
-    placeDivider(row, Math.floor(row.querySelector(".track").getBoundingClientRect().top) - dividerOffset);
+    // A held place has no memory track, so its text sets the divider.
+    const anchor = row.querySelector(".track") || row.querySelector(".row-label");
+    placeDivider(row, Math.floor(anchor.getBoundingClientRect().top) - dividerOffset);
   }
 }
 

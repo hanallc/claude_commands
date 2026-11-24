@@ -646,7 +646,7 @@ An empty scope and ended owner permit finalization. A reused scope path gets a n
 `finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
 The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
 `StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
-The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
+The finalizer records completed measurements for history. A first-step handoff records none: its peak is the preparation, not the step. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
 It imports live reservations, saved intents, waiter places, token handoffs, priority, and start spacing.
@@ -669,6 +669,18 @@ The next eligible pass publishes the guest row.
 The Builds feed reads `view.json` and uses its publication time as the data time.
 The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
 A missing or unreadable view file gives the queue read error.
+
+The service saves a `HeldPlace` when a failed run qualifies to keep its place.
+The record keeps the failed step, the run identity, its targets, and the expiry time.
+An older record can omit the failed step.
+The view assigns the place number from the waiting order and the saved arrival time.
+The Builds page shows the unit in its role color in the row label.
+The Machine cell uses the same dim target icons as a waiting row.
+The deadline uses the user's time zone.
+The row has no reorder control or memory bar.
+The hover shows the failed run, step, failure time, and deadline.
+`build_queue.py` uses the same place numbers and reports a kept place when the user selects it.
+
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
@@ -688,6 +700,7 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
 A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A first-step handoff ends its grant with `HandOff` and outcome `handed_off`. It ends this run's lifetime but does not count as a completed step; the command's own admission has its own lifetime.
 A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
 The saved finalization intent retains the facts for the end event across retries.
 The event identity prevents a retry from publishing the same end twice.
