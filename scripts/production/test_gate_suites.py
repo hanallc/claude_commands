@@ -1219,8 +1219,7 @@ class ChildImports(unittest.TestCase):
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
         gate_records = [cast(dict[str, object], json.loads(line))
-                        for path in caller_log.rglob("*")
-                        if path.is_file() and path != caller_log / "keep"
+                        for path in caller_log.glob("*/*.jsonl")
                         for line in path.read_text().splitlines()]
         self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")

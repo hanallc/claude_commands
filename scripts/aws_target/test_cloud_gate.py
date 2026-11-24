@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from functools import cached_property, partial
@@ -42,7 +42,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, cl
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.buildlog import index, store
+from scripts.buildlog import store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
@@ -58,6 +58,7 @@ from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, in
 from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.message.unit_labels import OwnerRole, UnitLabels
+from scripts.test_times import gate_record, recent_gate_times
 
 
 def service_environment(command: Sequence[str]) -> dict[str, str]:
@@ -367,13 +368,12 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 'subnets': [{'id': 'fixture-a', 'zone': 'a'}, {'id': 'fixture-b', 'zone': 'b'}]}]}
         self.fake.result = self.result()
 
+    def record_passing_wall(self, seconds: float) -> None:
+        recorded = ledger.mapping(self.result()['record'])
+        recent_gate_times.update_recent_times({**recorded, 'vcpus': 32, 'max_jobs': 32, 'wall_s': seconds})
+
     def test_time_limit_returns_red_with_traceback_and_ends_the_box(self) -> None:
-        import sqlite3
-        _ = index.update()
-        with closing(sqlite3.connect(index.index_path())) as connection, connection:
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
+        self.record_passing_wall(7)
         modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
         log = ('Runner: 2 modules, whole machine, 32 CPUs\n'
                'Starting module: fixture/test_ok.py\n'
@@ -467,12 +467,7 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
 
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
-        import sqlite3
-        _ = index.update()
-        with closing(sqlite3.connect(index.index_path())) as connection, connection:
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
+        self.record_passing_wall(1)
         for arrival in ('before-poll', 'at-stop', 'at-stop-log-timeout', 'ec2-timeout', 'at-deadline',
                         'ec2-outage-limit', 'boot-and-result'):
             with self.subTest(arrival=arrival):
@@ -2255,6 +2250,10 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                       mock.patch.object(store, 'host_file', return_value=destination) as host_file):
                     cloud_gate.import_record(self.folder, result)
                     cloud_gate.import_record(self.folder, result)
+                    vcpus = os.cpu_count() or 1
+                    self.assertEqual(gate.read_time_limit(vcpus, (), vcpus, False), gate_record.GateTimeLimit(6))
+                    self.assertEqual(gate.read_time_limit(vcpus, ('fixture/test_ok.py',), vcpus, True),
+                                     gate_record.GateTimeLimit(2))
                 self.assertEqual(host_file.call_args.args[0], 'aws')
                 # The result leaves the gate copy for the store, beside the gate run record.
                 self.assertFalse((self.folder / cloud_gate.RESULT_FILE).exists())
@@ -2287,6 +2286,74 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertTrue((self.folder / cloud_gate.RESULT_FILE).exists())
         self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
         reported.assert_called_once()
+
+    def test_cloud_import_keeps_module_reads_only_in_the_latest_read_file(self) -> None:
+        result = self.result()
+        outgoing = ledger.mapping(result['record'])
+        reads = ledger.rows(outgoing, 'modules')[0]
+        reads.update(config_reads=['limits'], folder_scans=['docs/'], content_reads=[])
+        cloud_gate.import_record(self.folder, result)
+        cloud_gate.import_record(self.folder, result)
+
+        destination = store.host_file(store.CLOUD_GATE_PLACE, self.now)
+        saved, = tuple(store.locked_rows(destination))
+        retained = ledger.text(cloud_gate.read(self.folder / 'imported.json'), 'result')
+        retained_result = ledger.mapping(cast(object, json.loads(gzip.decompress((store.root() / retained).read_bytes()))))
+        for record in (saved, ledger.mapping(retained_result['record'])):
+            module, = ledger.rows(record, 'modules')
+            self.assertTrue(module.keys().isdisjoint(gate_record.READ_FIELDS))
+            self.assertEqual(module['wall_s'], reads['wall_s'])
+            self.assertEqual(module['peak_mib'], reads['peak_mib'])
+            self.assertEqual(module['status'], reads['status'])
+        module_path = 'scripts/fixture/test_ok.py'
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(['limits'], ['docs/'], [])},
+            {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+        ))
+
+    def test_cloud_snapshot_write_failure_keeps_aws_verdict_and_payload(self) -> None:
+        result = self.result(status=1)
+        outgoing = ledger.mapping(result['record'])
+        ledger.rows(outgoing, 'modules')[0]['config_reads'] = ['limits']
+        payload = self.folder / cloud_gate.RESULT_FILE
+        marker = self.folder / 'imported.json'
+        snapshot = gate_record.latest_module_reads_path(store.host_name())
+        cloud_gate.save(payload, result)
+        cloud_gate.save(self.folder / 'outcome.json', {'status': 'complete', 'result_file': cloud_gate.RESULT_FILE})
+        _ = (self.folder / 'gate.log').write_text('fixture AWS test failed\n')
+        request = {**self.request, 'head': 'commit'}
+
+        def completed_cloud(repo: Path, **_options: object) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+            return cloud_gate.run_service(repo, self.folder, request, (), lambda _command: 0)
+
+        with (mock.patch.object(gate_record, 'write_text_atomic', side_effect=OSError('fixture snapshot write failed')),
+              mock.patch.object(cloud_gate, 'run_cloud', side_effect=completed_cloud),
+              mock.patch.object(cloud_gate, 'append_launch') as fallback,
+              mock.patch.object(gate, 'checked_git', return_value='commit'),
+              mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set[str]())),
+              mock.patch.object(gate, 'run_suites', side_effect=AssertionError('The local runner must not start')) as local,
+              redirect_stderr(StringIO()) as errors, redirect_stdout(StringIO()) as output):
+            remote = gate.run_gate_suites(self.root, target=gate.NO_GATE_ASSIGNMENT)
+        local.assert_not_called()
+        fallback.assert_not_called()
+        self.assertEqual(remote, gate_box.decode_run(result['gate']))
+        self.assertFalse(remote.passed)
+        self.assertEqual(errors.getvalue(), 'latest module reads not written: fixture snapshot write failed\n')
+        self.assertEqual(output.getvalue(), 'fixture AWS test failed\n')
+        self.assertFalse(marker.exists())
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(cloud_gate.read(payload), result)
+
+        cloud_gate.import_record(self.folder, cloud_gate.read(payload))
+        self.assertTrue(marker.exists())
+        self.assertFalse(payload.exists())
+        rows = list(store.locked_rows(store.host_file(store.CLOUD_GATE_PLACE, self.now)))
+        self.assertEqual([row['id'] for row in rows], ['gate-attempt'])
+        module_path = 'scripts/fixture/test_ok.py'
+        self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+            {module_path: gate_record.module_read_record(['limits'], None, None)},
+            {'config_reads': frozenset({module_path})},
+        ))
 
     def test_first_import_skips_existing_rows(self) -> None:
         destination = store.host_file('aws', self.now)

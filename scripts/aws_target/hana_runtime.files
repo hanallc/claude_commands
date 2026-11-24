@@ -96,3 +96,4 @@ scripts/message/session_records.py
 scripts/message/sessions.py
 scripts/production/staff.py
 scripts/test_times/gate_record.py
+scripts/test_times/recent_gate_times.py

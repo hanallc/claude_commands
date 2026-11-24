@@ -17,6 +17,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
 
@@ -159,6 +160,9 @@ argparse.ArgumentParser.exit = checked_exit
             **gate_run(), "kind": "gate_run", "v": 1, "id": "fixture-config-reads", "host": "fixture-host",
             "started_at": "2100-01-01T00:00:00.000Z", "selection": "full", "aborted": False, "modules": modules}
         self.write(caller_log / "fixture-host/config-reads.jsonl", json.dumps(reads) + "\n")
+        # The peer host publishes its newest full-gate reads as its own snapshot.
+        with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(caller_log)}):
+            gate_record.update_latest_module_reads(reads, modules, host="fixture-host")
         self.write(self.checkout / "config/fixture_settings.conf", "value=changed\n")
         _ = self.commit(self.checkout, "config changed")
         self.clear_gate_events()
