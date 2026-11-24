@@ -16,7 +16,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
-from scripts.review_links.firefox_test_support import load_firefox
+from scripts.review_links.browser_test_support import load_firefox
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 

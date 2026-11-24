@@ -1192,7 +1192,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 
 **Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
-**Shared Firefox for browser tests** (`scripts/review_links/firefox_test_support.py`).
+**Shared Firefox for browser tests** (`scripts/review_links/browser_test_support.py`).
 Each test module starts Firefox on its first probe.
 Marionette closes the probe windows and tabs.
 It clears the profile data before it opens the next tab with the requested viewport.
