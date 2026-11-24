@@ -58,17 +58,21 @@ The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMEN
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
 The gate checks a supplied assignment at startup.
+For `--tests-only` and `--affected`, the assignment source key must match the resolved `--repo` checkout.
 Without a supplied assignment, a direct gate asks `first_step.admitted_run` to place the test checkout.
-The queue offers natedev and `mac-linux` for direct gate placement according to the target configuration.
+The queue offers natedev and the Mac Linux guest for eligible direct gates.
 A direct merge gate asks after it creates the merge tree.
 The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
-The natedev handoff keeps its memory reservation until the suites end.
+The local runner keeps the queue grant until the suites end.
 The suites publish progress to the sidecar from the granted request.
-A `--module` run uses natedev. A nested run keeps its parent reservation.
-`--promote-only` runs on natedev.
+Named modules and `--promote-only` use natedev.
+A nested named module keeps its parent reservation.
+Named module results supply no pass certificate.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
+A prepared gate with an AWS assignment runs the tests in AWS.
+The AWS route reports the result or refusal to the queue.
 An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
 The nightly gate uses the guest for type checks when it finds `basedpyright` and `uv` there.
 If the guest lacks either tool, the nightly gate runs its type checks on natedev.
@@ -97,36 +101,45 @@ So the queue places no other run on the busy guest, and the Builds page shows a 
 Until the queue confirms the guest attempt, the row shows `mac-linux (not confirmed)`.
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
-If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
-The route sends no more cleanup requests.
+If the wait expires, the route prints `guest unreachable` with the guest alias from `ssh.hops`.
+The gate returns status 80 to the caller for that episode.
+The route saves the end result in the Mac Linux proof journal before any settlement report.
+The route stops its own cleanup requests.
+The queue can request another proof check for the saved guest attempt while the slot stays held.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
-It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
-The gate writes a claim failure to `<assignment>.claim-failure`.
-The gate prints `Mac Linux guest took no run: <cause>` and exits with status 79.
+The runner writes `mac-linux run start` before it starts the suites.
+A failure before that line can leave the start unconfirmed.
+The gate writes a claim failure to `<assignment>.claim-failure` when it can report that no tests started.
+It prints `Mac Linux guest took no run: <cause>`.
 In merge mode, it undoes the merge and reports the rollback.
-Status 80 identifies an unknown result after a guest could have started tests.
-A direct gate or `copies.py gate-step` places the run once.
-Checkpoint and bump stop after status 79 or 80.
-`copies.py gate-step` preserves both statuses if cancellation fails and prints the cleanup error on standard error.
-When `copies.py run` owns placement, it reports the claim failure to the queue on status 79 and requests placement again.
-The queue accepts a claim failure after launch permission was used if a new process read confirms the gate ended.
-The caller writes the new assignment to the same file and runs the gate on the assigned machine.
-A 180-second delay applies to another attempt on the same guest. A free named machine can take the run during that delay.
-A second decline excludes the guest for the rest of the run.
-If placement fails, the caller reports `Gate placement blocked`.
+Status 79 identifies a refusal before tests started.
+Status 80 identifies a run with no verdict or a launch that still needs settlement.
+A direct gate or `copies.py gate-step` uses one placement.
+`copies.py gate-step` preserves status 79 or 80 if cancellation fails and reports the cleanup error on standard error.
+Checkpoint and bump treat these statuses as blocked.
+A nightly gate reports the refusal to its production owner and records no red test result.
+When `copies.py run` owns placement, it reports the claim failure to the queue on status 79.
+The queue checks that the gate process ended before accepting a no-run report after launch permission was used.
+An attempt can still require guest proof before the queue releases it.
+On status 80, `copies.py run` requests settlement.
+For Mac Linux, the wrapper needs a no-run report before it requests a replacement.
+The wrapper writes the replacement assignment to the same file and runs the gate on the assigned machine.
+After a prelaunch refusal, another attempt on the same guest requires a fresh availability reading.
+An eligible named machine can take the run while the guest is in backoff.
+A fresh reading that still excludes the guest keeps it out of placement.
+If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
 Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
-A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
-If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
+If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
-A merge gate or targeted test with a prepared copy handoff from `copies.py run` can try AWS without a placement assignment.
-If the cloud route returns a final refusal, natedev runs the selection.
+The AWS route requires a current queue assignment and the prepared gate handoff.
 
 On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.
 The rule set is in `scripts/build_targets/mac_linux.py` (`limit_words`), because the guest runner can read only that module; `scripts/production/hand_made_limit.py` adds the natedev paths.
@@ -200,7 +213,7 @@ Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
 Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
-A gate without a placement assignment runs any requested type checks on natedev after a cloud result.
+The gate runs requested AWS type checks on natedev after the cloud result returns.
 A cloud result that reports a time limit ends the gate before those checks.
 
 The route tries all public zones at `m7a.8xlarge`, then all zones at `m7a.4xlarge`.
@@ -210,14 +223,15 @@ A guest deadline and an independent expiry Lambda bound normal attempt lifetimes
 The route confirms termination before it releases unused cost reservation.
 A launch timeout keeps the cost reservation until reconciliation confirms the outcome.
 
-The route returns a reason for cloud setup and infrastructure failures.
+The route reports cloud setup and infrastructure failures to the queue.
+The queue can reassign after settlement.
 Capacity refusals first exhaust the configured sizes and zones.
 A connect failure at launch means AWS did not receive the request, so no box exists.
 The route then skips that region and tries the next region; it prints `Cloud gate skips <region>: <reason>`.
 A running box survives a short AWS outage: the result poll skips failed reads for up to `observe_outage_s`.
 Termination repeats an outage error until `termination_timeout_s` ends.
-An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
-The route gives a fallback reason when an instance stops without a final result.
+The route reports pending settlement while a launch or termination is uncertain.
+A dead instance without a final result fails the AWS attempt.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once into the one AWS place, `aws`.
 The record keeps the box host name in `host`.
@@ -229,7 +243,7 @@ Launch, refusal, fallback, and finish rows record the queue's tagged job record 
 The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
 Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
-The natedev fallback prints `Cloud gate uses natedev: <reason>`.
+A final AWS refusal prints `AWS gate failed: <reason>`.
 These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.
@@ -1386,6 +1400,7 @@ The route passes the reservation sidecar path to the scaler service.
 The service writes module progress and `CloudProgress` beside that path.
 The cloud state records the phase, vCPU count, failed module count, and update time.
 The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route reports an uncertain launch to the queue as pending settlement.
 The route requests no local memory for a cloud gate.
 
 ## Verify function tests and process lifetime
