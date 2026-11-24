@@ -448,19 +448,28 @@ conf_reads.record('disabled')
             self.assertEqual(origin.value, 23)
         self.assertEqual(warning.getvalue(), "")
 
-    def test_fixture_without_history_ignores_inherited_git_dir(self) -> None:
-        self.write("other=2\n")
-        repository = self.root / "repository"
-        repository.mkdir()
-        committed = repository / self.path.name
-        _ = committed.write_text("# whole: 1..\ncount=17\n")
-        commit_config_fixture(committed)
-        with mock.patch.dict(os.environ, {"GIT_DIR": str(repository / ".git")}):
-            settings = conf.read("example")
-            self.assertIsInstance(settings.origin("count", int), conf.UnavailableValue)
-            with self.assertRaises(conf.Unusable) as caught:
-                _ = settings.whole("count")
-            self.assertEqual(str(caught.exception), f"{self.path}: count is missing; add it to {self.path}")
+    def test_config_history_ignores_inherited_git_repository_overrides(self) -> None:
+        with self.subTest(variable="GIT_DIR"):
+            self.write("other=2\n")
+            repository = self.root / "repository"
+            repository.mkdir()
+            committed = repository / self.path.name
+            _ = committed.write_text("# whole: 1..\ncount=17\n")
+            commit_config_fixture(committed)
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(repository / ".git")}):
+                settings = conf.read("example")
+                self.assertIsInstance(settings.origin("count", int), conf.UnavailableValue)
+                with self.assertRaises(conf.Unusable) as caught:
+                    _ = settings.whole("count")
+                self.assertEqual(str(caught.exception), f"{self.path}: count is missing; add it to {self.path}")
+
+        with self.subTest(variable="GIT_CEILING_DIRECTORIES"):
+            self.history()
+            self.commit("# whole: 1..\ncount=23\n")
+            self.path.unlink()
+            with (mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.root)}),
+                  redirect_stderr(io.StringIO())):
+                self.assertEqual(conf.read("example").whole("count"), 23)
 
     def test_worktree_reader_recovers_from_the_live_config_history(self) -> None:
         home = Path(os.environ["HOME"])
