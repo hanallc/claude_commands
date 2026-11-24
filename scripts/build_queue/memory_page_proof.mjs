@@ -2200,6 +2200,32 @@ try {
             // A row with no unit starts with the owner before ": " in its name, and its step goes in Step.
             assert.equal(absentCells.step,'nextest');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
+            await show(readings.step_unknown);
+            const unknown = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.wrow[data-run], .wrow.wait')];
+              const unrecorded = value => !value || value === '—' || value === 'owner not recorded';
+              return rows.flatMap(chart => {
+                const row = stepRow(chart.dataset.tip, latest);
+                if (!unrecorded(row.unit) || !unrecorded(row.showrunner)) return [];
+                const name = chart.querySelector('.name');
+                const step = document.querySelector('tr[data-tip="' + chart.dataset.tip + '"] .step');
+                return [{key:chart.dataset.tip, source:row.name, name:name.textContent, step:step.textContent,
+                  owner:chart.querySelector('.owner').textContent,
+                  staffColor:!!name.querySelector('.staff-name') || !!step.querySelector('.staff-name'),
+                  plainColor:getComputedStyle(name).color === getComputedStyle(chart).color &&
+                    getComputedStyle(step).color === getComputedStyle(step.parentElement).color}];
+              });
+            })()`);
+            assert.ok(unknown.some(row => row.key.startsWith('row:')));
+            assert.ok(unknown.some(row => row.key.startsWith('wait:')));
+            for (const row of unknown) {
+              const [name, ...step] = row.source.split(': ');
+              assert.equal(row.name, name, row.key);
+              assert.equal(row.step, step.join(': '), row.key);
+              assert.equal(row.owner, '', row.key);
+              assert.ok(row.plainColor && !row.staffColor, row.key + ' uses a staff color.');
+            }
+
             for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
@@ -2312,6 +2338,33 @@ try {
               assert.equal(state.room, proof.room);
               assert.match(state.text, /unavailable/);
               if (name==='missing_use') assert.match(state.text, /private memory.stat is missing/);
+              if (name === 'missing_cap') {
+                const columns = await evaluate(`(() => {
+                  const scroll = document.querySelector('.walk-scroll');
+                  const dialog = document.querySelector('#review-new-item');
+                  const positions = () => {
+                    scroll.scrollLeft = 0;
+                    return [...scroll.querySelectorAll('th[scope="col"]:not(.row-action)')].map(cell => {
+                      const {left, width} = cell.getBoundingClientRect();
+                      return {left, width};
+                    });
+                  };
+                  const withAction = positions();
+                  dialog.removeAttribute('id');
+                  fitLabels();
+                  const withoutAction = positions();
+                  dialog.id = 'review-new-item';
+                  fitLabels();
+                  scroll.scrollLeft = scroll.scrollWidth;
+                  const action = scroll.querySelector('.row-add').getBoundingClientRect();
+                  const clip = scroll.getBoundingClientRect();
+                  const reachable = scroll.scrollLeft > 0 && action.left >= clip.left && action.right <= clip.right;
+                  scroll.scrollLeft = 0;
+                  return {withAction, withoutAction, reachable};
+                })()`);
+                assert.deepEqual(columns.withAction, columns.withoutAction, 'The action moves data columns with no cap.');
+                assert.ok(columns.reachable, 'The action is clipped with no cap.');
+              }
             }
             for (const name of ['empty_report','missing_report']) {
               await show(readings[name]);
@@ -2532,12 +2585,6 @@ try {
             }
             await capture(version+'-owner-tooltip','#tip');
             if (comparisonImages) comparisons.push({version,...state});
-          }
-          for(const width of [600,800,1200,1600]) {
-            await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
-            await show(readings.step_unknown);
-            const text = await evaluate(`document.querySelector('#walk').textContent`);
-            assert.ok(!text.includes('owner not recorded'));
           }
           await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
           await show(readings.step_ci);
@@ -3530,6 +3577,11 @@ try {
             {open:true,recipient:'fixture-builds',kind:'question',sameTip:true,fits:true,evidence:undefined});
           assert.ok(dialog.evidence.includes(gateAbout) && dialog.evidence.includes('Overall memory'));
         };
+        const evidenceReading = structuredClone(gateReading);
+        const evidenceRow = evidenceReading.walk[gateIndex];
+        Object.assign(evidenceRow, {name:'Builds gate', unit:'', title:{unit:'', step:'Builds gate'}, showrunner:'builds'});
+        delete evidenceRow.started_by;
+        await show(evidenceReading);
         checkRowAsk(await openRowAsk());
         if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
         await rowAskStep('Send New item evidence', `(async () => {
@@ -3552,9 +3604,9 @@ try {
         assert.equal(submittedItem.words, 'Can we check this gate?');
         const evidence = submittedItem.evidence;
         assert.equal(evidence.kind, 'build-step');
-        assert.equal(evidence.step_id, gateRow.key);
-        assert.equal(evidence.title, gateRow.name);
-        assert.equal(evidence.owner, gateRow.showrunner);
+        assert.equal(evidence.step_id, evidenceRow.key);
+        assert.equal(evidence.title, evidenceRow.name);
+        assert.equal(evidence.owner, evidenceRow.showrunner);
         assert.ok(evidence.cells.some(cell => cell.label === 'Machine' && cell.value === 'natedev'));
         assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
         assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));

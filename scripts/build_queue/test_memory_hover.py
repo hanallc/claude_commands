@@ -463,7 +463,7 @@ class MemoryHoverTests(unittest.TestCase):
                                         data, walk=True)
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
         self.assertEqual(root.findall(".//table//*[@class='unit']"), [])
-        for key in ("row:fixture-run-0", "row:fixture-run-3", "wait:fixture-wait-0"):
+        for key in ("row:fixture-run-0", "row:fixture-run-2", "row:fixture-run-3", "wait:fixture-wait-0"):
             with self.subTest(row=key):
                 label = root.find(f".//div[@data-tip='{key}']/span[@class='row-label']")
                 assert label is not None
@@ -472,16 +472,15 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(name), 1)
                 self.assertEqual(name[0].get("data-color-text"), "role.unit-director")
                 self.assertEqual(name[0].text, "builder")
-                self.assertEqual(name[0].tail, " builds")
+                self.assertIsNone(name[0].tail)
                 owner = label.find("./span[@class='owner']/span")
                 assert owner is not None
                 self.assertEqual(owner.get("data-color-text"), "role.showrunner")
                 self.assertEqual(owner.text, "builds")
-        for key in ("fixture-run-1", "fixture-run-2"):
-            name = root.find(f".//div[@data-run='{key}']/span/span/span[@class='name']")
-            assert name is not None
-            self.assertEqual(len(name), 0)
-            self.assertEqual(name.text, "builder builds")
+        name = root.find(".//div[@data-run='fixture-run-1']/span/span/span[@class='name']")
+        assert name is not None
+        self.assertEqual(len(name), 0)
+        self.assertEqual(name.text, "builder builds")
 
     def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
         data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
@@ -889,7 +888,7 @@ class MemoryHoverTests(unittest.TestCase):
             list[str], self.page_expression(expression, {"read_at": 400, "walk": [row]}, walk=True))
         self.assertEqual((compile_peak, test_sample), ("7.0 GiB", "2.0 GiB"))
         self.assertEqual(disks, shared_builds)
-        self.assertIn("<dt>Runs on</dt><dd>natedev</dd>", disks)
+        self.assertIn('<dt>Runs on</dt><dd><span class="machine" data-machine="natedev">natedev</span></dd>', disks)
         self.assertNotIn("program-memory", disks)
         self.assertNotIn(".program-memory", shared.style)
         for tag in ("dt", "dd"):
@@ -2088,7 +2087,7 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{markup}</root>")
         self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']/span/span/span[@class='name']"),
                          "gate · widget")
-        self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "gate · widget")
+        self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "gate · widget")
         self.assertEqual(rows[0]["label"], "gate · widget")
 
     def test_heading_keeps_all_structured_priority_entries(self) -> None:

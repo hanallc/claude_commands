@@ -1697,6 +1697,10 @@ function queueRowLabels(row) {
     repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
+  if (row.kind === "repository-slot") {
+    const name = stepDisplayName(row);
+    return {name, step: name, verify};
+  }
   if (!unit) {
     // A row with no unit starts with its owner, the text before ": " in its name. The step goes in Step.
     // The owner has no small line: it would repeat the owner.
@@ -2386,7 +2390,8 @@ function buildStepEvidence(key, data, row, cells, tooltip, limits) {
   const labels = queueRowLabels(row);
   const evidence = {
     kind: 'build-step', captured_at: new Date(data.read_at * 1000).toISOString(), step_id: row.key,
-    title: clip(row.name, limits.title), owner: clip(row.caller || labels.owner || labels.starter || "", limits.title),
+    title: clip(row.name, limits.title),
+    owner: clip(row.caller || labels.owner || labels.starter || ownerText(row.showrunner), limits.title),
     cells: cells.map(cell => ({label: clip(cell.label, limits.label), value: clip(cell.value, limits.text)})),
     memory: {
       free_for_next_gib: gib(data.ram.room_bytes), queue_cap_gib: hasCap(data) ? data.cap : null,
@@ -2780,9 +2785,12 @@ function fitWalkDetails() {
   walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
+  const action = table.querySelector("thead .row-action");
+  // With no cap, the action uses the horizontal scroll and the data columns keep their positions.
+  const tableWidth = () => table.getBoundingClientRect().width - (hasCap(latest) ? 0 : action.getBoundingClientRect().width);
   function measure(labelWidth) {
     // The table starts half the cap line and the gap past the cap, as the placement below sets it.
-    const neededWidth = table.getBoundingClientRect().width + 0.5 + TABLE_CAP_GAP;
+    const neededWidth = tableWidth() + 0.5 + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
     const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
     const reservedWidth = capFraction > 0
@@ -2861,7 +2869,7 @@ function fitWalkDetails() {
     walk.style.minWidth = `${Math.ceil(walk.getBoundingClientRect().width + added)}px`;
     fit = measure(labelWidth);
   }
-  const naturalWidth = table.getBoundingClientRect().width;
+  const naturalWidth = tableWidth();
   root.style.setProperty("--details", `${fit.reservedWidth}px`);
   // The top bar shares the chart scale; in a pane where the chart scrolls sideways it uses the card width.
   root.style.setProperty("--bar-details", `${shortBy > 0 ? 0 : fit.reservedWidth}px`);
