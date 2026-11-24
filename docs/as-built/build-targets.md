@@ -60,7 +60,8 @@ The admission service requires a synced [Mac Linux state root](mac-test-offload.
 If setup fails, the next guest placement request retries it. Other targets remain available.
 To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.
 Set `settings.<name>=cloud_gate.conf`. The scaler also requires `enabled=on` in that settings file.
-The queue checks whether the scaler is available on each placement pass.
+The queue checks the scaler on each placement pass.
+It counts unbooked AWS grants against the spending limit.
 A scaler assignment uses a cloud slot until the queue confirms settlement.
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`

@@ -41,6 +41,15 @@ def scaler_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarg
         placement.ExplicitProviderSettings(target.settings))
 
 
+def configured_scaler_gate(registry: conf.ConfigRead, name: str) -> placement.PlacementCandidate:
+    """Read the named scaler in the current registry."""
+    for target in target_config.read_registered_targets(selected=name,
+            purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+        if isinstance(target, target_config.ScalerTarget):
+            return scaler_candidate(registry, target)
+    raise conf.Unusable(f"The scaler {name} is absent from the target registry")
+
+
 def natedev_only_flag(command: tuple[str, ...]) -> str | None:
     program = parse_command_program(command)
     return None if isinstance(program, OtherCommand) else gate_natedev_only_flag(program[1])
