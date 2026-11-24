@@ -136,6 +136,7 @@ class RunRecord(StopFields):
     command_started: NotRequired[str]
     command_slice: NotRequired[process_stop.RunSliceIdentity]
     stop_notice_id: NotRequired[str]
+    completion_after_slice_cleanup: NotRequired[Literal[True]]
     slice_cleanup_pending: NotRequired[Literal[True]]
     slice_leftovers: NotRequired[Literal[True]]
     director_dir: str
@@ -236,43 +237,48 @@ _RUN_INDEX_SUFFIXES = (PENDING_STOP_SUFFIX, process_stop.RUN_SLICE_RECORD_SUFFIX
 
 def _write_record(path: Path, record: RunRecord) -> RunRecord:
     with record_lock(path):
-        current = _read_record(path)
-        if current["run_id"] != record["run_id"]:
-            raise SystemExit(f"detached_runs: {path} no longer holds run {record['run_id']}")
-        fields: dict[str, object] = {**current, **record}
-        if current["status"] == "finished" and record["status"] == "running":
-            fields.update(current)
-        if delivery := current.get("delivery"):
-            fields["delivery"] = delivery
-        stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
-        if _has_saved_cgroup(current):
-            stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
-                            "pending_hold_stop_requests")
-        saved = cast(Mapping[str, object], current)
-        for key in stop_fields:
-            if key in saved:
-                fields[key] = saved[key]
-            else:
-                _ = fields.pop(key, None)
-        if fields["status"] == "finished":
-            _ = fields.pop("slice_cleanup_pending", None)
-            if fields.get("scope_error"):
-                _ = fields.pop("finished_at", None)
-            elif current["status"] == "running":
-                stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                if _has_saved_cgroup(current):
-                    fields["finished_at"] = stamp
-                else:
-                    _ = fields.setdefault("finished_at", stamp)
-        if not _is_run_record(fields):
-            raise SystemExit(f"detached_runs: {path} update is not a run record")
-        write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
-        if fields["status"] == "finished":
-            if fields.get("stop_pass_requested"):
-                path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
+        return _write_record_locked(path, record)
+
+
+def _write_record_locked(path: Path, record: RunRecord) -> RunRecord:
+    """Merge and save the update while the caller holds the record lock."""
+    current = _read_record(path)
+    if current["run_id"] != record["run_id"]:
+        raise SystemExit(f"detached_runs: {path} no longer holds run {record['run_id']}")
+    fields: dict[str, object] = {**current, **record}
+    if current["status"] == "finished" and record["status"] == "running":
+        fields.update(current)
+    if delivery := current.get("delivery"):
+        fields["delivery"] = delivery
+    stop_fields = ("stop_reason", "hold_stop_requests", "stop_pass_requested", "self_stop")
+    if _has_saved_cgroup(current):
+        stop_fields += ("scope_error", "slice_leftovers", "slice_cleanup_pending", "stop_notice_id",
+                        "pending_hold_stop_requests")
+    saved = cast(Mapping[str, object], current)
+    for key in stop_fields:
+        if key in saved:
+            fields[key] = saved[key]
+        else:
+            _ = fields.pop(key, None)
+    if fields["status"] == "finished":
+        _ = fields.pop("slice_cleanup_pending", None)
+        if fields.get("scope_error"):
+            _ = fields.pop("finished_at", None)
+        elif current["status"] == "running":
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             if _has_saved_cgroup(current):
-                path.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX).unlink(missing_ok=True)
-        return fields
+                fields["finished_at"] = stamp
+            else:
+                _ = fields.setdefault("finished_at", stamp)
+    if not _is_run_record(fields):
+        raise SystemExit(f"detached_runs: {path} update is not a run record")
+    write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
+    if fields["status"] == "finished":
+        if fields.get("stop_pass_requested"):
+            path.with_suffix(PENDING_STOP_SUFFIX).unlink(missing_ok=True)
+        if _has_saved_cgroup(current):
+            path.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX).unlink(missing_ok=True)
+    return fields
 
 
 def _is_hold_stop_requests(value: object) -> TypeGuard[list[str]]:
@@ -308,7 +314,8 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
-                                        "push_alert_attempted", "slice_cleanup_pending", "slice_leftovers"))
+                                        "push_alert_attempted", "slice_cleanup_pending", "slice_leftovers",
+                                        "completion_after_slice_cleanup"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
                              and isinstance(cast(dict[str, object], pane_dispatch).get("unavailable"), str))))
@@ -899,7 +906,23 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     return run_ids
 
 
-def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
+def reap_stopped_orphan(path: Path, *, notice_id: str, owner: staff.StaffId,
+                        run_slice: process_stop.RunSliceIdentity) -> None:
+    """Finish only the saved stop after its supervisor and slice end."""
+    def matches(record: RunRecord) -> bool:
+        return (bool(notice_id) and record.get("stop_notice_id") == notice_id
+                and record.get("completion_after_slice_cleanup") is True
+                and record.get("stop_pass_requested") is True
+                and record.get("command_slice") == run_slice and record["staff_id"] == owner)
+
+    with (path.parent / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        result = _reap_orphans_locked(path.parent, only=path, check=matches)
+    result.complete()
+
+
+def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = None,
+                         check: Callable[[RunRecord], bool] = lambda _record: True) -> OrphanReapResult:
     """Reap orphan records while the caller holds the runs-folder admission lock."""
     now = time.time()
     records: list[tuple[Path, RunRecord]] = []
@@ -910,6 +933,9 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             print(" ".join(str(error).splitlines()), file=sys.stderr)
     result = OrphanReapResult()
     for path, raw in records:
+        # The other records can show a newer run. This request changes only its selected record.
+        if only is not None and (path != only or raw["status"] != "running"):
+            continue
         if worker and raw.get("worker") != worker:
             continue
         if raw["status"] == "finished" and (_needs_completion(raw) or _needs_push_retry(raw)):
@@ -919,7 +945,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         if raw["status"] != "running":
             continue
         supervisor_alive = raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path)
-        if (run_slice := raw.get("command_slice")) and (
+        if only is None and (run_slice := raw.get("command_slice")) and (
                 raw.get("stop_pass_requested") or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
             try:
                 _resume_slice_stop(path, run_slice, allow_cleanup=not supervisor_alive)
@@ -933,22 +959,23 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                 record = _read_record(path)
                 if _has_saved_cgroup(record) and not scope_lock.enter_context(_scope_stop_lock(path, blocking=False)):
                     continue
-                if record.get("pending_hold_stop_requests") or not _orphaned(path, record, now):
+                if (not check(record) or record.get("pending_hold_stop_requests")
+                        or not _orphaned(path, record, now)):
                     continue
                 record = _recover_staged_pane_stop(path, record)
-            newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
-                        and other.get("staff_id") == record["staff_id"]
-                        and _number(other.get("started_at"), 0.0) > record["started_at"]
-                        for _, other in records)
-            if not record.get("delivery"):
-                if _cancels_pass(record):
-                    if newer:
-                        record["orphan_result_superseded"] = True
-                else:
-                    record["delivery"] = (SUPERSEDED_ORPHAN_DELIVERY if newer and not record.get("self_stop")
-                                          else ORPHAN_RESULT_PENDING)
-            record.update(status="finished", ended="supervisor gone", completion_pending=True)
-            record = _write_record(path, record)
+                newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                            and other.get("staff_id") == record["staff_id"]
+                            and _number(other.get("started_at"), 0.0) > record["started_at"]
+                            for _, other in records)
+                if not record.get("delivery"):
+                    if _cancels_pass(record):
+                        if newer:
+                            record["orphan_result_superseded"] = True
+                    else:
+                        record["delivery"] = (SUPERSEDED_ORPHAN_DELIVERY if newer and not record.get("self_stop")
+                                              else ORPHAN_RESULT_PENDING)
+                record.update(status="finished", ended="supervisor gone", completion_pending=True)
+                record = _write_record_locked(path, record)
             result.queue_completion(path, record)
             result.run_ids.append(record["run_id"])
         except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
@@ -2157,6 +2184,7 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
                 supervisor = process_start.process_start(os.getpid())
                 if isinstance(supervisor, process_start.Started):
                     record["supervisor_started"] = supervisor.start
+                    record["completion_after_slice_cleanup"] = True
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             _send_gate_line(gate, b"start\n")
         exit_code = _exit_status(child.wait())

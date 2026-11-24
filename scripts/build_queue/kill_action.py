@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Generator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -27,8 +27,7 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
-from scripts.lib import conf, process_start, process_stop
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import atomic_file, process_start, process_stop
 from scripts.lib.build_steps import GATE_PROGRAMS, command_program, live_process_arguments
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit
@@ -141,6 +140,8 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                 return NoStopRoute()
             try:
                 raw = worker_lifecycle.read_json_object(path)
+                if raw.get("completion_after_slice_cleanup") is not True:
+                    return NoStopRoute()
                 group = detached_runs.command_group(path)
             except (OSError, ValueError):
                 return NoStopRoute()
@@ -286,9 +287,9 @@ class SendingNotice:
 
 @dataclass(frozen=True)
 class FinishedStop:
-    """The action is complete. Its result stays visible until this time."""
+    """The action is complete."""
 
-    visible_until: float
+    finished_at: float = 0
 
 
 @dataclass(frozen=True)
@@ -310,44 +311,53 @@ def notification(run: KillCandidate, at: datetime) -> str:
 class RunningDetachedRun:
     """The record still shows an active run."""
 
+    stop_committed: bool
+
 
 @dataclass(frozen=True)
 class EndedDetachedRun:
     """The record shows completion or was pruned."""
 
+    stop_committed: bool
 
-def detached_run_state(route: DetachedCommand, recipient: staff.StaffId) -> RunningDetachedRun | EndedDetachedRun:
+
+@dataclass(frozen=True)
+class ChangedDetachedRun:
+    """The record lacks the saved identity or the completion contract."""
+
+
+def detached_run_state(
+    route: DetachedCommand, recipient: staff.StaffId, *, notice_id: str = "",
+) -> RunningDetachedRun | EndedDetachedRun | ChangedDetachedRun:
     try:
         raw = cast(object, json.loads(route.record.read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return EndedDetachedRun()
+        return EndedDetachedRun(stop_committed=False)
     if not isinstance(raw, dict):
-        raise ValueError("the detached run record is not an object")
+        return ChangedDetachedRun()
     record = cast(dict[str, object], raw)
     run_slice = record.get("command_slice")
-    if (record.get("run_id") != route.record.stem or record.get("staff_id") != recipient
+    if (record.get("completion_after_slice_cleanup") is not True
+            or record.get("run_id") != route.record.stem or record.get("staff_id") != recipient
             or not process_stop.is_slice_identity(run_slice) or run_slice != route.run_slice):
-        raise ValueError("the detached run record changed identity")
-    # command_supervise stamps finished_at after _finish_command_slice confirms populated 0.
-    if "finished_at" in record or record.get("status") != "running":
-        return EndedDetachedRun()
-    return RunningDetachedRun()
+        return ChangedDetachedRun()
+    committed = (bool(notice_id) and record.get("stop_notice_id") == notice_id
+                 and record.get("stop_pass_requested") is True)
+    if record.get("status") == "running":
+        return RunningDetachedRun(stop_committed=committed)
+    return EndedDetachedRun(stop_committed=committed)
 
 
-def stop_verified_run(target: KillTarget, reason: str) -> bool:
-    """Check the live route under the detached helper's stop lock."""
-    def route_matches() -> bool:
-        return stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC)) == target.route
+def request_stop(action: SavedKillAction) -> bool:
+    """Check the locked route or finish the stop for this action."""
+    def can_stop() -> bool:
+        state = detached_run_state(action.route, action.recipient, notice_id=action.id)
+        return isinstance(state, RunningDetachedRun) and (
+            state.stop_committed
+            or stop_route(action.run, action.recipient, memory_admit.process_table(PROC)) == action.route)
 
-    return detached_runs.stop_command(target.route.record, reason, check=route_matches)
-
-
-def resume_stop(action: SavedKillAction) -> bool:
-    """Request the stop again against the same saved run record."""
-    return detached_runs.stop_command(
-        action.route.record, action.message.partition("\n")[0],
-        check=lambda: isinstance(detached_run_state(action.route, action.recipient), RunningDetachedRun),
-    )
+    return detached_runs.stop_command(action.route.record, action.message.partition("\n")[0], check=can_stop,
+                                      stop_notice_id=action.id)
 
 
 @dataclass(frozen=True)
@@ -393,6 +403,8 @@ class KillActions:
         self._lock: threading.Lock = threading.Lock()
         self._actions: dict[str, SavedKillAction] = {}
         self._offers: dict[str, DetachedKillOffer] = {}
+        self._retry: set[str] = set()
+        self._worker: threading.Thread | None = None
 
     def handle(self, target: KillTarget) -> str:
         data = repr((target.candidate.reference, target.route, target.recipient)).encode()
@@ -400,19 +412,59 @@ class KillActions:
 
     def _cache(self, action: SavedKillAction) -> None:
         with self._lock:
-            self._actions[action.result["reference"]] = action
+            self._actions[action.run.reference] = action
 
     def _read(self, reference: str) -> SavedKillAction:
         text = (self._folder / f"{reference}.json").read_text()
         action = admission_wire.parse_record(text, SavedKillAction)
         if action.result["reference"] != reference or action.run.reference != reference:
             raise ValueError("the Builds stop record has a different run")
+        if re.fullmatch(r"[0-9a-f]{32}", action.id) is None:
+            raise ValueError("the Builds stop record has an invalid notice ID")
         return action
 
     def _save(self, action: SavedKillAction) -> None:
         reference = action.result["reference"]
-        write_text_atomic(self._folder / f"{reference}.json", admission_wire.encode_record(action), new_file_mode=0o600)
+        atomic_file.write_text_atomic(self._folder / f"{reference}.json", admission_wire.encode_record(action),
+                                      new_file_mode=0o600)
         self._cache(action)
+
+    def _notice_path(self, reference: str, notice_id: str) -> Path:
+        return self._folder / f"{reference}.{notice_id}.notice"
+
+    def _track_notice(self, action: SavedKillAction) -> None:
+        # Save the run path before the stop commit. The action file can disappear later.
+        path = self._notice_path(action.run.reference, action.id)
+        if not path.exists():
+            atomic_file.write_text_atomic(path, str(action.route.record), new_file_mode=0o600)
+
+    def _acknowledge_notice(self, record: Path, reference: str, notice_id: str) -> None:
+        path = self._notice_path(reference, notice_id)
+        if not path.exists():
+            return
+        try:
+            # The atomic write syncs the file before replacement. Confirm the directory sync.
+            atomic_file.sync_folder(self._folder)
+            detached_runs.acknowledge_stop_notice(record, notice_id)
+            path.unlink(missing_ok=True)
+        except (OSError, ValueError, SystemExit) as error:
+            print(f"review-links build kill {notice_id}: cannot acknowledge the stop notice: {error}", file=sys.stderr)
+
+    def _release_notices(self, reference: str, active_id: str = "") -> None:
+        for path in self._notice_files(reference):
+            notice_id = path.stem.partition(".")[2]
+            if notice_id != active_id:
+                try:
+                    record = Path(path.read_text())
+                    if not record.is_absolute() or record.parent.name != detached_runs.DETACHED_RUNS_DIR:
+                        raise ValueError("the Builds notice has an invalid run path")
+                    self._acknowledge_notice(record, reference, notice_id)
+                except (OSError, ValueError) as error:
+                    print(f"review-links build kill {path}: {error}", file=sys.stderr)
+
+    def _notice_files(self, reference: str) -> Iterator[Path]:
+        return (path for path in self._folder.glob(f"{reference}.*.notice")
+                if re.fullmatch(r"[0-9a-f]{32}", path.stem.partition(".")[2]) is not None)
 
     @contextmanager
     def _record_lock(self, reference: str) -> Generator[None]:
@@ -424,11 +476,12 @@ class KillActions:
         finally:
             os.close(descriptor)
 
-    def options(self) -> tuple[dict[str, KillOffer], list[KillResult]]:
+    def options(self, refresh_seconds: float) -> tuple[dict[str, KillOffer], list[KillResult]]:
+        now = time.time()
+        cutoff = now - 2 * refresh_seconds
         with self._lock:
-            now = time.time()
             for reference, action in tuple(self._actions.items()):
-                if isinstance(action.stage, FinishedStop) and action.stage.visible_until <= now:
+                if isinstance(action.stage, FinishedStop) and action.stage.finished_at <= cutoff:
                     del self._actions[reference]
             actions = dict(self._actions)
             self._offers = {reference: offer for reference, offer in self._offers.items() if offer.expires_at > now}
@@ -445,79 +498,118 @@ class KillActions:
             if reference not in actions
         }
         if offers:
-            deadline = now + conf.read_or_repository("review_links").number("kill_result_seconds")
+            deadline = now + 2 * refresh_seconds
             with self._lock:
                 self._offers.update({reference: DetachedKillOffer(targets[reference], deadline) for reference in offers})
         return offers, [action.result for action in actions.values()]
 
-    def _finish(self, action: SavedKillAction, result: KillResult, retention: float) -> SavedKillAction:
-        finished = replace(action, result=result, stage=FinishedStop(time.time() + retention))
+    def _finish(self, action: SavedKillAction, result: KillResult) -> SavedKillAction:
+        finished = replace(action, result=result, stage=FinishedStop(time.time()))
         self._save(finished)
+        if isinstance(action.stage, StopRequested):
+            self._acknowledge_notice(action.route.record, action.run.reference, action.id)
         return finished
 
-    def _advance(
-        self, action: SavedKillAction, retention: float, request_stop: Callable[[SavedKillAction], bool],
-    ) -> SavedKillAction:
+    def _advance(self, action: SavedKillAction) -> SavedKillAction:
         """Use the run record to advance to the notice."""
         if isinstance(action.stage, StopRequested):
-            state = detached_run_state(action.route, action.recipient)
+            if action.result["stop"] != StopState.STOPPING:
+                action = replace(action, result={**action.result, "stop": StopState.STOPPING})
+                self._save(action)
+            self._track_notice(action)
+            state = detached_run_state(action.route, action.recipient, notice_id=action.id)
             if isinstance(state, RunningDetachedRun):
+                retry = False
                 try:
-                    accepted = request_stop(action)
+                    _ = request_stop(action)
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
-                    accepted = False
-                state = detached_run_state(action.route, action.recipient)
-                if (isinstance(state, RunningDetachedRun) and not accepted
-                        and action.result["stop"] != StopState.UNCONFIRMED):
-                    action = replace(action, result={**action.result, "stop": StopState.UNCONFIRMED})
-                    self._save(action)
-            if isinstance(state, RunningDetachedRun):
+                    retry = True
+                state = detached_run_state(action.route, action.recipient, notice_id=action.id)
+                route = action.route
+                if (isinstance(state, RunningDetachedRun) and state.stop_committed
+                        and not detached_run_process.supervises(route.supervisor, route.record)
+                        and process_stop.slice_has_ended(route.run_slice)):
+                    detached_runs.reap_stopped_orphan(route.record, notice_id=action.id, owner=action.recipient,
+                                                       run_slice=route.run_slice)
+                    state = detached_run_state(route, action.recipient, notice_id=action.id)
+                if isinstance(state, RunningDetachedRun):
+                    if not state.stop_committed and not retry:
+                        return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
+                    return action
+            if isinstance(state, ChangedDetachedRun):
+                return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
+            if not state.stop_committed:
+                return self._finish(action, {**action.result, "stop": StopState.ALREADY_ENDED})
+            if not process_stop.slice_has_ended(action.route.run_slice):
                 return action
             action = replace(action, stage=SendingNotice(), result={**action.result, "stop": StopState.STOPPED})
             self._save(action)
         if isinstance(action.stage, SendingNotice):
+            self._acknowledge_notice(action.route.record, action.run.reference, action.id)
             try:
                 delivery = deliver(action)
             except (OSError, ValueError, subprocess.SubprocessError):
                 return action
             if isinstance(delivery, RetryNotice):
                 return action
-            return self._finish(action, {**action.result, "delivery": delivery}, retention)
+            return self._finish(action, {**action.result, "delivery": delivery})
         return action
 
-    def _watch(self, reference: str, sample: float, retention: float) -> None:
-        while True:
+    def _recover(self, references: tuple[str, ...]) -> None:
+        for reference in references:
             try:
                 with self._record_lock(reference):
                     try:
                         action = self._read(reference)
                     except FileNotFoundError:
-                        return
-                    action = self._advance(action, retention, resume_stop)
-                    if isinstance(action.stage, FinishedStop):
-                        self._cache(action)
-                        return
+                        self._release_notices(reference)
+                    else:
+                        if isinstance(action.stage, FinishedStop):
+                            self._release_notices(reference)
+                        else:
+                            self._release_notices(reference, action.id)
+                            action = self._advance(action)
+                            if not isinstance(action.stage, FinishedStop):
+                                continue
+                    if not any(self._notice_files(reference)):
+                        with self._lock:
+                            self._retry.discard(reference)
             except (OSError, ValueError) as error:
                 print(f"review-links build kill {reference}: {error}", file=sys.stderr)
-            time.sleep(sample)
 
-    def _start_watch(self, reference: str, settings: conf.ConfigRead) -> None:
-        threading.Thread(target=self._watch, args=(reference, settings.number("kill_pending_check_seconds"),
-                         settings.number("kill_result_seconds")), daemon=True).start()
+    def retry_pending(self) -> None:
+        """Start one recovery pass from the server maintenance cycle."""
+        with self._lock:
+            if self._retry and (self._worker is None or not self._worker.is_alive()):
+                self._worker = threading.Thread(target=self._recover, args=(tuple(self._retry),), daemon=True)
+                self._worker.start()
 
     def resume(self) -> None:
-        for path in self._folder.glob("*.json"):
-            if re.fullmatch(r"[0-9a-f]{64}", path.stem) is None:
+        references = {path.stem for path in self._folder.glob("*.json")}
+        references.update(path.name.partition(".")[0] for path in self._folder.glob("*.notice"))
+        for reference in sorted(references):
+            if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
                 continue
             try:
-                action = self._read(path.stem)
+                with self._record_lock(reference):
+                    active_id = ""
+                    try:
+                        action = self._read(reference)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        self._cache(action)
+                        if not isinstance(action.stage, FinishedStop):
+                            active_id = action.id
+                    self._release_notices(reference, active_id)
+                    if active_id or any(self._notice_files(reference)):
+                        with self._lock:
+                            self._retry.add(reference)
             except (OSError, ValueError) as error:
-                print(f"review-links build kill {path}: {error}", file=sys.stderr)
+                print(f"review-links build kill {reference}: {error}", file=sys.stderr)
                 continue
-            self._cache(action)
-            if not isinstance(action.stage, FinishedStop):
-                self._start_watch(path.stem, conf.read_or_repository("review_links"))
+        self.retry_pending()
 
     def stop(self, reference: str, handle: str, words: str) -> KillResult | NoStopRoute:
         if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
@@ -529,8 +621,6 @@ class KillActions:
         target = offered.target
         if not hmac.compare_digest(self.handle(target), handle):
             return NoStopRoute()
-        settings = conf.read_or_repository("review_links")
-        retention = settings.number("kill_result_seconds")
         run = target.candidate
         with self._record_lock(reference):
             try:
@@ -538,14 +628,17 @@ class KillActions:
             except FileNotFoundError:
                 pass
             else:
-                if not isinstance(previous.stage, FinishedStop) or previous.stage.visible_until > time.time():
+                if previous.result["stop"] != StopState.UNCONFIRMED or not isinstance(previous.stage, FinishedStop):
                     return NoStopRoute()
             state = detached_run_state(target.route, target.recipient)
+            if isinstance(state, ChangedDetachedRun):
+                return NoStopRoute()
             if isinstance(state, RunningDetachedRun):
                 current = live_targets().get(reference)
-                if (current is None or self.handle(current) != handle) and isinstance(
-                        detached_run_state(target.route, target.recipient), RunningDetachedRun):
-                    return NoStopRoute()
+                if current is None or self.handle(current) != handle:
+                    state = detached_run_state(target.route, target.recipient)
+                    if not isinstance(state, EndedDetachedRun):
+                        return NoStopRoute()
             at = datetime.now(user_zone())
             message = notification(run, at)
             result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
@@ -556,14 +649,14 @@ class KillActions:
             action = SavedKillAction(secrets.token_hex(16), run, result, target.recipient, body, StopRequested(),
                                      target.route)
             if isinstance(state, EndedDetachedRun):
-                return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}, retention).result
+                return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}).result
             self._save(action)
             try:
-                action = self._advance(action, retention, lambda _action: stop_verified_run(target, message))
+                action = self._advance(action)
             except (OSError, ValueError) as error:
                 print(f"review-links build kill {reference}: {error}", file=sys.stderr)
                 action = self._read(reference)
-            if isinstance(action.stage, FinishedStop):
-                return action.result
-        self._start_watch(reference, settings)
-        return action.result
+            if not isinstance(action.stage, FinishedStop) or any(self._notice_files(reference)):
+                with self._lock:
+                    self._retry.add(reference)
+            return action.result

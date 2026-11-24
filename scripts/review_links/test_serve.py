@@ -6143,7 +6143,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_build_kill_requires_origin_operator_token_and_bounded_body(self) -> None:
         settings = self.root.parent / "kill-config"
         settings.mkdir()
-        _ = write_config_fixture(settings / "review_links.conf", "# whole: 1024..65536\nkill_request_bytes=4096")
+        _ = write_config_fixture(settings / "review_links.conf",
+                                 "page_refresh_seconds=17\n# whole: 1024..65536\nkill.request_bytes=4096")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
         origin = f"http://127.0.0.1:{self.port}"
         token = self.server.new_item_token
@@ -6160,8 +6161,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             options.assert_not_called()
             self.assertEqual(self.post(kill_action.PATH, urlencode(form), origin=origin)[0], 403)
             operator.return_value = True
-            self.assertEqual(self.request(kill_action.PATH).status, 200)
-            options.assert_called_once_with()
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body), {"token": token, "offers": {}, "results": [],
+                                                          "refresh_seconds": 17})
+            options.assert_called_once_with(17)
             for sent_origin, values, expected in (
                 ("", form, 403),
                 ("http://wrong.invalid", form, 403),

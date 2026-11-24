@@ -2115,7 +2115,7 @@ The confirmation shows the row, process tree, progress, and recorded caller.
 The server identifies the caller from the reservation's session ID and the current staff record.
 
 1. The feed publishes an opaque reference for each eligible reservation.
-2. The console supplies a handle for the verified process, recipient and detached stop route.
+2. The console supplies a handle if the detached record has `completion_after_slice_cleanup` and the server verifies the stop route.
 3. The server checks the handle and reads the run record when the operator confirms.
 4. The server reports **Run already ended** if the record shows completion or is missing on that read.
 5. If the record shows an active run, the server saves the accepted request, notice and verified stop route.
@@ -2125,21 +2125,29 @@ The server identifies the caller from the reservation's session ID and the curre
 The detached helper stages the reason and the pass cancellation before TERM.
 A detached run with a saved slice uses `builds-detached-<id>.slice`.
 The helper checks `cgroup.events` for `populated 0` to confirm that the slice is empty.
-After acceptance, a completion stamp, a status other than running, or a missing record permits the notice.
-At restart, the server requests the stop again if the record is active.
+The supervisor sets `completion_after_slice_cleanup` when it publishes its process identity.
+It writes the completion stamp after the run slice is empty.
+Without the field, the page shows **Kill is not available for this run yet**.
+If the supervisor exits before it records completion, the server reaps the committed stop after the slice is empty.
+This recovery changes only the selected run.
+The server confirms the saved slice is empty before it sends the notice.
+If the detached record changes identity, the server saves **Stop unconfirmed**.
+The detached helper keeps the original run record until the server acknowledges its stop notice.
 If the server saved **Stopped**, it resumes only pending delivery.
-The server retains a verified handle for the result visibility interval.
+The server retains a verified handle for two `page_refresh_seconds` intervals.
 If the live row disappears, the retained handle can report an already ended run.
 A direct Cargo scope without a detached run record has no Kill action.
 Verify still has no Kill action because it creates only step scopes.
-The server retries pending actions every `kill_pending_check_seconds`.
+The server retries pending actions during its existing maintenance cycle.
 It retries an unclear delivery result with the saved key.
 A queued or kept message appears as **Message queued**.
 The server supplies the first line of the notice.
 The operator can add words in the confirmation.
-The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.
+The row shows **Stopping** while the run record shows an accepted stop is pending.
 **Message sent**, **Message queued**, and **Message failed** describe the delivery result.
-The console keeps the result visible for `kill_result_seconds` after the row leaves the table.
+The page checks results at `page_refresh_seconds` intervals.
+The result stays visible outside the table when the row leaves.
+The page shows finished results for two refresh intervals.
 Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
 The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
 

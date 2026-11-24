@@ -416,6 +416,8 @@ try {
   const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
     time:'19:41 EST',recipient_role:'worker',recipient_name:'impl3'};
   const killToken = 'fixture-token';
+  const killRefreshSeconds = 17;
+  const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
   let killPost;
   let killPostReply;
   let killResults = [];
@@ -493,14 +495,15 @@ try {
         req.on('end', () => {
           killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
           killPostReply = () => {
-            killResults = [killedResult];
-            res.end(JSON.stringify({result:killedResult}));
+            killResults = [stoppingResult];
+            res.end(JSON.stringify({result:stoppingResult}));
           };
           server.emit('kill-post');
         });
       } else {
         const canTry = !killResults.length;
-        res.end(JSON.stringify({token:killToken,offers:canTry ? {[killRef]:killOffer} : {},results:killResults}));
+        res.end(JSON.stringify({token:killToken,offers:canTry ? {[killRef]:killOffer} : {},results:killResults,
+          refresh_seconds:killRefreshSeconds}));
       }
       return;
     }
@@ -632,7 +635,7 @@ try {
           const local = {...source,key:'kill-fixture',machine:'natedev',pid:killOffer.pid,
             name:'unit-board check',unit:'unit-board',kill_ref:killRef,started_at:fixtureTime - 660};
           const other = {...source,key:'unavailable-fixture',machine:'natedev',pid:2637799,
-            name:'research nextest',unit:'research',started_at:fixtureTime - 1200};
+            name:'research nextest',unit:'research',kill_ref:'c'.repeat(64),started_at:fixtureTime - 1200};
           servedReading = {...base, walk:[other,local], waiters:[], queued_priority_units:[]};
           await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
@@ -708,10 +711,30 @@ try {
             assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
               words:'Start it again after 21:50.'});
             killPostReply();
-            assert.equal(await evaluate(`(async () => {
+            servedReading = {...servedReading,walk:servedReading.walk.filter(row => !row.kill_ref)};
+            const refresh = await evaluate(`(async () => {
               await refreshKill();
-              return document.querySelector('#kill-results').textContent;
-            })()`),'check (pid 2712994) · Killed by you at 19:41 EST · worker impl3 informed');
+              return {interval:killRefreshSeconds,text:document.querySelector('#kill-results').textContent};
+            })()`);
+            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:'check (pid 2712994) · Stopping'});
+            killResults = [killedResult];
+            const returned = await evaluate(`(async () => {
+              await tick();
+              const early = document.querySelector('#kill-results').textContent;
+              const read = refreshKill;
+              let reply;
+              refreshKill = () => reply = read();
+              try {
+                nextKillRead = performance.now();
+                await tick();
+                await reply;
+                return {early,finished:document.querySelector('#kill-results').textContent};
+              } finally {
+                refreshKill = read;
+              }
+            })()`);
+            assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
+              finished:'check (pid 2712994) · Killed by you at 19:41 EST · worker impl3 informed'});
             console.log(JSON.stringify({pass:true,proof:'Kill control'}));
           }
           break browserProof;

@@ -1542,12 +1542,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         server = cast(ReviewLinksServer, self.server)
         try:
-            offers, results = server.kill_actions.options()
+            refresh_seconds = conf.read_or_repository("review_links").number("page_refresh_seconds")
+            offers, results = server.kill_actions.options(refresh_seconds)
         except (OSError, ValueError, admission.AdmissionUnavailable) as error:
             print(f"review-links build kill: {error}", file=sys.stderr)
             self.json_response(503, {"reason": "The current runs are unavailable."})
         else:
-            self.json_response(200, {"token": server.new_item_token, "offers": offers, "results": results})
+            self.json_response(200, {"token": server.new_item_token, "offers": offers, "results": results,
+                                     "refresh_seconds": refresh_seconds})
 
     def build_kill_allowed(self, *, required_origin: bool = False) -> bool:
         if not self.same_origin(required=required_origin) or self.tailscale_refusal():
@@ -1564,7 +1566,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if (query or self.headers.get_content_type() != "application/x-www-form-urlencoded"
                     or self.headers.get_all("Transfer-Encoding") or len(lengths) != 1):
                 raise ValueError
-            limit = conf.read_or_repository("review_links").whole("kill_request_bytes")
+            limit = conf.read_or_repository("review_links").whole("kill.request_bytes")
             length = int(lengths[0])
             if not 0 < length <= limit:
                 raise ValueError
@@ -2819,6 +2821,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if now >= self.next_attachment_retry:
             self.next_attachment_retry = now + PAGE_ATTACHMENT_RETRY_SECONDS
             self.retry_page_attachments()
+            self.kill_actions.retry_pending()
         if now >= self.next_tailscale_check:
             settings = conf.read("review_links")
             self.next_tailscale_check = now + settings.number("tailscale_check_seconds")

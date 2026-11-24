@@ -2626,7 +2626,9 @@ const KILL_PATH = "/console/build-kill";
 const KILL_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86zM15 9l-6 6m0-6 6 6"/></svg>';
 let killInfo = {token: "", offers: {}, results: []};
 let killRequest = 0;
+let nextKillRead = 0;
 let killRead = false;
+let killRefreshSeconds = SECONDS;
 let killConfirmation = null;
 const pendingKills = new Map();
 
@@ -2680,15 +2682,23 @@ function showKillResults() {
 
 async function refreshKill() {
   const request = ++killRequest;
+  const started = performance.now();
+  nextKillRead = started + killRefreshSeconds * 1000;
   try {
     const response = await fetch(KILL_PATH, {cache: "no-store"});
     const info = response.ok ? await response.json() : null;
     if (request !== killRequest) return;
-    killRead = true;
-    killInfo = info?.offers && Array.isArray(info.results) ? info : {token: "", offers: {}, results: []};
+    if (Number.isFinite(info?.refresh_seconds) && info.refresh_seconds > 0) {
+      killRefreshSeconds = info.refresh_seconds;
+      nextKillRead = started + killRefreshSeconds * 1000;
+    }
+    killRead = response.status === 403 || response.ok;
+    if (info?.offers && Array.isArray(info.results)) killInfo = info;
+    else killInfo = {...killInfo, token: "", offers: {}};
+    if (response.status === 403) killInfo.results = [];
   } catch {
     if (request !== killRequest) return;
-    killInfo = {token: "", offers: {}, results: []};
+    killInfo = {...killInfo, token: "", offers: {}};
   }
   showKillResults();
   fitLabels();
@@ -3300,7 +3310,8 @@ async function tick(supersede=false,current=()=>true) {
   if (!current() || paused) return;
   if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
   render(d);
-  if (!killRead || d.walk.some(row => row.kill_ref) || killInfo.results.length || pendingKills.size) void refreshKill();
+  if (performance.now() >= nextKillRead && (!killRead || d.walk.some(row => row.kill_ref)
+      || killInfo.results.length || pendingKills.size)) void refreshKill();
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
   if (!current() || paused) return;
   const lv=level(latest);

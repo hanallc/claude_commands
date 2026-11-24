@@ -331,6 +331,8 @@ class DetachedRunsTests(unittest.TestCase):
               patch.object(detached_runs, "import_module", new=completion_import)):
             record = self.supervise(path)
         self.assertEqual(module.read_text(), replacement)
+        self.assertIs(record.get("completion_after_slice_cleanup"), True)
+        self.assertIn("supervisor_started", record)
         self.assertEqual(received.read_text(), self.worker_id)
         self.assertIs(record.get("completion_pending"), False)
         message, = cast(list[str], self.pending()["messages"])
@@ -1241,6 +1243,7 @@ sys.exit(1)
 
         run_id, separator, staff_id = path.stem.partition("@")
         self.assertEqual((separator, staff_id), ("@", self.worker_id))
+        self.assertNotIn("completion_after_slice_cleanup", worker_lifecycle.read_json_object(path))
 
         def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
             self.assertIn(f"--unit=detached-python-tests-{run_id}.scope", command)
