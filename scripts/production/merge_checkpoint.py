@@ -28,13 +28,14 @@ from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
@@ -298,8 +299,8 @@ def worktree_in_repo(row: staff.StaffRow, main_checkout: Path) -> bool:
     if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
         return False
     try:
-        return worktrees.main_checkout(location.path) == main_checkout
-    except worktrees.Refused:
+        return worktree_records.main_checkout(location.path) == main_checkout
+    except worktree_records.Refused:
         return False
 
 
@@ -336,8 +337,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
     try:
-        main_checkout = worktrees.main_checkout(production.checkout)
-    except worktrees.Refused as error:
+        main_checkout = worktree_records.main_checkout(production.checkout)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     parent_production: Production | StaffParentIsDestination = StaffParentIsDestination()
     if selected.parent != staff.ReportsTo(production.owner.id):
@@ -446,26 +447,45 @@ def merged(request: MergeRequest) -> bool:
                request.production.merge_branch).returncode == 0
 
 
-def ancestry(request: MergeRequest) -> CheckpointOrigin:
+def check_closing_ancestry(request: MergeRequest) -> None:
     checkout = request.production.checkout
+    run_git = partial(git, checkout)
+    _ = good(run_git("fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
+    main_tip = good(run_git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"), "ancestry")
+    closing = good(run_git("rev-list", "--first-parent", "--no-merges", "-n", "1", request.commit), "ancestry")
+    unmerged = good(run_git("rev-list", "--reverse", "--topo-order", "--no-merges",
+                            "--no-commit-header", "--format=%H %P",
+                            f"{request.production.merge_branch}..{request.commit}", f"^{main_tip}"), "ancestry")
+    candidates = [line.split() for line in unmerged.splitlines()]
+    pending = [row for row in candidates if row[0] != closing]
+    if not pending:
+        return
+    commit = pending[0][0]
+    try:
+        target = git_merge_tree.prepare_target(run_git, main_tip)
+        for commit, *parents in pending:
+            if not parents or not git_merge_tree.leaves_target_unchanged(
+                    run_git, commit, target, merge_base=parents[0]):
+                break
+        else:
+            return
+    except OSError as error:
+        raise checkpoint_gate.Stop("ancestry", "failed", f"{commit} against origin/main ({main_tip}): {error}",
+                                   "the showrunner will inspect the failed command") from error
+    subject = good(run_git("show", "-s", "--format=%s", commit), "ancestry")
+    kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
+    raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {commit[:12]}: {subject}",
+                               f"wait for {commit[:12]} to merge, then resend the {kind}")
+
+
+def ancestry(request: MergeRequest) -> CheckpointOrigin:
     origin_branch = on_origin(request)
     if origin_branch is None:
         raise checkpoint_gate.Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = merged(request)
     if not isinstance(request.kind, CodeCheckpoint):
-        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
-        closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
-                           request.commit), "ancestry")
-        unmerged = good(git(checkout, "rev-list", "--reverse", "--topo-order", "--no-merges",
-                            f"{request.production.merge_branch}..{request.commit}", "^origin/main"), "ancestry").splitlines()
-        pending = [commit for commit in unmerged if commit != closing]
-        if pending:
-            first = pending[0]
-            subject = good(git(checkout, "show", "-s", "--format=%s", first), "ancestry")
-            kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
-            raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {first[:12]}: {subject}",
-                                       f"wait for {first[:12]} to merge, then resend the {kind}")
+        check_closing_ancestry(request)
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return CheckpointOrigin(origin_branch.removeprefix("origin/"), already)

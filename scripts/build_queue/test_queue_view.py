@@ -33,8 +33,8 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     """Read step labels from the queue fixture."""
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.test-affected=test affected\n"
-        + "names.gate=merge gate\n"
-        + "prose.gate=merge gate\n"
+        + "names.gate=gate\n"
+        + "prose.gate=the gate\n"
         + "owned.test-affected={unit} targeted\n"
         + "owned.gate={unit} merge\n"
         + "owned.showrunner-gate=showrunner merge\n"
@@ -302,6 +302,17 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertIs(restored.gate_label, expected)
                     if expected == queue_view.MacGateLabel.PLACEMENT:
                         self.assertEqual(queue_view.gate_label_text(restored), wire)
+        build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, session="current-session")
+        for name, session_fields, session in (
+                ("legacy session only", {"launcher_session": "legacy-session"}, "legacy-session"),
+                ("empty shared session", {"session": "", "launcher_session": "legacy-session"}, "legacy-session"),
+                ("current session", {"session": "current-session", "launcher_session": "legacy-session"},
+                 "current-session")):
+            with self.subTest(name=name):
+                row = queue_view.mac_build_record(build)
+                del row["session"]
+                row.update(session_fields)
+                self.assertEqual(queue_view.mac_build_from_record(row).session, session)
 
     def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -338,6 +349,51 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(rows[0]["origin"], expected)
                     self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
                     self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
+
+    def test_mac_reader_preserves_the_submitting_session_and_verify_call(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            for name, marker, environment, session, call, placement in (
+                ("Claude", "", {"CLAUDE_CODE_SESSION_ID": "session-a"}, "session-a", "", ""),
+                ("copy record", "session-b", {"CLAUDE_CODE_SESSION_ID": "other"}, "session-b", "", ""),
+                ("Verify", "", {"CODEX_THREAD_ID": "session-c", "BUILDLOG_CALL_ID": "verify-id"}, "session-c", "verify-id", ""),
+                ("no record", "", {}, "", "", ""),
+                ("placed Verify", "", {"CODEX_THREAD_ID": "session-d", "BUILDLOG_CALL_ID": "placed-id",
+                    "MAC_PLACEMENT": "episode/attempt"}, "session-d", "placed-id", "episode/attempt"),
+            ):
+                with self.subTest(name=name):
+                    processes: dict[int, dict[str, object]] = {
+                        100: {"parent": 90, "command": "cargo build -p hana", "executable": "/bin/cargo",
+                              "resident_bytes": 1234, "started_at": NOW},
+                        90: {"parent": 1, "command": "/bin/zsh -c cargo build -p hana", "executable": "/bin/zsh",
+                             "resident_bytes": 0, "started_at": NOW},
+                    }
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+                        f"read_processes = lambda: {processes!r}\n"
+                        + "read_captures = lambda processes: {}\n"
+                        + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
+                        + "repository_name = lambda folder: 'hana'\n"
+                        + f"project_record = lambda folder: dict(recorded_unit='', session={marker!r}, repository='')\n"
+                        + "environment_reads = []\n"
+                        + "def process_environment(pid):\n"
+                        + "    environment_reads.append(pid)\n"
+                        + f"    return {environment!r} if pid == 100 else {{}}\n"
+                        + "reading = read_reading()\n"
+                        + "print(json.dumps([reading['builds'], environment_reads]))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rows, environment_reads = cast(tuple[list[dict[str, object]], list[int]],
+                        json.loads(result.stdout.removesuffix("rc=0\n")))
+                    row, = rows
+                    _ = row.pop("progress_tail")
+                    row["counter"] = {}
+                    build = queue_view.mac_build_from_record(row)
+                    self.assertEqual(build.session, session)
+                    self.assertEqual(build.verify_call_id, call)
+                    self.assertEqual(build.gate_placement, placement)
+                    if placement:
+                        self.assertEqual(environment_reads.count(build.pid), 1)
+                    self.assertEqual(queue_view.mac_build_from_record(queue_view.mac_build_record(build)), build)
 
     def test_mac_command_step_reads_the_verb_and_the_package(self) -> None:
         for command, expected in (
@@ -564,7 +620,7 @@ class CloudQueueViewTests(unittest.TestCase):
         settings["owned.test-affected"] = "targeted for {unit}"
         configured = replace(model, names=type(model.names)(settings))
         self.assertEqual(configured.names.shown("test-affected"), "test affected")
-        self.assertEqual(configured.names.prose("gate"), "merge gate")
+        self.assertEqual(configured.names.prose("gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

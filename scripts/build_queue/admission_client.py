@@ -68,6 +68,12 @@ class PlacementConstraintBuilder(Protocol):
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
 
 
+def placement_constraint_builder() -> PlacementConstraintBuilder:
+    """Load the fixed placement policy when a caller needs it."""
+    return cast(PlacementConstraintBuilder, getattr(
+        import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+
+
 CLOCK: ClientClock = SystemClock()
 
 
@@ -393,9 +399,9 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if _waits_for_live_service(request):
+    if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
@@ -581,8 +587,8 @@ def consume_permission(request: wire.ConsumePermission) -> wire.FirstAuthorizati
     raise wire.AdmissionUnavailable("invalid permission answer")
 
 
-def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
-    reply = _query(request)
+def report_execution(request: wire.ExecutionReport, *, wait_for_service: bool = True) -> wire.DispatchStatus:
+    reply = _query(request, wait_for_service=wait_for_service)
     if isinstance(reply, wire.DispatchStatus):
         return reply
     raise wire.AdmissionUnavailable("invalid execution report answer")
@@ -2188,8 +2194,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             kind = "test"
         elif kind in ("clippy", "mend-check"):
             kind = "lint"
-        builder = cast(PlacementConstraintBuilder, getattr(
-            import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+        builder = placement_constraint_builder()
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
             execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),

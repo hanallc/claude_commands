@@ -103,6 +103,7 @@ class MacBuild:
     ci_job: str = ""
     gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
     gate_placement: str = ""
+    verify_call_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -194,13 +195,15 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
-            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build)}
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build),
+            "verify_call_id": build.verify_call_id}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     test_pid = int(cast(int, row["test_pid"]))
     resident = int(cast(int, row["resident_bytes"]))
     command = str(row["command"])
+    session = str(row.get("session") or row.get("launcher_session") or "")
     counter_data = cast(dict[str, object], row["counter"])
     counter = progress_profile.ProgressCounter(str(counter_data["phase"]), int(cast(int, counter_data["done"])),
         int(cast(int, counter_data["total"]))) if counter_data else progress_profile.NoCounter()
@@ -210,12 +213,13 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
-                    str(row["recorded_unit"]), str(row["session"]),
+                    str(row["recorded_unit"]), session,
                     MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
                     str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
                     parse_gate_label(str(row.get("gate_label", ""))),
                     str(row.get("gate_label", "")).removeprefix("placement ")
-                    if str(row.get("gate_label", "")).startswith("placement ") else "")
+                    if str(row.get("gate_label", "")).startswith("placement ") else "",
+                    str(row.get("verify_call_id", "")))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -245,6 +249,7 @@ def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
 import ctypes
+from functools import cache
 import json
 import re
 import struct
@@ -257,7 +262,6 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
-
 
 def output(arguments):
     return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL,
@@ -428,16 +432,22 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"BUILDLOG_CALL_ID",
+                                 b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
 
-def test_output_directories(pid, folder, command, members, processes):
+@cache
+def observed_environment(pid):
+    """Read each process environment once per Mac reading."""
+    return process_environment(pid)
+
+
+def test_output_directories(folder, command, environment, members, processes):
     """Resolve target settings and observed compiler output directories."""
     try:
         arguments = shlex.split(command)
-        environment = process_environment(pid)
         settings = cargo_folder_settings(arguments, folder, environment)
         if "target-dir" in settings:
             setting = settings["target-dir"]
@@ -462,8 +472,8 @@ def test_output_directories(pid, folder, command, members, processes):
     return targets, outputs
 
 
-def running_test_pid(pid, folder, command, members, processes):
-    targets, outputs = test_output_directories(pid, folder, command, members, processes)
+def running_test_pid(pid, folder, command, environment, members, processes):
+    targets, outputs = test_output_directories(folder, command, environment, members, processes)
     for member in members:
         try:
             executable = Path(processes[member]["executable"]).resolve()
@@ -476,17 +486,23 @@ def running_test_pid(pid, folder, command, members, processes):
     return 0
 
 
+def runner_process(process):
+    """Match a GitHub Actions runner by its program name."""
+    try:
+        words = shlex.split(process["command"])
+    except ValueError:
+        words = []
+    return any(re.sub(r"-[0-9][0-9.-]*$", "", name) in ("Runner.Worker", "Runner.Listener")
+               for name in (Path(words[0]).name if words else "", Path(process["executable"]).name))
+
+
 def build_origin(pid, processes):
     """Identify a build with a GitHub Actions runner ancestor."""
     cursor = pid
     seen = set()
     while cursor in processes and cursor not in seen:
         seen.add(cursor)
-        try:
-            words = shlex.split(processes[cursor]["command"])
-        except ValueError:
-            return "unknown"
-        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
+        if runner_process(processes[cursor]):
             return "ci"
         cursor = processes[cursor]["parent"]
     return "non-ci"
@@ -519,7 +535,7 @@ def gate_label(pid, processes, records, ci_uid):
         if record and record[0] == process["started_at"]:
             return record[1]
         # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
-        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        placement = observed_environment(pid).get("MAC_PLACEMENT", "")
         if PLACEMENT_FORM.fullmatch(placement):
             return "placement " + placement
         pid = process["parent"]
@@ -604,8 +620,9 @@ def read_builds(processes=None, records=None, captures=None):
         except Exception:
             record = dict(recorded_unit="", session="", repository="")
         command = capture.get("command", processes[pid]["command"])
+        environment = observed_environment(pid)
         try:
-            test_pid = running_test_pid(pid, folder, command, members, processes)
+            test_pid = running_test_pid(pid, folder, command, environment, members, processes)
         except Exception:
             test_pid = -1
         try:
@@ -616,7 +633,8 @@ def read_builds(processes=None, records=None, captures=None):
             origin = build_origin(pid, processes)
         except Exception:
             origin = "unknown"
-        ci_environment = process_environment(pid) if origin == "ci" else {}
+        ci_environment = environment if origin == "ci" else {}
+        session = record["session"] or environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -628,10 +646,11 @@ def read_builds(processes=None, records=None, captures=None):
                            command=command, test_pid=test_pid,
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
                            progress_tail=tail, repository=repository,
-                           recorded_unit=record["recorded_unit"], session=record["session"],
+                           recorded_unit=record["recorded_unit"], session=session,
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
                            ci_job=ci_environment.get("GITHUB_JOB", ""),
-                           gate_label=gate_label(pid, processes, records, ci_uid)))
+                           gate_label=gate_label(pid, processes, records, ci_uid),
+                           verify_call_id=environment.get("BUILDLOG_CALL_ID", "")))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 

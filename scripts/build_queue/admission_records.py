@@ -93,6 +93,11 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class GuestStartNotReported:
+    """The assignment has no saved guest start report."""
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
     """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
@@ -107,6 +112,7 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1227,6 +1233,7 @@ class RunningStep:
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
+    counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1250,6 +1257,8 @@ def execution_group(step: RunningStep, fallback: str) -> str:
         identity = evidence.identity
         if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        if isinstance(identity, execution_identity.GuestExecution):
+            return repr((identity.target, identity.attempt))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
         return repr((step.assignment_host, fallback))

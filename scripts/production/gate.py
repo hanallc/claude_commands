@@ -82,7 +82,8 @@ from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-                                     gate_job_for_command, gate_job_from_process, read_step_names)
+                                     gate_job_for_command, gate_job_from_process, gate_natedev_only_flag,
+                                     gate_target_kind, read_step_names)
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -211,6 +212,7 @@ class HoldExemptNamedModuleMachine:
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    module_progress: Callable[[str], None] | None = None
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1138,7 +1140,7 @@ def _gate_program_source() -> BinaryIO:
 
 
 # The placement belongs to this gate. A test child can run gate code, so it must not read the placement.
-_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE")
+_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR")
 
 
 def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
@@ -1739,10 +1741,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    module_progress = machine.module_progress if isinstance(machine, WholeMachine) else None
+
+    def print_module_record(line: str) -> None:
+        print(line, flush=True)
+        if module_progress is not None:
+            module_progress(line)
+
     if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
-        print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
+        print_module_record(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs")
     if isinstance(time_limit, gate_record.ReadGateTimeLimit):
         try:
             time_limit = read_time_limit(
@@ -1874,8 +1883,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         print(f"--- {result.suite}/{result.module} exit={result.returncode} ---\n"
                               + failure_log_tail(result.output) + "\n--- end module failure ---", flush=True)
                     if not shared:
-                        print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
-                              + (" stopped" if result.killed_for else ""), flush=True)
+                        print_module_record(f"{result.suite}/{result.module} exit={result.returncode}"
+                                            + f" seconds={result.seconds:.2f}"
+                                            + (" stopped" if result.killed_for else ""))
                     cpu_key = f"{job.suite}/{result.module}"
                     run_cpu[cpu_key] = run_cpu.get(cpu_key, 0.0) + result.cpu_seconds
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and hold is not None and not hold.admits():
@@ -2443,10 +2453,19 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline)
-        if isinstance(recovery, GateRecovery):
-            recovery.rollback = ""
-            recovery.save()
+        try:
+            rollback_merge(repo, baseline)
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = ""
+                recovery.save()
+        except Exception as cleanup_error:
+            if not isinstance(error, MacLinuxTookNoRun):
+                raise
+            if isinstance(recovery, GateRecovery):
+                # Keep the recovery record when cleanup fails.
+                recovery.rollback = baseline
+            detail = str(cleanup_error) or type(cleanup_error).__name__
+            raise MacLinuxTookNoRun(f"{error}; merge cleanup failed: {detail}") from cleanup_error
         refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
         raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
@@ -3144,7 +3163,7 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_start_target(args: GateArguments) -> GateTarget:
+def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
@@ -3153,7 +3172,7 @@ def gate_start_target(args: GateArguments) -> GateTarget:
     """
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
-    flag = natedev_only_flag(args)
+    flag = gate_natedev_only_flag(arguments)
     if flag is not None and not isinstance(placed, NoGateAssignment) and target != "natedev":
         raise GateAssignmentRefused(
             f"gate.py {flag} runs only on natedev and cannot take the {placed.assignment.destination.target} assignment")
@@ -3165,17 +3184,6 @@ def gate_start_target(args: GateArguments) -> GateTarget:
         if isinstance(ended, admission_wire.Refused):
             raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {ended.reason}")
     return target
-
-
-def natedev_only_flag(args: GateArguments) -> str | None:
-    """Return the flag of a mode that cannot route the gate, or None when the mode can route it."""
-    if args.modules:
-        return "--module"
-    if args.nightly:
-        return "--nightly"
-    if args.promote_only:
-        return "--promote-only"
-    return None
 
 
 def placement_target(
@@ -3305,6 +3313,12 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if job.returncode:
                     print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
                           file=sys.stderr, flush=True)
+        else:
+            modules = sum(job.kind is GateJobKind.TEST_MODULE for job in outcome.jobs)
+            minutes, seconds = divmod(round(outcome.seconds), 60)
+            head = checked_git(repo, "rev-parse", "HEAD")[:10]
+            print(f"Mac Linux guest gate passed: {modules} modules in {minutes} min {seconds} s (checkout HEAD {head})",
+                  flush=True)
         return outcome
 
     def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
@@ -3322,7 +3336,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         finally:
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
-    match target:
+    match gate_target_kind(target) if isinstance(target, str) else target:
         case "natedev":
             # A gate assigned to natedev checks its checkout at the end, like every other gate.
             return run_routed(lambda _routed, _dirty: run_local(type_dirs))
@@ -3613,7 +3627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        target = gate_start_target(args)
+        target = gate_start_target(args, arguments)
     except GateRefused as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
+from typing import Literal
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE as HAND_MADE, GateJobNotRecorded, StepJob as StepJob
 from scripts.build_queue.snapshot_codec import RAW_ID
@@ -139,6 +140,24 @@ def _option(arguments: Sequence[str], name: str) -> str:
 
 def _count(arguments: Sequence[str], name: str) -> int:
     return sum(1 for argument in arguments if argument == name or argument.startswith(name + "="))
+
+
+def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
+    """Return the gate option that requires natedev."""
+    if _count(arguments, "--module"):
+        return "--module"
+    if "--nightly" in arguments:
+        return "--nightly"
+    if "--promote-only" in arguments:
+        return "--promote-only"
+    return None
+
+
+def gate_target_kind(target: str) -> Literal["natedev", "mac-linux", "aws"] | None:
+    """Return the route that can run an assigned gate."""
+    if target in ("natedev", "mac-linux", "aws"):
+        return target
+    return None
 
 
 # A program that runs the script named after its options.

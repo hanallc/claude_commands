@@ -98,8 +98,10 @@ The panel says `No actions required.`
 The status line shows session review counts under `Review:`.
 It retains adhoc items and the existing review count colors.
 A separate `For you:` row names each waiting rebuild and counts the other open actions.
-`assignment.py` passes the rebuild names and the action count to jq with the session counts.
-On Linux it uses the shared For you reader.
+On Linux, the shell checks the source stamps and deadline before it passes saved session fields to jq.
+These fields include the assignment, branch, Review counts, adhoc count, and For you row.
+On a miss, `assignment.py` reads the current sources.
+It saves the session fields only after a complete read with unchanged sources and a valid deadline.
 The Mac requests the rebuild machines and counts from the console host without command text.
 The Mac resolves the peer in `console.conf` setting `for_you.host` with `tailscale ip -4`.
 The status line omits a known zero count.

@@ -225,6 +225,7 @@ class RebuildAnswer:
     needs: OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable = RebuildNeedsNotRead()
     probes: RunningSystemProbes = RunningSystemProbes()
     running_paths: dict[str, str] = field(default_factory=dict)
+    comparison_deadline: int = 0
 
     def row(self) -> str:
         return rebuild_names(self.machines)
@@ -429,18 +430,13 @@ def read_compared_changes(config: Path, answer: RebuildAnswer) -> dict[str, Comp
             and answer.probes.succeeded(machine) and changes.running_path == answer.running_paths.get(machine)}
 
 
-def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time) -> RebuildAnswer:
+def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time,
+         watch: need.SourceWatch | None = None) -> RebuildAnswer:
     """Combine the cached comparison with open rebuild needs."""
-    answer = _read_cache(config, clock)
+    answer = _read_cache(config, clock, watch=None if watch is None else watch.watch)
+    errors: list[str] = []
     try:
-        # Glob can hide an inaccessible folder.
-        try:
-            with os.scandir(need.needs_folder()):
-                pass
-        except FileNotFoundError:
-            pass
-        errors: list[str] = []
-        needs = tuple(need.read_needs(errors))
+        needs = tuple(need.read_needs(errors) if watch is None else need.read_needs(errors, watch=watch))
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
@@ -448,17 +444,23 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
                    needs=RebuildNeedsUnavailable("\n".join(errors), needs) if errors else needs)
 
 
-def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
+def _read_cache(config: Path, clock: Callable[[], float], *,
+                watch: Callable[[Path], None] | None = None) -> RebuildAnswer:
     """Read the configured comparison cache without evaluating systems."""
     try:
+        if watch is not None:
+            watch(config)
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
         return RebuildAnswer((), False)
     try:
+        if watch is not None:
+            watch(cache)
         lines = cache.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 2 or not lines[1].isdigit():
+        if len(lines) < 2 or not lines[1].isascii() or not lines[1].isdecimal():
             return RebuildAnswer((), True)
-        refresh_due = int(lines[1]) <= clock() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
+        deadline = int(lines[1])
+        refresh_due = deadline <= clock() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
@@ -491,7 +493,7 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
                 pass
         compared = tuple(item.removeprefix("rebuild ") for item in items)
         return RebuildAnswer(compared, refresh_due, expected, failure, compared,
-                             probes=probes, running_paths=running_paths)
+                             probes=probes, running_paths=running_paths, comparison_deadline=deadline)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
