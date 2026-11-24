@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Check the path against the approved forms before removal."""
+"""Check the path against the approved path templates before removal."""
 from __future__ import annotations
 
 if __name__ == "__main__":
@@ -31,7 +31,7 @@ from scripts.lib import conf
 from scripts.lib.build_folders import OWNER_MARKER
 from scripts.production import staff
 
-FORMS_KEY = "removal.forms"
+PATH_TEMPLATES_KEY = "removal.path_templates"
 CARGO_TAG = "CACHEDIR.TAG"
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 LEGACY_TOP = frozenset(("cargo", "slot", "paths", "claude", "hana-ci", "session"))
@@ -53,12 +53,12 @@ def identity(info: os.stat_result) -> Identity:
 
 class RefusalReason(Enum):
     INVALID_ROOT = "unsafe build folder root"
-    OUTSIDE_ROOT = "path is outside the declared removal forms"
+    OUTSIDE_ROOT = "path does not match a removal path template"
     PROTECTED_PATH = "path is or contains the build root or the home folder"
     UNKNOWN_MAKER = UnknownMaker.NO_EVIDENCE.value
     MOUNT = "mount between the build root and the path, at the path, or below it"
     UNVERIFIED_PATH = "cannot verify the path"
-    UNAVAILABLE_ROOTS = "cannot read the declared removal forms"
+    UNAVAILABLE_ROOTS = "cannot read the removal path templates"
     UNAVAILABLE_STAFF = "cannot read the staff record"
     UNAVAILABLE_MOUNTS = "cannot verify the mount table"
 
@@ -280,23 +280,23 @@ class RemovalGuard:
                                tuple(edges), root_mount)
 
 
-def _configured_forms(value: str) -> tuple[tuple[Path, Form], ...]:
+def _configured_path_templates(value: str) -> tuple[tuple[Path, Form], ...]:
     result: list[tuple[Path, Form]] = []
     for word in value.split():
         path = Path(word).expanduser()
         if not path.is_absolute() or ".." in path.parts or "<repo>" not in path.parts:
-            raise ValueError(f"invalid removal form: {word}")
+            raise ValueError(f"invalid removal path template: {word}")
         prefix = path.parts.index("<repo>")
         result.append((Path(*path.parts[:prefix]), Form(path.parts[prefix:])))
     if not result or len({form for _, form in result}) != len(result):
-        raise ValueError("expected distinct removal forms")
+        raise ValueError("expected distinct removal path templates")
     return tuple(result)
 
 
 def read(*, mount_reader: Callable[[], tuple[Path, ...]] | None = None,
          build_top: Path | None = None, names: KnownNames | None = None) -> RemovalGuard:
-    """Read the forms and mount table once."""
-    setting = conf.read("build_folders").origin(FORMS_KEY, _configured_forms)
+    """Read the path templates and mount table once."""
+    setting = conf.read("build_folders").origin(PATH_TEMPLATES_KEY, _configured_path_templates)
     if not isinstance(setting, conf.UsableLiveValue):
         raise Refused(RefusalReason.UNAVAILABLE_ROOTS, setting.reason)
     home = Path.home().resolve()
@@ -447,7 +447,7 @@ class Tool(Enum):
     BUILD = "sweep"
     DOC = "sweep:rustdoc"
     CARGO = "scratch:cargo"
-    GATE = "gate_folders_delete"
+    RETIRED_GATE = "gate_folders_delete"
 
 
 LIST_DIRECTORY = Path(".local/state/removal-lists")

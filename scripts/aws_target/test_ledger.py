@@ -2018,9 +2018,12 @@ class SettledChargeWatchTests(CostFixture):
         last_read = first + 8 * day
         self.replace('cost_explorer_watch_days', '45')
         fetch = mock.Mock(side_effect=recent_reads)
-        for elapsed in range(5, 3 * day + 1, 5):
-            _ = book.refresh_charges(self.settings, last_read + elapsed, fetch)
-            self.assertEqual(fetch.call_count, elapsed // day, f'{elapsed} seconds after the last seven-day query')
+        for offset in range(3):
+            day_start = offset * day
+            day_end = day_start + day
+            for elapsed in (day_start + 5, day_end - 5, day_end):
+                _ = book.refresh_charges(self.settings, last_read + elapsed, fetch)
+                self.assertEqual(fetch.call_count, elapsed // day, f'{elapsed} seconds after the last seven-day query')
 
         self.assertEqual(fetch.call_args_list, [
             mock.call(last_read + (offset - 45) * day, last_read + offset * day)
@@ -2064,7 +2067,7 @@ class SettledChargeWatchTests(CostFixture):
         fetch = mock.Mock(return_value=readings)
         log = io.StringIO()
         with redirect_stderr(log):
-            for elapsed in range(0, day, 5):
+            for elapsed in (0, 5, day // 2, day - 5, day - 1):
                 self.assertEqual(book.refresh_charges(self.settings, end + elapsed, fetch), readings[-1])
                 self.assertEqual(fetch.call_count, 1)
         fetch.assert_called_once_with(end - 45 * day, end)
@@ -2307,6 +2310,13 @@ class SpotPriceEvidenceTests(CostFixture):
         _ = path.write_text(json.dumps(dict(time=1)) + '\n' + json.dumps(recent) + '\n{"time":')
         self.assertEqual(ledger.recent_gate_launches(self.state, 100), (recent,))
 
+
+    def test_all_gate_launches_reads_every_row_and_skips_a_damaged_row(self) -> None:
+        rows = [dict(time=1, result='launched'), dict(time=100, result='refused')]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(
+            json.dumps(rows[0]) + '\n{"time":\n' + json.dumps(rows[1]) + '\n')
+        self.assertEqual(ledger.all_gate_launches(self.state), tuple(reversed(rows)))
+        self.assertEqual(ledger.all_gate_launches(self.root / 'absent'), ())
 
 if __name__ == "__main__":
     _ = unittest.main()

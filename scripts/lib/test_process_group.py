@@ -290,7 +290,8 @@ def send_process_group(group, signum):
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         verify = self.root / "scripts/direct/verify.sh"
-        definitions = shell_functions(verify, "stop_verify_group", function)
+        definitions = shell_functions(verify, "stop_verify_group", "save_verify_exit_stderr",
+                                      "finish_exit_diagnostics", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -309,11 +310,17 @@ note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
 verify_helper() { :; }
+final_pass_finish() { :; }
 finish_verify_run() { :; }
 stop_interrupted_run_log() { :; }
 """
+        if function == "verify_interrupted":
+            driver += """
+save_verify_exit_stderr
+exit_diagnostics="$TREE_WATCH_DIR/exit-diagnostics"
+"""
         return subprocess.run(
-            ["bash", "-c", driver + definitions + f"\n{function} {signal.SIGTERM}\n", "fixture",
+            ["bash", "-c", definitions + driver + f"\n{function} 15\n", "fixture",
              str(child.pid), str(verify.parent), str(watch)],
             cwd=self.root, env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -345,6 +352,7 @@ stop_interrupted_run_log() { :; }
                     result = self.cancel_step(function, child)
                     diagnostic = ("scripts.lib.process_group" if failure == "missing"
                                   else "fixture refused the group signal")
+                    self.assertIn("process group helper failed", result.stderr)
                     self.assertIn(diagnostic, result.stderr)
                     self.assertIsNone(child.poll(), "a refused helper must not fall back to an unchecked signal")
 

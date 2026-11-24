@@ -49,6 +49,37 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## AWS off
+
+Two existing keys switch the two AWS machines:
+
+- `enabled` in `config/cloud_gate.conf` switches the cloud gate box.
+  With `off`, the gate route sends gates to natedev, the pinned `hana-gpu` route refuses its step, and the hourly job reads no placement scores.
+  Both routes give the reason `cloud gates are off (cloud_gate.conf enabled=off)`.
+- `enabled` in `config/hana_aws.conf` switches the Hana box.
+  With `off`, placement and the controller give no claim and start no box, and the controller makes no AWS call for a box at rest.
+
+AWS is off when both keys are `off`.
+Then `aws-target.service` reads no account charges, and the hourly job reads no prices or quotas.
+The hourly job also skips the hours-gap check, because a bill that no charge refresh updates stays provisional.
+
+`aws_switch()` in `scripts/aws_target/config.py` is the one function that unattended code uses to read these keys.
+Each caller gives the settings of the machine that it serves.
+Unattended code decides on a key only through `aws_switch()`.
+An invalid live value counts as `off`, and a missing key or a missing live file takes the committed value.
+`hana_guest.read_settings()` also reads the Hana key, but only the image build (`hana_render.py`) uses that value, and it refuses an invalid live value.
+So no image holds a switch value that the user did not set, and the image files do not import `config.py`.
+
+With `enabled=off` in `hana_aws.conf`, the controller still observes and stops the box, unless `key_refused.json` holds the calls (see Hana lifecycle controller), when the lifecycle record shows that the box can run: a state other than `idle-stopped` or `unprovisioned`, a claim, a replacement stop duty, open Hana compute in the cost ledger, or an operation other than `observe`.
+With `enabled=off` in `cloud_gate.conf`, the gate route launches no new box, also for a retry after a Spot interruption or a box failure.
+When a gate reservation is due for cleanup, the route starts only the reconcile step, which ends that box and launches no box.
+A reservation is due for cleanup when its worker is dead, or when it has no known worker and its time is up; `cleanup_due()` in `cloud_gate.py` holds this rule.
+A live gate worker ends its own box, and with no reservation due for cleanup the route makes no AWS call.
+An error when the route starts the reconcile step prints its own line, and the route still gives the off reason.
+With `enabled=off` in `cloud_gate.conf`, `gpu_setup()` refuses the pinned `hana-gpu` queue route, which `gpu_size_trial.py` serves.
+`deploy.py` reads the Hana key through `aws_switch()` only to print the placement state, and it refuses no command.
+`aws_trial.py`, a `gpu_size_trial.py` run by hand, and quota requests do not read the switch, because a person runs them.
+
 ## AWS plan identity
 
 Run this command in a terminal on natedev.
@@ -207,26 +238,32 @@ It applies each rendered file's mode.
 The image keeps `safety.py`, `receiver.py`, `safety.json`, `receiver.json`, and their units.
 It installs the Python closure in `scripts/aws_target/hana_image.files` under `/var/lib/hana-runtime`.
 That closure supplies the root receiver, the safety code, and the unprivileged bootstrap.
+`scripts/aws_target/hana_image.sha256` holds the source hash of that closure.
+[Hana image freshness](#hana-image-freshness) gives the rule for the hash and the runtime ABI.
 NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved slot settings.
 
 The NixOS build runs the renderer from its pinned `claude-commands` input.
 The NixOS image requires these integration changes.
 
-1. Update the `claude-commands` pin to include the per-run runtime change.
-2. Include the paths listed in `scripts/aws_target/hana_image.files` and these seven files in the renderer input filter.
-   - `config/build_folders.conf`
-   - `config/build_targets.conf`
-   - `config/hana_aws.conf`
-   - `scripts/aws_target/hana_image.files`
-   - `scripts/aws_target/hana_render.py`
-   - `scripts/lib/conf.py`
-   - `scripts/lib/conf_reads.py`
+1. Update the `claude-commands` pin to include runtime ABI 2 and the Hana folder changes.
+2. Use `scripts/aws_target/hana_render.files` as the renderer input filter.
 3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
-4. Append the approved roots and capacity to the rendered `runtime/config/build_folders.conf`.
-5. Put the approved `# whole:` limit directly above each capacity setting.
-6. Give the bootstrap write access to `/var/lib/hana/tmp`.
+4. Append the approved capacity block below to the rendered `runtime/config/build_folders.conf`.
+5. Create the directories below with runner ownership after the data mount.
+6. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
 7. Provide Python 3.13 or newer for the bootstrap.
-8. Remove `CONF_DIR` from `runner-environment`.
+8. Remove `CONF_DIR` and `TMPDIR` from `runner-environment`.
+
+List `~/rust`, `~/rust/hana`, `~/rust/hana/.git`, `~/rust/hana/.git/hana-payload`, and `~/build` explicitly in the directory command.
+
+```ini
+# whole: 1..
+slots.aws-hana.default_max=1
+# whole: 1..
+slots.aws-hana.hana.max=1
+# whole: 1..
+slots.aws-hana.hana.max_bytes=137438953472
+```
 
 Root and the bootstrap read the installed `build_folders.conf`.
 User data supplies the boot descriptor and signed control access.
@@ -314,8 +351,8 @@ Open compute exposure remains reserved after permit expiry until a lifecycle obs
 Storage remains reserved after stop and termination until volume deletion is confirmed.
 Storage estimates use a 30-day month.
 The ledger reserves the remaining storage cost for every day that a permit reaches.
-`reconcile()` records an automatic restart even when Hana placement is disabled.
-It reserves the boot guard interval and retains exposure until a confirmed stop.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
+For an automatic restart, `reconcile()` reserves the boot guard interval and retains exposure until a confirmed stop.
 Unknown lifecycle state releases no exposure.
 Each lifecycle observation names the generation that the observer read before its request.
 An observation for an older generation changes no exposure or observation time.
@@ -356,6 +393,16 @@ The new rate therefore belongs to the Hana configuration.
 `aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
 Each child attempts Hana lifecycle recovery before account charge refresh.
 Either operation can fail without suppressing the other operation.
+A refused key is the one exception.
+When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
+While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
+The hourly job also makes no AWS call while the record exists.
+The cloud gate route then sends each gate to natedev with no AWS call, with the reason `key_refusal.REFUSED_REASON`.
+The record clears only after one child sees every AWS machine off and a later child sees one on.
+So a person sets `enabled=off` in both `cloud_gate.conf` and `hana_aws.conf`, keeps them off for at least one tick (about 10 s), then sets one to `on`.
+An unusable `enabled` value does not count as off for this rule.
+An unreadable record holds the calls, as a refusal does.
+`scripts/aws_target/key_refusal.py` owns the record.
 The supervisor continues after a failed or timed-out child.
 It releases all child-owned locks when the child exits.
 
@@ -438,7 +485,7 @@ Renewal retains the execution identity and advances the permit generation.
 A failed install leaves the active permit unchanged.
 An exact replay can acknowledge the installed permit while it is fresh.
 The controller reserves exposure until stop confirmation through the Phase C ledger.
-It reconciles automatic restarts without a caller, including while placement is disabled.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
 An automatic restart cannot reuse an interrupted execution's boot challenge.
 
 `HanaProvider.step()` defines the typed provider boundary.
@@ -560,17 +607,38 @@ The launch template sets `DeleteOnTermination` on the root disk. AWS deletes eac
 
 ### Hana image freshness
 
-`hana_render` hashes the paths, modes, and bytes of the rendered image files.
-It adds the digest to the rendered `safety.json`.
+The image digest tells whether the box is compatible with main.
+`hana_render` hashes the paths, modes, and bytes of the rendered control files.
+These are the units, the `safety.py` and `receiver.py` entry shims, `safety.json`, `receiver.json`, and `runtime/config/build_folders.conf`.
+The digest also covers `hana_protocol.RUNTIME_ABI`.
+The image receiver refuses a manifest with another runtime ABI.
+The digest does not cover the Python source under `runtime/`. The image still installs that source.
+`hana_render` adds the digest to the rendered `safety.json`.
 Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
 The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
 The renderer rejects invalid slot probe settings before it computes the digest.
-NixOS supplies the approved slot roots and capacity, compiler version, and runner environment.
+The renderer supplies `roots.build` and includes it in the digest.
+NixOS appends the approved capacity settings.
+NixOS supplies the compiler version and runner environment.
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
+An edit to a file in `scripts/aws_target/hana_image.files` also leaves the image digest unchanged.
 The receiver still uses `enabled` as an independent image admission switch.
 This split requires one image replacement before the box accepts a combined payload.
+
+`scripts/aws_target/hana_image.sha256` holds the sha256 of the image file list and each listed path and its bytes.
+`test_hana_render` fails when the checked-in hash differs from the computed hash.
+After an edit to an image file, apply this rule.
+
+1. If the edit changes what the receiver accepts or does, bump `hana_protocol.RUNTIME_ABI`.
+2. Write the new hash to `scripts/aws_target/hana_image.sha256`.
+
+No check makes a writer bump the runtime ABI. The test only makes the writer decide.
+A new runtime ABI makes the deployed image stale.
+Known cost: the box can run an older receiver with the same runtime ABI until the next image.
+A receiver fix that the host does not need reaches the box only with the next image.
+An image recorded with the earlier digest formula reads as stale. It needs one replacement.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
 Registration requires the build derivation and the renderer output to be present in the local store.
@@ -815,7 +883,7 @@ The paired trial replaces the size/start trials.
 The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
-## Cloud gate region fallback
+## Cloud gate placement and region retries
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
@@ -826,9 +894,11 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, the route sends merge gates and targeted tests to natedev.
-For each request, the route reads this setting before it reads deployment state or calls AWS.
+Direct gate placement uses natedev and `mac-linux`.
+A merge gate or targeted test with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
+The cloud route reserves a queue slot before it requests a box.
+The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
+With `enabled=off`, a gate without a placement assignment runs its tests on natedev.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
@@ -837,9 +907,10 @@ The route saves the interruption count and the next choice in `current.json` bef
 Resume restores both values, so a crash cannot reset the retry budget.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final natedev fallback row includes the interruption count when retries or capacity choices end.
+The final fallback row includes the interruption count when retries or capacity choices end.
+A gate without a placement assignment runs the tests on natedev after a final cloud refusal.
 A complete gate failure keeps its failed result and gets no retry.
-An unconfirmed termination or another controller error retains the existing fallback behavior.
+An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -886,7 +957,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-The controller then uses the normal natedev fallback.
+If the cloud route returns a final refusal, a gate without a placement assignment uses the natedev fallback.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -1162,7 +1233,7 @@ The user approved the combined table on 2026-11-18.
    A ban icon with the title `Not sold here` identifies a type that the region does not sell.
    Unavailable values show a dash with the reason where known.
 4. The Runs chips show when Cost per gate is on.
-   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   Gates, Targeted runs, and Both select the Gate estimates and the run tables.
    The choice also selects the refused and launched tables.
    The billed hours table does not depend on the run choice.
    The run tables omit Spot price and estimate because the Prices and quotas card shows them.
@@ -1617,17 +1688,23 @@ The guest receives no AWS credentials.
 The bootstrap downloads the payload with curl and verifies its SHA-256.
 The image sets the maximum file size and `source_download_timeout_s` (120 seconds).
 `hana_source.materialize` verifies Git prerequisites, checks the advertised commit, and fetches verified objects.
-The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
-The shared maker allocates mirror metadata and temporary bundle files.
-`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
-The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
-The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+The guest retains its main checkout at `~/rust/hana` on the data disk.
+The bootstrap downloads the payload inside the main checkout.
+The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
+Systemd mounts that path as a bounded filesystem for each command.
+The runner stages the verified bundle in the main checkout's Git directory.
+`build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+The maker rescues source edits before reset and retains Cargo output within the configured size limit.
+The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
+The shell cache lives at `~/build/hana/main/shells`.
 
 The guest must use host name `aws-hana`.
-Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
-The image supplies these approved values and includes Git, curl, and Python.
-The per-run runtime supplies the source, maker, slot, rescue, and configuration modules.
-The runner retains inherited slot locks through command execution.
+The image selects `roots.build` for the guest and expands `~/` against the runner's home.
+Admission requires a `# whole:` limit above each of `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
+The image supplies these values and includes Git, curl, and Python.
+The per-run runtime supplies the source, copy maker, rescue, and configuration modules.
+The runner retains the numbered copy lock through command execution.
+Runtime ABI 2 requires an image that probes the numbered copy lock.
 
 ## Hana result transport
 
@@ -1681,7 +1758,7 @@ An interrupt during completion reporting can change the exit status, so the call
 ## Hana runtime per run
 
 The sender packages its runner files and the full or delta Git bundle in one uncompressed archive.
-`scripts/aws_target/hana_render.files` lists the Python files for the run.
+`scripts/aws_target/hana_runtime.files` lists the Python files for the run.
 The archive also holds the runner entry point, resolved config, and the runtime ABI marker.
 The existing conditional PUT sends the archive once.
 The signed GET and SHA-256 cover the entire archive.
@@ -1697,6 +1774,7 @@ The image bootstrap verifies the payload and its ABI inside the unprivileged com
 It gives the runner the verified local Git bundle.
 The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
 The bootstrap applies the image's approved roots, slot capacity, and probe timing.
+It uses the command's runtime workspace for `TMPDIR`.
 The runner uses the image's command timeout.
 The runner sends the reason for an expected refusal.
 If an exception escapes the runner, the entry point sends a refusal that names the exception class.

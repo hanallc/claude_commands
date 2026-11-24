@@ -12,16 +12,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.agents import shutdown
+from scripts.accounts import moves
 from scripts.production import unit_lookup as script_unit_lookup
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, build_folders
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import unit_membership
+from scripts.worktree import worktrees
 
 
 def setUpModule() -> None:
@@ -30,11 +33,11 @@ def setUpModule() -> None:
 
 class AddUnitRerunTests(AddUnitTestCase):
     def dead_pending_resume(self) -> tuple[add_unit.RequestedUnitLaunch, Path]:
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         owner = self.prepare_restored_worktree("alpha", worktree)
         request = add_unit.RequestedUnitLaunch(
             production=read_production(self.production_name), requested_name="alpha", unit="alpha",
-            branch="build-followups-alpha", worktree=worktree,
+            branch="alpha-worktree", worktree=worktree,
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             session=add_unit.ResumedSession(owner.current_session, worktree), timeout=5,
@@ -127,7 +130,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         with patch.object(add_unit, "commit_unit", side_effect=interrupted):
             stopped = self.cli("alpha", "--brief", "Keep the committed brief in the unit worktree.")
         self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         config = unit_config.read(worktree)
         assert isinstance(config, unit_config.UnitConfig)
         assert isinstance(config.plan, unit_config.PlanFile)
@@ -146,6 +149,71 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(sum(command[2:4] == ["agent", "start"] for command in self.herdr_calls()), starts)
 
+    def test_retry_finishes_a_registered_unit_checkout(self) -> None:
+        arguments = ("alpha", "--plan", "docs/plans/given.md")
+        with patch.object(worktrees, "ensure_target_link", side_effect=OSError("output setup stopped")):
+            stopped = self.cli(*arguments)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("output setup stopped", stopped.stderr)
+        tree = self.unit_tree("alpha")
+        inode = tree.stat().st_ino
+        with patch.dict(os.environ, self.env):
+            record_path = worktrees.record_file(tree)
+            pending = worktrees.read_record(record_path)
+        self.assertIs(pending.stage, worktrees.MakeStage.MAKING)
+        self.assertFalse((tree / "target").is_symlink())
+
+        _ = self.successful(*arguments)
+
+        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(tree.stat().st_ino, inode)
+        self.assertIsInstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        assert isinstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        self.assertEqual((tree / "target").readlink(), pending.layout.output)
+
+    def test_retry_finishes_an_empty_pending_unit_checkout(self) -> None:
+        tree = self.unit_tree("alpha")
+        arguments = ("alpha", "--plan", "docs/plans/given.md")
+
+        def stop_before_git(request: build_folders.LinkedEditableRepository) -> None:
+            self.assertEqual(request.path, tree)
+            tree.mkdir(parents=True)
+            raise OSError("checkout stopped before Git")
+
+        with patch.object(build_folders, "create_build_folder", side_effect=stop_before_git):
+            stopped = self.cli(*arguments)
+        self.assertEqual(stopped.returncode, 1, stopped.stderr)
+        self.assertIn("checkout stopped before Git", stopped.stderr)
+        inode = tree.stat().st_ino
+        with patch.dict(os.environ, self.env):
+            record_path = worktrees.record_file(tree)
+        self.assertIs(worktrees.read_record(record_path).stage, worktrees.MakeStage.MAKING)
+        self.assertEqual(list(tree.iterdir()), [])
+
+        _ = self.successful(*arguments)
+
+        self.assertEqual(tree.stat().st_ino, inode)
+        self.assertIs(worktrees.read_record(record_path).stage, worktrees.MakeStage.DONE)
+        self.assertIn("/unit:direct", self.opening_prompt())
+
+    def test_launch_refreshes_the_record_of_an_existing_unit_checkout(self) -> None:
+        tree = self.unit_tree("alpha")
+        branch = "alpha-worktree"
+        _ = self.git("worktree", "add", "-b", branch, str(tree), "build-followups")
+        base = self.git("rev-parse", branch)
+        legacy = worktrees.new_record(tree, branch, self.checkout, base, "old-owner", "")
+        with patch.dict(os.environ, self.env):
+            worktrees.write_record(legacy)
+            record_path = worktrees.record_file(tree)
+            expected = worktrees.output_record("origin", "alpha", "worktree")
+
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+
+        self.assertEqual(worktrees.read_record(record_path),
+                         replace(legacy, owner="alpha", merge_branch="build-followups", layout=expected))
+        self.assertEqual((tree / "target").readlink(), expected.output)
+        self.assertIn("/unit:direct", self.opening_prompt())
+
     def test_retry_after_config_publication_reuses_the_row_file_and_launch(self) -> None:
         publish = unit_config.write
 
@@ -159,7 +227,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
         self.assertEqual(staff.find(kind="unit"), [])
-        path = self.root / "project-alpha/.unit.toml"
+        path = self.unit_tree("alpha") / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
         submitted: list[str] = []
@@ -199,13 +267,17 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
-        unit = shutdown.RetiredUnitRecovery(read_production(self.production_name), "alpha", self.root / "project-alpha",
+        unit = shutdown.RetiredUnitRecovery(read_production(self.production_name), "alpha", self.unit_tree("alpha"),
             "alpha", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766")
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 
         def run_resume(argv: list[str]) -> subprocess.CompletedProcess[str]:
-            return self.cli(*argv[4:])
+            self.prepare_herdr_launch(*(argument for argument in argv[4:] if argument != "--join-recovery-locks"))
+            arguments = argv[2:]
+            lock_environment = {name: value for name, value in os.environ.items() if name.startswith("STAFF_ROW_FD_")}
+            return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments, self.env | lock_environment,
+                              self.checkout, production_state=True)
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
               patch.object(unit_lookup, "labeled_session", return_value=marked),
@@ -213,6 +285,7 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(shutdown, "retirement_run", side_effect=run_resume),
+              staff.session_operation(unit.session_id, native_key=moves.native_row_key(unit.session_id)),
               redirect_stdout(output)):
             shutdown.recovery_launch(unit)
         self.assertIn("alpha started:", output.getvalue())

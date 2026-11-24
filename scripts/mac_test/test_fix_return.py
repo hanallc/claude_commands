@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 import fcntl
+from importlib import reload
 import io
 import json
 import os
@@ -18,7 +19,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.lib import berth_board, build_folders
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
 from scripts.lib import test_hang_guard
@@ -149,7 +150,7 @@ class ReturnFixTests(unittest.TestCase):
 
     def return_fix(self, sent: offload.TreeKey) -> fix_return.FixResult:
         config = eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
+            enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10, UNREACHABLE_WAIT_FIXTURE_SECONDS), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=1, default_target_budget_gib="24", values={},
         )
         request = offload.OffloadRequest(
@@ -636,6 +637,50 @@ class LocalCopyTests(unittest.TestCase):
         status = fix_return.main(["drop-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)])
         self.assertEqual(status, 0)
         self.assertFalse(made.folder.exists())
+
+    def assert_return_after_reload_keeps_copy(self, *, with_allocation_id: bool,
+                                              with_recorded_id: bool = True) -> None:
+        made = self.copy()
+        relative = "ws/src/held.rs"
+        fixed = "fn held() { repaired }\n"
+        _ = (made.tree / relative).write_text(fixed)
+        if not with_recorded_id:
+            (made.folder / fix_return.ALLOCATION_NAME).unlink()
+        arguments = ["return-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)]
+        if with_allocation_id:
+            arguments.extend(("--allocation-id", made.allocation_id))
+        _ = reload(fix_return)
+        with patch.object(fix_return, "read_board", self.read), redirect_stderr(io.StringIO()) as report:
+            status = fix_return.main(arguments)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.text(relative), fixed)
+        self.assertEqual((made.tree / relative).read_text(), fixed)
+        self.assertEqual(report.getvalue(),
+                         f"kept for a manual removal list: {made.folder} (fix_return, the lint copy return ended)\n")
+
+    def test_return_without_id_after_reload_writes_changes_and_keeps_copy(self) -> None:
+        self.assert_return_after_reload_keeps_copy(with_allocation_id=False)
+
+    def test_return_with_id_after_reload_writes_changes_and_keeps_copy(self) -> None:
+        self.assert_return_after_reload_keeps_copy(with_allocation_id=True)
+
+    def test_return_without_id_accepts_a_copy_with_no_recorded_id(self) -> None:
+        self.assert_return_after_reload_keeps_copy(with_allocation_id=False, with_recorded_id=False)
+
+    def test_return_with_id_refuses_a_copy_with_no_recorded_id(self) -> None:
+        made = self.copy()
+        relative = "ws/src/held.rs"
+        original = self.text(relative)
+        fixed = "fn held() { repaired }\n"
+        _ = (made.tree / relative).write_text(fixed)
+        (made.folder / fix_return.ALLOCATION_NAME).unlink()
+        with patch.object(fix_return, "read_board", self.read), redirect_stderr(io.StringIO()) as report:
+            status = fix_return.main(["return-copy", "--repo-root", str(self.worktree), "--folder",
+                                      str(made.folder), "--allocation-id", made.allocation_id])
+        self.assertEqual(status, 1)
+        self.assertEqual(self.text(relative), original)
+        self.assertEqual((made.tree / relative).read_text(), fixed)
+        self.assertIn("the lint fix pass wrote no file: the lint copy allocation differs.", report.getvalue())
 
     def test_drop_keeps_a_folder_that_replaced_its_own_copy(self) -> None:
         made = self.copy()

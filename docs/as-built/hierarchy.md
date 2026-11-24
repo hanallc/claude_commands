@@ -74,7 +74,7 @@ The roster, unit board, staff display, and cleanup consumers use this evidence.
 
 Unknown evidence retains its reason. Unrelated process diagnostics do not refuse a staff write about another member.
 The target's own live identity still refuses retirement. Unavailable peer evidence also retains the target.
-`unit_runs.report_anomaly` prints each repeated run anomaly once per process.
+`unit_runs.report_anomaly` prints each repeated run anomaly once per command. A `ContextVar` holds the printed messages, and verify_helper.py runs each command in a new context copy.
 A shared read through `worker_lifecycle.locked_state` creates no missing state folder.
 
 ### Assignment and result flow
@@ -213,7 +213,12 @@ A cleanup failure prints its step and returns nonzero.
 The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
 
-Workers create private work folders with `scratch.py new --worker [--name <word>]`.
+The director creates a model worktree for a parallel phase or trial project.
+The director runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after the checkpoint reaches origin.
+The director sends the reported paths to the showrunner as a removal list.
+Workers use numbered copies for tests and proofs that need source copies.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+Workers use `scratch.py new --worker [--name <word>]` only for downloads and files unrelated to builds, tests, gates, or source copies.
 Names have the form `<showrunner>-<unit>-<worker>-<suffix>[-<word>]` under `TMPDIR`.
 `scratch.worker_task(staff_id) -> str` names their shared task.
 `scratch.end(task)` removes folders for that exact task and permits retries.

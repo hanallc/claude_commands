@@ -20,7 +20,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from inspect import currentframe
+from inspect import currentframe, getsource
 from pathlib import Path
 import resource
 import select
@@ -33,7 +33,10 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, checkout_root, gate_parent
+
 if TYPE_CHECKING:
+    from scripts.lib.testing_folders import PreparedTestRunsParent
     from scripts.test_times.gate_record import TestStatus, TestTime
 
 
@@ -201,6 +204,127 @@ class RepositoryReadAudit:
         except (OSError, ValueError):
             # Observation cannot change a test's result.
             return
+
+
+def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> None:
+    """Reject Python writes to the live config and record the first attempt."""
+    canonical = os.path.realpath
+
+    def entry_path(path: str) -> str:
+        parent, name = os.path.split(path.rstrip(os.sep) or os.sep)
+        return os.path.normpath(os.path.join(canonical(parent), name))
+
+    roots = (entry_path(folder), canonical(folder))
+    prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
+    reported = False
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def descriptor_path(descriptor: int) -> str:
+        if sys.platform == "darwin":
+            # macOS uses command 50 for F_GETPATH.
+            raw = fcntl.fcntl(descriptor, 50, bytes(1024)).split(b"\0", 1)[0]
+            return os.fsdecode(raw)
+        return os.readlink(f"/proc/self/fd/{descriptor}")
+
+    def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
+        nonlocal reported
+        try:
+            if isinstance(value, int):
+                path = descriptor_path(value)
+            elif isinstance(value, (str, bytes)):
+                path = os.fsdecode(value)
+                if not os.path.isabs(path) and isinstance(directory_fd, int) and directory_fd >= 0:
+                    path = os.path.join(descriptor_path(directory_fd), path)
+            else:
+                return
+            absolute = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+            resolved = canonical(absolute) if follow_entry else entry_path(absolute)
+        except (OSError, ValueError):
+            return
+        if resolved in roots or resolved.startswith(prefixes):
+            if not os.path.isfile(startup_hook):
+                return
+            if not reported:
+                try:
+                    with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
+                        _ = log.write(f"{absolute}\n")
+                except FileNotFoundError:
+                    if not os.path.isfile(startup_hook):
+                        return
+                    raise
+                reported = True
+            raise AssertionError(f"Test attempted to write live configuration at {absolute}")
+
+    def check_entry(value: object, directory_fd: object = -1) -> None:
+        check(value, directory_fd, follow_entry=False)
+
+    def audit(event: str, arguments: tuple[object, ...]) -> None:
+        if event == "open":
+            path, _, flags = arguments
+            # The event omits dir_fd. The working directory may be wrong.
+            if isinstance(flags, int) and flags & write_flags and isinstance(path, (str, bytes)) and os.path.isabs(path):
+                exclusive = flags & os.O_CREAT and flags & os.O_EXCL
+                check(path, follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
+        elif event in {"os.rename", "os.link"}:
+            check_entry(arguments[0], arguments[2])
+            check_entry(arguments[1], arguments[3])
+        elif event == "os.symlink":
+            check_entry(arguments[1], arguments[2])
+        elif event in {"os.mkdir", "os.remove", "os.rmdir", "shutil.rmtree", "os.chmod", "os.chown", "os.utime"}:
+            check_entry(arguments[0], arguments[-1])
+        elif event in {"os.setxattr", "os.removexattr"}:
+            check_entry(arguments[0])
+        elif event == "os.truncate":
+            check(arguments[0], follow_entry=True)
+
+    sys.addaudithook(audit)
+
+
+@contextmanager
+def guard_live_config(folder: Path, startup_folder: Path, violation_log: Path) -> Generator[None]:
+    """Use the same guard in the runner and its Python child processes."""
+    folder = folder.absolute()
+    violation_log = violation_log.absolute()
+    hook = startup_folder.absolute() / "sitecustomize.py"
+    _ = hook.write_text(
+        """from __future__ import annotations
+import fcntl
+import os
+import sys
+from importlib.machinery import PathFinder
+from importlib.util import module_from_spec
+
+""" + getsource(install_live_config_guard)
+        + f"\ninstall_live_config_guard({str(folder)!r}, {str(violation_log)!r}, __file__)\n"
+        + """
+# Keep the primary hook registered while the next hook runs.
+directory = os.path.realpath(os.path.dirname(__file__))
+search = iter(sys.path)
+for entry in search:
+    if os.path.realpath(entry) == directory:
+        break
+spec = PathFinder.find_spec("sitecustomize", list(search))
+if spec is not None and spec.loader is not None:
+    module = module_from_spec(spec)
+    if __file__ == sys.modules["sitecustomize"].__file__:
+        sys.modules["sitecustomize"] = module
+    spec.loader.exec_module(module)
+""", encoding="utf-8")
+    previous = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (str(hook.parent) if previous is None
+                                else os.pathsep.join((str(hook.parent), previous)))
+    install_live_config_guard(str(folder), str(violation_log), str(hook))
+    try:
+        yield
+    finally:
+        if previous is None:
+            _ = os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous
+        hook.unlink(missing_ok=True)
+        if violation_log.exists():
+            with violation_log.open(encoding="utf-8") as log:
+                raise AssertionError(f"Test attempted to write live configuration at {log.readline().rstrip()}")
 
 
 @dataclass(frozen=True)
@@ -513,7 +637,67 @@ class TimedRunner(unittest.TextTestRunner):
         return result
 
 
-def main(run_root: Path) -> None:
+@dataclass(frozen=True)
+class GateModuleLease:
+    root: Path
+
+
+@dataclass(frozen=True)
+class UnleasedGateJob:
+    """A gate job without a module lease. The runner keeps its folder leases in the gate's TMPDIR."""
+
+
+@dataclass(frozen=True)
+class DirectModuleRun:
+    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout.
+
+    A checkout without a modeled output uses `$TMPDIR/test-runs` instead.
+    """
+    parent: PreparedTestRunsParent
+
+
+RunnerFolderOwner = GateModuleLease | UnleasedGateJob | DirectModuleRun
+
+
+def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
+    if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
+        return GateModuleLease(Path(root))
+    if not isinstance(gate_parent(), UnverifiedGateParent):
+        return UnleasedGateJob()
+    from scripts.lib import git_files
+    from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
+
+    try:
+        checkout = git_files.locate(start_dir).toplevel
+    except git_files.GitFilesError:
+        checkout = Path(checkout_root(str(start_dir)) or start_dir)
+    parent = prepare_test_runs_parent(checkout)
+    use_test_runs_parent(parent)
+    return DirectModuleRun(parent)
+
+
+@contextmanager
+def runner_folder(owner: RunnerFolderOwner, name: str) -> Generator[Path]:
+    if isinstance(owner, GateModuleLease):
+        folder = owner.root / name
+        folder.mkdir(mode=0o700)
+        # The gate removes the module folder after it reaps the module's processes.
+        yield folder
+    elif isinstance(owner, DirectModuleRun):
+        from scripts.lib import build_folders
+
+        request = build_folders.UniqueBuildFolder(f"{name}-", build_folders.ExplicitBuildParent(owner.parent))
+        with build_folders.temporary_build_folder(request) as folder:
+            yield folder
+    else:
+        from scripts.lib import build_folders
+
+        with build_folders.tool_folder(name) as folder:
+            yield folder
+
+
+def main(owner: RunnerFolderOwner, run_root: Path) -> None:
+    violation_log = (owner.root if isinstance(owner, GateModuleLease) else run_root) / "live-config-writes"
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -521,19 +705,19 @@ def main(run_root: Path) -> None:
 
         if find_spec("scripts.lib.conf_reads") is not None:
             raise
-        run_module(NoConfigReadLog())
+        run_module(NoConfigReadLog(), run_root, violation_log)
         return
 
-    log = run_root / "config-reads" / "reads"
-    _ = log.write_text("")
-    with conf_reads.record_reads(log):
-        run_module(log)
+    with ExitStack() as cleanup:
+        temporary = (owner.root / "config-reads" if isinstance(owner, GateModuleLease)
+                     else cleanup.enter_context(runner_folder(owner, "config-reads")))
+        log = temporary / "reads"
+        log.touch()
+        with conf_reads.record_reads(log):
+            run_module(log, run_root, violation_log)
 
 
-def run_module(config_log: Path | NoConfigReadLog) -> None:
-    if len(sys.argv) != 3:
-        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
-        sys.exit(2)
+def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log: Path) -> None:
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
@@ -548,13 +732,15 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
-        if isinstance(TimedRunner.destination, TimesOutput):
-            TimedRunner.scanned_folders = set()
-            TimedRunner.read_contents = set()
-            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
-                                                TimedRunner.read_contents))
-        suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-        result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
+        # The guard reads this file, so the read audit starts after it.
+        with guard_live_config(Path.home() / ".claude" / "config", run_root, violation_log):
+            if isinstance(TimedRunner.destination, TimesOutput):
+                TimedRunner.scanned_folders = set()
+                TimedRunner.read_contents = set()
+                sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                    TimedRunner.read_contents))
+            suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+            result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
     except SystemExit:
         if "scripts.message.session_send_test_support" in sys.modules:
@@ -567,8 +753,8 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots() -> Generator[tuple[Path, Callable[[], None]]]:
-    """Keep one private folder until the runner finishes its children."""
+def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
+    """Keep the private run root until the runner reaps its processes."""
     from scripts.lib import build_folders
 
     names = ("TMPDIR", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR",
@@ -576,20 +762,22 @@ def private_run_roots() -> Generator[tuple[Path, Callable[[], None]]]:
     previous = {name: os.environ[name] for name in names if name in os.environ}
     previous_tempdir = tempfile.tempdir
     with ExitStack() as cleanup:
+        _ = os.environ.pop(build_folders.PRIVATE_RUN_ROOT, None)
+        _ = os.environ.pop(build_folders.SUPERVISED_RUN_ROOT, None)
         try:
-            _ = os.environ.pop(build_folders.SUPERVISED_RUN_ROOT, None)
-            if os.environ.get("MERGE_GATE_PARENT_PID") == str(os.getppid()):
-                root = Path(os.environ["TMPDIR"]).resolve(strict=True)
+            root = cleanup.enter_context(runner_folder(owner, "test-run-roots")).resolve()
+            if isinstance(owner, GateModuleLease):
+                _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
+                temporary = owner.root
+            elif isinstance(owner, UnleasedGateJob):
+                temporary = Path(os.environ.get("TMPDIR", str(root)))
             else:
-                root = cleanup.enter_context(build_folders.temporary_build_folder(
-                    build_folders.UniqueBuildFolder("tr-", build_folders.ExplicitBuildParent(
-                        build_folders.tmpfs_temporary_parent())))).resolve()
-            (root / "config-reads").mkdir(exist_ok=True)
-            os.environ.update(TMPDIR=str(root), SCRATCH_ROOT=str(root / "scratch"),
+                temporary = root
+            os.environ.update(TMPDIR=str(temporary), SCRATCH_ROOT=str(root / "scratch"),
                               ASTRA_REVIEW_DIR=str(root / "astra"))
-            os.environ[build_folders.PRIVATE_RUN_ROOT] = str(root)
+            os.environ[build_folders.PRIVATE_RUN_ROOT] = str(temporary)
             tempfile.tempdir = None
-            yield root, cleanup.close
+            yield root
         finally:
             tempfile.tempdir = previous_tempdir
             for name in names:
@@ -597,15 +785,16 @@ def private_run_roots() -> Generator[tuple[Path, Callable[[], None]]]:
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], None]) -> None:
+def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
-    from scripts.lib.build_folders import SUPERVISED_RUN_ROOT
+    from scripts.lib.build_folders import PRIVATE_RUN_ROOT, SUPERVISED_RUN_ROOT
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main(run_root)
+        main(owner, cleanup.enter_context(private_run_roots(owner)))
         return
+    parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -618,12 +807,12 @@ def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], 
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    parent = os.environ.pop("MERGE_GATE_PARENT_PID", "")
-    if parent:
+    if not isinstance(parent, UnverifiedGateParent):
         # No test child exists before the parent-death handoff completes.
-        parent_fds.append(os.pidfd_open(int(parent)))
+        parent_fds.append(os.pidfd_open(int(parent.pid)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
+    run_root = cleanup.enter_context(private_run_roots(owner))
     usage = resource.getrusage(resource.RUSAGE_SELF)
     supervisor = os.getpid()
     test_pid = os.fork()
@@ -637,8 +826,8 @@ def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], 
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        os.environ[SUPERVISED_RUN_ROOT] = str(run_root)
-        main(run_root)
+        os.environ[SUPERVISED_RUN_ROOT] = os.environ[PRIVATE_RUN_ROOT]
+        main(owner, run_root)
         return
     status = 0
     received = 0
@@ -682,9 +871,9 @@ def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], 
         for descriptor in [signal_fd, test_fd, *parent_fds]:
             os.close(descriptor)
     exit_code = os.waitstatus_to_exitcode(status)
+    cleanup.close()
     if received or exit_code < 0:
         number = received or -exit_code
-        cleanup_run_roots()
         if number not in (signal.SIGKILL, signal.SIGSTOP):
             _ = signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
@@ -694,5 +883,9 @@ def run_with_descendant_cleanup(run_root: Path, cleanup_run_roots: Callable[[], 
 
 
 if __name__ == "__main__":
-    with private_run_roots() as (run_root, cleanup_run_roots):
-        run_with_descendant_cleanup(run_root, cleanup_run_roots)
+    if len(sys.argv) != 3:
+        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
+        sys.exit(2)
+    folder_owner = runner_folder_owner(Path(sys.argv[1]).resolve())
+    with ExitStack() as runner_cleanup:
+        run_with_descendant_cleanup(folder_owner, runner_cleanup)

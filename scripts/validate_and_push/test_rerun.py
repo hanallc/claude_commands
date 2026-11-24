@@ -1,14 +1,96 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
+import sys
+import tempfile
+from typing import cast
+import unittest
+from unittest.mock import patch
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
+class ValidationFixtureTests(unittest.TestCase):
+    def test_the_repository_fixture_uses_a_private_cache(self) -> None:
+        caller_cache = self.enterContext(tempfile.TemporaryDirectory())
+        fixture = ScriptRepositoryTestCase()
+        self.addCleanup(fixture.doCleanups)
+        with patch.dict(os.environ, XDG_CACHE_HOME=caller_cache):
+            fixture.setUp()
+
+        self.assertEqual(fixture.environment["XDG_CACHE_HOME"], str(fixture.home / ".cache"))
+
+
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    def test_dispatch_and_poll_report_the_run_or_error(self) -> None:
+        self.seed()
+        _ = self.git("switch", "-c", "ci-delay")
+        _ = self.git("push", "origin", "ci-delay")
+        published = self.git("rev-parse", "HEAD").stdout.strip()
+        repo = "github.com/example/example"
+        self.environment.update(CI_PUSH_ORIGIN=str(self.remote), CI_PUSH_REPO=repo, CANCEL_PRIOR="false")
+        calls = self.root / "gh-calls"
+        lookup_error = self.root / "lookup-error"
+        listings = self.root / "poll-runs.json"
+        _ = self.stub("gh", f'''import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path({str(calls)!r}).open("a") as log:
+    log.write(json.dumps(args[:2]) + "\\n")
+if args[:2] == ["workflow", "run"]:
+    print("Dispatch was refused", file=sys.stderr)
+    raise SystemExit(9)
+if args[:2] != ["run", "list"]:
+    raise SystemExit("Unexpected gh command")
+if Path({str(lookup_error)!r}).exists():
+    print("Could not list runs", file=sys.stderr)
+    raise SystemExit(8)
+print(Path({str(listings)!r}).read_text())
+''')
+        _ = self.stub("sleep", 'raise SystemExit("No eligible run in the first poll")\n')
+        created_at = "2026-10-30T00:01:00Z"
+        at_bound = (123, "queued", "")
+        queued = (124, "queued", "")
+        failed = (125, "completed", "failure")
+        dispatch_args = ("--dispatch-published", published, "ci.yml")
+        follow_args = ("--follow-published", published, "pushed", "ci.yml", "workflow_dispatch")
+        poll_args = (*follow_args, f"dispatched 123 {created_at}")
+        list_call = '["run", "list"]'
+
+        for outcome, args, runs, exit_code, message, gh_calls in (
+            ("lookup error", dispatch_args, (), 8, "Could not list runs", [list_call]),
+            ("poll error", (*follow_args, "dispatched 0"), (), 8, "Could not list runs", [list_call]),
+            ("refused", dispatch_args, (), 9, "Dispatch was refused", [list_call, '["workflow", "run"]']),
+            ("queued and failed", poll_args, (at_bound, queued, failed), 0, "run_id:  124", [list_call]),
+            ("failed before first poll", poll_args, (at_bound, failed), 1,
+             f"CI run 125 completed with failure (https://{repo}/actions/runs/125)", [list_call]),
+            ("moved", dispatch_args, (), 1, f"origin/ci-delay moved before dispatch of {published}", [list_call]),
+        ):
+            with self.subTest(outcome=outcome):
+                if outcome in ("lookup error", "poll error"):
+                    lookup_error.touch()
+                else:
+                    lookup_error.unlink(missing_ok=True)
+                if outcome == "moved":
+                    _ = self.git("commit", "--allow-empty", "-m", "Advance the published branch")
+                    _ = self.git("push", "origin", "ci-delay")
+                _ = calls.write_text("")
+                _ = self.write(listings, json.dumps([
+                    {"databaseId": run_id, "status": status, "conclusion": conclusion,
+                     "createdAt": created_at, "headSha": published}
+                    for run_id, status, conclusion in runs
+                ]))
+
+                result = self.script("validate_and_push/push_direct.sh", *args)
+
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr if exit_code else result.stdout)
+                self.assertEqual(calls.read_text().splitlines(), gh_calls)
+
     def install_gh(self) -> None:
         _ = self.stub("gh", '''import subprocess, sys
 args = sys.argv[1:]
@@ -44,6 +126,56 @@ if sys.argv[1] == "fmt":
         _ = shutil.copy2(lint, target)
         _ = self.stub("taplo", "pass\n")
         self.environment["VALIDATE_QUICK"] = "1"
+
+    @unittest.skipUnless(sys.platform == "linux", "requires a Linux process start")
+    def test_full_validation_shares_one_run_place_with_local_ci(self) -> None:
+        calls = self.root / "ci-steps"
+        record = f'''import json, os, sys
+from pathlib import Path
+sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
+from scripts.lib.process_start import Started, proc_table_start
+
+owner = os.getppid()
+start = proc_table_start(owner, Path("/proc"))
+if not isinstance(start, Started):
+    raise SystemExit("Cannot read the parent process start")
+parent_run = f"{{owner}}:{{start.start}}"
+with Path({str(calls)!r}).open("a") as log:
+    log.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:], parent_run,
+                          os.environ.get("BUILDLOG_RUN", "")]) + "\\n")
+'''
+        lint = self.stub("lint", record)
+        installed = self.home / ".claude/scripts/lint/lint"
+        installed.parent.mkdir(parents=True)
+        _ = shutil.copy2(lint, installed)
+        _ = self.stub("taplo", record)
+        _ = self.stub("record-ci-step", record)
+        target = "x86_64-pc-windows-gnu"
+        _ = self.stub("rustup", f"print({target!r})\n")
+        _ = self.write(self.repo / ".claude/config/cross_targets", target + "\n")
+        _ = self.write(self.repo / ".claude/config/local_ci.sh", "record-ci-step first\nrecord-ci-step second\n")
+        self.seed()
+        _ = self.environment.pop("BUILDLOG_RUN", None)
+        _ = self.environment.pop("VERIFY_PROC_ROOT", None)
+
+        result = self.script("validate_and_push/validate_ci.sh")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [cast(tuple[str, list[str], str, str], json.loads(line)) for line in calls.read_text().splitlines()]
+        self.assertEqual([(tool, args) for tool, args, _, _ in rows], [
+            ("lint", ["mend", "--workspace", "--fix"]),
+            ("lint", ["fmt"]),
+            ("taplo", ["fmt"]),
+            ("lint", ["clippy", "--workspace", "--all-features"]),
+            ("lint", ["clippy", "--workspace", "--all-features", "--target", target]),
+            ("lint", ["doc", "--workspace", "--all-features"]),
+            ("lint", ["nextest", "--workspace", "--all-features", "--tests"]),
+            ("lint", ["mend", "--workspace", "--fail-on-warn"]),
+            ("record-ci-step", ["first"]),
+            ("record-ci-step", ["second"]),
+        ])
+        _, _, validation_run, _ = rows[0]
+        self.assertEqual({step_run for _, _, _, step_run in rows}, {validation_run})
 
     def test_a_synced_default_branch_retries_its_failed_post_push_hook(self) -> None:
         hook = '''#!/usr/bin/env bash

@@ -18,8 +18,7 @@ from scripts.lib import conf
 LINUX_PRIVATE_PATHS = tuple(Path(name) for name in ("/home", "/tmp", "/build", "/session", "/dev/shm", "/var/tmp"))
 LINUX_CHECKOUT = Path("/home/removal-source")
 MAC_BACKEND = Path("/usr/bin/sandbox-exec")
-CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_state_dir",
-                              "visible_root", "holds_file"))
+CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_state_dir", "holds_file"))
 ROOT_CONFIGS = ("build_folders.conf", "lint.conf", "mac_test.conf", "scratch.conf")
 
 
@@ -141,9 +140,11 @@ class RemovalSandbox:
                     line = f"{key}={private}"
                 lines.append(line)
             if name == "build_folders.conf":
-                forms = next(setting.value for key, setting in conf.settings(source).items()
-                             if key.startswith("removal.forms.") and setting.value.startswith("~/build/"))
-                lines.append(f"removal.forms={forms}")
+                templates = next(
+                    setting.value for key, setting in conf.settings(source).items()
+                    if key.startswith("removal.path_templates.") and setting.value.startswith("~/build/")
+                )
+                lines.append(f"removal.path_templates={templates}")
             _ = path.write_text("\n".join(lines) + "\n")
         fixture_bin = self.fixture / "bin"
         fixture_bin.mkdir()

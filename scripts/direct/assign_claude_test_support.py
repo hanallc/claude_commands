@@ -6,6 +6,7 @@ from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
 from scripts.lib.fork_test_support import ForkChildren
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import isolated_staff_file
 
@@ -29,6 +30,7 @@ from typing import ClassVar, TextIO, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -67,7 +69,7 @@ def direct_launcher_helpers() -> Generator[None]:
 
     def fixture_command(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
         if len(command) < 2 or Path(command[1]).name not in {
-                "progress_history.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
+                "progress_history.py", "pass_record.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
             return real_run(command, **options)
         script = command[1]
         module = ModuleType("launcher_helper")
@@ -121,6 +123,7 @@ if sys.argv[1] == '--bg':
     if os.environ.get('TEST_WORKER_STARTED'):
         pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
+    (root / 'launch_cwd.txt').write_text(str(pathlib.Path.cwd()))
     (root / 'launch_environment.json').write_text(json.dumps({
         key: os.environ.get(key, '')
         for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_REMOTE_MEMORY_DIR')
@@ -225,6 +228,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
     assign_script: Path = Path()
+    model_environment: dict[str, str] = {}
     direct_cli_calls: ClassVar[bool] = False
     completed_setups: ClassVar[dict[str, CompletedLauncherSetup]] = {}
 
@@ -270,39 +274,47 @@ class AssignClaudeLauncherFixture(LauncherFixture):
     @cached_property
     def staff_parent(self) -> str:
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        with isolated_staff_file(self.root / "staff.json", {}):
+
+        root = self.root.resolve()
+        isolate_fixture_git(self, root)
+        self.model_environment = model_worktree_environment(root, root)
+        main = root / "rust" / "project"
+        main.parent.mkdir()
+        _ = self.working_dir.rename(main)
+        with patch.dict(os.environ, self.model_environment), isolated_staff_file(root / "staff.json", {}):
+            self.working_dir: Path = make_fixture_worktree(main, "fixture", "project")
+            # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
+            with patch.dict(os.environ, config_environment(self.root)):
+                _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
+                    unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
             parent = unit_membership("fixture", "fixture")
-            from scripts.production import staff
             parent = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=parent.worktree)
         return parent.id
 
     @override
     def prepare_fixture(self) -> None:
-        self.prepare_project(
-            "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
-            (
-                "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
-                "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
-                "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3",
-                "# whole: 2..", "STALLED_ROUNDS=3",
-                "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
-                "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
-                "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
-                "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
-            ), CLAUDE_REGISTRY,
-        )
-        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
-        _ = config_environment(self.root)
-        _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
-            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
+        environment = {**fixture_git_environment(self.root), "HOME": str(self.root), "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True):
+            self.prepare_project(
+                "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
+                (
+                    "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                    "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
+                    "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
+                    "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                    "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3",
+                    "# whole: 2..", "STALLED_ROUNDS=3",
+                    "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
+                    "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
+                    "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
+                    "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
+                ), CLAUDE_REGISTRY,
+            )
+            _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+            # The worktree model and a phase launch need HEAD; the base commit is empty.
+            _ = commit_repository(self.working_dir, "base", allow_empty=True)
         (self.root / "codex").symlink_to(sys.executable)
         _ = (self.root / "paths").write_text("src/\n")
-        # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
-        _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
-                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
-                            "-m", "base"], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
@@ -350,13 +362,14 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         child_source = "\n".join((
             "assign.SCRIPTS = assign_claude.SCRIPTS = Path(__file__).resolve().parent",
             "assign.PYTHON = assign_claude.PYTHON = str(assign.SCRIPTS.parent / 'lib/py')",
+            "assign.PASS_RECORD = str(assign.SCRIPTS / 'pass_record.py')",
             "args = assign.parse_arguments()",
             "env = dict(os.environ)",
             "cwd, prompt = Path(args.cwd).resolve(), Path(args.prompt).resolve()",
             "run, phase = assign.prepare_run(args, cwd, prompt, env)",
             "role = 'impl' if args.role == 'implement' else args.role",
             "model = assign.resolve_model(args, role, env)",
-            "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
+            "check = assign.call([assign.PYTHON, assign.PASS_RECORD, 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
             "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
             "slot = args.to or args.new_worker or role",
             "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
@@ -385,12 +398,13 @@ class AssignClaudeLauncherFixture(LauncherFixture):
 
     @override
     def environment(self) -> dict[str, str]:
-        environment = launcher_environment(self.root)
+        parent = self.staff_parent
+        environment = {**launcher_environment(self.root), **self.model_environment}
         environment["CLAUDE_BIN"] = str(self.root / "claude-bin")
         environment["STUB_CLAUDE_ROOT"] = str(self.root)
         environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
         environment["STAFF_FILE"] = str(self.root / "staff.json")
-        environment["CODEX_THREAD_ID"] = self.staff_parent
+        environment["CODEX_THREAD_ID"] = parent
         _ = environment.pop("STAFF_ID", None)
         from scripts.message import sessions
         environment["FIXTURE_BACKEND_PID"] = str(os.getpid())
@@ -557,7 +571,7 @@ printf '%s\\n' '{answer}'
         """Record the status each copied helper sees before it updates its ledger."""
         direct_dir = self.root / "scripts" / "direct"
         for name, commands in (
-            ("progress_history.py", ("finish-pass",)),
+            ("pass_record.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),
         ):
             script = direct_dir / name

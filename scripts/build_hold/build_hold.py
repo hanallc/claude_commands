@@ -25,23 +25,34 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
+from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
+from scripts.build_hold.override_guard import require_hold_write as require_hold_write
 from scripts.build_hold.shared_state_defaults import (
     DEFAULT_HOLDER_DIRECTORY as DEFAULT_HOLDER_DIRECTORY,
     DEFAULT_RELEASE_DIRECTORY as DEFAULT_RELEASE_DIRECTORY,
     DEFAULT_PROC_ROOT,
+    StopStatus as StopStatus,
+    holder_directory as holder_directory,
+    read_stop_confirmation,
+    release_directory as release_directory,
+    stop_confirmation_path as stop_confirmation_path,
+    write_stop_confirmation,
 )
 from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
 from scripts.message import session_send
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -51,17 +62,37 @@ SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # Retry a failed session lookup before reporting an undelivered release notice.
 LOOKUP_TRIES = 3
 LOOKUP_RETRY_S = 1.0
+# One notice names at most this many stopped runs. Linux limits one argv string to 128 KiB.
+RELEASE_NOTICE_RUN_LIMIT = 500
 RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
                   "their memory gate orders them. No answer is needed.")
 
-DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "WorkerClosed", "DeliveryFailed"]
+DeliveryOutcome = Literal[
+    "NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "WorkerClosed", "DeliveryFailed",
+]
 DELIVERY_OUTCOMES = frozenset(cast(tuple[object, ...], get_args(DeliveryOutcome)))
+
+
+class StoppedRun(TypedDict):
+    id: str
+    label: str
+    staff_id: str
+    director_dir: str
 
 
 class ReleaseEntry(TypedDict):
     session_id: str
     name: str
     delivery: DeliveryOutcome
+    run: NotRequired[StoppedRun]
+
+
+
+
+class StopRequest(TypedDict):
+    id: str
+    entry: ReleaseEntry
+    runner_record: NotRequired[str]
 
 
 class HoldCycle(TypedDict):
@@ -71,6 +102,7 @@ class HoldCycle(TypedDict):
     recipients: dict[str, str]
     entries: list[ReleaseEntry]
     release_started_at: str
+    stop_logs: NotRequired[list[str]]
 
 
 class ReleaseRecordReadError(ValueError):
@@ -82,10 +114,17 @@ class NoCycle:
     pass
 
 
+@dataclass(frozen=True)
+class NoStaffRead:
+    """Status has not read the staff snapshot yet."""
+
+
 class CycleReleaseNotices(TypedDict):
     kind: Literal["cycle"]
     cycle_id: str
     recipients: dict[str, str]
+    runs: NotRequired[list[ReleaseEntry]]
+    stop_requests: NotRequired[list[StopRequest]]
 
 
 class BroadcastReleaseNotice(TypedDict):
@@ -130,6 +169,9 @@ class ReleaseRecordsForChange:
 class CycleNoticesToSend:
     cycle: HoldCycle
     entries: list[ReleaseEntry]
+    unresolved_stops: int
+    # Queued notices arrive when their session returns. A release does not send them again.
+    queued: list[ReleaseEntry]
 
 
 class ReleaseNoticeReadError(ReleaseRecordReadError):
@@ -404,6 +446,14 @@ class ClaimsUnreadable:
     reason: str
 
 
+class PidNamespaceRelation(Enum):
+    """Describe the process PID namespace relative to the auditor."""
+
+    SAME = auto()
+    DIFFERENT = auto()
+    UNREADABLE = auto()
+
+
 @dataclass(frozen=True)
 class AuditProcess:
     identity: ProcessIdentity
@@ -417,10 +467,16 @@ class AuditProcess:
     tty_nr: int = 0
     executable: str = ""
     desktop_app: bool = False
+    pid_namespace: PidNamespaceRelation = PidNamespaceRelation.UNREADABLE
 
 
 @dataclass(frozen=True)
 class FullBuildAudit:
+    pass
+
+
+@dataclass(frozen=True)
+class DrainBuildAudit:
     pass
 
 
@@ -430,6 +486,7 @@ class HoldBuildCandidates:
 
 
 FULL_BUILD_AUDIT = FullBuildAudit()
+DRAIN_BUILD_AUDIT = DrainBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -447,10 +504,10 @@ class AuditedBuild:
 
 
 def read_audit_processes(
-    proc_root: Path, selection: FullBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
+    proc_root: Path, selection: FullBuildAudit | DrainBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
     cgroup_root: Path = SYSTEM_CGROUP_ROOT,
 ) -> dict[int, AuditProcess]:
-    """Read the table once; an enforcer reads details only for candidates and ancestors."""
+    """Read process details for the selected audit. Only the drain reads PID namespaces."""
     processes: dict[int, AuditProcess] = {}
     desktop_pids: set[int] = set()
     if isinstance(selection, HoldBuildCandidates):
@@ -486,13 +543,19 @@ def read_audit_processes(
                                       uid, tty_nr, executable, pid in desktop_pids)
     details: set[int] = set()
     for pid, process in processes.items():
-        if (isinstance(selection, FullBuildAudit) or process.uid == selection.uid and
+        if (not isinstance(selection, HoldBuildCandidates) or process.uid == selection.uid and
                 any(name in AUDIT_COMMANDS | {"pytest", "py.test", "sccache", "bash", "sh", "dash", "zsh",
-                                             "verify.sh", "merge_gate.py", "clippy-driver", "rust-analyzer",
+                                             "verify.sh", "merge_gate.py", "gate.py", "clippy-driver", "rust-analyzer",
                                              "basedpyright", "node", "nodejs"}
                     or name.startswith("python") for name in (process.command, process.executable))):
             details.add(pid)
             details.update(parent.identity.pid for parent in audit_ancestors(process, processes))
+    auditor_namespace = None
+    if isinstance(selection, DrainBuildAudit):
+        try:
+            auditor_namespace = (proc_root / "self/ns/pid").readlink()
+        except OSError:
+            pass
     for pid in details:
         process = processes[pid]
         directory = proc_root / str(pid)
@@ -510,8 +573,16 @@ def read_audit_processes(
             cwd = str((directory / "cwd").readlink())
         except OSError:
             cwd = ""
+        pid_namespace = PidNamespaceRelation.UNREADABLE
+        if auditor_namespace is not None:
+            try:
+                namespace = (directory / "ns/pid").readlink()
+                pid_namespace = (PidNamespaceRelation.SAME if namespace == auditor_namespace
+                                 else PidNamespaceRelation.DIFFERENT)
+            except OSError:
+                pass
         in_build_scope = False
-        if isinstance(selection, FullBuildAudit):
+        if not isinstance(selection, HoldBuildCandidates):
             try:
                 in_build_scope = any("/builds.slice/" in line
                                      and "/builds.slice/builds-detached.slice/" not in line
@@ -523,7 +594,7 @@ def read_audit_processes(
             continue
         processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
                                       environment, in_build_scope, process.uid, process.tty_nr,
-                                      process.executable, process.desktop_app)
+                                      process.executable, process.desktop_app, pid_namespace=pid_namespace)
     return processes
 
 
@@ -707,10 +778,6 @@ def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = Fals
             print(line)
     except (OSError, ValueError) as error:
         print(f"Hold enforcer report unavailable: {error}")
-
-
-def holder_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / DEFAULT_HOLDER_DIRECTORY)))
 
 
 def holder_path(directory: Path, name: str) -> Path:
@@ -1090,21 +1157,6 @@ def release_hold(directory: Path, holder: Holder) -> str:
     return "released; still held by " + "; ".join(holder_text(holder, now) for holder in state.holders)
 
 
-def release_directory() -> Path:
-    explicit = os.environ.get("BUILD_HOLD_RELEASE_DIR")
-    if explicit is not None:
-        return Path(explicit)
-    if "BUILD_HOLD_DIR" not in os.environ:
-        return Path.home() / DEFAULT_RELEASE_DIRECTORY
-    holders = holder_directory().absolute()
-    return holders.with_name(holders.name + "-release")
-
-
-def require_hold_write(*directories: Path) -> None:
-    override_guard.require_shared_state_write(
-        Path(__file__), "build_hold/build_hold.py", holder_directory(), release_directory(), *directories)
-
-
 @dataclass(frozen=True)
 class ReleaseLockHeld:
     """The release lock covers these validated holder and release directories."""
@@ -1155,6 +1207,14 @@ def read_cycle() -> HoldCycle | NoCycle:
     return path if isinstance(path, NoCycle) else read_hold_cycle(path)
 
 
+def read_stopped_run(value: object) -> StoppedRun:
+    match value:
+        case {"id": str(run_id), "label": str(label), "staff_id": str(staff_id), "director_dir": str(directory)} if run_id and label:
+            return {"id": run_id, "label": label, "staff_id": staff_id, "director_dir": directory}
+        case _:
+            raise ValueError("invalid stopped run in release record")
+
+
 def read_hold_cycle(path: Path) -> HoldCycle:
     """Read current and retained cycles through the same validation boundary."""
     try:
@@ -1181,6 +1241,13 @@ def read_hold_cycle(path: Path) -> HoldCycle:
         if any(not isinstance(name, str) or not isinstance(session_id, str)
                for session_id, name in cast(dict[object, object], recipients).items()):
             raise ValueError("invalid recipients: expected string names and session IDs")
+        if "stop_logs" in cycle:
+            logs = cycle["stop_logs"]
+            if not isinstance(logs, list) or any(
+                not isinstance(name, str) or not re.fullmatch(r"hold-builds-[0-9a-f]{64}\.jsonl", name)
+                for name in cast(list[object], logs)
+            ):
+                raise ValueError("invalid hold stop logs")
         entries = cycle.get("entries")
         if not isinstance(entries, list):
             raise ValueError("invalid entries: expected list")
@@ -1206,7 +1273,10 @@ def read_hold_cycle(path: Path) -> HoldCycle:
                             else "NotAttempted")
             if delivery not in DELIVERY_OUTCOMES:
                 raise ValueError(f"invalid delivery for entry {index}")
-            normalized.append({"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)})
+            item: ReleaseEntry = {"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)}
+            if "run" in entry:
+                item["run"] = read_stopped_run(entry["run"])
+            normalized.append(item)
         cycle["entries"] = normalized
         return cast(HoldCycle, cast(object, cycle))
     except (OSError, ValueError, TypeError, KeyError) as error:
@@ -1280,6 +1350,24 @@ def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
             for key, value in cast(dict[object, object], recipients).items()
         ):
             raise ValueError("invalid release intent: recipients")
+        runs = notice_fields.get("runs", [])
+        if not isinstance(runs, list):
+            raise ValueError("invalid release intent: stopped runs")
+        for entry in cast(list[object], runs):
+            _ = read_restart_entry(entry)
+        requests = notice_fields.get("stop_requests", [])
+        if not isinstance(requests, list):
+            raise ValueError("invalid release intent: stop requests")
+        for request in cast(list[object], requests):
+            fields_by_name = cast(dict[str, object], request) if isinstance(request, dict) else {}
+            match fields_by_name:
+                case {"id": str(request_id), "entry": entry} if re.fullmatch(r"[0-9a-f]{32}", request_id):
+                    _ = read_restart_entry(entry)
+                    runner_record = fields_by_name.get("runner_record", "")
+                    if not isinstance(runner_record, str) or runner_record and not Path(runner_record).is_absolute():
+                        raise ValueError("invalid release intent: runner record path")
+                case _:
+                    raise ValueError("invalid release intent: stop request")
     elif notice_fields.get("kind") != "broadcast":
         raise ValueError("invalid release intent: notice kind")
     return cast(ReleaseIntent, cast(object, fields))
@@ -1333,14 +1421,33 @@ def first_release_entries(cycle: HoldCycle) -> dict[str, ReleaseEntry]:
     """Use the first recorded entry for each session."""
     first: dict[str, ReleaseEntry] = {}
     for entry in cycle["entries"]:
-        _ = first.setdefault(entry["session_id"], entry)
+        if "run" not in entry:
+            _ = first.setdefault(entry["session_id"], entry)
     return first
 
 
-def release_entries(cycle: HoldCycle, recipients: Mapping[str, str]) -> list[ReleaseEntry]:
+def stopped_run_entries(entries: Sequence[ReleaseEntry]) -> dict[str, ReleaseEntry]:
+    runs: dict[str, ReleaseEntry] = {}
+    for entry in entries:
+        if "run" in entry:
+            _ = runs.setdefault(entry["run"]["id"], entry)
+    return runs
+
+
+def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
+                    saved_runs: Sequence[ReleaseEntry] = ()) -> list[ReleaseEntry]:
     first = first_release_entries(cycle)
-    return [first[session_id] if session_id in first else new_entry(session_id, name)
-            for session_id, name in recipients.items()]
+    runs = stopped_run_entries([*cycle["entries"], *saved_runs])
+    owners = {entry["session_id"].removeprefix("codex:") for entry in runs.values()}
+    return [*runs.values(), *(first[session_id] if session_id in first else new_entry(session_id, name)
+                             for session_id, name in recipients.items() if session_id.removeprefix("codex:") not in owners)]
+
+
+def release_notice_pending(entry: ReleaseEntry) -> bool:
+    """A queued notice arrives later. A gone Claude session has no route later; a Codex thread can open again."""
+    delivery = entry["delivery"]
+    return (delivery in ("NotAttempted", "DeliveryFailed", "WorkerClosed")
+            or delivery == "RecipientGone" and entry["session_id"].startswith("codex:"))
 
 
 def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
@@ -1355,13 +1462,49 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
             raise ValueError("release intent does not match its hold cycle")
     except (OSError, ValueError) as error:
         raise ReleaseNoticeReadError(path, str(error)) from error
-    return CycleNoticesToSend(cycle, [entry for entry in release_entries(cycle, notices["recipients"])
-                                      if entry["delivery"] in ("NotAttempted", "DeliveryFailed")])
+    runs = list(notices.get("runs", []))
+    unresolved = 0
+    for request in notices.get("stop_requests", []):
+        match stop_request_status(request):
+            case "stopped":
+                runs.append(request["entry"])
+            case None:
+                unresolved += 1
+            case "not_stopped":
+                pass
+    entries = release_entries(cycle, notices["recipients"], runs)
+    return CycleNoticesToSend(cycle, [entry for entry in entries if release_notice_pending(entry)], unresolved,
+                              [entry for entry in entries if entry["delivery"] == "QueuedUnconfirmed"])
+
+
+def entry_name(entry: ReleaseEntry, recipients: Mapping[str, str], membership: staff.StaffSnapshot | None) -> str:
+    """Use the staff name when a staff row matches. Otherwise use the recorded name."""
+    run = entry.get("run")
+    if membership is not None:
+        row = (run_worker(entry, run, membership) if run is not None
+               else membership.by_member_reference(entry["session_id"].removeprefix("codex:")))
+        if row is not None:
+            return row.name
+    return entry["name"] if run is not None else recipients.get(entry["session_id"], entry["name"])
+
+
+def recipients_text(entries: Sequence[ReleaseEntry], recipients: Mapping[str, str],
+                    membership: staff.StaffSnapshot | None) -> str:
+    """Name each recipient session once, with the count of its stopped runs."""
+    sessions: dict[str, tuple[str, int]] = {}
+    for entry in entries:
+        name, runs = sessions.get(entry["session_id"]) or (entry_name(entry, recipients, membership), 0)
+        sessions[entry["session_id"]] = (name, runs + int("run" in entry))
+    return ", ".join(f"{name} ({runs} stopped run{'s' if runs > 1 else ''})" if runs else name
+                     for name, runs in sessions.values()) or "none"
 
 
 def pending_release_status_lines() -> list[str]:
     """Name unfinished notices without locking, migrating or changing release state."""
+    from scripts.production import staff
+
     lines: list[str] = []
+    membership: staff.StaffSnapshot | None | NoStaffRead = NoStaffRead()
     for path in pending_release_paths():
         try:
             intent = read_release_intent(path)
@@ -1369,9 +1512,19 @@ def pending_release_status_lines() -> list[str]:
                 continue
             pending = release_notices(intent)
             notices = intent["notices"]
-            unsent = (", ".join(notices["recipients"][entry["session_id"]] for entry in pending.entries) or "none"
-                      if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
-                      else "every session (broadcast)")
+            if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle":
+                if isinstance(membership, NoStaffRead):
+                    try:
+                        membership = staff.initial_snapshot()
+                    except staff.StaffUnreadable:
+                        membership = None
+                unsent = recipients_text(pending.entries, notices["recipients"], membership)
+                if pending.queued:
+                    unsent += "; queued: " + recipients_text(pending.queued, notices["recipients"], membership)
+            else:
+                unsent = "every session (broadcast)"
+            if isinstance(pending, CycleNoticesToSend) and pending.unresolved_stops:
+                unsent += f". Pending stop confirmations: {pending.unresolved_stops}"
         except (OSError, ValueError) as error:
             if isinstance(error, ReleaseNoticeReadError):
                 path = error.path
@@ -1507,7 +1660,8 @@ def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> s
         first = first_release_entries(cycle)
         for session_id, name in notices["recipients"].items():
             entry = first.get(session_id)
-            if session_id not in cycle["recipients"] and (entry is None or entry["delivery"] != "RecipientGone"):
+            if (session_id not in cycle["recipients"]
+                    and (entry is None or entry["delivery"] != "RecipientGone" or release_notice_pending(entry))):
                 cycle["recipients"][session_id] = name
                 changed = True
         for key, instants in cycle["holders"].items():
@@ -1521,6 +1675,10 @@ def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> s
         if changed:
             save_cycle(cycle)
         result = send_cycle_notices(cycle, pending.entries)
+        if pending.unresolved_stops:
+            return result + f" Pending stop confirmations: {pending.unresolved_stops}."
+        if any(release_notice_pending(entry) for entry in pending.entries):
+            return result
     complete_release_record(held, record)
     return result
 
@@ -1572,7 +1730,7 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
             if session_id:
                 cycle["recipients"][session_id] = name
                 for entry in cycle["entries"]:
-                    if entry["session_id"] == session_id:
+                    if "run" not in entry and entry["session_id"] == session_id:
                         entry["name"] = name
         save_cycle(cycle)
 
@@ -1589,10 +1747,83 @@ def register_wait(session_id: str, name: str = "") -> str:
         if isinstance(cycle, NoCycle):
             return "no hold cycle: wait for the release broadcast"
         _ = cycle["recipients"].setdefault(session_id, name or session_id)
-        if not any(entry["session_id"] == session_id for entry in cycle["entries"]):
+        if session_id not in first_release_entries(cycle):
             cycle["entries"].append(new_entry(session_id, cycle["recipients"][session_id]))
         save_cycle(cycle)
         return f"registered {session_id}; wait for release before building"
+
+
+def track_stop_log(held: ReleaseLockHeld, name: str) -> None:
+    """Track the log even when its holder leaves before the cycle ends."""
+    cycle = read_cycle_for_change(held)
+    if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+        return
+    logs = cycle.setdefault("stop_logs", [])
+    if name not in logs:
+        logs.append(name)
+        save_cycle(cycle)
+
+
+def save_stop_confirmation(held: ReleaseLockHeld, request_id: str, status: StopStatus) -> None:
+    """Save the signal outcome before the audit update."""
+    path = stop_confirmation_path(request_id)
+    held.require(path)
+    write_stop_confirmation(path, status)
+
+
+def stop_request_status(request: StopRequest) -> StopStatus | None:
+    status = read_stop_confirmation(request["id"])
+    if status is not None:
+        return status
+    runner_record = request.get("runner_record")
+    run = request["entry"].get("run")
+    if runner_record and run is not None:
+        from scripts.agents import detached_runs
+
+        if detached_runs.confirms_hold_stop(Path(runner_record), run["id"], request["id"]):
+            return "stopped"
+        # Prune can copy the confirmation and remove the record during this read.
+        return read_stop_confirmation(request["id"])
+    return None
+
+
+def read_restart_entry(value: object) -> ReleaseEntry:
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    match fields:
+        case {"session_id": str(session_id), "name": str(name), "delivery": "NotAttempted", "run": run}:
+            return {**new_entry(session_id, name), "run": read_stopped_run(run)}
+        case _:
+            raise ValueError("invalid release intent: stopped run notice")
+
+
+def collect_stop_notices(cycle: HoldCycle, notices: CycleReleaseNotices) -> None:
+    """Save confirmed notices and unresolved requests in the release intent."""
+    from scripts.buildlog import store
+
+    runs = stopped_run_entries(cycle["entries"])
+    pending: list[StopRequest] = []
+    logs = cycle.get("stop_logs", [])
+    if logs:
+        folder = store.root() / store.host_name()
+        for name in logs:
+            for row in store.locked_rows(folder / name):
+                restart, status = row.get("restart"), row.get("stop_status")
+                if row.get("kind") != "hold_build" or status not in ("stopped", "requested") or not isinstance(restart, dict):
+                    continue
+                entry = read_restart_entry(cast(dict[str, object], restart))
+                if status == "stopped":
+                    run = entry.get("run")
+                    assert run is not None
+                    _ = runs.setdefault(run["id"], entry)
+                elif isinstance(request_id := row.get("stop_request_id"), str):
+                    request: StopRequest = {"id": request_id, "entry": entry}
+                    if isinstance(runner_record := row.get("runner_record"), str):
+                        request["runner_record"] = runner_record
+                    pending.append(request)
+    if runs:
+        notices["runs"] = [{**entry, "delivery": "NotAttempted"} for entry in runs.values()]
+    if pending:
+        notices["stop_requests"] = pending
 
 
 def new_entry(session_id: str, name: str) -> ReleaseEntry:
@@ -1636,12 +1867,13 @@ ReleaseNoticeResult = ReleaseDelivered | ReleaseQueued | ReleaseWorkerClosed | R
 
 def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseNoticeResult:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    return send_release_to(entry, f"uds:{socket}", notice)
+    return send_release_to([entry], f"uds:{socket}", notice)
 
 
-def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNoticeResult:
-    """Send the same release text to a session socket or a Codex thread."""
-    notice = f"{notice} Session {entry['session_id']}."
+def send_release_to(entries: Sequence[ReleaseEntry], address: str, notice: str) -> ReleaseNoticeResult:
+    """Send the same release text to a session socket or a Codex thread. Name each session of the entries once."""
+    sessions = list(dict.fromkeys(entry["session_id"] for entry in entries))
+    notice += f" Session {sessions[0]}." if len(sessions) == 1 else f" Sessions {', '.join(sessions)}."
     try:
         options = ("--skip-closed",) if address.startswith("codex:") else ()
         result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
@@ -1657,6 +1889,119 @@ def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNo
     if options and result.returncode == SEND_ABSENT_EXIT:
         return RecipientGone()
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
+
+
+def send_session_release(entry: ReleaseEntry, notice: str) -> ReleaseNoticeResult:
+    session_id = entry["session_id"]
+    if session_id.startswith("codex:"):
+        return send_release_to([entry], session_id, notice)
+    recipient = socket_for(session_id)
+    if isinstance(recipient, RecipientLive):
+        return send_release(entry, recipient.socket, notice)
+    return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
+
+
+def run_worker(entry: ReleaseEntry, run: StoppedRun, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None:
+    if membership is None:
+        return None
+    return membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
+
+
+def run_address(entry: ReleaseEntry, worker: staff.StaffRow | None, membership: staff.StaffSnapshot | None) -> str:
+    """Name the first address of a stopped run notice. A run without a staff row goes to its session."""
+    from scripts.production import staff
+
+    if worker is None:
+        return entry["session_id"]
+    if worker.kind == "worker" and (
+        entry["session_id"].startswith("codex:")
+        or membership is not None and isinstance(membership.backends.get(worker.id), staff.CodexBackend)
+    ):
+        return f"codex:{worker.current_session}"
+    return str(worker.id)
+
+
+def run_ids_text(runs: Sequence[StoppedRun]) -> str:
+    """Name each run ID once. Runs with the same label share it."""
+    ids: dict[str, list[str]] = {}
+    for run in runs:
+        ids.setdefault(run["label"], []).append(run["id"])
+    return "; ".join(f"{label} (Run ID{'s' if len(group) > 1 else ''} {', '.join(group)})"
+                     for label, group in ids.items())
+
+
+def stopped_runs_text(entries: Sequence[ReleaseEntry], membership: staff.StaffSnapshot | None) -> str:
+    """Name the stopped runs of the entries, grouped by the worker that owns them."""
+    owners: dict[str, list[StoppedRun]] = {}
+    for entry in entries:
+        run = entry.get("run")
+        assert run is not None
+        owners.setdefault(entry_name(entry, {}, membership), []).append(run)
+    if len(entries) == 1:
+        (name, (run,)), = owners.items()
+        return f" Restart the stopped run {run['label']} for {name}. Run ID {run['id']}."
+    if len(owners) == 1:
+        (name, runs), = owners.items()
+        return f" Restart the {len(entries)} stopped runs for {name}: {run_ids_text(runs)}."
+    return f" Restart the {len(entries)} stopped runs." + "".join(
+        f" For {name}: {run_ids_text(runs)}." for name, runs in owners.items())
+
+
+def notice_chunks(entries: Sequence[ReleaseEntry]) -> list[list[ReleaseEntry]]:
+    """Split the entries of one recipient so that each notice fits in one argv string."""
+    return [list(entries[start:start + RELEASE_NOTICE_RUN_LIMIT])
+            for start in range(0, len(entries), RELEASE_NOTICE_RUN_LIMIT)]
+
+
+def notice_batches(entries: Sequence[ReleaseEntry], membership: staff.StaffSnapshot | None) -> list[list[ReleaseEntry]]:
+    """Put the stopped runs with one route into one batch. Each session notice is a batch of its own."""
+    batches: list[list[ReleaseEntry]] = []
+    routes: dict[tuple[str, str, str], list[ReleaseEntry]] = {}
+    for entry in entries:
+        run = entry.get("run")
+        if run is None:
+            batches.append([entry])
+            continue
+        worker = run_worker(entry, run, membership)
+        # The director fallback reads the worker parent or the run director folder.
+        route = (str(worker.id) if worker is not None else "", run_address(entry, worker, membership),
+                 run["director_dir"])
+        if route not in routes:
+            routes[route] = []
+            batches.append(routes[route])
+        routes[route].append(entry)
+    return [chunk for batch in batches for chunk in notice_chunks(batch)]
+
+
+def send_stopped_runs_release(entries: Sequence[ReleaseEntry], notice: str,
+                              membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
+    """Send one notice for stopped runs with one route to the run owner. The first entry sets the route."""
+    entry = entries[0]
+    run = entry.get("run")
+    assert run is not None
+    worker = run_worker(entry, run, membership)
+    notice += stopped_runs_text(entries, membership)
+    if worker is None:
+        return send_session_release(entry, notice)
+    return send_release_to(entries, run_address(entry, worker, membership), notice)
+
+
+def run_director(entry: ReleaseEntry, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None | ReleaseSendFailed:
+    """Find the director that takes a stopped run notice when the run owner is closed or gone."""
+    from scripts.production import staff, worker_admission
+
+    if membership is None:
+        return ReleaseSendFailed("staff membership is unavailable")
+    run = entry.get("run")
+    assert run is not None
+    worker = run_worker(entry, run, membership)
+    director = membership.parent_of(worker) if worker is not None else None
+    if director is None and run["director_dir"]:
+        try:
+            director = worker_admission.parent(membership, run=Path(run["director_dir"]))
+        except (worker_admission.RunOwnerUnavailable, staff.StaffUnreadable) as error:
+            return ReleaseSendFailed(str(error))
+    return director
 
 
 def send_release_broadcast(notice: str) -> None:
@@ -1676,11 +2021,15 @@ def cycle_status_lines(cycle: HoldCycle) -> list[str]:
 
 
 def not_reached_detail(cycle: HoldCycle) -> str:
-    outcomes = {"RecipientGone": "session gone", "DeliveryFailed": "send failed",
-                "QueuedUnconfirmed": "queued, delivery unconfirmed"}
-    missing = [f"{entry['name']} ({outcomes[entry['delivery']]})" for entry in first_release_entries(cycle).values()
-               if entry["session_id"] in cycle["recipients"] and entry["delivery"] in outcomes]
-    return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
+    entries = release_entries(cycle, cycle["recipients"])
+    # Name each session once, however many of its runs are listed.
+    missing = list({entry["session_id"]: f"{entry['name']} (session gone)" for entry in entries
+                    if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)}.values())
+    pending = list({entry["session_id"]: entry["name"] for entry in entries if release_notice_pending(entry)}.values())
+    failed = " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
+    if not pending:
+        return failed
+    return failed + ("." if failed else "") + " Release notices still pending for " + ", ".join(pending) + "."
 
 
 def notify_release(cycle: HoldCycle) -> str:
@@ -1712,48 +2061,76 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         membership = staff.initial_snapshot()
     except staff.StaffUnreadable:
         # An unreadable snapshot cannot prove that a staff row is absent.
-        pass
+        membership = None
     else:
         without_staff = {entry["session_id"] for entry in entries
                          if membership.by_member_reference(entry["session_id"].removeprefix("codex:")) is None}
-    for entry in entries:
+    notice = release_notice(cycle["holders"])
+    # A director takes one notice for the runs of all its closed or gone workers.
+    fallbacks: dict[str, list[ReleaseEntry]] = {}
+    for batch in notice_batches(entries, membership):
         if has_holder_file(holder_directory()):
-            break
+            return not_reached_detail(cycle)
+        save_attempt(cycle, batch)
+        run = "run" in batch[0]
+        result = (send_stopped_runs_release(batch, notice, membership) if run
+                  else send_session_release(batch[0], notice))
+        if run and isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
+            director = run_director(batch[0], membership)
+            if isinstance(director, ReleaseSendFailed):
+                result = director
+            elif director is not None:
+                # The entries stay NotAttempted until the director notice returns.
+                fallbacks.setdefault(str(director.id), []).extend(batch)
+                continue
+        save_outcome(cycle, batch, result, without_staff)
+    for address, group in fallbacks.items():
+        for chunk in notice_chunks(group):
+            if has_holder_file(holder_directory()):
+                return not_reached_detail(cycle)
+            save_attempt(cycle, chunk)
+            result = send_release_to(chunk, address, notice + stopped_runs_text(chunk, membership))
+            save_outcome(cycle, chunk, result, without_staff)
+    return not_reached_detail(cycle)
+
+
+def save_attempt(cycle: HoldCycle, batch: Sequence[ReleaseEntry]) -> None:
+    """Save the pending entries before a send. A stop before the outcome is saved may cause a harmless second notice."""
+    for entry in batch:
         if entry not in cycle["entries"]:
             cycle["entries"].append(entry)
         entry["delivery"] = "NotAttempted"
-        # Save the pending entry before sending, and the outcome only after return.
-        # A stop at any point between these saves may cause a harmless second notice.
-        save_cycle(cycle)
-        session_id = entry["session_id"]
-        codex = session_id.startswith("codex:")
-        result: ReleaseNoticeResult
-        if codex:
-            result = send_release_to(entry, session_id, release_notice(cycle["holders"]))
-        else:
-            recipient = socket_for(session_id)
-            if isinstance(recipient, RecipientLive):
-                result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
-            elif isinstance(recipient, RecipientGone):
-                result = recipient
-            else:
-                result = ReleaseSendFailed(recipient.reason)
-        if isinstance(result, ReleaseDelivered):
-            entry["delivery"] = "Delivered"
-        elif isinstance(result, ReleaseQueued):
-            entry["delivery"] = "QueuedUnconfirmed"
-        elif isinstance(result, ReleaseWorkerClosed):
-            entry["delivery"] = "WorkerClosed"
-        elif isinstance(result, RecipientGone):
-            entry["delivery"] = "RecipientGone"
-            if session_id in without_staff:
-                _ = cycle["recipients"].pop(session_id, None)
-        else:
-            entry["delivery"] = "DeliveryFailed"
-            if codex:
-                print(f"build_hold: release notice for {entry['session_id']}: {result.reason}", file=sys.stderr)
-        save_cycle(cycle)
-    return not_reached_detail(cycle)
+    save_cycle(cycle)
+
+
+def save_outcome(cycle: HoldCycle, batch: Sequence[ReleaseEntry], result: ReleaseNoticeResult,
+                 without_staff: set[str]) -> None:
+    """Save one send outcome on every entry of the batch, only after the send returns."""
+    session_id = batch[0]["session_id"]
+    run = "run" in batch[0]
+    delivery = release_delivery(result, run=run)
+    for entry in batch:
+        entry["delivery"] = delivery
+        if (isinstance(result, RecipientGone) and not release_notice_pending(entry)
+                and entry["session_id"] in without_staff):
+            _ = cycle["recipients"].pop(entry["session_id"], None)
+    if isinstance(result, ReleaseSendFailed) and (run or session_id.startswith("codex:")):
+        print(f"build_hold: release notice for {session_id}: {result.reason}", file=sys.stderr)
+    save_cycle(cycle)
+
+
+def release_delivery(result: ReleaseNoticeResult, *, run: bool) -> DeliveryOutcome:
+    match result:
+        case ReleaseDelivered():
+            return "Delivered"
+        case ReleaseQueued():
+            return "QueuedUnconfirmed"
+        case ReleaseWorkerClosed():
+            return "RecipientGone" if run else "WorkerClosed"
+        case RecipientGone():
+            return "RecipientGone"
+        case ReleaseSendFailed():
+            return "DeliveryFailed"
 
 
 def release_cycle(directory: Path, name: str, *, resume: bool = False,
@@ -1785,6 +2162,7 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             notices: CycleReleaseNotices | BroadcastReleaseNotice = {"kind": "broadcast"}
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
+                collect_stop_notices(cycle, notices)
             intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}

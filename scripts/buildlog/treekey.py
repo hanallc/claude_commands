@@ -20,10 +20,18 @@ stat-dirty file as changed, so the key would move whenever another session's
 git refreshed the index. No git objects are written either. Both git calls
 run at once; any failure (not a repository, an unborn HEAD, a timeout) gives
 None.
+
+A checkout that is not trusted can name programs in its git config: an
+fsmonitor hook, or a clean filter that git status runs on a changed file.
+With checkout_programs=False, git runs none of them: the fsmonitor and each
+filter driver are turned off, submodule work trees are not read (git status
+in a submodule reads the submodule config), and git fetches no missing object.
+ignored_paths asks git in the same form.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import hashlib
 import os
 import subprocess
@@ -36,23 +44,59 @@ WORKTREE_STATUS_ARGS = (
 )
 
 
-def git(directory: str, *args: str) -> subprocess.Popen[bytes]:
+# A partial clone fetches no missing object, so it runs no fetch program of the checkout config.
+NO_FETCH_ENVIRONMENT = {"GIT_NO_LAZY_FETCH": "1"}
+
+
+def git(directory: str, *args: str, environment: Mapping[str, str] | None = None,
+        stdin: int = subprocess.DEVNULL) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         ["git", "--no-optional-locks", "-C", directory, *args],
-        stdin=subprocess.DEVNULL,
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        env=environment,
     )
 
 
-def finish(processes: list[subprocess.Popen[bytes]]) -> list[bytes] | None:
-    """Each process's stdout, or None when any fails or the shared deadline passes."""
+def no_program_environment(directory: str, environment: Mapping[str, str]) -> dict[str, str] | None:
+    """The environment that turns off the fsmonitor and each filter driver of the config, or None.
+
+    GIT_CONFIG_COUNT has the scope of -c, so it wins over every config file of the checkout.
+    """
+    drivers = finish([git(directory, "config", "--null", "--name-only", "--get-regexp",
+                          r"^filter\..+\.(clean|process)$", environment=environment)], missing_ok=True)
+    if drivers is None:
+        return None
+    settings = [("core.fsmonitor", "false")]
+    for driver in sorted({name.rpartition(b".")[0] for name in drivers[0].split(b"\0") if name}):
+        name = os.fsdecode(driver)
+        settings += [(f"{name}.clean", ""), (f"{name}.process", ""), (f"{name}.required", "false")]
+    result = {**environment, "GIT_CONFIG_COUNT": str(len(settings))}
+    for index, (key, value) in enumerate(settings):
+        result[f"GIT_CONFIG_KEY_{index}"] = key
+        result[f"GIT_CONFIG_VALUE_{index}"] = value
+    return result
+
+
+def no_program_git_environment(directory: str) -> dict[str, str] | None:
+    """The environment of a git call that runs no program that the checkout names, or None when git fails."""
+    return no_program_environment(directory, {**os.environ, **NO_FETCH_ENVIRONMENT})
+
+
+def finish(processes: list[subprocess.Popen[bytes]], *, missing_ok: bool = False,
+           stdin_bytes: bytes = b"") -> list[bytes] | None:
+    """Each process's stdout, or None when any fails or the shared deadline passes.
+
+    With missing_ok, exit 1 is no failure: git config and git check-ignore give it when they find no name.
+    A process started with a stdin pipe gets stdin_bytes.
+    """
     deadline = time.monotonic() + GIT_TIMEOUT_S
     outputs: list[bytes] = []
     try:
         for process in processes:
-            stdout, _ = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
-            if process.returncode != 0:
+            stdout, _ = process.communicate(stdin_bytes or None, timeout=max(0.0, deadline - time.monotonic()))
+            if process.returncode not in ((0, 1) if missing_ok else (0,)):
                 return None
             outputs.append(stdout)
     except subprocess.TimeoutExpired:
@@ -62,40 +106,59 @@ def finish(processes: list[subprocess.Popen[bytes]]) -> list[bytes] | None:
             if process.poll() is None:
                 process.kill()
                 _ = process.wait()
-            if process.stdout is not None:
-                process.stdout.close()
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None:
+                    pipe.close()
     return outputs
 
 
-def content(path: bytes) -> bytes:
+def ignored_paths(directory: str, paths: Sequence[str]) -> set[str] | None:
+    """The paths, relative to directory, that git ignores; None when git fails. git runs no program that the
+    checkout names."""
+    try:
+        environment = no_program_git_environment(directory)
+        if environment is None:
+            return None
+        process = git(directory, "check-ignore", "--stdin", "-z", environment=environment, stdin=subprocess.PIPE)
+    except OSError:
+        return None
+    outputs = finish([process], missing_ok=True, stdin_bytes=b"".join(os.fsencode(path) + b"\0" for path in paths))
+    return None if outputs is None else {os.fsdecode(name) for name in outputs[0].split(b"\0") if name}
+
+
+def content(path: bytes, *, checkout_programs: bool = True) -> bytes:
     if os.path.islink(path):
         return b"link " + os.readlink(path)
     if os.path.isfile(path):
         with open(path, "rb") as handle:
             return hashlib.file_digest(handle, "sha256").digest()
-    return gitlink_content(path) or b"absent"
+    return gitlink_content(path, checkout_programs=checkout_programs) or b"absent"
 
 
-def tracked_gitlink(path: bytes) -> bool:
+def tracked_gitlink(path: bytes, *, checkout_programs: bool = True) -> bool:
     """Check the parent worktree index, including staged submodules."""
     parent, name = os.path.split(path)
     if not name:  # Git status adds a slash to an untracked repository.
         return False
-    outputs = finish([git(os.fsdecode(parent or b"."), "--literal-pathspecs",
-                          "ls-files", "--stage", "-z", "--", os.fsdecode(name))])
+    directory = os.fsdecode(parent or b".")
+    environment = None if checkout_programs else no_program_git_environment(directory)
+    if not checkout_programs and environment is None:
+        raise OSError(f"no safe Git environment for {directory}")
+    outputs = finish([git(directory, "--literal-pathspecs", "ls-files", "--stage", "-z", "--",
+                          os.fsdecode(name), environment=environment)])
     if outputs is None:
         raise OSError(f"cannot check whether {os.fsdecode(path)} is a tracked submodule")
     return any(entry.startswith(b"160000 ") and entry.partition(b"\t")[2] == name
                for entry in outputs[0].split(b"\0"))
 
 
-def gitlink_content(path: bytes) -> bytes:
+def gitlink_content(path: bytes, *, checkout_programs: bool = True) -> bytes:
     """Return the checked-out commit and content key for a tracked submodule."""
     if not os.path.isdir(path) or not os.path.lexists(os.path.join(path, b".git")):
         return b""
-    if not tracked_gitlink(path):
+    if not tracked_gitlink(path, checkout_programs=checkout_programs):
         return b""
-    submodule_key = _tree_key(os.fsdecode(path), submodule=True)
+    submodule_key = _tree_key(os.fsdecode(path), submodule=True, checkout_programs=checkout_programs)
     if submodule_key is None:
         raise OSError(f"no tree key for {os.fsdecode(path)}")
     return b"gitlink " + submodule_key.encode("ascii")
@@ -122,18 +185,26 @@ def committed_tree_key(tree_id: bytes) -> str:
     return hashlib.sha256(tree_id + b"\n").hexdigest()
 
 
-def tree_key(directory: str, *, exclude_session_dirs: bool = False) -> str | None:
-    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs)
+def tree_key(directory: str, *, exclude_session_dirs: bool = False, checkout_programs: bool = True) -> str | None:
+    """Read the worktree key with optional session and checkout program controls."""
+    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs,
+                     checkout_programs=checkout_programs)
 
 
-def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = False) -> str | None:
+def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = False,
+              checkout_programs: bool = True) -> str | None:
     revision = ("HEAD^{tree}", "HEAD") if submodule else ("HEAD^{tree}",)
+    status_args = WORKTREE_STATUS_ARGS
+    environment = None
     try:
+        if not checkout_programs:
+            environment = no_program_git_environment(directory)
+            if environment is None:
+                return None
+            status_args = (*WORKTREE_STATUS_ARGS[:-1], "--ignore-submodules=dirty")
         processes = [
-            git(directory, "rev-parse", "--show-toplevel", *revision),
-            # Staged, unstaged, deleted and untracked alike, every untracked file
-            # by name; porcelain names paths from the top in any folder.
-            git(directory, *WORKTREE_STATUS_ARGS),
+            git(directory, "rev-parse", "--show-toplevel", *revision, environment=environment),
+            git(directory, *status_args, environment=environment),
         ]
     except OSError:
         return None
@@ -154,7 +225,7 @@ def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = F
     excluded = session_directory_prefixes(top) if exclude_session_dirs else ()
     try:
         for path in changed_paths(status, exclude=excluded):
-            key.update(path + b"\0" + content(os.path.join(top, path)))
+            key.update(path + b"\0" + content(os.path.join(top, path), checkout_programs=checkout_programs))
     except OSError:
         return None
     return key.hexdigest()

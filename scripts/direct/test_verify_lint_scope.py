@@ -174,6 +174,7 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         return [line for line in result.stdout.splitlines() if line.startswith("verify.sh batch ")]
 
     def fail_first(self, *, status: int) -> None:
+        self.run_git("remote", "add", "origin", str(self.root.with_suffix(".git")))
         options = copies_environment(self.root / "batch-copies", repository=self.root.name)
         folders = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         _ = folders.write_bytes((Path(options["CONF_DIR"]) / folders.name).read_bytes())
@@ -345,7 +346,8 @@ wait_for_file(Path({str(release)!r}))
             result = self.batch("--fail-first")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("verify.sh batch fail-first sample green cached=no", result.stdout)
-        self.assertTrue((self.root / "batch-copies" / "slots" / "case-slot1").is_dir())
+        numbered_copy = self.root / "batch-copies" / "build" / self.root.name / "batch-fixture" / "1"
+        self.assertTrue(numbered_copy.is_dir())
         placements = [request for call in observe.call_args_list
                       if isinstance(request := cast(wire.Request, call.args[0]), wire.PlacementRequest)]
         first_requests = list({request.episode: request for request in reversed(placements)}.values())[::-1]

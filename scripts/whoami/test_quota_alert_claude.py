@@ -32,11 +32,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.noted, [])
         _ = self.alert([self.note("claude2.md", "active", "2")], self.now + timedelta(minutes=2))
         self.assertEqual(len(self.noted), 1)
-        self.assertEqual(self.noted[0].body,
-            "claude2 has 2% of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.")
-        self.assertEqual(self.noted[0].title, "Claude work on claude2 may stop")
-        self.assertEqual(self.noted[0].action,
-                         ActionRequired("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."))
+        self.assertEqual(self.noted[0].body, "")
+        self.assertEqual(self.noted[0].title, "claude2 has 2% left with no move")
+        self.assertEqual(self.noted[0].action, ActionRequired("Set a move on the Accounts page"))
         for minute, left in ((4, "1"), (32, "1"), (120, "null"), (122, "1")):
             _ = self.alert([self.note("claude2.md", "active", left)], self.now + timedelta(minutes=minute))
         self.assertEqual(len(self.noted), 1)
@@ -47,6 +45,18 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = self.alert([self.note("claude2.md", "active", "2")], self.now + timedelta(minutes=126))
         self.assertEqual(len(self.noted), 2)
         self.assertEqual(self.sent, [])
+
+    def test_claude_reminder_keeps_the_full_label_and_formats_whole_percent(self) -> None:
+        label = "claude123456789012345678"
+        for left, expected in (
+            ("0", "0%"), ("-0", "0%"), ("0.9", "<1%"), ("1.9", "1%"),
+            ("99.6", "99%"), ("100", "100%"), ("100.1", "unknown"),
+        ):
+            with self.subTest(left=left):
+                note = self.note(f"{label}.md", "active", left)
+                self.assertEqual(quota_alert.percent(note, whole=True), expected)
+        _ = self.alert([self.note(f"{label}.md", "active", "0.9")], self.now)
+        self.assertEqual([push.title for push in self.noted], [f"{label} has <1% left with no move"])
 
     def test_claude_account_used_only_by_producers_records_a_status_note(self) -> None:
         note = self.note("claude2.md", "active", "1")

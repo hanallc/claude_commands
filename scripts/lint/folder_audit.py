@@ -6,8 +6,8 @@ The scratch guard refuses most loose folders before they exist, and the hourly t
 temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
 the backstop for the rest: folders that can hold work. A folder is loose when it is none of these:
 
-  * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or a scratch
-    root (~/rust/repro, ~/rust/scratch);
+  * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or the scratch
+    root ~/rust/scratch;
   * in ~/rust/scratch: nothing; every folder there is loose, since scratch.py never makes one there;
   * in /tmp, /tmp/claude and $TMPDIR: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
@@ -69,7 +69,7 @@ from typing import Protocol, cast
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import build_folder_lock, build_folders, cargo_output, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
@@ -78,7 +78,7 @@ RUST_SCRATCH_NAME = "scratch"
 TEMP_SCAN_ROOTS = (Path("/tmp"), Path("/tmp/claude"))
 KEPT_NAMES = SYSTEM_TEMP_NAMES | {
     unit_runs.RUN_ROOT.name, unit_runs.FORMER_RUN_ROOT.name, copy_record.root().name,
-    copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
+    copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name,
 }
 KEPT_PREFIXES = (*SYSTEM_TEMP_PREFIXES, "codex-daemon-")
 GIT_TIME_FILES = ("HEAD", "index", os.path.join("logs", "HEAD"))
@@ -220,10 +220,8 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[DiscoveredFolder]:
     """Every loose folder this user owns, before the age rule."""
-    visible_root = scratch.visible_root(scratch_settings=scratch_settings).resolve()
-
     def kept_in_rust(entry: Path) -> bool:
-        return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
+        return expected is None or entry.name in expected or entry.name in KEPT_NAMES
 
     verify_name = tmp_sweep.verify_temp_name()
     roots: list[tuple[Path, Callable[[Path], bool]]] = [
@@ -353,10 +351,7 @@ def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep
     if not paths:
         return tmp_sweep.ProcessUsesKnown([])
     prefixes = tuple(dict.fromkeys(str(path.parent) + os.sep for path in paths))
-    found = tmp_sweep.process_paths(proc, prefixes)
-    if isinstance(found, tmp_sweep.ProcessUsesUnavailable):
-        return tmp_sweep.lsof_paths(prefixes)
-    return found
+    return tmp_sweep.process_uses_with_lsof(proc, prefixes)
 
 
 def worktree_sources(path: Path, *,
@@ -717,13 +712,7 @@ def check_cargo_output_location(path: Path) -> None:
     if home_identity not in parents:
         return
     settings = conf.read("build_folders")
-    configured = settings.value("roots.build", str, default="", recover_invalid=False)
-    # Older configurations name the cargo directory inside the build root.
-    if configured:
-        build = Path(configured).expanduser().resolve()
-    else:
-        slot_cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser()
-        build = slot_cargo.parent.resolve()
+    build = Path(settings.text("roots.build")).expanduser().resolve()
     protected = {directory_identity(parent.stat()) for parent in (home, *home.parents)}
     try:
         build_identity = directory_identity(build.stat())
@@ -736,7 +725,7 @@ def check_cargo_output_location(path: Path) -> None:
 
 
 def clean_checkout_cargo_output(path: Path) -> None:
-    """Remove external output only after ownership, use stamps, locks and processes permit removal."""
+    """Report external output after checking ownership, use stamps, locks and processes."""
     attempt_started = time.time()
     saved = scratch.save_cargo_outputs(path)
     outputs = [output for output in saved if not output.roots.build_directory.is_relative_to(path)
@@ -776,11 +765,24 @@ def clean_checkout_cargo_output(path: Path) -> None:
                           or other.build_directory.is_relative_to(root)) for other in known)
         if shared:
             continue
-        trees = list(dict.fromkeys([str(root), *sweep.build_trees(str(root))]))
-        locked = sweep.lock_trees(trees)
-        if isinstance(locked, sweep.TargetLockBusy):
-            raise OSError(f"Cargo output is locked: {locked.path}")
-        try:
+        if not build_folders.may_remove_build_path(root):
+            raise OSError(f"Cargo output is protected: {root}")
+        remove_locked_cargo_output(root, attempt_started)
+        remove_empty_mirror_parents(root, output.roots.workspace_root, path)
+
+
+def remove_locked_cargo_output(root: Path, attempt_started: float) -> None:
+    """Report this Cargo output while its folder lock is held."""
+    trees = list(dict.fromkeys([str(root), *sweep.build_trees(str(root))]))
+    locked = sweep.lock_trees(trees)
+    if isinstance(locked, sweep.TargetLockBusy):
+        raise OSError(f"Cargo output is locked: {locked.path}")
+    try:
+        with build_folders.reserve_cargo_output(root, held_locks=locked.held) as reservation:
+            if isinstance(reservation, build_folders.CargoOutputAbsent):
+                return
+            if not isinstance(reservation, build_folders.ReservedCargoOutput):
+                raise OSError(build_folders.removal_refusal_detail(reservation))
             uses = process_uses([root])
             if isinstance(uses, ProcessUsesUnavailable) or any(
                     pid != os.getpid() and Path(used).resolve().is_relative_to(root) for used, pid, _ in uses.paths):
@@ -788,40 +790,19 @@ def clean_checkout_cargo_output(path: Path) -> None:
             stamp = root / scratch.USE_STAMP
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
-            with build_folders.reserve_cargo_output(root, held_locks=locked.held) as reservation:
-                if not isinstance(reservation, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
-                    raise OSError(build_folders.removal_refusal_detail(reservation))
-                removed = reservation.remove()
-                if not isinstance(removed, build_folders.Removed):
-                    raise OSError(build_folders.removal_refusal_detail(removed))
-            remove_empty_mirror_parents(root, output.roots.workspace_root, path)
-        finally:
-            sweep.release(locked.held)
-
+            if not build_folders.may_remove_folder_tree(root):
+                raise OSError(f"Cargo output is mounted or could not be verified: {root}")
+            print(f"kept for a manual removal list: {root} (folder_audit, checkout Cargo output)", file=sys.stderr)
+    finally:
+        sweep.release(locked.held)
 
 def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None:
-    """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
+    """Report the former mirror parent without removing it."""
     tail = workspace.parts[1:]
-    if not tail or root.parts[-len(tail):] != tail:
-        return
-    top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
-    if path.is_relative_to(top):
-        return
-    folder = root.parent
-    while folder.is_relative_to(top):
-        try:
-            with build_folder_lock.mutation_lock(folder, wait=False) as guard:
-                if isinstance(guard, build_folder_lock.ParentChanged):
-                    return
-                _ = checked_scan_roots([folder])
-                check_cargo_output_location(folder)
-                folder.rmdir()
-        except ValueError as error:
-            print(f"Cargo mirror kept: {error}", file=sys.stderr)
-            return
-        except OSError:
-            return
-        folder = folder.parent
+    if tail and root.parts[-len(tail):] == tail:
+        top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
+        if not path.is_relative_to(top) and top.is_dir():
+            print(f"kept for a manual removal list: {top} (folder_audit, former mirror parent)", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:

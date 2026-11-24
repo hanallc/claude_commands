@@ -1,8 +1,8 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
-from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement, queue_evidence
+from scripts.review_links.browser_test_support import assert_status_states
+from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -11,9 +11,9 @@ import io
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterator
 from contextlib import redirect_stdout
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from pathlib import Path
@@ -27,12 +27,12 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, parse
-from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.buildlog import charts, cost_actions, costs, machine_facts, parse
+from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, SlotCaller, recorded_step
+from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
@@ -42,18 +42,19 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, build_slots, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
+from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
+from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.production.merge_gate import SuiteMode
+from scripts.production.gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
+from scripts.mac_test.claim_state import RepositoryScope
 
 REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
@@ -118,6 +119,27 @@ def with_wait_reason(reading: admission_records.QueueRead, reason: admission_rec
     waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
                               admission_records.GIB, reason, project="fixture-project")
     return replace(reading, view=replace(reading.view, waiting=(waiter,)))
+
+
+@dataclass(frozen=True)
+class GatePlacementWaiter(admission_records.WaitingStep):
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+
+
+@dataclass(frozen=True)
+class GatePlacementStep(admission_records.RunningStep):
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+
+
+def gate_candidates(guest: placement.HostEligibility) -> tuple[placement.CandidateEligibility, ...]:
+    scope = RepositoryScope("claude_commands")
+    return (
+        placement.CandidateEligibility(placement.PlacementDestination("local", "natedev", "natedev", scope),
+                                       placement.AllowedHost()),
+        placement.CandidateEligibility(placement.PlacementDestination("mac", "mac-linux", "guest", scope), guest),
+        placement.CandidateEligibility(placement.PlacementDestination("scaler", "hana-aws", "aws", scope),
+                                       placement.AllowedHost()),
+    )
 
 
 def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> admission_records.RunningStep:
@@ -276,32 +298,32 @@ class MemoryFeedTests(unittest.TestCase):
         linked_root.symlink_to(roots["natedev"], target_is_directory=True)
         mac_home = self.root / "remote-home"
         for label, machine, folder, configured, expected in (
-            ("natedev slot", "natedev", roots["natedev"] / "hana-slot2", "machine", 2),
-            ("natedev common root", "natedev", roots["natedev"] / "hana-slot2", "common", 2),
-            ("natedev symlink root", "natedev", roots["natedev"] / "hana-slot2", "symlink", 2),
-            ("Mac host root", "mac", roots[mac_machine] / "hana-slot3", "machine", 3),
-            ("Mac tilde root", "mac", mac_home / "build/slot/hana-slot3", "~", 3),
-            ("Mac HOME root", "mac", mac_home / "build/slot/hana-slot3", "$HOME", 3),
-            ("Mac braced HOME root", "mac", mac_home / "build/slot/hana-slot3", "${HOME}", 3),
-            ("local tilde root", "natedev", Path.home() / "build/slot/hana-slot2", "~", 2),
-            ("local HOME root", "natedev", Path.home() / "build/slot/hana-slot2", "$HOME", 2),
-            ("Mac home unavailable", "mac", Path.home() / "build/slot/hana-slot3", "unknown-home", "—"),
+            ("natedev slot", "natedev", roots["natedev"] / "hana/unit/2", "machine", 2),
+            ("natedev common root", "natedev", roots["natedev"] / "hana/unit/2", "common", 2),
+            ("natedev symlink root", "natedev", roots["natedev"] / "hana/unit/2", "symlink", 2),
+            ("Mac host root", "mac", roots[mac_machine] / "hana/unit/3", "machine", 3),
+            ("Mac tilde root", "mac", mac_home / "build/hana/unit/3", "~", 3),
+            ("Mac HOME root", "mac", mac_home / "build/hana/unit/3", "$HOME", 3),
+            ("Mac braced HOME root", "mac", mac_home / "build/hana/unit/3", "${HOME}", 3),
+            ("local tilde root", "natedev", Path.home() / "build/hana/unit/2", "~", 2),
+            ("local HOME root", "natedev", Path.home() / "build/hana/unit/2", "$HOME", 2),
+            ("Mac home unavailable", "mac", Path.home() / "build/hana/unit/3", "unknown-home", "—"),
             ("outside root", "natedev", self.root / "worktree", "machine", "—"),
-            ("lookalike outside root", "natedev", self.root / "hana-slot2", "machine", "—"),
-            ("other machine root", "mac", roots["natedev"] / "hana-slot2", "machine", "—"),
-            ("nested folder", "natedev", roots["natedev"] / "hana-slot2" / "crate", "machine", "—"),
-            ("no roots", "natedev", roots["natedev"] / "hana-slot2", "none", "—"),
-            ("Mac without roots", "mac", roots[mac_machine] / "hana-slot3", "none", "—"),
+            ("lookalike outside root", "natedev", self.root / "hana/unit/2", "machine", "—"),
+            ("other machine root", "mac", roots["natedev"] / "hana/unit/2", "machine", "—"),
+            ("nested folder", "natedev", roots["natedev"] / "hana/unit/2" / "crate", "machine", "—"),
+            ("no roots", "natedev", roots["natedev"] / "hana/unit/2", "none", "—"),
+            ("Mac without roots", "mac", roots[mac_machine] / "hana/unit/3", "none", "—"),
         ):
             with self.subTest(label=label):
-                settings = ("".join(f"roots.slots.{host}={path}\n" for host, path in roots.items())
-                            if configured == "machine" else f"roots.slots={roots['natedev']}\n" if configured == "common" else "")
+                settings = ("".join(f"roots.build.{host}={path}\n" for host, path in roots.items())
+                            if configured == "machine" else f"roots.build={roots['natedev']}\n" if configured == "common" else "")
                 if configured in ("~", "$HOME", "${HOME}", "unknown-home"):
                     selected_host = mac_machine if machine == "mac" else machine
                     prefix = "~" if configured == "unknown-home" else configured
-                    settings = f"roots.slots.{selected_host}={prefix}/build/slot\n"
+                    settings = f"roots.build.{selected_host}={prefix}/build\n"
                 if configured == "symlink":
-                    settings = f"roots.slots.natedev={linked_root}\n"
+                    settings = f"roots.build.natedev={linked_root}\n"
                 _ = (self.root / "build_folders.conf").write_text(settings)
                 reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
                 step = replace(reading.view.running[0], folder=str(folder))
@@ -320,20 +342,22 @@ class MemoryFeedTests(unittest.TestCase):
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
-                self.assertEqual(rows[0].get("slot"), expected)
+                # The feed sends no slot number; the slot folder ends with it.
+                self.assertNotIn("slot", rows[0])
+                self.assertEqual(rows[0].get("slot_folder", "—").rsplit("/", 1)[-1], str(expected))
                 # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
                 self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
-                                 (folder.name, mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
+                                 ("/".join(folder.parts[-3:]), mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
-                self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
+                self.assertTrue(all("slot" not in row for row in shown_rows))
                 self.assertTrue(all("slot" not in row for row in page["waiters"]))
                 for waiting in page["waiters"]:
                     self.assertEqual(staff_names.parts_text(waiting.get("name_parts", [])), waiting["name"])
                 # A natedev step that waits in a slot names it too; the waiting table shows no slot number.
                 in_slot = expected != "—" if machine == "natedev" else label == "other machine root"
                 self.assertEqual([(row.get("slot_folder"), row.get("slot_machine")) for row in page["waiters"]],
-                                 [(folder.name, "natedev") if in_slot else (None, None)])
+                                 [("/".join(folder.parts[-3:]), "natedev") if in_slot else (None, None)])
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")
@@ -368,10 +392,11 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
-            + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
-            + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
-            + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
+            + "names.gate=gate\n"
+            + "owned.default={unit} {step}\n"
+            + "owned.test-affected={unit} {step}\n"
+            + "owned.ci-default=CI {step}\n"
+            + "owned.showrunner-default=showrunner {step}\n")
         self.configure()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
@@ -385,6 +410,8 @@ class MemoryFeedTests(unittest.TestCase):
             "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "MACHINE_FACTS_FILE": str(self.root / "machine-facts.json"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
@@ -458,6 +485,7 @@ class MemoryFeedTests(unittest.TestCase):
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
         return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons()))
                 .replace('</head>', staff_names.script({}) + '</head>', 1))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
@@ -476,26 +504,286 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(uncertain["state"], "uncertain")
         self.assertEqual(reading.explanation.room, baseline.explanation.room)
 
-    def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
-        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(os, "cpu_count", return_value=4)):
-            page = memory_feed.reading()
+    def gate_wait_page(self, guest: placement.HostEligibility) -> memory_feed.MemoryPage:
+        return self.placement_wait_page("/fixture/claude_commands", gate_candidates(guest))
+
+    def placement_wait_page(self, folder: str,
+                            candidates: tuple[placement.CandidateEligibility, ...]) -> memory_feed.MemoryPage:
+        base = captured_reading()
+        waiter = GatePlacementWaiter(8100, "gate-session", "fixture gate", "gate", folder,
+            base.explanation.now - 30, admission_records.GIB, admission_records.NeedsMemory(),
+            job=StepJob("gate"), placement_candidates=candidates)
+        with mock.patch.object(admission_client, "view", return_value=replace(base, view=replace(base.view, waiting=(waiter,)))):
+            return memory_feed.reading()
+
+    def test_a_fixed_guest_exclusion_is_not_a_target_and_the_route_fit_names_the_targets(self) -> None:
+        row, = self.placement_wait_page("/fixture/hana", gate_candidates(placement.FixedExclusion("repo")))["waiters"]
+        route_fit, = self.placement_wait_page("/fixture/hana", ())["waiters"]
+        self.assertNotIn("mac-linux", row.get("targets", []))
+        self.assertNotIn("mac-linux", row.get("runs_on", ""))
+        self.assertEqual((row.get("runs_on"), row.get("targets"), row.get("because")),
+                         (route_fit.get("runs_on"), route_fit.get("targets"), route_fit.get("because")))
+
+    def test_an_allowed_guest_is_a_target_and_a_fixed_exclusion_is_not(self) -> None:
+        candidates = tuple(replace(candidate, eligibility=placement.FixedExclusion("offload_exclude"))
+                           if candidate.destination.target == "hana-aws" else candidate
+                           for candidate in gate_candidates(placement.AllowedHost()))
+        row, = self.placement_wait_page("/fixture/claude_commands", candidates)["waiters"]
+        self.assertEqual(row.get("targets"), ["natedev", "mac-linux"])
+        self.assertEqual(row.get("runs_on"), "natedev or mac-linux")
+
+    def test_gate_wait_row_lists_every_named_machine_once(self) -> None:
+        page = self.gate_wait_page(placement.AllowedHost())
+        row, = page["waiters"]
+        self.assertEqual(row.get("targets"), ["natedev", "mac-linux", "hana-aws"])
+        self.assertEqual(row.get("runs_on"), "natedev or mac-linux or hana-aws")
+        self.assertEqual(row.get("because"), "")
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-        rows = [*page["walk"], *page["waiters"]]
-        keys = [row.get("key") for row in rows]
-        self.assertEqual(len(set(keys)), len(rows))
-        for row in reversed(rows):
-            original = row.get("key")
-            cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
-            self.assertEqual(memory_feed.step_key(row), original)
-        # Two CI rows with no runner differ only by their cgroup.
-        with tempfile.TemporaryDirectory() as folder:
-            ci_keys = set[str]()
-            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
-                (cgroup := Path(folder) / name).mkdir()
-                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
-        self.assertEqual(len(ci_keys), 2)
+        _tips, table = self.render_assignment_table(payload)
+        self.assertEqual(table.count(f'data-tip="wait:{row.get("key")}" tabindex="0"'), 1)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="wait:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("dim", "natedev"), ("dim", "mac-linux"), ("dim", "hana-aws")])
+
+    def test_gate_wait_row_shows_the_recorded_mac_linux_exclusion(self) -> None:
+        for guest in (placement.TemporaryExclusion("backoff until 15:30 EST"),
+                      placement.EvidenceNeeded("unreadable record"),
+                      placement.TemporaryExclusion("the Mac does not answer")):
+            with self.subTest(guest=guest):
+                row, = self.gate_wait_page(guest)["waiters"]
+                self.assertEqual(row.get("because"), f"mac-linux: {guest.reason}")
+                self.assertEqual(row.get("targets"), ["natedev", "mac-linux", "hana-aws"])
+        page = self.gate_wait_page(placement.TemporaryExclusion("backoff until 15:30 EST"))
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, _table = self.render_assignment_table(payload)
+        self.assertIn("mac-linux: backoff until 15:30 EST", "\n".join(tips["waiters"][0]))
+        waiters = cast(list[dict[str, object]], payload["waiters"])
+        waiters[0]["head_room"] = {"unavailable": True}
+        unavailable_tips, _table = self.render_assignment_table(payload)
+        self.assertIn("mac-linux: backoff until 15:30 EST", "\n".join(unavailable_tips["waiters"][0]))
+
+    def test_native_mac_gate_row_keeps_named_targets_and_guest_exclusion(self) -> None:
+        base = captured_reading()
+        now = base.explanation.now
+        scope = RepositoryScope("claude_commands")
+        native = placement.CandidateEligibility(placement.PlacementDestination("mac", "mac", "mac", scope),
+                                               placement.AllowedHost())
+        step = GatePlacementStep("gate-session", "fixture gate", "gate", "/Mac/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
+            job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.TemporaryExclusion("not answering"))))
+        reading = replace(base, view=replace(base.view, running=(step,)))
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
+        other = replace(build, pid=8203, gate_placement="episode/other-attempt")
+        mac = queue_view.MacBuildReading(now, (build, other))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            page = memory_feed.reading()
+        row = next(row for row in page["walk"] if row["pid"] == build.pid)
+        self.assertEqual(row.get("targets"), ["mac", "natedev", "mac-linux", "hana-aws"])
+        self.assertEqual(row.get("because"), "mac-linux: not answering")
+        unrelated = next(row for row in page["walk"] if row["pid"] == other.pid)
+        self.assertNotIn("targets", unrelated)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        text = "\n".join(tips["walk"][page["walk"].index(row)])
+        self.assertIn("mac-linux: not answering", text)
+        self.assertIn("Named targets  Mac or natedev or mac-linux or hana-aws", text)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("run", "mac")])
+
+    def test_consumed_guest_gate_uses_the_recorded_job_and_owner(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        with mock.patch.object(admission_client, "view", return_value=captured_reading(running=(step,))):
+            page = memory_feed.reading()
+        (row,) = (cast(memory_feed.RunRow, row) for row in page["walk"] if row.get("guest_unconfirmed"))
+        self.assertEqual(row["title"], {"unit": "phases", "step": "test affected"})
+        self.assertEqual((row.get("caller"), row.get("machine"), row["state"]),
+                         ("phases", "mac-linux", "running"))
+
+    def test_guest_gate_progress_comes_from_the_placement_sidecar(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate, mac_linux_and_natedev_request,
+            publish_candidate,
+        )
+
+        for sidecar_state in ("empty", "missing file", "written counter"):
+            with self.subTest(sidecar=sidecar_state):
+                readings: list[admission_records.QueueRead] = []
+                with PlacementFixture() as fixture:
+                    request = mac_linux_and_natedev_request(fixture, natedev=False)
+                    assert isinstance(request.local, wire.LocalAdmissionContext)
+                    sidecar = fixture.root / "gate.cgroup"
+                    request = replace(request, identity=replace(request.identity, step="gate",
+                        unit="phases", job=StepJob("test-affected")), local=replace(request.local,
+                        sidecar="" if sidecar_state == "empty" else str(sidecar)))
+                    if sidecar_state == "written counter":
+                        progress_profile.publish_counter(sidecar, progress_profile.ProgressCounter("modules", 7, 12))
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                    assert isinstance(granted, wire.FirstAuthorization), granted
+                    _ = fixture.run_pass()
+                    execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                        assignment.destination.host, "host-generation-a", 700001, "guest-start"))
+                    for confirmed in (False, True):
+                        if confirmed:
+                            _ = fixture.server.handle_request(
+                                wire.ExecutionReport("guest-running", assignment, granted.claim, execution))
+                        reply, = fixture.server.handle_request(wire.ViewRequest())
+                        decoded = wire.parse_reply(wire.encode_reply(reply))
+                        assert isinstance(decoded, wire.ViewReply)
+                        readings.append(decoded.reading)
+
+                for confirmed, reading in zip((False, True), readings, strict=True):
+                    with self.subTest(confirmed=confirmed):
+                        with mock.patch.object(admission_client, "view", return_value=reading):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("machine") == "mac-linux"]
+                        self.assertEqual(bool(row.get("guest_run")), confirmed)
+                        self.assertEqual(bool(row.get("guest_unconfirmed")), not confirmed)
+                        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                        tips, table = self.render_assignment_table(payload)
+                        if sidecar_state == "written counter":
+                            self.assertIn('<td class="place">testing</td><td class="done">58.3%</td>', table)
+                            self.assertIn("Testing  7 of 12 modules", "\n".join(tips["walk"][page["walk"].index(row)]))
+                        else:
+                            self.assertIn('<td class="place">—</td><td class="done">—</td>', table)
+
+    def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"))
+        with (mock.patch.object(admission_client, "view", side_effect=[
+                  captured_reading(running=(step,)), wire.AdmissionUnavailable("queue read timed out")]),
+              mock.patch.object(time, "sleep", side_effect=[None, FeedStopped]),
+              self.assertRaises(FeedStopped)):
+            _ = memory_feed.main([])
+        payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(payload["read_error"], "queue read timed out")
+        rows = cast(list[dict[str, object]], payload["walk"])
+        row, = [row for row in rows if row.get("guest_unconfirmed")]
+        _tips, table = self.render_assignment_table(payload)
+        self.assertEqual(table.count(f'data-tip="row:{row["key"]}" tabindex="0"'), 1)
+
+    def guest_gate_page(self) -> memory_feed.MemoryPage:
+        base = captured_reading()
+        now = base.explanation.now
+        guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
+            mac_placement="episode/placement-attempt",
+            job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        # The queue names no Mac placement for an unconfirmed guest attempt.
+        pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
+                          execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
+        running = (guest, pending)
+        explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+            0, 0, 0, owner=str(step.pid)) for step in running)
+        reading = replace(base, view=replace(base.view, running=running),
+                          explanation=replace(base.explanation, running=explained))
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
+        mac = queue_view.MacBuildReading(now, (native,))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            return memory_feed.reading()
+
+    def test_guest_gate_rows_show_on_mac_linux_with_the_confirmed_attempt_or_not_confirmed(self) -> None:
+        page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
+        self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
+        self.assertEqual((row.get("machine"), row.get("state")), ("mac-linux", "running"))
+        self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
+        unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
+        self.assertNotIn("guest_run", unconfirmed)
+        self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
+                         ("mac-linux", True, "running"))
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
+        text = "\n".join(tips["walk"][page["walk"].index(row)])
+        self.assertIn("Runs on  mac-linux", text)
+        self.assertIn("Guest attempt  guest-attempt", text)
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
+
+    def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
+        # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
+        page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        cells = dict(cast(list[tuple[str, str]],
+            re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(cells[str(row.get("key"))]), [("run", "mac-linux")])
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", "\n".join(tips["walk"][page["walk"].index(row)]))
+
+    def test_consumed_unconfirmed_guest_gate_shows_one_mac_linux_row(self) -> None:
+        base = captured_reading()
+        now = base.explanation.now
+        consumed = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, assignment_host="linux-guest",
+            assignment_target="mac-linux", job=StepJob("gate"),
+            execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        # Before the consume, the queue has no start time and the gate starts nothing on the guest.
+        available = replace(consumed, session_id="available-session", started_at=0.0)
+        native = GatePlacementStep("mac-session", "fixture mac gate", "gate", "/Mac/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8300, started_at=now - 20, assignment_host="mac", mac_placement="episode/native-attempt",
+            job=StepJob("gate"))
+        running = (consumed, available, native)
+        explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+            0, 0, 0, owner=str(index)) for index, step in enumerate(running))
+        reading = replace(base, view=replace(base.view, running=running),
+                          explanation=replace(base.explanation, running=explained))
+        build = queue_view.MacBuild(8302, native.folder, native.started_at, "gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=native.mac_placement)
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (build,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            page = memory_feed.reading()
+        remote = [row for row in page["walk"] if row.get("keep_text") == "remote memory is unavailable"]
+        guest = next(row for row in remote if row["started_at"] == consumed.started_at)
+        self.assertEqual((guest.get("machine"), guest.get("guest_unconfirmed")), ("mac-linux", True))
+        self.assertNotIn("guest_run", guest)
+        waiting = next(row for row in remote if row["started_at"] == 0)
+        self.assertEqual(waiting.get("machine"), "linux-guest")
+        self.assertNotIn("guest_unconfirmed", waiting)
+        host_row = next(row for row in remote if row["pid"] == native.pid)
+        mac_row = next(row for row in page["walk"] if row["pid"] == build.pid)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        counts = {name: table.count(f'data-tip="row:{row.get("key")}" tabindex="0"')
+                  for name, row in (("guest", guest), ("waiting", waiting), ("host", host_row), ("mac", mac_row))}
+        # The Mac host run shows once, as its Mac build row; the guest run shows once, as its queue row.
+        self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
+        # The guest row shows the bright mac-linux icon; its hover says the attempt is not confirmed.
+        self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
+        text = "\n".join(tips["walk"][page["walk"].index(guest)])
+        self.assertIn("Runs on  mac-linux", text)
+        self.assertIn("Guest attempt  not confirmed", text)
+        self.assertNotIn("unavailable", text.splitlines()[0])
+        # The confirmation adds a pid and an attempt; the row keeps its key, so an open hover stays.
+        confirmed = cast(memory_feed.RunRow, guest.copy())
+        confirmed["pid"] = 8400
+        confirmed["guest_run"] = memory_feed.ConfirmedGuestRun(target="mac-linux", attempt="guest-attempt")
+        del confirmed["guest_unconfirmed"]
+        self.assertEqual(memory_feed.step_key(confirmed), guest.get("key"))
+
+    def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
@@ -520,7 +808,29 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = cast(dict[str, object], json.loads(result.stdout))
         tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
-        table = cast(str, rendered["table"])
+        return tips, cast(str, rendered["table"])
+
+    def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
+        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(os, "cpu_count", return_value=4)):
+            page = memory_feed.reading()
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        rows = [*page["walk"], *page["waiters"]]
+        keys = [row.get("key") for row in rows]
+        self.assertEqual(len(set(keys)), len(rows))
+        for row in reversed(rows):
+            original = row.get("key")
+            cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
+            self.assertEqual(memory_feed.step_key(row), original)
+        # Two CI rows with no runner differ only by their cgroup.
+        with tempfile.TemporaryDirectory() as folder:
+            ci_keys = set[str]()
+            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
+                (cgroup := Path(folder) / name).mkdir()
+                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
+        self.assertEqual(len(ci_keys), 2)
+        tips, table = self.render_assignment_table(payload)
         matches = cast(list[tuple[str, str, str]],
             re.findall(r'<tr[^>]*data-tip="(row|wait):([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
         cells = {f"{kind}:{key}": body for kind, key, body in matches}
@@ -542,22 +852,23 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
-                        # A queued row names the machines that can take it, in a span that wraps in the column.
+                        # A queued row shows a dim icon for each machine that can take it.
                         self.assertEqual(machine, "")
-                        targets = " or ".join(cast(list[str], row["targets"]))
+                        targets = cast(list[str], row["targets"])
                         self.assertTrue(targets)
-                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
-                                            for target in cast(list[str], row["targets"]))
-                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
-                                      cell)
+                        self.assertEqual(machine_icons(cell), [("dim", target) for target in targets])
                     else:
                         self.assertTrue(machine)
-                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
+                        self.assertEqual([name for _, name in machine_icons(cell)], [machine])
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
-                    unit = str(row["unit"])
-                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
+                    title = cast(memory_feed.QueueRowTitle, row["title"])
+                    # A row with no unit shows the step after ": " in its name.
+                    name = str(row["name"])
+                    step = (title["step"] if row["unit"] not in ("", "—") else
+                            name.partition(": ")[2])
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":
                         self.assertNotIn("Uses  ", text)
@@ -631,7 +942,7 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
-    def test_parentless_owner_keeps_its_name_and_uses_the_repository_for_steps(self) -> None:
+    def test_parentless_owner_keeps_its_name_and_names_its_steps(self) -> None:
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         labels = {step.session_id: unit_labels.UnitLabels("solo")
                   for step in (*reading.view.running, *reading.view.waiting)}
@@ -643,7 +954,7 @@ process.stdout.write(JSON.stringify({
         for row in (running, waiting):
             self.assertEqual(row.get("showrunner"), "solo")
             self.assertEqual(row["unit"], "—")
-            self.assertTrue(row["name"].startswith("fixture-project "))
+            self.assertTrue(row["name"].startswith("solo: "))
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
         gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
@@ -662,18 +973,43 @@ process.stdout.write(JSON.stringify({
                     (proc / str(pid)).mkdir()
                     command = gate_command[:2] + arguments + (gate_command[2:] if expected.branch else [])
                     _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
-                    job = memory_feed.step_job("merge-gate", pid, proc)
+                    job = memory_feed.step_job("gate", pid, proc)
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, names)
                     self.assertTrue(notes.get("about"))
                     self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
-            self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
+            self.assertIsInstance(memory_feed.step_job("gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
             (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
             (["py", "targeted_test.py", "--full"], StepJob("test-all")),
             (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
             (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["gate.py", "--tests-only"], StepJob("test-all")),
+            (["gate.py", "--tests-only", "--module=a", "--module", "b"], StepJob("test-modules", modules=2)),
+            (["gate.py", "--nightly", "--merge-branch", "sdlc"], StepJob("test-nightly", branch="sdlc")),
+            (["gate.py", "--promote-only", "--merge-branch", "sdlc"], StepJob("promote", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["python3", "-mscripts.production.gate", "--nightly", "--merge-branch=sdlc"],
+             StepJob("test-nightly", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--promote-only", "--merge-branch", "sdlc"],
+             StepJob("promote", branch="sdlc")),
+            (["python3", "/repo/scripts/production/gate.py", "--affected"], StepJob("test-affected")),
+            (["gate.py", "--affected", "--full"], StepJob("test-all")),
+            (["gate.py", "--affected", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
+            (["python3", "-m", "scripts.production.gate", "--affected"], StepJob("test-affected")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["merge_gate.py", "--affected"], StepJob("test-affected")),
+            (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
             (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
@@ -724,14 +1060,14 @@ process.stdout.write(JSON.stringify({
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
-        for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
+        for step in ("test-affected", "gate", "nextest", "test", "t"):
             with self.subTest(step=step):
                 with AdmissionFixture() as fixture, fixture.loop_turn():
                     owner = fixture.proc.spawn()
                     sidecar = fixture.scope(owner)
                     request = replace(fixture.request(owner=owner, step=step), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
-                    phase = "suites:1" if step in ("targeted-test", "merge-gate") else "test:1"
+                    phase = "suites:1" if step in ("test-affected", "gate") else "test:1"
                     counter = progress_profile.ProgressCounter(phase, 7, 12)
                     progress_profile.publish_counter(sidecar, counter)
                     _ = fixture.run_pass()
@@ -780,7 +1116,7 @@ process.stdout.write(JSON.stringify({
             page = memory_feed.reading()
         row = cast(memory_feed.MacBuildRow, next(row for row in page["walk"] if row["pid"] == 710001))
         self.assertEqual(row["kind"], "mac-build")
-        self.assertEqual(row["name"], "hana nextest")
+        self.assertEqual(row["name"], "trunk: nextest")
         self.assertEqual(row["repository"], "hana")
         self.assertEqual(row["showrunner"], "—")
         self.assertEqual(row["machine"], "mac")
@@ -821,9 +1157,25 @@ process.stdout.write(JSON.stringify({
         wait, = page["waiters"]
         for row, pid in ((run, 50), (wait, 200)):
             with self.subTest(pid=pid):
-                self.assertEqual((row["pid"], row["name"]), (pid, "CI nextest"))
+                self.assertEqual((row["pid"], row["name"]), (pid, "hana CI: nextest"))
                 self.assertEqual(row.get("ci_label"), "hana CI")
                 self.assertEqual(row["title"], {"unit": "", "step": "hana CI"})
+
+    def test_a_waiting_ci_step_shows_its_job_start_and_age(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
+        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        started = base.explanation.now - 70 * 60
+        waiting = replace(base.view.waiting[0], ci_runner="hana-linux-2", session_name="unregistered session",
+                          ci_job_start=admission_records.JobStart(started))
+        reading = replace(base, view=replace(base.view, waiting=(waiting,)))
+        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
+        assert isinstance(reply, wire.ViewReply)
+        with mock.patch.object(admission_client, "view", return_value=reply.reading), \
+             mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            page = memory_feed.reading()
+        wait, = page["waiters"]
+        clock = datetime.fromtimestamp(started, UTC).strftime("%H:%M")
+        self.assertEqual(wait.get("job_start"), f"{clock} UTC · 1 h 10 min ago")
 
     def test_ci_feed_rejects_incomplete_label_templates(self) -> None:
         for template, valid in (("CI {runner} {job}", "CI hana-linux-2 compile"),
@@ -833,20 +1185,17 @@ process.stdout.write(JSON.stringify({
                 with self.subTest(template=template, job=job):
                     self.assertEqual(memory_feed.ci_step_label("hana-linux-2", job), expected)
 
-    def test_current_step_parts_check_the_configured_step_and_owner(self) -> None:
-        step = reservation_reading().view.running[0]
-        for unit, shown, expected in (("panes", "tests", "panes tests"),
-                                      ("panes", "—", "panes"),
-                                      ("—", "tests", "tests"),
-                                      ("—", "—", "unregistered session")):
-            with self.subTest(unit=unit, shown=shown):
-                identity = unit_labels.UnitLabels("caller", "", unit)
-                row = replace(step, unit=unit, project="")
-                names = StepNames({f"names.{row.step}": shown})
-                parts = memory_feed.current_step_parts(row, names, identity, {row.session_id: identity})
+    def test_row_parts_mark_the_staff_unit_owner(self) -> None:
+        for owner, what, unit, expected in (("panes", "tests", "panes", "panes: tests"),
+                                            ("panes", "—", "panes", "panes"),
+                                            ("caller", "tests", "panes", "caller: tests"),
+                                            ("—", "tests", "—", "unregistered session: tests"),
+                                            ("—", "—", "—", "unregistered session")):
+            with self.subTest(owner=owner, what=what):
+                parts = staff_names.row_parts(owner, what, unit)
                 self.assertEqual(staff_names.parts_text(parts), expected)
                 self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
-                                 ["panes"] if unit == "panes" else [])
+                                 ["panes"] if owner == unit == "panes" else [])
 
     def test_mac_work_uses_the_caller_after_an_unknown_owner(self) -> None:
         build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
@@ -854,7 +1203,21 @@ process.stdout.write(JSON.stringify({
         row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
                                       names=read_step_names(), slot_roots={}, slot_machine="private-mac-host")
         self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
-        self.assertEqual(row["name"], "hana nextest")
+        self.assertEqual(row["name"], "mac caller: nextest")
+
+    def test_a_placed_mac_run_keeps_its_stored_owner_and_what(self) -> None:
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement="episode/attempt")
+        for unit, name in (("cargo-liner", ""), ("", "cargo-liner")):
+            with self.subTest(unit=unit, name=name):
+                placed = admission_records.RunningStep("", name, "run", "/private/hana", 0,
+                    admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+                    pid=admission_records.PidNotRecorded(), unit=unit, mac_placement="episode/attempt",
+                    what="run 6 installs")
+                row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
+                                              unit_labels.UnitLabels(""), names=read_step_names(),
+                                              slot_roots={}, slot_machine="private-mac-host", placed_step=placed)
+                self.assertEqual(row["name"], "cargo-liner: run 6 installs")
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
@@ -881,7 +1244,7 @@ process.stdout.write(JSON.stringify({
                 run = next(row for row in page["walk"] if row.get("queued"))
                 self.assertEqual(run.get("showrunner"), "")
                 self.assertEqual(run.get("ci_label"), "unrelated display name")
-                self.assertEqual(run["name"], "CI nextest")
+                self.assertEqual(run["name"], "hana CI: nextest")
                 self.assertEqual(page["waiters"][0]["showrunner"], "")
                 self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
                 self.assertEqual(run["unit"], "")
@@ -890,7 +1253,13 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(ci.get("ci_label"))
                 for row in (run, page["waiters"][0], ci):
                     self.assertFalse(row.get("mac_text"))
+                for row in (run, ci):
                     self.assertFalse(row.get("runs_on"))
+                # bob, 2026-11-23: a waiting CI step can run only on the host, where the running CI row shows it.
+                host = FIXTURE_MACHINE
+                self.assertEqual(ci.get("machine"), host)
+                self.assertEqual(page["waiters"][0].get("targets"), [host])
+                self.assertEqual(page["waiters"][0].get("runs_on"), f"{host} only")
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 
@@ -1268,8 +1637,12 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              # Each cycle reads the clock once, then once more after its token dump request.
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
+              # Each cycle reads the clock for the loop, token dump, Mac source, and limits source.
+              mock.patch.object(time, "monotonic", side_effect=(
+                  0.0, 0.0, 0.0, 0.0,
+                  100.0, 100.0, 100.0, 100.0,
+                  301.0, 301.0, 301.0, 301.0,
+              )) as clock,
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
               mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
@@ -1280,6 +1653,7 @@ process.stdout.write(JSON.stringify({
             with self.assertRaises(FeedStopped):
                 _ = memory_feed.main([])
         self.assertEqual(queue.call_count, 3)
+        self.assertEqual(clock.call_count, 12)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
         # The second report read has the same text, so only the first one writes report.json.
@@ -1316,11 +1690,17 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=(
+                          0.0, 0.0, 0.0, 0.0,
+                          29.0, 29.0, 29.0, 29.0,
+                          # The third cycle has no token dump request.
+                          30.0, 30.0, 30.0,
+                      )) as clock,
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+                self.assertEqual(clock.call_count, 11)
 
     def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
         clock = [0.0]
@@ -1445,12 +1825,12 @@ process.stdout.write(JSON.stringify({
         memory = step.measured
         assert isinstance(memory, admission_records.MeasuredMemory)
         step = replace(step, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
-        for unit, shown, expected in (("widget", "tests", "widget tests"),
+        for unit, shown, expected in (("widget", "tests", "widget: tests"),
                                       ("widget", "—", "widget"),
-                                      ("—", "tests", "tests"),
+                                      ("—", "tests", "unregistered session: tests"),
                                       ("—", "—", "unregistered session")):
             with self.subTest(unit=unit, shown=shown):
-                row = replace(step, unit="", project=unit)
+                row = replace(step, unit="", project=unit, session_name="")
                 reading = memory_feed.read_swap((row,), {}, 6, StepNames({f"names.{row.step}": shown}))
                 assert isinstance(reading, memory_feed.SwapReading)
                 self.assertEqual([item["name"] for item in reading.rows if item["kind"] == "owner"], [expected])
@@ -1563,6 +1943,57 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
         self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
 
+    def test_swap_leaves_detached_tool_scope_remainder_unclassified(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        builds = self.cgroup("builds.slice", 4 * gib)
+        detached = "builds.slice/builds-detached.slice"
+        _ = self.cgroup(detached, 4 * gib)
+        parent = self.cgroup(detached + "/tool.scope", 4 * gib)
+        child = self.cgroup(detached + "/tool.scope/cargo.scope", gib)
+        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), pid=700001), pid=700001)
+        cargo = reservation_reading().view.running[0]
+        memory = cargo.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        cargo = replace(cargo, measured=replace(memory, anonymous_source=admission_records.ScopeSource(child, frozenset())))
+        with mock.patch.object(gate, "builds_slice_cgroup", return_value=builds):
+            names = read_step_names()
+            baseline = memory_feed.read_swap((cargo,), {}, 6, names)
+            swap = memory_feed.read_swap((tool, cargo), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        remainder, = (row for row in swap.rows if row["kind"] == "ungrouped")
+        self.assertEqual((remainder["name"], remainder["bytes"]), ("Unclassified groups", 3 * gib))
+        owner, = (row for row in swap.rows if row["kind"] == "owner")
+        self.assertEqual(owner["bytes"], gib)
+        self.assertEqual(swap.builds_ci, 4 * gib)
+
+    def test_swap_shows_both_cgroups_below_a_detached_tool_scope(self) -> None:
+        gib = admission_records.GIB
+        total = 3 * gib // 4
+        self.host_swap(2 * gib, total)
+        user = "user.slice/user-1000.slice/user@1000.service"
+        for group in ("user.slice", "user.slice/user-1000.slice", user):
+            _ = self.cgroup(group, total)
+        builds = user + "/builds.slice"
+        detached = builds + "/builds-detached.slice"
+        run = detached + "/builds-detached-r1.slice"
+        for group in (builds, detached, run):
+            _ = self.cgroup(group, total)
+        parent = self.cgroup(run + "/tool.scope", total)
+        _ = self.cgroup(run + "/tool.scope/first.scope", gib // 2)
+        _ = self.cgroup(run + "/tool.scope/second.scope", gib // 4)
+        tool = admission_records.RunningStep("", "tool", "unowned", str(parent), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), owner="tool", pid=700001), pid=700001)
+        names = read_step_names()
+        baseline = memory_feed.read_swap((), {}, 6, names)
+        swap = memory_feed.read_swap((tool,), {}, 6, names)
+        assert isinstance(swap, memory_feed.SwapReading)
+        self.assertEqual(swap, baseline)
+        self.assertEqual([(row["name"], row["bytes"]) for row in swap.rows if row["kind"] == "owner"],
+                         [("first", gib // 2), ("second", gib // 4)])
+
     def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
         for number in range(3):
@@ -1625,7 +2056,7 @@ process.stdout.write(JSON.stringify({
                   mock.patch.object(staff, "local_snapshot", return_value=members),
                   mock.patch.object(staff, "snapshot", return_value=members)):
                 run = fixture.run_owner()
-                first = fixture.request(run=run, step="merge-gate", need=6 * admission_records.GIB)
+                first = fixture.request(run=run, step="gate", need=6 * admission_records.GIB)
                 first = replace(first, identity=replace(first.identity, name="caller with no staff record"))
                 grant = only_admitted(fixture.server.handle_request(first))
                 if continuation:
@@ -1831,7 +2262,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
-            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler · nextest", True),
+            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler: nextest", True),
         )
         for reason, expected, has_blocker in reasons:
             with self.subTest(reason=reason):
@@ -1848,7 +2279,7 @@ process.stdout.write(JSON.stringify({
                 row = page["waiters"][-1 if has_blocker else 0]
                 self.assertIn(expected, row["reason"])
                 if isinstance(reason, placement.CargoFolderWait):
-                    self.assertEqual(row["name"], "fixture-project nextest")
+                    self.assertEqual(row["name"], "fixture: nextest")
                 if has_blocker:
                     self.assertNotIn("first step in line", row["reason"])
                 self.assertTrue(page["walk"])
@@ -1921,182 +2352,48 @@ process.stdout.write(JSON.stringify({
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 self.assertEqual(page["decoder_revision"], "after")
 
-    def test_repository_slot_wait_reaches_the_queued_table_without_memory_charge(self) -> None:
+    def test_retired_copy_wait_does_not_reach_the_queued_table(self) -> None:
         base = captured_reading()
         slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
             wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
             base.explanation.now - 60, "natedev",
             wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-            cloud_gate_stale_pushes=3, repository_slots=(slot,))
         with mock.patch.object(admission_client, "view", return_value=base):
             before = memory_feed.reading()
-        with mock.patch.object(admission_client, "view", return_value=reading):
-            after = memory_feed.reading()
-        row, = after["waiters"]
-        self.assertEqual(row.get("kind"), "repository-slot")
-        self.assertEqual(cast(memory_feed.WaitRow, row)["why"], "build slot")
-        self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
-        self.assertEqual(row["pid"], slot.owner.pid)
-        self.assertEqual(row["since"], slot.since)
-        self.assertEqual(cast(memory_feed.WaitRow, row)["need"], 0)
-        self.assertEqual(after["reserved"], before["reserved"])
-        self.assertEqual(after["used"], before["used"])
-        self.assertEqual(after["waiting"], 1)
-        self.assertEqual(row.get("about"), "Waits for a build slot")
+        for identity in (
+            slot.identity,
+            replace(slot.identity, step="gate", job=StepJob("test-all", unit="widget")),
+        ):
+            with self.subTest(step=identity.step):
+                reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
+                    cloud_gate_stale_pushes=3, repository_slots=(replace(slot, identity=identity),))
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    after = memory_feed.reading()
+                self.assertEqual(after["waiters"], before["waiters"])
+                self.assertEqual(after["reserved"], before["reserved"])
+                self.assertEqual(after["used"], before["used"])
+                self.assertEqual(after["waiting"], before["waiting"])
 
-        saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
-        with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):
-            waiting, = memory_feed.reading()["waiters"]
-        self.assertEqual(waiting.get("about"), "Runs every test module")
-        self.assertEqual(waiting.get("changes"), "no branch")
-
-    def copies_slot_page(self, command: str, *, source: str, unit: str = "",
-                         worktree_owner: str = "", recorded_step: str = "bash",
-                         recorded_unit: str = "", staff_id: str = "") -> memory_feed.MemoryPage:
-        session = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
-        base = captured_reading()
-        slot = wire.RepositorySlotRow(wire.Owner(2693113, "start"),
-            wire.Identity(staff_id or session, "hana", recorded_step, "bash", recorded_unit or session),
-            base.explanation.now - 60, "natedev",
-            wire.RepositorySlotWaiting("hana", (1, 2), 2, "slots.natedev.hana.max"))
-        proc = self.root / "proc"
-        write_process(proc, slot.owner.pid, start=slot.owner.start_time)
-        arguments = ["python3", "/fixture/scripts/copies/copies.py", "run", "--repo", source,
-                     "--commit", "HEAD" if unit == "startup" else "64baa5ef66"]
-        if unit == "startup":
-            arguments.extend(("--apply-uncommitted", source))
-        arguments.extend(("--", "bash", "-c", command))
-        _ = (proc / str(slot.owner.pid) / "cmdline").write_bytes(b"\0".join(map(os.fsencode, arguments)) + b"\0")
-        reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-            cloud_gate_stale_pushes=3, repository_slots=(slot,))
-        runner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "hana", staff.StaffRoot(),
-                               current_session=staff.StaffId("showrunner-session"))
-        director = staff.StaffRow(staff.StaffId(staff_id or "director"), "unit", unit or worktree_owner,
-                                  staff.ReportsTo(runner.id), staff.PresentWorktree(slot.machine,
-                                      self.root / "other-worktree" if staff_id else Path(source)),
-                                  current_session=staff.StaffId(session if unit and not staff_id else "other-session"))
-        record = staff.StaffSnapshot((runner, director) if unit or worktree_owner else (runner,))
-
-        def labels(ids: Iterable[str], _environment: Mapping[str, str]) -> dict[str, unit_labels.UnitLabels]:
-            return unit_labels.recorded_owner_labels(set(ids), record)
-
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(staff, "snapshot", return_value=record),
-              mock.patch.object(unit_labels, "unit_labels_for", side_effect=labels)):
-            return memory_feed.reading()
-
-    def test_wrapped_copies_waiters_name_the_first_verify_step_and_unit(self) -> None:
+    def test_wrapped_verify_command_names_the_first_call_in_feed_notes(self) -> None:
         verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
         cases = (
-            ("startup", "/home/natepiano/rust/hana_catalyst-startup",
-             f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'", "test hana"),
-            ("widget", "/home/natepiano/rust/widget-enhancements",
-             f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; " +
-             f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test", "test hana_diegetic"),
+            ("startup", f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'",
+             ("hana", "--filter", "name with spaces"), "verify test hana --filter 'name with spaces'"),
+            ("widget", f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; "
+             + f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test",
+             ("hana_diegetic",), "verify test hana_diegetic"),
         )
-        for unit, source, command, name in cases:
-            with self.subTest(unit=unit):
-                row, = self.copies_slot_page(command, source=source, unit=unit)["waiters"]
-                self.assertEqual(row["name"], name)
-                self.assertEqual(row["unit"], unit)
-                self.assertEqual(row["showrunner"], "hana")
-
-    def test_wrapped_copies_waiter_without_verify_names_the_script(self) -> None:
-        for unit, staff_id in (("row-check", "staff-row-check"), ("", "")):
-            with self.subTest(unit=unit):
-                row, = self.copies_slot_page("env MODE=check direnv exec . zsh -c 'python3 -u /fixture/check_rows.py'",
-                    source="/fixture/row-check", unit=unit, staff_id=staff_id)["waiters"]
-                self.assertEqual(row["name"], "check_rows.py")
-                self.assertEqual(row["unit"], unit)
-
-    def test_wrapped_copies_waiters_resolve_a_named_session_or_worktree(self) -> None:
-        session, = self.copies_slot_page(
-            "bash /fixture/verify.sh --session-dir /fixture/sessions/startup test --filter 'a b' hana",
-            source="/fixture/hana_catalyst-startup", unit="startup", staff_id="staff-startup")["waiters"]
-        self.assertEqual(session["name"], "test hana")
-        self.assertEqual(session["unit"], "startup")
-        worktree, = self.copies_slot_page("sh /fixture/check-rows.sh", source="/fixture/widget-enhancements",
-                                        worktree_owner="widget")["waiters"]
-        self.assertEqual(worktree["unit"], "widget")
-
-    def test_legacy_slot_commands_skip_shell_setup(self) -> None:
-        for setup in ("cd /fixture && ", "exec -a label ", "command -- ", "umask 077 && "):
-            with self.subTest(setup=setup):
-                row, = self.copies_slot_page(setup + "python3 /fixture/check.service.sh",
-                                             source="/fixture/row-check")["waiters"]
-                self.assertEqual(row["name"], "check.service.sh")
-
-    def test_legacy_slot_unit_uses_staff_when_session_dir_has_a_variable(self) -> None:
-        row, = self.copies_slot_page(
-            'bash /fixture/verify.sh --session-dir "$UNIT_SESSION_DIR" test --filter "a b" hana',
-            source="/fixture/widget-enhancements", worktree_owner="widget")["waiters"]
-        self.assertEqual(row["name"], "test hana")
-        self.assertEqual(row["unit"], "widget")
-
-    def test_slot_page_prefers_the_recorded_step_and_current_staff_name(self) -> None:
-        row, = self.copies_slot_page("python3 /fixture/unrelated.py",
-            source="/fixture/organon", unit="organon", recorded_step="test hana", staff_id="staff-organon",
-            recorded_unit="organon-unit")["waiters"]
-        self.assertEqual(row["name"], "test hana")
-        self.assertEqual(row["unit"], "organon")
-
-    def test_copies_sends_the_wrapped_step_and_staff_unit_in_the_slot_request(self) -> None:
-        from scripts.copies import copies
-
-        owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
-        source = self.root / "repository"
-        pool = private_slot_config(self.root / "slot-request", repository="hana")
-        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
-                               current_session=staff.StaffId("runner-session"))
-        member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
-                                current_session=staff.StaffId("startup-session"))
-        cases = (
-            ('env MODE=test bash /fixture/verify.sh test --filter "a b" hana', "test hana", GATE_JOB_NOT_RECORDED,
-             admission_records.VerifyCall("test", "verify test --filter 'a b' hana", 1, 1), "Runs the selected tests"),
-            ('env MODE=test bash /fixture/verify.sh --session-dir /fixture/session final hana --local "check local code"',
-             "final hana", GATE_JOB_NOT_RECORDED,
-             admission_records.VerifyCall("final", "verify final hana --local 'check local code'", 1, 1),
-             "Checks the workspace targets and runs the selected tests"),
-            ('python3 /fixture/merge_gate.py --tests-only --full', "test-all", StepJob("test-all"),
-             admission_records.NotVerifyCall(), "Runs every test module"),
-        )
-        for command, step, job, verify, about in cases:
-            with (self.subTest(step=step),
-                  mock.patch.dict(os.environ, {
-                      "CONF_DIR": str(pool.settings.parent), "CLAUDE_CODE_SESSION_ID": runner.current_session}),
-                  mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
-                  mock.patch.object(copies, "source_commit", return_value="abc"),
-                  mock.patch.object(copies, "slot_source", return_value=source),
-                  mock.patch.object(copies, "main_checkout", return_value=source),
-                  mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-                  mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
-                with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
-                    with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
-                                             ["bash", "-c", f"cd . && {command}"]):
-                        self.fail("The slot is full")
-                send.assert_called_once()
-                request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
-                self.assertEqual(request.root, str(pool.slots.resolve()))
-                saved = wire.parse_request(wire.encode_request(request))
-                assert isinstance(saved, wire.RepositorySlotRequest)
-                self.assertEqual(saved.identity.step, step)
-                self.assertEqual(saved.identity.session_id, owner)
-                self.assertEqual(saved.identity.unit, "")
-                self.assertEqual(saved.identity.folder, str(source))
-                self.assertEqual(saved.identity.job, job)
-                self.assertEqual(saved.identity.verify, verify)
-                slot = wire.RepositorySlotRow(saved.owner, saved.identity, saved.since, saved.machine,
-                    wire.RepositorySlotWaiting("hana", (1,), 1, "slots.fixture.hana.max"))
-                reading = replace(cloud_reading(captured_reading()), repository_slots=(slot,), cloud=())
-                with (mock.patch.object(admission_client, "view", return_value=reading),
-                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner, member)))):
-                    row, = memory_feed.reading()["waiters"]
-                self.assertEqual(row.get("about"), about)
-                if isinstance(verify, admission_records.VerifyCall):
-                    self.assertEqual(row.get("verify"),
-                        {"verb": verify.verb, "call": verify.call, "position": 1, "total": 1, "step": step})
-
+        for unit, command, arguments, call in cases:
+            with (self.subTest(unit=unit),
+                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                assert isinstance(name, memory_feed.QueueRowName)
+                step = f"test {arguments[0]}"
+                row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
+                self.assertEqual(row["title"], {"unit": unit, "step": step})
+                self.assertEqual(memory_feed.call_notes(facts, name).get("verify"),
+                    {"verb": "test", "call": call, "position": 1, "total": 1, "step": step})
+                parse.assert_called_once_with("test", arguments)
 
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
@@ -2123,8 +2420,6 @@ process.stdout.write(JSON.stringify({
             with self.subTest(program=program):
                 self.assertEqual(memory_feed.QueueRowName.recorded_program(program), program)
         self.assertIsInstance(recorded_step("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", read_step_names()), NoNamedStep)
-        row, = self.copies_slot_page("python3 -c pass", source="/fixture/hana")["waiters"]
-        self.assertEqual(row["name"], "hana build")
 
     def test_every_recorded_build_step_has_its_own_name(self) -> None:
         script = Path(__file__).resolve().parents[1] / "direct/verify.sh"
@@ -2172,43 +2467,21 @@ process.stdout.write(JSON.stringify({
         slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
             wire.Identity("", "", "", ""), known.since + 1, "fixture",
             wire.RepositorySlotWaiting("", (1,), 1, "fixture"))
-        for step, folder, names in (("", "", []), (parse.step_name(["bash", "-c", ":"]), "/", ["bash"]),
-                                    ("unknown", "/", ["unknown"])):
+        for step, folder, names in (("", "", []), (parse.step_name(["bash", "-c", ":"]), "/", ["fixture: bash"]),
+                                    ("unknown", "/", ["fixture: unknown"])):
             with self.subTest(step=step, folder=folder):
                 missing = replace(known, pid=known.pid + 1, step=step, project="", folder=folder)
                 reading = cloud_reading(replace(base, view=replace(base.view, waiting=(missing, known))))
                 with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(slot,))):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["waiters"]],
-                                 [*names, "fixture-project check", "route-two"])
+                                 [*names, "fixture: check", "route-two"])
 
     def test_blank_or_unrelated_configured_name_uses_the_verb(self) -> None:
         for text in ("", "umask"):
             with self.subTest(text=text):
                 _ = write_config_fixture(self.root / "build_steps.conf", f"names.test={text}\n")
                 self.assertEqual(recorded_step("test", read_step_names()), "test")
-
-    def test_unresolved_slot_owner_does_not_take_the_worktree_unit(self) -> None:
-        base = captured_reading()
-        source = str(self.root / "other")
-        member = staff.StaffRow(staff.StaffId("other"), "unit", "other", staff.StaffRoot(),
-            staff.PresentWorktree("fixture", Path(source)), current_session=staff.StaffId("other-session"))
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("missing-id", "", "check", source), base.explanation.now, "fixture",
-            wire.RepositorySlotWaiting("hana", (1,), 1, "fixture"))
-        proc = self.root / "proc"
-        write_process(proc, slot.owner.pid, start=slot.owner.start_time)
-        argv = ("python3", "/fixture/scripts/copies/copies.py", "run", "--repo", source, "--", "bash", "check.sh")
-        _ = (proc / str(slot.owner.pid) / "cmdline").write_bytes(b"\0".join(map(os.fsencode, argv)) + b"\0")
-        reading = replace(cloud_reading(base), cloud=())
-        for reference, folder, expected in (("missing-id", source, ""), ("other-session", source, ""),
-                                            ("", source, ""), ("", "bash", "other")):
-            with (self.subTest(reference=reference, folder=folder),
-                  mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,)))):
-                request = replace(slot, identity=replace(slot.identity, session_id=reference, folder=folder))
-                with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(request,))):
-                    row, = memory_feed.reading()["waiters"]
-                self.assertEqual(row["unit"], expected)
 
     def test_recorded_queue_rows_always_have_a_name(self) -> None:
         _ = write_config_fixture(self.root / "build_steps.conf", "names.test=\n")
@@ -2242,30 +2515,25 @@ process.stdout.write(JSON.stringify({
                 cloud = cloud_reading(replace(read, view=replace(read.view, waiting=(wait, token))))
                 cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(row.identity, step=step))
                     for row in cloud.cloud))
-                slot_step = "check" if step in (make, bash, cxx) else step
-                slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-                    wire.Identity("", "", slot_step, folder), inputs.now, "fixture",
-                    wire.RepositorySlotWaiting(repository, (1,), 1, "fixture"))
                 build = queue_view.MacBuild(90082, folder, inputs.now - 30, f"cargo {step}", repository)
-                with (mock.patch.object(admission_client, "view", return_value=replace(cloud, repository_slots=(slot,))),
+                with (mock.patch.object(admission_client, "view", return_value=cloud),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(inputs.now, (build,)))):
                     page = memory_feed.reading()
-                by_pid = {row["pid"]: row["name"] for row in (*page["walk"], *page["waiters"])
-                          if isinstance(row["pid"], int)}
+                # Each row shows `<owner>: <what>`; this test checks the "what" part.
+                by_pid = {row["pid"]: row["name"].rpartition(codec.ROW_SEPARATOR)[2]
+                          for row in (*page["walk"], *page["waiters"]) if isinstance(row["pid"], int)}
                 if not repository:
                     expected_names = {pid: step for pid in (50, 101, 200, 201, 900)}
-                    expected_names[slot.owner.pid] = slot_step
                     for pid, name in expected_names.items():
                         with self.subTest(pid=pid):
                             self.assertIn(pid, by_pid)
                             self.assertEqual(by_pid[pid], name)
-                self.assertTrue({50, 101, 200, 201, 900, 700001, 700002, 701001, 90082} <= by_pid.keys())
+                self.assertTrue({50, 101, 200, 201, 900, 700001, 700002, 90082} <= by_pid.keys())
                 self.assertNotIn(legacy.run.pid, by_pid)
                 shown_reserved = sum(row["reserved"] for row in page["walk"] if "reserved" in row)
                 self.assertEqual(page["reserved"], shown_reserved + legacy.bytes / gib)
                 if step == "unrecognized":
                     self.assertEqual(by_pid[101], f"{repository} build")
-                    self.assertEqual(by_pid[701001], f"{repository} build")
                 if step in ("test", "mend"):
                     self.assertEqual(by_pid[101], step)
                 for row in (*page["walk"], *page["waiters"]):
@@ -2410,7 +2678,7 @@ process.stdout.write(JSON.stringify({
         """Build three rows from their recorded placement routes."""
         from scripts.build_targets import targets
         from scripts.build_targets.target_config import SshTarget
-        from scripts.mac_test import eligibility
+        from scripts.mac_test import claim_state, eligibility, mac_test
 
         reading = queued_reading(captured_reading(host=admission_records.HostMemory(
             0, 60 * admission_records.GIB)), ("build", "mend", "direct"))
@@ -2421,10 +2689,16 @@ process.stdout.write(JSON.stringify({
                      for index, (row, step, route) in enumerate(zip(
                          reading.view.waiting[:3], ("build", "mend", "build"), routes, strict=True)))
         reading = replace(reading, view=replace(reading.view, waiting=rows))
-        job = targets.RunningJob("nextest hana_catalyst", datetime.now(UTC), targets.NotSeenIdle())
+        # The Mac fit note reads the claim folder, so the running job has its claim there too.
+        record: claim_state.ProcessBoundClaim = {
+            "claim_id": "fixture", "episode": "fixture", "attempt": "fixture", "submitting_session": "", "pid": 4242,
+            "proc_start": "1", "what": "nextest hana_catalyst", "worktree": "/fixture/hana_catalyst",
+            "since": datetime.now(UTC).isoformat()}
+        claim = claim_state.HeldClaim(RepositoryScope("hana_catalyst"), self.root / "claim.json", record)
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"),
-                     (targets.Running((job,)),), (), eligibility.NO_BACKOFF),)
+                     (targets.Running((targets.running_job(claim),)),), (claim,), eligibility.NO_BACKOFF),)
         with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(mac_test, "run_is_live", return_value=True),
               mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
               mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
             return memory_feed.reading()
@@ -2453,6 +2727,40 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("runs_on"), "natedev only")
                 self.assertEqual(row.get("mac_text"), "")
                 self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
+
+    def test_verify_wait_at_the_natedev_limit_keeps_its_mac_route(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
+        from scripts.mac_test import eligibility
+
+        with PlacementFixture() as fixture:
+            fixture.configure(slot_gap_seconds=60)
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
+            _ = fixture.run_pass()
+            fixture.clock.advance(1)
+            step = placement_request(fixture)
+            _ = publish_candidate(fixture, step, placement.TemporaryExclusion("busy"))
+            request = replace(step,
+                identity=replace(step.identity, verify=admission_records.VerifyCall("test", "verify test", 1, 1)),
+                constraints=replace(step.constraints, candidates=(local_candidate(fixture), *step.constraints.candidates)))
+            reply, = fixture.connect(request).replies()
+            assert isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait), reply
+            reason = reply.wait.reason
+            self.assertEqual(reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason,
+                             admission_records.RunLimitWait(0, 0, "fixture", fixture.server.host))
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            job = targets.RunningJob("nextest fixture", datetime.now(UTC), targets.NotSeenIdle())
+            snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
+            with (mock.patch.object(admission_client, "view", return_value=view.reading),
+                  mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
+                  mock.patch.object(build_targets, "step_policy",
+                                    return_value=eligibility.KnownRepository("fixture", str(fixture.root)))):
+                page = memory_feed.reading()
+            row, = page["waiters"]
+            self.assertEqual(row["pid"], request.owner.pid)
+            self.assertEqual(row.get("runs_on"), "natedev or Mac")
+            self.assertEqual(row.get("targets"), ["natedev", "mac"])
 
     def verify_call_page(self) -> memory_feed.MemoryPage:
         """Read the verify facts from admissions through the private service socket."""
@@ -2582,10 +2890,10 @@ process.stdout.write(JSON.stringify({
              "cargo check --manifest-path=Cargo.toml"),
             (("cargo", "test", "-v", "-v"), "cargo test · -v ×2"),
             (("cargo", "test", "--", "--skip", "first", "--skip", "second", "hana"), "cargo test -- hana · 2 skips"),
-            (("py", "merge_gate.py", "--tests-only", "--module", "one", "--module=two"),
-             "merge_gate.py --tests-only · 2 modules"),
-            (("py", "merge_gate.py", "--checkout", "/work/project/", "--tests-only", "--module", "suite/module"),
-             "merge_gate.py --checkout project --tests-only --module suite/module"),
+            (("py", "gate.py", "--tests-only", "--module", "one", "--module=two"),
+             "gate.py --tests-only · 2 modules"),
+            (("py", "gate.py", "--checkout", "/work/project/", "--tests-only", "--module", "suite/module"),
+             "gate.py --checkout project --tests-only --module suite/module"),
         )
         for arguments, expected in cases:
             with self.subTest(arguments=arguments):
@@ -2739,6 +3047,14 @@ process.stdout.write(JSON.stringify({
             with self.subTest(reason=type(reason).__name__):
                 self.assertEqual(memory_feed.wait_why(reason), expected)
 
+    def test_builds_page_shows_the_repository_run_limit(self) -> None:
+        wait = admission_records.RunLimitWait(2, 2, "claude_commands", "natedev")
+        reading = with_wait_reason(reservation_reading(), wait)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        row = cast(memory_feed.MemoryWaitRow, page["waiters"][0])
+        self.assertEqual(row["why"], "2 of 2 claude_commands runs on natedev")
+
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")
         _ = write_idle_config(self.root)
@@ -2762,8 +3078,11 @@ process.stdout.write(JSON.stringify({
                     saved = cast(dict[str, object], json.loads(path.read_text()))
                     saved.update(state=state, until=now + 300)
                     _ = path.write_text(json.dumps(saved))
+                live = write_live_mac_state(self.root / "mac-state", block=state == "idle",
+                                            unreachable_until=now + 300 if state == "unreachable" else 0)
                 with mock.patch.object(admission_client, "view", return_value=reading), \
-                     mock.patch.object(time, "time", return_value=now):
+                     mock.patch.object(time, "time", return_value=now), \
+                     mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
                     page = memory_feed.reading()
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 self.assertEqual(payload["mac_idle_alert"], expected)
@@ -2783,6 +3102,9 @@ process.stdout.write(JSON.stringify({
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"), (block,), (), eligibility.NO_BACKOFF),
                      targets.TargetSnapshot(LocalTarget("natedev", "linux"), (targets.Free(),), (), eligibility.NO_BACKOFF))
         labels = {"mac-owner": unit_labels.UnitLabels("director", "hana", "research")}
+        background = limits_view.Background(frozenset({"https://example.invalid/team/hana"}),
+                                            limits_view.Metric("money", None, None, "USD"))
+        mac = limits_view.MacReading(limits={"hana": 1}, claims_readable=True)
         for admission_error, expected in (("", ""), ("fixture down", "MAC IDLE WATCH: admission query failed: fixture down.")):
             with self.subTest(admission_error=admission_error):
                 path = write_idle_alert(self.root / "mac-idle", now)
@@ -2794,13 +3116,41 @@ process.stdout.write(JSON.stringify({
                      mock.patch.object(target_availability, "read_snapshots", return_value=snapshots), \
                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels), \
                      mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana")):
-                    page = memory_feed.reading()
+                    page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: mac)
                 self.assertEqual(page["mac_idle_alert"], expected)
+                limits = page.get("build_limits")
+                assert limits is not None
+                self.assertEqual(limits.mac.state, "Held")
+                self.assertEqual([(row.name, row.mac.used, row.mac.limit) for row in limits.repositories],
+                                 [("hana", 0, 1)])
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
                 self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
                 self.assertEqual({tuple(waiter.get("targets", ())) for waiter in page["waiters"]}, {("natedev", "mac")})
+
+    def test_feed_carries_saved_machine_facts_into_build_limits(self) -> None:
+        reading = queued_reading(captured_reading(), ())
+        now = reading.explanation.now
+        background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None, "USD"))
+        saved: machine_facts.SavedFacts = {"version": machine_facts.VERSION, "written": now, "machines": {
+            "natedev": machine_facts.facts("read", load=8.04, cpus=32),
+            "mac": machine_facts.facts("read", link_ms=3.2, load=1.5, cpus=12, battery={"percent": 85, "mains": True}),
+            "aws": machine_facts.facts("no_box")}}
+
+        def limits() -> limits_view.BuildLimits:
+            with mock.patch.object(admission_client, "view", return_value=reading), \
+                 mock.patch.object(time, "time", return_value=now):
+                page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: None)
+            shown = page.get("build_limits")
+            assert shown is not None
+            return shown
+
+        self.assertEqual(limits().mac.facts, "facts not sampled")
+        _ = (self.root / "machine-facts.json").write_text(json.dumps(saved))
+        shown = limits()
+        self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
+                         ("load 8.0/32", "link 3 ms · load 1.5/12 · battery 85% · not in use", "no box running"))
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -2840,8 +3190,8 @@ process.stdout.write(JSON.stringify({
     def gate_job_page(self, step: str, argv: tuple[str, ...], *,
                       running_pid: int | admission_records.PidNotRecorded = 700000,
                       showrunner: bool = False, unit_known: bool = True,
-                      job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
-                      ) -> memory_feed.MemoryPage:
+                      job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
+                      owner: unit_labels.UnitLabels | None = None) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
         config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
         _ = shutil.copyfile(config, self.root / "build_steps.conf")
@@ -2860,7 +3210,7 @@ process.stdout.write(JSON.stringify({
                     _ = cmdline.write_bytes(("\0".join(argv) + "\0").encode())
                 else:
                     cmdline.unlink(missing_ok=True)
-        owner = (unit_labels.make_labels("sdlc", unit_labels.RunsProduction("sdlc"), unit_labels.NoDirector())
+        owner = owner or (unit_labels.make_labels("sdlc", unit_labels.RunsProduction("sdlc"), unit_labels.NoDirector())
                  if showrunner else unit_labels.make_labels("impl", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                                             unit_labels.UnderDirector("devtools", "devtools", "")))
         labels = {session: owner for session in
@@ -2869,20 +3219,31 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             return memory_feed.reading()
 
+    def test_unreadable_gate_rows_strip_the_showrunner_prefix_on_local_and_cloud_rows(self) -> None:
+        merge_staff = unit_labels.make_labels("sdlc-merge-gate", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                             unit_labels.DirectsUnit("sdlc-merge-gate"))
+        page = self.gate_job_page("gate", (), owner=merge_staff)
+        rows = [*(row for row in page["walk"] if row.get("queued") or row.get("kind") == "cloud"),
+                *(row for row in page["waiters"] if row.get("kind") in (None, "cloud"))]
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            with self.subTest(pid=row["pid"]):
+                self.assertEqual(row["name"], "merge-gate")
+                self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), "merge-gate")
+
     def test_gate_modes_and_jobs_show_approved_names_on_local_and_cloud_rows(self) -> None:
         approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
                     "promote", "CI", "toolchain trial"}
         modes = {mode.value for mode in SuiteMode}
-        self.assertEqual(modes, memory_feed.GATE_STEPS)
+        self.assertEqual(modes | {"merge-gate", "targeted-test"}, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
-            program = mode.replace("-", "_") + ".py"
-            cases = ((), ("--full",), ("--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
+            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
                 ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
             for arguments in (*cases, memory_feed.CommandUnreadable("missing cmdline"), admission_records.PidNotRecorded()):
                 with self.subTest(mode=mode, arguments=arguments):
-                    argv = ("python3", program, *arguments) if isinstance(arguments, tuple) else ()
+                    argv = ("python3", "gate.py", *arguments) if isinstance(arguments, tuple) else ()
                     page = self.gate_job_page(mode, argv,
                         running_pid=arguments if isinstance(arguments, admission_records.PidNotRecorded) else 700000)
                     job = command_job(argv)
@@ -2895,7 +3256,7 @@ process.stdout.write(JSON.stringify({
                     local_wait, = [row for row in page["waiters"] if not row.get("kind")]
                     cloud_wait, = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                     for row in (local_run, cloud_run, local_wait, cloud_wait):
-                        self.assertEqual(row["name"], "devtools " + named if named else "devtools")
+                        self.assertEqual(row["name"], "devtools: " + named if named else "devtools")
                         self.assertEqual(row["title"]["step"], named or "devtools")
                         self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
                         about = names.about(job) if isinstance(job, StepJob) else "Runs a merge or test job"
@@ -2904,36 +3265,29 @@ process.stdout.write(JSON.stringify({
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
                   "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
-        page = self.gate_job_page("merge-gate", copied)
+        for step in ("gate", "merge-gate"):
+            with self.subTest(step=step):
+                page = self.gate_job_page(step, copied)
+                local, = [row for row in page["walk"] if row.get("queued")]
+                waiting, = [row for row in page["waiters"] if not row.get("kind")]
+                for row in (local, waiting):
+                    self.assertIn(row["title"]["step"], approved)
+                    self.assertEqual(row["name"], "devtools: test all")
+                    self.assertEqual(row.get("about"), "Runs every test module")
+
+        page = self.gate_job_page("gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
         waiting, = [row for row in page["waiters"] if not row.get("kind")]
         for row in (local, waiting):
-            self.assertIn(row["title"]["step"], approved)
-            self.assertEqual(row["name"], "devtools test all")
+            self.assertEqual(row["name"], "devtools: test all")
             self.assertEqual(row.get("about"), "Runs every test module")
-
-        page = self.gate_job_page("merge-gate", (), job=StepJob("test-all"))
-        local, = [row for row in page["walk"] if row.get("queued")]
-        waiting, = [row for row in page["waiters"] if not row.get("kind")]
-        for row in (local, waiting):
-            self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Runs every test module")
-
-        source = Path("/repo/devtools")
-        caller = SlotCaller("director", "sdlc", source, copied[6:], "test-all")
-        self.assertEqual(caller.step, "test-all")
-        for step in ("merge_gate.py", "test-all"):
-            slot, = self.copies_slot_page(" ".join(caller.command), source=str(source),
-                worktree_owner="devtools", recorded_step=step)["waiters"]
-            self.assertIn(slot["title"]["step"], approved)
-            self.assertEqual(slot["name"], "test all")
 
         base = captured_reading()
         inputs = base.explanation.decided_from
         policy = admission_policy_fixture()
         owner = staff.StaffRow(staff.StaffId("director"), "unit", "devtools", staff.StaffRoot(),
                                current_session=staff.StaffId("director-session"))
-        for step, expected in (("test-all", "test all"), ("merge-gate", "devtools")):
+        for step, expected in (("test-all", "test all"), ("gate", "devtools")):
             with self.subTest(ended_step=step):
                 run = LiveBuildRun(101, "101", inputs.now - 15)
                 reservation = memory_tests.ProgressKeepAsideTests.reservation(step, need=admission_records.GIB)
@@ -2950,28 +3304,30 @@ process.stdout.write(JSON.stringify({
 
         from scripts.aws_target.aws_trial import PAIRED_TRIAL_JOB
 
-        for unit_known, name in ((True, "devtools test named"), (False, "test named")):
+        # Without a staff unit the stored caller name is the owner, and the title shows the whole name.
+        for unit_known, name, title in ((True, "devtools: test named", "test named"),
+                                        (False, "{caller}: test named", "{caller}: test named")):
             with self.subTest(paired_trial_unit_known=unit_known):
                 trial = self.gate_job_page(PAIRED_TRIAL_JOB.step, (), unit_known=unit_known, job=PAIRED_TRIAL_JOB)
-                for rows in (trial["walk"], trial["waiters"]):
+                for rows, caller in ((trial["walk"], "route-one"), (trial["waiters"], "route-two")):
                     row, = [row for row in rows if row.get("kind") == "cloud"]
-                    self.assertIn(row["title"]["step"], approved)
-                    self.assertEqual(row["name"], name)
+                    self.assertEqual(row["title"]["step"], title.format(caller=caller))
+                    self.assertEqual(row["name"], name.format(caller=caller))
                     self.assertEqual(row.get("about"), "Runs 1 named test modules")
                     self.assertEqual(row.get("changes"), "no branch")
 
-        integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
+        integration = self.gate_job_page("gate", ("python3", "gate.py"), showrunner=True)
         for rows in (integration["walk"], integration["waiters"]):
             row, = [row for row in rows if row.get("kind") == "cloud"]
-            self.assertEqual(row["name"], "showrunner integrate")
+            self.assertEqual(row["name"], "sdlc: integrate")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
-        page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))
+        page = self.gate_job_page("gate", ("python3", "scripts/production/gate.py", "--tests-only", "--full"))
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
-        self.assertEqual(row["name"], "devtools test all")
+        self.assertEqual(row["name"], "devtools: test all")
         self.assertEqual(row.get("about"), "Runs every test module")
         self.assertEqual(row.get("changes"), "no branch")
-        self.assertEqual(row.get("call"), "merge_gate.py --tests-only --full")
+        self.assertEqual(row.get("call"), "gate.py --tests-only --full")
 
     def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:
         """Use the same owner across the local, Mac, and cloud rows."""
@@ -2995,9 +3351,9 @@ process.stdout.write(JSON.stringify({
     def test_step_owners_name_every_machine_and_both_tables(self) -> None:
         for owner, name in (
             (unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
-                unit_labels.UnderDirector("research", "research", "")), "research nextest"),
+                unit_labels.UnderDirector("research", "research", "")), "research: nextest"),
             (unit_labels.make_labels("hana", unit_labels.RunsProduction("hana"), unit_labels.NoDirector()),
-                "showrunner nextest"),
+                "hana: nextest"),
         ):
             with self.subTest(role=owner.role):
                 page = self.owner_machine_page(owner)
@@ -3029,7 +3385,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(len({row.get("key") for row in (*running, *waiting)}), 8)
                 self.assertEqual(page["reserved"], 11.0)
                 self.assertEqual((running[1]["name"], running[1].get("ci_label")),
-                                 ("CI nextest", "hana CI"))
+                                 ("hana CI: nextest", "hana CI"))
                 self.assertEqual((running[2].get("caller"), running[2].get("owner_text")), (held, held))
                 for row in (running[0], *waiting):
                     with self.subTest(pid=row["pid"]):
@@ -3037,9 +3393,8 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual((row["unit"], row.get("showrunner")), ("fixture unit", "fixture showrunner"))
                 self.assertEqual(waiting[0]["name"], "fixture unit")
                 self.assertEqual(waiting[0]["title"]["step"], "fixture unit")
-                self.assertEqual(waiting[2]["name"], "fixture unit")
-                for cloud_row in (running[0], waiting[1]):
-                    self.assertEqual(cloud_row["name"], "fixture unit nextest")
+                for cloud_row in (running[0], *waiting[1:]):
+                    self.assertEqual(cloud_row["name"], "fixture unit: nextest")
                     self.assertEqual(cloud_row["title"], {"unit": "fixture unit", "step": "nextest"})
 
     def caller_selection_page(self, *, stored_caller: str | None = None,
@@ -3051,14 +3406,14 @@ process.stdout.write(JSON.stringify({
         worker = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "held caller", staff.StaffRoot(),
                                 current_session=staff.StaffId("new-worker-session"))
         absent = admission_records.EndedStepFactNotRecorded()
-        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+        facts = admission_records.EndedStepFacts("gate", admission_records.PackageNotRecorded(),
                                                   absent, absent, worker.id, caller_name="$CALLER")
         retained = admission_records.BetweenStepsSlot(LiveBuildRun(301, "301", now - 5), "retained",
                                                       admission_records.GIB, now + 10, facts)
         continued = replace(retained, run=LiveBuildRun(302, "302", now - 5), reservation="continued",
                             identity=replace(facts, staff_id=admission_records.NoEndedStepStaff()))
         ci = replace(inputs.running[0], ci_runner="hana-linux-2", session_name="—")
-        local = replace(initial.view.waiting[0], session_name="recorded local", step="merge-gate")
+        local = replace(initial.view.waiting[0], session_name="recorded local", step="gate")
         members = staff.StaffSnapshot((worker,))
         reservations = inputs.reservations
         if stored_caller is not None:
@@ -3075,15 +3430,17 @@ process.stdout.write(JSON.stringify({
             slots=(retained, admission_records.ContinuationSlot(continued, "next"))), admission_policy_fixture())
         cloud = cloud_reading(replace(reading, view=replace(reading.view, waiting=(local,))))
         cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
-            row.identity, name="recorded cloud", step="merge-gate")) for row in cloud.cloud))
-        slot = wire.RepositorySlotRow(wire.Owner(303, "303"),
-            wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"),
-            now - 30, "natedev", wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+            row.identity, name="recorded cloud", step="gate")) for row in cloud.cloud))
+        running_cloud, waiting_cloud = cloud.cloud
+        extra_wait = replace(waiting_cloud, owner=wire.Owner(303, "303"), since=now - 30,
+                             identity=wire.Identity("slot-session", "recorded slot", "gate", "/private/widget"))
         if stored_caller is not None:
             cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
                 row.identity, session_id=worker.current_session, name=stored_caller, step="nextest")) for row in cloud.cloud))
-            slot = replace(slot, identity=replace(slot.identity, session_id=worker.id, name=stored_caller))
-        message = wire.encode_reply(wire.ViewReply(replace(cloud, repository_slots=(slot,))))
+            extra_wait = replace(extra_wait, identity=replace(
+                extra_wait.identity, session_id=worker.current_session, name=stored_caller, step="nextest"))
+            running_cloud, waiting_cloud = cloud.cloud
+        message = wire.encode_reply(wire.ViewReply(replace(cloud, cloud=(running_cloud, waiting_cloud, extra_wait))))
         mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
                                    queue_view.MacTesting(305), admission_records.GIB)
 
@@ -3105,7 +3462,7 @@ process.stdout.write(JSON.stringify({
         _ = (self.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown"), ci=True)
         mac, = [row for row in page["walk"] if row.get("kind") == "mac-build"]
-        self.assertEqual(mac["name"], "CI nextest")
+        self.assertEqual(mac["name"], "hana CI: nextest")
         self.assertEqual(mac.get("ci_label"), "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac["title"]["step"], "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac.get("showrunner"), "")
@@ -3118,15 +3475,48 @@ process.stdout.write(JSON.stringify({
                 row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
                                               unit_labels.UnitLabels("unknown"), names=read_step_names(),
                                               slot_roots={}, slot_machine="private-mac-host")
-                self.assertEqual(row["name"], "CI nextest")
+                self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
+
+    def test_a_mac_build_with_no_unit_starts_with_its_launcher(self) -> None:
+        # bob, 2026-11-23: a Mac build with no owner names who started it; a row with a unit does not change.
+        worker = staff.StaffRow(staff.StaffId("impl2"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-a"))
+        members = memory_feed.FeedStaff(staff.StaffSnapshot((worker,)))
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo build -p hana", "hana")
+        owned = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                        unit_labels.UnderDirector("research", "research", ""))
+        for case, launched, identity, expected in (
+            ("known session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-a"),
+             unit_labels.UnitLabels(""), "impl2"),
+            ("unknown session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-x"),
+             unit_labels.UnitLabels(""), "Claude session"),
+            ("CI", replace(build, launcher=queue_view.MacLauncher.CI, origin=queue_view.MacBuildOrigin.CI),
+             unit_labels.UnitLabels(""), "hana CI"),
+            ("rust-analyzer", replace(build, launcher=queue_view.MacLauncher.RUST_ANALYZER),
+             unit_labels.UnitLabels(""), "rust-analyzer"),
+            ("terminal", replace(build, launcher=queue_view.MacLauncher.TERMINAL), unit_labels.UnitLabels(""), "terminal"),
+            ("old reading", build, unit_labels.UnitLabels(""), ""),
+            ("unit", replace(build, launcher=queue_view.MacLauncher.TERMINAL), owned, ""),
+        ):
+            with self.subTest(case=case):
+                row = memory_feed.mac_work_row(launched, queue_view.MacBuildReading(1, (launched,)), identity,
+                    names=read_step_names(), slot_roots={}, slot_machine="private-mac-host",
+                    launcher=memory_feed.mac_launcher_name(launched, members))
+                if expected:
+                    self.assertEqual(row.get("started_by"), {"name": expected, "step": "build"})
+                    self.assertEqual(row["name"], f"{expected}: build")
+                    self.assertEqual(row["repository"], "hana")
+                else:
+                    self.assertNotIn("started_by", row)
+                    self.assertEqual(row["name"], "research: build" if case == "unit" else "hana: build")
 
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["hana nextest"])
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["unknown: nextest"])
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["route-one: nextest"])
         local, = [row for row in page["walk"] if not row.get("kind")]
-        self.assertEqual(local["name"], "fixture-project nextest")
+        self.assertEqual(local["name"], "fixture: nextest")
         for row in (*page["walk"], *page["waiters"]):
             self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
 
@@ -3149,10 +3539,11 @@ process.stdout.write(JSON.stringify({
         process = self.root / "proc" / str(pid)
         write_process(process.parent, pid)
         stat = process / "stat"
+        # The feed reads no tty. Only the client stores a terminal name, so an empty stored name stays unknown.
         for members, tty, name, unit, showrunner, caller in (
-            ((), 34816, "hana build", "", "", "terminal · hana_catalyst"),
-            ((), 0, "hana build", "", "", "terminal · hana_catalyst"),
-            ((runner, director), 34816, "startup build", "startup", "hana", "startup"),
+            ((), 34816, "hana: build", "", "", "unregistered session"),
+            ((), 0, "hana: build", "", "", "unregistered session"),
+            ((runner, director), 34816, "startup: build", "startup", "hana", "startup"),
         ):
             with self.subTest(tty=tty, unit=unit):
                 fields = ["S", "1", str(pid), str(pid), str(tty), *(["0"] * 14), str(pid)]
@@ -3179,7 +3570,7 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
               mock.patch.object(staff, "snapshot", return_value=record)):
             row, = memory_feed.reading()["waiters"]
-        self.assertEqual(row["name"], "organon nextest")
+        self.assertEqual(row["name"], "organon: nextest")
         self.assertEqual(row["unit"], "organon")
 
     def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
@@ -3194,20 +3585,20 @@ process.stdout.write(JSON.stringify({
                                                 unit_labels.NoDirector())
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
-            ("targeted-test", director, "panes"),
-            ("build", director, "panes build"),
-            ("literal{step}", director, "panes literal{step}"),
-            ("merge-gate", runner, "builds"),
-            ("merge-gate", director, "panes"),
-            ("merge-gate", merge_staff, "sdlc-merge-gate"),
-            ("merge-gate", unit_worker, "panes"),
-            ("merge-gate", runner_worker, "builds"),
-            ("targeted-test", unknown, "unknown"),
-            ("merge-gate", unknown, "unknown"),
-            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
-            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
-            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
-            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
+            ("test-affected", director, "panes"),
+            ("build", director, "panes: build"),
+            ("literal{step}", director, "panes: literal{step}"),
+            ("gate", runner, "builds"),
+            ("gate", director, "panes"),
+            ("gate", merge_staff, "merge-gate"),
+            ("gate", unit_worker, "panes"),
+            ("gate", runner_worker, "builds"),
+            ("test-affected", unknown, "unknown"),
+            ("gate", unknown, "unknown"),
+            ("test-affected", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("test-affected", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
+            ("gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -3216,44 +3607,37 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
 
-        config = self.root / "build_steps.conf"
-        _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
-                                                         "owned.targeted-test=targeted for {unit}"))
-        step = "targeted-test"
-        for owner, expected in ((director, "targeted for panes"), (None, "unregistered session")):
+        step = "test-affected"
+        for owner, expected in ((director, "panes"), (None, "unregistered session")):
             with self.subTest(owner=owner, expected=expected):
                 page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
                 self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
                 self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
 
-    def test_cloud_gate_uses_the_configured_template_after_an_unknown_caller(self) -> None:
+    def test_cloud_gate_names_the_owner_after_an_unknown_caller(self) -> None:
         with isolated_staff_file(self.root / "staff.json", {}):
             runner = fixture_member("showrunner", name="sdlc")
             unit = fixture_member("unit", name="panes", parent=runner.id)
             director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                                unit_labels.DirectsUnit("panes"))
-            config = self.root / "build_steps.conf"
-            _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
-                                                             "owned.targeted-test=targeted for {unit}"))
-            identity = wire.Identity(unit.current_session, "unregistered session", "targeted-test", "")
+            identity = wire.Identity(unit.current_session, "unregistered session", "test-affected", "")
             page = self.cloud_owner_page(identity.step, director, identity=identity)
             for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
                 row, = [row for row in table if row.get("kind") == "cloud"]
-                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "targeted for panes", "panes"))
+                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "panes", "panes"))
 
-    def test_cloud_owner_templates_check_the_configured_step_and_unit(self) -> None:
+    def test_unknown_cloud_gate_rows_show_only_the_owner_for_any_step_name(self) -> None:
         config = self.root / "build_steps.conf"
         original = config.read_text()
-        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes selected tests"),
+        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes"),
                                                   ("panes", "sdlc", "—", "panes"),
                                                   ("—", "sdlc", "selected tests", "sdlc"),
                                                   ("—", "—", "—", "unregistered session")):
             with self.subTest(unit=unit, showrunner=showrunner, shown=shown):
-                _ = config.write_text(original.replace("owned.targeted-test={unit} targeted",
-                    "owned.targeted-test={unit} {step}").replace("names.targeted-test=targeted test",
-                    f"names.targeted-test={shown}"))
+                _ = config.write_text(original.replace("names.test-affected=test affected",
+                                                        f"names.test-affected={shown}"))
                 owner = unit_labels.UnitLabels("", showrunner, unit, unit_labels.OwnerRole.UNIT)
-                identity = wire.Identity("old-cloud", "", "targeted-test", "")
+                identity = wire.Identity("old-cloud", "", "test-affected", "")
                 page = self.cloud_owner_page(identity.step, owner, identity=identity)
                 for table in (page["walk"], page["waiters"]):
                     row, = [row for row in table if row.get("kind") == "cloud"]
@@ -3264,11 +3648,11 @@ process.stdout.write(JSON.stringify({
                                           unit_labels.DirectsUnit("panes"))
         config = self.root / "build_steps.conf"
         template = config.read_text()
-        step = "targeted-test"
+        step = "test-affected"
         for text in ("—", "owner not recorded", "${unit}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
             with self.subTest(template=text):
-                _ = config.write_text(template.replace("owned.targeted-test={unit} targeted",
-                                                        f"owned.targeted-test={text}"))
+                _ = config.write_text(template.replace("owned.test-affected={unit} {step}",
+                                                        f"owned.test-affected={text}"))
                 page = self.cloud_owner_page(step, director, identity=wire.Identity("legacy", "", step, ""))
                 for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
                     row, = [row for row in table if row.get("kind") == "cloud"]
@@ -3290,7 +3674,7 @@ process.stdout.write(JSON.stringify({
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(member.id),
                 }), mock.patch.object(unit_labels, "unit_labels_for", new=UNIT_LABELS_FOR),
                       mock.patch.object(unit_labels, "newest_sessions", return_value=[])):
-                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    identity = admission_client.step_identity("test-affected", "/private/tree")
                     self.assertEqual(identity.session_id, member.current_session)
                     page = self.cloud_owner_page(identity.step, identity=identity)
                     for table in (page["walk"], page["waiters"]):
@@ -3303,7 +3687,7 @@ process.stdout.write(JSON.stringify({
                                    ("panes", unit_labels.Runner.UNIT_DIRECTOR, "")):
             with self.subTest(role=role):
                 owner = unit_labels.UnitLabels(name, "sdlc", "panes", unit_labels.OwnerRole.UNIT, role)
-                page = self.cloud_owner_page("targeted-test", owner)
+                page = self.cloud_owner_page("test-affected", owner)
                 rows = [cast(memory_feed.CloudWorkRow, row) for row in (*page["walk"], *page["waiters"])
                         if row.get("kind") == "cloud"]
                 self.assertEqual([(row["showrunner"], row["unit"], row.get("runner"), row.get("worker")) for row in rows],
@@ -3311,20 +3695,16 @@ process.stdout.write(JSON.stringify({
 
     def test_queue_views_keep_recorded_names_when_registry_labels_are_empty(self) -> None:
         base = cloud_reading(with_wait_reason(captured_reading(), admission_records.NeedsMemory()))
-        waiter = replace(base.view.waiting[0], step="merge-gate", session_name="local caller name")
-        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-            wire.Identity("slot-session", "slot caller name", "merge-gate", str(self.root)),
-            base.explanation.now - 60, "natedev",
-            wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
-        reading = replace(base, view=replace(base.view, waiting=(waiter,)), repository_slots=(slot,))
+        waiter = replace(base.view.waiting[0], step="gate", session_name="local caller name")
+        reading = replace(base, view=replace(base.view, waiting=(waiter,)))
         labels = {session: unit_labels.UnitLabels("") for session in (
-            waiter.session_id, slot.identity.session_id, *(row.identity.session_id for row in base.cloud))}
+            waiter.session_id, *(row.identity.session_id for row in base.cloud))}
         with (mock.patch.object(admission_client, "view", return_value=reading),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             page = memory_feed.reading()
         rows = {row["pid"]: row for row in (*page["walk"], *page["waiters"])}
-        for pid, name in ((waiter.pid, waiter.session_name), (slot.owner.pid, slot.identity.name),
+        for pid, name in ((waiter.pid, waiter.session_name),
                           *((row.owner.pid, row.identity.name) for row in base.cloud)):
             with self.subTest(pid=pid):
                 self.assertEqual(rows[pid]["name"], name)
@@ -3450,20 +3830,22 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual([row["pid"] for row in queued], [waiting.owner.pid])
 
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
+        # With no session name, the project is the owner; a folder never is.
         for raw_step, project, folder, expected in (
-            ("nextest", "known-project", "/fixture", "known-project nextest"),
-            ("nextest", "", "/fixture", "nextest"),
-            ("nextest", "", "/absolute/repository", "nextest"),
-            ("integrate", "", "/fixture", "integrate"),
+            ("nextest", "known-project", "/fixture", "known-project: nextest"),
+            ("nextest", "", "/fixture", "unregistered session: nextest"),
+            ("nextest", "", "/absolute/repository", "unregistered session: nextest"),
+            ("integrate", "", "/fixture", "unregistered session: integrate"),
         ):
             with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)
-                step = replace(reading.view.running[0], step=raw_step, folder=folder)
+                step = replace(reading.view.running[0], step=raw_step, folder=folder, session_name="")
                 explanation_step = replace(reading.explanation.running[0], step=step)
                 reading = replace(reading, view=replace(reading.view, running=(step,)),
                     explanation=replace(reading.explanation, running=(explanation_step,)))
                 reading = with_wait_reason(reading, admission_records.StartSpacingWait(110))
-                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder)
+                waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder,
+                                 session_name="")
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
                 with (mock.patch.object(admission_client, "view", return_value=reading),
                       mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
@@ -3865,6 +4247,213 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(room.used, cargo_use)
                 self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
 
+    def test_tracked_run_keeps_its_row_when_detached_scopes_account_for_its_tools(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helper_pids = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helper_pids:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+                _ = (proc / str(pid) / "cmdline").write_bytes(b"sleep\0")
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.clock.advance(200)
+            self.assertTrue(fixture.server.run_places)
+
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            detached = builds / "builds-detached.slice"
+            run_slice = detached / "builds-detached-r1.slice"
+            write_scope(builds, current=5 * gib, anonymous=5 * gib)
+            write_scope(detached, current=5 * gib, anonymous=5 * gib)
+            write_scope(run_slice, current=5 * gib, anonymous=5 * gib)
+            cargo = fixture.fixture_owner(700005, "300")
+            sidecar = fixture.scope(cargo, folder=str((run_slice / "cargo.scope").relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(replace(fixture.request(owner=cargo), sidecar=str(sidecar))))
+
+            def page() -> tuple[memory_feed.MemoryPage, admission_records.QueueRead]:
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                      mock.patch.object(memory_feed, "PROC", proc)):
+                    return memory_feed.reading(), decoded.reading
+
+            before, baseline = page()
+            original, = (row for row in before["walk"] if row["pid"] == root.pid)
+            original = cast(memory_feed.RunRow, original)
+            self.assertEqual((original["name"], original["used"], original["counted"]), ("verify.sh", 1.5, 0.0))
+
+            for pid, scope_gib in zip(helper_pids, (1, 2), strict=True):
+                write_scope(run_slice / f"helper-{pid}.scope", members=(pid,),
+                            current=scope_gib * gib, anonymous=scope_gib * gib)
+            after, reading = page()
+            matching = {str(run_slice / f"helper-{pid}.scope") for pid in helper_pids}
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
+            shown, = (row for row in after["walk"] if row["pid"] == root.pid)
+            self.assertEqual(shown, original)
+            self.assertEqual(after["walk"], before["walk"])
+            self.assertEqual(reading.explanation.totals, baseline.explanation.totals)
+            self.assertEqual(reading.explanation.totals.measured, 7 * gib // 2)
+            ram = after["ram"]
+            self.assertEqual((ram["queued_builds_bytes"], ram["build_tools_bytes"], ram["other_build_tools_bytes"]),
+                             (2 * gib, 3 * gib, 3 * gib))
+            self.assertEqual(after["used"], 2.0)
+
+            other = fixture.fixture_owner(700006, "400")
+            other_run = wire.RunIdentity(other.pid, other.start_time)
+            for offset, (pid, scope_gib) in enumerate(zip(helper_pids, (1, 2), strict=True)):
+                owner = fixture.fixture_owner(700007 + offset, str(500 + offset))
+                scope = run_slice / f"helper-{pid}.scope"
+                sidecar = fixture.scope(owner, folder=str(scope.relative_to(fixture.root)), members=(pid,),
+                                        current=scope_gib * gib, anonymous=scope_gib * gib)
+                fixture.allow_next_start()
+                request = fixture.request(owner=owner, run=other_run)
+                _ = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+
+            owned, reading = page()
+            self.assertTrue(matching.isdisjoint(step.measured.cgroup for step in reading.view.running
+                                               if isinstance(step.measured, admission_records.UnownedSliceMemory)))
+            self.assertEqual({str(step.measured.anonymous_source.directory) for step in reading.view.running
+                              if isinstance(step.run, LiveBuildRun) and step.run.pid == other.pid
+                              and isinstance(step.measured, admission_records.MeasuredMemory)
+                              and isinstance(step.measured.anonymous_source, admission_records.ScopeSource)}, matching)
+            retained, = (row for row in owned["walk"] if row["pid"] == root.pid)
+            self.assertEqual(retained, original)
+            self.assertEqual(owned["ram"]["queued_builds_bytes"], 5 * gib)
+            self.assertEqual(owned["ram"]["build_tools_bytes"], 0)
+
+    def test_system_read_matches_main_for_nested_detached_scopes(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            proc = fixture.proc.path
+            root = fixture.fixture_owner(700001, "100")
+            run = wire.RunIdentity(root.pid, root.start_time)
+            helpers = (700002, 700003)
+            write_process(proc, root.pid, gib, start=root.start_time)
+            _ = (proc / str(root.pid) / "cmdline").write_bytes(b"bash\0/fixture/verify.sh\0test\0")
+            for pid in helpers:
+                write_process(proc, pid, gib // 4, parent=root.pid)
+            first = fixture.fixture_owner(700004, "200")
+            _ = fixture.finish_step(fixture.request(owner=first, run=run))
+            fixture.allow_next_start()
+
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            helper = builds / "builds-detached.slice/builds-detached-r1.slice/helper.scope"
+            child = helper / "cargo.scope"
+            write_scope(helper, members=helpers, current=5 * gib, anonymous=5 * gib)
+            cargo_owner = fixture.fixture_owner(700005, "300")
+            for pid in (root.pid, *helpers, cargo_owner.pid):
+                (proc / str(pid) / "cwd").symlink_to(fixture.root)
+            sidecar = fixture.scope(cargo_owner, folder=str(child.relative_to(fixture.root)),
+                                    current=2 * gib, anonymous=2 * gib)
+            request = replace(fixture.request(owner=cargo_owner), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(replace(config, ci_memory_slice=""), (record,),
+                                                       tuple(fixture.server.run_places.values()), False)
+            reads: Counter[str] = Counter()
+            read_bytes = Path.read_bytes
+            read_text = Path.read_text
+            readlink = Path.readlink
+            iterdir = Path.iterdir
+
+            def read_process(path: Path) -> bytes:
+                if path.parent.parent == proc and path.name in ("status", "cmdline", "environ"):
+                    reads[path.name] += 1
+                return read_bytes(path)
+
+            def read_group(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path.is_relative_to(builds):
+                    if path.name == "cgroup.procs":
+                        reads["cgroup.procs"] += 1
+                    elif path == builds / "sccache.service/memory.current":
+                        reads["compiler probe"] += 1
+                    elif path.name in ("memory.current", "memory.stat", "memory.swap.current"):
+                        reads["memory counters"] += 1
+                return read_text(path, encoding=encoding, errors=errors)
+
+            def read_folder(path: Path) -> Path:
+                if path.parent.parent == proc and path.name == "cwd":
+                    reads["cwd"] += 1
+                return readlink(path)
+
+            def list_groups(path: Path) -> Iterator[Path]:
+                if path.is_relative_to(builds):
+                    reads["cgroup listings"] += 1
+                return iterdir(path)
+
+            with (mock.patch.object(Path, "read_bytes", read_process), mock.patch.object(Path, "read_text", read_group),
+                  mock.patch.object(Path, "readlink", read_folder), mock.patch.object(Path, "iterdir", list_groups)):
+                evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            # The scope with no recorded caller reads its oldest process command line once for its owner name.
+            self.assertEqual(dict(reads), {"status": 3, "cmdline": 2, "environ": 1, "cwd": 1,
+                                           "cgroup.procs": 2, "cgroup listings": 2, "memory counters": 3,
+                                           "compiler probe": 1})
+            self.assertEqual(evidence.unowned, ())
+            tracked, = evidence.between
+            assert isinstance(tracked.measured, admission_records.MeasuredMemory)
+            self.assertEqual(tracked.measured.bytes, 3 * gib // 2)
+            memory = evidence.reservations[request.episode].memory
+            assert isinstance(memory, admission_records.MeasuredMemory)
+            self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
+
+    def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            child = ci / "job.scope"
+            write_scope(ci, current=2 * gib, anonymous=2 * gib)
+            tree_owner = fixture.fixture_owner(700001, "100")
+            scope_owner = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, tree_owner.pid, gib, start=tree_owner.start_time)
+            tree_request = fixture.request(owner=tree_owner, need=2 * gib)
+            _ = only_admitted(fixture.server.handle_request(tree_request))
+            fixture.allow_next_start()
+            sidecar = fixture.scope(scope_owner, folder=str(child.relative_to(fixture.root)))
+            scope_request = replace(fixture.request(owner=scope_owner, need=2 * gib), sidecar=str(sidecar))
+            _ = only_admitted(fixture.server.handle_request(scope_request))
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            plan = admission_service.SystemReadingPlan(config, tuple(fixture.server.reservations.values()), (), False)
+            read_text = Path.read_text
+
+            def move_process(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                if path == ci / "memory.current":
+                    # The earlier reservation already measured its child.
+                    write_scope(ci, current=3 * gib, anonymous=3 * gib)
+                    write_scope(child, members=(scope_owner.pid, tree_owner.pid), current=2 * gib, anonymous=2 * gib)
+                return read_text(path, encoding=encoding, errors=errors)
+
+            for move in (False, True):
+                with self.subTest(move=move), mock.patch.object(Path, "read_text", autospec=True,
+                                                                  side_effect=move_process if move else read_text):
+                    evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                child_memory = evidence.reservations[scope_request.episode].memory
+                assert isinstance(child_memory, admission_records.MeasuredMemory)
+                self.assertEqual(child_memory.anonymous_source,
+                                 admission_records.ScopeSource(child, frozenset({scope_owner.pid})))
+                self.assertEqual(evidence.scope_members[str(ci)], {scope_owner.pid, tree_owner.pid}
+                                 if move else {scope_owner.pid})
+                fixture.server.system_reader = FixedSystemReader(evidence)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                      mock.patch.object(memory_feed, "PROC", fixture.proc.path)):
+                    page = memory_feed.reading()
+                self.assertEqual(page["ci_ram"], 1.0)
+
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (
                 ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):
@@ -4003,6 +4592,43 @@ process.stdout.write(JSON.stringify({
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
+    def test_move_identity_uses_the_wait_owner_and_keeps_the_service_revision(self) -> None:
+        base = with_wait_reason(captured_reading(), admission_records.NeedsMemory())
+        step, = base.view.waiting
+        step = replace(step, run=LiveBuildRun(900, "run-start", 1))
+        member = admission_records.QueueMoveMember("fixture-wait")
+        line = admission_records.QueueMoveLine("fixture-revision", (member,))
+        row = gate.rank_waiter({"pid": step.pid, "since": step.since, "start_time": "wait-start",
+                               "need": step.need, "move_id": member.row_id}, admission_records.NormalOrder())
+        reading = replace(base, view=replace(base.view, waiting=(step,), move_line=line),
+                          ordered=[(self.root / "fixture", row)])
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            payload = memory_feed.reading()
+        rows = cast(list[dict[str, object]], payload["waiters"])
+        self.assertEqual(payload.get("move_revision"), line.revision)
+        self.assertEqual(rows[0].get("move"), member)
+        self.assertEqual(rows[0]["pid"], 900)
+
+        unnamed = replace(step, pid=201, step="", folder="", project="", run=NoLiveBuildRun())
+        unnamed_member = admission_records.QueueMoveMember("unnamed-wait")
+        unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
+            "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
+        complete = replace(line, members=(unnamed_member, *line.members))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading,
+                               view=replace(reading.view, waiting=(unnamed, step), move_line=complete),
+                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
+            named = memory_feed.reading()
+        self.assertEqual(named.get("move_revision"), line.revision)
+        shown, = named["waiters"]
+        self.assertEqual(shown["name"], rows[0]["name"])
+        self.assertEqual(shown.get("move"), member)
+
+        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
+        with mock.patch.object(admission_client, "view",
+                               return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
+            stale = memory_feed.reading()
+        self.assertNotIn("move_revision", stale)
+
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()
@@ -4012,12 +4638,23 @@ process.stdout.write(JSON.stringify({
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
 
 
+class PageTextTests(unittest.TestCase):
+    def test_the_page_and_its_fixtures_use_only_configured_job_names(self) -> None:
+        # bob, 2026-11-23 12:59: job names come from config/build_steps.conf (names.gate=gate), so no file shows the retired name.
+        retired = " ".join(("merge", "gate"))
+        folder = Path(__file__).resolve().parent
+        for name in ("memory_live.html", "builds_page_real_rows.json", "memory_page_proof.mjs",
+                     "test_memory_feed.py", "test_memory_hover.py", "test_queue_view.py"):
+            with self.subTest(file=name):
+                self.assertNotIn(retired, (folder / name).read_text(encoding="utf-8").lower())
+
+
 class BuildsPageProofTests(unittest.TestCase):
     def test_only_a_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / "checkout"
             checkout.mkdir()
-            lease = build_slots.lease_path(checkout)
+            lease = build_folders.lease_path(checkout)
             self.assertFalse(needs_all_page_proof_views(checkout))
             _ = lease.write_text(json.dumps({"work": "test-all"}), encoding="utf-8")
             self.assertFalse(needs_all_page_proof_views(checkout))
@@ -4045,6 +4682,20 @@ class BuildsPageProofTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).glob("*.png")), [])
             for report in ("proof.json", "steady-refresh.json"):
                 self.assertFalse((Path(directory) / report).exists())
+
+
+def machine_icons(row: str) -> list[tuple[str, str]]:
+    """Return the state and name of each machine in the Machine cell of one rendered table row.
+
+    An icon has the state "run" or "dim" and its name as its accessible name. An unknown machine is text, with no state.
+    """
+    cell = re.search(r'<td class="machine">(.*?)</td>', row, flags=re.S)
+    assert cell is not None
+    machines = cast(list[tuple[str, str, str]], re.findall(
+        r'<span class="machine(?: machine-icon (run|dim))?" data-machine="([^"]+)"(?:[^>]* role="img" aria-label="([^"]+)")?>',
+        cell.group(1)))
+    assert all(label == (name if state else "") for state, name, label in machines), machines
+    return [(state, name) for state, name, _ in machines]
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
@@ -4143,14 +4794,12 @@ def write_browser_fixture(folder: Path) -> None:
         pages: dict[str, object] = {}
         pages["caller_selection"] = json.loads(memory_feed.page_json(fixture.caller_selection_page()))
         reports: dict[str, memory_feed.ReportFile] = {}
-        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
-                                          unit_labels.DirectsUnit("panes"))
-        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
         names = read_step_names()
         for version in ("before", "after"):
             named_pages: list[memory_feed.MemoryPage] = []
-            for step, label in (("targeted-test", director), ("merge-gate", runner)):
-                name = names.shown(step) if version == "before" else names.for_owner(step, label.unit, label.role)
+            # The stored caller names before and after the owner names: a unit, then a showrunner.
+            for step, prefix in (("test-affected", "panes"), ("gate", "showrunner")):
+                name = names.shown(step) if version == "before" else f"{prefix} {names.shown(step)}"
                 named_pages.append(fixture.cloud_owner_page(step, identity=wire.Identity("", name, step, "")))
             comparison = named_pages[0]
             comparison["walk"] = [row for page in named_pages for row in page["walk"] if row.get("kind") == "cloud"]
@@ -4175,7 +4824,12 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page = fixture.verify_call_page()
         builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
                                  current_session=staff.StaffId("builder"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
+                                     current_session=staff.StaffId(name))
+                      for name in ("queue", "natest", "admin-console"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit
@@ -4203,8 +4857,10 @@ def write_browser_fixture(folder: Path) -> None:
             pages["priority"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         _ = write_idle_config(fixture.root)
         _ = write_idle_alert(fixture.root / "mac-idle", base.explanation.now)
+        live = write_live_mac_state(fixture.root / "mac-state", block=True)
         with mock.patch.object(admission_client, "view", return_value=base), \
-             mock.patch.object(time, "time", return_value=base.explanation.now):
+             mock.patch.object(time, "time", return_value=base.explanation.now), \
+             mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
@@ -4213,13 +4869,18 @@ def write_browser_fixture(folder: Path) -> None:
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
                 reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        # The first build has no unit: a terminal started it. The last one is from a reading with no launcher.
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
-            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
-            for index, (pid, path, command, repository, used, done, unit) in enumerate((
-                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk"),
-                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify"),
-                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler"))))
+            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit,
+            launcher=launcher)
+            for index, (pid, path, command, repository, used, done, unit, launcher) in enumerate((
+                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk",
+                 queue_view.MacLauncher.TERMINAL),
+                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify",
+                 queue_view.MacLauncher.CLAUDE),
+                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler",
+                 queue_view.MacLauncher.UNKNOWN))))
         mac_reading = queue_view.MacBuildReading(base.explanation.now - 5, mac_builds)
         from scripts.mac_test import claim_state
         from scripts.copies import copies

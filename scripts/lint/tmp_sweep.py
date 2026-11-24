@@ -100,10 +100,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
+from errno import EACCES, ENOENT
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
@@ -148,6 +151,7 @@ RUN_TEMP_NAME = unit_runs.RUN_TEMP_NAME
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
 SESSION_SCRATCH_PREFIX = "claude-"
 PROC_DIR = "/proc"
+NO_IGNORED_FDS: frozenset[int] = frozenset()
 # Where no /proc exists (the Mac), one lsof scan lists what each process uses.
 LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfan")
 LSOF_TIMEOUT_SECONDS = 120
@@ -155,6 +159,7 @@ LSOF_TIMEOUT_SECONDS = 120
 LSOF_CWD = "cwd"
 LSOF_MAPPED = ("txt", "mem")
 WORKS_IN = "works in it"
+ROOTS_IN = "has its root in it"
 MAPS_FILE = "maps a file in it"
 HOLDS_FILE = "holds a file open in it"
 WRITES_FILE = "holds a file open for writing in it"
@@ -254,6 +259,10 @@ class Limit:
     folder_ctime: bool = True
 
 
+def report_unreadable_copy_folder(path: Path, error: OSError) -> None:
+    print(f"tmp sweep: cannot read {path}: {error}", file=sys.stderr)
+
+
 @dataclass(frozen=True)
 class Roots:
     """The folders whose top-level entries the sweep judges, by kind. In a temp folder only a
@@ -274,20 +283,27 @@ class Roots:
     def all(self) -> tuple[str, ...]:
         return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
 
-    def entries(self, root: str) -> Iterator[os.DirEntry[str]]:
+    def entries(self, root: str, *,
+        unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
+    ) -> Iterator[os.DirEntry[str]]:
         """The entries of root the sweep judges, without retaining the directory."""
         if root in self.copies:
-            for pair in listing(root):
-                if pair.is_dir(follow_symlinks=False):
-                    for entry in listing(pair.path):
-                        copy = scratch.removal_target(Path(entry.path))
-                        if copy is not None:
-                            removal = scratch.checked_removal(copy)
-                            if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)):
-                                continue
+            for pair in scratch.legacy_copy_pairs(Path(root), unreadable=unreadable_copies):
+                for entry in listing(str(pair), unreadable=unreadable_copies):
+                    path = Path(entry.path)
+                    copy = scratch.removal_target(path)
+                    if copy is not None:
+                        removal = scratch.checked_removal(copy)
+                        if isinstance(removal, (copy_record.Registered, scratch.StaleRemoval)) or (
+                                isinstance(removal, copy_record.NotRegistered) and not os.path.lexists(entry.path)):
+                            continue
+                    if not scratch.protected_build_path(path):
                         yield entry
             return
+        in_build_root = Path(root).resolve().is_relative_to(copy_record.build_root())
         for entry in listing(root):
+            if in_build_root and scratch.protected_build_path(Path(entry.path)):
+                continue
             if root not in self.temp or self.judged_temp(root, entry):
                 yield entry
 
@@ -496,12 +512,15 @@ def verify_running(pid: int, made: float, now: float, proc: str = PROC_DIR) -> b
     return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and start <= made + START_SLACK_SECONDS
 
 
-def listing(directory: str) -> Iterator[os.DirEntry[str]]:
+def listing(directory: str, *, unreadable: Callable[[Path, OSError], None] | None = None) -> Iterator[os.DirEntry[str]]:
     try:
         with os.scandir(directory) as entries:
             yield from entries
-    except OSError:
+    except FileNotFoundError:
         return
+    except OSError as error:
+        if unreadable is not None:
+            unreadable(Path(directory), error)
 
 
 def running_session_ids() -> frozenset[str] | None:
@@ -515,10 +534,29 @@ def running_session_ids() -> frozenset[str] | None:
 
 
 @dataclass(frozen=True)
+class KernelHiddenProcess:
+    """A live process that the kernel hides from the caller."""
+
+    pid: int
+    comm: str
+
+
+@dataclass(frozen=True)
+class CwdOnlyProcess:
+    """A process that used a scanned folder only as its working directory."""
+
+    start_ticks: int
+    executable: str
+
+
+@dataclass(frozen=True)
 class ProcessUsesKnown:
     """A completed scan of process paths, including a scan with no matches."""
     paths: list[tuple[str, int, str]]
     unreadable_cwd_pids: tuple[int, ...] = ()
+    unreadable_process_pids: tuple[int, ...] = ()
+    kernel_hidden: tuple[KernelHiddenProcess, ...] = ()
+    cwd_only_processes: dict[int, CwdOnlyProcess] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -526,70 +564,305 @@ class ProcessUsesUnavailable:
     """Process use cannot be checked; candidates must stay."""
 
 
-def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Read matching process paths and report processes with unreadable working directories.
+@dataclass(frozen=True)
+class ProcessUsesIncomplete(ProcessUsesUnavailable):
+    """The proc table exists, but the scan could not finish."""
 
-    Ignore processes that end during the scan.
-    """
-    if not os.path.isdir(proc):
-        return ProcessUsesUnavailable()
-    found: list[tuple[str, int, str]] = []
-    unreadable: list[int] = []
-    for entry in listing(proc):
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+
+class UserProcessStatus(Enum):
+    SKIP_PROCESS = "skip process"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class LinuxProcessStat:
+    state: str
+    parent: int
+    start_ticks: int
+
+
+def linux_process_stat(path: str | Path) -> LinuxProcessStat:
+    """Read the process state, parent, and start time in kernel clock ticks."""
+    fields = (Path(path) / "stat").read_text(errors="replace").rpartition(")")[2].split()
+    return LinuxProcessStat(fields[0], int(fields[1]), int(fields[19]))
+
+
+def _permitted_capabilities(status: Sequence[str]) -> int:
+    for line in status:
+        if line.startswith("CapPrm:"):
+            value = line.removeprefix("CapPrm:").strip()
+            if re.fullmatch(r"[0-9a-fA-F]+", value):
+                return int(value, 16)
+            break
+    raise ValueError("missing or invalid CapPrm")
+
+
+@dataclass(frozen=True)
+class UserTask:
+    path: str
+    status: list[str]
+    exited: bool
+
+    def has_other_threads(self) -> bool:
+        return self.exited or not any(line.startswith("Threads:") and line.split() == ["Threads:", "1"]
+                                      for line in self.status)
+
+
+def _user_task(path: str, user: int) -> UserTask | UserProcessStatus:
+    try:
+        with open(os.path.join(path, "status"), encoding="ascii", errors="replace") as handle:
+            status = handle.read().splitlines()
+        users = next(line.split()[1:3] for line in status if line.startswith("Uid:"))
+        state = next(line.split()[1] for line in status if line.startswith("State:"))
+        if len(users) != 2 or not all(uid.isdecimal() for uid in users):
+            return UserProcessStatus.UNREADABLE
+        if str(user) not in users:
+            return UserProcessStatus.SKIP_PROCESS
+        return UserTask(path, status, state in ("Z", "X"))
+    except FileNotFoundError:
+        return UserProcessStatus.SKIP_PROCESS
+    except (OSError, StopIteration, IndexError):
+        return UserProcessStatus.UNREADABLE
+
+
+def _surviving_tasks(leader: UserTask, user: int) -> Iterator[UserTask | UserProcessStatus]:
+    pid = os.path.basename(leader.path)
+    try:
+        with os.scandir(os.path.join(leader.path, "task")) as entries:
+            for entry in entries:
+                if entry.name.isdecimal() and entry.name != pid:
+                    yield _user_task(entry.path, user)
+    except FileNotFoundError:
+        if os.path.isdir(leader.path):
+            yield UserProcessStatus.UNREADABLE
+    except OSError:
+        yield UserProcessStatus.UNREADABLE
+
+
+def _kernel_hidden_process(path: str, pid: int, status: list[str], user: int, caller_capabilities: int
+                           ) -> KernelHiddenProcess | UserProcessStatus:
+    """Check the kernel exceptions after a path read returns EACCES."""
+    try:
+        if (_permitted_capabilities(status) & ~caller_capabilities == 0
+                and os.lstat(os.path.join(path, "cwd")).st_uid == user):
+            return UserProcessStatus.UNREADABLE
+        with open(os.path.join(path, "comm"), encoding="utf-8", errors="replace") as handle:
+            comm = handle.read().rstrip("\n").replace("\n", "\\n")
+        return KernelHiddenProcess(pid, comm)
+    except FileNotFoundError:
         try:
-            cwd = os.readlink(os.path.join(entry.path, "cwd"))
-        except PermissionError:
-            unreadable.append(pid)
-            continue
+            _ = os.stat(path)
+        except FileNotFoundError:
+            return UserProcessStatus.SKIP_PROCESS
         except OSError:
-            continue
+            pass
+    except (OSError, ValueError):
+        pass
+    return UserProcessStatus.UNREADABLE
+
+
+def _read_process_paths(path: str, pid: int, prefix: str | tuple[str, ...], *, strict: bool,
+                        ignored_self_fds: frozenset[int], found: list[tuple[str, int, str]],
+                        unreadable: set[int], cwd_only: bool = False) -> set[int | None]:
+    read_errors: set[int | None] = set()
+    try:
+        cwd = os.readlink(os.path.join(path, "cwd"))
+    except FileNotFoundError:
+        if not strict:
+            return read_errors
+        read_errors.add(ENOENT)
+    except PermissionError as error:
+        unreadable.add(pid)
+        if not strict:
+            return read_errors
+        read_errors.add(error.errno)
+    except OSError as error:
+        if not strict:
+            return read_errors
+        read_errors.add(error.errno)
+    else:
         if cwd.startswith(prefix):
             found.append((cwd, pid, WORKS_IN))
-        fds = os.path.join(entry.path, "fd")
-        for fd in listing(fds):
+    if cwd_only:
+        return read_errors
+    if strict:
+        for name, how in (("root", ROOTS_IN), ("exe", MAPS_FILE)):
             try:
-                target = os.readlink(fd.path)
-            except OSError:
+                target = os.readlink(os.path.join(path, name))
+            except FileNotFoundError:
+                read_errors.add(ENOENT)
+                continue
+            except OSError as error:
+                read_errors.add(error.errno)
                 continue
             if target.startswith(prefix):
-                how = HOLDS_FILE
+                found.append((target.removesuffix(DELETED_SUFFIX), pid, how))
+    fds = os.path.join(path, "fd")
+    descriptors: list[os.DirEntry[str]] = []
+    try:
+        with os.scandir(fds) as entries:
+            for fd in entries:
+                descriptors.append(fd)
+    except FileNotFoundError:
+        read_errors.add(ENOENT)
+    except OSError as error:
+        read_errors.add(error.errno)
+    for fd in descriptors:
+        if pid == os.getpid() and fd.name.isdecimal() and int(fd.name) in ignored_self_fds:
+            continue
+        try:
+            target = os.readlink(fd.path)
+        except FileNotFoundError:
+            read_errors.add(ENOENT)
+            continue
+        except OSError as error:
+            read_errors.add(error.errno)
+            continue
+        if target.startswith(prefix):
+            how = HOLDS_FILE
+            if not strict:
                 try:
-                    with open(os.path.join(entry.path, "fdinfo", fd.name), encoding="utf-8") as info:
+                    with open(os.path.join(path, "fdinfo", fd.name), encoding="utf-8") as info:
                         for line in info:
                             if line.startswith("flags:") and int(line.split()[1], 8) & os.O_ACCMODE in (os.O_WRONLY, os.O_RDWR):
                                 how = WRITES_FILE
                 except (OSError, ValueError):
                     pass
-                found.append((target.removesuffix(DELETED_SUFFIX), pid, how))
+            found.append((target.removesuffix(DELETED_SUFFIX), pid, how))
+    try:
+        with open(os.path.join(path, "maps"), encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.rstrip("\n").split(maxsplit=5)
+                if len(parts) == 6 and parts[5].startswith(prefix):
+                    found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
+    except FileNotFoundError:
+        read_errors.add(ENOENT)
+    except OSError as error:
+        read_errors.add(error.errno)
+    return read_errors
+
+
+def process_clear_beyond_cwd(process: Path, pid: int, folders: tuple[str, ...]) -> bool:
+    """Check one process for other uses of the folders."""
+    task = _user_task(str(process), os.geteuid())
+    if not isinstance(task, UserTask) or task.has_other_threads():
+        return False
+    found: list[tuple[str, int, str]] = []
+    errors = _read_process_paths(str(process), pid, folders, strict=True, ignored_self_fds=NO_IGNORED_FDS,
+                                 found=found, unreadable=set())
+    return not errors and not any(
+        how != WORKS_IN and any(name == folder or name.startswith(folder + os.sep) for folder in folders)
+        for name, _, how in found
+    )
+
+
+def process_paths(proc: str, prefix: str | tuple[str, ...], *,
+                  require_readable_user_processes: bool = False,
+                  ignored_self_fds: frozenset[int] = NO_IGNORED_FDS) -> ProcessUsesKnown | ProcessUsesUnavailable:
+    """Read matching process paths and report processes with unreadable working directories.
+
+    Ignore processes that end during the scan.
+    """
+    try:
+        _ = os.stat(proc)
+    except FileNotFoundError:
+        return ProcessUsesUnavailable()
+    except OSError:
+        return ProcessUsesIncomplete()
+    try:
+        with os.scandir(proc) as entries:
+            processes = list(entries)
+    except OSError:
+        return ProcessUsesIncomplete()
+    strict = require_readable_user_processes
+    caller_capabilities = 0
+    if strict:
         try:
-            with open(os.path.join(entry.path, "maps"), encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    parts = line.rstrip("\n").split(maxsplit=5)
-                    if len(parts) == 6 and parts[5].startswith(prefix):
-                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
-        except OSError:
+            with open(os.path.join(proc, "self", "status"), encoding="ascii", errors="replace") as handle:
+                caller_capabilities = _permitted_capabilities(handle.read().splitlines())
+        except (OSError, ValueError):
+            return ProcessUsesIncomplete()
+    found: list[tuple[str, int, str]] = []
+    unreadable: set[int] = set()
+    incomplete: set[int] = set()
+    kernel_hidden: dict[int, KernelHiddenProcess] = {}
+    cwd_only_processes: dict[int, CwdOnlyProcess] = {}
+    user = os.geteuid()
+    for entry in processes:
+        if not entry.name.isdigit():
             continue
-    return ProcessUsesKnown(found, tuple(unreadable))
+        pid = int(entry.name)
+        if not strict:
+            _ = _read_process_paths(entry.path, pid, prefix, strict=False, ignored_self_fds=ignored_self_fds,
+                                    found=found, unreadable=unreadable)
+            continue
+        leader = _user_task(entry.path, user)
+        threaded = isinstance(leader, UserTask) and leader.has_other_threads()
+        other_tasks = _surviving_tasks(leader, user) if isinstance(leader, UserTask) and threaded else ()
+        for task in chain((leader,), other_tasks):
+            if not isinstance(task, UserTask) or task.exited:
+                if task is UserProcessStatus.UNREADABLE:
+                    incomplete.add(pid)
+                continue
+            cwd_only = isinstance(leader, UserTask) and not leader.exited and task is not leader
+            start_ticks = -1
+            if not threaded:
+                with suppress(OSError, ValueError, IndexError):
+                    start_ticks = linux_process_stat(task.path).start_ticks
+            first_path = len(found)
+            read_errors = _read_process_paths(task.path, pid, prefix, strict=True, ignored_self_fds=ignored_self_fds,
+                                             found=found, unreadable=unreadable, cwd_only=cwd_only)
+            if (start_ticks >= 0 and not read_errors and len(found) == first_path + 1
+                    and found[first_path][2] == WORKS_IN):
+                with suppress(OSError, ValueError, IndexError):
+                    executable = os.readlink(os.path.join(task.path, "exe"))
+                    if linux_process_stat(task.path).start_ticks == start_ticks:
+                        cwd_only_processes[pid] = CwdOnlyProcess(start_ticks, executable)
+            # Missing data prevents a cwd-only exception. An ended process can also leave this result.
+            read_errors.discard(ENOENT)
+            if not read_errors:
+                continue
+            access = (_kernel_hidden_process(task.path, pid, task.status, user, caller_capabilities)
+                      if read_errors == {EACCES} else UserProcessStatus.UNREADABLE)
+            if isinstance(access, KernelHiddenProcess):
+                kernel_hidden[pid] = access
+            elif access is UserProcessStatus.UNREADABLE:
+                incomplete.add(pid)
+    return ProcessUsesKnown(found, tuple(sorted(unreadable)), tuple(sorted(incomplete)),
+                            tuple(kernel_hidden.values()), cwd_only_processes)
 
 
-def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False) -> ProcessUsesKnown | ProcessUsesUnavailable:
+def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False,
+               ignored_self_fds: frozenset[int] = NO_IGNORED_FDS,
+               same_user_only: bool = False) -> ProcessUsesKnown | ProcessUsesUnavailable:
     """Process paths from one lsof scan; unavailable when lsof cannot run or prints nothing."""
     try:
-        completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
+        command = tuple(arg for arg in LSOF if arg != "-w") if require_complete else LSOF
+        if same_user_only:
+            command = (*command, "-u", str(os.geteuid()))
+        completed = subprocess.run(command, capture_output=True, text=True, errors="replace",
                                    timeout=LSOF_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ProcessUsesUnavailable()
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
     if completed.returncode != 0 and (require_complete or completed.returncode != 1):
         return ProcessUsesUnavailable()
-    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix))
+    if require_complete and (completed.stderr or not completed.stdout.endswith("\n")):
+        return ProcessUsesIncomplete()
+    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix, ignored_self_fds=ignored_self_fds))
             if completed.stdout else ProcessUsesUnavailable())
 
 
-def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
+def process_uses_with_lsof(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
+    """Use lsof only when the proc table is absent."""
+    uses = process_paths(proc, prefix)
+    if type(uses) is ProcessUsesUnavailable:
+        return lsof_paths(prefix, require_complete=True)
+    return uses
+
+
+def parse_lsof(text: str, prefix: str | tuple[str, ...], *,
+               ignored_self_fds: frozenset[int] = NO_IGNORED_FDS) -> list[tuple[str, int, str]]:
     """Read each process path and its access from `lsof -F pfan` output."""
     found: list[tuple[str, int, str]] = []
     pid = 0
@@ -600,6 +873,8 @@ def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int,
             pid = int(value)
         elif field == "f":
             how = WORKS_IN if value == LSOF_CWD else MAPS_FILE if value in LSOF_MAPPED else HOLDS_FILE
+            if pid == os.getpid() and value.isdecimal() and int(value) in ignored_self_fds:
+                how = ""
         elif field == "a" and value in ("w", "u") and how == HOLDS_FILE:
             how = WRITES_FILE
         elif field == "n" and pid and how and value.startswith(prefix):
@@ -1041,6 +1316,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
+    unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
     from scripts.production import staff
@@ -1053,12 +1329,10 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         return
     # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
     prefix = os.path.join(os.path.commonpath(roots.all()), "")
-    paths = process_paths(proc, prefix)
-    if isinstance(paths, ProcessUsesUnavailable):
-        paths = lsof_paths(prefix)
+    paths = process_uses_with_lsof(proc, prefix)
     if isinstance(paths, ProcessUsesUnavailable):
         for root in roots.all():
-            for entry in roots.entries(root):
+            for entry in roots.entries(root, unreadable_copies=unreadable_copies):
                 yield KeptEntry(entry.path, NO_PROC)
         return
     live = running_session_ids()
@@ -1094,10 +1368,11 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 phase_parents[str(phases)] = []
                 unreadable_phases.add(str(phases))
     judged = roots.all() + inner + temp_parents(roots, temp_live) + tuple(phase_parents)
-    pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
+    pairs = tuple(str(pair) for root in roots.copies
+                  for pair in scratch.legacy_copy_pairs(Path(root), unreadable=unreadable_copies))
     uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
-        for entry in roots.entries(root):
+        for entry in roots.entries(root, unreadable_copies=unreadable_copies):
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
@@ -1200,9 +1475,7 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
 def live_entry_use(path: Path) -> str:
     """Return the process that uses an entry, or a reason the scan failed."""
     root = str(path.resolve())
-    paths = process_paths(PROC_DIR, (root,))
-    if isinstance(paths, ProcessUsesUnavailable):
-        paths = lsof_paths((root,), require_complete=True)
+    paths = process_uses_with_lsof(PROC_DIR, (root,))
     if isinstance(paths, ProcessUsesUnavailable):
         return NO_PROC
     return next((f"pid {pid} {how} {name}" for name, pid, how in paths.paths
@@ -1216,9 +1489,17 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
 ) -> Sweep:
     """Assess idle entries without removing them."""
     result = Sweep()
+    unreadable_paths: set[Path] = set()
+
+    def unreadable_copies(path: Path, error: OSError) -> None:
+        if path not in unreadable_paths:
+            unreadable_paths.add(path)
+            result.failed.append(FailedEntry(path=str(path), error=str(error)))
+
+    pane_use = read_pane_runs()
     inspection = scratch.RemoteInspection.LOCAL_ONLY if dry_run else scratch.RemoteInspection.ADVERTISE
     for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
-                               inspection=inspection):
+                               pane_use=pane_use, inspection=inspection, unreadable_copies=unreadable_copies):
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)
@@ -1326,6 +1607,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
+    unreadable_copies: Callable[[Path, OSError], None] = report_unreadable_copy_folder,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Keep unrecorded work until the configured folder removal age after the other checks pass."""
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1334,7 +1616,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
     for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
-                               pane_use=pane_use, inspection=inspection):
+                               pane_use=pane_use, inspection=inspection, unreadable_copies=unreadable_copies):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
             continue

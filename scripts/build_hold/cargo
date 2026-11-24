@@ -14,6 +14,19 @@ while :; do
     search_path=${search_path#*:}
 done
 
+# The cargo word lists. cargo_folder.py reads each list from its one line here, so keep each on one line.
+value_options=(-C --config -Z --color --manifest-path --lockfile-path --target-dir --target -j --jobs -p --package --exclude -F --features --profile --message-format --artifact-dir --out-dir)
+build_subcommands=(build b check c clippy test t nextest run r bench doc d rustc rustdoc fix install miri mend)
+
+cargo_word_in() {
+    local word=$1 item
+    shift
+    for item; do
+        [[ "$item" != "$word" ]] || return 0
+    done
+    return 1
+}
+
 subcommand=
 subcommand_index=0
 skip_value=0
@@ -25,17 +38,28 @@ for arg in "$@"; do
     fi
     case "$arg" in
         +*) ;;
-        -C|--config|-Z|--color|--manifest-path|--lockfile-path|--target-dir|--target|\
-        -j|--jobs|-p|--package|--exclude|-F|--features|--profile|--message-format|\
-        --artifact-dir|--out-dir) skip_value=1 ;;
-        -*) ;;
+        -*) if cargo_word_in "$arg" "${value_options[@]}"; then skip_value=1; fi ;;
         *) subcommand=$arg; break ;;
     esac
 done
-case "$subcommand" in
-    build|b|check|c|clippy|test|t|nextest|run|r|bench|doc|d|rustc|rustdoc|fix|install|miri|mend) ;;
-    *) exec "$real_cargo" "$@" ;;
-esac
+
+if [[ "$subcommand" == clean ]]; then
+    if [[ $# == 1 && "$1" == clean && ! ${CARGO_TARGET_DIR+x} &&
+          ! ${CARGO_BUILD_TARGET_DIR+x} && ! ${CARGO_BUILD_BUILD_DIR+x} ]]; then
+        wrapper_path=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+        wrapper_dir=${wrapper_path%/*}
+        if "$wrapper_dir/../lib/py" "$wrapper_dir/cargo_folder.py" --clean-output "$@"; then
+            exit 0
+        else
+            clean_status=$?
+        fi
+        # Status 3 means Cargo owns the output.
+        (( clean_status == 3 )) || exit "$clean_status"
+    fi
+    exec "$real_cargo" "$@"
+fi
+
+cargo_word_in "$subcommand" "${build_subcommands[@]}" || exec "$real_cargo" "$@"
 
 for arg in "${@:subcommand_index+1}"; do
     case "$arg" in
@@ -49,16 +73,18 @@ for arg in "${@:subcommand_index+1}"; do
     esac
 done
 
-[[ "$OSTYPE" == linux* ]] || exec "$real_cargo" "$@"
-
 # A builds.slice scope came from the build queue: a queued step or an editor.
-# Its Cargo calls start at once. Detached scopes have no queue place.
+# Its Cargo calls start at once. A detached run lives under builds-detached.slice
+# and has no queue place, so its Cargo calls go to the queue.
+# A queued step of a detached run is different: invoke.sh, and each reserved
+# queue_place program scope, exports its scope folder as BUILDLOG_STEP_SCOPE. When that folder is this cgroup, Cargo starts at once.
 # The override selects a saved cgroup record instead of the host's process state.
 cgroup_file=${CARGO_WRAPPER_CGROUP_FILE:-/proc/self/cgroup}
 in_build_scope=0
 if [[ -r "$cgroup_file" ]]; then
     while IFS= read -r cgroup || [[ -n "$cgroup" ]]; do
-        if [[ "$cgroup" == */builds.slice/* && "$cgroup" != */builds.slice/builds-detached.slice/* ]]; then
+        if [[ "$cgroup" == */builds.slice/* && "$cgroup" != */builds.slice/builds-detached.slice/* ]] ||
+           [[ "$cgroup" == 0::* && "/sys/fs/cgroup${cgroup#0::}" == "${BUILDLOG_STEP_SCOPE-}" ]]; then
             in_build_scope=1
             break
         fi
@@ -66,25 +92,192 @@ if [[ -r "$cgroup_file" ]]; then
 fi
 (( in_build_scope )) && exec "$real_cargo" "$@"
 
-wrapper_path=$(readlink -f -- "${BASH_SOURCE[0]}")
-wrapper_dir=${wrapper_path%/*}
-hold_dir=${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}
-shopt -s nullglob dotglob
-hold_entries=("$hold_dir"/*)
-if (( ${#hold_entries[@]} )); then
-    if hold_message=$("$wrapper_dir/../lib/py" "$wrapper_dir/hold_applies.py" 2>&1); then
-        printf '%s\n' "$hold_message" >&2
-        exit 1
-    else
-        hold_status=$?
-        if (( hold_status != 1 )); then
-            printf 'cargo: note: %s\n' "${hold_message//$'\n'/ }" >&2
+# Read the layout settings that the fast path can verify.
+cargo_output_roots() {
+    local config="${CONF_DIR:-$HOME/.claude/config}/build_folders.conf"
+    local host line key value
+    local base_build= base_workspace= host_build= host_workspace=
+    if [[ -n "${CONF_DIR-}" && ! -e "$config" && ! -L "$config" ]]; then
+        config="$wrapper_dir/../../config/build_folders.conf"
+    fi
+    [[ -f "$config" && -r "$config" ]] || return 1
+    host=$(hostname -s) || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*(roots\.(build|workspace)(\.[^[:space:]=]+)?)[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*($|[[:space:]]#) ]]; then
+            key=${BASH_REMATCH[1]}
+            value=${BASH_REMATCH[4]}
+            case "$key" in
+                roots.build) : "${base_build:=$value}" ;;
+                roots.workspace) : "${base_workspace:=$value}" ;;
+                "roots.build.$host") : "${host_build:=$value}" ;;
+                "roots.workspace.$host") : "${host_workspace:=$value}" ;;
+            esac
+        elif [[ "$line" =~ ^[[:space:]]*repo_word\.claude_commands[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*($|[[:space:]]#) ]]; then
+            : "${claude_repo_word:=${BASH_REMATCH[1]}}"
+        elif [[ "$line" =~ ^[[:space:]]*(roots\.(build|workspace)([[:space:].=]|$)|repo_word\.claude_commands[[:space:].=]) ]]; then
+            return 1
         fi
+    done < "$config"
+    build_root=${host_build:-$base_build}
+    workspace_root=${host_workspace:-$base_workspace}
+    [[ "$build_root" != '~/'* ]] || build_root="$HOME/${build_root:2}"
+    [[ "$workspace_root" != '~/'* ]] || workspace_root="$HOME/${workspace_root:2}"
+    [[ "$build_root" == /* && "$workspace_root" == /* ]] || return 1
+    build_root=$(cd -- "$build_root" && pwd -P) || return 1
+    workspace_root=$(cd -- "$workspace_root" && pwd -P) || return 1
+}
+
+cargo_one_link() {
+    if [[ "$OSTYPE" == darwin* ]]; then
+        [[ $(stat -f '%l' -- "$1") == 1 ]]
+    else
+        [[ $(stat -c '%h' -- "$1") == 1 ]]
+    fi
+}
+
+cargo_git_config_current() {
+    local git_dir="$1/.git" stamp="$2" pointer common_dir
+    if [[ -f "$git_dir" && ! -L "$git_dir" ]]; then
+        [[ ! "$git_dir" -nt "$stamp" ]] || return 1
+        IFS= read -r pointer < "$git_dir" || return 1
+        [[ "$pointer" == 'gitdir: '?* ]] || return 1
+        git_dir=${pointer#gitdir: }
+        [[ "$git_dir" == /* ]] || git_dir="$1/$git_dir"
+    fi
+    common_dir=$git_dir
+    if [[ -e "$git_dir/commondir" || -L "$git_dir/commondir" ]]; then
+        [[ -f "$git_dir/commondir" && ! "$git_dir/commondir" -nt "$stamp" ]] || return 1
+        IFS= read -r common_dir < "$git_dir/commondir" || return 1
+        [[ -n "$common_dir" ]] || return 1
+        [[ "$common_dir" == /* ]] || common_dir="$git_dir/$common_dir"
+    fi
+    [[ -f "$common_dir/config" && ! "$common_dir/config" -nt "$stamp" &&
+       ! "$git_dir/config.worktree" -nt "$stamp" ]]
+}
+
+cargo_output_fast_path() {
+    [[ ! ${CARGO_TARGET_DIR+x} && ! ${CARGO_BUILD_TARGET_DIR+x} &&
+       ! ${CARGO_BUILD_BUILD_DIR+x} && ! ${CARGO_HOME+x} ]] || return 1
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --) break ;;
+            -C*|-Z*|--manifest-path*|--config*|--target-dir*|--out-dir*|--artifact-dir*) return 1 ;;
+        esac
+    done
+    command -v flock >/dev/null 2>&1 || return 1
+    local here manifest= checkout= output physical suffix repo stamp lock unit short line assignment
+    here=$(pwd -P) || return 1
+    while :; do
+        if [[ -e "$here/.cargo/config" || -L "$here/.cargo/config" ||
+              -e "$here/.cargo/config.toml" || -L "$here/.cargo/config.toml" ]]; then
+            return 1
+        fi
+        if [[ -e "$here/Cargo.toml" || -L "$here/Cargo.toml" ]]; then
+            [[ -z "$manifest" && -f "$here/Cargo.toml" && ! -L "$here/Cargo.toml" ]] || return 1
+            manifest=$here
+        fi
+        if [[ -z "$checkout" && -e "$here/.git" ]]; then
+            checkout=$here
+        fi
+        [[ "$here" != / ]] || break
+        here=${here%/*}
+        here=${here:-/}
+    done
+    [[ -n "$checkout" && "$manifest" == "$checkout" && -r "$manifest/Cargo.toml" ]] || return 1
+    # Only accept a literal workspace header in the shell.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *workspace* && ! "$line" =~ ^[[:space:]]*\[workspace\][[:space:]]*$ ]]; then
+            return 1
+        fi
+        [[ "$line" != *'\u'* && "$line" != *'\U'* ]] || return 1
+    done < "$manifest/Cargo.toml"
+    [[ ! -e "$HOME/.cargo/config" && ! -L "$HOME/.cargo/config" &&
+       ! -e "$HOME/.cargo/config.toml" && ! -L "$HOME/.cargo/config.toml" ]] || return 1
+    output=$(readlink -- "$checkout/target") || return 1
+    [[ "$output" == /* && -d "$output" ]] || return 1
+    local build_root workspace_root claude_repo_word=
+    cargo_output_roots || return 1
+    [[ "$output" == "$build_root/"* ]] || return 1
+    physical=$(cd -- "$output" && pwd -P) || return 1
+    [[ "$output" == "$physical" ]] || return 1
+    suffix=${output#"$build_root/"}
+    local metadata='\.(lock|lease\.json(\.[0-9a-f]{16}\.tmp)?)(/|$)'
+    [[ ! "$suffix" =~ $metadata ]] || return 1
+    if [[ "$suffix" == */main && "$suffix" != */*/* ]]; then
+        [[ -d "$checkout/.git" && ! -L "$checkout/.git" ]] || return 1
+        if [[ "$checkout" == "$HOME/.claude" ]]; then
+            repo=$claude_repo_word
+        else
+            [[ "$checkout" == "$HOME/rust/"* ]] || return 1
+            repo=${checkout#"$HOME/rust/"}
+        fi
+        [[ -n "$repo" && "$suffix" == "$repo/main" ]] || return 1
+    else
+        [[ "$suffix" =~ ^[^/]+/[^/]+/[^/]+$ && "$checkout" == "$workspace_root/$suffix" ]] || return 1
+        unit=${suffix#*/}
+        unit=${unit%/*}
+        short=${suffix##*/}
+        case "$unit:$short" in
+            main:*|ci:*) return 1 ;;
+        esac
+        [[ "$short" == *[!0-9]* ]] || return 1
+    fi
+    lock="$output.lock"
+    stamp="$output/.lint-sweep-used"
+    [[ -f "$lock" && ! -L "$lock" ]] || return 1
+    exec {cargo_output_fd}<> "$lock" || return 1
+    if flock -sn "$cargo_output_fd" &&
+       [[ -f "$lock" && ! -L "$lock" && "$lock" -ef "/dev/fd/$cargo_output_fd" &&
+          -d "$output" && ! -L "$output" && -f "$stamp" && ! -L "$stamp" && -r "$stamp" ]] &&
+       [[ $(readlink -- "$checkout/target") == "$output" ]] &&
+       cargo_one_link "$lock" && cargo_one_link "$stamp" &&
+       cargo_git_config_current "$checkout" "$stamp" &&
+       { ! IFS= LC_ALL=C read -r -d '' assignment &&
+         [[ "$assignment" == "$checkout"$'\n' ]]; } < "$stamp" &&
+       touch -h -- "$stamp"; then
+        return 0
+    fi
+    exec {cargo_output_fd}<&-
+    return 1
+}
+
+wrapper_path=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+wrapper_dir=${wrapper_path%/*}
+route=direct
+if [[ "$OSTYPE" == linux* ]]; then
+    hold_dir=${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}
+    shopt -s nullglob dotglob
+    hold_entries=("$hold_dir"/*)
+    if (( ${#hold_entries[@]} )); then
+        if hold_message=$("$wrapper_dir/../lib/py" "$wrapper_dir/hold_applies.py" 2>&1); then
+            printf '%s\n' "$hold_message" >&2
+            exit 1
+        else
+            hold_status=$?
+            if (( hold_status != 1 )); then
+                printf 'cargo: note: %s\n' "${hold_message//$'\n'/ }" >&2
+            fi
+        fi
+    fi
+
+    if [[ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]] && command -v systemd-run >/dev/null 2>&1; then
+        route=queue
     fi
 fi
 
-# The build queue is the one way in: it admits the command and starts its scope.
-if [[ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]] && command -v systemd-run >/dev/null 2>&1; then
+if [[ "$subcommand" != install && "${CARGO_FOLDER_CHECKED:-}" != 1 ]]; then
+    if ! cargo_output_fast_path "$@"; then
+        exec "$wrapper_dir/../lib/py" "$wrapper_dir/cargo_folder.py" --exec-checked "$route" "$real_cargo" "$@"
+    fi
+    export CARGO_FOLDER_CHECKED=1
+    if [[ "$route" == queue ]]; then
+        export CARGO_OUTPUT_LOCK_FD=$cargo_output_fd
+    fi
+fi
+
+# The queue admits the command and starts its scope.
+if [[ "$route" == queue ]]; then
     exec "$wrapper_dir/../lib/py" "$wrapper_dir/../build_queue/queue_place.py" -- "$real_cargo" "$@"
 fi
 exec "$real_cargo" "$@"

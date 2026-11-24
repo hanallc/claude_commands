@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from typing import cast
 
-from scripts.aws_target import hana_guest, hana_receiver
+from scripts.aws_target import hana_guest, hana_payload, hana_protocol, hana_receiver
 from scripts.lib import conf
 
 
@@ -25,13 +25,14 @@ HANA_RUNTIME_KEYS = ('execution_shell', 'free_floor_gib', 'source_git_timeout_s'
 COMMAND_TIMEOUT_KEY = 'loopback.command_timeout_s'
 SHELL_TIMEOUT_KEY = 'loopback.shell_timeout_s'
 SLOT_PROBE_KEYS = ('locks.probe_wait_seconds', 'locks.probe_retry_seconds')
+COPY_POLICY_KEYS = (hana_payload.BUILD_ROOT_KEY, *SLOT_PROBE_KEYS)
 IMAGE_SETTINGS = {
     'hana_aws': HANA_IMAGE_KEYS,
     'build_targets': (COMMAND_TIMEOUT_KEY,),
-    'build_folders': SLOT_PROBE_KEYS,
+    'build_folders': COPY_POLICY_KEYS,
 }
 IMAGE_FILE_LIST = Path('scripts/aws_target/hana_image.files')
-RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_render.files')
+RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_runtime.files')
 RUNNER_ENTRY = Path('scripts/aws_target/hana_runner_entry.py')
 
 
@@ -173,8 +174,17 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
     command_timeout = _resolved_read(targets, command_config, workload).value(
         COMMAND_TIMEOUT_KEY, float, recover_invalid=False)
     folders = checkout / 'config/build_folders.conf'
-    slot_config = resolved_config_text(conf.settings(folders.read_text(encoding='utf-8')), SLOT_PROBE_KEYS, alias)
-    slot_policy = _resolved_read(folders, slot_config, workload)
+    slot_config = conf.settings(resolved_config_text(
+        conf.settings(folders.read_text(encoding='utf-8')), COPY_POLICY_KEYS, alias))
+    root_setting = slot_config[hana_payload.BUILD_ROOT_KEY]
+    root = Path(root_setting.value)
+    if root_setting.value.startswith('~/'):
+        root = hana_guest.RUNNER_HOME / root.relative_to('~')
+    if not root.is_absolute() or '..' in root.parts:
+        raise ValueError(f'{folders}: The Hana build root must resolve to an absolute path.')
+    slot_config[hana_payload.BUILD_ROOT_KEY] = replace(root_setting, value=str(root))
+    slot_config_text = config_text(slot_config)
+    slot_policy = _resolved_read(folders, slot_config_text, workload)
     wait_key, retry_key = SLOT_PROBE_KEYS
     wait = slot_policy.value(wait_key, conf.decimal, recover_invalid=False)
     retry = slot_policy.value(retry_key, conf.decimal, recover_invalid=False)
@@ -188,7 +198,7 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
         *(RenderedGuestFile(Path(file.path.name), file.mode, file.content.encode()) for file in control),
         *(RenderedGuestFile(Path('runtime') / file.path, file.mode, file.content)
           for file in _listed_files(checkout, IMAGE_FILE_LIST)),
-        RenderedGuestFile(Path('runtime/config/build_folders.conf'), 0o644, slot_config.encode()),
+        RenderedGuestFile(Path('runtime/config/build_folders.conf'), 0o644, slot_config_text.encode()),
     )
 
 
@@ -203,12 +213,12 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     copies = conf.settings((checkout / 'config/copies.conf').read_text(encoding='utf-8'))
     copies_config = config_text(_runtime_defaults(copies, alias))
     folders = conf.settings((checkout / 'config/build_folders.conf').read_text(encoding='utf-8'))
-    # The image supplies the slot pool and lock timing.
-    image_roots = ('roots.slots', 'roots.slot_cargo', 'roots.mirror', 'roots.shell', 'roots.temporary')
+    # The image supplies the build root, capacity, and lock timing.
+    image_roots = ('roots.slots', 'roots.slot_cargo', 'roots.temporary')
     folder_defaults = _runtime_defaults(folders, alias)
     folder_config = config_text({key: setting for key, setting in folder_defaults.items()
-        if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *SLOT_PROBE_KEYS))
-        and (not key.startswith('slots.') or key in ('slots.unused_days', 'slots.wait_seconds'))})
+        if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *COPY_POLICY_KEYS))
+        and not key.startswith('slots.')})
     files = {file.path: file for file in _listed_files(checkout, RUNTIME_FILE_LIST)}
     entry = files.pop(RUNNER_ENTRY)
     return (
@@ -221,13 +231,24 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     )
 
 
+def image_source_sha256(checkout: Path) -> str:
+    """Hash the image file list and each listed path and its bytes, in list order."""
+    entries = [(IMAGE_FILE_LIST.as_posix(), sha256((checkout / IMAGE_FILE_LIST).read_bytes()).hexdigest()),
+               *((file.path.as_posix(), sha256(file.content).hexdigest())
+                 for file in _listed_files(checkout, IMAGE_FILE_LIST))]
+    return sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest()
+
+
 def digest_files(files: tuple[RenderedGuestFile, ...]) -> GuestDigest:
-    """Hash the rendered paths, modes, and bytes before adding the digest."""
-    entries = sorted((file.path.as_posix(), file.mode, sha256(file.content).hexdigest()) for file in files)
-    return GuestDigest(sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
+    """Hash the rendered controls and the runtime ABI, without the image Python source."""
+    entries = sorted((file.path.as_posix(), file.mode, sha256(file.content).hexdigest()) for file in files
+                     if not (file.path.parts[0] == 'runtime' and file.path.suffix == '.py'))
+    document = {'files': entries, 'runtime_abi': hana_protocol.RUNTIME_ABI}
+    return GuestDigest(sha256(json.dumps(document, separators=(',', ':')).encode()).hexdigest())
 
 
 def guest_digest(configuration: Path | conf.ConfigRead, *, checkout: Path = CHECKOUT) -> GuestDigest:
+    """Hash what makes the image compatible: the rendered controls and the runtime ABI."""
     return digest_files(guest_files(checkout, configuration, DATA_DEVICE))
 
 

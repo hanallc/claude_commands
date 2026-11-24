@@ -30,7 +30,7 @@ unchanged. A commit record finishes the renames, so the tree has every fix.
 Usage:
   fix_return.py finish --repo-root DIR
   fix_return.py copy --repo-root DIR --owner PID < cargo-metadata.json
-  fix_return.py return-copy --repo-root DIR --folder DIR --allocation-id ID
+  fix_return.py return-copy --repo-root DIR --folder DIR [--allocation-id ID]
 """
 
 from __future__ import annotations
@@ -648,16 +648,17 @@ def report_retained_lint_copy(folder: Path, reason: str) -> None:
     print(f"kept for a manual removal list: {folder} (fix_return, {reason})", file=sys.stderr)
 
 
-def return_copy(repo_root: Path, folder: Path, allocation_id: str,
+def return_copy(repo_root: Path, folder: Path, allocation_id: str | None,
                 board_reader: BoardReader | None = None) -> FixResult:
     """Bring back the held changes and close the lint copy."""
-    try:
-        recorded_id = (folder / ALLOCATION_NAME).read_text(encoding="utf-8")
-    except (OSError, ValueError):
-        recorded_id = ""
-    if not recorded_id or recorded_id != allocation_id:
-        report_retained_lint_copy(folder, "the lint copy allocation differs")
-        return FixRefused("the lint copy allocation differs")
+    if allocation_id is not None:
+        try:
+            recorded_id = (folder / ALLOCATION_NAME).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            recorded_id = ""
+        if not recorded_id or recorded_id != allocation_id:
+            report_retained_lint_copy(folder, "the lint copy allocation differs")
+            return FixRefused("the lint copy allocation differs")
     try:
         root = repo_root.resolve()
         sent = read_sent(folder)
@@ -700,7 +701,7 @@ def main(arguments: Sequence[str]) -> int:
     returning = commands.add_parser("return-copy", help="bring the held changes of the copy back")
     _ = returning.add_argument("--repo-root", required=True)
     _ = returning.add_argument("--folder", required=True)
-    _ = returning.add_argument("--allocation-id", required=True)
+    _ = returning.add_argument("--allocation-id")
     dropping = commands.add_parser("drop-copy", help="close the lint copy without returning changes")
     _ = dropping.add_argument("--repo-root", required=True)
     _ = dropping.add_argument("--folder", required=True)
@@ -725,7 +726,7 @@ def main(arguments: Sequence[str]) -> int:
         return 0
     if command == "return-copy":
         result = return_copy(Path(cast(str, parsed.repo_root)), Path(cast(str, parsed.folder)),
-                             cast(str, parsed.allocation_id))
+                             cast(str | None, parsed.allocation_id))
         report_copy(result)
         return 0 if fix_passed(result) else 1
     try:

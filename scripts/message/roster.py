@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, fields, replace
+from enum import Enum
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -187,6 +188,11 @@ class CannotReceiveMessages:
 MessageReach = Messageable | CannotReceiveMessages
 
 
+class WorkerClosure(Enum):
+    UNCONFIRMED = "unconfirmed"
+    CONFIRMED = "confirmed"
+
+
 @dataclass(frozen=True)
 class AssignmentUnrecorded:
     """A legacy worker record has no assignment field."""
@@ -288,6 +294,7 @@ class RosterEntry:
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
     pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
     registry_name: RegistryName | NoRegistryName = NoRegistryName()
+    worker_closure: WorkerClosure = WorkerClosure.UNCONFIRMED
 
 
 @dataclass(frozen=True)
@@ -601,9 +608,12 @@ class RosterSnapshot:
     result: Roster
 
     def encode(self) -> str:
+        # Older peers accept extra snapshot keys but reject extra entry keys.
+        closed_workers = [index for index, entry in enumerate(self.result.entries) if is_closed_worker(entry)]
         return json.dumps({"tag": "RosterSnapshot", "entries": [
             _snapshot_entry(entry) for entry in self.result.entries
         ], "problems": self.result.problems,
+            **({"closed_workers": closed_workers} if closed_workers else {}),
             **({"warnings": self.result.warnings} if self.result.warnings else {})})
 
     @classmethod
@@ -619,8 +629,22 @@ class RosterSnapshot:
             raise ValueError("snapshot problems must be strings")
         if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in cast(list[object], warnings)):
             raise ValueError("snapshot warnings must be strings")
-        return cls(Roster([_decode_entry(entry) for entry in cast(list[object], entries)],
-                          cast(list[str], raw_problems), cast(list[str], warnings)))
+        rows = [_decode_entry(entry) for entry in cast(list[object], entries)]
+        closed_workers = values.get("closed_workers", [])
+        if not isinstance(closed_workers, list):
+            raise ValueError("snapshot closed workers must be a list")
+        for index in cast(list[object], closed_workers):
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(rows):
+                raise ValueError("snapshot closed worker index is invalid")
+            row = rows[index]
+            if row.role != "worker" or not isinstance(row.reach, CannotReceiveMessages):
+                raise ValueError("snapshot closure requires an unreachable worker")
+            rows[index] = replace(row, worker_closure=WorkerClosure.CONFIRMED)
+        return cls(Roster(rows, cast(list[str], raw_problems), cast(list[str], warnings)))
+
+
+def is_closed_worker(entry: RosterEntry) -> bool:
+    return entry.role == "worker" and entry.worker_closure is WorkerClosure.CONFIRMED
 
 
 def cannot_receive_message_text(entry: RosterEntry) -> str:
@@ -1260,12 +1284,16 @@ def _unit_workers(
                             and not isinstance(backend, staff.CodexBackend) and existing is not None):
                         entries.append(replace(existing, role="worker", director=director, showrunner=showrunner))
                         continue
+                    closure = WorkerClosure.UNCONFIRMED
                     if isinstance(state, worker_panes.OpenWorker):
                         status = f"{state.status}; pane {state.pane}"
                         reach: MessageReach = Messageable(f"worker:{parent.name}/{row.name}")
+                    elif isinstance(state, worker_panes.ClosedWorker):
+                        closure = WorkerClosure.CONFIRMED
+                        status = "closed"
+                        reach = CannotReceiveMessages(status)
                     else:
                         status = (f"stopped; pane {state.pane}" if isinstance(state, worker_panes.StoppedWorker) else
-                                  "closed" if isinstance(state, worker_panes.ClosedWorker) else
                                   f"unknown; pane {state.pane}: {state.reason}" if isinstance(state, worker_panes.ProcessUnknownWorker) else
                                   f"incomplete: {state.reason}")
                         reach = CannotReceiveMessages(status)
@@ -1277,6 +1305,7 @@ def _unit_workers(
                     entries.append(RosterEntry(
                         machine=machine, kind="codex" if isinstance(backend, staff.CodexBackend) else "claude",
                         role="worker", name=row.name, status=status, reach=reach,
+                        worker_closure=closure,
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
                         assignment=assignment,

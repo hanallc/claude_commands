@@ -34,7 +34,7 @@ from scripts.lib import conf
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 
 
@@ -368,8 +368,8 @@ elif name == 'cargo':
               mock.patch.object(trial, 'preflight', return_value={}),
               mock.patch.object(build_hold, 'natedev_holds', return_value=holds),
               mock.patch.object(build_targets, 'caller_waits_on_hold', side_effect=[True, False, False]),
-              mock.patch.object(merge_gate, 'local_release_waiter'),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission,
+              mock.patch.object(gate, 'local_release_waiter'),
+              mock.patch.object(gate, 'gate_reservation') as admission,
               mock.patch.object(trial, 'start_service', side_effect=service),
               redirect_stdout(stdout), redirect_stderr(stderr)):
             context = cast(mock.MagicMock, admission.return_value)
@@ -674,8 +674,8 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', return_value='a' * 40) as command,
               mock.patch.object(trial, 'export_source', side_effect=export),
               mock.patch.object(trial, 'preflight', return_value={}),
-              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=GateRefused('held')),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+              mock.patch.object(gate.BuildHoldWait, 'wait_until_free', side_effect=GateRefused('held')),
+              mock.patch.object(gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held'):
                 trial.prepare(self.root, 'HEAD', trial.trial_root() / 'trial')
         admission.assert_not_called()
@@ -690,8 +690,8 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={}),
-              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=[None, GateRefused('held again')]),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+              mock.patch.object(gate.BuildHoldWait, 'wait_until_free', side_effect=[None, GateRefused('held again')]),
+              mock.patch.object(gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held again'):
                 trial.prepare(self.root, 'HEAD', trial.trial_root() / 'trial')
         place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
@@ -703,8 +703,8 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={'vulkaninfo': '/nix/store/fixture/bin/vulkaninfo'}),
-              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission,
+              mock.patch.object(gate.BuildHoldWait, 'wait_until_free'),
+              mock.patch.object(gate, 'gate_reservation') as admission,
               redirect_stdout(StringIO())):
             place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
             popen = cast(mock.MagicMock, place.popen)
@@ -726,8 +726,8 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={}),
-              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+              mock.patch.object(gate.BuildHoldWait, 'wait_until_free'),
+              mock.patch.object(gate, 'gate_reservation') as admission):
             place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
             popen = cast(mock.MagicMock, place.popen)
             wait = cast(mock.MagicMock, cast(mock.MagicMock, popen.return_value).wait)
@@ -753,8 +753,8 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={}),
-              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
-              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+              mock.patch.object(gate.BuildHoldWait, 'wait_until_free'),
+              mock.patch.object(gate, 'gate_reservation') as admission):
             place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
             popen = cast(mock.MagicMock, place.popen)
             wait = cast(mock.MagicMock, cast(mock.MagicMock, popen.return_value).wait)
@@ -833,8 +833,8 @@ elif name == 'cargo':
                 with (mock.patch.object(trial, 'checked', side_effect=checked),
                       mock.patch('shutil.which', side_effect=fake_tool_path),
                       mock.patch.object(trial, 'export_source', return_value=self.root),
-                      mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free') as hold,
-                      mock.patch.object(merge_gate, 'gate_reservation') as admission):
+                      mock.patch.object(gate.BuildHoldWait, 'wait_until_free') as hold,
+                      mock.patch.object(gate, 'gate_reservation') as admission):
                     with self.assertRaisesRegex(ValueError, missing):
                         trial.prepare(self.root, 'HEAD', trial.trial_root() / missing)
                 hold.assert_not_called()
@@ -2428,7 +2428,8 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': claim})
 
         cancel = shell_functions(trial.ROOT / 'scripts/direct/verify.sh',
-                                 'stop_assigned_gpu_unit', 'cancel_tree_run', 'forward_mac_runner_signal')
+                                 'remove_tool_folder', 'remove_tree_watch', 'stop_assigned_gpu_unit',
+                                 'cancel_tree_run', 'forward_mac_runner_signal')
         cancel += """
 after_tree_change() { return 0; }
 find_mac_runner_pid() { runner_pid=42; }
@@ -2449,6 +2450,7 @@ CMD=test
                 result = subprocess.run(['bash', '-c', cancel + command, 'verify.sh', str(self.root)],
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn('command not found', result.stderr)
                 self.assertEqual(result.stdout.splitlines(),
                     ['42 TERM', 'build_targets.py stop-hana-gpu --assignment-file assignment.json'])
 

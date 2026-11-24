@@ -164,7 +164,7 @@ def ci_run(run_id: int, attempt: int, jobs: list[Record]) -> Record:
     return {
         "kind": "ci_run",
         "v": 1,
-        "repo": "natepiano/hana",
+        "repo": "hanallc/hana",
         "run_id": run_id,
         "attempt": attempt,
         "workflow": "CI",
@@ -176,7 +176,7 @@ def ci_run(run_id: int, attempt: int, jobs: list[Record]) -> Record:
         "created_at": "2026-10-02T12:00:00Z",
         "started_at": "2026-10-02T12:00:00Z",
         "updated_at": "2026-10-02T12:10:00Z",
-        "url": f"https://github.com/natepiano/hana/actions/runs/{run_id}",
+        "url": f"https://github.com/hanallc/hana/actions/runs/{run_id}",
         "jobs": jobs,
     }
 

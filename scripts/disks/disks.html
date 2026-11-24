@@ -121,6 +121,8 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 560px) {
   .card { padding: 14px 12px 10px; }
+  .limit .range { flex-basis: 100%; min-width: 0; flex-wrap: wrap; gap: 4px 10px; }
+  .limit output { margin-inline-start: auto; }
   .tree col.place { width: auto; } .tree col.size { width: 64px; } .tree col.pct { width: 0; } .tree col.walk { width: 64px; }
   .tree .pct { display: none; }
   /* On a phone the holder goes under the slot name, so each column keeps its width. */
@@ -199,12 +201,44 @@ function toSlider(limit, range) {
   return Math.round(SLIDER_STEPS * Math.log(limit / range.min) / Math.log(range.max / range.min));
 }
 
+function roundLimit(bytes) {
+  const suffixes = ["MiB", "GiB", "TiB", "PiB", "EiB"];
+  let index = 0;
+  let unit = 1024 ** 2;
+  // Change units when rounding would show 1,000.
+  while (bytes / unit >= 999.5 && index < suffixes.length - 1) {
+    unit *= 1024;
+    index++;
+  }
+  const scaled = bytes / unit;
+  const value = Number(scaled < 10 ? scaled.toFixed(2) : scaled.toPrecision(3));
+  const suffix = suffixes[index];
+  const wholeWithDecimal = Number.isInteger(value)
+    && ((suffix === "GiB" && value >= 1 && value < 10) || (suffix === "TiB" && value < 100));
+  const text = wholeWithDecimal ? value.toFixed(1) : String(value);
+  return {bytes: value * unit, text: `${text} ${suffix}`};
+}
+
+function limitLabel(bytes) {
+  const rounded = roundLimit(bytes);
+  // An exact endpoint can need more digits than the label shows.
+  return rounded.bytes === bytes ? rounded.text : "≈" + rounded.text;
+}
+
+function snapLimit(bytes, range) {
+  if (bytes <= range.min) return range.min;
+  if (bytes >= range.max) return range.max;
+  return Math.min(range.max, Math.max(range.min, roundLimit(bytes).bytes));
+}
+
 function fromSlider(position, range) {
-  return range.min * (range.max / range.min) ** (position / SLIDER_STEPS);
+  if (position === SLIDER_STEPS) return range.max;
+  if (position === 0) return range.min;
+  return snapLimit(range.min * (range.max / range.min) ** (position / SLIDER_STEPS), range);
 }
 
 function startLimit(range, settings) {
-  return Math.min(range.max, Math.max(range.min, settings.slider_default_gib * GIB));
+  return snapLimit(settings.slider_default_gib * GIB, range);
 }
 
 function topPath(mount, name) {
@@ -358,11 +392,11 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
       return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
         + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
     }
-    return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
+    return row.needs_review ? '<span class="tag go">review</span>' : "";
   };
   const slotRow = row => {
     const use = usedBy(row);
-    return `<tr data-tip="slot:${esc(row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
+    return `<tr data-tip="slot:${esc(row.key ?? row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
       + `<td class="n">${slotSize(row.size)}</td><td>${lastUsedText(row, now)}</td>`
       + (use ? `<td class="use wide">${use}</td>` : '<td class="dim wide">—</td>') + "</tr>";
   };
@@ -536,7 +570,7 @@ function refill(part, attribute, html) {
 function driveView(card) {
   let drive = null, range = null, state = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = size(state.limit);
+    card.querySelector("output").textContent = limitLabel(state.limit);
     refill(card.querySelector("tbody"), "data-path",
            treeRows(drive.tree, drive.mount, state, data.keep_bytes).map(row => rowHtml(row, drive.tree.size)).join(""));
   };
@@ -569,8 +603,8 @@ function driveView(card) {
     range = sliderRange(drive.tree, settings);
     state = stateFor(drive, range);
     card.querySelector(".top").innerHTML = headHtml(drive);
-    card.querySelector(".end.low").textContent = size(range.min);
-    card.querySelector(".end.high").textContent = size(range.max);
+    card.querySelector(".end.low").textContent = limitLabel(range.min);
+    card.querySelector(".end.high").textContent = limitLabel(range.max);
     slider.disabled = range.max <= range.min;
     const position = String(toSlider(state.limit, range));
     if (slider.value !== position) slider.value = position;
@@ -582,7 +616,7 @@ function driveView(card) {
 function sessionsView(card) {
   let report = null, keepBytes = 0, range = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = sessionLimit ? size(sessionLimit) : "any size";
+    card.querySelector("output").textContent = sessionLimit ? limitLabel(sessionLimit) : "any size";
     card.querySelector("tbody").innerHTML = sessionRows(report, keepBytes, sessionLimit);
   };
   const build = () => {
@@ -611,7 +645,7 @@ function sessionsView(card) {
     range = sessionRange(report, keepBytes);
     // A filter with no range left shows every session, so no data change can lock it.
     sessionLimit = range.max <= range.min ? 0 : Math.min(sessionLimit, range.max);
-    card.querySelector(".end.high").textContent = size(range.max);
+    card.querySelector(".end.high").textContent = limitLabel(range.max);
     slider.disabled = range.max <= range.min;
     const position = String(sessionLimit ? toSlider(sessionLimit, range) : 0);
     if (slider.value !== position) slider.value = position;
@@ -658,7 +692,7 @@ function slotStep(slot) {
   const age = builds ? Date.now() / 1000 - builds.read_at : NaN;
   // A missing read time gives NaN, which fails this check.
   if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
-  const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
+  const here = row => row.key && row.slot_folder === (slot.key ?? slot.name) && row.slot_machine === slotReport.machine;
   const run = builds.walk?.find(here);
   if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
   const wait = builds.waiters?.find(here);
@@ -676,7 +710,7 @@ function tipFor(key) {
   }
   if (kind === "slot" && slotReport) {
     for (const group of slotReport.groups) {
-      const slot = group.slots.find(slot => slot.name === name);
+      const slot = group.slots.find(slot => (slot.key ?? slot.name) === name);
       if (!slot) continue;
       const step = slotStep(slot);
       return step ? stepTip.tooltipHtml(step.tip, builds)
@@ -695,12 +729,11 @@ function tipFor(key) {
 
 function slotsAbout(report) {
   const field = stepTip.field;
-  return [field("Build slots", "", "title"),
-    field("", "A slot is a worktree of one repository that build runs use again.", "long"),
-    field("", "A run takes the lowest free slot, checks out its commit and builds there. The slot keeps the build output, so the next run builds less.", "long"),
-    field("", "Each repository has a slot limit. A run waits when all its slots are in use.", "long"),
-    field("", `The nightly sweep deletes a free slot unused for ${report ? report.unused_days : "some"} days.`, "long"),
-    field("", "Size counts the worktree and its build output. A slot in use shows its step as the Builds page shows it.", "long")];
+  return [field("Test copies", "", "title"),
+    field("", "A test takes the lowest free copy number in its unit and checks out the commit.", "long"),
+    field("", "If all copies are in use, the test takes the smallest missing number.", "long"),
+    field("", "The copy keeps its build output for the next test.", "long"),
+    field("", `The nightly sweep lists a free copy for review after ${report ? report.unused_days : "some"} days without use.`, "long")];
 }
 
 const SESSIONS_ABOUT = [stepTip.field("Session folders", "", "title"),
@@ -718,11 +751,11 @@ function groupTip(group, keepBytes) {
 
 function slotTip(slot, group, keepBytes, now, unusedDays) {
   const field = stepTip.field;
-  const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
+  const rows = [field(slot.name, slot.used_by ? "in use" : slot.needs_review ? "review" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
   if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
     stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
-  if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
+  if (slot.needs_review) rows.push(field("", `The nightly sweep lists this folder after ${unusedDays} days without use.`, "long", true));
   return rows;
 }
 
@@ -762,7 +795,7 @@ function fitSessionTip(tip, list) {
 function smallerTip(rows, limit, keepBytes) {
   const field = stepTip.field;
   return [field(`${rows.length} smaller session${rows.length === 1 ? "" : "s"}`, measuredSize(slotTotal(rows), keepBytes), "title"),
-    field("", `Each is below ${size(limit)}. Move the size filter to the left to show them.`, "long")];
+    field("", `Each is below ${limitLabel(limit)}. Move the size filter to the left to show them.`, "long")];
 }
 
 // The Builds page data, read again while the page shows, so a slot in use shows its step as it is now.

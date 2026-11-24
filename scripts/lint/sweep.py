@@ -87,9 +87,8 @@ from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
 from scripts.mac_test.mirror_root import MacMirrorRoot
+from scripts.lib.sizes import GIB, MIB, gib, mib
 
-GIB = 1 << 30
-MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
@@ -168,8 +167,8 @@ class CargoOutputIndex:
     known_trees: dict[str, list[str]] = field(default_factory=dict)
 
     @cached_property
-    def linked_roots(self) -> dict[str, tuple[str, ...]]:
-        """Connected output roots, shared by all lookups in this index."""
+    def connected_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with every root that a chain of saved mappings connects to it."""
         connected: dict[str, set[str]] = {}
         for mapping in self.workspaces:
             target, build = str(mapping.target_directory), str(mapping.build_directory)
@@ -178,8 +177,27 @@ class CargoOutputIndex:
                 connected[root] = linked
         return {root: tuple(sorted(linked)) for root, linked in connected.items()}
 
-    def roots_for(self, root: str) -> tuple[str, ...]:
-        return tuple(path for path in self.linked_roots.get(root, (root,)) if os.path.isdir(path))
+    @cached_property
+    def pair_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with the target and build folders of the saved mappings that name it."""
+        pairs: dict[str, set[str]] = {}
+        for mapping in self.workspaces:
+            pair = {str(mapping.target_directory), str(mapping.build_directory)}
+            for root in pair:
+                pairs.setdefault(root, set()).update(pair)
+        return {root: tuple(sorted(pair)) for root, pair in pairs.items()}
+
+    def connected_roots_for(self, root: str) -> tuple[str, ...]:
+        """The closure of root's mappings.
+
+        Scan clusters, batch order, group last use, the CI exclusion and the filesystem floor's
+        target list use it. Busy state never uses it.
+        """
+        return tuple(path for path in self.connected_roots.get(root, (root,)) if os.path.isdir(path))
+
+    def pair_roots_for(self, root: str) -> tuple[str, ...]:
+        """One hop: the roots of root's own mappings. Busy state spreads this far only."""
+        return tuple(path for path in self.pair_roots.get(root, (root,)) if os.path.isdir(path))
 
     @cached_property
     def output_owners(self) -> dict[Path, tuple[int, ...]]:
@@ -200,6 +218,17 @@ class CargoOutputIndex:
 
 
 OUTPUT_ROOTS: ContextVar[CargoOutputIndex] = ContextVar("cargo_output_roots", default=CargoOutputIndex())
+
+
+def spread_over_pairs[Use](found: Mapping[str, Use], roots: Collection[str]) -> dict[str, Use]:
+    """A use of one output root counts as a use of the other roots of its own mappings, in roots.
+
+    A root keeps its own use. The spread is one hop.
+    """
+    pairs = OUTPUT_ROOTS.get().pair_roots_for
+    spread = {paired: use for root, use in found.items() for paired in pairs(root) if paired in roots}
+    spread.update(found)
+    return spread
 
 
 @dataclass(frozen=True)
@@ -1143,21 +1172,64 @@ class SlotBuildOutput:
         return str(self.checkout.with_name(self.checkout.name + ".lock"))
 
 
-def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
+def output_slot_leases(
+    path: str, *, outputs: CargoOutputIndex | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> tuple[SlotBuildOutput, ...]:
     """Locate slot leases for direct output and recorded external output."""
-    settings = conf.read_or_repository("build_folders")
-    values = settings.values()
-    machine = store.host_name()
-    slot_value = values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
-    if not slot_value:
-        return ()
-    slots = Path(os.path.expandvars(slot_value)).expanduser().resolve()
-    cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser().resolve()
+    if isinstance(outputs, UseConfiguredValue):
+        outputs = OUTPUT_ROOTS.get()
     resolved = Path(path).resolve()
-    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in OUTPUT_ROOTS.get().mappings_for(resolved)))
-    checkouts = {slots / source.relative_to(root).parts[0] for source in sources for root in (slots, cargo)
-                 if source != root and source.is_relative_to(root)}
+    sources = (resolved, *(mapping.workspace_root.resolve() for mapping in outputs.mappings_for(resolved)))
+    root = build_folders.build_root().resolve()
+    checkouts: set[Path] = set()
+    for source in sources:
+        if not source.is_relative_to(root):
+            continue
+        for candidate in (source, *source.parents):
+            if not candidate.is_relative_to(root):
+                break
+            form = build_folders.parse_form(candidate)
+            if isinstance(form, build_folders.UnverifiedFolderPath):
+                raise form.error
+            if isinstance(form, build_folders.BuildCopy):
+                checkouts.add(candidate)
     return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
+
+
+@dataclass(frozen=True)
+class UnverifiedSlotLease:
+    """The target stays because the sweep cannot verify its slot lease."""
+
+    reason: str
+
+
+def report_unverified_slot(path: str, error: Exception) -> UnverifiedSlotLease:
+    reason = f"cannot verify the slot lease: {error}"
+    print(f"lint sweep: {path} kept: {reason}", file=sys.stderr)
+    return UnverifiedSlotLease(reason)
+
+
+def hold_trim_recovery_slots(roots: Sequence[str], guards: ExitStack,
+                             held_slots: Collection[SlotBuildOutput]) -> bool:
+    """Hold each slot lease before a paired trim retries deletion."""
+    current = OUTPUT_ROOTS.get()
+    saved = saved_cargo_output_roots()
+    outputs = CargoOutputIndex((*current.workspaces, *saved.workspaces, *saved.history))
+    held = set(held_slots)
+    for root in roots:
+        try:
+            if not outputs.mappings_for(Path(root).resolve()):
+                raise ValueError("no recorded Cargo output mapping for the saved trim")
+            for slot in output_slot_leases(root, outputs=outputs):
+                if slot not in held:
+                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
+                        print(f"lint sweep: busy slot lease; {root} left alone")
+                        return False
+                    held.add(slot)
+        except (OSError, RuntimeError, ValueError) as error:
+            _ = report_unverified_slot(root, error)
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1523,7 +1595,7 @@ def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
     return found
 
 
-def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], sizes: dict[str, int],
+def floor_holders(busy: Mapping[str, FloorProtection], sizes: dict[str, int],
                   locks: str = PROC_LOCKS, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[FloorHolder]:
@@ -1531,8 +1603,12 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     holders: list[FloorHolder] = []
-    for root, use in busy.items():
+    for root, protection in busy.items():
+        use = direct_use(protection)
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
+            continue
+        if isinstance(use, UnverifiedSlotLease):
+            holders.append(FloorHolder(root, sizes.get(root, 0), None, use.reason, None))
             continue
         if isinstance(use, LockHeld):
             pid = lock_holder(use.lock, locks, lint_settings=lint_settings)
@@ -1852,6 +1928,13 @@ class UnconfirmedReclaim:
 
 
 @dataclass(frozen=True)
+class PairedTrimDeferred:
+    """The saved trim stays because one of its outputs is in use."""
+
+    roots: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PendingUnlink:
     path: str
     device: int
@@ -1931,8 +2014,17 @@ class TrimTake:
             self.group_paths = []
         self.save()
 
-    def recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
+    def recover(
+        self, *, held_slots: Collection[SlotBuildOutput] = (),
+    ) -> ConfirmedDeletion | UnconfirmedReclaim | PairedTrimDeferred:
         """A missing or replaced name proves removal, never reclaimed blocks."""
+        with ExitStack() as guards:
+            if (len(self.output_roots) > 1 and self.stage == "deleting" and self.pending
+                    and not hold_trim_recovery_slots(self.output_roots, guards, held_slots)):
+                return PairedTrimDeferred(self.output_roots)
+            return self._recover()
+
+    def _recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
         paths: list[str] = []
         for entry in self.pending:
             try:
@@ -1966,9 +2058,6 @@ class TrimTake:
                 return False
         path.unlink(missing_ok=True)
         return True
-
-
-TRIM_TAKES: ContextVar[dict[str, TrimTake]] = ContextVar("sweep_trim_takes", default={})
 
 
 def trim_intent_path(target: str) -> Path:
@@ -2057,49 +2146,6 @@ def trim_row_recorded(take: TrimTake) -> bool:
                for row in store.locked_rows(path, take.log_offset))
 
 
-@contextmanager
-def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
-                     dry_run: bool, owners: TargetOwnerIndex, *,
-                     lint_settings: conf.ConfigRead, proc: str) -> Generator[dict[str, TargetUse | BuildHoldTarget]]:
-    """Keep the trim locked and report any users that block its recovery."""
-    if dry_run:
-        yield {}
-        return
-    target = os.path.abspath(target)
-    path = trim_intent_path(target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a") as guard:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        groups = [group for group in scan.groups if owners.owner(group.build_tree) == TargetOwner(target)]
-        whole_targets = [whole for whole in scan.whole_targets
-                         if cause == "floor take" and whole.target == target]
-        take = TrimTake(target, cause, len(groups) + len(whole_targets),
-                        output_roots=OUTPUT_ROOTS.get().roots_for(target))
-        recovered = True
-        if path.exists():
-            unfinished = load_trim_for_recovery(path)
-            if not isinstance(unfinished, DamagedTrimIntentSetAside):
-                uses = trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc)
-                if uses:
-                    yield uses
-                    return
-                _ = unfinished.recover()
-                recovered = unfinished.publish()
-                if not recovered:
-                    take = unfinished
-        active = dict(TRIM_TAKES.get())
-        active.update({group.build_tree: take for group in groups})
-        active.update({whole.target: take for whole in whole_targets})
-        token = TRIM_TAKES.set(active)
-        try:
-            yield {}
-            # A failed append keeps its completed intent for the next invocation.
-            if recovered and path.exists() and not take.publish():
-                return
-        finally:
-            TRIM_TAKES.reset(token)
-
-
 def stamp_newer(root: str, moment: float) -> bool:
     """Return whether the use stamp is newer than moment. A missing stamp returns False."""
     try:
@@ -2124,12 +2170,12 @@ def trim_output_uses(take: TrimTake, *, lint_settings: conf.ConfigRead,
 
 
 def saved_trim_outside(roots: Sequence[str]) -> str | None:
-    """The first root whose own saved trim has output outside roots; recoverable_trim would finish it."""
+    """The first root whose own saved trim has output outside roots; recovery would finish it."""
     for root in roots:
         try:
             take = read_trim_intent(trim_intent_path(os.path.abspath(root)))
         except (OSError, ValueError, KeyError):
-            # No intent; or a damaged one, which recoverable_trim sets aside without a removal.
+            # No intent; or a damaged one, which recovery sets aside without a removal.
             continue
         if not trim_inside(take, roots):
             return root
@@ -2183,7 +2229,8 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     if isinstance(locks, TargetLockBusy):
                         continue
                     try:
-                        _ = take.recover()
+                        if isinstance(take.recover(), PairedTrimDeferred):
+                            continue
                         if not take.publish():
                             continue
                     finally:
@@ -2578,14 +2625,6 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
     return 0
 
 
-def gib(size: int) -> str:
-    return f"{size / GIB:.1f} GiB"
-
-
-def mib(size: int) -> str:
-    return f"{size / MIB:.1f} MiB"
-
-
 def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
@@ -2638,12 +2677,12 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
             scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
 
-    paired_roots = output_index.roots_for
+    connected_roots = output_index.connected_roots_for
     clusters: list[tuple[str, ...]] = []
     assigned: set[str] = set()
     for root in roots:
         if root not in assigned:
-            cluster = tuple(path for path in paired_roots(root) if path in roots)
+            cluster = tuple(path for path in connected_roots(root) if path in roots)
             clusters.append(cluster)
             assigned.update(cluster)
     if not clusters:
@@ -2882,7 +2921,7 @@ def group_unchanged(group: FloorTake) -> bool:
 def shrink_floor(
     scan: Scan, total: int, budget: int, dry_run: bool,
     tree_targets: dict[str, str], trees: dict[str, list[str]],
-    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence], removal_order: RemovalOrder,
+    busy: dict[str, FloorProtection], removal_order: RemovalOrder,
     planned_at: float, owners: TargetOwnerIndex,
 *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -2906,7 +2945,7 @@ def shrink_floor(
         target_batches.items(),
         key=lambda batch: (max(target_last_use(root, [
             group for group in batch[1] if isinstance(group, Group)
-        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().roots_for(batch[0])), batch[0]),
+        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().connected_roots_for(batch[0])), batch[0]),
     )
     remaining = dict(scan.links)
     taken: list[tuple[FloorTake, int]] = []
@@ -2918,8 +2957,8 @@ def shrink_floor(
     for root, candidates in batches:
         if left <= budget:
             break
-        paired_roots = OUTPUT_ROOTS.get().roots_for(root)
-        if any(paired in busy for paired in paired_roots):
+        paired_roots = OUTPUT_ROOTS.get().pair_roots_for(root)
+        if first_use(busy, paired_roots) is not None:
             continue
         current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings, proc=PROC_DIR)
                          if not isinstance(policy, MacFloor) else {})
@@ -2932,17 +2971,26 @@ def shrink_floor(
         current_holds = {path: use for path, use in current_holds.items() if path in paired_roots}
         current_uses = {path: use for path, use in current_uses.items() if path in paired_roots}
         if current_holds or current_uses:
-            busy.update(current_holds)
-            busy.update(current_uses)
+            busy.update(spread_over_pairs({**current_holds, **current_uses}, scan.discovered_targets))
             continue
         with ExitStack() as guards:
             blocked_pair = False
+            held_slots: set[SlotBuildOutput] = set()
             for paired in paired_roots:
-                for slot in output_slot_leases(paired):
+                try:
+                    slots = output_slot_leases(paired)
+                except (OSError, RuntimeError) as error:
+                    busy[paired] = report_unverified_slot(paired, error)
+                    blocked_pair = True
+                    break
+                for slot in slots:
+                    if slot in held_slots:
+                        continue
                     if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
                         busy[paired] = LockHeld(slot.lock)
                         blocked_pair = True
                         break
+                    held_slots.add(slot)
                 if blocked_pair:
                     break
                 if not guards.enter_context(scratch.content_lock(Path(paired), removing=removing)):
@@ -3910,6 +3958,33 @@ class BuildHoldTarget:
     holder: str
 
 
+RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+
+
+@dataclass(frozen=True)
+class PairHeld:
+    """A root held only because a root of its own mappings is in use. It makes no other root held."""
+
+    use: RootProtection
+
+
+FloorProtection = RootProtection | PairHeld
+
+
+def direct_use(protection: FloorProtection) -> RootProtection:
+    """The use that protects a root, also when the root is held through its pair."""
+    return protection.use if isinstance(protection, PairHeld) else protection
+
+
+def first_use(busy: Mapping[str, FloorProtection], roots: Iterable[str]) -> RootProtection | None:
+    """The first use among roots. A pair-held root is not in use."""
+    for root in roots:
+        use = busy.get(root)
+        if use is not None and not isinstance(use, PairHeld):
+            return use
+    return None
+
+
 def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     proc: str = PROC_DIR,
@@ -4295,7 +4370,7 @@ def _hold_floor(floor: int, dry_run: bool, *,
             if any(root.is_relative_to(ci) for root in pair for ci in ci_roots):
                 excluded_roots.update(pair)
                 for root in pair:
-                    excluded_roots.update(Path(paired) for paired in mappings.roots_for(str(root)))
+                    excluded_roots.update(Path(paired) for paired in mappings.connected_roots_for(str(root)))
         targets = [root for root in targets if not any(Path(root).is_relative_to(excluded)
                                                       for excluded in excluded_roots)]
         filesystems = filesystem_floors(floor, targets, lint_settings=lint_settings)
@@ -4566,7 +4641,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     target_search: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
     protected: tuple[tuple[str, int], ...] = ()
     held_targets: set[str] = set()
-    busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
+    busy: dict[str, FloorProtection] = {}
     detail = ""
     mirror_leases = ExitStack()
     try:
@@ -4607,9 +4682,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
-        paired_roots = OUTPUT_ROOTS.get().roots_for
         known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
-        targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
+        targets = (sorted({paired for root in filesystem.targets
+                           for paired in OUTPUT_ROOTS.get().connected_roots_for(root)})
                    if isinstance(filesystem, FilesystemFloor) else
                    target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
         all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
@@ -4629,20 +4704,20 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             for root in targets:
                 if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
                     uses[root] = LockHeld("remote mirror lease is busy")
-        for root in tuple(hold_targets):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    hold_targets[paired] = hold_targets[root]
-        for root in tuple(uses):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    uses[paired] = uses[root]
+        hold_targets = spread_over_pairs(hold_targets, targets)
+        uses = spread_over_pairs(uses, targets)
         locked_files = held_cargo_lock_files(lint_settings=lint_settings)
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
-            held_slots = [slot for slot in output_slot_leases(root)
-                          if build_folders.build_folder_state(slot.checkout) == "held"]
+            try:
+                held_slots = [slot for slot in output_slot_leases(root)
+                              if build_folders.build_folder_state(slot.checkout) == "held"]
+            except (OSError, RuntimeError) as error:
+                busy[root] = report_unverified_slot(root, error)
+                held_targets.add(root)
+                _ = known_trees.setdefault(root, [])
+                continue
             if held_slots:
                 busy[root] = LockHeld(held_slots[0].lock)
                 held_targets.add(root)
@@ -4693,14 +4768,13 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
         for root in tuple(idle):
-            pair = paired_roots(root)
-            blocked_pair = next((paired for paired in pair if paired in busy), "")
-            if blocked_pair:
-                busy[root] = busy[blocked_pair]
+            pair_use = first_use(busy, OUTPUT_ROOTS.get().pair_roots_for(root))
+            if pair_use is not None:
+                busy[root] = PairHeld(pair_use)
                 idle.remove(root)
         scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
-        grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
+        grouped_roots = {root: OUTPUT_ROOTS.get().connected_roots_for(root) for root in set(tree_targets.values())}
         for group in scan.groups:
             for root in grouped_roots[tree_targets[group.build_tree]]:
                 if root in target_groups:
@@ -4717,10 +4791,10 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             busy_bytes = {path: 0 for path in busy if on_floor_filesystem(path)}
             measured = measure_protected_folders(frozenset(
                 path for path, use in busy.items()
-                if not isinstance(policy, MacFloor) and not isinstance(use, BuildHoldTarget)),
+                if not isinstance(policy, MacFloor) and not isinstance(direct_use(use), BuildHoldTarget)),
                 excluded_targets, walk=cache_walk)
             busy_bytes.update(measured.sizes)
-            protected = tuple((path, size) for path, size in measured.sizes if isinstance(busy[path], NoRecordedEvidence))
+            protected = tuple((path, size) for path, size in measured.sizes if isinstance(direct_use(busy[path]), NoRecordedEvidence))
             held_bytes = sum(busy_bytes.values())
             ci_paths: list[str] = []
             for path in lint_settings.words("sweep_ci_targets"):
@@ -4741,7 +4815,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
         # scan reported a 122.6 GiB fall while 123 GiB was freed.
         scanned_free = free_bytes(home)
-        protection_reason = ("because they are protected" if any(isinstance(use, NoRecordedEvidence) for use in busy.values())
+        protection_reason = ("because they are protected" if any(isinstance(direct_use(use), NoRecordedEvidence) for use in busy.values())
                              else "while a build or test run uses them")
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
@@ -4813,7 +4887,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     if after_free < floor and push_due:
                         holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
-                                       for root, use in busy.items() if isinstance(use, BuildHoldTarget))
+                                       for root, protection in busy.items()
+                                       if isinstance(use := direct_use(protection), BuildHoldTarget))
                         told = send_floor_holder_messages(holders, after_free, floor, 0, lint_settings=lint_settings)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
@@ -4845,9 +4920,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     finally:
         try:
             if not dry_run:
-                held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
+                held_targets.update(root for root, use in busy.items()
+                                    if not isinstance(direct_use(use), NoRecordedEvidence))
                 for root in tuple(held_targets):
-                    held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
+                    if not isinstance(busy.get(root), PairHeld):
+                        held_targets.update(OUTPUT_ROOTS.get().pair_roots_for(root))
                 notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets)),
                                              targets=target_search),
                                      lint_settings=lint_settings, detail=detail,
@@ -5181,9 +5258,80 @@ def rebuilds_main(argv: list[str]) -> int:
     return 0
 
 
+def _form_children(parent: Path) -> Iterator[Path]:
+    """List real child directories without following links."""
+    with os.scandir(parent) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                yield Path(entry.path)
+
+
+def _unused_form_paths(repo: Path) -> Iterator[tuple[Path, build_folders.FolderForm]]:
+    for entry in _form_children(repo):
+        if entry.name == "main":
+            paths = (entry,)
+        else:
+            paths = _form_children(entry)
+        for path in paths:
+            form = build_folders.parse_form(path)
+            if isinstance(form, (build_folders.WorktreeOutput, build_folders.BuildCopy,
+                                 build_folders.MainOutput, build_folders.CiOutput)):
+                yield path, form
+            elif isinstance(form, build_folders.UnverifiedFolderPath):
+                print(f"lint sweep: {path}: {form.error}", file=sys.stderr)
+
+
+def sweep_unused_folders(dry_run: bool, *, now: float, lint_settings: conf.ConfigRead) -> int:
+    """List expired build folders for review."""
+    _ = lint_settings
+    root = build_folders.build_root()
+    settings = conf.read_or_repository("build_folders")
+    cutoff = now - settings.whole("folders.unused_days") * 86400
+    plan = removal_guard.ListMode.PRINT_ONLY if dry_run else removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    if not removal_guard.is_real_directory(root):
+        return 0
+    for record in build_folders.numbered_copy_records():
+        if isinstance(record, build_folders.NumberedCopyRemovalPending):
+            path = record.copy.path
+            print(f"kept for a manual removal list: {path} (sweep, saved numbered copy removal)")
+            if isinstance(plan, removal_guard.RemovalList):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "saved numbered copy removal")
+    for repo in sorted(root.iterdir()):
+        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.LEGACY_TOP
+                or repo.name.startswith("old-") or not removal_guard.is_real_directory(repo)):
+            continue
+        for path, form in _unused_form_paths(repo):
+            if isinstance(form, build_folders.CiOutput) or not build_folders.expired_folder(path, cutoff=cutoff):
+                continue
+            print(f"kept for a manual removal list: {path} (sweep, expired build folder)")
+            if isinstance(plan, removal_guard.RemovalList):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "expired build folder")
+    if isinstance(plan, removal_guard.RemovalList):
+        plan.report()
+    return 0
+
+
+def switch_removal_list() -> int:
+    """List legacy build folders for the switch."""
+    root = build_folders.build_root()
+    plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
+    if removal_guard.is_real_directory(root):
+        for name in ("cargo", "paths", "slot", "hana-ci", "old-claude"):
+            path = root / name
+            if removal_guard.is_real_directory(path):
+                _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "legacy build folder at the switch")
+                print(f"kept for a manual removal list: {path} (sweep, legacy build folder at the switch)")
+    plan.report()
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv == ["--switch-removal-list"]:
+        return switch_removal_list()
     if argv and argv[0] == "rebuilds":
         return rebuilds_main(argv[1:])
+    if argv in (["--unused-folders"], ["--unused-folders", "--dry-run"]):
+        return sweep_unused_folders(len(argv) == 2, now=time.time(), lint_settings=conf.read("lint"))
     if "--dry-run" in argv:
         return assess(argv)
     plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)

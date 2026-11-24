@@ -15,6 +15,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import TypedDict, cast, override
 from unittest import mock
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -39,6 +40,7 @@ class ScratchGuardTests(unittest.TestCase):
     session_root: Path = Path()
     new_root: Path = Path()
     name: str = ""
+    build: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -46,10 +48,16 @@ class ScratchGuardTests(unittest.TestCase):
             prefix="scratch-guard-test-", dir="/tmp",
         ))))
         self.home, self.temp = base / "home", base / "temp"
+        self.build = base / "build"
+        config = base / "config"
+        _ = write_config_fixture(config / "build_folders.conf",
+            f"roots.build={self.build}\nroots.build.natedev={self.build}\n"
+            + f"roots.workspace={self.home / 'worktrees'}\n")
         # session_root is the former root; new_root is the session root, absent until a test makes it.
         self.session_root, self.new_root = base / "sessions", base / "session"
         self.enterContext(mock.patch.dict(os.environ, {"SESSION_FORMER_ROOT": str(self.session_root),
-                                                       "SESSION_TEMP_ROOT": str(self.new_root)}))
+                                                       "SESSION_TEMP_ROOT": str(self.new_root),
+                                                       "CONF_DIR": str(config)}))
         # The home folders a real home holds; a new folder directly in home is refused.
         (self.home / "rust" / "hana").mkdir(parents=True)
         (self.home / "worktrees").mkdir()
@@ -97,18 +105,31 @@ class ScratchGuardTests(unittest.TestCase):
             self.assertEqual(self.write_hook("Write", "file_path", path), "", path)
         self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
 
-    def test_copies_root_allows_a_new_pair_and_copy(self) -> None:
-        guard = importlib.import_module(f"scripts.hooks.{HOOK.stem}")
-        private = self.temp / "claude"
-        loose_folder = cast(Callable[[Path], Path | None], guard.loose_folder)
+    def test_manual_checkout_creation_is_refused_under_managed_roots(self) -> None:
+        sources = self.home / "worktrees"
+        workspace = sources / "hana/demo/change"
+        numbered = self.build / "hana/demo/1"
+        for path in (workspace, numbered):
+            self.assert_refused(f"mkdir -p {path}", str(path))
+            self.assert_refused(f"git clone origin {path}", str(path))
+            self.assertIn(str(path), self.write_hook("Write", "file_path", path / "README"))
+        self.assert_allowed("worktrees.py make hana demo change")
 
-        def private_root(text: str) -> Path:
-            return private if text == "/tmp/claude" else Path(text)
-
-        with (mock.patch.object(guard, "roots", return_value=[private]),
-              mock.patch.object(guard, "real", side_effect=private_root)):
-            self.assertIsNone(loose_folder(private / "copies" / "show-maker" / "21-gate"))
-            self.assertEqual(loose_folder(private / "loose" / "21-gate"), private / "loose")
+    def test_a_worktree_alias_allows_regular_edits(self) -> None:
+        repository = self.home / "rust/hana"
+        workspace = self.home / "worktrees/hana/demo/change"
+        workspace.parent.mkdir(parents=True)
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        for command in (("init",), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                    "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Fixture"),
+                        ("worktree", "add", "--detach", str(workspace))):
+            _ = subprocess.run(["git", "-C", str(repository), *command], capture_output=True,
+                               check=True, timeout=TEST_HANG_GUARD_SECS, env=environment)
+        alias = self.home / "old-worktree"
+        alias.symlink_to(workspace, target_is_directory=True)
+        self.assert_allowed(f"mkdir -p {alias}/src/sub")
+        self.assertEqual(self.write_hook("Write", "file_path", alias / "src/new.rs"), "")
+        self.assert_refused(f"git clone origin {alias}/nested", str(workspace / "nested"))
 
     def test_deleted_session_temp_folder_is_restored_for_each_tool(self) -> None:
         own = self.session_root / "scratch-session"
@@ -248,6 +269,7 @@ class ScratchGuardTests(unittest.TestCase):
             (f"cargo new --name x /tmp/claude/{self.name}", f"{os.path.realpath('/tmp/claude')}/{self.name}"),
             ("mktemp -d", f"{self.temp}/tmp.XXXXXXXXXX"),
             ("tar -xzf a.tgz -C ~/rust", f"{rust}/(archive entries)"),
+            ("git clone x ~/rust/repro/cargo-liner-C54-demo", f"{rust}/repro"),
         ]:
             self.assert_refused(command, folder)
 
@@ -259,8 +281,6 @@ class ScratchGuardTests(unittest.TestCase):
         for command in [
             "mkdir -p /tmp/claude-1000/-home-x/session/scratchpad/copy",
             "mkdir -p /tmp/claude/unit/abc /tmp/claude/delegate/abc /tmp/claude/scratch/run-x",
-            "git clone x ~/rust/repro/cargo-liner-C54-demo",
-            "git -C ~/rust/hana worktree add ~/worktrees/hana-x",
             f"make_a_worktree hana ~/rust/{self.name}",
             "mkdir -p ~/rust/hana/target/sub",
             "mktemp -d -p /tmp/claude-1000/-home-x/session/scratchpad",
@@ -284,7 +304,7 @@ class ScratchGuardTests(unittest.TestCase):
                     self.assertNotEqual(output, "")
                     decision = cast(HookResponse, json.loads(output))["hookSpecificOutput"]
                     self.assertEqual(decision["permissionDecision"], "deny")
-                    self.assertIn("build_folders.py run --owner O --name N -- CMD", decision["permissionDecisionReason"])
+                    self.assertIn("copies.py run", decision["permissionDecisionReason"])
         self.assert_allowed("mkdir -p /tmp/claude/unit/private-run/data")
         self.assert_allowed("cp ~/rust/hana/file /tmp/claude/unit/private-run/file")
 

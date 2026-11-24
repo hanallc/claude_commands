@@ -166,6 +166,20 @@ def _test_scope(argv: list[str], step: str) -> TestScope:
     return "full"
 
 
+CheckTargets = Literal["all-targets", "named"]
+"""The Cargo targets of a check: every target, or the targets its flags name."""
+
+
+def check_targets(argv: Sequence[str]) -> CheckTargets:
+    """Keep all-target check history apart, because test code raises its peak."""
+    return "all-targets" if "--all-targets" in argv else "named"
+
+
+def same_check_targets(arguments: Sequence[str], targets: CheckTargets) -> bool:
+    """A check peak without recorded arguments has unknown targets and matches no request."""
+    return bool(arguments) and check_targets(arguments) == targets
+
+
 def test_selection(argv: Sequence[str]) -> HistorySelection:
     """Read the package, scope and canonical filters with one command parse."""
     words = list(argv)
@@ -318,6 +332,7 @@ def percentile(values: list[int], *,
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
                   test_threads: int | None = None, *, scope: TestScope = "full",
                   filters: tuple[str, ...] = (), package: str = "",
+                  targets: CheckTargets = "named",
                   fresh: bool = False,
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
                   first_peak_bytes: int,
@@ -340,17 +355,20 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
         return filtered_history_peak(repository, step, host, now, root, test_threads,
                                      filters, package, history, share_percent=share_percent)
     return full_history_peak(repository, step, host, now, root, test_threads,
-                             scope, package, first_peak_bytes, history, share_percent=share_percent)
+                             scope, package, first_peak_bytes, history, targets=targets,
+                             share_percent=share_percent)
 
 
 def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
                       root: Path, test_threads: int | None, scope: TestScope,
                       package: str, first_peak_bytes: int, history: EstimateHistory, *,
+                      targets: CheckTargets = "named",
                       share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
     """Use repository peaks, indexed peaks, then pooled peaks for full runs.
 
     Full test requests with a package recover missing selection fields from
     indexed arguments. Other requests keep the recorded scope rule.
+    A check uses only the peaks of checks with the same targets.
     The gate pools test widths. `test_threads` selects one width for reports.
     """
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
@@ -362,6 +380,8 @@ def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now:
             if selection.package != package or selection.scope != scope:
                 continue
         elif item.get("test_scope", "full") != scope:
+            continue
+        if step == "check" and not same_check_targets(evidence.arguments, targets):
             continue
         if (test_threads is None or item.get("test_threads") == test_threads) and (
                 item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES):
@@ -386,7 +406,8 @@ def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now:
                     arguments = history_arguments(raw_argv)
                     selection = test_selection(arguments)
                     if (selection.scope == scope
-                            and (step not in TEST_STEPS or not package or selection.package == package)):
+                            and (step not in TEST_STEPS or not package or selection.package == package)
+                            and (step != "check" or same_check_targets(arguments, targets))):
                         peaks.append(value)
         except (OSError, sqlite3.Error):
             pass
@@ -979,7 +1000,7 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
         if step == "build" and callable(now):
             estimate_time = now()
         peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
-                             package=package, filters=filters, fresh=fresh,
+                             package=package, filters=filters, targets=check_targets(argv), fresh=fresh,
                              shape=build_shape(argv) if step == "build" else NO_BUILD_SHAPE,
                              first_peak_bytes=first_peak_bytes, share_percent=share_percent)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp(),

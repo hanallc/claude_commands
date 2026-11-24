@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from scripts.accounts import moves
 from scripts.agents import stop_resume
+from scripts.agents.stop_results import ClaudeStartState
 from scripts.production import staff
 
 
@@ -43,11 +44,13 @@ class FakeSessionMoves:
                  source_accounts: Mapping[str, str] = _NO_SOURCES, batch_id: str = "",
                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
-                 staff_members: Collection[staff.StaffId] = ()) -> list[stop_resume.MoveResult]:
-        del cause, batch_id, intent, staff_members
+                 staff_members: Collection[staff.StaffId] = (), user_command: bool = False) -> list[stop_resume.MoveResult]:
+        del cause, batch_id, staff_members, user_command
         self.sources.append(dict(source_accounts))
         self.batches.append(list(sessions))
-        return [self.move(session, target, why=why) for session in sessions]
+        return [stop_resume.ClaudeUp(session, "w1:p1", target, start_state=ClaudeStartState.ALREADY_RUNNING)
+                if isinstance(intent, moves.FollowGroupAccount) and source_accounts.get(session) == target
+                else self.move(session, target, why=why) for session in sessions]
 
     def move(self, session: str, target: str, *, why: str) -> stop_resume.ClaudeUp | stop_resume.StopFailed:
         call = MoveCall(session, target, why)

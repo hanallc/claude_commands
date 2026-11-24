@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import copy_helpers
-
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
@@ -30,8 +28,9 @@ from scripts.worktree import worktrees
 from scripts.production import showrunners
 from scripts.production import production_doc
 
-from scripts.lib import main_publish, scratch
+from scripts.lib import build_folders, main_publish, scratch
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
@@ -121,21 +120,28 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
+    def test_successful_push_lists_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
         _ = config.write_text((checkout / "config/staff.conf").read_text())
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
-        _ = copy_helpers(Path(self.env["HOME"]))
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
-        trees = {"landed-work": self.root / "landed-work", "dirty-work": self.root / "dirty-work"}
-        for branch, tree in trees.items():
-            made = subprocess.run(
-                ["bash", str(checkout / "scripts/worktree/make_worktree.sh"), str(tree), branch],
-                cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=20)
-            self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        workspace = self.root / "workspace"
+        build = self.root / "build"
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 f"roots.workspace={workspace}\nroots.build={build}\nroots.build.natedev={build}\n"
+                                 + "locks.probe_wait_seconds=0.05\nlocks.probe_retry_seconds=0.005\n")
+        trees = {f"{unit}-work": workspace / "origin" / unit / "work" for unit in ("landed", "dirty")}
+        for unit in ("landed", "dirty"):
+            branch = f"{unit}-work"
+            tree = trees[branch]
+            with mock.patch.dict(os.environ, self.env):
+                made = worktrees.create_checkout(
+                    tree, self.checkout, build_folders.NewWorktreeBranch(branch, "HEAD"),
+                    worktrees.output_record("origin", unit, "work"), owner=unit, merge_branch="production")
+            self.assertEqual(made, tree)
             _ = self.git("merge", "--ff-only", checkpoint, cwd=tree)
             _ = self.git("push", "-u", "origin", branch, cwd=tree)
         self.write(trees["dirty-work"], "src/alpha.txt", "uncommitted work\n")
@@ -150,23 +156,24 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("push: ok", result.stdout)
         self.assertEqual(self.git("rev-parse", "refs/remotes/origin/other-production"), retained)
-        self.assertIn("worktrees: ended", result.stdout)
-        self.assertIn(str(trees["landed-work"]), result.stdout)
         self.assertIn("worktrees: kept", result.stdout)
+        self.assertIn(f"{trees['landed-work']}: the checkout landed and requires manual review", result.stdout)
         self.assertIn(str(trees["dirty-work"]), result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"),
                          self.git("rev-parse", "refs/heads/production", cwd=self.origin))
         tree_listing = self.git("worktree", "list", "--porcelain")
-        self.assertNotIn(f"worktree {trees['landed-work']}\n", tree_listing + "\n")
-        self.assertNotIn(trees["landed-work"].name, [path.name for path in self.root.iterdir()])
+        self.assertIn(f"worktree {trees['landed-work']}\n", tree_listing + "\n")
+        self.assertTrue(trees["landed-work"].is_dir())
+        self.assertTrue((build / "origin/landed/work").is_dir())
+        self.assertTrue((build / "origin/dirty/work").is_dir())
         for folder in (self.checkout, self.origin):
             branches = self.git("for-each-ref", "--format=%(refname)", "refs/heads", cwd=folder).splitlines()
-            self.assertNotIn("refs/heads/landed-work", branches)
+            self.assertIn("refs/heads/landed-work", branches)
             self.assertIn("refs/heads/dirty-work", branches)
         remaining = [cast(dict[str, object], json.loads(path.read_text()))
                      for path in (records / "made").glob("*.json")]
-        self.assertEqual([(row["path"], row["branch"]) for row in remaining],
-                         [(str(trees["dirty-work"]), "dirty-work")])
+        self.assertEqual({(row["path"], row["branch"]) for row in remaining},
+                         {(str(tree), branch) for branch, tree in trees.items()})
         self.assertEqual((trees["dirty-work"] / "src/alpha.txt").read_text(), "uncommitted work\n")
 
     def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
@@ -260,6 +267,69 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertIn("docs/as-built/alpha.md", tree)
                     self.assertNotIn("docs/plans/alpha.md", tree)
                     self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
+
+    def duplicate_shrink_on_unit_branch(self) -> str:
+        plan = "docs/plans/alpha.md"
+        subject = "shrink(alpha): phase 43"
+        initial = "Phase 43 is open.\n\n# Schedule\n\nReview the plan.\n\n# Phase 44\n"
+        base = self.checkpoint(plan, initial, subject="Add the plan", push=False)
+        _ = self.git("merge", "--ff-only", base)
+        _ = self.git("merge", "--ff-only", base, cwd=self.promote)
+        shortened = initial.replace("Phase 43 is open.", "Phase 43 is complete.")
+        original = self.checkpoint(plan, shortened, subject=subject, push=False)
+        _ = self.git("merge", "--no-ff", "-m", "Merge the first shrink", original, cwd=self.promote)
+        _ = self.git("push", "origin", "main", "production")
+        _ = self.push_main_change("src/alpha.txt", "main changes this file\n")
+        _ = self.git("reset", "--hard", base, cwd=self.unit)
+        duplicate = self.checkpoint(plan, shortened, subject=subject + " again", push=False)
+        self.assertEqual(self.git("merge-base", original, duplicate), base)
+        self.assertEqual(self.git("diff", original, duplicate), "")
+        return duplicate
+
+    def test_shrink_ancestry_accepts_a_duplicate_shrink_on_another_branch(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-parse", f"{closing}^"), duplicate)
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_accepts_a_duplicate_with_a_production_only_parent(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("reset", "--hard", f"{duplicate}^", cwd=self.unit)
+        parent = self.checkpoint("src/beta.txt", "production work\n", subject="Update production", push=False)
+        _ = self.git("merge", "--ff-only", parent)
+        _ = self.git("push", "origin", "production")
+        _ = self.git("cherry-pick", duplicate, cwd=self.unit)
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-list", "main..production", cwd=self.origin), parent)
+
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_content_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Add pending work"
+        pending = self.checkpoint("src/beta.txt", "pending work\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_conflict_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Change a line that main changed"
+        pending = self.checkpoint("src/alpha.txt", "branch changes this file\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
 
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()

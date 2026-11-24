@@ -31,7 +31,7 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
-        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+        self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
@@ -225,7 +225,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("commands/component/seed.txt", "fixture\n")
         for expression, changed, selected, declaration in cases:
             with self.subTest(scan=expression, changed=changed, declaration=declaration):
-                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                            + f"# text:\nscan_roots={declaration}\n")
                 self.write(changed, "# before\n")
                 self.write("scripts/component/audit.py", "import os\nfrom scripts.component import directory_walk\n"
@@ -276,13 +276,13 @@ class AffectedModulesTests(unittest.TestCase):
                             self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
                 self.modules.remove(self.repo / "scripts/checks/test_audit.py")
 
-        words = (
-            "issue_score/test_experiment.py:config/issue_score.conf "
-            "issue_score/test_score_issues.py:config/issue_score.conf "
-            "maintenance/test_vault_commit.py:config/agent_notes.toml "
-            "review_links/test_review_link.py:scripts/lib/py "
-            "usage/test_collect_mac.py:scripts/lib/py"
-        ).split()
+        words = [
+            "issue_score/test_experiment.py:config/issue_score.conf",
+            "issue_score/test_score_issues.py:config/issue_score.conf",
+            "maintenance/test_vault_commit.py:config/agent_notes.toml",
+            "review_links/test_review_link.py:scripts/lib/py",
+            "usage/test_collect_mac.py:scripts/lib/py",
+        ]
         data_inputs = (
             ("config/issue_score.conf", ("issue_score/test_experiment.py", "issue_score/test_score_issues.py")),
             ("config/agent_notes.toml", ("maintenance/test_vault_commit.py",)),
@@ -297,7 +297,7 @@ class AffectedModulesTests(unittest.TestCase):
                     path = self.repo / word.partition(":")[2]
                     if not path.exists():
                         path.mkdir(parents=True)
-                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                self.write(".git/test-config/gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                            + f"# text:\nscan_roots={declaration}\n")
                 for name in names:
                     self.add_test(name, "from pathlib import Path\n"
@@ -382,7 +382,7 @@ class AffectedModulesTests(unittest.TestCase):
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
 
-    def test_landing_bases_exclude_changes_that_already_passed_the_merge_gate(self) -> None:
+    def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
         self.write("scripts/own/subject.py", "VALUE = 1\n")
         self.add_test("checks/test_landed.py", "import scripts.landed.subject\n")
@@ -420,6 +420,43 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result.modules, (self.repo / "scripts/checks/test_own.py",))
         self.assertEqual(result.base.commit, landing)
 
+    def test_a_join_selects_a_test_that_main_added_for_a_module_the_row_changed(self) -> None:
+        # Red 2 of item 191: the row changed a settings type, and main had added a test that builds it.
+        self.write("scripts/lib/eligibility.py", "VALUE = 1\n")
+        self.certify()
+        _ = self.git("switch", "-c", "row")
+        self.write("scripts/lib/eligibility.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
+        _ = self.git("switch", "main")
+        self.write("scripts/buildlog/machine_facts.py", "from scripts.lib import eligibility\n")
+        self.add_test("buildlog/test_machine_facts.py", "from scripts.lib import eligibility\n")
+        _ = self.git("update-ref", "refs/remotes/origin/main", self.commit())
+        _ = self.git("switch", "row")
+        _ = self.git("merge", "--no-ff", "main", "-m", "Join main")
+        result = self.selection()
+        self.assertEqual(result.changed_files, ("scripts/lib/eligibility.py",))
+        self.assertEqual(result.modules, (self.repo / "scripts/buildlog/test_machine_facts.py",))
+
+    def test_recorded_content_reads_select_a_test_whose_module_embeds_a_changed_source(self) -> None:
+        # Red 3 of item 191: gate_box.GUEST embeds the startup hook source through inspect.getsource.
+        self.write("scripts/lib/sitecustomize.py", "NAME = 'gate'\n")
+        # A computed module name keeps the import graph from selecting the test.
+        self.write("scripts/aws_target/gate_box.py", "import importlib\nimport inspect\nHOOK = 'site' + 'customize'\n"
+                   + "GUEST = inspect.getsource(importlib.import_module(f'scripts.lib.{HOOK}'))\n")
+        self.add_test("aws_target/test_gate_box.py", "from scripts.aws_target import gate_box\n")
+        self.certify()
+        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
+        run = cast(dict[str, object], json.loads(log.read_text()))
+        for row in cast(list[dict[str, object]], run["modules"]):
+            row["folder_scans"] = []
+            row["content_reads"] = (["scripts/lib/sitecustomize.py", "scripts/aws_target/gate_box.py"]
+                                    if row["module"] == "test_gate_box.py" else [])
+        _ = log.write_text(json.dumps(run) + "\n")
+        self.write("scripts/lib/sitecustomize.py", "NAME = 'merge_gate'\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/aws_target/test_gate_box.py",))
+
     def test_a_dirty_file_at_the_landing_tip_is_the_only_changed_path(self) -> None:
         self.add_test("checks/test_own.py", "VALUE = 1\n")
         landing = self.commit()
@@ -456,7 +493,7 @@ class AffectedModulesTests(unittest.TestCase):
         )
         for certificate, branches, expected_base, changed in cases:
             with self.subTest(branches=branches, certificate=certificate):
-                self.write(".git/test-config/merge_gate.conf", f"# text:\nlanding_branches={branches}\n"
+                self.write(".git/test-config/gate.conf", f"# text:\nlanding_branches={branches}\n"
                            + "# text:\nscan_roots=\n")
                 with mock.patch.object(affected, "git_output", wraps=affected.git_output) as git:
                     result = affected.select_affected(self.repo, certificate, self.modules, set())
@@ -691,7 +728,7 @@ class AffectedModulesTests(unittest.TestCase):
 
     def test_unreferenced_inputs_select_only_tests_in_a_changed_python_folder(self) -> None:
         paths = ["scripts/lib/new.py", "scripts/other/conftest.py", "settings.json",
-                 "scripts/production/merge_gate.py", "scripts/production/affected_modules.py",
+                 "scripts/production/gate.py", "scripts/production/affected_modules.py",
                  "scripts/agents/models_config.sh"]
         for path in paths:
             with self.subTest(path=path):

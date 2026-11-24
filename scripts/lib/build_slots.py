@@ -1,47 +1,33 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Take reusable repository slots and preserve source before each reset."""
+"""Take numbered copies and preserve source before each reset."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-import json
-from enum import Enum, auto
+from datetime import datetime, timezone
+import fcntl
 import os
 from pathlib import Path
-import re
-import selectors
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-import time
 from types import MappingProxyType
-from typing import BinaryIO, cast
+from typing import cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
-from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
-from scripts.lib.slot_root import slot_root as slot_root
+from scripts.lib.slot_root import configured_slot_root as configured_slot_root
 
 
-SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
-LEASE_SUFFIX = ".lease.json"
-
-
-@dataclass(frozen=True)
-class Slot:
-    path: Path
-    cargo_dir: Path
-    repository: str
-    number: int
-    env: Mapping[str, str]
+# Python writes these folders beside each imported module; they hold no work.
+_TOOL_OUTPUT_FOLDERS = ("__pycache__",)
 
 
 @dataclass(frozen=True)
@@ -53,7 +39,7 @@ class ExactSlotRequest:
 
 @dataclass(frozen=True)
 class LowestFreeSlot:
-    """Acquire the lowest free number within the configured pool."""
+    """Acquire the lowest free copy number."""
 
 
 SlotSelection = ExactSlotRequest | LowestFreeSlot
@@ -76,16 +62,6 @@ class NewSlotQueuePosition:
 NEW_SLOT_QUEUE_POSITION = NewSlotQueuePosition()
 
 
-class SlotsFull(RuntimeError):
-    """Every slot in the pool has a holder."""
-
-    def __init__(self, repository: str, machine: str, maximum: int) -> None:
-        self.repository: str = repository
-        self.machine: str = machine
-        self.maximum: int = maximum
-        super().__init__(f"slots: all {maximum} slots for {repository} on {machine} are held")
-
-
 class SlotResetRefused(BlockingIOError):
     """The slot reset could not reserve its work or output tree."""
 
@@ -105,15 +81,6 @@ class SlotRepositoryMismatch(ValueError):
 
 class SlotGitFailure(RuntimeError):
     """A slot Git command failed or exceeded its configured deadline."""
-
-
-@dataclass(frozen=True)
-class RepositoryPool:
-    source: Path
-    repository: str
-    machine: str
-    root: Path
-    cargo_root: Path
 
 
 def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: tuple[int, ...] = (0,)) -> str:
@@ -156,62 +123,13 @@ def slot_cargo_root(settings: conf.ConfigRead) -> Path:
     return _root(settings, "roots.slot_cargo")
 
 
-def lease_path(path: Path) -> Path:
-    return path.with_name(path.name + LEASE_SUFFIX)
-
-
-def slot_paths(root: Path) -> list[tuple[Path, str, int]]:
-    """List each slot's path, repository, and number from its folder or lease record."""
-    names = {entry.name.removesuffix(LEASE_SUFFIX) for entry in root.iterdir()}
-    return [(root / name, match[1], int(match[2])) for name in sorted(names)
-            if (match := SLOT_NAME.fullmatch(name)) is not None]
-
-
-def unused(last_use: datetime, settings: conf.ConfigRead, now: datetime) -> bool:
-    """Check whether the last use exceeds slots.unused_days."""
-    return last_use < now - timedelta(days=settings.whole("slots.unused_days"))
-
-
 def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
     """Read the repository limit or the machine's default limit."""
     key = f"slots.{machine}.{repository}.max"
     return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
 
 
-def _pool(source: Path) -> RepositoryPool:
-    settings = conf.read_or_repository("build_folders")
-    machine = host_name()
-    root = configured_slot_root()
-    main = source_checkout(source)
-    origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
-                            capture_output=True, text=True,
-                            pass_fds=build_folders.held_build_folder_descriptors())
-    if origin.returncode not in (0, 2):
-        origin.check_returncode()
-    repository = (origin.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
-                  if origin.returncode == 0 else main.name)
-    return RepositoryPool(main, repository, machine, root, slot_cargo_root(settings))
-
-
-def _maximum(pool: RepositoryPool) -> int:
-    settings = conf.read_or_repository("build_folders")
-    return configured_maximum(settings, pool.machine, pool.repository)
-
-
-def _slot_repository(pool: RepositoryPool) -> Path:
-    """Use the established pool repository before following copy records."""
-    if pool.root.is_dir():
-        for path, repository, _ in slot_paths(pool.root):
-            if repository == pool.repository and path.is_dir():
-                try:
-                    lease = cast(dict[str, object], json.loads(lease_path(path).read_text()))
-                except FileNotFoundError:
-                    continue
-                if lease.get("ready") is not True:
-                    continue
-                _ = git_files.at(path)
-                return source_checkout(path)
-    source = pool.source
+def _persistent_source(source: Path) -> Path:
     seen: set[Path] = set()
     while True:
         record_path = copy_record.record_path(source)
@@ -246,11 +164,13 @@ def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path) -> None:
+def _rescue(path: Path, output: Sequence[str] = ()) -> None:
+    """Save the source work, but not target, the use stamp or the `output` folders."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
+    generated = [path / "target", path / build_folders.COPY_USE_STAMP, *(path / folder for folder in output)]
     try:
-        _ = git_rescue.rescue(path, name, generated=[path / "target"],
+        _ = git_rescue.rescue(path, name, generated=generated,
                              pass_fds=build_folders.held_build_folder_descriptors())
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
@@ -262,7 +182,7 @@ def _rescue(path: Path) -> None:
         try:
             descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-            _ = git_rescue.rescue(path, name, generated=[path / "target"],
+            _ = git_rescue.rescue(path, name, generated=generated,
                                  pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
             _ = saved_index.replace(index)
@@ -270,190 +190,249 @@ def _rescue(path: Path) -> None:
         saved_index.unlink()
 
 
-def _exclude_slot_target(source: Path, path: Path, descriptor: int) -> None:
-    """Keep build output ignored only in this slot's worktree."""
-    checkout = git_files.at(path)
-    if _git(source, "config", "--local", "--type=bool", "--get", "extensions.worktreeConfig",
-            accepted=(0, 1), pass_fds=(descriptor,)) != "true":
+def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> None:
+    read_extension = ("config", "--local", "--type=bool", "--get", "extensions.worktreeConfig")
+    if _git(path, *read_extension, accepted=(0, 1), pass_fds=(descriptor,)) == "true":
+        return
+    with (common_dir / "build-copy-config.lock").open("a") as lock:
+        # Git retains the lock if the slot process exits during a write.
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        descriptors = (descriptor, lock.fileno())
+        if _git(path, *read_extension, accepted=(0, 1), pass_fds=descriptors) == "true":
+            return
         # Preserve the main checkout's location when Git enables worktree configuration.
         for key in ("core.worktree", "core.bare"):
-            value = _git(source, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=(descriptor,))
+            value = _git(path, "config", "--local", "--get", key, accepted=(0, 1), pass_fds=descriptors)
             if value:
-                _ = _git(source, "config", "--file", str(checkout.common_dir / "config.worktree"),
-                         key, value, pass_fds=(descriptor,))
-                _ = _git(source, "config", "--local", "--unset", key, pass_fds=(descriptor,))
-        _ = _git(source, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=(descriptor,))
+                _ = _git(path, "config", "--file", str(common_dir / "config.worktree"),
+                         key, value, pass_fds=descriptors)
+                _ = _git(path, "config", "--local", "--unset", key, pass_fds=descriptors)
+        _ = _git(path, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=descriptors)
+
+
+def _exclude_slot_target(path: Path, descriptor: int) -> None:
+    """Keep build output ignored only in this slot's worktree."""
+    checkout = git_files.at(path)
+    _enable_worktree_config(path, checkout.common_dir, descriptor)
     exclude = checkout.git_dir / "info/exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     text = exclude.read_text() if exclude.exists() else ""
-    if "/target/" not in text.splitlines():
+    missing = [pattern for pattern in ("/target/", f"/{build_folders.COPY_USE_STAMP}")
+               if pattern not in text.splitlines()]
+    if missing:
         with exclude.open("a") as output:
-            _ = output.write(("\n" if text and not text.endswith("\n") else "") + "/target/\n")
+            _ = output.write(("\n" if text and not text.endswith("\n") else "") + "\n".join(missing) + "\n")
     _ = _git(path, "config", "--worktree", "core.excludesFile", str(exclude), pass_fds=(descriptor,))
 
 
+@dataclass(frozen=True)
+class LeasedCopy:
+    """The source and Cargo paths of a held test copy."""
+
+    path: Path
+    repository: str
+    number: int
+    env: Mapping[str, str]
+    pass_fds: tuple[int, ...]
+
+    @property
+    def cargo_dir(self) -> Path:
+        return self.path / "target"
+
+
+def _copy_order(parent: Path) -> Generator[int]:
+    try:
+        numbers = build_folders.copy_numbers(parent)
+    except FileNotFoundError:
+        numbers = {}
+    existing = {number for number, folder in numbers.items() if folder}
+    yield from sorted(existing)
+    number = 1
+    while True:
+        if number not in existing:
+            yield number
+        number += 1
+
+
 @contextmanager
-def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, report: Callable[[str], None],
-              selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[Slot]:
-    """Acquire a selected slot and reset its source under the exclusive lock."""
-    pool = _pool(source)
-    maximum = _maximum(pool)
-    if isinstance(selection, ExactSlotRequest):
-        if type(selection.number) is not int or not 1 <= selection.number <= maximum:
-            raise ValueError('The assigned slot exceeds the configured pool')
-        numbers = (selection.number,)
-    else:
-        numbers = range(1, maximum + 1)
-    repository = _slot_repository(pool)
-    checkout = build_folders.SlotCheckout(repository, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
-    source_busy: build_folders.SlotSourceBusy | None = None
+def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
+              purpose: str, selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[LeasedCopy]:
+    """Take the assigned number or the first free copy."""
+    repository = _persistent_source(source_checkout(source))
+    name = build_folders.repo_word(repository)
+    revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
+    if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
+        raise SlotGitFailure(f"{revision}: the commit tracks a reserved copy path")
+    parent = build_folders.unit_folder(name, unit)
+    checkout = build_folders.SlotCheckout(repository, revision)
+    numbers = (selection.number,) if isinstance(selection, ExactSlotRequest) else _copy_order(parent)
     reset_refusal: build_folders.RemovalRefusal | None = None
-    with _slot_commit(repository, pool.source, checkout.commit):
+    with _slot_commit(repository, source, revision), ExitStack() as unit_claim:
+        _ = unit_claim.enter_context(build_folders.unit_allocation_lock(parent, exclusive=False))
         for number in numbers:
-            spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
-                                                repository=pool.repository, slot=number, showrunner=showrunner,
-                                                unit=unit, work=work, purpose=purpose, slot_checkout=checkout,
-                                                machine=pool.machine)
-            with ExitStack() as held:
+            spec = build_folders.BuildFolderSpec(kind="copy", parent=build_folders.build_root(),
+                suffix_length=0, repository=name, slot=number, showrunner=showrunner, unit=unit,
+                work=work, purpose=purpose, slot_checkout=checkout, machine=host_name())
+            with ExitStack() as held, ExitStack() as reset:
                 try:
                     path = held.enter_context(build_folders.slot_build_folder(spec))
-                except build_folders.SlotSourceBusy as error:
-                    source_busy = error
+                except build_folders.SlotSourceBusy:
+                    raise
+                except (BlockingIOError, FileExistsError):
                     continue
-                except BlockingIOError:
+                descriptor = build_folders.build_folder_lock_fd(path)
+                record = build_folders.numbered_copy_record(path)
+                if not isinstance(record, build_folders.NumberedCopySource):
                     continue
-                cargo = pool.cargo_root / path.name
-                with ExitStack() as guards:
-                    output = guards.enter_context(build_folders.reserve_cargo_output(cargo, alongside=(path,)))
-                    if not isinstance(output, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
-                        reset_refusal = output
-                        continue
-                    scan = guards.enter_context(build_folders.hold_descendant_leases(path))
-                    if not isinstance(scan, build_folders.DescendantLeasesHeld):
-                        reset_refusal = scan
-                        continue
-                    descriptor = build_folders.build_folder_lock_fd(path)
-                    (git_files.at(path).git_dir / "index.lock").unlink(missing_ok=True)
-                    target = path / "target"
-                    if target.is_symlink():
-                        target.unlink()
-                        target.mkdir()
-                    _exclude_slot_target(path, path, descriptor)
+                leases = reset.enter_context(build_folders.hold_descendant_leases(path))
+                if not isinstance(leases, build_folders.DescendantLeasesHeld):
+                    reset_refusal = leases
+                    continue
+                build_folders.mark_folder_use(path)
+                index = record.git_directory / "index"
+                index.with_name("index.lock").unlink(missing_ok=True)
+                if not os.path.lexists(index):
+                    _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
+                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
+                        *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
+                rescued = False
+                try:
+                    untracked = _git(path, *scan, pass_fds=(descriptor,))
+                except SlotGitFailure as error:
+                    if isinstance(error.__cause__, subprocess.TimeoutExpired):
+                        raise
                     _rescue(path)
-                    _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1), pass_fds=(descriptor,))
-                    _ = _git(path, "checkout", "--force", "--detach", checkout.commit, pass_fds=(descriptor,))
-                    _ = _git(path, "clean", "-ffdx", "--exclude=/target", pass_fds=(descriptor,))
-                    settings = conf.read_or_repository("build_folders")
-                    key = f"slots.{pool.machine}.{pool.repository}.max_bytes"
-                    if key in settings.values():
-                        limit = settings.whole(key)
-                        size = _size(path) + _size(cargo)
-                        if size > limit:
-                            removed = output.remove()
-                            if not isinstance(removed, build_folders.Removed):
-                                reset_refusal = removed
-                                continue
-                            target = path / "target"
-                            if target.is_dir() and not target.is_symlink():
-                                shutil.rmtree(target)
-                            report(f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
-                                   + "its build output is deleted once.")
-                    cargo.mkdir(parents=True, exist_ok=True)
-                yield Slot(path, cargo, pool.repository, number,
-                           MappingProxyType({"CARGO_BUILD_BUILD_DIR": str(cargo)}))
-            return
+                    rescued = True
+                    untracked = _git(path, *scan, pass_fds=(descriptor,))
+                if any(name.endswith("/") for name in untracked.split("\0")):
+                    print(f"kept for a manual removal list: {path} (build_slots, untracked folders)", file=sys.stderr)
+                    continue
+                unit_claim.close()
+                target = path / "target"
+                if target.is_symlink():
+                    target.unlink()
+                _exclude_slot_target(path, descriptor)
+                if not rescued:
+                    output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
+                    _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
+                _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
+                _ = _git(path, "checkout", "--force", "--detach", revision)
+                _ = _git(path, "clean", "-ffx", "--exclude=/target",
+                         f"--exclude=/{build_folders.COPY_USE_STAMP}")
+                target.mkdir(exist_ok=True)
+                build_folders.record_numbered_copy_source(path, repository, revision)
+                reset.close()
+                yield LeasedCopy(path, name, number, MappingProxyType({
+                    "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
+                    build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
+                }), (descriptor,))
+                return
         if reset_refusal is not None:
             raise SlotResetRefused(reset_refusal)
-        if source_busy is not None:
-            raise source_busy
-        raise SlotsFull(pool.repository, pool.machine, maximum)
+        if isinstance(selection, ExactSlotRequest):
+            raise BlockingIOError(f"{parent}: assigned copy {selection.number} is unavailable")
 
 
-class SlotWaitPolicy(Enum):
-    """Select queued acquisition or an immediate capacity result."""
+def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
+    """Discard Cargo output when a held copy exceeds its size limit."""
+    size = _size(copy.path)
+    if size > limit:
+        with build_folders.reserve_cargo_output(copy.cargo_dir) as output:
+            if not isinstance(output, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
+                build_folders.report_removal_refusal(output)
+                return
+            removed = output.remove()
+            if not isinstance(removed, build_folders.Removed):
+                build_folders.report_removal_refusal(removed)
+                return
+            copy.cargo_dir.mkdir()
+        print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
+              + "The maker deleted its Cargo output.")
 
-    QUEUE = auto()
-    REFUSE = auto()
 
-
-def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -> None:
-    """Wait for any kernel lock, with a finite deadline and no polling."""
-    from scripts.build_queue.slot_wait import SlotWaitExpired
-
-    script = ("import fcntl, sys\n"
-              "with open(sys.argv[1], 'rb') as lock:\n"
-              " fcntl.flock(lock, fcntl.LOCK_SH)\n"
-              " sys.stdout.write('free\\n')\n")
-    helpers: list[subprocess.Popen[bytes]] = []
+def _check_directory_identity(path: Path, expected: build_folders.CopyDirectoryIdentity) -> bool:
     try:
-        with selectors.DefaultSelector() as ready:
-            for number in range(1, maximum + 1):
-                path = root / f"{repository}-slot{number}.lock"
-                helper = subprocess.Popen([sys.executable, "-c", script, str(path)], stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE)
-                helpers.append(helper)
-                assert helper.stdout is not None
-                _ = ready.register(helper.stdout, selectors.EVENT_READ)
-            events = ready.select(max(0.0, deadline - time.monotonic()))
-            if not events:
-                raise SlotWaitExpired(f"slots: wait ended for {repository}; all {maximum} slots remain held")
-            stream = cast(BinaryIO, events[0][0].fileobj)
-            if stream.readline() != b"free\n":
-                raise RuntimeError(f"slots: cannot read a free-slot notification for {repository}")
-    finally:
-        for helper in helpers:
-            if helper.poll() is None:
-                helper.terminate()
-            _ = helper.communicate()
+        identity = build_folders.CopyDirectoryIdentity.from_stat(path.lstat())
+    except FileNotFoundError:
+        return False
+    if identity != expected:
+        raise SlotGitFailure(f"{path}: directory identity changed during copy removal")
+    return True
 
 
 @contextmanager
-def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, wait_policy: SlotWaitPolicy = SlotWaitPolicy.QUEUE,
-              report: Callable[[str], None] = print,
-              selection: SlotSelection = LOWEST_FREE_SLOT,
-              queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION) -> Generator[Slot]:
-    """Take the lowest free slot and wait through the queue at capacity."""
-    episode = queue_position.episode if isinstance(queue_position, SlotQueuePosition) else str(uuid4())
-    since = queue_position.since if isinstance(queue_position, SlotQueuePosition) else time.time()
-    seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
-    expires_at = time.time() + seconds
-    while True:
-        with ExitStack() as held:
-            try:
-                slot = held.enter_context(_try_slot(source, commit, showrunner=showrunner, unit=unit,
-                                                    work=work, purpose=purpose, report=report, selection=selection))
-            except SlotsFull as error:
-                if wait_policy is SlotWaitPolicy.REFUSE or isinstance(selection, ExactSlotRequest):
-                    raise
-                _wait_for_capacity(error, SlotQueuePosition(episode, since), expires_at,
-                                   showrunner=showrunner, unit=unit, work=work, purpose=purpose)
-                continue
-            yield slot
-            return
+def _numbered_copy_busy_marks(copy: build_folders.NumberedCopySource, *, dry_run: bool) -> Generator[bool]:
+    """Hold the old busy marks even when the checkout is partly removed."""
+    with ExitStack() as stack:
+        try:
+            parents = [copy.common_directory, copy.path, copy.path.parent]
+            with suppress(FileNotFoundError):
+                info = copy.git_directory.lstat()
+                if stat.S_ISDIR(info.st_mode) and build_folders.CopyDirectoryIdentity.from_stat(info) == copy.git_identity:
+                    parents.insert(1, copy.git_directory)
+            for parent in parents:
+                mark = parent / build_folders.BUSY
+                create = not dry_run and parent in (copy.common_directory, copy.git_directory)
+                with suppress(FileNotFoundError):
+                    descriptor = build_folders.open_busy_mark(mark, create=create)
+                    _ = stack.callback(os.close, descriptor)
+                    mode = fcntl.LOCK_SH if parent == copy.common_directory else fcntl.LOCK_EX
+                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+                    if not os.path.samestat(os.fstat(descriptor), mark.lstat()):
+                        raise BlockingIOError(f"{mark}: the busy mark changed")
+        except OSError:
+            yield False
+        else:
+            yield True
 
 
-def wait_for_capacity(source: Path, position: SlotQueuePosition, expires_at: float, *,
-                      showrunner: str, unit: str, work: str, purpose: str, owner_pid: int) -> None:
-    """Wait for capacity without taking a repository slot."""
-    pool = _pool(source)
-    _wait_for_capacity(SlotsFull(pool.repository, pool.machine, _maximum(pool)), position, expires_at,
-                       showrunner=showrunner, unit=unit, work=work, purpose=purpose, owner_pid=owner_pid)
+def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
+    """Check a numbered copy for manual review."""
+    from scripts.lib import scratch
+
+    record = build_folders.numbered_copy_record(path)
+    if isinstance(record, build_folders.NoNumberedCopySource):
+        return False
+    if isinstance(record, build_folders.UnreadableNumberedCopySource):
+        raise SlotGitFailure(record.reason)
+    copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+    if not build_folders.may_remove_folder_tree(path, copy.git_directory):
+        return False
+    if not _check_directory_identity(copy.common_directory, copy.common_identity):
+        return False
+    _ = _check_directory_identity(path, copy.checkout_identity)
+    with _numbered_copy_busy_marks(copy, dry_run=True) as idle:
+        if not idle or not isinstance(scratch.borrow_lifetime(path, scratch_settings=conf.read("scratch")), scratch.Ended):
+            return False
+        for borrower in scratch.registered_copy_paths():
+            evidence = scratch.task_of(borrower)
+            if isinstance(evidence, copy_record.Registered):
+                borrowed = evidence.fields.get("borrows_from")
+                if isinstance(borrowed, str) and borrowed:
+                    store = Path(borrowed).resolve()
+                    if store.is_relative_to(copy.git_directory) or store.is_relative_to(path.resolve()):
+                        return False
+        if not dry_run:
+            print(f"kept for a manual removal list: {path} (build_slots, numbered copy)", file=sys.stderr)
+        return dry_run
 
 
-def _wait_for_capacity(full: SlotsFull, position: SlotQueuePosition, expires_at: float, *,
-                       showrunner: str, unit: str, work: str, purpose: str, owner_pid: int = 0) -> None:
-    from scripts.build_queue import slot_wait
-
-    if sys.platform == "darwin":
-        _ = sys.stderr.write(str(full) + "; waiting for a free slot\n")
-        deadline = time.monotonic() + max(0.0, expires_at - time.time())
-        _wait_mac_slot(configured_slot_root(), full.repository, full.maximum, deadline)
-    else:
-        slot_wait.wait_for_slot(full.repository, full.machine, configured_slot_root(), full.maximum,
-            episode=position.episode, since=position.since, showrunner=showrunner, unit=unit, work=work,
-            purpose=purpose, expires_at=expires_at, owner_pid=owner_pid)
+def remove_copy(copy: build_folders.NumberedCopySource | build_folders.NumberedCopyRemovalPending, *,
+                dry_run: bool = False) -> bool:
+    """Check a free numbered copy for manual review."""
+    path = copy.copy.path if isinstance(copy, build_folders.NumberedCopyRemovalPending) else copy.path
+    form = build_folders.parse_form(path)
+    if isinstance(form, build_folders.UnverifiedFolderPath):
+        return False
+    if not isinstance(form, build_folders.BuildCopy):
+        raise ValueError(f"{path}: expected a numbered copy")
+    with build_folders.folder_removal_lease(path, wait=False, create=False,
+                                           root=build_folders.build_root()) as lease:
+        if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+            return False
+        if build_folders.numbered_copy_record(path) != copy or not remove_copy_locked(path, dry_run=dry_run):
+            return False
+        return True
 
 
 def _size(path: Path) -> int:
@@ -465,105 +444,38 @@ def _size(path: Path) -> int:
     return total
 
 
-def sweep_slots() -> None:
-    """Remove old free slots and delete oversized build output under their locks."""
-    machine = host_name()
-    settings = conf.read_or_repository("build_folders")
-    try:
-        root = configured_slot_root()
-    except SlotsNotConfigured:
-        return
-    cargo_root = slot_cargo_root(settings)
-    if not root.exists():
-        return
-    for path, repository, _ in slot_paths(root):
-        cargo = cargo_root / path.name
-        with ExitStack() as guards:
-            output = guards.enter_context(build_folders.reserve_cargo_output(cargo))
-            if not isinstance(output, (build_folders.ReservedCargoOutput, build_folders.CargoOutputAbsent)):
-                continue
-            record_path = lease_path(path)
-            oversized_report = ""
-            checkout_guarded = False
-            if path.exists():
-                lease_guard = guards.enter_context(build_folders.folder_removal_lease(path, children=True, wait=False))
-                checkout_guarded = not isinstance(lease_guard, build_folders.RefusedRemovalLease)
-            if path.exists():
-                if not checkout_guarded:
-                    continue
-                settings = conf.read_or_repository("build_folders")
-                lease = cast(dict[str, object], json.loads(record_path.read_text()))
-                last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
-                if unused(last_use, settings, datetime.now(timezone.utc)):
-                    try:
-                        _rescue(path)
-                    except git_rescue.RescueError as error:
-                        detail = " ".join(str(error).splitlines())
-                        _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
-                        continue
-                    descriptor = build_folders.build_folder_lock_fd(path)
-                    _ = _git(source_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
-                else:
-                    key = f"slots.{machine}.{repository}.max_bytes"
-                    if key not in settings.values() or isinstance(output, build_folders.CargoOutputAbsent):
-                        continue
-                    limit = settings.whole(key)
-                    size = _size(path) + _size(cargo)
-                    if size <= limit:
-                        continue
-                    oversized_report = (
-                        f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
-                        + "its build output is deleted.\n")
-            removed = output.remove()
-            if not isinstance(removed, build_folders.Removed):
-                build_folders.report_removal_refusal(removed)
-            elif oversized_report:
-                _ = sys.stdout.write(oversized_report)
-            elif checkout_guarded:
-                record_path.unlink(missing_ok=True)
-            elif record_path.exists():
-                with build_folders.folder_removal_lease(path, wait=False) as lease_guard:
-                    if not isinstance(lease_guard, build_folders.RefusedRemovalLease) and not path.exists():
-                        record_path.unlink(missing_ok=True)
-
-
 def main(argv: Sequence[str]) -> int:
     import argparse
-    from scripts.build_queue.slot_wait import SlotWaitExpired
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    _ = commands.add_parser("sweep")
+    parser = argparse.ArgumentParser(description="Run a command in a numbered test copy.")
+    commands = parser.add_subparsers(required=True)
     run = commands.add_parser("run")
     _ = run.add_argument("--source", type=Path, required=True)
     _ = run.add_argument("--commit", required=True)
-    for name in ("showrunner", "unit", "work", "purpose"):
-        _ = run.add_argument(f"--{name}", required=True)
-    _ = run.add_argument("argv", nargs=argparse.REMAINDER)
+    _ = run.add_argument("--showrunner", required=True)
+    _ = run.add_argument("--unit", required=True)
+    _ = run.add_argument("--work", required=True)
+    _ = run.add_argument("--purpose", required=True)
+    _ = run.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    if cast(str, args.command) == "sweep":
-        sweep_slots()
-        return 0
-    arguments = cast(list[str], args.argv)
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
+    command = cast(list[str], args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
     try:
-        with take_slot(cast(Path, args.source), cast(str, args.commit), showrunner=cast(str, args.showrunner),
-                       unit=cast(str, args.unit), work=cast(str, args.work), purpose=cast(str, args.purpose)) as slot:
-            descriptor = build_folders.build_folder_lock_fd(slot.path)
-            return build_folders.run_build_command(arguments, path=slot.path,
-                                                  environment={**os.environ, **slot.env, "BUILD_FOLDER": str(slot.path),
-                                                               "BUILD_FOLDER_LOCK_FD": str(descriptor)},
-                                                  pass_fds=(descriptor,))
-    except (SlotsFull, SlotWaitExpired) as error:
-        _ = sys.stderr.write(f"{error}\n")
-        return 75
-    except SlotsNotConfigured as error:
-        _ = sys.stderr.write(f"{error}\n")
-        return 2
-    except (SlotGitFailure, SlotResetRefused, build_folders.SlotSourceBusy, subprocess.SubprocessError) as error:
-        _ = sys.stderr.write(f"{error}\n")
-        return 2
+        with take_copy(cast(Path, args.source), cast(str, args.commit), showrunner=cast(str, args.showrunner),
+                       unit=cast(str, args.unit), work=cast(str, args.work), purpose=cast(str, args.purpose)) as copy:
+            if not command:
+                print(copy.path, flush=True)
+                _ = sys.stdin.read(1)
+                return 0
+            descriptor = build_folders.build_folder_lock_fd(copy.path)
+            environment = {**os.environ, **copy.env, "BUILD_FOLDER": str(copy.path),
+                           "BUILD_FOLDER_LOCK_FD": str(descriptor)}
+            return build_folders.run_build_command(command, path=copy.path, environment=environment,
+                                                   pass_fds=build_folders.held_build_folder_descriptors())
+    except (OSError, ValueError, SlotGitFailure, subprocess.SubprocessError) as error:
+        print(f"copies: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
