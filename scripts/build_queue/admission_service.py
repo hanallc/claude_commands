@@ -14,7 +14,6 @@ import errno
 import hashlib
 import heapq
 import json
-import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -85,7 +84,6 @@ class ProviderConfiguration:
     files: dict[Path, conf.ConfigurationBytes | OSError] = field(default_factory=dict)
     targets: dict[str, target_config.Target | records.UnregisteredTarget | conf.Unusable] = field(default_factory=dict)
     generations: dict[tuple[str, placement.ProviderSettings], str] = field(default_factory=dict)
-    reply_deadlines: dict[str, float] = field(default_factory=dict)
 
     def registered_target(self, name: str) -> target_config.Target | records.UnregisteredTarget:
         if name not in self.targets:
@@ -150,12 +148,6 @@ def _provider_configuration() -> ProviderConfiguration:
     return ProviderConfiguration() if current is None else current
 
 
-def _limit_placement_reply(episode: str, deadline: float) -> None:
-    current = _PASS_PROVIDER_CONFIGURATION.get(None)
-    if current is not None:
-        current.reply_deadlines[episode] = min(current.reply_deadlines.get(episode, float("inf")), deadline)
-
-
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
 READING_ALERT_KEY = "build-admission-reading"
 
@@ -202,12 +194,7 @@ class MacLinuxReadyForProbe:
     failed_at: float
 
 
-@dataclass(frozen=True)
-class MacLinuxBackoff:
-    deadline: float
-
-
-def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | MacLinuxBackoff | placement.TemporaryExclusion:
+def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | placement.TemporaryExclusion:
     from scripts.mac_test import eligibility
 
     try:
@@ -223,19 +210,17 @@ def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | MacLinuxBackoff | p
     except (OSError, ValueError):
         return placement.TemporaryExclusion("mac_linux_settings_unreadable")
     try:
-        backoff = eligibility.backoff_path(eligibility.MAC_LINUX_TARGET)
-        with backoff.open(encoding="utf-8") as stream:
-            deadline = float(stream.read().strip())
-            failed_at = os.fstat(stream.fileno()).st_mtime
-        if not math.isfinite(deadline):
+        backoff = eligibility.read_backoff(now, eligibility.MAC_LINUX_TARGET, strict=True)
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return placement.TemporaryExclusion("mac_linux_backoff")
+        if isinstance(backoff, eligibility.UnreadableBackoff):
             return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
-        if now < deadline:
-            return MacLinuxBackoff(deadline)
+        failed_at = eligibility.backoff_path(eligibility.MAC_LINUX_TARGET).stat().st_mtime
     except target_config.ConfigError:
         return placement.TemporaryExclusion("mac_linux_unregistered")
     except FileNotFoundError:
         failed_at = float("-inf")
-    except (OSError, ValueError):
+    except OSError:
         return placement.TemporaryExclusion("mac_linux_backoff_unreadable")
     return MacLinuxReadyForProbe(registry, failed_at)
 
@@ -1201,13 +1186,12 @@ class HostEvidenceWorker:
 
     def __init__(self, key: placement.HostEvidenceKey,
                  probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence],
-                 clock: Clock, wake: int, interval: float, *, changed: Callable[[], None] | None = None) -> None:
+                 clock: Clock, wake: int, interval: float) -> None:
         self.key: placement.HostEvidenceKey = key
         self.probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = probe
         self.clock: Clock = clock
         self.wake: int = wake
         self.interval: float = interval
-        self.changed: Callable[[], None] | None = changed
         self.lock: threading.Lock = threading.Lock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
@@ -1225,13 +1209,7 @@ class HostEvidenceWorker:
 
     def publish(self, evidence: placement.HostEvidence) -> None:
         with self.lock:
-            self._store(evidence)
-
-    def _store(self, evidence: placement.HostEvidence) -> None:
-        if evidence != self.observations.get(evidence.key):
             self.observations[evidence.key] = evidence
-            if self.changed is not None:
-                self.changed()
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Request a worker reading and retain ownership until the exact reading arrives."""
@@ -1331,12 +1309,10 @@ class HostEvidenceWorker:
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
-            self._store(evidence)
+            self.observations[key] = evidence
             for attempt, probe, observed in dispatches_read:
                 if self.dispatch_probes.get(attempt) is probe:
                     self.dispatch_observations[attempt] = observed
-                    if self.changed is not None:
-                        self.changed()
             self.due[key] = time.monotonic() + self.interval
             if self.stopped.is_set():
                 return False
@@ -1415,12 +1391,10 @@ def durable_copy(value: object) -> object:
 
 
 @dataclass(frozen=True)
-class PublishedPlacement:
+class PublishedPlacementWait:
     input_event_count: int
     request_digest: bytes
-    reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
-    evidence_version: object
-    valid_until: float
+    reply: wire.PlacementWait
 
 
 @dataclass
@@ -1428,7 +1402,7 @@ class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
     wait_positions: dict[str, int]
-    placements: dict[str, PublishedPlacement]
+    placement_waits: dict[str, PublishedPlacementWait]
     view_bytes: bytes = b""
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
@@ -1805,7 +1779,6 @@ class AdmissionServer:
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.placement_request_digests: dict[str, bytes] = {}
         self.input_event_count: int = 0
-        self.provider_evidence_version: object = object()
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -1840,6 +1813,7 @@ class AdmissionServer:
         self.listener_started_at: float = float("inf")
         self.configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration = gate.UnusableAdmissionConfiguration("configuration not read")
         self.last_usable_configuration: records.MemoryConfig | NoPass = NoPass()
+        self.request_slow_seconds: float = float("inf")
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
@@ -1899,8 +1873,6 @@ class AdmissionServer:
         self.config_parent: Path = self.config_path.parent
         self.config_parent_identity: tuple[int, int] = (-1, -1)
         self.config_event_name: str = ""
-        self.provider_config_names: set[str] = set()
-        self.unwatched_provider_configs: dict[Path, conf.ConfigurationStamp | conf.UnstampedConfiguration] = {}
         self.next_config_watch_retry: float = float("inf")
         self._arm_config_watch()
         self.epoll.register(self.config_events, select.EPOLLIN)
@@ -2838,6 +2810,13 @@ class AdmissionServer:
         configuration = gate.read_admission_configuration()
         if isinstance(configuration, gate.UsableAdmissionConfiguration):
             self.last_usable_configuration = configuration.config
+            try:
+                with conf.diagnostics(report=False) as messages:
+                    self.request_slow_seconds = conf.read("build_admission").number("request_slow_seconds")
+            except conf.Unusable as error:
+                records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
+            else:
+                records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
         return configuration
 
     def _take_configuration(self) -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
@@ -2918,12 +2897,10 @@ class AdmissionServer:
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
-        provider = ProviderConfiguration()
-        token = _PASS_PROVIDER_CONFIGURATION.set(provider)
+        token = _PASS_PROVIDER_CONFIGURATION.set(ProviderConfiguration())
         try:
             with target_config.command_configuration():
                 result = self._pass(configuration)
-                self._remember_provider_configs(provider)
                 self._answer_parked_placements()
                 return result
         finally:
@@ -2973,9 +2950,6 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        evidence_started_at = self.clock.now()
-        # Keep the version from before the pass reads any provider evidence.
-        evidence_version = self.provider_evidence_version
         evidence_keys: PlacementEvidenceKeys = {}
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
@@ -3057,7 +3031,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        self.published.placements = self._publish_placement_replies(evidence_keys, evidence_started_at, evidence_version)
+        self.published.placement_waits = self._publish_placement_waits(evidence_keys)
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -3404,35 +3378,20 @@ class AdmissionServer:
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
-        placements = self.published.placements if isinstance(self.published, PublishedReplies) else {}
-        self.published = PublishedReplies(view, explain, positions, placements)
+        waits = self.published.placement_waits if isinstance(self.published, PublishedReplies) else {}
+        self.published = PublishedReplies(view, explain, positions, waits)
 
-    def _publish_placement_replies(self, keys: PlacementEvidenceKeys, started_at: float,
-                                   evidence_version: object) -> dict[str, PublishedPlacement]:
-        input_event_count = self.input_event_count
-        deadlines = _provider_configuration().reply_deadlines
-        for (episode, _destination), key in keys.items():
-            if not isinstance(key, placement.HostEvidenceKey):
-                continue
-            evidence = self.host_observations.get(key)
-            if isinstance(evidence, placement.FreshHostEvidence):
-                try:
-                    expires_at = evidence.observed_at + self._evidence_lifetime(key)
-                except (OSError, ValueError):
-                    continue
-                if expires_at >= started_at:
-                    _limit_placement_reply(episode, expires_at)
-        replies: dict[str, PublishedPlacement] = {}
+    def _publish_placement_waits(self, keys: PlacementEvidenceKeys) -> dict[str, PublishedPlacementWait]:
+        waits: dict[str, PublishedPlacementWait] = {}
         for episode, request in self.placement_requests.items():
-            request_digest = self.placement_request_digests.get(episode)
-            if request_digest is None or not self._placement_owner_live(request.owner):
+            digest = self.placement_request_digests.get(episode)
+            if digest is None or not self._placement_waiting(request):
                 continue
             reply = self._placement_reply(request,
                 self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys)
-            if not isinstance(reply, wire.DispatchStatus):
-                deadline = deadlines.get(episode, float("inf"))
-                replies[episode] = PublishedPlacement(input_event_count, request_digest, reply, evidence_version, deadline)
-        return replies
+            if isinstance(reply, wire.PlacementWait):
+                waits[episode] = PublishedPlacementWait(self.input_event_count, digest, reply)
+        return waits
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3767,10 +3726,6 @@ class AdmissionServer:
         except OSError:
             pass
 
-    def _provider_evidence_changed(self) -> None:
-        # The worker changes the version before it wakes the loop.
-        self.provider_evidence_version = object()
-
     def host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         reader = self.host_readers.get(key)
         evidence = (reader.latest if reader is not None else self.host_observations.get(key,
@@ -3857,9 +3812,6 @@ class AdmissionServer:
                                     key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
         now = self.clock.now()
         backoff = mac_linux_backoff(now)
-        if isinstance(backoff, MacLinuxBackoff):
-            _limit_placement_reply(request.episode, backoff.deadline)
-            return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion("mac_linux_backoff"))
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, now, "", backoff)
         self.host_requests[key] = request
@@ -3900,7 +3852,7 @@ class AdmissionServer:
             reader = self.host_targets.get(target)
             if reader is None:
                 reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
-                    self.reading_events, interval, changed=self._provider_evidence_changed)
+                    self.reading_events, interval)
                 self.host_targets[target] = reader
             else:
                 reader.request(key)
@@ -4074,8 +4026,6 @@ class AdmissionServer:
 
         started_at = self.clock.now()
         backoff = mac_linux_backoff(started_at)
-        if isinstance(backoff, MacLinuxBackoff):
-            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("mac_linux_backoff"))
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, started_at, "", backoff)
         try:
@@ -4471,7 +4421,6 @@ done
             elif isinstance(retry, placement.DoNotRetry):
                 permitted = placement.FixedExclusion(retry.reason)
             elif retry.deadline > self.clock.now():
-                _limit_placement_reply(request.episode, retry.deadline)
                 permitted = placement.TemporaryExclusion("retry deadline has not passed")
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination, keys)
@@ -4564,7 +4513,6 @@ done
             hold = records.RemoteStartHold(now + remote_start_hold_seconds)
             self.assignments[key] = replace(saved, remote_start_hold=hold)
         if now < hold.deadline:
-            _limit_placement_reply(request.episode, hold.deadline)
             return True
         self.assignments[key] = self._end_remote_start_hold(request, saved)
         return False
@@ -4692,7 +4640,6 @@ done
                     and isinstance(attempt.retry, placement.RetryAt) and attempt.retry.deadline > self.clock.now()
                     and isinstance(report, placement.TerminalAttemptReport)
                     and attempt.retry.deadline > report.received_at):
-                _limit_placement_reply(request.episode, attempt.retry.deadline)
                 target = attempt.assignment.destination.target
                 delayed[target] = placement.ProviderRetryNotice(target, attempt.state.reason,
                     attempt.retry.deadline - report.received_at)
@@ -5274,21 +5221,15 @@ done
             digest = connection.placement_request_digest if isinstance(connection, Connection) else None
             if digest is None:
                 digest = hashlib.sha256(wire.encode_request(request).encode().removesuffix(b"\n")).digest()
-            if self._configuration_changed():
-                self.pending_configuration = NoPass()
-                self._schedule_pass()
+            _ = self._configuration_changed()
             if (isinstance(self.pending_configuration, NoPass)
+                    and request.episode not in self.current_assignments
+                    and request.episode not in self.reservations
                     and isinstance(self.published, PublishedReplies)
-                    and (published := self.published.placements.get(request.episode)) is not None
+                    and (published := self.published.placement_waits.get(request.episode)) is not None
                     and published.input_event_count == self.input_event_count
-                    and published.request_digest == digest
-                    and self.clock.now() < published.valid_until
-                    and self.config_watch >= 0
-                    and all(conf.file_stamp(path) == stamp for path, stamp in self.unwatched_provider_configs.items())
-                    and published.evidence_version is self.provider_evidence_version):
-                saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
-                if saved is None or not self._ended_claim_holder(saved):
-                    return [published.reply]
+                    and published.request_digest == digest):
+                return [published.reply]
             previous = self.placement_requests.get(request.episode)
             identity = self._placement_identity(request)
             members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
@@ -5506,17 +5447,11 @@ done
             self._log_request_timing(request, started, cpu_started)
 
     def _log_request_timing(self, request: wire.Request, started: float, cpu_started: float) -> None:
-        try:
-            with conf.diagnostics(report=False) as messages:
-                limit = conf.read("build_admission").number("request_slow_seconds")
-        except conf.Unusable as error:
-            records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
-        else:
-            records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
-            wall, cpu = self.clock.monotonic() - started, time.thread_time() - cpu_started
-            if wall > limit:
-                print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
-                      file=sys.stderr, flush=True)
+        wall = self.clock.monotonic() - started
+        if wall > self.request_slow_seconds:
+            cpu = time.thread_time() - cpu_started
+            print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
+                  file=sys.stderr, flush=True)
 
     def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
@@ -6170,31 +6105,19 @@ done
         self.next_config_watch_retry = self.clock.monotonic() + interval
         self.next_pass = min(self.next_pass, self.next_config_watch_retry)
 
-    def _remember_provider_configs(self, provider: ProviderConfiguration) -> None:
-        self.provider_config_names = {path.name for path in provider.files if path.parent == self.config_path.parent}
-        self.unwatched_provider_configs.clear()
-        for path, snapshot in provider.files.items():
-            try:
-                if path.parent == self.config_path.parent and not path.is_symlink():
-                    continue
-            except OSError:
-                pass
-            stamp = snapshot.stamp if isinstance(snapshot, conf.ConfigurationBytes) else conf.UnstampedConfiguration.UNSTAMPED
-            self.unwatched_provider_configs[path] = stamp
-
     def _configuration_changed(self) -> bool:
         changed = False
         for event in inotify.events(self.config_events):
             if event.mask & inotify.IN_Q_OVERFLOW:
                 changed = True
             elif event.watch == self.config_watch:
-                changed |= (bool(event.mask & inotify.WATCH_REMOVED) or not event.name
-                            or event.name == self.config_event_name
-                            or (self.config_parent == self.config_path.parent and event.name in self.provider_config_names))
+                changed |= bool(event.mask & inotify.WATCH_REMOVED) or not event.name or event.name == self.config_event_name
                 if event.mask & inotify.WATCH_REMOVED:
                     inotify.remove_watch(self.config_events, self.config_watch)
                     self.config_watch = -1
         if changed:
+            self.pending_configuration = NoPass()
+            self._schedule_pass()
             self._arm_config_watch()
         return changed
 
@@ -6213,6 +6136,7 @@ done
     def run_once(self, timeout: float = 0) -> None:
         self.start()
         now = self.clock.monotonic()
+        # While steps wait, the effective pass interval is the larger of the waiting interval and the minimum pass gap.
         due = max(self.next_pass, self._pass_allowed_at())
         delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)

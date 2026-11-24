@@ -211,18 +211,15 @@ An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
 `wait_for_placement` polls after each configured waiting interval, which is one second by default.
 Changes to the queue files do not trigger a poll.
-The service publishes placement waits and grants after each pass.
-The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
-Each published reply carries the request digest, the input event count, the provider evidence version, and the earliest applicable deadline.
-A poll can reuse a reply when the digest, count, and version match and the deadline is in the future.
-The deadline covers provider evidence expiry, attempt retries, guest backoff, and the hold for a remote start.
-The configuration watch checks admission configuration and the provider settings read by the pass.
-The service compares file stamps for settings outside the watched folder and for settings that use symbolic links.
-A pending configuration change or an ended claim holder prevents reuse.
-The owner can then ask the service to close the attempt under the usual provider rules.
-The reuse check needs no pass or state write.
-Readings, process exits, configuration changes, queue changes, and the pass timer advance the input event count.
-Provider workers change the evidence version when they store new evidence.
+The service caches placement waits after each pass.
+It hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+A poll can reuse a wait when the request digest and input event count match and no configuration change is pending.
+An episode with a current assignment or local grant takes the regular request path.
+An unchanged poll that reuses a wait needs no pass, state write, or configuration file read.
+A poll from another account still checks the owner's account in `/proc/<pid>/status`.
+The timer refreshes waits at the larger of `waiting_pass_seconds` and `min_pass_gap_seconds`.
+The next poll sees the new result after the pass.
+The service reads the request timing limit during its configuration read.
 `Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
