@@ -1,7 +1,7 @@
 """Share the queue rule and Later values for List and Review."""
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from enum import StrEnum
 import json
 import re
@@ -70,8 +70,21 @@ def later_label(value: LaterValue, format_time: Callable[[datetime], str]) -> st
     return "Until delivered"
 
 
+def resolve_later_time(value: datetime, zone: tzinfo) -> datetime:
+    """Apply the configured zone to a legacy time without an offset."""
+    return value.replace(tzinfo=zone) if value.tzinfo is None else value
+
+
 def later_active(value: Later, now: datetime) -> bool:
-    return value is UntilDelivered.DELIVERED or isinstance(value, datetime) and value > now
+    return value is UntilDelivered.DELIVERED or isinstance(value, datetime) and value.timestamp() > now.timestamp()
+
+
+def next_later_deadline(values: Iterable[Later], now: datetime) -> str:
+    """Return the first future deadline in epoch seconds."""
+    current = now.timestamp()
+    future = (stamp for value in values if isinstance(value, datetime) and (stamp := value.timestamp()) > current)
+    first = min(future, default=None)
+    return '' if first is None else str(int(first))
 
 
 @dataclass(frozen=True)

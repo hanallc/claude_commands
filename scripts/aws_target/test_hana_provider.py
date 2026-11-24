@@ -723,6 +723,14 @@ class HanaProviderTests(CostFixture):
             _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
         self.assertEqual(str(pending.exception), 'Hana provider call failed: ec2:DescribeInstances (InvalidInstanceID.NotFound)')
 
+    def test_a_refused_key_names_its_code_for_the_controller(self) -> None:
+        self.fake.failure = 'describe-instances'
+        self.fake.failure_stderr = 'An error occurred (AuthFailure) when calling the DescribeInstances operation: Fixture'
+        with self.assertRaises(provider.ProviderKeyRefused) as refused:
+            _ = self.provider.step(IDENTITY, self.start(), self.operation(box.Action.OBSERVE))
+        self.assertEqual(refused.exception.code, 'AuthFailure')
+        self.assertEqual(str(refused.exception), 'Hana provider call failed: ec2:DescribeInstances (AuthFailure)')
+
     def test_cli_timeout_reports_only_the_action(self) -> None:
         self.fake.lose_response = 'modify-instance-attribute'
         with self.assertRaises(provider.ProviderPending) as pending:
