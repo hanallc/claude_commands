@@ -1466,8 +1466,7 @@ class DirectCommandCopy:
     tree: Path
 
 
-GATE_SCRIPT = Path("scripts/production/gate.py")
-GATE_MODULE = "scripts.production.gate"
+GATE_SCRIPT = "scripts/production/gate.py"
 GATE_CHECK_HELP = 3
 GATE_CHECK_PROGRAM = """
 import argparse
@@ -1504,34 +1503,13 @@ except SystemExit as error:
 """
 
 
-def gate_module_arguments(command: Sequence[str]) -> Sequence[str] | None:
-    """Read the arguments of the qualified gate module."""
-    module = parse_command_program(command)
-    if isinstance(module, OtherCommand) or module[0] != GATE_SCRIPT.name:
-        return None
-    _, arguments = module
-    word = command[len(command) - len(arguments) - 1]
-    return arguments if word == GATE_MODULE or word.partition("m")[2] == GATE_MODULE else None
-
-
-def gate_command_source_check(command: Sequence[str], checkout: Path, *,
+def gate_command_source_check(command: Sequence[str], *,
                               numbered_copy: bool = False) -> Callable[[Path], None] | None:
-    """Select the check for the gate script or its qualified module."""
+    """Select the check for the exact relative gate script path."""
     program = parse_command_program(command, keep_path=True)
-    if isinstance(program, OtherCommand):
-        arguments = gate_module_arguments(command)
-        if arguments is None:
-            return None
-    else:
-        script, arguments = program
-        path = Path(script).expanduser()
-        if numbered_copy:
-            if Path(os.path.normpath(path)).parts[-len(GATE_SCRIPT.parts):] != GATE_SCRIPT.parts:
-                return None
-            if path != GATE_SCRIPT:
-                raise CopyError(f"Use {GATE_SCRIPT} or -m {GATE_MODULE} in copies.py run.")
-        elif checkout / path != checkout / GATE_SCRIPT:
-            return None
+    if isinstance(program, OtherCommand) or program[0] != GATE_SCRIPT:
+        return None
+    _, arguments = program
 
     def check(source: Path) -> None:
         path = source.resolve() / GATE_SCRIPT
@@ -1547,8 +1525,9 @@ def gate_command_source_check(command: Sequence[str], checkout: Path, *,
                    for node in syntax.body):
             return
         mode = "run" if numbered_copy else "gate-step"
+        checked_arguments = arguments if numbered_copy else [part.replace("{tree}", str(source)) for part in arguments]
         result = subprocess.run(
-            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *arguments],
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *checked_arguments],
             cwd=source, capture_output=True, text=True,
         )
         if result.returncode == GATE_CHECK_HELP:
@@ -2753,7 +2732,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
-    check_source = gate_command_source_check(command, source, numbered_copy=True)
+    check_source = gate_command_source_check(command, numbered_copy=True)
     verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
@@ -2790,8 +2769,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            entry = (str(GATE_SCRIPT),) if gate_module_arguments(arguments) is not None else arguments
-            if not first_step.canonical_gate_command(entry, tree):
+            if not first_step.canonical_gate_command(arguments, tree):
                 return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
             return run_prepared_gate(arguments, cwd=tree, descriptors=locks, environment=child_environment)
 
@@ -2825,8 +2803,9 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
 
     if command_program(command) not in GATE_SCRIPTS:
         raise CopyError("gate-step requires a gate command")
-    if check := gate_command_source_check(command, source):
+    if check := gate_command_source_check(command):
         check(source)
+        command = [part.replace("{tree}", str(source)) for part in command]
     targets = first_step.gate_targets(command, source, args.targets)
 
     def run() -> subprocess.CompletedProcess[str]:

@@ -2517,15 +2517,27 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertIn("Use --repo '{tree}'.", result.stderr)
                 admit.assert_not_called()
 
-    def test_run_refuses_a_gate_script_path_outside_the_numbered_copy(self) -> None:
-        revision = self.commit_gate_script("raise SystemExit(0)\n")
-        _ = self.commit_gate_validator()
-        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/scripts/production/gate.py"):
-            with self.subTest(script=script), mock.patch.object(first_step, "admitted_run") as admit:
-                result = self.run_cli("--commit", revision, command=(sys.executable, script, "--targeted"))
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertIn("Use scripts/production/gate.py or -m scripts.production.gate", result.stderr)
-                admit.assert_not_called()
+    def test_run_launches_alternate_gate_script_paths_without_early_validation(self) -> None:
+        revision = self.commit_gate_script("""\
+            from pathlib import Path
+            import sys
+
+            def check_prepared_gate_source(arguments, parser, source):
+                raise AssertionError("An alternate script path reached validation")
+
+            assert sys.argv[1:] == ["--targeted", str(Path.cwd())]
+            """)
+        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/scripts/production/gate.py",
+                       "./scripts/production/gate.py"):
+            with self.subTest(script=script):
+                run_gate = mock.Mock(side_effect=launch_copy_fixture)
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+                with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit:
+                    result = self.run_cli("--commit", revision,
+                                          command=(sys.executable, script, "--targeted", "{tree}"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                admit.assert_called_once()
+                run_gate.assert_called_once()
 
     def test_run_checks_only_the_requested_module_paths(self) -> None:
         _ = self.commit_gate_validator()
@@ -2584,12 +2596,14 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_run_does_not_validate_an_unrelated_gate_script_or_module(self) -> None:
         _ = self.commit_gate_validator()
-        script = self.source / "tools/gate.py"
-        script.parent.mkdir()
-        _ = script.write_text("import sys\nassert sys.argv[1:] == ['--report']\n")
-        _ = self.git(self.source, "add", str(script))
-        _ = self.git(self.source, "commit", "-qm", "Add the report command")
-        for program in (("tools/gate.py",), ("-m", "tools.gate")):
+        vendor_script = "vendor/tool/scripts/production/gate.py"
+        for name in ("tools/gate.py", vendor_script):
+            script = self.source / name
+            script.parent.mkdir(parents=True)
+            _ = script.write_text("import sys\nassert sys.argv[1:] == ['--report']\n")
+            _ = self.git(self.source, "add", str(script))
+        _ = self.git(self.source, "commit", "-qm", "Add the report commands")
+        for program in (("tools/gate.py",), ("-m", "tools.gate"), (vendor_script,)):
             with self.subTest(program=program):
                 run_gate = mock.Mock(side_effect=launch_copy_fixture)
                 admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
@@ -2598,15 +2612,24 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 run_gate.assert_called_once()
 
-    def test_run_validates_the_qualified_gate_module_before_admission(self) -> None:
-        _ = self.commit_gate_validator()
-        with mock.patch.object(first_step, "admitted_run") as admit:
-            result = self.run_cli(command=(sys.executable, "-m", "scripts.production.gate", "--module", "x"))
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
-        admit.assert_not_called()
+    def test_run_passes_qualified_gate_module_arguments_to_the_child(self) -> None:
+        _ = self.commit_gate_script("""\
+            import sys
 
-    def test_run_launches_the_qualified_gate_from_the_numbered_copy(self) -> None:
+            def check_prepared_gate_source(arguments, parser, source):
+                raise AssertionError("A module invocation reached validation")
+
+            assert sys.argv[1:] == ["--module", "x"]
+            """)
+        run_gate = mock.Mock(side_effect=launch_copy_fixture)
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit:
+            result = self.run_cli(command=(sys.executable, "-m", "scripts.production.gate", "--module", "x"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        admit.assert_called_once()
+        run_gate.assert_called_once()
+
+    def test_run_launches_the_qualified_gate_without_a_prepared_handoff(self) -> None:
         revision = self.commit_gate_script(f"""\
             import os
             from pathlib import Path
@@ -2625,8 +2648,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 root = Path.cwd()
                 assert Path(__file__).parents[2] == root
                 assert parse(sys.argv[1:], argparse.ArgumentParser()).repo == str(root)
-                fd = int(os.environ[{copies.PREPARED_GATE_FD!r}])
-                assert os.read(fd, 32) == f"{{os.getpid()}}\\n".encode("ascii")
+                assert {copies.PREPARED_GATE_FD!r} not in os.environ
             """)
         _ = self.commit_gate_script("raise SystemExit(9)\n")
         run_gate = mock.Mock(side_effect=launch_copy_fixture)

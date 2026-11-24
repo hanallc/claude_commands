@@ -328,38 +328,51 @@ class GateDefaultPlacementTests(unittest.TestCase):
             source = Path(folder).resolve()
             module = "fixture/test_ok.py"
             script = Path("scripts/production/gate.py")
-            arguments = ["--affected", "--module", module, "--repo", str(source)]
-            command = [sys.executable, "-B", str(script), *arguments]
+            arguments = ["--affected", "--module", module, "--repo"]
+            command = [sys.executable, "-B", str(script), *arguments, "{tree}"]
+            expanded = [*arguments, str(source)]
             test = source / "scripts" / module
             test.parent.mkdir(parents=True)
             test.touch()
             assignment = placed("natedev")
             (source / script).parent.mkdir(parents=True)
+            _ = (source / "scripts/__init__.py").write_text('')
             _ = (source / script).write_text(dedent(f"""\
                 from contextlib import nullcontext
                 from pathlib import Path
                 import sys
                 from unittest import mock
 
-                from scripts.production import gate
-                from scripts.production.test_gate_default_placement import placed
+                def check_prepared_gate_source(arguments, parser, source):
+                    parser.add_argument("--affected", action="store_true", required=True)
+                    parser.add_argument("--module", required=True)
+                    parser.add_argument("--repo", required=True)
+                    args = parser.parse_args(arguments)
+                    assert args.repo == str(source)
+                    assert (source / "scripts" / args.module).is_file()
+                    (source / "validated").write_text(args.repo)
 
-                assert sys.argv[1:] == {arguments!r}
-                outcome = gate.GateRun((gate.GateJobResult("fixture", "test_ok.py", 0, 1, ""),), 1, 0)
-                with (mock.patch.object(gate, "current_gate_placement", return_value=placed("natedev")),
-                      mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
-                      mock.patch.object(gate.scratch, "copy_lock", return_value=nullcontext()),
-                      mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
-                      mock.patch.object(gate.copies, "source_owner", return_value=""),
-                      mock.patch.object(gate, "run_named_modules", return_value=outcome) as run):
-                    assert gate.main() == 0
-                run.assert_called_once_with(Path.cwd(), [{module!r}], gate.SuiteMode.TARGETED)
+                if __name__ == "__main__":
+                    from scripts.production import gate
+                    from scripts.production.test_gate_default_placement import placed
+
+                    assert sys.argv[1:] == {expanded!r}
+                    assert (Path.cwd() / "validated").read_text() == sys.argv[-1]
+                    outcome = gate.GateRun((gate.GateJobResult("fixture", "test_ok.py", 0, 1, ""),), 1, 0)
+                    with (mock.patch.object(gate, "current_gate_placement", return_value=placed("natedev")),
+                          mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                          mock.patch.object(gate.scratch, "copy_lock", return_value=nullcontext()),
+                          mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                          mock.patch.object(gate.copies, "source_owner", return_value=""),
+                          mock.patch.object(gate, "run_named_modules", return_value=outcome) as run):
+                        assert gate.main() == 0
+                    run.assert_called_once_with(Path.cwd(), [{module!r}], gate.SuiteMode.TARGETED)
                 """))
             with (mock.patch.dict(os.environ, {"PYTHONPATH": str(REPOSITORY)}, clear=True),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(
                       inherited_admission(assignment))) as admit):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--targets", "natedev", "--", *command]), 0)
-            admit.assert_called_once_with(command, source, targets=("natedev",))
+            admit.assert_called_once_with([*command[:-1], str(source)], source, targets=("natedev",))
 
     def test_default_modes_enter_one_admission_for_the_whole_command(self) -> None:
         checkpoint = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
