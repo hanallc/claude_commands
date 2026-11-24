@@ -24,7 +24,7 @@ from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.lib import build_folders, scratch
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
-from scripts.production import change_review, gate, staff, showrunners
+from scripts.production import change_review, gate, nightly_schedule, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_unit_saved_name
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import GateResultUnknown
@@ -418,7 +418,7 @@ class NightlyPushTests(unittest.TestCase):
         with (mock.patch.object(gate, "nightly_git", return_value=""),
               mock.patch.object(gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(gate, "nightly_owner", return_value="sdlc"),
-              mock.patch.object(gate, "nightly_next_run", return_value=self.next_run),
+              mock.patch.object(nightly_schedule, "nightly_next_run", return_value=self.next_run),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
               mock.patch.object(gate, "run_gate_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
@@ -791,10 +791,10 @@ class NightlyPushTests(unittest.TestCase):
                     "Next elapse: Wed 2026-11-25 03:53:00 EST\n"
                     + "    (in UTC): Wed 2026-11-25 08:53:00 UTC\n", ""))
             with (self.subTest(reported_start=reported_start), mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}),
-                  mock.patch.object(gate, "datetime", NightlyClock),
+                  mock.patch.object(nightly_schedule, "datetime", NightlyClock),
                   mock.patch.object(subprocess, "run", side_effect=results) as run):
                 NightlyClock.current = now
-                self.assertEqual(gate.nightly_next_run(), "Wed 11-25 00:53 PST")
+                self.assertEqual(nightly_schedule.nightly_next_run(), "Wed 11-25 00:53 PST")
                 self.assertEqual(run.call_count, len(results))
                 self.assertEqual(run.call_args_list[0].args[0][-1], "claude-nightly.timer")
                 if reported_start == elapsed:

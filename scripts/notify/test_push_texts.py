@@ -22,6 +22,7 @@ from scripts.notify import push_texts
 from scripts.message import session_send
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+from scripts.production import nightly_schedule
 
 
 def literal_path(node: ast.expr) -> str:
@@ -190,14 +191,13 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(push.posted_title), 45)
 
     def test_nightly_not_run_accepts_the_installed_timer_values(self) -> None:
-        from scripts.production import gate
-
         for reason, action, expected_action in (
                 ("GitHub credentials are cold", "In a terminal on natedev, run github-warmup",
                  "Action: In a terminal on natedev, run github-warmup\n"),
                 ("fetch failed", "None. The next nightly run tries again.", "")):
             values = {"branch": "main", "time": "03:00 EST", "reason": reason, "action": action}
-            with (self.subTest(reason=reason), mock.patch.object(gate, "nightly_next_run", return_value="Wed 11-25 00:00 PST")):
+            with (self.subTest(reason=reason),
+                  mock.patch.object(nightly_schedule, "nightly_next_run", return_value="Wed 11-25 00:00 PST")):
                 rendered = push_texts.render("nightly.not_run", **values)
             self.assertEqual(rendered.values, values)
             self.assertEqual(rendered.posted_title, "Nightly check did not run")
