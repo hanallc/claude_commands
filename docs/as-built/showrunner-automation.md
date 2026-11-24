@@ -499,8 +499,9 @@ Each local Promote checkout must exist before the command pushes.
   A failed main push or Mac pull adds no rows.
   The next successful call adds the rows from earlier promoted merges.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
-- **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
-  It uses the shared runner with affected-module selection.
+- **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
+  Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+  The gate uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.

@@ -805,7 +805,7 @@ fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
     if [[ -f "$VERIFY_REPO_ROOT/scripts/copies/copies.py" ]]; then
-        printf '%s\n' 'claude_commands: run tests with copies.py --affected or --module' >&2
+        printf '%s\n' 'claude_commands: From the worktree root, run ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected' >&2
     fi
     exit 2
 fi
@@ -882,7 +882,7 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb length offset=0 status list_run step_list=0
+    local verb length offset=0 status step_list=0
     if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
         step_list=1
     fi
@@ -897,10 +897,7 @@ run_verify_verbs() {
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
-        # Doc can leave its grant without a memory handoff when it takes its own slot.
-        list_run=""
-        if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
-        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="${BUILDLOG_RUN:-}" bash "$VERIFY_START_DIR/verify.sh" \
             "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
         wait "$!" || status=$?
@@ -1218,6 +1215,7 @@ run() {
 run_step() {
     local -a command=("$@")
     local cargo_index=0 BUILDLOG_VERIFY_POSITION=1
+    local VERIFY_WAIT_DIR=${HOLD_WAIT_DIR:-}
     if [[ "${command[0]:-}" == env ]]; then
         cargo_index=1
         while :; do
@@ -1235,6 +1233,12 @@ run_step() {
             final:nextest) BUILDLOG_VERIFY_POSITION=2 ;;
             lint:clippy) BUILDLOG_VERIFY_POSITION=${VERIFY_STEP_COUNT:-1} ;;
         esac
+        case "${CMD:-}:${command[cargo_index]:-}" in
+            lint:mend|lint:clippy|lint:fmt)
+                if [[ -n "$VERIFY_WAIT_DIR" ]]; then
+                    VERIFY_WAIT_DIR="$HOLD_WAIT_DIR/wait-${command[cargo_index]}"
+                fi ;;
+        esac
     fi
     local -x BUILDLOG_VERIFY_VERB="${CMD:-}" BUILDLOG_VERIFY_CALL="${VERIFY_CALL_TEXT:-}"
     local -x BUILDLOG_VERIFY_TOTAL="${VERIFY_STEP_COUNT:-1}"
@@ -1247,6 +1251,10 @@ run_step() {
             exit $?
         fi
         return 0
+    fi
+    if [[ -n "$VERIFY_WAIT_DIR" && "$VERIFY_WAIT_DIR" != "$HOLD_WAIT_DIR" ]]; then
+        mkdir -p "$VERIFY_WAIT_DIR" || return $?
+        local -x BUILDLOG_HOLD_WAIT_FILE="$VERIFY_WAIT_DIR/seconds"
     fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
@@ -2016,6 +2024,11 @@ buildlog_memory_event() {
                 STEP_MAC_DISK_EXCLUSIONS=$exclusions
             fi
             ;;
+        memory-seconds\ *)
+            if [[ -n "$HOLD_WAIT_DIR" ]]; then
+                printf '%s\n' "${1#memory-seconds }" >> "${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/memory-seconds"
+            fi
+            ;;
         retry\ *)
             if [[ "$PLACEMENT_RETRY_NOTICE_SHOWN" == 0 ]]; then
                 printf '%s\n' "${1#retry }" >&2
@@ -2453,17 +2466,14 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "$MEM_KILL_FILE" ]]; then
         mem_kills=$(wc -c < "$MEM_KILL_FILE")
     fi
-    local token_wait_s=${TOKEN_WAIT_S:-0} step_wait
-    if [[ -n "${TOKEN_WAIT_FILE:-}" && -f "$TOKEN_WAIT_FILE" ]]; then
-        while IFS= read -r step_wait; do
-            token_wait_s=$(( token_wait_s + step_wait ))
-        done < "$TOKEN_WAIT_FILE"
-    fi
     local mem_kill_stopped=0
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="$token_wait_s" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+    BUILDLOG_WAIT_DIR="$HOLD_WAIT_DIR" \
+        BUILDLOG_TOKEN_WAIT_FILE="${TOKEN_WAIT_FILE:-}" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" \
+        BUILDLOG_TOKEN_WAIT_DIR="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}" \
+        BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
         verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
@@ -3088,6 +3098,7 @@ mac_only_refuse() {
 # Only a busy claim can wait on a Mac-only call; every other answer ends it.
 
 PLACEMENT_STEP_NUMBER=0
+PLACEMENT_CALL_NUMBER=0
 PLACEMENT_EPISODE=""
 PLACEMENT_OWNER_PID=$$
 PLACEMENT_EVIDENCE_EPISODE=""
@@ -3207,12 +3218,17 @@ placement_once() {
         return 0
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
+    PLACEMENT_CALL_NUMBER=$((${PLACEMENT_CALL_NUMBER:-0} + 1))
+    local wait_result="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}-$PLACEMENT_CALL_NUMBER"
+    # An empty file means the client did not return a measurement.
+    : > "$wait_result" || return $?
     # A builtin wait lets the parent handle signals during a service outage.
     local placement_previous_job_pid=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
-    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
+    BUILDLOG_PLACEMENT_WAIT_RESULT="$wait_result" \
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
         > "$HOLD_WAIT_DIR/placement-reply" &
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
@@ -3221,7 +3237,7 @@ placement_once() {
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in
-            first|holder\ *|resource\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
+            first|holder\ *|resource\ *|memory-seconds\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
             left\ *)
                 printf '%s\n' "${line#left }"
                 buildlog_memory_event left ;;
@@ -4101,7 +4117,11 @@ token_acquired() {
 # The local argument disables remote routing for a local formatter.
 record_token_wait() {
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+        local output=$TOKEN_WAIT_FILE
+        if [[ -n "${VERIFY_WAIT_DIR:-}" && "$VERIFY_WAIT_DIR" != "$HOLD_WAIT_DIR" ]]; then
+            output="$VERIFY_WAIT_DIR/token-seconds"
+        fi
+        printf '%s\n' "$TOKEN_WAITED" >> "$output"
     fi
 }
 
@@ -4444,6 +4464,9 @@ buildlog_wait_for_memory() {
     sync_token_state
     release_token || return $?
     buildlog_wait_for_memory_only "$@" || status=$?
+    if (( BUILDLOG_MEM_WAIT_S > 0 )); then
+        buildlog_memory_event "memory-seconds $BUILDLOG_MEM_WAIT_S"
+    fi
     if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
         return "$status"
     fi

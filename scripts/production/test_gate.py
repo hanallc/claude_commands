@@ -727,7 +727,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         job_folders.append(root)
                         return prepare(root, environment)
 
-                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                    environment = {"TMPDIR": str(inherited), "BUILDLOG_PREPARED_COPY": str(self.checkout)}
+                    with (mock.patch.dict(self.environment, environment),
+                          mock.patch.object(copies, "take_prepared_gate_handoff", return_value=flag == "--affected"),
                           mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
                         result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
