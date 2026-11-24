@@ -1158,6 +1158,7 @@ class DispatchWork:
     kind: str
     lens: str
     fix_pass: int
+    work_order: pass_recorder.AssignmentWorkOrder | pass_recorder.FullPromptDigest = pass_recorder.FullPromptDigest.FULL_PROMPT
 
 
 class DispatchWorkAtUse(Enum):
@@ -1206,7 +1207,8 @@ def select_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
         if saved_phase is not None and pass_recorder.string(saved_phase.get("id")) == phase:
             match_phase = saved_phase
     match = (pass_recorder.dispatch_match(previous, match_phase, _dispatch_fields(role, prompt, work),
-                             launcher_command, dispatch_owned=True)
+                             launcher_command, dispatch_owned=True, work_order=work.work_order
+                             if isinstance(work, DispatchWork) else pass_recorder.FullPromptDigest.FULL_PROMPT)
              if match_phase is not None else pass_recorder.NoMatchedDispatch())
     if isinstance(match, pass_recorder.ActiveDispatchPromptConflict):
         return match
@@ -1271,7 +1273,7 @@ def recorded_dispatch_runs() -> dict[staff.StaffId, RecordedDispatchRun]:
     return found
 
 
-def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
+def link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
     link = _dispatch_state_link(worker_id)
     link.parent.mkdir(parents=True, exist_ok=True)
     temporary = link.with_name(f".{worker_id}.{uuid.uuid4().hex}")
@@ -1299,6 +1301,8 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "",
                    called: CalledAgent = CALLED_AGENT_NOT_RECORDED,
                    new_pass_instance_id: uuid.UUID | None = None,
+                   work_order: pass_recorder.AssignmentWorkOrder | pass_recorder.FullPromptDigest =
+                   pass_recorder.FullPromptDigest.FULL_PROMPT,
                    selection: pass_recorder.DispatchSelection | pass_recorder.SelectDispatchAtRecorder =
                    pass_recorder.SelectDispatchAtRecorder.SELECT) -> str:
     """Record a published worker's dispatch and return its durable pass id."""
@@ -1310,18 +1314,10 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family=called.family, called_model=called.model, called_effort=called.effort,
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
-        new_pass_instance_id=new_pass_instance_id,
+        new_pass_instance_id=new_pass_instance_id, work_order=work_order,
         assign_status_file=os.environ.get(ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else "",
     )
-    session_dir.mkdir(parents=True, exist_ok=True)
-    with pass_recorder.recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            instance_id = pass_recorder.start_pass(args, selection)
-            _link_dispatch_state(worker_id, session_dir)
-            return instance_id
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return pass_recorder.record_worker_dispatch(args, selection, lambda: link_dispatch_state(worker_id, session_dir))
 
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
@@ -2808,6 +2804,26 @@ def _board_stamp(line: str) -> float | None:
         return None
 
 
+def assignment_registered(session_dir: Path, slot: str, role: staff.WorkerRole, instance: str, status: str,
+                          legacy_since: int) -> bool:
+    """Find a registration by pass ID or by its unique recorded pass window."""
+    prefix = f"[{slot}] register: role={role}; "
+    try:
+        with (session_dir / "board.log").open(encoding="utf-8", errors="replace") as board:
+            for line in board:
+                body = line.partition(" ")[2].rstrip("\n")
+                if not body.startswith(prefix):
+                    continue
+                fields = body.removeprefix(prefix)
+                if fields.startswith(f"pass={instance}; ") or fields.endswith(f"; pass {instance}"):
+                    return True
+                if fields == f"status in {status}" and (at := _board_stamp(line)) is not None and at >= legacy_since:
+                    return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
 def _board_role_changes(session_dir: Path) -> list[RoleChange]:
     """Every role each slot has held this run, in the order it took them.
 
@@ -2911,7 +2927,7 @@ def _board_phrase(said: BoardActivity) -> str:
     and repeating it here spends the line.
     """
     message = said["own"] or said["message"].removeprefix(LAUNCHER_PREFIX)
-    message = re.sub(r"^\s*role=\S+\s*", "", message).strip()
+    message = re.sub(r"^\s*role=\S+\s*(?:pass=[0-9a-f-]+;\s*)?", "", message).strip()
     body = message if said["kind"] == "status" else f"{said['kind']}: {message}"
     body = body.strip() or said["kind"]
     if len(body) > BOARD_NOTE_CHARS:

@@ -502,28 +502,31 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     instance = uuid.uuid4()
     message = directory / f"{slot}_prompt{suffix}.{instance}.txt"
-    content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    work_order = prompt.read_bytes().decode("utf-8")
+    content = work_order + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
     write_text_atomic(message, content)
     try:
-        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message)
+        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message,
+                               len(work_order.encode("utf-8")))
     finally:
         with suppress(OSError, SystemExit, ValueError, recorder_state.OldRecorderState):
             if message.is_file() and not _prompt_adopted(run, instance):
                 message.unlink(missing_ok=True)
+                message.with_suffix(".admitted").unlink(missing_ok=True)
 
 
 def _prompt_adopted(run: Path, instance: uuid.UUID) -> bool:
     state = pass_recorder.read_state(run, resolve_staff=False)
     return (not pass_recorder.string(state.get("history_file"))
             or any(passed.get("instance_id") == str(instance) for passed in pass_recorder.pass_slots(state).values())
-            or isinstance(staff_worker.admitted_pass_number(state, str(instance)), int))
+            or isinstance(staff_worker.admitted_pass(state, str(instance)), staff_worker.AdmittedPass))
 
 
 def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: list[str], env: dict[str, str],
-                    slot: str, suffix: str, instance: uuid.UUID, message: Path) -> int:
+                    slot: str, suffix: str, instance: uuid.UUID, message: Path, work_order_size: int) -> int:
     directory = message.parent
     launcher = launcher_command()
     summary = directory / f"{slot}_summary{suffix}.txt"
@@ -562,7 +565,7 @@ def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: li
     with log.open("a") as output, TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
         offset = output.tell()
         path_file = Path(temporary) / "paths.json"
-        write_text_atomic(path_file, json.dumps(paths))
+        write_text_atomic(path_file, json.dumps({"paths": paths, "work_order_size": -1 if args.style_since else work_order_size}))
         result = subprocess.run([*command, "--assignment-paths-file", str(path_file)], env=worker_env, text=True,
                                 stdout=output, stderr=subprocess.STDOUT)
     with log.open() as output:

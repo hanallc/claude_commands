@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
 from scripts.direct import recorder_state
-from scripts.lib import conf_reads, transcripts, unit_runs
+from scripts.lib import atomic_file, conf_reads, transcripts, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_records
 from scripts.production import staff
@@ -889,6 +889,22 @@ class MatchedDispatch:
 
 
 @dataclass(frozen=True)
+class AssignmentPromptRetry(MatchedDispatch):
+    path: Path
+    completed: bool
+
+
+@dataclass(frozen=True)
+class AssignmentWorkOrder:
+    size: int
+    paths: list[str]
+
+
+class FullPromptDigest(Enum):
+    FULL_PROMPT = "match the full prompt bytes"
+
+
+@dataclass(frozen=True)
 class ContinueDispatchStage(MatchedDispatch):
     """Submit the saved next stage of the same pass."""
 
@@ -916,7 +932,7 @@ class DispatchPromptRefused(RuntimeError):
 
 def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool,
+                    dispatch_owned: bool, work_order: AssignmentWorkOrder | FullPromptDigest = FullPromptDigest.FULL_PROMPT,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
         return NoMatchedDispatch()
@@ -928,11 +944,15 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                        else cast(object, saved_command))
     same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
         active.get("status") in ("active", "refused") and launcher_command == current_command))
+    instance = string(active.get("instance_id"))
+    saved_path = Path(string(active.get("prompt_file")))
+    request = Path(string(fields.get("prompt_file")))
+    assignment = (isinstance(work_order, AssignmentWorkOrder) and work_order.size >= 0 and instance and saved_path.parent == request.parent
+                  and saved_path.stem.removesuffix(f".{instance}") == request.stem.rpartition(".")[0])
     stage_two = False
-    if dispatch_owned and fields.get("prompt_file") != active.get("prompt_file"):
+    if dispatch_owned and not assignment and fields.get("prompt_file") != active.get("prompt_file"):
         delivery = dispatch_delivery(active)
         prompt = json.dumps(fields.get("prompt_file"))
-        instance = string(active.get("instance_id"))
         stage_two = (same_launcher and active.get("status") in ("active", "refused") and active.get("kind") == "review"
                      and bool(instance and delivery.early_ready) and delivery.completion_id == f"{instance}-2"
                      and delivery.line.startswith("Stage 2: ")
@@ -941,23 +961,39 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
             return NoMatchedDispatch()
     if dispatch_owned and not stage_two:
         try:
-            digest = hashlib.sha256(Path(string(fields.get("prompt_file"))).read_bytes()).hexdigest()
+            content = request.read_bytes()
         except OSError:
             return NoMatchedDispatch()
-        if active.get("prompt_digest") != digest:
+        delivery_digest = active.get("delivery_prompt_digest", active.get("prompt_digest"))
+        same_prompt = delivery_digest == hashlib.sha256(content).hexdigest()
+        if assignment and isinstance(work_order, AssignmentWorkOrder):
+            if "delivery_prompt_digest" in active:
+                same_prompt = active.get("prompt_digest") == hashlib.sha256(content[:work_order.size]).hexdigest()
+            elif not same_prompt:
+                try:
+                    original = saved_path.read_bytes()
+                except FileNotFoundError:
+                    original = b""
+                if delivery_digest == hashlib.sha256(original).hexdigest():
+                    same_prompt = original.startswith(content[:work_order.size] + b"\n\nRules for this dispatch:\n")
+                elif same_launcher and active.get("status") in ("completed", "refused"):
+                    raise DispatchSelectionChanged(f"Original prompt for pass {instance} is unavailable")
+        if not same_prompt:
             if active.get("status") == "active":
                 return ActiveDispatchPromptConflict(string(active.get("worker_name")), string(active.get("instance_id")))
             return NoMatchedDispatch()
     if launcher_command and saved_command and not same_launcher:
         return NoMatchedDispatch()
     if not all(active.get(key, "") == value for key, value in fields.items()
-               if key != "prompt_file" or not stage_two):
+               if key != "prompt_file" or not (stage_two or assignment)):
         return NoMatchedDispatch()
     if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
         return NoMatchedDispatch()
-    matched = ContinueDispatchStage if stage_two else MatchedDispatch
-    return matched(string(active.get("worker_name")), string(active.get("instance_id")))
+    worker = string(active.get("worker_name"))
+    if assignment:
+        return AssignmentPromptRetry(worker, instance, saved_path, active.get("status") == "completed")
+    return (ContinueDispatchStage if stage_two else MatchedDispatch)(worker, instance)
 
 
 class VacantDispatchSlot(Enum):
@@ -1010,6 +1046,37 @@ def validate_dispatch_selection(state: dict[str, object], selection: DispatchSel
         raise DispatchSelectionChanged(f"Slot {slot} or phase {phase} changed during dispatch")
 
 
+def _restore_assignment_prompt(passed: dict[str, object], retry: AssignmentPromptRetry, request: Path) -> None:
+    """Restore the verified prompt while the caller holds the recorder lock."""
+    digest = passed.get("delivery_prompt_digest", passed.get("prompt_digest"))
+    with suppress(FileNotFoundError):
+        if hashlib.sha256(retry.path.read_bytes()).hexdigest() == digest:
+            return
+    content = request.read_bytes()
+    if hashlib.sha256(content).hexdigest() != digest and "delivery_prompt_digest" in passed:
+        content = retry.path.with_suffix(".admitted").read_bytes()
+    if hashlib.sha256(content).hexdigest() != digest:
+        raise DispatchSelectionChanged(f"Original prompt for pass {retry.instance_id} is unavailable")
+    atomic_file.write_bytes_atomic(retry.path, content)
+
+
+def record_worker_dispatch(args: argparse.Namespace, selection: DispatchSelection | SelectDispatchAtRecorder,
+                           link_state: Callable[[], None]) -> str:
+    """Validate and record the dispatch under one recorder lock."""
+    run = argument_session_dir(args)
+    run.mkdir(parents=True, exist_ok=True)
+    with recorder_lock_path(run).open("a+", encoding="utf-8") as lock, ExitStack() as locks:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        action = selection.action if isinstance(selection, DispatchSelection) else NewAssignment()
+        if isinstance(action, AssignmentPromptRetry) and not action.completed and arg_string(args, "pass_kind") == "fix":
+            ledger = locks.enter_context((run / ".findings.lock").open("a+", encoding="utf-8"))
+            fcntl.flock(ledger.fileno(), fcntl.LOCK_SH)
+        instance = start_pass(args, selection)
+        if not isinstance(action, AssignmentPromptRetry) or not action.completed:
+            link_state()
+        return instance
+
+
 def start_pass(args: argparse.Namespace,
                selection: DispatchSelection | SelectDispatchAtRecorder = SelectDispatchAtRecorder.SELECT) -> str:
     if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
@@ -1042,8 +1109,6 @@ def start_pass(args: argparse.Namespace,
     launcher_command = _launcher_arguments(optional_arg(args, "launcher_command"))
     if isinstance(selection, DispatchSelection):
         validate_dispatch_selection(state, selection, team_slot, optional_arg(args, "phase_id"))
-    # Name the phase when more than one phase is open.
-    phase, launch_check = _checked_launch(args, state, session_dir)
     launcher_pid = arg_integer(args, "launcher_pid", os.getppid())
     early_id = optional_arg(args, "early_review_pass_id")
     dispatch_fields: dict[str, object] = {
@@ -1057,8 +1122,18 @@ def start_pass(args: argparse.Namespace,
         "lens": optional_arg(args, "lens"),
     }
     active = pass_slots(state).get(team_slot)
+    work_order: object = getattr(args, "work_order", FullPromptDigest.FULL_PROMPT)
+    if not isinstance(work_order, AssignmentWorkOrder):
+        work_order = FullPromptDigest.FULL_PROMPT
+    completed_retry = (isinstance(selection, DispatchSelection) and isinstance(selection.action, AssignmentPromptRetry)
+                       and selection.action.completed)
+    launch_check: LaunchCheck | dict[str, object]
+    if completed_retry and active is not None:
+        phase, launch_check = object_dict(active.get("phase")) or {}, {}
+    else:
+        phase, launch_check = _checked_launch(args, state, session_dir)
     match = dispatch_match(active, phase, dispatch_fields, launcher_command,
-                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)))
+                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)), work_order=work_order)
     if isinstance(match, ActiveDispatchPromptConflict):
         raise DispatchPromptRefused(match)
     if isinstance(selection, DispatchSelection):
@@ -1067,6 +1142,10 @@ def start_pass(args: argparse.Namespace,
                 or active.get("worker_id") != dispatch_fields["worker_id"]):
             raise DispatchSelectionChanged(f"Pass {action.instance_id} changed during dispatch")
         match = action
+    if isinstance(match, AssignmentPromptRetry) and active is not None:
+        _restore_assignment_prompt(active, match, Path(optional_arg(args, "prompt_file")))
+        if completed_retry:
+            return match.instance_id
     status_file = optional_arg(args, "assign_status_file")
     if status_file:
         status_file = str(worker_artifact(Path(status_file), os.environ.get(TEAM_SLOT_ENV, team_slot), team_slot))
@@ -1088,6 +1167,15 @@ def start_pass(args: argparse.Namespace,
         armed = object_dict(phase.get(ARMED_REVIEW_KEY))
         if pass_kind != "review" or armed is None or armed.get("pass_instance_id") != early_id:
             raise SystemExit("The open phase has no early review reserved for this pass")
+    if getattr(args, "dispatch_owned", False):
+        prompt = Path(optional_arg(args, "prompt_file"))
+        content = prompt.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        dispatch_fields["prompt_digest"] = digest
+        if isinstance(work_order, AssignmentWorkOrder) and work_order.size >= 0:
+            dispatch_fields.update(delivery_prompt_digest=digest, assignment_paths=work_order.paths,
+                                   prompt_digest=hashlib.sha256(content[:work_order.size]).hexdigest())
+            atomic_file.write_bytes_atomic(prompt.with_suffix(".admitted"), content)
     now = now_epoch()
     owner_id = state.get(unit_runs.OWNER_FIELD)
     # A different dispatch replaces only this slot's pass.
@@ -1113,8 +1201,6 @@ def start_pass(args: argparse.Namespace,
         "phase": phase_stamp(phase),
         "status": "active",
     }
-    if getattr(args, "dispatch_owned", False):
-        current_pass["prompt_digest"] = hashlib.sha256(Path(optional_arg(args, "prompt_file")).read_bytes()).hexdigest()
     if status_file:
         current_pass["assign_status_file"] = status_file
     slots = pass_slots(state)

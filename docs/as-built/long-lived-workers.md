@@ -96,15 +96,15 @@ If notice delivery fails, the assign returns uncertain and reports the pending n
 A replacement for a failed pass starts after the hook delivers the pending notice.
 The recorder gives the replacement a new pass id even when the assignment inputs match.
 
-A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
+A dispatch retry matches the slot, phase, role, launcher arguments, and the recorder's prompt identity.
+For a generated assignment prompt, the recorder matches the work order digest and retains the admitted delivery bytes.
 `assign.sh` removes each temporary prompt when the recorder confirms that no pass uses it.
 The worker publishes the manifest and registers the pass on the board before submission.
 A retry preserves a manifest that names the admitted pass.
 Under the ticket lock, the worker merges the current ticket paths and paths from a matching legacy manifest.
-A retry posts a board registration if the board lacks a registration for the admitted pass ID.
+The worker checks the pass ID on each board registration. It uses the recorded pass time to identify a legacy registration.
 A matching retry checks the receipt before it validates and restores the recorded prompt under the recorder lock.
-The pass records the digest before submission.
-Changed content at the same prompt path starts a new pass after completion.
+Changed work order bytes start a new pass after completion.
 With an active pass, changed content returns busy and names that pass without printing `submitted`.
 This refusal applies when the launcher arguments change.
 The recorder repeats the content check under its lock before it changes the pass.
