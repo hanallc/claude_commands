@@ -1264,7 +1264,7 @@ fi
                 mac_linux.reconcile_unproven(episode, 43)
                 submit.assert_called_once()
                 mac_linux.reconcile_guest_end(episode, 43)
-        self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
+                self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
         self.assert_guest_clean('fence')
 
     def test_unrecorded_attempt_uses_holder_exit_without_guest_recovery(self) -> None:
