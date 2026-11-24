@@ -302,20 +302,20 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 5. **Docs.** `commands/default_models.md`: the examples and the paragraph at lines 106-111 name `config/cli.conf` keys, not `[cli.claude]`. `commands/build/hand_made.md`: name `config/cli.conf`. `config/README.md`: rule 6 adds "`# agent: claude` or `# agent: codex` checks an `agent[:effort]` value against that family in `config/models.conf`."; rule 11 adds "The `cli` rows live in `config/cli.conf`."; the `## models.conf` section drops the cli rows; add a `## cli.conf` section with the key form `<tool>.<family>.<field>` or `<tool>.<setting>`, and "A new CLI tool copies a block and changes `<tool>`; it adds a `.role` row only when its code reads one."
 6. **Tests.** Fixtures write `cli.conf` in `CONF_DIR`: `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py` and the other `scripts/production/test_hand_made_*.py` that build a registry, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`. Add cases through `default_models.sh`: `/default_models cli.merge_branch sonnet` writes `merge_branch.claude.model` in `cli.conf`; the status listing shows the `cli` rows; `/default_models cli claude` changes only `[assignments] cli`; a model replace across functions changes the matching `cli.conf` rows; a value with a line separator is refused and leaves both files unchanged; `hand_made.claude.model=opus` (no effort) is refused by the hand made reader with the key name.
 7. **Proof.** Record `bash scripts/cli_agent/cli_agent.sh --status` before the change. After the change it prints the same agents.
-8. **Output tail.** `scripts/production/hand_made_limit.py` `TAIL_BYTES` (line 44, `64 * 1024`) becomes the `hand_made.output_tail_bytes=65536` row above (bob's working name `cli.hand_made.output_tail_bytes`), read at use. Its `TunableLiteral` row (batch "config/cli.conf") leaves the inventory. No test reads the live value; each test writes its own fixture config.
+8. **Output tail.** `scripts/production/hand_made_limit.py` `TAIL_BYTES` (line 44, `64 * 1024`) becomes the `hand_made.output_tail_bytes=65536` row above (bob's working name `cli.hand_made.output_tail_bytes`), read at use. Its `TunableLiteral` row (batch "config/cli.conf") leaves the inventory. No test reads the live value; each test writes its own fixture config. `scripts/production/hand_made_guest.py` makes an `OutputTail` on the controller for the guest's streamed output, so a read in `OutputTail.write()` would repeat for each chunk. Read the key once on the controller before the attempt starts, and pass the bounded value to each `OutputTail`. Change the natedev and guest routes, and test both with the same fixture.
 
 **Files:**
 - `config/cli.conf` — new
 - `config/models.conf` — `[cli.*]` sections removed
 - `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`
-- `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`
+- `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/production/hand_made_guest.py`
 - `scripts/lib/config_form_exceptions.py` — the `TAIL_BYTES` row removed
 - `commands/default_models.md`, `commands/build/hand_made.md`, `config/README.md`
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py`, `scripts/production/test_hand_made_guest.py`, `scripts/production/test_hand_made_limit.py`, `scripts/production/test_hand_made_mac.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`
 
 **Workers:** 2 writers — the launcher side and the hand made side.
 - `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`; hub: `config/cli.conf` (both sides read it)
-- `test` opens as impl — `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/lib/config_form_exceptions.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
+- `test` opens as impl — `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/production/hand_made_guest.py`, `scripts/lib/config_form_exceptions.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
 
 **State:** none
 
@@ -470,50 +470,36 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Acceptance gate:**
 - `test_config_form.py` passes, and `COMMENT_LIMIT_FILES` is gone.
 - `git diff -U0 -- config/` shows only added comment and blank lines.
-- A script reads each changed ordinary stem with `conf.read`, and each read succeeds on the live values. `config/models.conf` is checked by section through the model registry reader.
+- A script checks each stored value of each changed stem against its limit line, host overrides included, with Git recovery off. (`check_comment_limits` checks only that a limit line exists, and a `conf.read` with recovery can return an older value.) `config/models.conf` is checked by section through the model registry reader. The proof also covers the four Phase 10 keys: `head_stall.times_tail_bytes`, `disk.min_outside_directory_bytes`, `report.edited_crate_max_crates`, `nextest.summary_scan_bytes`.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
 ### Phase 10 — Build tool literals to config  · status: done
-**Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** Each `tunable` literal of the build tool batch is a commented, limit-checked key in `config/`, read at use, with the same value, and its allow list row is gone.
-
-**Spec:**
-
-0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
-1. Batch folders: `scripts/buildlog`, `scripts/build_queue`, `scripts/build_targets`, `scripts/build_hold`, `scripts/mac_test`, `scripts/lint`, `scripts/copies`.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
-3. The code reads the key with `conf.read(stem)` at use. Delete the constant. A value that a function default or a module-level object used now comes from the read at use.
-4. Values stay the same. A move of an unchanged value needs no value approval; the new name uses bob's working name.
-5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
+- Four keys replace the batch constants, with the same values. `build_admission` `head_stall.times_tail_bytes=1048576` (`whole: 1..`). `buildlog` `disk.min_outside_directory_bytes=1073741824` (`whole: 1..`). `buildlog` `report.edited_crate_max_crates=3` (`whole: 1..48`, because the cascade row ends at 49 crates). `mac_test` `nextest.summary_scan_bytes=8192` (`whole: 1..1048576`).
+- `report.RebuildClasses` holds the one rebuild bin rule: `read()`, `labels()` and `label(crates_compiled, warm)`. `rebuild_timings`, `package_rebuild_rows`, `rebuilds_section` and `profile_step_durations` take `classes`.
+- `head_stall.last_admission(times, settings: conf.ConfigRead)` takes the `build_admission` read that its caller already made.
+- `disk.outside_directories` reads its limit at use.
+- `nextest_log.replay_log` reads the Summary scan limit only after a failure (`if status:`). `run_logged` catches `(OSError, conf.Unusable)`, prints a diagnostic and keeps the nextest status and the log.
+- The four `tunable` rows left `scripts/lib/config_form_exceptions.py`.
 
 **Files:**
-- `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
-- `scripts/**/*.py` — the source files of the batch rows, and their tests
-- `config/*.conf` — the stems that get keys
+- `config/build_admission.conf`, `config/buildlog.conf`, `config/mac_test.conf` — the four keys
+- `scripts/build_queue/head_stall.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/report.py`, `scripts/mac_test/nextest_log.py` — readers at use
+- `scripts/build_queue/test_head_stall.py`, `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_moments.py`, `scripts/mac_test/test_offload_cleanup.py` — `CONF_DIR` fixtures
+- `scripts/lib/config_form_exceptions.py` — four rows removed
+- `docs/as-built/build-followups.md`, `docs/as-built/build-targets.md`, `docs/plans/builds-resources.md` — key names replace the constant names
 
-**Workers:** 2 writers — split by folder.
-- `impl` — `scripts/buildlog` and `scripts/build_queue` rows, `config/buildlog.conf`, `config/build_admission.conf`; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — the `scripts/mac_test` row, `config/mac_test.conf`, and their tests
+**Binds later work:** the four key names and limits. The follow-up "Build tool limits follow-ups" passes one `RebuildClasses` through each report and adds a Mac replay row with an unusable scan limit.
 
-**State:** none
+**Gotchas:**
+- A test spy on a changed function survives the change: `test_moments.py` kept a spy on the old `profile_step_durations` call form. Search the tests for each changed function.
+- Current docs named the deleted constants. Search `docs/` for each moved name.
+- An open upper limit lets `readline` take `2**63` bytes; each byte limit that reaches a read needs an upper bound.
 
-**Constraints from prior phases:**
-- Phase 3 wrote the literal inventory in `scripts/lib/config_form_exceptions.py`. Each `tunable` row holds the proposed stem, key, limit line and batch "Build tool literals to config".
-- Phase 1 rules: key form (rule 4), a limit line directly above each number key, a blank line between blocks.
-- The batch has four rows (`_BUILD_TOOL_BATCH`): `scripts/build_queue/head_stall.py` `TIMES_TAIL_BYTES` → `build_admission` `head_stall.times_tail_bytes`; `scripts/buildlog/disk.py` `MIN_OUTSIDE_DIRECTORY_BYTES` → `buildlog` `disk.min_outside_directory_bytes`; `scripts/buildlog/report.py` `EDITED_CRATE_MAX_CRATES` → `buildlog` `report.edited_crate_max_crates`; `scripts/mac_test/nextest_log.py` `SUMMARY_SCAN_BYTES` → `mac_test` `nextest.summary_scan_bytes`. All three stems exist. No folder of the batch has a row in `scripts/build_targets`, `scripts/build_hold`, `scripts/lint` or `scripts/copies`.
-- `config/build_admission.conf` still has `[disk]` and `[memory]` lines (Phase 8 removes them). `conf.read` ignores them, so the new key can sit in any block. Put a blank line above its comment.
-- Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`. Fixture trees copy the helpers named in `scripts/lib/checkout_test_support.py` (line 26).
-
-**Acceptance gate:**
-- Each changed module's tests pass.
-- `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:** a command-line argument for the Summary scan limit. It changes the `run TAIL SUMMARY COMMAND...` form, and macOS gets no copy of the script for each run.
 
 ### Phase 11 — Message and notice literals to config  · status: todo
 **Depends on:** Phase 3
@@ -532,15 +518,18 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 7. Hooks run on each tool call. A hook reads its key once for each run, never at import.
+8. **Bounds.** Both context hooks use `scripts/hooks/context_usage.py`. Give `context_usage.transcript.tail_bytes` the limit `# whole: 1..4194304`, so the first scan is never larger than the 4 MiB `TAIL_BYTES_RETRY`, which stays in the code. Each hook reads the key on the host that runs it. Give `notify.pushover.max_source_chars` an upper bound before it reaches the source slices.
+9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
 - `scripts/**/*.py` — the source files of the batch rows, and their tests
 - `config/*.conf` — the stems that get keys
+- `docs/as-built/usage-ledger.md` — names a moved constant
 
-**Workers:** 2 writers — split by folder.
-- `impl` — `scripts/notify`, `scripts/message`, `scripts/maintenance` and their stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — `scripts/hooks`, `scripts/usage`, `scripts/whoami` and their stems
+**Workers:** 2 writers — split by reader.
+- `impl` — the context hooks (`scripts/hooks/context_usage.py` and its callers) and Pushover (`scripts/notify/pushover.py`), their tests and stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — waste watch (`scripts/usage/waste_watch.py`) and the Codex pacer (`scripts/whoami/codex_pacer.py`), their tests and stems, and `docs/as-built/usage-ledger.md`
 
 **State:** none
 
@@ -550,10 +539,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 4 moved `scripts/notify/review.py` to `conf.read("notify")`. `config/notify.conf` has `# range: 5e-324..` above `REVIEW_TIMEOUT_SECONDS`.
 - `scripts/message/notifier.sh` is a zsh script: check it with `zsh -n`, not `bash -n`.
 - Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`.
+- Phase 10: a test spy on a changed function (`test_moments.py`) and current docs that named moved constants broke after the move. Search for both before the edit round ends. A size key gets an upper bound when the code passes it to a read or a slice (`readline` overflows at 2**63).
 
 **Acceptance gate:**
-- Each changed module's tests pass.
+- Each changed module's tests pass, and each test module with a changed reference passes.
 - `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
+- `context_usage.transcript.tail_bytes` has the limit `# whole: 1..4194304`, and `notify.pushover.max_source_chars` has an upper bound.
+- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -573,15 +565,20 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 4. Values stay the same.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
+7. **Saved Review items.** `read_submission()` reads saved items with the same image count and evidence limits as new submissions, so a lower `MAX_IMAGES` makes a saved two-image item fail to load. Apply the configured limits to new submissions only. Keep saved submissions readable under the limits in effect before this phase. Keep the saved JSON form. In the domain record, use `NoBugPageState` for absent page state in place of `BugPageState | None`.
+8. **Review request limits.** `scripts/review_links/serve.py` derives `MAX_NEW_ITEM_BODY` at import from three moved constants and uses it before `rfile.read(size)`. `scripts/review_links/review_submissions.py` imports three moved constants for image decoding. The dialog also sends these limits to the browser. Read one Review limit set for each request, and use it for the body size, the parse and the image decode. Cap the derived body size before the read. Render the dialog from the same keys.
+9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
 - `scripts/**/*.py` — the source files of the batch rows, and their tests
 - `config/*.conf` — the stems that get keys
+- `scripts/review_links/review_submissions.py`, `scripts/review_links/test_serve.py`, `scripts/aws_target/test_gpu_size_trial.py`
+- `docs/as-built/screen-record.md`, `docs/as-built/style-showrunner.md` — name moved constants
 
 **Workers:** 2 writers — split by folder.
-- `impl` — `scripts/aws_target`, `scripts/review_links` and their stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, the other folders of the batch, and their stems
+- `impl` — `scripts/aws_target`, `scripts/review_links` and their stems (`review_submissions.py`, `test_serve.py` and `test_gpu_size_trial.py` included); hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, the other folders of the batch, their stems, `docs/as-built/screen-record.md` and `docs/as-built/style-showrunner.md`
 
 **State:** none
 
@@ -589,10 +586,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 3 wrote the literal inventory; each `tunable` row of batch "AWS and review tool literals to config" holds the proposed stem, key, limit line.
 - The batch rows sit in `scripts/aws_target/gpu_size_trial.py`, `scripts/review_links/new_item_dialog.py` (10 rows), `scripts/review_links/serve.py`, `scripts/screen_record/screen_record.py` (2), `scripts/shot_report/transcripts.py`, `scripts/style/style_ledger.py` and `scripts/test_times/module_cost.py`. No row is in `scripts/aws_target/config.py`, which Phase 5 changes for `AWS_TARGET_CONFIG`; this phase does not wait for Phase 5.
 - Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`.
+- Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
 
 **Acceptance gate:**
-- Each changed module's tests pass.
+- Each changed module's tests pass, and each test module with a changed reference passes.
 - `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
+- A saved two-image Review item opens after the intake image limit drops to one.
+- An oversized request is refused before its body is read. `test_serve.py` keeps its body limit, total image limit and URL slice cases.
+- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -613,6 +614,10 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. **the_list.conf.** Insert one blank line before each comment line that directly follows a key row in `config/the_list.conf`. Change nothing else. Before the row goes, run the item 229 writer (`listadd`, `scripts/production/the_list.py`) on a fixture copy and run `check_blank_lines` on its output. If the writer breaks the form, fix the writer and add a test row that runs it and then `check_blank_lines`. Remove its row from the blank-line allow list. Remove the absent-file case for `config/the_list.conf` from the stale-row loop of `test_repository_form` in `scripts/lib/test_config_form.py`.
 7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
+8. **Unused reader.** Before the literal moves, after the main merge of item 0: confirm that `scripts/agents/inventory.py` `last_tool_call()` still has no caller. Then remove it, its `_LAST_STEP_BYTES` constant and its inventory row. Do not add `production.inventory.last_step_scan_bytes`.
+9. **Bounds.** Give the `scripts/production/gate.py` `RERUN_LIMIT` key the lower bound 0, and keep the shipped value 8: `test_gate_holds.py` sets it to zero to prove hold recovery with ordinary reruns off; keep that fixture. Bound `worker.history_bytes` (`scripts/production/worker.py` `WORKER_HISTORY_BYTES`) so that `read(limit + 1)` stays in range. Give the nightly diagnostic and board note slices explicit upper bounds.
+10. **Guests.** Selected suites reach the rerun policy in the Mac Linux and AWS guest gates. Prove with a test that each guest gate route reads the candidate's `gate.conf`.
+11. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
@@ -621,6 +626,9 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `config/the_list.conf` — blank lines
 - `scripts/lib/test_config_form.py` — the `config/the_list.conf` absent-file case removed
 - `scripts/production/the_list.py`, `scripts/production/test_the_list.py` — only if the writer breaks the blank-line form
+- `scripts/agents/inventory.py` — `last_tool_call()` removed
+- `scripts/production/test_gate_holds.py`, `scripts/production/test_gate_suites_reruns.py`, `scripts/production/test_gate_suites_types.py`, `scripts/production/test_worker.py`
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/plans/builds-natest.md` — name moved constants
 
 **Workers:** 2 writers — split by folder. Before edits start, the director assigns each destination stem to one slot in the prompts.
 - `impl` — `scripts/production`, `scripts/herdr`, `config/the_list.conf`, `scripts/lib/test_config_form.py`, every edit to `scripts/lib/config_form_exceptions.py`, and the stems assigned to this slot; hub: `scripts/lib/config_form_exceptions.py` (`test` sends its row removals to `impl`)
@@ -633,10 +641,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 1 put `config/the_list.conf` on the blank-line allow list. `test_repository_form` does not report that row as stale while the file is absent; that case is code in the test, near the stale-row check of the file exceptions.
 - Phase 5 changed `scripts/direct/assign.py`, `scripts/direct/claude_worker.py` and `scripts/production/staff.py` for `CONF_DIR`.
 - The `TAIL_BYTES` row of `scripts/production/hand_made_limit.py` belongs to the `config/cli.conf` phase (Phase 6), not to this batch.
+- Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
 
 **Acceptance gate:**
-- Each changed module's tests pass.
+- Each changed module's tests pass, and each test module with a changed reference passes.
 - `test_config_form.py` passes. The allow list has no `tunable` row of this batch and no blank-line row.
+- `test_gate_holds.py` passes with its zero rerun fixture. A test proves that the Mac Linux and AWS guest gate routes read the candidate's `gate.conf`.
+- `last_tool_call()` and its inventory row are gone, and no `last_step_scan_bytes` key exists.
+- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -757,5 +769,40 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Acceptance gate:**
 - The configured CLI median of 20 runs is within 5 ms of the 34 ms measured before Phase 4, or the reply names each remaining import, the module-level code that needs it, and its cost.
 - `test_user_zone.py` and `test_conf.py` pass. The configured subtest asserts that the moved modules stay unloaded.
+- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
+- basedpyright reports zero errors and zero warnings on each changed Python file.
+
+### Phase 17 — Build tool limits follow-ups  · status: todo
+**Depends on:** Phase 10
+
+#### Work Order
+
+**Goal:** One build report uses one edited-crate limit in all its sections, and a Mac nextest run with an unusable Summary scan limit keeps its log, its status and a clear diagnostic.
+
+**Spec:**
+
+1. **One limit for each report.** `scripts/buildlog/report.py` `report()` reads `RebuildClasses` for the rebuilds section, and `moments_section()` reads a second one. A `/tune` write between the two reads can give the rebuild table and the moments groups different labels. Pass the one `RebuildClasses` value from `report()` through every section. The standalone moments command (`scripts/buildlog/cli.py`, line 222) reads its own value.
+2. **Report test.** Add a row to the existing report test: one report pass reads `report.edited_crate_max_crates` once, and both sections use the same labels.
+3. **Unusable scan limit.** Add a row to `scripts/mac_test/test_offload_cleanup.py` `test_nextest_replays_success_and_retains_bounded_failure_output`: an unusable `nextest.summary_scan_bytes` (above its `# whole: 1..1048576` limit) and no recovery source. Check the diagnostic, the retained log path and the original nextest status, and that no Summary line is sent. Keep the `run TAIL SUMMARY COMMAND...` interface. Change `scripts/mac_test/nextest_log.py` only if the row fails.
+
+**Files:**
+- `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`
+- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_moments.py`
+- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/nextest_log.py` — the code only if the new row fails
+
+**Workers:** 1 writer + 1 tester — split by folder.
+- `impl` — `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_moments.py`
+- `test` — `scripts/mac_test/test_offload_cleanup.py`, and `scripts/mac_test/nextest_log.py` if the new row shows a defect
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 10: `RebuildClasses` (a frozen dataclass in `report.py`) holds the edited-crate maximum and the labels. `RebuildClasses.read()` reads `conf.read("buildlog").whole("report.edited_crate_max_crates")`. `label(crates_compiled, warm)` is the one bin rule. `rebuild_timings`, `package_rebuild_rows`, `rebuilds_section` and `profile_step_durations(connection, start, end, classes, *, hana_only=False)` take `classes`. `moments_section(connection, day)` reads `RebuildClasses.read()` once and passes it to `grouped()`.
+- Phase 10: `test_moments.py` spies on `report.profile_step_durations`. Keep each spy target current.
+- Phase 10: `config/mac_test.conf` has `# whole: 1..1048576` above `nextest.summary_scan_bytes=8192`. `replay_log` reads the key under `if status:` and calls `parse.bounded_displayed_lines(log, scan_bytes)`. `run_logged` catches `(OSError, conf.Unusable)`. The macOS target gets no per-run script copy, so the `run TAIL SUMMARY COMMAND...` form must not change.
+- Tests write keys in a `CONF_DIR` fixture with `write_config_fixture`.
+
+**Acceptance gate:**
+- `test_report.py`, `test_moments.py` and `test_offload_cleanup.py` pass. The report test proves one read for each report pass.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
