@@ -790,8 +790,34 @@ class MacDiskRecoveryPending(ExcludedTarget):
     disk: offload.MacDiskShort
 
 
-type MacDiskSweep = tuple[offload.MacDiskShort, Callable[[], None]]
-type RequestMacDiskRecovery = Callable[[str, MacDiskSweep | None], offload.MacDiskShort | None]
+@dataclass(frozen=True)
+class MacDiskSweep:
+    """Start a sweep for this disk shortage."""
+
+    disk: offload.MacDiskShort
+    run: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryQuery:
+    """Read the recovery state without starting a sweep."""
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryActive:
+    """The sweep keeps the Mac excluded."""
+
+    disk: offload.MacDiskShort
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryInactive:
+    """The host has no active sweep."""
+
+
+type MacDiskRecoveryRequest = MacDiskSweep | MacDiskRecoveryQuery
+type MacDiskRecoveryState = MacDiskRecoveryActive | MacDiskRecoveryInactive
+type RequestMacDiskRecovery = Callable[[str, MacDiskRecoveryRequest], MacDiskRecoveryState]
 
 
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
@@ -831,9 +857,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         return ExcludedTarget(target, answer)
     if answer == "bad" and not recover_mac_backoff:
         if request_disk_recovery is not None:
-            pending = request_disk_recovery(config.host, None)
-            if pending is not None:
-                return MacDiskRecoveryPending(target, "disk", pending)
+            recovery = request_disk_recovery(config.host, MacDiskRecoveryQuery())
+            if isinstance(recovery, MacDiskRecoveryActive):
+                return MacDiskRecoveryPending(target, "disk", recovery.disk)
         return EligibleTarget(target)
     # Only an eligible step pays for the offload runner's import.
     from scripts.mac_test import offload
@@ -863,11 +889,11 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             def recover_disk() -> None:
                 _ = sweep(offload.ProcessController())
 
-            request = (reading, recover_disk) if isinstance(reading, offload.MacDiskShort) else None
-            pending = request_disk_recovery(config.host, request)
-            if pending is not None:
-                return MacDiskRecoveryPending(target, "disk", pending)
-            return EligibleTarget(target) if request is None else ExcludedTarget(target, "disk")
+            request = MacDiskSweep(reading, recover_disk) if isinstance(reading, offload.MacDiskShort) else MacDiskRecoveryQuery()
+            recovery = request_disk_recovery(config.host, request)
+            if isinstance(recovery, MacDiskRecoveryActive):
+                return MacDiskRecoveryPending(target, "disk", recovery.disk)
+            return EligibleTarget(target) if isinstance(request, MacDiskRecoveryQuery) else ExcludedTarget(target, "disk")
 
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())

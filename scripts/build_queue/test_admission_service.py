@@ -2073,6 +2073,49 @@ class LocalHoldPlacementTests(unittest.TestCase):
             self.assertEqual(second.disk, offload.MacDiskShort(59, 60))
             self.assertFalse(fixture.release.is_set())
 
+    def test_mac_disk_recovery_excludes_another_keys_cached_allowed_reading(self) -> None:
+        for during_pass in (False, True):
+            with self.subTest(during_pass=during_pass):
+                self.assert_mac_disk_recovery_blocks_cached_reading(during_pass)
+
+    def assert_mac_disk_recovery_blocks_cached_reading(self, during_pass: bool) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            fixture.disk_ready.set()
+            cached = server.read_provider_evidence(fixture.key)
+            assert isinstance(cached, placement.FreshHostEvidence)
+            self.assertEqual(cached.eligibility, placement.AllowedHost())
+            server.publish_host_evidence(cached)
+
+            def start_recovery() -> None:
+                fixture.disk_ready.clear()
+                other = server.read_provider_evidence(fixture.other_key())
+                self.assertIsInstance(other, service.MacDiskRecoveryPendingEvidence)
+                self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+
+            request = server.host_requests[fixture.key]
+            if during_pass:
+                read = server.host_evidence
+
+                def read_before_recovery(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    evidence = read(key)
+                    if key == fixture.key and not fixture.started.is_set():
+                        self.assertEqual(evidence, cached)
+                        start_recovery()
+                    return evidence
+
+                with mock.patch.object(server, "host_evidence", side_effect=read_before_recovery):
+                    reply, = server.handle_request(request)
+            else:
+                start_recovery()
+                reply, = server.handle_request(request)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                fixture.key.destination, placement.TemporaryExclusion("disk")),))
+            self.assertNotIn(request.episode, server.current_assignments)
+            self.assertEqual(server.host_observations[fixture.key], cached)
+
     def test_mac_sweep_completion_refreshes_every_key_during_a_probe(self) -> None:
         with self.mac_disk_sweep_fixture() as fixture:
             server = fixture.admission.server

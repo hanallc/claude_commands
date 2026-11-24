@@ -8,7 +8,7 @@ except FileNotFoundError:
 from collections import deque
 from collections.abc import Generator, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 import errno
 import hashlib
@@ -74,7 +74,7 @@ from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
     from scripts.aws_target import ledger as aws_ledger
-    from scripts.build_targets.build_targets import MacDiskSweep
+    from scripts.build_targets.build_targets import MacDiskRecoveryRequest, MacDiskRecoveryState
     from scripts.mac_test import offload
     from scripts.mac_test.claim_state import RemoteJobClaim
 
@@ -4355,6 +4355,10 @@ class AdmissionServer:
                 return placement.HostEvidenceUnavailable(key, evidence.observed_at, str(error))
             if self.clock.now() - evidence.observed_at > lifetime:
                 return placement.StaleHostEvidence(key, evidence.observed_at, "provider evidence expired")
+            if key.destination.provider == "mac" and isinstance(evidence.eligibility, placement.AllowedHost):
+                with self.mac_recovery_lock:
+                    if key.destination.host in self.mac_disk_recoveries:
+                        return replace(evidence, eligibility=placement.TemporaryExclusion("disk"))
         return evidence
 
     def _refresh_host_observations(self) -> None:
@@ -4508,9 +4512,11 @@ class AdmissionServer:
             self.mac_recovery_retry_at[target] = float("inf")
             return True
 
-    def _request_mac_disk_recovery(self, host: str, request: MacDiskSweep | None) -> offload.MacDiskShort | None:
-        """Return the disk shortage for a pending sweep or start a requested sweep."""
-        def recover() -> None:
+    def _request_mac_disk_recovery(self, host: str, request: MacDiskRecoveryRequest) -> MacDiskRecoveryState:
+        """Read the recovery state and start a sweep if requested."""
+        from scripts.build_targets.build_targets import MacDiskRecoveryActive, MacDiskRecoveryInactive, MacDiskSweep
+
+        def recover(sweep: Callable[[], None]) -> None:
             try:
                 sweep()
             except (OSError, ValueError) as error:
@@ -4527,18 +4533,18 @@ class AdmissionServer:
         with self.mac_recovery_lock:
             active = self.mac_disk_recoveries.get(host)
             if active is not None:
-                return active if request is None else request[0]
-            if (request is None or self.closed
+                disk = request.disk if isinstance(request, MacDiskSweep) else active
+                return MacDiskRecoveryActive(disk)
+            if (not isinstance(request, MacDiskSweep) or self.closed
                     or self.clock.monotonic() < self.mac_disk_retry_at.get(host, 0)):
-                return None
-            reading, sweep = request
-            self.mac_disk_recoveries[host] = reading
+                return MacDiskRecoveryInactive()
+            self.mac_disk_recoveries[host] = request.disk
             try:
-                threading.Thread(target=recover, name="mac-disk-recovery", daemon=True).start()
+                threading.Thread(target=recover, args=(request.run,), name="mac-disk-recovery", daemon=True).start()
             except RuntimeError:
                 del self.mac_disk_recoveries[host]
                 raise
-            return reading
+            return MacDiskRecoveryActive(request.disk)
 
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
@@ -5726,7 +5732,16 @@ done
                 elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
-                assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
+                mac = destination.provider == "mac"
+                with self.mac_recovery_lock if mac else nullcontext():
+                    # A sweep can start after candidate selection.
+                    if mac and destination.host in self.mac_disk_recoveries:
+                        self.placement_eligibility[request.episode] = tuple(
+                            replace(item, eligibility=placement.TemporaryExclusion("disk"))
+                            if item.destination == destination else item
+                            for item in self.placement_eligibility[request.episode])
+                        continue
+                    assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
