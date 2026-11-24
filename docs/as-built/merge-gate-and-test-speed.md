@@ -364,7 +364,11 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/gate.py` merges a checkpoint into the production's merge branch.
 It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
+Run a unit's targeted tests with `copies.py run` and `scripts/production/gate.py --affected`.
+A direct `--affected` call prints the `copies.py run` command on standard error and exits with status 1.
+The command selects the source checkout's current `HEAD` commit.
+When the call includes `--repo` or `--checkout`, the command adds `--repo '{tree}'` for the prepared checkout.
+The gate requires the handoff from `copies.py run` before it starts placement or tests.
 `python3 -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
@@ -467,8 +471,10 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+The six merge flags are required for a checkpoint merge.
+Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+`copies.py run` refuses a named gate without either mode before it requests placement.
 Use the module names that the gate prints.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.

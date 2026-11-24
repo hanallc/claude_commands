@@ -3704,14 +3704,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --unit or --production")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
-    if args.modules and not (args.tests_only or args.affected):
-        parser.error("--module needs --tests-only or --affected")
+    if error := first_step.gate_module_mode_error(
+            has_modules=bool(args.modules), tests_only=args.tests_only, affected=args.affected):
+        parser.error(error)
     if not args.tests_only and not args.affected and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
+        if args.affected and not args.prepared_copy:
+            try:
+                repo = Path(args.repo).expanduser().resolve()
+                commit = checked_git(repo, "rev-parse", "--verify", "HEAD")
+            except (GateRefused, OSError, RuntimeError) as error:
+                raise GateRefused(" ".join(str(error).splitlines())) from error
+            command = ["run", "--repo", str(repo), "--commit", commit, "--",
+                       "./scripts/lib/py", "scripts/production/gate.py", *arguments]
+            if any(word in {"--repo", "--checkout"} or word.startswith(("--repo=", "--checkout="))
+                   for word in arguments):
+                # copies.py replaces {tree} with the prepared checkout path.
+                command.extend(("--repo", "{tree}"))
+            # Keep newlines in quoted arguments on one shell command line.
+            words = shlex.join(command).replace("\n", "'$'\\n''")
+            print(f"python3 ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
+            return 1
         target = gate_start_target(args, args.command)
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):

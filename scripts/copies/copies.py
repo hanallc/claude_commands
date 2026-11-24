@@ -47,8 +47,9 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, MERGE_GATE_PROGRAMS,
+    OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
+    parse_command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -2622,6 +2623,15 @@ def take_prepared_gate_handoff() -> bool:
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
+    program = parse_command_program(command)
+    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
+        arguments = program[1]
+        if "-h" not in arguments and "--help" not in arguments:
+            error = first_step.gate_module_mode_error(
+                has_modules=any(word == "--module" or word.startswith("--module=") for word in arguments),
+                tests_only="--tests-only" in arguments, affected="--affected" in arguments)
+            if error:
+                raise CopyError(error)
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     verification = verify_command(command)
