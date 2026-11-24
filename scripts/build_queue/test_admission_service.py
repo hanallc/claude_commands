@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 if TYPE_CHECKING:
+    from scripts.build_queue.test_placement import PlacementFixture
     from scripts.mac_test import offload
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
@@ -75,6 +76,79 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def replace_waiting_placement(self, fixture: PlacementFixture) -> wire.PlacementRequest:
+        from scripts.build_queue.test_place_take import mac_step, unit_request, wait_in_line
+        from scripts.build_queue.test_placement import local_candidate
+
+        fixture.free(0)
+        fixture.hold_starts()
+        old = mac_step(fixture, fixture.run_owner())
+        old = replace(old, constraints=replace(old.constraints, candidates=(local_candidate(fixture),)))
+        self.assertIsInstance(fixture.server.handle_request(old)[0], wire.PlacementWait)
+        fixture.clock.advance(1)
+        wait_in_line(fixture, unit_request(fixture, fixture.run_owner()))
+        self.assertNotIn(old.episode, fixture.server.placement_requests)
+        return old
+
+    def test_replaced_waiting_placement_refuses_a_prerequisite_and_cancel(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            old = self.replace_waiting_placement(fixture)
+
+            prerequisite = wire.PrerequisiteReport("prerequisite", old.episode, old.owner, placement.TokenHeld())
+            cancel = wire.CancelPlacement("cancel", old.episode, old.owner, "the caller left")
+            refused = [wire.Refused(status_wire.REPLACED_REASON)]
+            with self.subTest(request="prerequisite"):
+                self.assertEqual(fixture.connect(prerequisite).replies(), refused)
+            with self.subTest(request="cancel"):
+                self.assertEqual(fixture.connect(cancel).replies(), refused)
+
+            fixture.restart()
+            with fixture.serving():
+                with self.assertRaises(client.RunReplaced) as rejected_prerequisite:
+                    _ = client.report_prerequisite(prerequisite)
+                with self.assertRaises(client.RunReplaced) as rejected_cancel:
+                    _ = client.cancel_placement(cancel)
+            message = "Replaced: a newer run of this unit took the place of this run."
+            self.assertEqual(rejected_prerequisite.exception.reason, message)
+            self.assertEqual(rejected_cancel.exception.reason, message)
+
+            missing = [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)]
+            other_owner = replace(old.owner, pid=old.owner.pid + 1)
+            self.assertEqual(fixture.connect(replace(cancel, owner=other_owner)).replies(), missing)
+            fixture.clock.advance(records.read_memory_config().replay_retention_seconds + 1)
+            self.assertEqual(fixture.server.handle_request(prerequisite), missing)
+
+    def test_replaced_placement_replay_does_not_match_an_unrelated_request(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            old = self.replace_waiting_placement(fixture)
+            owner = old.owner
+            request_id = "placement-replaced:" + json.dumps((old.episode, owner.host, owner.pid, owner.start_time))
+            release = wire.ReleaseRequest(request_id, "unrecorded-reservation", 0)
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+            fixture.restart()
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+            cancel = wire.CancelPlacement("cancel", old.episode, owner, "the caller left")
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(status_wire.REPLACED_REASON)])
+
+    def test_replaced_placement_expires_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            fixture.configure(replay_retention_seconds=2)
+            fixture.restart()
+            old = self.replace_waiting_placement(fixture)
+            cancel = wire.CancelPlacement("cancel", old.episode, old.owner, "the caller left")
+            fixture.clock.advance(1)
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(status_wire.REPLACED_REASON)])
+            saved = (fixture.state_dir / "state.json").read_bytes()
+            fixture.clock.advance(1)
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)])
+            self.assertEqual((fixture.state_dir / "state.json").read_bytes(), saved)
+
     def test_kept_place_restores_its_failed_step_and_reads_an_old_record(self) -> None:
         from scripts.build_queue.test_place_take import place_rules, run_steps
 

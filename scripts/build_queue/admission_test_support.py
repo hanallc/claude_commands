@@ -525,10 +525,10 @@ class AdmissionFixture(ExitStack):
             previous = real_monotonic()
             try:
                 while not stopped.is_set():
-                    current = real_monotonic()
-                    self.clock.advance(current - previous)
-                    previous = current
                     with self.loop_turn():
+                        current = real_monotonic()
+                        self.clock.advance(current - previous)
+                        previous = current
                         self.server.run_once(SERVING_POLL_SECONDS)
             except BaseException as error:
                 failures.append(error)

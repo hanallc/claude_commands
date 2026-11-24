@@ -19,7 +19,7 @@ from unittest.mock import patch
 from scripts.lint.memory_test_support import config_environment
 
 from scripts.buildlog import index, memory, store
-from scripts.lib import scratch
+from scripts.lib import conf, scratch
 from scripts.lint import sweep
 from scripts.buildlog.cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
@@ -211,8 +211,9 @@ class MemoryWindowTests(unittest.TestCase):
     def test_earlyoom_reader_classifies_gate_target_programs_and_other_kills(self) -> None:
         target = cargo_output(self.base / "cargo-output")
         at = datetime.fromisoformat(START_UTC)
+        adjustment = conf.read("lint").whole("build_oom_score_adj")
         messages = [
-            earlyoom_message(101, cmdline="/usr/bin/rustc --crate-name hana"),
+            earlyoom_message(101, adj=adjustment, cmdline="/usr/bin/rustc --crate-name hana"),
             earlyoom_message(102, command="hana-test", signal="SIGKILL", adj=200,
                              cmdline=f"{target}/debug/deps/hana-abc --test"),
             earlyoom_message(103, command="python", adj=200,
@@ -234,7 +235,7 @@ class MemoryWindowTests(unittest.TestCase):
             (at + timedelta(minutes=2), 103, "python"), (at + timedelta(minutes=3), 104, "legacy"),
         ])
         self.assertEqual([kill.oom_score_adj for kill in kills],
-                         [500, 200, 200, memory.OomScoreAdjUnavailable.VALUE])
+                         [adjustment, 200, 200, memory.OomScoreAdjUnavailable.VALUE])
         self.assertEqual([kill.is_build for kill in kills], [True, True, False, False])
         self.assertEqual([kill.outside_build_gate for kill in kills], [False, True, False, False])
         self.assertEqual(kills[1].cmdline, f"{target}/debug/deps/hana-abc --test")

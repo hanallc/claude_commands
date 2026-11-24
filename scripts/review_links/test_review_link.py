@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
 from scripts.review_links.server_test_support import started_review_server
@@ -315,9 +316,11 @@ class ReviewLinkTests(unittest.TestCase):
         initial = self.run_link(str(expired_source))
         self.assertEqual(initial.returncode, 0, initial.stderr)
         expired = self.linked_snapshot(initial.stdout.strip()).parent
-        old = time.time() - 8 * 24 * 60 * 60
+        now = time.time()
+        retention = conf.read("review_links").number("snapshot_retention_seconds")
+        old = now - retention - 1
         os.utime(expired, (old, old))
-        self.assertEqual(serve.sweep_snapshots(self.snapshots, time.time()), 1)
+        self.assertEqual(serve.sweep_snapshots(self.snapshots, now), 1)
         other = self.run_link(str(other_source))
         self.assertEqual(other.returncode, 0, other.stderr)
         index = (self.snapshots / ".index.json").read_text(encoding="utf-8")

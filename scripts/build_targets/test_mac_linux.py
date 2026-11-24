@@ -972,8 +972,14 @@ class MacLinuxRouteTests(unittest.TestCase):
             return wire.FirstAuthorization(request.assignment, request.claim)
 
         _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
-        _ = self.enterContext(patch.object(mac_linux, 'send_guest_execution', return_value=wire.DispatchStatus(
-            self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))))
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            self.assertGreater(timeout, 0)
+            state = (placement.ClosedAssignment('completed') if isinstance(request.outcome, placement.AttemptCompleted)
+                     else placement.CurrentAssignment())
+            return wire.DispatchStatus(request.assignment, state, placement.PermissionConsumed(1.0))
+
+        _ = self.enterContext(patch.object(mac_linux, 'send_guest_execution', report))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
@@ -1126,7 +1132,7 @@ fi
                 self.assertEqual(request.assignment, dispatch.assignment)
                 self.assertEqual(request.outcome, placement.AttemptCompleted(0))
                 self.assertEqual(request.path, placement.DispatchPathSettled())
-                expected = f'Mac Linux guest settlement report failed: {reason}\n' if reason else ''
+                expected = f'Mac Linux guest completion report failed: {reason}\n' if reason else ''
                 self.assertEqual(errors.getvalue(), expected)
 
     def test_guest_settlement_reads_only_a_complete_matching_proof(self) -> None:
@@ -1156,7 +1162,7 @@ fi
             writer.flush()
             self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
 
-    def test_started_guest_reports_start_and_settlement_for_its_placement(self) -> None:
+    def test_guest_reports_start_and_completion_for_its_placement(self) -> None:
         self.placed = replace(self.placed, attempt=f'{16:032x}')
         reports: list[wire.ExecutionReport] = []
 
@@ -1165,7 +1171,7 @@ fi
             self.assertEqual(timeout, 1)
             reports.append(request)
             if isinstance(request.path, placement.DispatchPathSettled):
-                self.assertEqual(self.trace.read_text().splitlines()[-1], 'cleanup')
+                self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
                 self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
                 path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
                 launch, line = path.read_bytes().splitlines()
@@ -1187,12 +1193,12 @@ fi
             result = self.route()
         self.assertIsInstance(result, GateRun)
         self.assertEqual(errors.getvalue(), '')
-        report_row, settled = reports
+        report_row, completion = reports
         self.assertEqual((report_row.assignment, report_row.claim), (self.placed, self.consumed[0][0].claim))
-        self.assertEqual((settled.assignment, settled.claim, settled.evidence),
+        self.assertEqual((completion.assignment, completion.claim, completion.evidence),
                          (report_row.assignment, report_row.claim, report_row.evidence))
-        self.assertEqual(settled.outcome, placement.AttemptCompleted(0))
-        self.assertIsInstance(settled.path, placement.DispatchPathSettled)
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(0))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
         assert isinstance(report_row.evidence, execution_identity.ObservedExecution)
         identity = report_row.evidence.identity
         assert isinstance(identity, execution_identity.CloudExecution)
@@ -1686,6 +1692,37 @@ fi
             mac_linux.reconcile_guest_end(episode, attempt)
             self.assertEqual(errors.getvalue(), 'Mac Linux guest reconcile failed: guest unavailable\n')
 
+    def test_completion_report_does_not_wait_for_stalled_configuration(self) -> None:
+        entered = Event()
+        release = Event()
+        finished = Event()
+        read = conf.read
+        dispatch = self.guest_dispatch()
+        dispatch.started = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
+
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                entered.set()
+                _ = release.wait(3)
+                finished.set()
+            return read(file)
+
+        with (patch.object(conf, 'read', read_config),
+              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.2),
+              patch.object(mac_linux, 'send_guest_execution') as send,
+              redirect_stderr(io.StringIO()) as errors):
+            try:
+                mac_linux.settle_guest_dispatch(dispatch, placement.AttemptCompleted(0))
+                self.assertTrue(entered.is_set())
+                self.assertFalse(finished.is_set(), 'The completion report waited for configuration.')
+            finally:
+                release.set()
+                if entered.is_set():
+                    self.assertTrue(finished.wait(1))
+            send.assert_not_called()
+        self.assertEqual(errors.getvalue(), 'Mac Linux guest completion report failed: '
+                         + 'the queue report configuration read timed out\n')
+
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,
               patch.object(mac_linux, 'send_guest_execution', side_effect=wire.AdmissionUnavailable('fixture refusal'))):
@@ -1693,6 +1730,29 @@ fi
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed: fixture refusal'), 1)
+        self.assertEqual(errors.getvalue().count('Mac Linux guest completion report failed: fixture refusal'), 1)
+
+    def test_closed_stderr_keeps_the_failed_guest_verdict_after_a_report_timeout(self) -> None:
+        completions: list[wire.ExecutionReport] = []
+
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            if isinstance(request.outcome, placement.AttemptCompleted):
+                completions.append(request)
+                raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s')
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(errors, 'write', side_effect=BrokenPipeError('fixture stderr pipe closed')) as write,
+              patch.object(mac_linux, 'send_guest_execution', report)):
+            result = self.route('red')
+        assert isinstance(result, GateRun), result
+        self.assertFalse(result.passed)
+        self.assertEqual([job.returncode for job in result.jobs], [1, 1])
+        completion, = completions
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(1))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
+        write.assert_called_once_with('Mac Linux guest completion report failed: no answer in 1 s')
 
     def test_guest_module_progress_uses_the_placement_sidecar(self) -> None:
         sidecar = self.root / 'placement.cgroup'
