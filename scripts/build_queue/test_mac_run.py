@@ -2105,7 +2105,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             self.assertEqual(worktrees.migrate_on_mac("claude_commands", dry_run=False), 255)
         remote = ("~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py"
                   + " migrate --repo claude_commands")
-        self.assertEqual(commands, [(*mac_linux.SSH, "fixture-mac", remote)])
+        self.assertEqual(commands, [("ssh", *mac_linux.SSH_OPTIONS, "-o", f"ConnectTimeout={mac_linux.SSH_CONNECT_TIMEOUT_SECONDS}",
+                                     *eligibility.server_alive_options(UNREACHABLE_WAIT_FIXTURE_SECONDS), "fixture-mac", remote)])
         self.assertIn("ServerAliveInterval=15", commands[0])
-        self.assertIn("ServerAliveCountMax=2", commands[0])
         self.assertEqual(claim_state.read_claims(self.paths), ())
