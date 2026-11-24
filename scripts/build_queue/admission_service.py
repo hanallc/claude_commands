@@ -3758,8 +3758,10 @@ class AdmissionServer:
             request = self.placement_requests.get(assignment.episode)
             if request is None:
                 continue
-            evidence = self.execution_evidence.get(key, execution_identity.ExecutionEvidenceUnavailable(
-                "execution evidence is unavailable", self.clock.now()))
+            evidence = (execution_identity.ObservedExecution(saved.guest_start)
+                if isinstance(saved.guest_start, execution_identity.GuestExecution)
+                else self.execution_evidence.get(key, execution_identity.ExecutionEvidenceUnavailable(
+                    "execution evidence is unavailable", self.clock.now())))
             policy_key = self.placement_host_keys.get((request.episode, assignment.destination))
             host_evidence = self.host_evidence(policy_key) if policy_key is not None else None
             retained = False
@@ -5189,7 +5191,8 @@ done
             evidence = self.execution_evidence.get(key)
             host_key = self.placement_host_keys.get((request.episode, saved.assignment.destination))
             host_evidence = self.host_evidence(host_key) if host_key is not None else None
-            if (isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+            if (isinstance(saved.guest_start, execution_identity.GuestExecution)
+                    or isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
                     or isinstance(evidence, execution_identity.ObservedExecution)
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
@@ -5872,6 +5875,7 @@ done
                 and isinstance(saved.permission, placement.PermissionConsumed)
                 and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
                 and not saved.guest_execution_observed
+                and isinstance(saved.guest_start, records.GuestStartNotReported)
                 and isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
                 and self._confirmed_local_holder_ended(saved.holder))
 
@@ -6408,20 +6412,23 @@ done
             self._schedule_pass()
             if isinstance(connection, Connection) and (assignment.destination.provider == "scaler" or guest):
                 self._record_caller_version(request, connection, persist_change=False)
-            if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
-                    or not isinstance(request.evidence, execution_identity.ObservedExecution)):
-                self.execution_evidence[key] = request.evidence
-                if (assignment.destination.target == "mac-linux"
-                        and isinstance(request.evidence, execution_identity.ObservedExecution)):
-                    saved = replace(saved, guest_execution_observed=True)
-                    self.assignments[key] = saved
-            if (isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
-                    and current
+            evidence = request.evidence
+            confirmed = (current
                     and isinstance(saved.state, placement.CurrentAssignment)
                     and isinstance(saved.permission, placement.PermissionConsumed)
-                    and confirmed_guest_run(assignment, request.evidence) is not None):
+                    and confirmed_guest_run(assignment, evidence) is not None)
+            if (isinstance(evidence, execution_identity.ObservedExecution)
+                    and isinstance(evidence.identity, execution_identity.GuestExecution)):
+                if confirmed:
+                    saved = replace(saved, guest_start=evidence.identity, guest_execution_observed=True)
+            elif (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
+                    or not isinstance(evidence, execution_identity.ObservedExecution)):
+                self.execution_evidence[key] = evidence
+                if assignment.destination.target == "mac-linux" and isinstance(evidence, execution_identity.ObservedExecution):
+                    saved = replace(saved, guest_execution_observed=True)
+            if confirmed and isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded):
                 saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(self.clock.now()))
-                self.assignments[key] = saved
+            self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)

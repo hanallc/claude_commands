@@ -129,17 +129,17 @@
   },
   {
    "kind": "mac-build",
-   "name": "terminal: build",
+   "name": "trunk-p172-assembly-rows: build",
    "title": {
     "unit": "",
-    "step": "terminal: build"
+    "step": "trunk-p172-assembly-rows: build"
    },
    "call": "cargo build --release -p hana",
    "about": "Builds the selected targets",
    "name_parts": [
     {
      "kind": "text",
-     "text": "terminal: build"
+     "text": "trunk-p172-assembly-rows: build"
     }
    ],
    "showrunner": "",
@@ -169,10 +169,6 @@
     "total": 1000,
     "percent": 60.4,
     "unit": "units"
-   },
-   "started_by": {
-    "name": "terminal",
-    "step": "build"
    },
    "key": "7ca8e11c0084aa4f6f31945e"
   },

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,15 +125,21 @@ class ActionStore:
 
     folder: Path = field(default_factory=actions_folder)
 
-    def list(self) -> tuple[UserAction, ...]:
+    def list(self, *, watch: Callable[[Path], None] | None = None) -> tuple[UserAction, ...]:
         """Read every retained action or report the damaged source."""
+        if watch is not None:
+            watch(self.folder)
         try:
             paths = sorted(path for path in self.folder.iterdir() if path.suffix == ".json")
         except FileNotFoundError:
+            if watch is not None and (self.folder.exists() or self.folder.is_symlink()):
+                raise
             return ()
         records: list[UserAction] = []
         for path in paths:
             try:
+                if watch is not None:
+                    watch(path)
                 record = UserAction.decode(path.read_text(encoding="utf-8"))
                 if path.stem != action_id(record.key):
                     raise ActionStoreError("The filename does not match the action key.")
