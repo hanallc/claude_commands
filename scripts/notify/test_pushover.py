@@ -692,9 +692,7 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual((code, form), (6, {}))
 
     def test_every_post_ends_with_its_sender_then_its_template(self) -> None:
-        entry = next(item for item in push_texts.catalog() if item.id == "nixos.ups_battery")
-        registered = ["--text-id", entry.id, *(item for key, value in entry.examples[0].values.items()
-                                                for item in ("--value", f"{key}={value}"))]
+        registered = ["--text-id", "nixos.ups_battery", "--value", "charge=30", "--value", "minutes=5"]
         for argv, sender, template in (
                 (registered, "ups", "nixos.ups_battery"),
                 (["--no-action", "Build done", "The build passed."], PARENT, "fixture.admitted"),
@@ -921,9 +919,9 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(form["priority"], ["2"])
         detail = f"registered text, approved {approved}"
-        rendered = push_texts.render_entry(entry, values)
-        self.assertEqual(form["title"], [rendered.title])
-        self.assertEqual(form["message"], [footed(rendered.message, rendered.sender, entry.id)])
+        self.assertEqual(push_texts.render_entry(entry, values).values, {"charge": "80", "minutes": "20"})
+        self.assertEqual(form["title"], ["Power out: natedev on battery, 20 min left"])
+        self.assertEqual(form["message"], [footed("Action: Save your open work on natedev now.", "ups", entry.id)])
         self.assertEqual(self.reviews()[0]["detail"], detail)
         self.assertEqual(self.log_lines()[-1]["outcome"], "sent, " + detail)
         self.assertNotIn("failed review", output.getvalue())

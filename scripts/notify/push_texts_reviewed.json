@@ -419,14 +419,21 @@
   },
   "nixos.ups_battery": {
     "shutdown_threshold": {
-      "reviewer": "opus",
-      "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
-      "time": "2026-10-14T04:26:53.467045-04:00"
+      "objections": [],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 09:49 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "bb706de143161d801fefef8882c395c072f84012a24c7111e123a977164712da",
+      "time": "2026-11-24T12:52:31.374651-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
-      "time": "2026-10-14T04:26:42.406180-04:00"
+      "objections": [
+        {
+          "quote": "Save your open work on natedev now.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 09:49 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "bb706de143161d801fefef8882c395c072f84012a24c7111e123a977164712da",
+      "time": "2026-11-24T12:52:23.660634-05:00"
     }
   },
   "nixos.ups_no_contact": {
@@ -1171,30 +1178,6 @@
       "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
-  "shutdown.manual_restart": {
-    "one_session": {
-      "reviewer": "opus",
-      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
-      "time": "2026-11-01T22:43:40.334596-05:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
-      "time": "2026-11-01T22:43:31.298215-05:00"
-    }
-  },
-  "shutdown.move_failed": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
-      "time": "2026-10-22T08:41:21.232661-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
-      "time": "2026-10-22T08:41:13.031634-04:00"
-    }
-  },
   "shutdown.move_untrusted": {
     "mac": {
       "reviewer": "opus",
@@ -1217,37 +1200,6 @@
       "reviewer": "opus",
       "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
       "time": "2026-11-07T12:59:38.245148-05:00"
-    }
-  },
-  "shutdown.restart_incomplete": {
-    "long_account": {
-      "reviewer": "opus",
-      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
-      "time": "2026-11-07T13:00:09.523293-05:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
-      "time": "2026-11-07T13:00:02.062164-05:00"
-    }
-  },
-  "shutdown.restart_untrusted": {
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "ac22944a6753615e074a27bffe4dbba0c64c654aebf4f560a00a2ad57e560c95",
-      "time": "2026-11-07T12:59:55.219819-05:00"
-    }
-  },
-  "shutdown.restart_untrusted_unlisted": {
-    "one_session": {
-      "reviewer": "opus",
-      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
-      "time": "2026-11-01T23:41:12.323161-05:00"
-    },
-    "several_sessions": {
-      "reviewer": "opus",
-      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
-      "time": "2026-11-01T23:41:18.957713-05:00"
     }
   },
   "silence.auto_off": {
