@@ -168,6 +168,7 @@ class GateReservation:
     mode: str = ''
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
+    placement_claim: str = ''
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
@@ -220,6 +221,7 @@ class HanaStorageExposure:
 @dataclass(frozen=True)
 class GateReserved:
     reservation: GateReservation
+    created: bool = True
 
 
 @dataclass(frozen=True)
@@ -930,7 +932,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
-            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))),
+            text(item, 'placement_claim') if 'placement_claim' in item else ''))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     if 'gate_quota_refusals' in row:
@@ -1015,6 +1018,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
+             **({'placement_claim': r.placement_claim} if r.placement_claim else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -2198,6 +2202,11 @@ class CostLedger:
         """Read the published evidence without creating coordination files."""
         return self._read()
 
+    def gate_claim_reservations(self, claim_id: str) -> tuple[GateReservation, ...]:
+        """Read the reservations for a placement claim without the account lock."""
+        state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+        return tuple(row for row in state.gate_reservations if row.placement_claim == claim_id or row.attempt == claim_id)
+
     def record_hana_attempt(self, charge: hana_result.HanaAttemptCharge) -> None:
         """Link transfer and query evidence without adding another dollar total."""
         _ = hana_result.decode_attempt_charge(hana_result.encode_attempt_charge(charge))
@@ -2388,7 +2397,7 @@ class CostLedger:
                 if previous.attempt == request.attempt:
                     if isinstance(previous.state, (GateAbsent, GateTerminated)):
                         return GateAttemptEnded()
-                    return GateReserved(previous)
+                    return GateReserved(previous, created=False)
             settings = read_settings(settings_path)
             if isinstance(request.trial, GateTrialBudget):
                 if request.mode != 'gpu-size-trial' or not request.trial.trial_id or request.trial.limit_usd <= 0:
@@ -2405,15 +2414,34 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-            state.gate_reservations.append(request)
-            reason = self.reservation_cap(state, settings, request.at, costs)
-            if reason:
-                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-                self._save(state)
-                return GateCapReached(reason)
+            reason = self._book_gate(state, settings, request)
             self._save(state)
-            return GateReserved(state.gate_reservations[-1])
+            return GateCapReached(reason) if reason else GateReserved(state.gate_reservations[-1])
+
+    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
+        """Return the spending refusal for a proposed placement without saving the booking."""
+        return self._book_gate(replace(snapshot, gate_reservations=list(snapshot.gate_reservations)),
+                               read_settings(settings_path), request)
+
+    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
+        state.gate_reservations.append(request)
+        reason = self._gate_cap(state, settings, request, request.at)
+        if reason:
+            _ = state.gate_reservations.pop()
+        return reason
+
+    def recheck_gate_booking(self, settings_path: Path, attempt: str, now: int) -> str:
+        """Check the pending booking against the current account bill."""
+        with self._locked() as state:
+            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            if booking is None or not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot launch a box')
+            return self._gate_cap(state, read_settings(settings_path), booking, now)
+
+    def _gate_cap(self, state: LedgerEvidence, settings: SpendingSettings, booking: GateReservation, now: int) -> str:
+        prior = replace(state, gate_reservations=[row for row in state.gate_reservations if row is not booking])
+        costs = _charges(prior, settings, now, current_window=True, require_fresh=False)
+        return self.reservation_cap(state, settings, now, costs)
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:
@@ -2485,9 +2513,12 @@ class CostLedger:
                                        for row in state.gate_reservations]
             self._save(state)
 
-    def gate_owner(self, attempt: str, owner: GateWorkerOwner) -> None:
+    def gate_owner(self, attempt: str, owner: GateWorkerOwner, *, now: float = 0) -> None:
         """Save the worker identity before an attempt can launch a box."""
         with self._locked() as state:
+            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            if booking is None or not gate_is_open(booking) or booking.placement_claim and booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot take a worker')
             state.gate_reservations = [replace(row, owner=owner) if row.attempt == attempt else row
                                        for row in state.gate_reservations]
             self._save(state)

@@ -4,11 +4,14 @@ from pathlib import Path
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import execution_identity, placement
-from scripts.build_queue.admission_client import placement_constraint_builder
+from scripts.build_queue.admission_client import OuterReservation, outer_reservation, placement_constraint_builder
 from scripts.build_targets import target_config
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
-from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, gate_target_kind, parse_command_program
+from scripts.lib.build_steps import (
+    OtherCommand, StepJob, command_job, gate_natedev_only_flag, gate_target_kind, parse_command_program,
+)
+from scripts.mac_test.claim_state import WHOLE_MAC
 
 
 @dataclass(frozen=True)
@@ -18,20 +21,50 @@ class NoEnabledTarget:
     reason: str = "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf."
 
 
+def uses_parent_reservation(command: tuple[str, ...]) -> bool:
+    """Keep a nested named module under its parent reservation."""
+    job = command_job(command)
+    return (isinstance(job, StepJob) and job.step == "test-modules"
+            and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation))
+
+
+def scaler_enabled(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> bool:
+    """Check both scaler switches before reading provider evidence."""
+    return (registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False)
+            and conf.read(target.settings).value("enabled", conf.on_off, default=False, recover_invalid=False))
+
+
+def scaler_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> placement.PlacementCandidate:
+    destination = placement.PlacementDestination("scaler", target.name, target.name, WHOLE_MAC)
+    return placement.PlacementCandidate(destination,
+        placement.AllowedHost() if scaler_enabled(registry, target) else placement.FixedExclusion("off"),
+        placement.ExplicitProviderSettings(target.settings))
+
+
+def natedev_only_flag(command: tuple[str, ...]) -> str | None:
+    program = parse_command_program(command)
+    return None if isinstance(program, OtherCommand) else gate_natedev_only_flag(program[1])
+
+
+def is_claude_gate_source(repo_root: Path) -> bool:
+    try:
+        return build_folders.repo_word(repo_root) == "claude"
+    except build_folders.InvalidFolderForm:
+        return False
+
+
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
     """Select the enabled targets that can run a Claude gate."""
-    program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and gate_natedev_only_flag(program[1]):
-        return ()
-    try:
-        if build_folders.repo_word(repo_root) != "claude":
-            return ()
-    except build_folders.InvalidFolderForm:
+    if natedev_only_flag(command) is not None or not is_claude_gate_source(repo_root):
         return ()
     registry = conf.read("build_targets")
     builder = placement_constraint_builder()
     names: list[str] = []
-    for target in target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+    for target in target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+        if isinstance(target, target_config.ScalerTarget):
+            if scaler_enabled(registry, target):
+                names.append(target.name)
+            continue
         kind = gate_target_kind(target.name)
         if kind is None:
             continue

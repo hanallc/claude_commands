@@ -33,7 +33,7 @@ from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
@@ -245,17 +245,18 @@ class ObservedAdmissionServer(service.AdmissionServer):
 
 class TestProcesses:
     """Real pidfds with private resident-memory files."""
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, private_child_starts: bool = False) -> None:
         self.path: Path = path
         path.mkdir(parents=True, exist_ok=True)
-        self.children: list[subprocess.Popen[bytes]] = []
+        self.private_child_starts: bool = private_child_starts
+        self.children: dict[int, subprocess.Popen[bytes]] = {}
         self.starts: dict[int, str] = {}
         self.fixture_owners: dict[int, str] = {}
 
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.children.append(child)
-        start = records.process_start_time(child.pid)
+        self.children[child.pid] = child
+        start = str(child.pid) if self.private_child_starts else records.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -272,10 +273,17 @@ class TestProcesses:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
-        start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
+        if self.private_child_starts and (child := self.children.get(pid)) is not None:
+            start = self.starts[pid] if child.poll() is None else None
+        else:
+            start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
     def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        if self.private_child_starts and pid in self.children:
+            if isinstance(self.owner_start(pid), service.OwnerProcessGone):
+                return service.OwnerProcessGone()
+            return service.linux_owner_process(pid, self.path)
         return service.linux_owner_process(pid, Path("/proc"))
 
     def pidfd(self, pid: int) -> int:
@@ -285,12 +293,12 @@ class TestProcesses:
         return gate.reservation_lifetime(row, owner_live)
 
     def kill(self, owner: wire.Owner) -> None:
-        child = next(child for child in self.children if child.pid == owner.pid)
+        child = self.children[owner.pid]
         child.kill()
         _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def close(self) -> None:
-        for child in self.children:
+        for child in self.children.values():
             if child.poll() is None:
                 child.kill()
             _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
@@ -388,14 +396,14 @@ class GaplessRefill:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 state_dir: Path | None = None, skip_idle_spacing: bool = False) -> None:
+                 state_dir: Path | None = None, skip_idle_spacing: bool = False,
+                 private_child_starts: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        if configuration := os.environ.get("CONF_DIR"):
-            _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         try:
+            self.enter_context(mock.patch.dict(os.environ, gate_isolation_environment(self.root)))
             self.temporary: Path = self.root / "tmp"
             self.temporary.mkdir(parents=True, exist_ok=True)
             # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
@@ -409,7 +417,7 @@ class AdmissionFixture(ExitStack):
             self.skip_idle_spacing: bool = skip_idle_spacing
             self.clock: FakeClock = FakeClock()
             self.fault: Faults = Faults()
-            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            self.proc: TestProcesses = TestProcesses(self.root / "proc", private_child_starts=private_child_starts)
             _ = self.callback(self.proc.close)
             pressure = self.root / "pressure"
             if not pressure.exists():
@@ -418,7 +426,7 @@ class AdmissionFixture(ExitStack):
                        "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
                       if (self.root / "meminfo").exists() else fake_memory_readings(
                           self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-            environment = {**gate_isolation_environment(self.root), **memory,
+            environment = {**memory,
                 "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
                 "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
                 "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),

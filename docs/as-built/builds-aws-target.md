@@ -873,7 +873,7 @@ The paired trial replaces the size/start trials.
 The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
-## Cloud gate region fallback
+## Cloud gate placement and region retries
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
@@ -884,20 +884,41 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, merge gates and targeted tests without a placement assignment run on natedev.
-For each request, the route reads this setting before it reads deployment state or calls AWS.
+The queue offers AWS after `cloud_gate.availability()` confirms the switch, deployment, spend room and Spot quota room.
+This check reads local files and makes no AWS call.
+It checks the per-attempt booking against the daily and monthly caps and the safety reserve.
+It deducts live gate vCPUs from current Spot quotas and checks recent quota refusals.
+With `enabled=off` in `cloud_gate.conf`, the queue excludes AWS.
+The route checks this switch again before a launch.
+The AWS route consumes the assignment's launch permission once and reports the result to the queue.
+An AWS refusal ends the gate command and leaves any reassignment to the queue.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in `current.json` before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
-Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+An assigned AWS run starts from its claim and clears the saved retry state.
+An unassigned resume restores the saved retry state.
+Each retry gets a new attempt ID.
+The worker checks the current spending caps before each fresh assigned launch.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final natedev fallback row includes the interruption count when retries or capacity choices end.
+The final refusal row includes the interruption count when retries or capacity choices end.
 A complete gate failure keeps its failed result and gets no retry.
-An unconfirmed termination or another controller error retains the existing fallback behavior.
+An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
+The route reports pending settlement to the queue while the launch remains uncertain.
+The stop cleanup looks up an unknown instance by client token.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
+The queue reads settlement for the exact claim through `settlement()`.
+The queue calls `reconcile_expired()` when it checks pending settlement.
+A direct gate that receives status 80 asks the queue for settlement before it takes a replacement in the same episode.
+If the settlement request or replacement fails after status 80, the direct gate preserves status 80.
+`reconcile_expired()` requests the service when a booking for that claim has expired and cleanup is due.
+It reads the exact claim again before submitting the service.
+The call returns before reconciliation completes.
+If the service cannot start, the call prints one warning per attempt in the queue process.
+The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -944,7 +965,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-The controller then uses the normal natedev fallback.
+The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -1370,8 +1391,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.
