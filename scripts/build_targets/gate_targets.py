@@ -4,11 +4,13 @@ from pathlib import Path
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import execution_identity, placement
-from scripts.build_queue.admission_client import placement_constraint_builder
+from scripts.build_queue.admission_client import OuterReservation, outer_reservation, placement_constraint_builder
 from scripts.build_targets import target_config
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
-from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, gate_target_kind, parse_command_program
+from scripts.lib.build_steps import (
+    OtherCommand, StepJob, command_job, gate_natedev_only_flag, gate_target_kind, parse_command_program,
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,10 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
     """Select the enabled targets that can run a Claude gate."""
     program = parse_command_program(command)
     if not isinstance(program, OtherCommand) and gate_natedev_only_flag(program[1]):
+        return ()
+    job = command_job(command)
+    if (isinstance(job, StepJob) and job.step == "test-modules"
+            and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
         return ()
     try:
         if build_folders.repo_word(repo_root) != "claude":

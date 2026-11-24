@@ -124,6 +124,13 @@ class Setting:
     line: int
 
 
+@dataclass(frozen=True)
+class _ShiftedSetting(Setting):
+    """A test fixture setting carries its committed value."""
+
+    origin: conf_reads.ShiftedConfigKey
+
+
 Result = TypeVar("Result")
 
 
@@ -223,6 +230,8 @@ class ConfigRead:
                 if not use_default or isinstance(default, UseConfiguredValue):
                     raise
                 return default, None
+            if isinstance(setting, _ShiftedSetting):
+                setting.origin.record()
             bad = setting.value
             if not use_file_limits:
                 return convert(setting.value), setting.value
@@ -258,7 +267,7 @@ class ConfigRead:
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
             try:
-                value, raw_value = read_key(_parse(committed), use_default=missing is None)
+                value, raw_value = read_key(_read_settings(committed, self.source), use_default=missing is None)
             except (ValueError, ArithmeticError):
                 continue
             if not current_limit:
@@ -329,6 +338,8 @@ class ConfigRead:
                 setting = _setting(settings, key)
             except _MissingKey:
                 continue
+            if isinstance(setting, _ShiftedSetting):
+                setting.origin.record()
             if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
                 result[key] = setting.value
                 continue
@@ -343,7 +354,7 @@ class ConfigRead:
 def _recover_file(source: Path, fault: _UnreadableFile) -> dict[str, Setting]:
     _warning(f"warning: {source}: keys: {fault.reason}")
     for contents in _committed_files(source):
-        return _parse(contents)
+        return _read_settings(contents, source)
     if fault.missing:
         raise Unusable(_missing_file(source))
     raise Unusable(f"{source}: keys: {fault.reason}; no usable committed file")
@@ -388,7 +399,7 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
             contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         return ConfigRead(source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)), stamp)
-    return ConfigRead(source, _parse(contents), stamp)
+    return ConfigRead(source, _read_settings(contents, source), stamp)
 
 
 def read_or_repository(stem: str) -> ConfigRead:
@@ -453,6 +464,18 @@ def _parse(source: str) -> dict[str, Setting]:
             if separator:
                 _ = settings.setdefault(key.strip(), Setting(value.strip(), previous, index))
         previous = raw.strip()
+    return settings
+
+
+def _read_settings(contents: str, source: Path) -> dict[str, Setting]:
+    """Attach shift marks to actual settings only when a test traces reads."""
+    settings = _parse(contents)
+    if conf_reads.shift_reads_enabled():
+        for shift in conf_reads.shifted_values(contents):
+            setting = settings.get(shift.key)
+            if setting is not None and setting.line == shift.line:
+                origin = conf_reads.ShiftedConfigKey(source.name, shift)
+                settings[shift.key] = _ShiftedSetting(setting.value, setting.limit, setting.line, origin)
     return settings
 
 

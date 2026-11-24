@@ -16,11 +16,11 @@ import ctypes
 import json
 import os
 import fcntl
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from inspect import currentframe, getsource
+from inspect import currentframe, getsource, signature
 from pathlib import Path
 import pwd
 import resource
@@ -28,6 +28,7 @@ import select
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 from types import FrameType, MethodType, TracebackType
@@ -417,6 +418,9 @@ else:
 
 
 class TimedResult(TimedResultBase):
+    shift_directory: ClassVar[Path | None] = None
+    select_shift_log: ClassVar[Callable[[str], str] | None] = None
+
     def __init__(self, stream: TestOutput, descriptions: bool, verbosity: int,
                  *, durations: int | None = None) -> None:
         super().__init__(stream, descriptions, verbosity, durations=durations)
@@ -426,6 +430,8 @@ class TimedResult(TimedResultBase):
         self.test_labels: dict[str, str] = {}
         self.cpu_times: dict[str, float] = {}
         self.test_cpu_started: float = 0.0
+        self.shift_log: Path | None = None
+        self.previous_shift_log: str = ""
 
     @override
     def startTest(self, test: unittest.TestCase) -> None:
@@ -433,12 +439,24 @@ class TimedResult(TimedResultBase):
         self.open_test = OpenTest(test.id())
         self.test_labels[test.id()] = test.id().removeprefix(type(test).__module__ + ".")
         super().startTest(test)
+        select_log = TimedResult.select_shift_log
+        if self.shift_directory is not None and select_log is not None:
+            self.shift_log = self.shift_directory / f"shift-{self.testsRun}"
+            self.previous_shift_log = select_log(str(self.shift_log))
 
     @override
     def stopTest(self, test: unittest.TestCase) -> None:
         self.cpu_times[test.id()] = cpu_seconds() - self.test_cpu_started
-        super().stopTest(test)
-        self.open_test = NoOpenTest()
+        try:
+            super().stopTest(test)
+        finally:
+            self.open_test = NoOpenTest()
+            select_log = TimedResult.select_shift_log
+            if self.shift_log is not None and select_log is not None:
+                _ = select_log(self.previous_shift_log)
+                failed = self.outcomes.get(test.id()) in ("fail", "error", "unexpected_success")
+                finish_shift_log(self.shift_log, test.id(), self.stream.writeln, failed=failed)
+                self.shift_log = None
 
     def record_outcome(self, test: unittest.TestCase, status: TestStatus) -> None:
         if isinstance(self.open_test, OpenTest):
@@ -540,6 +558,78 @@ def test_times(result: TimedResult) -> list[TestTime]:
     return rows
 
 
+def finish_shift_log(log: Path, label: str, write: Callable[[str], None], *, failed: bool) -> None:
+    """Print the distinct shifted reads only when the call fails."""
+    try:
+        if failed and log.is_file():
+            reads = sorted(set(log.read_text(encoding="utf-8").splitlines()))
+            if reads:
+                write(f"Shifted configuration reads for {label}")
+                for read in reads:
+                    write(f"  {read}")
+    except (OSError, UnicodeError):
+        pass
+    finally:
+        try:
+            log.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def trace_fixture_shifts(name: str, index: int) -> Generator[None]:
+    """Give each unittest setup call its own shift read log."""
+    directory, select_log = TimedResult.shift_directory, TimedResult.select_shift_log
+    if directory is None or select_log is None or not name.startswith(("setUpModule (", "setUpClass (")):
+        yield
+        return
+    log = directory / f"shift-fixture-{index}"
+    previous = select_log(str(log))
+    failed = False
+    try:
+        yield
+    except unittest.SkipTest:
+        raise
+    except Exception:
+        failed = True
+        raise
+    finally:
+        _ = select_log(previous)
+        finish_shift_log(log, name, lambda line: print(line, file=sys.stderr), failed=failed)
+
+
+@contextmanager
+def preserve_child_shift_log(shift_environment: Callable[[], dict[str, str]]) -> Generator[None]:
+    """Pass the active read log through subprocess environment replacements."""
+    popen = subprocess.Popen
+    initialize = cast(Callable[..., None], popen.__init__)
+    parameters = tuple(signature(initialize).parameters)
+    env_index = parameters.index("env") - 1
+
+    @wraps(initialize)
+    def launch(process: object, *arguments: object, **options: object) -> None:
+        if additions := shift_environment():
+            positional = len(arguments) > env_index
+            supplied = arguments[env_index] if positional else options.get("env")
+            if supplied is not None or any(os.environ.get(key) != value for key, value in additions.items()):
+                inherited = os.environ if supplied is None else supplied
+                environment = dict(cast(Mapping[str | bytes, str | bytes], inherited))
+                for key, value in additions.items():
+                    _ = environment.pop(os.fsencode(key), None)
+                    environment[key] = value
+                if positional:
+                    arguments = (*arguments[:env_index], environment, *arguments[env_index + 1:])
+                else:
+                    options["env"] = environment
+        initialize(process, *arguments, **options)
+
+    setattr(popen, "__init__", launch)
+    try:
+        yield
+    finally:
+        setattr(popen, "__init__", initialize)
+
+
 @contextmanager
 def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
                      ) -> Generator[list[FixtureMeasure], None, None]:
@@ -561,7 +651,8 @@ def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
             cpu = cpu_seconds()
             started = time.perf_counter()
             try:
-                return function()
+                with trace_fixture_shifts(name, len(rows)):
+                    return function()
             finally:
                 depth -= 1
                 rows.append({"kind": "fixture", "test": name,
@@ -786,7 +877,9 @@ def main(owner: RunnerFolderOwner, run_root: Path) -> None:
                      else cleanup.enter_context(runner_folder(owner, "config-reads")))
         log = temporary / "reads"
         log.touch()
-        with conf_reads.record_reads(log):
+        TimedResult.shift_directory = log.parent
+        TimedResult.select_shift_log = conf_reads.set_shift_read_log
+        with conf_reads.record_reads(log), preserve_child_shift_log(conf_reads.shift_child_environment):
             run_module(log, run_root, violation_log)
 
 

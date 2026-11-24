@@ -10,7 +10,6 @@ import shlex
 import subprocess
 import sys
 
-from scripts.lib import conf
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, startup_pythonpath
 
 
@@ -46,19 +45,22 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
 
 
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
-    """Copy missing runtime files and keep the fixture's existing tools.
+    """Copy missing runtime files and keep the fixture's existing tools."""
+    from scripts.lint.memory_test_support import copy_config_file_fixture
 
-    The config files take their values from the test-owned copies.
-    """
     for relative in runtime_files():
-        if relative.parts[0] == "config" or not configuration and relative.parts[0] == "test_config":
+        if not configuration and relative.parts[0] in {"config", "test_config"}:
             continue
         destination = checkout / relative
-        if not destination.exists():
+        if not os.path.lexists(destination):
             destination.parent.mkdir(parents=True, exist_ok=True)
-            copy_with_bytecode(SOURCE / relative, destination)
-    if configuration:
-        _ = conf.copy_for_test(SOURCE / "config", checkout / "config")
+            source = SOURCE / relative
+            if relative.parts[0] == "config" and source.is_symlink():
+                destination.symlink_to(source.readlink(), target_is_directory=source.is_dir())
+            elif len(relative.parts) == 2 and relative.parts[0] == "config" and relative.suffix == ".conf":
+                _ = copy_config_file_fixture(source, destination)
+            else:
+                copy_with_bytecode(source, destination)
 
 
 def copy_startup(checkout: Path) -> None:

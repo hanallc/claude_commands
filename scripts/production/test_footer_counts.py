@@ -1,6 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.agents import remote
 
 import contextlib
@@ -14,7 +15,6 @@ from typing import cast, final, override
 from unittest import mock
 
 
-from scripts.lib import conf
 from scripts.production import change_review
 from scripts.production import footer_counts
 from scripts.production import next_item
@@ -93,8 +93,11 @@ class FooterCountsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.root / ".claude/config"
+        for name in ("change_review", "review_links"):
+            _ = write_config_fixture(config / f"{name}.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN})))
+            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN, "CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
         _ = self.enterContext(isolated_source_readers())
@@ -415,8 +418,8 @@ class FooterCountsTests(unittest.TestCase):
 
         config = self.root / "config"
         config.mkdir()
-        source = conf.test_config_path("change_review")
-        _ = (config / "change_review.conf").write_text(source.read_text())
+        source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        _ = copy_config_file_fixture(source, config / "change_review.conf")
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         listing = self.root / "change-review - top.md"

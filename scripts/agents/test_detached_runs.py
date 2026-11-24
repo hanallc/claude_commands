@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 
 import contextlib
 import fcntl
@@ -114,8 +114,8 @@ class DetachedRunsTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         for name in ("detached_runs", "send", "postmaster", "codex_daemon", "direct", "shutdown"):
-            _ = (config / f"{name}.conf").write_text(
-                conf.test_config_path(name).read_text())
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{name}.conf",
+                                         config / f"{name}.conf")
         self.stack.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
@@ -3076,9 +3076,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.defer_transcript = False
         self.pending_transcripts = []
         config = self.fixture.root / "conf"
-        for name in ("detached_runs", "send", "postmaster", "codex_daemon", "shutdown"):
-            write_text_atomic(config / f"{name}.conf",
-                              conf.test_config_path(name).read_text())
+        _ = write_config_fixture(config / "detached_runs.conf",
+                                 "RESULT_PUSH_RETRIES=3\nRESULT_PUSH_RETRY_SECONDS=5\n")
+        for name in ("send", "postmaster", "codex_daemon", "shutdown"):
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{name}.conf",
+                                         config / f"{name}.conf")
         for name, keys in (("send", {"delivery_timeout", "kill_grace", "remote_transport_seconds",
                                      "waits_review_seconds", "caller_margin_seconds"}),
                            ("postmaster", {"wait_seconds", "claim_grace_seconds", "poll_seconds"}),

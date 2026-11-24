@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_fixture
 from scripts.lib.checkout_test_support import python_tool_source
 
 import io
@@ -21,7 +22,6 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.notify import push_texts, silence
-from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
@@ -76,7 +76,7 @@ class SilenceTests(unittest.TestCase):
     def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         checkout = Path(__file__).resolve().parents[2]
-        _ = conf.copy_for_test(checkout / "config", root / "config")
+        _ = copy_config_fixture(checkout / "config", root / "config")
         keys = root / "keys"
         _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
         posted = root / "posted.jsonl"

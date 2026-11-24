@@ -1,13 +1,18 @@
 """Private memory readings for tests that use the admission gate."""
 from __future__ import annotations
 
+from decimal import Decimal, DecimalException
+from enum import Enum
+import math
 import os
-from functools import cache
+import re
+import shutil
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.lib.fixture_test_support import FIXTURE_OWNER
 
 if TYPE_CHECKING:
@@ -21,7 +26,7 @@ ADMISSION_CONFIG_FIXTURE = Path(__file__).with_name("fixtures") / "build_admissi
 
 @cache
 def admission_configuration_fixture() -> MemoryConfig:
-    """Read the fixed test settings with the original configuration reader."""
+    """Read the explicit fixture settings without using the committed template."""
     from unittest.mock import patch
 
     from scripts.build_queue.admission_records import read_memory_config
@@ -45,43 +50,359 @@ UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
 UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge the template, existing settings, and explicit overrides in that order.
+# Give real fixture commands short deadlines.
+# A test that exercises a deadline sets its own value.
+TEST_CONFIG_DEFAULTS = {
+    "accounts.conf": (
+        "quota_relay_timeout_seconds=30\n"
+        "quota_edit_timeout_seconds=30\n"
+        "account_command_timeout_seconds=15\n"
+        "claude_usage_timeout_seconds=15\n"
+        "codex_close_timeout_seconds=3\n"
+        "codex_version_timeout_seconds=15\n"
+        "codex_update_timeout_seconds=30\n"
+        "login_probe_timeout_seconds=30\n"
+        "role_map_timeout_seconds=20\n"
+        "login_peer_read_timeout_seconds=30\n"
+    ),
+    "aws_target.conf": (
+        "gpu_size_trial_preflight_timeout_s=30\n"
+        "notification_timeout_s=30\n"
+        "aws_timeout_s=30\n"
+        "snapshot_notification_timeout_s=30\n"
+        "deployment_timeout_s=30\n"
+        "stack_wait_timeout_s=30\n"
+        "box_setup_timeout_s=60\n"
+    ),
+    "build_admission.conf": (
+        "min_pass_gap_seconds=0\n"
+        "running_pass_seconds=5\n"
+        "waiting_pass_seconds=1\n"
+        "wait_reply_seconds=30\n"
+        "query_timeout_seconds=0.5\n"
+        "reconnect_seconds=2\n"
+        "silence_seconds=30\n"
+        "source_check_seconds=1\n"
+        "source_settle_seconds=2\n"
+    ),
+    "build_folders.conf": (
+        "slots.wait_seconds=30\n"
+        "locks.probe_wait_seconds=0.25\n"
+        "locks.probe_retry_seconds=0.005\n"
+    ),
+    "build_targets.conf": (
+        "hold_sender_timeout_seconds=30\n"
+        "sync.connect_timeout_s=10\n"
+        "sync.reach_timeout_s=30\n"
+        "sync.rsync_timeout_s=60\n"
+        "vault.lock_retries=5\n"
+        "vault.lock_retry_delay_s=1\n"
+        "loopback.command_timeout_s=60\n"
+        "loopback.shell_timeout_s=30\n"
+    ),
+    "buildlog.conf": "INDEX_READ_WAIT_SECONDS=1\n",
+    "cloud_gate.conf": (
+        "gpu_setup_dry_run_retry_timeout_s=30\n"
+        "gpu_setup_dry_run_retry_interval_s=5\n"
+        "spot_price_live_read_timeout_s=3\n"
+        "git_network_timeout_s=30\n"
+        "api_timeout_s=30\n"
+        "termination_timeout_s=30\n"
+        "expiry_timeout_s=30\n"
+        "module_time_limit_s=60\n"
+        "gpu_size_trial_result_poll_s=10\n"
+        "result_poll_s=2\n"
+    ),
+    "codex_daemon.conf": (
+        "timeout_seconds=5.0\n"
+        "queue_timeout_seconds=30\n"
+    ),
+    "copies.conf": (
+        "git_timeout_seconds=30\n"
+        "guard_timeout_seconds=10\n"
+    ),
+    "dev_shell.conf": "timeout_s=30\n",
+    "direct.conf": (
+        "CLAUDE_WORKER_REGISTER_WAIT_SECS=30\n"
+        "WORKER_FIRST_TURN_SECONDS=30\n"
+        "WORKER_SETTLE_SECONDS=30\n"
+        "WORKER_COMPACT_SECONDS=30\n"
+        "PANE_AGENT_START_SECONDS=30\n"
+        "WORKER_PUBLISH_LOCK_SECONDS=15\n"
+    ),
+    "disks.conf": "measure.timeout_seconds=30\n",
+    "fast_track.conf": (
+        "check_time_limit_seconds=30\n"
+        "fetch_lock_wait_seconds=0.5\n"
+    ),
+    "hana_aws.conf": (
+        "guard_grace_seconds=30\n"
+        "mount_timeout_seconds=15\n"
+        "stop_poll_seconds=10\n"
+        "control_poll_seconds=1\n"
+        "start_timeout_seconds=30\n"
+        "controller_tick_timeout_s=30\n"
+        "aws_timeout_s=10\n"
+        "stop_wait_timeout_s=30\n"
+        "setup_idle_wait_timeout_s=30\n"
+        "intent_lookup_timeout_s=30\n"
+        "image_upload_timeout_s=60\n"
+        "image_wait_interval_s=10\n"
+        "source_download_timeout_s=30\n"
+        "source_upload_timeout_s=30\n"
+        "result_transfer_timeout_s=30\n"
+        "source_git_timeout_s=30\n"
+    ),
+    "hana_instances.conf": "stop_grace_seconds=5\n",
+    "hana_shot.conf": (
+        "call_timeout_seconds=10.0\n"
+        "capture_timeout_seconds=30.0\n"
+        "copy_timeout_seconds=30.0\n"
+        "git_timeout_seconds=5\n"
+        "signal_grace_seconds=2\n"
+        "setup_seconds=5.0\n"
+        "ready_seconds=30.0\n"
+        "warm_seconds=30.0\n"
+        "git_status_seconds=3\n"
+        "port_probe_seconds=0.5\n"
+        "poll_seconds=0.1\n"
+        "shutdown_call_seconds=5\n"
+        "shutdown_seconds=20\n"
+    ),
+    "issue_score.conf": "request_timeout=30\n",
+    "lint.conf": (
+        "sweep_sender_timeout_seconds=30\n"
+        "sweep_history_timeout_seconds=30\n"
+    ),
+    "live_settings.conf": "mac_wake_probe_seconds=5\n",
+    "mac_gate.conf": (
+        "placement_check_timeout_seconds=10\n"
+        "placement_recheck_seconds=15\n"
+        "terminate_grace_seconds=3\n"
+    ),
+    "mac_test.conf": (
+        "connect_timeout_s=6\n"
+        "probe_timeout_s=15\n"
+        "floor_sweep_timeout_s=30\n"
+        "gh_timeout_s=30\n"
+        "leftover_timeout_s=10\n"
+        "send_timeout_s=30\n"
+        "claim_poll_seconds=5\n"
+    ),
+    "merge_checkpoint.conf": "MAC_PULL_RETRY_SECONDS=2\n",
+    "nix_env.conf": (
+        "command_timeout_seconds=30\n"
+        "alert_timeout_seconds=30\n"
+    ),
+    "notify.conf": "REVIEW_TIMEOUT_SECONDS=30\n",
+    "postmaster.conf": (
+        "wait_seconds=3.0\n"
+        "claim_grace_seconds=15.0\n"
+        "poll_seconds=0.05\n"
+    ),
+    "production.conf": (
+        "RETIRE_TERM_WAIT_SECONDS=10\n"
+        "RETIRE_COMMAND_TIMEOUT_SECONDS=30\n"
+        "mac_run_example_seconds=20\n"
+        "mac_run_status_grace_seconds=30\n"
+        "mac_run_poll_seconds=1\n"
+        "smoke_ready_seconds=30\n"
+        "smoke_exit_seconds=30\n"
+        "smoke_connect_seconds=1\n"
+        "smoke_call_seconds=5\n"
+        "smoke_signal_grace_seconds=2\n"
+        "smoke_poll_seconds=1\n"
+        "RENAME_LIVE_WAIT_SECONDS=30\n"
+        "RENAME_RUN_STOP_WAIT_SECONDS=30\n"
+        "RENAME_POLL_SECONDS=1\n"
+        "RENAME_COMMAND_TIMEOUT_SECONDS=30\n"
+        "units_census_seconds=10\n"
+        "units_table_width_read_milliseconds=50\n"
+    ),
+    "rca.conf": "send_seconds=30\n",
+    "review_links.conf": (
+        "page_request_timeout_seconds=15\n"
+        "tailscale_timeout_seconds=10\n"
+    ),
+    "scratch.conf": "removal_remote_timeout_seconds=30\n",
+    "send.conf": (
+        "waits_review_seconds=30\n"
+        "delivery_timeout=30\n"
+        "kill_grace=10\n"
+        "user_cancel_timeout=30\n"
+        "check_timeout=20\n"
+        "caller_margin_seconds=15\n"
+        "remote_transport_seconds=30\n"
+    ),
+    "send_repeat_guard.conf": (
+        "notice_timeout_seconds=15\n"
+        "drain_timeout_seconds=30\n"
+    ),
+    "shutdown.conf": (
+        "STOP_GRACE_SECONDS=2\n"
+        "KILL_GRACE_SECONDS=5\n"
+        "MOVE_STOP_MARGIN_SECONDS=3\n"
+        "START_SECONDS=20\n"
+        "OPENING_PROMPT_SECONDS=30\n"
+        "STAY_SECONDS=10\n"
+        "OWN_PANE_SHELL_SECONDS=30\n"
+        "RESUME_CHECK_SECONDS=30\n"
+        "RESUME_CHECK_INTERVAL_SECONDS=5\n"
+    ),
+    "stall_watch.conf": (
+        "sender_batch_seconds=30\n"
+        "sender_cleanup_seconds=2\n"
+        "delivery_reserve_seconds=10\n"
+    ),
+    "statusline.conf": "rebuild.eval_timeout=30\n",
+    "test_times.conf": (
+        "MODULE_COST_STAGE_TIMEOUT_S=60\n"
+        "MODULE_COST_LEFTOVER_S=2\n"
+    ),
+}
 
-    Keep each setting's explicit limit.
-    """
-    source = _template(f"{template}.conf" if template else path.name)
-    lines = source.read_text().splitlines() if source.exists() else []
-    existing = path.read_text() if path.exists() else ""
+
+def shifted_number(setting: conf.Setting) -> str:
+    directive, _, bounds = setting.limit.partition(":")
+    low_text, separator, high_text = bounds.strip().partition("..")
+    if not separator or directive not in ("# whole", "# range"):
+        return setting.value
+    try:
+        if directive == "# whole":
+            if any(re.fullmatch(r"[+-]?[0-9]+", text.strip()) is None
+                   for text in (setting.value, low_text, high_text) if text.strip()):
+                return setting.value
+            whole = int(setting.value)
+            low_whole = int(low_text) if low_text.strip() else None
+            high_whole = int(high_text) if high_text.strip() else None
+            if ((low_whole is not None and whole < low_whole)
+                    or (high_whole is not None and whole > high_whole)):
+                return setting.value
+            if high_whole is None or whole < high_whole:
+                return str(whole + 1)
+            return str(whole - 1) if low_whole is None or whole > low_whole else setting.value
+
+        number = conf.decimal(setting.value)
+        low = conf.decimal(low_text) if low_text.strip() else None
+        high = conf.decimal(high_text) if high_text.strip() else None
+
+        def usable(candidate: Decimal) -> bool:
+            return (math.isfinite(float(candidate)) and float(candidate) != float(number)
+                    and (low is None or candidate >= low) and (high is None or candidate <= high))
+
+        if (low is not None and number < low) or (high is not None and number > high):
+            return setting.value
+        step = abs(number) / 4 if number else Decimal(1)
+        preferred = number * Decimal("1.25") if number else step
+        if usable(preferred):
+            return str(preferred)
+        toward_low = (low + number) / 2 if low is not None else number - step
+        if usable(toward_low):
+            return str(toward_low)
+        if high is not None:
+            toward_high = (high + number) / 2
+            if usable(toward_high):
+                return str(toward_high)
+        for endpoint in (low, high):
+            if endpoint is not None and usable(endpoint):
+                return str(endpoint)
+        for direction in (-math.inf, math.inf):
+            adjacent = math.nextafter(float(number), direction)
+            if not math.isfinite(adjacent):
+                continue
+            candidate = Decimal.from_float(adjacent)
+            if usable(candidate):
+                return str(candidate)
+        return setting.value
+    except (DecimalException, ValueError):
+        return setting.value
+
+
+@lru_cache(maxsize=128)
+def shifted_config_lines(source: str) -> tuple[str, ...]:
+    """Shift the committed values and mark their original values."""
+    lines = source.splitlines()
+    marked_lines = {shift.line for shift in conf_reads.shifted_values(source)}
+    changes = {setting.line: (setting, shifted_number(setting))
+               for setting in conf.settings(source).values() if setting.line not in marked_lines}
+    result: list[str] = []
+    for index, line in enumerate(lines):
+        change = changes.get(index)
+        if change is not None:
+            setting, value = change
+            if value != setting.value:
+                result.insert(len(result) - 1, f"{conf_reads.SHIFT_MARK}{setting.value} {value}")
+                prefix, separator, suffix = line.partition("=")
+                start = len(suffix) - len(suffix.lstrip())
+                line = prefix + separator + suffix[:start] + value + suffix[start + len(setting.value):]
+        result.append(line)
+    return tuple(result)
+
+
+def fixture_config_lines(source: Path, existing: str, overrides: str) -> list[str]:
+    """Shift inherited settings and keep explicit fixture settings."""
+    text = source.read_text() if source.exists() else ""
+    explicit = source == ADMISSION_CONFIG_FIXTURE
+    lines = text.splitlines() if explicit else list(shifted_config_lines(text))
+    defaults = "" if explicit else TEST_CONFIG_DEFAULTS.get(source.name, "")
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (existing, overrides):
-        previous = ""
+    for layer, keep_shifts in ((defaults, False), (existing, True), (overrides, False)):
+        previous = before_limit = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
-            previous = raw.strip()
+            mark = before_limit if keep_shifts and limit else ""
+            before_limit, previous = previous, raw.strip()
             key, separator, value = raw.partition("=")
             if not separator or key.lstrip().startswith("#"):
                 continue
+            key = key.strip()
+            if mark and not conf_reads.shifted_original(mark, re.split(r"\s+#", value, maxsplit=1)[0].strip()):
+                mark = ""
             for index, line in enumerate(lines):
-                if line.partition("=")[0].strip() == key.strip():
-                    lines[index] = f"{key.strip()}={value}"
-                    if limit:
-                        if index and lines[index - 1].strip().startswith(limit_prefixes):
-                            lines[index - 1] = limit
-                        else:
-                            lines.insert(index, limit)
+                if line.partition("=")[0].strip() == key:
+                    start = index
+                    if index and lines[index - 1].strip().startswith(limit_prefixes):
+                        start -= 1
+                        limit = limit or lines[start]
+                        if start and lines[start - 1].startswith(conf_reads.SHIFT_MARK):
+                            start -= 1
+                    lines[start:index + 1] = [part for part in (mark, limit, f"{key}={value}") if part]
                     break
             else:
-                if limit:
-                    lines.append(limit)
-                lines.append(raw)
+                lines.extend(part for part in (mark, limit, raw) if part)
+    return lines
+
+
+def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
+    """Write the merged configuration to the private fixture path."""
+    source = _template(f"{template}.conf" if template else path.name)
+    existing = path.read_text() if path.exists() else ""
+    lines = fixture_config_lines(source, existing, overrides)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def copy_config_file_fixture(source: Path, destination: Path) -> Path:
+    """Copy one committed config with its inherited numeric values shifted."""
+    if source.name in TEST_CONFIG_DEFAULTS:
+        contents = "\n".join(fixture_config_lines(source, "", "")) + "\n"
+    else:
+        text = source.read_text(encoding="utf-8")
+        lines = shifted_config_lines(text)
+        contents = text if lines == tuple(text.splitlines()) else "\n".join(lines) + "\n"
+    _ = destination.write_text(contents, encoding="utf-8")
+    return destination
+
+
 def copy_config_fixture(source: Path, destination: Path) -> Path:
-    """Copy a configuration folder into a private fixture with the test-owned values."""
-    return conf.copy_for_test(source, destination)
+    """Copy the committed configuration folder into a private fixture."""
+    def copy(name: str, target: str) -> str:
+        template = Path(name)
+        if template.parent == source and template.suffix == ".conf":
+            return str(copy_config_file_fixture(template, Path(target)))
+        return shutil.copy2(name, target)
+
+    return Path(shutil.copytree(source, destination, symlinks=True, copy_function=copy))
 
 
 def write_config_fault(path: Path, source: str) -> int:
@@ -135,16 +456,26 @@ def commit_config_fixture(path: Path) -> None:
                            capture_output=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
 
 
-def config_environment(root: Path) -> dict[str, str]:
-    """Give subprocess fixtures their own complete configuration folder."""
+class FixtureConfigValues(Enum):
+    """Choose test settings or the exact committed configuration bytes."""
+
+    SHIFTED = "shift inherited values"
+    EXACT = "copy committed bytes"
+
+
+def config_environment(root: Path, *, values: FixtureConfigValues = FixtureConfigValues.SHIFTED) -> dict[str, str]:
+    """Give subprocess fixtures a configuration folder with the requested values."""
     folder = root
-    names = {source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf")}
+    names = {source.name for source in _template("build_targets.conf").parent.glob("*.conf")}
     names.add(ADMISSION_CONFIG_FIXTURE.name)
     for name in sorted(names):
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes(_template(name).read_bytes())
+            if values is FixtureConfigValues.EXACT:
+                _ = shutil.copyfile(_template(name), destination)
+            else:
+                _ = copy_config_file_fixture(_template(name), destination)
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 

@@ -70,7 +70,8 @@ def configuration() -> Limits | GuardUnavailable:
     path = Path(os.environ["SEND_REPEAT_CONFIG"]) if "SEND_REPEAT_CONFIG" in os.environ else conf.path("send_repeat_guard")
     try:
         values: dict[str, int] = {}
-        for line in conf_reads.read_text(path).splitlines():
+        contents = conf_reads.read_text(path)
+        for line in contents.splitlines():
             line = line.split("#", 1)[0].strip()
             if not line:
                 continue
@@ -82,6 +83,9 @@ def configuration() -> Limits | GuardUnavailable:
             raise ValueError("all configured limits must be positive integers")
         if values["repeat_count"] < 3:
             raise ValueError("repeat_count must allow the first two copies")
+        for key, origin in conf_reads.shift_origins(path, contents).items():
+            if key in values and origin.shift.value == str(values[key]):
+                origin.record()
         return Limits(**values)
     except (OSError, ValueError, TypeError) as error:
         reason = f"{path}: {error}"
