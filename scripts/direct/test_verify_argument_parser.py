@@ -11,6 +11,22 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyArgumentParserTests(unittest.TestCase):
+    def test_verify_refuses_an_invalid_verb_list_before_setup(self) -> None:
+        script = Path(__file__).with_name("verify.sh")
+        cases = (("test,unknown",), ("test,build",), ("test,",), ("test,,doc",),
+                 ("test,lint", "--test", "one"))
+        with tempfile.TemporaryDirectory() as directory:
+            for words in cases:
+                with self.subTest(words=words):
+                    result = subprocess.run(["bash", str(script), *words], cwd=directory,
+                                            env=verify_test_environment(), capture_output=True, text=True,
+                                            timeout=TEST_HANG_GUARD_SECS, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    message, = result.stderr.splitlines()
+                    self.assertIn("verb list", message)
+                    self.assertIn("test, lint, doc", message)
+
     def test_parser_accepts_routing_flags_and_refuses_a_missing_reason(self) -> None:
         script = shell_functions(Path(__file__).with_name("verify.sh"), "parse_routing_arguments") + '''
 CMD=test
