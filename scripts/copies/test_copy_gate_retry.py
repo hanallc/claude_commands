@@ -152,7 +152,7 @@ class CopyGateRetryTests(unittest.TestCase):
 
         self.assertEqual(status, 7, errors)
         self.assertEqual(self.runs.read_text().splitlines(), ["guest-attempt", "local-attempt"])
-        retry = "placement: retry — fixture-guest (mac-linux) did not answer. Requesting placement again.\n"
+        retry = "placement: retry — fixture-guest (mac-linux) did not answer. Received a replacement assignment.\n"
         self.assertEqual(output, b"guest-attempt stdout\xff\n" + retry.encode("utf-8") + b"local-attempt stdout\xff\n")
         self.assertEqual(errors, b"guest-attempt stderr\xfe\nlocal-attempt stderr\xfe\n")
 

@@ -17,7 +17,7 @@ from scripts.build_targets.execution_transport import (
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 
 
 Platform = Literal["linux", "macos"]
@@ -199,11 +199,38 @@ def ssh_target_state_directory(target: str) -> Path:
     """Return the state path without requiring target registration."""
     require_target_name(target)
     if target != "mac":
-        configured_root = os.environ.get("BUILD_TARGETS_STATE_DIR")
-        root = Path(configured_root).expanduser() if configured_root else Path.home() / ".local/state/build-targets"
-        return root / target
+        return build_targets_state_root() / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
     return Path(configured).expanduser()
+
+
+def build_targets_state_root() -> Path:
+    """Return the shared state root for SSH build targets."""
+    configured = os.environ.get("BUILD_TARGETS_STATE_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+
+
+def provision_mac_linux_state_root(root: Path) -> None:
+    """Create the root and sync each directory entry up to home or the filesystem root."""
+    root = root.absolute()
+    home = Path.home().absolute()
+    boundary = home if root.is_relative_to(home) else Path(root.anchor)
+    folders = (root, *root.parents)
+    for folder in reversed(folders[:folders.index(boundary)]):
+        if folder.is_symlink():
+            raise OSError(f"The Mac Linux state root path {folder} is a symbolic link. Use a real directory")
+    for folder in reversed(folders):
+        if not folder.is_dir():
+            folder.mkdir(exist_ok=True)
+    for folder in folders:
+        if folder == boundary:
+            break
+        atomic_file.sync_folder(folder.parent)
+
+
+def mac_linux_end_proof_journal() -> Path:
+    """Return the journal for guest launch and end proof."""
+    return ssh_target_state_directory("mac-linux") / "end-proofs.jsonl"
 
 
 def uses_legacy_mac_layout(platform: Platform) -> bool:

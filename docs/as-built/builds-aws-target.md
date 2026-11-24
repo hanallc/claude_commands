@@ -362,7 +362,10 @@ An older observation cannot close a newer permit or replace a later running obse
 The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
-The existing `cost-ledger.json` version remains 1.
+The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
+Drain old gate workers and upgrade ledger users before the first version 2 write.
+After that write, a code-only rollback to version 1 makes old reconcile code refuse the ledger.
+Keep version 2 support in all rollbacks.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
@@ -895,25 +898,17 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-The canonical `scripts/production/gate.py` can run suites on an AWS queue assignment.
-The queue offers AWS only when the target registry lists an enabled scaler.
+A direct gate uses natedev or `mac-linux`.
+The prepared copy wrapper can pass an AWS assignment to the gate.
+The queue offers AWS only when both the registry and the scaler settings enable it.
 The live registry has no AWS scaler entry.
-Keep the AWS machine off until `awsfix` is on main.
-
-The item 291 closure review found seven defects.
-
-1. A pending launch can block its own cleanup by using the last slot or the remaining budget.
-2. Assigned reconciliation can use the caller's AWS account.
-3. Placement can miss a booking during journal closure, and the worker can use different booking terms.
-4. The `{tree}` placeholder can prevent AWS admission for a canonical gate.
-5. An isolated launcher in another checkout can lose the gate job identity.
-6. A repeat can lose a saved verdict and reset the retry count.
-7. The Builds page omits current assigned AWS gates.
 
 The queue checks slot availability and daily spending room before it grants AWS.
 The budget check counts each current grant until the worker records its booking.
 The queue reads the registry again when it returns an unused grant or consumes launch permission.
-Nightly, named modules, and promotion without tests use their existing targets.
+Prepared copies can run nightly suites and named modules on AWS.
+Promotion without tests uses natedev.
+When a passing AWS gate requests type checks, natedev runs those checks.
 A gate without an assignment runs its tests on natedev.
 An AWS assignment occupies one slot under `cloud_gate_slots`.
 The route checks `enabled` in `cloud_gate.conf` before it reads deployment state.
@@ -954,9 +949,25 @@ The worker confirms cleanup of the interrupted box and reservation before the re
 The final fallback row includes the interruption count when retries or capacity choices end.
 An assigned gate exits 79 when the journal confirms no launch.
 It exits 80 if a launch remains possible and no test verdict is available.
-The gate requests no other target in either case.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
+The route reports pending settlement to the queue while the launch remains uncertain.
+The stop cleanup looks up an unknown instance by client token.
+Cleanup accepts a saved termination for the same booking, region, and set of instances.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
+The queue reads settlement for the exact claim from its dispatch journal.
+The queue also checks deployment and Spot quota evidence from local files.
+The worker checks the current spending caps before each fresh assigned launch.
+A wrapper that owns the placement can request settlement after status 80.
+It keeps the episode for a replacement when the journal confirms no launch.
+The wrapper preserves status 80 if the settlement request or replacement fails.
+When cleanup is due, the queue requests the reconcile service for an expired booking in the journal.
+The service uses the ledger directory and account settings from the assignment.
+The request returns before reconciliation completes.
+The queue prints one warning per attempt if the service cannot start.
+The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -1003,6 +1014,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
+The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -1428,8 +1440,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.
