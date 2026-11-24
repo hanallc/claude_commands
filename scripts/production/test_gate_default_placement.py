@@ -445,6 +445,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
                 from scripts.aws_target import cloud_gate
                 from scripts.build_queue import admission_client, admission_records, admission_wire as wire, first_step, placement
+                from scripts.buildlog import treekey
                 from scripts.production import gate
                 from scripts.production.test_gate_default_placement import placed
 
@@ -461,6 +462,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     saved, placement.CurrentAssignment(), placement.NoProviderClaim()))
                 result = gate.GateRun((), 1, 0, tests_reused=True)
                 with (mock.patch.object(admission_client, "placement_status", return_value=status) as check,
+                      mock.patch.object(treekey, "tree_key", return_value="fixture-source") as source,
                       mock.patch.object(first_step, "admitted_run") as admit,
                       mock.patch.object(gate.scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
@@ -471,6 +473,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       redirect_stderr(StringIO()) as errors):
                     assert gate.main(["--tests-only"]) == 0, errors.getvalue()
                 check.assert_called_once_with(saved.episode, saved.attempt)
+                source.assert_called_once_with(str(Path.cwd()))
                 admit.assert_not_called()
                 local.assert_not_called()
                 aws.assert_called_once()
