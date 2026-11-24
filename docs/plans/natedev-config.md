@@ -620,6 +620,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 11: a read in a hook, alert, notice, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
 - Phase 11: the controller's `GuestSettings` (`scripts/build_targets/mac_linux.py` `read_settings`) owns `ssh.connect_attempts`; the candidate commit owns `gate.conf`. `runner_commit` (`mac_linux.py:345`) refuses an uncommitted change under `scripts/`, so the hand-made Mac Linux guest tests run only on a committed tree.
 - Phase 12: a limit that guards saved or accepted work reads `conf.read(stem).whole_upper_bound(key)`, the upper bound of the key's `# whole:` limit line, so a lower value never makes saved work fail. A new request reads the live value. Form: `scripts/review_links/new_item_dialog.py` `read_new_item_limits`.
+- Phase 19: `conf.read` of a `.conf` path in the live config folder reads as its stem, so a new key read by that path recovers from the repository before it is on main. A path outside the live folder does not.
 
 **Acceptance gate:**
 - Each changed module's tests pass, and each test module with a changed reference passes.
@@ -782,3 +783,45 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Ruled out:**
 - A sender limit check before silence keeps a push: the release refuses and logs a kept push with an unusable limit.
+
+### Phase 19 — Live config reads by path recover like stem reads  · status: done
+**Depends on:** Phase 11
+
+#### Work Order
+
+**Goal:** A `conf.read` of a `.conf` path in the live config folder recovers a missing file or key from the repository, like a read of its stem, so the Mac Linux route reads `ssh.connect_attempts` before the key is on main.
+
+**Spec:**
+
+1. **The failure.** The merge gate run of this branch failed on mac-linux: `/home/natepiano/.claude/config/mac_linux.conf: ssh.connect_attempts='<missing>': key is missing; no usable committed value`. `eligibility.mac_linux_target` (`scripts/mac_test/eligibility.py:248`) gives the settings as `registry.source.parent / settings`, a `Path`. `mac_linux.read_settings` (`scripts/build_targets/mac_linux.py:205`) calls `conf.read(<Path>)`. `ConfigRead._resolve_setting` and `_recover_file` use the repository file only when `self.file` is a `str` (`scripts/lib/conf.py:244`, `:363`). The live file and its Git history are main, which does not have the key yet. The same read of the stem, `conf.read("mac_linux").whole("ssh.connect_attempts")`, returns 3.
+2. **The fix, in `scripts/lib/conf.py`.** At the start of `read()`, a `Path` whose suffix is `.conf` and whose expanded, resolved parent is `directory().resolve()` reads as its stem (`file.stem`). Then `ConfigRead.file` is the stem, and the repository recovery and the Git recovery are the same as for a stem read. Use one small private function, for example `_live_stem(file: str | Path) -> str | Path`, with a one-line docstring.
+3. **Unchanged.** A path outside the live folder does not use the repository. A `str` stem read does not change. With `CONF_DIR` set, `directory()` is the fixture folder and the repository stays off, so fixture reads do not change. Do not change `eligibility.py` or `mac_linux.py`: the defect is in the reader.
+4. **Tests in `scripts/lib/test_conf.py`.**
+   - A path read of a live-folder file that lacks a key returns the repository value with no warning and no Git call (the form of `test_missing_live_key_uses_repository_without_changing_live_values`).
+   - A path read of an absent live-folder file returns the repository value (the form of `test_value_origin_uses_repository_for_an_absent_file`).
+   - `test_existing_invalid_key_and_explicit_missing_path_do_not_use_repository` keeps its rule for a path outside the live folder: move its explicit path to a folder that is not `directory()`. A present invalid value still raises `conf.Unusable`.
+5. **Test in `scripts/build_targets/test_mac_linux.py`.** With `CONF_DIR` unset and `HOME` in the temporary folder, `mac_linux.read_settings` reads a live `mac_linux.conf` that lacks `ssh.connect_attempts` and returns the repository value of `ssh.connect_attempts`. Patch `conf._repository_path` to a fixture file, as `test_conf.py` `setUp` does. The test never writes the live config folder.
+6. **Doc.** `config/README.md`, at the line "An absent default file or key can use the repository value when `CONF_DIR` is unset.": add one sentence that a path to a `.conf` file in that folder reads as its stem.
+7. **References.** Search `scripts/` for tests that delete `CONF_DIR` and read an explicit path in the temporary home config folder. A test that expects no repository value from such a read now gets one: report it, and change its path to a folder outside the live folder only when the test checks the outside-path rule.
+
+**Files:**
+- `scripts/lib/conf.py` — `read()` and the live stem function
+- `scripts/lib/test_conf.py` — the path recovery rows
+- `scripts/build_targets/test_mac_linux.py` — the route recovery row
+- `config/README.md` — the path rule
+
+**Workers:** 1 writer — one reader change and its tests; the files do not split.
+- `impl` — all files
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 11 added `mac_linux` `ssh.connect_attempts=3` (`whole: 1..`) and `GuestSettings.connect_attempt_limit`. The controller's `read_settings` owns the key.
+- Phase 12 added `ConfigRead.whole_upper_bound` and moved the key recovery into `_resolve_setting(key, convert, ...)`.
+- The main merge of item 149 added `_ShiftedSetting` and `write_config_fixture` shifts of inherited numeric keys with limits. A test that needs a value writes it in its own fixture.
+
+**Acceptance gate:**
+- The test rows of Spec items 4 and 5 pass as single test functions. `lib/test_conf.py` and `build_targets/test_mac_linux.py` pass in the queued run.
+- With `CONF_DIR` unset, `conf.read(Path("~/.claude/config/mac_linux.conf").expanduser()).whole("ssh.connect_attempts")` returns 3 on this worktree.
+- The queued `gate.py --affected` run passes on natedev and mac-linux, except a red that also fails on the base commit.
+- basedpyright reports zero errors and zero warnings on each changed Python file.

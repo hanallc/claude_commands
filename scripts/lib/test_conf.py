@@ -457,13 +457,16 @@ conf_reads.record('disabled')
         source.parent.mkdir(parents=True)
         contents = "# whole: 1..\nusage_stale_minutes=23\n"
         _ = source.write_text(contents)
-        self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 23)
-        with mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")):
-            self.assertEqual(conf.read("accounts").text("notes_directory"), "~/rust/hanadocs/agents")
-            origin = conf.read("accounts").origin("notes_directory", str)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+        for file in ("accounts", source):
+            with (self.subTest(file=file), redirect_stderr(io.StringIO()) as warning,
+                  mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery"))):
+                self.assertEqual(conf.read(file).whole("usage_stale_minutes"), 23)
+                self.assertEqual(conf.read(file).text("notes_directory"), "~/rust/hanadocs/agents")
+                origin = conf.read(file).origin("notes_directory", str)
+                self.assertIsInstance(origin, conf.RecoveredValue)
+                if isinstance(origin, conf.RecoveredValue):
+                    self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+                self.assertEqual(warning.getvalue(), "")
         self.assertEqual(source.read_text(), contents)
 
     def test_missing_override_key_refuses_repository_values(self) -> None:
@@ -492,17 +495,19 @@ conf_reads.record('disabled')
 
     def test_value_origin_uses_repository_for_an_absent_file(self) -> None:
         del os.environ["CONF_DIR"]
-        origin = conf.read("accounts").origin("usage_stale_minutes", int)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, 10)
+        for file in ("accounts", Path("~/.claude/config/accounts.conf")):
+            with self.subTest(file=file):
+                origin = conf.read(file).origin("usage_stale_minutes", int)
+                self.assertIsInstance(origin, conf.RecoveredValue)
+                if isinstance(origin, conf.RecoveredValue):
+                    self.assertEqual(origin.value, 10)
 
     def test_existing_invalid_key_and_explicit_missing_path_do_not_use_repository(self) -> None:
         del os.environ["CONF_DIR"]
         source = self.root / "home/.claude/config/accounts.conf"
         source.parent.mkdir(parents=True)
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
-            _ = conf.read(source).whole("usage_stale_minutes")
+            _ = conf.read(self.directory / "accounts.conf").whole("usage_stale_minutes")
         for contents in ("# whole: 1..\nusage_stale_minutes=broken\n", "# whole: 1..\nusage_stale_minutes=0\n"):
             with self.subTest(contents=contents):
                 _ = source.write_text(contents)

@@ -72,6 +72,7 @@ A comment directly above a key sets its limits: `# whole: A..B`,
 `# range: A..B` or `# one of: a, b, c`.
 
 The reader resolves a missing or invalid key when the caller uses it.
+A path to a `.conf` file in the active configuration folder recovers like its stem.
 An absent default file or key can use the repository value when `CONF_DIR` is unset.
 Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
 Recovery prefers a value that also passes the current setting's limit.

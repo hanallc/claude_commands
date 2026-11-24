@@ -1313,6 +1313,26 @@ fi
                 _ = write_config_fixture(configuration, f'ssh.connect_attempts={value}\n')
                 _ = mac_linux.read_settings(conf.read(self.registry))
 
+    def test_read_settings_recovers_the_missing_connect_attempt_limit(self) -> None:
+        home = self.root / 'home'
+        live_config = home / '.claude/config'
+        registry = live_config / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'kind.mac-linux=ssh\nplatform.mac-linux=linux\n'
+                                 + 'settings.mac-linux=mac_linux.conf\n'
+                                 + f'{target_config.UNREACHABLE_WAIT_KEY}=20\n')
+        configuration = live_config / 'mac_linux.conf'
+        _ = write_config_fixture(configuration, 'ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n'
+                                 + 'test.jobs=2\nrun.time_limit_seconds=7\nssh.connect_attempts=3\n')
+        _ = configuration.write_text(configuration.read_text().replace(
+            '# whole: 1..\nssh.connect_attempts=3\n', ''))
+        repository = self.root / 'repository-config/mac_linux.conf'
+        _ = write_config_fixture(repository, 'ssh.connect_attempts=5\n')
+        with (patch.dict(os.environ, {'HOME': str(home)}),
+              patch.object(conf, '_repository_path', return_value=repository)):
+            del os.environ['CONF_DIR']
+            settings = mac_linux.read_settings(conf.read('build_targets'))
+        self.assertEqual(settings.connect_attempt_limit, 5)
+
     def test_missing_bwrap_refuses_before_upload(self) -> None:
         binaries = self.root / 'without-bwrap'
         binaries.mkdir()

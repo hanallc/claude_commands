@@ -393,9 +393,17 @@ def read_bytes(source: Path) -> ConfigurationBytes:
         return ConfigurationBytes(stream.read(), stamp)
 
 
+def _live_stem(file: str | Path) -> str | Path:
+    """Use the stem of an active .conf path for repository recovery."""
+    if isinstance(file, Path) and file.suffix == ".conf" and file.expanduser().parent.resolve() == directory().resolve():
+        return file.stem
+    return file
+
+
 def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
+    file = _live_stem(file)
     repository_allowed = "CONF_DIR" not in os.environ
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
