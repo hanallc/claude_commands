@@ -124,7 +124,7 @@ class CloudPlace:
     group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
 
 
-def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
+def cloud_queue_time(place: CloudPlace, since: float) -> tuple[float, int, str]:
     """Use the trial start time for grouped requests."""
     if isinstance(group := place.group, CloudGroup):
         return group.started_at, 0, group.key
