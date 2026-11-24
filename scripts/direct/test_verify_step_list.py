@@ -4,14 +4,18 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
+import time
 from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service
+from scripts.build_queue import placement
+from scripts.build_queue.admission_test_support import caller_admission, wait_reply
 from scripts.build_targets import target_config
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 from scripts.lib.build_folders_test_support import tool_folders
@@ -124,12 +128,21 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
     def test_each_call_records_its_admission_wait_under_the_outer_run(self) -> None:
         self.prepare_repository()
         root = self.fixture.root
-        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        startup = root / "verify-clock.sh"
+        _ = startup.write_text('''if [[ ${0##*/} == verify.sh ]]; then
+    unset EPOCHREALTIME
+    EPOCHREALTIME="$(date +%s).000000"
+fi
+''')
+        token_clock = root / "token-clock"
+        _ = token_clock.write_text("0\n")
+        self.fixture.environment.update({"BUILDLOG_OFF": "0", "BASH_ENV": str(startup),
+                                         "UNIT_TOKEN_CLOCK_FILE": str(token_clock)})
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
         admission = caller_admission(self.fixture, root, self.fixture.environment)
         previous = admission.server.handle_request
         observed: dict[str, wire.PlacementRequest] = {}
-        waits = {"mend": 4200, "clippy": 720, "nextest": 1290}
+        waits = {"mend": 4200, "clippy": 720, "nextest": 1290, "doc": 420}
 
         def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
                    ) -> list[wire.Reply]:
@@ -145,14 +158,62 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
             return previous(request, connection)
 
         with mock.patch.object(admission.server, "handle_request", side_effect=handle):
-            result = self.run_verify("lint,test", "sample")
+            result = self.run_verify("lint", "sample", "+", "test", "sample", "+",
+                                     "doc", "sample", "--mac", "Mac-only docs")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([request.identity.step for request in observed.values()], ["mend", "clippy", "nextest"])
+        self.assertEqual([request.identity.step for request in observed.values()], ["mend", "clippy", "nextest", "doc"])
         rows = cast(list[dict[str, object]], self.fixture.call_records())
         run = next(iter(observed.values())).run
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([(row["verb"], row["wait_s"], row["run_id"]) for row in rows],
-                         [("lint", 4920, f"{run.pid}:{run.start_time}"), ("test", 1290, f"{run.pid}:{run.start_time}")])
+                         [("lint", 4920, f"{run.pid}:{run.start_time}"), ("test", 1290, f"{run.pid}:{run.start_time}"),
+                          ("doc", 420, f"{run.pid}:{run.start_time}")])
+        lint_waits = cast(dict[str, int], rows[0]["step_wait_s"])
+        self.assertEqual((lint_waits["mend"], lint_waits["clippy"]), (4200, 720))
+        self.assertEqual([row["step_wait_s"] for row in rows[1:]], [{"test": 1290}, {"doc": 420}])
+
+    def test_term_records_the_open_memory_wait(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        wait = wait_reply(records.NeedsMemory())
+        signalled = False
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            nonlocal signalled
+            if isinstance(request, wire.PrerequisiteReport):
+                return [wire.Ok()]
+            if not isinstance(request, wire.PlacementRequest):
+                return previous(request, connection)
+            candidates = tuple(placement.CandidateEligibility(candidate.destination, candidate.eligibility)
+                               for candidate in request.constraints.candidates)
+            folder, = tool_folders(root / "tmp", "verify", pid=request.owner.pid)
+            path = folder / f"placement-{request.episode}.json.wait"
+            if not path.is_file():
+                notice = admission_client.PlacementWaitNotice(time.monotonic() - 7, (), 0, wait)
+                _ = path.write_text(wire.encode_record(notice))
+                return [wire.PlacementWait(request.episode, request.since, 0, candidates)]
+            saved = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
+            if saved.last_position == wait.position and not signalled:
+                signalled = True
+                os.kill(request.owner.pid, signal.SIGTERM)
+            return [wire.PlacementWait(request.episode, request.since, 1, candidates, wait)]
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("check", "sample", "--local", "requires Linux")
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertTrue(signalled)
+        row, = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual(row["outcome"], "interrupted")
+        waits = cast(dict[str, int], row["step_wait_s"])
+        self.assertGreaterEqual(waits["check"], 7)
+        self.assertEqual(row["wait_s"], waits["check"])
+        self.assertTrue(all(event["args"][:1] == ["metadata"] for event in self.fixture.cargo_events()))
+        self.assert_removed()
 
     def test_quoted_plus_is_a_routing_reason(self) -> None:
         self.prepare_repository()

@@ -1215,6 +1215,7 @@ run() {
 run_step() {
     local -a command=("$@")
     local cargo_index=0 BUILDLOG_VERIFY_POSITION=1
+    local VERIFY_WAIT_DIR=${HOLD_WAIT_DIR:-}
     if [[ "${command[0]:-}" == env ]]; then
         cargo_index=1
         while :; do
@@ -1232,6 +1233,12 @@ run_step() {
             final:nextest) BUILDLOG_VERIFY_POSITION=2 ;;
             lint:clippy) BUILDLOG_VERIFY_POSITION=${VERIFY_STEP_COUNT:-1} ;;
         esac
+        case "${CMD:-}:${command[cargo_index]:-}" in
+            lint:mend|lint:clippy|lint:fmt)
+                if [[ -n "$VERIFY_WAIT_DIR" ]]; then
+                    VERIFY_WAIT_DIR="$HOLD_WAIT_DIR/wait-${command[cargo_index]}"
+                fi ;;
+        esac
     fi
     local -x BUILDLOG_VERIFY_VERB="${CMD:-}" BUILDLOG_VERIFY_CALL="${VERIFY_CALL_TEXT:-}"
     local -x BUILDLOG_VERIFY_TOTAL="${VERIFY_STEP_COUNT:-1}"
@@ -1244,6 +1251,10 @@ run_step() {
             exit $?
         fi
         return 0
+    fi
+    if [[ -n "$VERIFY_WAIT_DIR" && "$VERIFY_WAIT_DIR" != "$HOLD_WAIT_DIR" ]]; then
+        mkdir -p "$VERIFY_WAIT_DIR" || return $?
+        local -x BUILDLOG_HOLD_WAIT_FILE="$VERIFY_WAIT_DIR/seconds"
     fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
@@ -2015,7 +2026,7 @@ buildlog_memory_event() {
             ;;
         memory-seconds\ *)
             if [[ -n "$HOLD_WAIT_DIR" ]]; then
-                printf '%s\n' "${1#memory-seconds }" >> "$HOLD_WAIT_DIR/memory-seconds"
+                printf '%s\n' "${1#memory-seconds }" >> "${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/memory-seconds"
             fi
             ;;
         retry\ *)
@@ -2098,6 +2109,7 @@ collect_hold_wait() {
 
 interrupt_hold_wait() {
     local waiter_pid=$HOLD_WAITER_PID last_job_pid=${!:-}
+    VERIFY_WAIT_STOPPED_AT=${VERIFY_WAIT_STOPPED_AT:-${EPOCHREALTIME:-}}
     if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
         # A signal can arrive after Bash starts the job and before Verify saves its PID.
         if [[ -z "$waiter_pid" && -n ${placement_previous_job_pid+x} &&
@@ -2455,26 +2467,17 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "$MEM_KILL_FILE" ]]; then
         mem_kills=$(wc -c < "$MEM_KILL_FILE")
     fi
-    local token_wait_s=${TOKEN_WAIT_S:-0} step_wait
-    if [[ -n "${TOKEN_WAIT_FILE:-}" && -f "$TOKEN_WAIT_FILE" ]]; then
-        while IFS= read -r step_wait; do
-            token_wait_s=$(( token_wait_s + step_wait ))
-        done < "$TOKEN_WAIT_FILE"
-    fi
-    local memory_wait_s=0 wait
-    if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/memory-seconds" ]]; then
-        memory_wait_s=$(awk '{ total += $1 } END { print total + 0 }' "$HOLD_WAIT_DIR/memory-seconds")
-    fi
-    wait=$(awk -v memory="$memory_wait_s" -v token="$token_wait_s" -v hold="$BUILDLOG_HOLD_WAIT_S" \
-        'BEGIN { printf "%d", memory + token + hold }')
     local mem_kill_stopped=0
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="$token_wait_s" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+    BUILDLOG_WAIT_DIR="$HOLD_WAIT_DIR" BUILDLOG_WAIT_STOPPED_AT="${VERIFY_WAIT_STOPPED_AT:-}" \
+        BUILDLOG_TOKEN_WAIT_FILE="${TOKEN_WAIT_FILE:-}" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" \
+        BUILDLOG_TOKEN_WAIT_DIR="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}" \
+        BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
-        verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+        verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" 0 "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -3172,9 +3175,11 @@ placement_once() {
         local placement_path="$HOLD_WAIT_DIR/placement-$step_id"
         PLACEMENT_ASSIGNMENT_FILE="$placement_path.json"
         PLACEMENT_GRANT_FILE="$placement_path.sh"
+        PLACEMENT_WAIT_TIMING="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-$PLACEMENT_STEP_NUMBER"
         if [[ "$refresh_source" == 0 && -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
             mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
             LINT_MEMORY_WAIT_FILE=""
+            PLACEMENT_WAIT_TIMING=$LINT_MEMORY_WAIT_TIMING
         fi
         export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
     fi
@@ -3220,7 +3225,8 @@ placement_once() {
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
-    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
+    BUILDLOG_PLACEMENT_WAIT_FILE="${PLACEMENT_WAIT_TIMING:-}" \
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
         > "$HOLD_WAIT_DIR/placement-reply" &
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
@@ -3383,6 +3389,7 @@ route_test() {
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
+                LINT_MEMORY_WAIT_TIMING=$PLACEMENT_WAIT_TIMING
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
                 HOLD_LINT=1
@@ -4109,7 +4116,11 @@ token_acquired() {
 # The local argument disables remote routing for a local formatter.
 record_token_wait() {
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+        local output=$TOKEN_WAIT_FILE
+        if [[ -n "${VERIFY_WAIT_DIR:-}" && "$VERIFY_WAIT_DIR" != "$HOLD_WAIT_DIR" ]]; then
+            output="$VERIFY_WAIT_DIR/token-seconds"
+        fi
+        printf '%s\n' "$TOKEN_WAITED" >> "$output"
     fi
 }
 
@@ -5044,7 +5055,7 @@ run_lint_sequence() {
         MEND_LOG="$(mktemp)"
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
-        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_REPAIR_PENDING_GRANT=0
+        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_MEMORY_WAIT_TIMING="" LINT_REPAIR_PENDING_GRANT=0
         lint_copy_begin
         while true; do
             if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then

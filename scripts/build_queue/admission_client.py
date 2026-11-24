@@ -46,7 +46,7 @@ else:
 from scripts.build_queue.system_clock import SystemClock
 
 from scripts.lib import conf, process_stat
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
@@ -1711,7 +1711,7 @@ class PlacementWaitNotice:
 
 def first_hana_image_notice() -> bool:
     """Share the notice with other clients that use the same verify run folder."""
-    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
+    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAITER_FILE") or os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
     if hold_wait_file:
         try:
             with Path(hold_wait_file).with_name("hana-image-stale").open("x"):
@@ -2157,6 +2157,22 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
     already_queued = False
     keep_wait = False
     pinned_refusal_reported = False
+    wait_file = os.environ.get("BUILDLOG_PLACEMENT_WAIT_FILE", "") if args.wait_events else ""
+    finished_elapsed: int | None = None
+
+    def record_wait(*, active: bool) -> None:
+        if not wait_file:
+            return
+        if active and not isinstance(output.last_resource, wire.PlacementResourceWait):
+            started = CLOCK.now() - (CLOCK.monotonic() - output.started)
+            seconds = f"{output.elapsed_memory_seconds} {started}"
+        else:
+            seconds = str(finished_elapsed if finished_elapsed is not None else output.elapsed_seconds())
+        try:
+            atomic_sample(Path(wait_file), seconds + "\n")
+        except OSError as error:
+            print(f"cannot record the placement wait: {error}", file=sys.stderr)
+
     try:
         if args.command == "place-step" and placement_wait_state.exists():
             try:
@@ -2270,11 +2286,13 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             if isinstance(answer.wait, wire.Wait) and not token_check:
                 output(answer.wait)
+                record_wait(active=True)
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
                     output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             elif isinstance(answer.wait, wire.PlacementResourceWait):
                 output.resource_wait(answer.wait)
+                record_wait(active=True)
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
                     output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
@@ -2308,10 +2326,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 print(wire.encode_reply(answer), end="")
             return 2
         write_assignment(args.assignment_file, answer)
-        elapsed = output.elapsed_seconds()
+        elapsed = finished_elapsed = output.elapsed_seconds()
         if isinstance(answer, wire.LocalPlacementGranted) and args.shell_state is not None:
             write_shell_grant(args.shell_state, answer.grant, elapsed)
-        if elapsed and args.wait_events:
+        if elapsed and args.wait_events and not wait_file:
             output.on_event(f"memory-seconds {elapsed}")
         output.finished(left=isinstance(answer, wire.Assignment), placement_events=args.wait_events)
         if output.held:
@@ -2323,6 +2341,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         return 0
     finally:
         if not keep_wait:
+            record_wait(active=False)
             if output.held:
                 output.on_event("done")
                 output.held = False

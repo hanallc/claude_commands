@@ -638,10 +638,11 @@ The first failure ends either list with its status.
 A step list reports the command and exit status for each step it runs, including the package of a failed test step.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
 Both list forms keep the queue place during checkout, including for `doc`.
-The `doc` step still acquires its own checkout.
+The `doc` step acquires its own checkout and uses ordinary memory admission.
 A busy Mac leaves a mend step at its existing queue rank for the next placement.
-Each step's call record uses the outer run ID.
 The `wait_s` field counts time waiting for admission, routing, holds, and the Cargo token.
+The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
+Verify records an open memory wait through the time it stops the placement client.
 A standalone step with its own checkout slot also uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 

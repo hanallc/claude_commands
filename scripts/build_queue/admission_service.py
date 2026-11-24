@@ -2651,7 +2651,8 @@ class AdmissionServer:
             if placement_request is not None and not isinstance(self._local_placement_eligibility(placement_request),
                                                                 (placement.AllowedHost, placement.EvidenceNeeded)):
                 continue
-            if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
+            if (not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity)
+                    or request.profile.step == "doc"):
                 continue
             if owner in claimed or isinstance(gate.waiter_state(waiting.row), records.TokenWaitingWaiter):
                 continue
@@ -4153,7 +4154,7 @@ class AdmissionServer:
                                 self.places, RegisteredServiceWrites(self.writes),
                                 retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False)),
             end_kind=end_kind)
-        if ((started or not isinstance(ending, LocalGrantReturned))
+        if ((started or not isinstance(ending, LocalGrantReturned)) and record.step != "doc"
                 and isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
@@ -5072,7 +5073,7 @@ done
     def _release_unclaimed_remote_slots(self, request: wire.PlacementRequest) -> None:
         """Release the run's unclaimed slots when remote placement begins without a hold."""
         run = request.run
-        if not isinstance(run, wire.RunIdentity):
+        if not isinstance(run, wire.RunIdentity) or request.profile.step == "doc":
             return
         for key, slot in list(self.slots.items()):
             if isinstance(slot, records.BetweenStepsSlot) and (slot.run.pid, slot.run.start_time) == (run.pid, run.start_time):

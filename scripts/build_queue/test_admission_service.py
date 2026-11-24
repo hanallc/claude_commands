@@ -9374,6 +9374,32 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(row["order_since"], second.since)
             self.assertFalse(fixture.server.reservations)
 
+    def test_doc_keeps_its_run_rank_without_a_memory_hold(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            grant = fixture.finish_step(first)
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            doc = fixture.request(step="doc", run=run)
+            self.assertIsInstance(fixture.server.handle_request(doc)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [doc.owner.pid, peer.owner.pid])
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[doc.episode].continuation_claim, service.NoContinuationClaim)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            doc_grant = fixture.server.reservations[doc.episode].reservation_id
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("doc", doc_grant, 0)), [wire.Ok()])
+            self.assertNotIn(doc_grant, fixture.server.slots)
+
     def test_mac_busy_mend_keeps_its_rank_for_the_retry(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,

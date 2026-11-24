@@ -1257,6 +1257,51 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
     store.append_line(store.host_file(host, started), record)
 
 
+def wait_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text().splitlines()
+    except OSError:
+        return []
+
+
+def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]:
+    """Read the wait totals before Verify removes its wait directory."""
+    stop = optional_nonnegative_number(os.environ.get("BUILDLOG_WAIT_STOPPED_AT", "")) or time.time()
+    token_file = os.environ.get("BUILDLOG_TOKEN_WAIT_FILE", "")
+    token_directory = Path(os.environ.get("BUILDLOG_TOKEN_WAIT_DIR") or directory)
+    step_waits: dict[str, int] = {}
+    wait_total = 0.0
+    hold_total = 0.0
+    token_total = 0
+    for folder in (directory, *sorted(directory.glob("wait-*"))):
+        label = verb if folder == directory else folder.name.removeprefix("wait-")
+        hold = sum(optional_nonnegative_number(line) or 0 for line in wait_lines(folder / "seconds"))
+        token_path = Path(token_file) if folder == directory and token_file else folder / "token-seconds"
+        token = sum(optional_int(line) or 0 for line in wait_lines(token_path))
+        if folder == token_directory:
+            token += token_wait
+        memory = sum(optional_int(line) or 0 for line in wait_lines(folder / "memory-seconds"))
+        for path in folder.glob("placement-*"):
+            if not path.name.removeprefix("placement-").isdecimal():
+                continue
+            for line in wait_lines(path):
+                seconds, _, started = line.partition(" ")
+                elapsed = optional_nonnegative_number(seconds) or 0
+                if start := optional_nonnegative_number(started):
+                    elapsed += max(0, stop - start)
+                memory += int(elapsed)
+        total = memory + token + hold
+        if total or label != verb:
+            step_waits[label] = int(total)
+        wait_total += total
+        hold_total += hold
+        token_total += token
+    if not step_waits:
+        step_waits[verb] = 0
+    return {"wait_s": int(wait_total), "hold_wait_s": hold_total, "token_wait_s": token_total,
+            "step_wait_s": step_waits}
+
+
 def call(args: list[str]) -> None:
     from scripts.direct.step_record import NamedPackage, WorkspacePackages
 
@@ -1294,6 +1339,9 @@ def call(args: list[str]) -> None:
         "mem_kills": int(os.environ.get("BUILDLOG_MEM_KILLS", "0")),
         "mem_kill_stopped": os.environ.get("BUILDLOG_MEM_KILL_STOPPED") == "1",
     }
+    if wait_directory := os.environ.get("BUILDLOG_WAIT_DIR"):
+        token_wait = optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "")) or 0
+        fields.update(call_waits(Path(wait_directory), verb, token_wait))
     write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
 
 
