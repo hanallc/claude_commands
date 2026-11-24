@@ -46,7 +46,7 @@ from scripts.build_targets import build_targets
 from scripts.build_targets.mac_linux import (BWRAP_FAILED, BWRAP_MISSING, COMPILED_START, TOOL_FOLDERS, bindable,
                                              entry_kind, home_folder, main_folder, setup_failed)
 from scripts.buildlog import parse, record, store, treekey
-from scripts.lib import build_steps, models_registry
+from scripts.lib import build_steps, conf_reads, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
 from scripts.production import hand_made_guest, hand_made_limit, hand_made_mac
@@ -66,10 +66,9 @@ UV_VALUE_LETTERS = "CPfipw"
 ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
 # Variables that the program also gets when they are set; the model sees each one with its value.
 SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PATH", "BINDGEN_EXTRA_CLANG_ARGS",
-                             "SCCACHE_DIR", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE",
-                             "NIX_LDFLAGS"})
+                             "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
-PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
+PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH")
 # The characters that split a word into values, as in --config build.target-dir="/tmp/x".
 VALUE_SEPARATORS = re.compile(r"""[\s=,:;"']""")
 # Each file under this folder is fixed, so a tool can run a file from a folder under it.
@@ -78,7 +77,7 @@ STORE = "/nix/store/"
 INSTALLED_WRAPPER = hand_made_limit.CHECKER / "scripts" / hand_made_limit.BUILD_HOLD / "cargo"
 WRITE_REFUSAL = ("the real path of {path} is in {bind}, which the run writes, so a run can change a program that a "
                  + "later run starts; use a program and a PATH folder outside the checkout, the build output folder, "
-                 + "SCCACHE_DIR and the cargo registry and git folders")
+                 + "and the cargo registry and git folders")
 # The cargo word that keeps the installed wrapper as the start file; its clean rule needs files that the limit hides.
 CLEAN = "clean"
 CLEAN_REFUSAL = ("a hand made run cannot clean the build output: the build-hold cargo wrapper cleans it with files "
@@ -138,9 +137,10 @@ def read_settings(text: str) -> CheckSettings:
     section = models_registry.parse_registry(text).get(SECTION)
     if section is None:
         raise Refused(f"the model registry has no [{SECTION}] section")
+    settings = conf_reads.trace_values(models_registry.registry_path(), text, section)
 
     def value(key: str) -> str:
-        found = section.get(key, "")
+        found = settings.get(key, "")
         if not found:
             raise Refused(f"the model registry has no {SECTION}.{key}")
         return found
