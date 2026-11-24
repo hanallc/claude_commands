@@ -21,7 +21,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
 from scripts.lib import build_folders
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
@@ -193,10 +193,10 @@ def _request(name: str) -> StyleProduction:
         merge_branch = production_field(doc.read_text().splitlines(), "Merge branch")
     else:
         merge_branch = style_production_branch(name)
-        branches = worktrees.worktree_branches(repository)
+        branches = worktree_records.worktree_branches(repository)
         for candidate, candidate_doc in ((checkout, doc), (legacy_checkout, legacy_doc)):
             branch = branches.get(candidate.resolve(), "")
-            if not branch and (record := worktrees.checkout_record(candidate)) is not None:
+            if not branch and (record := worktree_records.checkout_record(candidate)) is not None:
                 if Path(record.repo) == repository:
                     branch = record.branch
             if is_style_production_branch(branch, name):
@@ -234,7 +234,7 @@ def _branch_description_key(style: StyleProduction) -> str:
 
 
 def _recorded_branch_point(style: StyleProduction) -> str:
-    result = worktrees.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
+    result = worktree_records.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
     if result.returncode not in (0, 1):
         raise Refusal(result.stderr.strip() or f"cannot read the description for {style.merge_branch}")
     return result.stdout.rstrip("\n")
@@ -262,7 +262,7 @@ def _check_existing(style: StyleProduction) -> bool:
         branch_point = _recorded_branch_point(style)
         if branch_point:
             _require_branch_point(style, branch_point)
-        elif (style.checkout / ".git").exists() or worktrees.checkout_record(style.checkout) is not None:
+        elif (style.checkout / ".git").exists() or worktree_records.checkout_record(style.checkout) is not None:
             raise Refusal(f"{style.checkout}: no recorded branch point for {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -512,7 +512,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
         _attach_parent(style)
         return 0
-    except (Refusal, worktrees.Refused, rules.RuleValidationError, style_ledger.LedgerError,
+    except (Refusal, worktree_records.Refused, rules.RuleValidationError, style_ledger.LedgerError,
             OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
