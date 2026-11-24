@@ -72,7 +72,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import BinaryIO, Literal, Protocol, TextIO, cast
+from typing import BinaryIO, Literal, NoReturn, Protocol, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -2489,10 +2489,17 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline)
-        if isinstance(recovery, GateRecovery):
-            recovery.rollback = ""
-            recovery.save()
+        try:
+            rollback_merge(repo, baseline)
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = ""
+                recovery.save()
+        except Exception as cleanup_error:
+            if not isinstance(error, (AwsGateTookNoRun, GateSettlementPending)):
+                raise
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = baseline
+            raise_gate_cleanup_failure(error, cleanup_error, "Merge cleanup")
         if isinstance(error, (AwsGateTookNoRun, GateSettlementPending)):
             print("Merge undone. The merge was not pushed.", file=sys.stderr, flush=True)
             raise
@@ -3094,13 +3101,14 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
         owner = nightly_owner(args)
-        with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        with gate_cleanup_scope() as cleanup:
+            clone = cleanup.enter_context(copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly"))
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 with gate_suite_target(args, clone, target) as assigned:
                     run = run_gate_suites(clone, NIGHTLY_TYPE_DIRS, module_time_limit_s=args.module_time_limit_s,
                                           full=True, gate_job=args.gate_job, target=assigned, nightly_types=True)
-            except (AwsGateTookNoRun, GateSettlementPending):
+            except GATE_PLACEMENT_ERRORS:
                 raise
             except (GateRefused, first_step.FirstStepRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
@@ -3150,7 +3158,7 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 else:
                     print(f"Assign the fix: gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
-    except (AwsGateTookNoRun, GateSettlementPending):
+    except GATE_PLACEMENT_ERRORS:
         raise
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
@@ -3210,7 +3218,8 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
     if not isinstance(target, NoGateAssignment):
         yield target
         return
-    with first_step.admitted_run(args.command, source) as admitted:
+    with gate_cleanup_scope() as cleanup:
+        admitted = cleanup.enter_context(first_step.admitted_run(args.command, source))
         grant = admitted.grant
         if not isinstance(grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
@@ -3326,6 +3335,34 @@ class AwsGateLaunchPending(GateSettlementPending):
 
 class MacLinuxTookNoRun(GateRefused):
     """The assigned Mac Linux guest took no run. The caller can place the gate again."""
+
+
+GatePlacementError = AwsGateTookNoRun | MacLinuxTookNoRun | GateSettlementPending
+GATE_PLACEMENT_ERRORS = (AwsGateTookNoRun, MacLinuxTookNoRun, GateSettlementPending)
+
+
+def raise_gate_cleanup_failure(error: GatePlacementError, cleanup_error: Exception, action: str) -> NoReturn:
+    detail = str(cleanup_error) or type(cleanup_error).__name__
+    raise type(error)(f"{error}\n{action} failed. {detail}") from cleanup_error
+
+
+@contextmanager
+def gate_cleanup_scope(*scopes: AbstractContextManager[object]) -> Generator[ExitStack]:
+    """Keep the placement error through the exits of the scopes."""
+    placement_error: GatePlacementError | None = None
+    try:
+        with ExitStack() as cleanup:
+            for scope in scopes:
+                _ = cleanup.enter_context(scope)
+            try:
+                yield cleanup
+            except GATE_PLACEMENT_ERRORS as error:
+                placement_error = error
+                raise
+    except Exception as cleanup_error:
+        if placement_error is not None and cleanup_error is not placement_error:
+            raise_gate_cleanup_failure(placement_error, cleanup_error, "Gate cleanup")
+        raise
 
 
 class GuestNotStartedOutcome(Protocol):
@@ -3767,8 +3804,6 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
         result = admitted.run_gate(run)
         if result.stderr:
             _ = sys.stderr.write(result.stderr)
-        if mode is SuiteMode.GATE and result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
-            return 1
         return result.returncode
 
     return run_with_gate_cleanup(run_admitted, admission)
@@ -3786,13 +3821,11 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
         if not (args.nightly or args.promote_only):
             return run_with_gate_cleanup(partial(merge_checkpoint, args, target),
                                          scratch.copy_lock(checkout), gate_recovery(checkout))
+        if args.nightly:
+            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)) as cleanup:
+                _ = cleanup.callback(_sweep_nightly_build_folders)
+                return nightly(args, target)
         with scratch.copy_lock(checkout):
-            if args.nightly:
-                with admission_records.default_owner(args.unit):
-                    try:
-                        return nightly(args, target)
-                    finally:
-                        _sweep_nightly_build_folders()
             promote(args)
             production, review_list = change_review_list(args)
             if review_list is not None:

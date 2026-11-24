@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
+import io
 import os
 from pathlib import Path
 import signal
@@ -339,6 +340,44 @@ class GateDefaultPlacementTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0], clone)
             self.assertEqual(run.call_args.kwargs['target'], gate.MacLinuxAssignment(assignment.assignment))
             publish.assert_called_once()
+
+    def test_nightly_keeps_placement_status_through_cleanup(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo = Path(directory)
+            arguments = ['--nightly', '--merge-branch', 'main', '--unit', 'fixture', '--repo', directory]
+            refused = gate.MacLinuxTookNoRun('fixture guest took no run')
+            pending = gate.GateSettlementPending('fixture guest end remains unproven')
+            cases = ((refused, GATE_PRELAUNCH_REFUSED_STATUS, ''),
+                     (refused, GATE_PRELAUNCH_REFUSED_STATUS, 'copy'),
+                     (pending, GATE_UNSETTLED_LAUNCH_STATUS, 'lock'))
+
+            @contextmanager
+            def scope(name: str, failed: str) -> Generator[Path]:
+                try:
+                    yield repo
+                finally:
+                    if name == failed:
+                        raise OSError(f'fixture {name} cleanup failed')
+
+            for error, status, failed in cases:
+                with (self.subTest(status=status, failed=failed),
+                      mock.patch.object(gate, 'checked_gate_target', return_value=gate.placement_target(placed('mac-linux'))),
+                      mock.patch.object(gate, 'nightly_git'), mock.patch.object(gate, 'checked_git', return_value='tree'),
+                      mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
+                      mock.patch.object(copies, 'standing', return_value=scope('copy', failed)),
+                      mock.patch.object(scratch, 'copy_lock', return_value=scope('lock', failed)),
+                      mock.patch.object(gate, '_sweep_nightly_build_folders'),
+                      mock.patch.object(gate, 'gate_state_dir', return_value=repo),
+                      mock.patch.object(gate, 'nightly_red_lock', side_effect=AssertionError('unexpected nightly red')),
+                      mock.patch.object(gate, 'push_nightly_result') as publish,
+                      mock.patch.object(gate, 'run_gate_suites', side_effect=error),
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(gate.main(arguments), status, errors.getvalue())
+                    self.assertIn(str(error), errors.getvalue())
+                    if failed:
+                        self.assertIn(f'fixture {failed} cleanup failed', errors.getvalue())
+                    publish.assert_not_called()
+                    self.assertFalse((repo / 'full-required').exists())
 
     def test_promote_only_skips_placement(self) -> None:
         with (mock.patch.dict(os.environ, clear=True),
