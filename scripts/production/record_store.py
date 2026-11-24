@@ -44,6 +44,11 @@ class RecordKind(StrEnum):
         return self.value[0].upper()
 
 
+def morty_ids(members: staff.StaffSnapshot) -> list[staff.StaffId]:
+    """Return the staff ID of each active producer named morty. Each caller decides what zero or two IDs mean."""
+    return [row.id for row in staff.active(members, "producer") if row.name == "morty"]
+
+
 def record_owner(kind: RecordKind, issue: Issue, legacy_owner: str) -> staff.StaffId:
     """Use the recorded owner when the record has one."""
     field = "owner" if kind is RecordKind.INVESTIGATION else "production_id"
@@ -746,7 +751,7 @@ class NumberedRecords:
         return self.folder() / ".next-number"
 
     def require_list_keeper(self) -> None:
-        keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+        keepers = morty_ids(staff.snapshot())
         if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
             raise self.error_type("only morty's List folder can allocate List numbers")
 
