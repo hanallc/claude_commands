@@ -14,7 +14,8 @@ builds.slice scope when its probe succeeds, unless disabled or already in that s
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host. Full test runs use all modules.
 Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
-SharedMachine is the default. WholeMachine uses one job per CPU without shared admission or failure reruns.
+SharedMachine is the default. WholeMachine uses one job per CPU without shared admission.
+WholeMachine reruns failures for named or selected modules, or when the caller enables failure reruns.
 Merge and tests-only runs omit type checks.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
@@ -212,9 +213,10 @@ class HoldExemptNamedModuleMachine:
 
 @dataclass(frozen=True)
 class WholeMachine:
-    """Use every CPU without shared admission, holds, or failure reruns."""
+    """Use every CPU without shared admission or holds. Allow failure reruns for all modules when enabled."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
     module_progress: Callable[[str], None] | None = None
+    rerun_failed_modules: bool = False
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1700,6 +1702,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
+    rerun_failed_modules = shared or isinstance(selected, (SelectedModules, NamedModules)) or machine.rerun_failed_modules
     named = isinstance(selected, NamedModules)
     placed = isinstance(local_grant, LocalGateAssignment)
     under_parent = shared and named and not placed and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
@@ -1907,6 +1910,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         status = job.process.returncode
                     if status is None:
                         continue
+                    if rerunning and not time_limit_report:
+                        hold_seconds_now = hold.waited_s() - initial_hold_seconds if hold is not None else 0.0
+                        if time.monotonic() >= deadline + hold_seconds_now:
+                            # Keep the job for the time limit report below.
+                            break
                     try:
                         result = finish_gate_job(job, status)
                         executions.append(result)
@@ -2054,8 +2062,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:
                         admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
-                if (not time_limit_report and (shared or isinstance(selected, (SelectedModules, NamedModules)))
-                        and not pending and not running):
+                if rerun_failed_modules and not time_limit_report and not pending and not running:
                     failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -3530,6 +3537,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
             write_gate_claim_failure(failure)
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
+        first_failures = {(job.suite, job.module): job for job in outcome.executions
+                          if job.kind is GateJobKind.TEST_MODULE and job.returncode
+                          and not (job.killed_for or job.tripwire_tripped or job.restart)}
+        for job in outcome.jobs:
+            if (job.kind is GateJobKind.TEST_MODULE and job.returncode == 0
+                    and (first := first_failures.get((job.suite, job.module))) is not None):
+                print(f"--- {job.suite}/{job.module} passed on rerun alone; first run exit={first.returncode} ---"
+                      + f"\n{first.output}", flush=True)
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
             if outcome.time_limit_report:

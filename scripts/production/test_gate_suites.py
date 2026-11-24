@@ -86,6 +86,51 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 self.assertEqual(run.time_limit_report, "")
                 self.assertLess(run.seconds, 20)
 
+    @gate_suites("hooks")
+    def test_final_rerun_cannot_pass_after_the_gate_deadline(self) -> None:
+        now = 0.0
+        attempts = 0
+
+        def start(*arguments: object) -> gate.RunningGateJob:
+            nonlocal now, attempts
+            attempts += 1
+            if attempts == 2:
+                now = 9.98
+            suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
+            process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+            self.write(log, "fixture attempt output\n")
+            return gate.RunningGateJob(suite, path, process, now, 0, log.open("r+"), log, path.name)
+
+        def reap(pid: int, _options: int) -> tuple[int, int, resource.struct_rusage]:
+            ready = attempts == 1 or now >= 10.01
+            status = 1 << 8 if attempts == 1 else 0
+            return pid if ready else 0, status, resource.getrusage(resource.RUSAGE_SELF)
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(time, "monotonic", side_effect=lambda: now),
+              mock.patch.object(time, "sleep", side_effect=advance),
+              mock.patch.object(gate, "start_gate_job", side_effect=start),
+              mock.patch.object(os, "wait4", side_effect=reap),
+              mock.patch.object(process_group, "send_process_group"),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            run = gate.run_suites(self.checkout, machine=gate.WholeMachine(rerun_failed_modules=True),
+                                  time_limit=gate_record.GateTimeLimit(10))
+
+        self.assertEqual(attempts, 2)
+        self.assertFalse(run.passed, output.getvalue())
+        self.assertIn("limit 10 s; elapsed 10.030 s; running modules: hooks/test_first.py", run.time_limit_report)
+        self.assertEqual(len(run.executions), 2)
+        first, rerun = run.executions
+        self.assertEqual(first.returncode, 1)
+        self.assertNotEqual(rerun.returncode, 0)
+        self.assertTrue(rerun.killed_for.startswith("time limit:"))
+        self.assertEqual(run.jobs, (rerun,))
+        self.assertNotIn("passed on rerun alone", output.getvalue())
+
     def test_time_limit_notice_resolves_staff_ids_and_unit_names(self) -> None:
         from scripts.message import roster, send
         from scripts.production import staff
