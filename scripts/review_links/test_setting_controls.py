@@ -9,7 +9,7 @@ from scripts.review_links.test_accounts_page import firefox_probe_results
 
 
 def cost_limit(value: str, live: str) -> str:
-    return setting_controls.slider("limit", "Cost limit for merge checks",
+    return setting_controls.slider("limit", "Cost limit for gate jobs",
                                    minimum=Decimal("1.00"), maximum=Decimal("3.00"), step=Decimal("0.05"),
                                    value=Decimal(value), live=Decimal(live), decimals=2,
                                    live_note="off" if Decimal(live) == 1 else "")
@@ -21,7 +21,7 @@ def budget() -> str:
 
 
 def go() -> str:
-    return setting_controls.go_button("limit-go", "Set the limit to 1.50 for merge checks",
+    return setting_controls.go_button("limit-go", "Set the limit to 1.50 for gate jobs",
                                       page="aws_machines", key="faster_box_max_cost_ratio")
 
 
@@ -149,7 +149,7 @@ class SettingControlsTests(unittest.TestCase):
         self.assertIn('min="0" step="0.01" value="31.36"', budget())
         self.assertIn('more a month to go faster.', budget())
         self.assertIn('data-page="aws_machines" data-key="faster_box_max_cost_ratio"', go())
-        self.assertIn('Set the limit to 1.50 for merge checks</button>', go())
+        self.assertIn('Set the limit to 1.50 for gate jobs</button>', go())
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the shared controls.")
     def test_go_confirms_cancels_saves_and_reports_a_refusal(self) -> None:

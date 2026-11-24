@@ -853,7 +853,7 @@ GATE_STEPS = frozenset(GATE_PROGRAMS)
 
 @dataclass(frozen=True)
 class NotGateStep:
-    """The step is not a merge gate or a targeted test, so its name already says its job."""
+    """The step name already identifies the job."""
 
 
 StepJobReading = StepJob | NotGateStep | admission_records.PidNotRecorded | CommandUnreadable | OtherCommand
@@ -861,7 +861,7 @@ StepJobReading = StepJob | NotGateStep | admission_records.PidNotRecorded | Comm
 
 def step_job(step: str, pid: int | admission_records.PidNotRecorded, proc: Path = PROC, *,
              start_time: str = "") -> StepJobReading:
-    """The job of a natedev merge gate or targeted test, read from its process arguments."""
+    """Read the natedev gate job from its process arguments."""
     if step not in GATE_STEPS:
         return NotGateStep()
     if not isinstance(pid, int):

@@ -76,7 +76,7 @@ class FakeGuestRun:
         return 0
 
 
-# The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
+# The variables of a caller, such as the gate, that change the output folder or the compiler of a run.
 BUILD_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR")
 
 
