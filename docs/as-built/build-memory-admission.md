@@ -1573,8 +1573,9 @@ So a damaged record of a killed gate does not make the hold claims unreadable fo
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
-`on_mac` selects `mac`, `on_natedev` selects `natedev`, and `on_ssh` selects its supplied target.
-Other state words clear the selected target.
+`on_mac` selects `mac`, and `on_natedev` selects `natedev`.
+`on_ssh` and `waiting_ssh` keep their supplied target.
+`verify.sh` supplies a target only with these two words, so other state words have no selected target.
 Readers continue to find records through `*.json` only.
 
 A tree-writing step publishes `writes_tree <state>` with an optional target for its whole lifetime.
