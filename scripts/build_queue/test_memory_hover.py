@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -913,6 +914,143 @@ class MemoryHoverTests(unittest.TestCase):
                 for row in table.findall("./tbody/tr"):
                     self.assertEqual(len(row), len(headers) - int(row.get("class", "").startswith(("wait", "queue-head"))))
 
+    def test_kept_place_row_has_a_number_and_leaves_the_wait_bars_in_order(self) -> None:
+        unit_open = '<span class="staff-name" data-color-text="role.unit-director">'
+        setup = ("globalThis.window=globalThis;" + staff_names.script({})[8:-9]
+            + f"staffNames.set({{}}, {json.dumps(unit_open)});")
+        held = self.kept_place_row()
+        reading = {"total": 64, "read_at": 200, "queueControls": {"canMove": True},
+            "held_places": [held],
+            "waiters": [{"name": "phases", "unit": "phases", "since": 40, "need": 2,
+                         "targets": held["targets"], "move": {"row_id": "first"}},
+                        {"name": "research", "since": 60, "need": 3, "move": {"row_id": "last"}}]}
+        render = "(()=>{" + setup + "renderWalk(data); return $('walk').innerHTML;})()"
+        html = self.page_expression(render, reading, walk=True)
+        grid = ElementTree.fromstring(f"<root>{html}</root>")
+        kept = grid.find(".//div[@data-tip='held:4242-99']")
+        assert kept is not None
+        self.assertNotIn("wait", kept.get("class", "").split())
+        self.assertIsNone(kept.find(".//button"))
+        self.assertIsNone(kept.find(".//div[@class='track']"))
+        self.assertEqual(step_text(kept, ".//span[@class='name']"), "queue: kept place")
+        colored = kept.find(".//span[@class='name']/span[@data-color-text='role.unit-director']")
+        assert colored is not None
+        self.assertEqual(colored.text, "queue")
+        self.assertEqual(colored.tail, ": kept place")
+        self.assertEqual(kept.findtext(".//span[@class='owner']"), "last run failed in lint")
+        self.assertEqual(grid.findall(".//*[@class='unit']"), [])
+        table = grid.find(".//tr[@data-tip='held:4242-99']")
+        assert table is not None
+        self.assertNotIn("wait", table.get("class", "").split())
+        self.assertEqual([table.findtext(f"./td[@class='{name}']") for name in ("place", "duration")],
+                         ["2", "until 22:37"])
+        self.assertEqual(len(table), len(grid.findall(".//tr[@class='queue-head']/th")))
+        machine = table.find("./td[@class='machine']")
+        waiting_machine = grid.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
+        assert machine is not None and waiting_machine is not None
+        self.assertEqual(ElementTree.tostring(machine), ElementTree.tostring(waiting_machine))
+        self.assertEqual([(icon.attrib["class"], icon.attrib["aria-label"]) for icon in machine],
+                         [("machine machine-icon dim", "natedev"), ("machine machine-icon dim", "mac-linux")])
+        wait_rows = [row for row in grid.findall(".//div") if "wait" in row.get("class", "").split()]
+        self.assertEqual([row.get("data-tip") for row in wait_rows], ["wait:fixture-wait-0", "wait:fixture-wait-1"])
+        self.assertTrue(all(row.find(".//div[@class='track']") is not None for row in wait_rows))
+        self.assertEqual(grid.findtext(".//tr[@data-tip='wait:fixture-wait-1']/td[@class='place']"), "3")
+        reading["held_places"] = [{**held, "failed_step": ""}]
+        html = self.page_expression(render, reading, walk=True)
+        self.assertNotIn("last run failed in", str(html))
+
+    def test_queue_drag_updates_the_kept_place_before_the_next_view(self) -> None:
+        first = {"row_id": "first", "kept_before": 0}
+        last = {"row_id": "last", "kept_before": 1}
+        line = {"revision": "original", "members": [first, last], "kept_runs": ["4242-99"]}
+        reading = {"total": 64, "read_at": 200, "move_revision": "original",
+            "move_line": line,
+            "held_places": [self.kept_place_row()],
+            "waiters": [{"name": "phases", "since": 70, "order_since": 40, "place": 1, "move": first},
+                        {"name": "cloud", "kind": "cloud", "since": 60},
+                        {"name": "research", "since": 60, "order_since": 60, "place": 3, "move": last}]}
+        result = self.page_expression("""(() => {
+          const snapshot = JSON.stringify(data);
+          const positions = reading => queueRows(reading.waiters, reading.held_places)
+            .map(row => [row.key, row.position ?? row.place ?? null]);
+          const original = positions(data);
+          queueDrag = {reading:data, rows:data.waiters, row:data.waiters[2], pointer:null};
+          previewQueueMove(data.waiters[0]);
+          const preview = positions(painted);
+          const previewHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
+          queueReply = {previousRevisions:[data.move_revision], line:{...data.move_line,
+            revision:"confirmed", members:[...data.move_line.members].reverse()}};
+          const confirmed = queueReading(data);
+          showWalk(confirmed);
+          const confirmedHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
+          return [original, preview, positions(confirmed), queuePlace(confirmed, "last", "confirmed"),
+            previewHover, confirmedHover, snapshot === JSON.stringify(data)];
+        })()""", reading, walk=True, queue_move=True)
+        self.assertEqual(result, [
+            [["fixture-wait-0", 1], ["4242-99", 2], ["fixture-wait-1", None], ["fixture-wait-2", 3]],
+            [["4242-99", 1], ["fixture-wait-2", 2], ["fixture-wait-1", None], ["fixture-wait-0", 3]],
+            [["4242-99", 1], ["fixture-wait-2", 2], ["fixture-wait-1", None], ["fixture-wait-0", 3]],
+            2, True, True, True])
+
+    def test_queue_drag_counts_a_hidden_waiter_before_the_kept_place(self) -> None:
+        first = {"row_id": "first", "kept_before": 0}
+        hidden = {"row_id": "hidden", "kept_before": 0}
+        moving = {"row_id": "moving", "kept_before": 1}
+        last = {"row_id": "last", "kept_before": 1}
+        line = {"revision": "original", "members": [first, moving, hidden, last], "kept_runs": ["4242-99"]}
+        reading = {"total": 64, "read_at": 200, "move_revision": "original", "move_line": line,
+            "held_places": [self.kept_place_row()],
+            "waiters": [{"name": "first", "since": 35, "place": 1, "move": first},
+                        {"name": "moving", "since": 60, "place": 3, "move": moving},
+                        {"name": "last", "since": 55, "place": 5, "move": last}]}
+        confirmed = {**line, "revision": "confirmed", "members": [first, hidden, last, moving]}
+        result = self.page_expression("""(() => {
+          const kept = reading => reading.held_places[0].position;
+          queueDrag = {reading:data, rows:data.waiters, row:data.waiters[1], pointer:null};
+          previewQueueMove(data.waiters[2]);
+          const preview = kept(painted);
+          queueReply = {previousRevisions:[data.move_revision], line:data.confirmed};
+          const confirmed = queueReading(data);
+          showWalk(confirmed);
+          const published = {...data, move_revision:"confirmed", move_line:data.confirmed,
+            held_places:[{...data.held_places[0], position:3}],
+            waiters:[data.waiters[0], {...data.waiters[2], place:4}, {...data.waiters[1], place:5}]};
+          return [preview, kept(confirmed), kept(queueReading(published)),
+            queuePlace(confirmed, "moving", "confirmed"), painted.waiters.map(row => row.place)];
+        })()""", {**reading, "confirmed": confirmed}, walk=True, queue_move=True)
+        self.assertEqual(result, [3, 3, 3, 5, [1, 4, 5]])
+
+    def test_kept_place_hover_uses_the_saved_jobs_match_rule(self) -> None:
+        now = datetime(2026, 11, 24, tzinfo=UTC).timestamp()
+        for job, expected in (("test-all", "same repository and test family"),
+                              ("lint", "same repository and job")):
+            with self.subTest(job=job):
+                kept = admission_records.HeldPlace("queue", "fixture", job, now - 60, now, now + 60,
+                    "4242-99", ("natedev",), 1, "failed", failed_step="lint", position=2)
+                row = memory_feed.held_place_row(kept, UTC)
+                html = self.page_expression("tooltipHtml('held:4242-99', data)", {"held_places": [row]}, walk=True)
+                self.assertIn(f"({expected})", str(html))
+
+    def test_kept_place_hover_names_the_failure_and_the_deadline(self) -> None:
+        reading = {"held_places": [self.kept_place_row()]}
+        html = self.page_expression("tooltipHtml('held:4242-99', data)", reading, walk=True)
+        tip = ElementTree.fromstring(str(html))
+        self.assertEqual([(node.tag, node.get("class"), node.text) for node in tip[:2]],
+                         [("dt", "title", "Kept place"), ("dd", "title", "place 2")])
+        fields = {"Unit": "queue", "Failed run": "4242-99", "Failed step": "lint",
+                  "Failed at": "22:07 PST", "Kept until": "22:37 PST"}
+        self.assertEqual({node.text: tip[index + 1].text for index, node in enumerate(tip)
+                          if node.tag == "dt" and index > 0}, fields)
+        self.assertEqual(tip.findtext("dd[@class='long']"),
+            "If the next run of unit queue (same repository and job) arrives before 22:37 PST, "
+            + "it starts from place 2. Runs behind place 2 do not wait for it.")
+
+    @staticmethod
+    def kept_place_row() -> dict[str, object]:
+        return {"kind": "held", "key": "4242-99", "since": 50, "position": 2, "unit": "queue",
+                "failed_run": "4242-99", "failed_step": "lint", "failed_at": "22:07 PST",
+                "kept_until": "22:37 PST", "targets": ["natedev", "mac-linux"], "match_rule": "same repository and job"}
+
     def test_guest_row_shows_confirmation_and_caller(self) -> None:
         for guest, state in (({"guest_run": {"attempt": "fixture-attempt"}}, ""),
                              ({"guest_unconfirmed": True}, "not confirmed")):
@@ -1357,7 +1495,7 @@ process.stdout.write(JSON.stringify(steps));
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
-                        limits: bool = False) -> object:
+                        limits: bool = False, queue_move: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
@@ -1375,6 +1513,16 @@ const $ = id => {
   return elements.get(id);
 };
 function fitLabels() {}
+"""
+        if queue_move:
+            start = html.index("const queueMovePath =")
+            functions += html[start:html.index('$("queue-action").addEventListener', start)]
+            start = html.index("function pageTooltipHtml(")
+            functions += html[start:html.index("let lastBuildLimitsHtml", start)]
+            constants += """
+const document = {activeElement:null};
+let painted;
+renderWalk = reading => { painted = reading; };
 """
         if swap:
             start = html.index("const swapView =")

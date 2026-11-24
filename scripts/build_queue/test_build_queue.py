@@ -175,6 +175,28 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(self.bump_output("missing"), (3, "build queue: no waiting step matches missing\n", ""))
         self.assertEqual(self.bumps(), [])
 
+    def test_bump_uses_the_place_numbers_that_include_a_kept_place(self) -> None:
+        _ = self.waiter(100, "head")
+        worker = self.waiter(200, "worker")
+        published = queue_snapshot.read_view_snapshot(self.fixture.state_dir)
+        now = self.fixture.clock.now()
+        kept = records.HeldPlace("queue", "fixture", "lint", now, now, now + 60, "4242-99",
+                                 ("natedev",), 1, "failed", position=2)
+        reading = replace(published.reading, held_places=(kept,))
+        queue_snapshot.write_view_snapshot(self.fixture.state_dir, published.written_at, published.fresh_until,
+                                          wire.encode_reply(wire.ViewReply(reading)).encode())
+        with mock.patch.object(admission_client, "priority_set") as priority:
+            self.assertEqual(self.bump_output("2"), (3, "build queue: place #2 is kept for queue\n", ""))
+            self.assertEqual(self.bumps(), [])
+            status, output, errors = self.bump_output("3")
+            priority.assert_not_called()
+        self.assertEqual((status, errors), (0, ""))
+        bump, = self.bumps()
+        self.assertEqual(output, f"build queue: recorded {bump.id}\n")
+        step_key = self.fixture.server.waiters[worker.episode].row.get("move_id", "")
+        self.assertTrue(step_key)
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(step_key, 3), "worker"))
+
     def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
         for selectors in (("berth", "other"), ("two words",)):
             with self.subTest(selectors=selectors):
@@ -215,6 +237,7 @@ class QueueTests(unittest.TestCase):
 
     def test_bump_without_a_published_order_reports_unavailable(self) -> None:
         (self.fixture.state_dir / "queue.json").unlink()
+        (self.fixture.state_dir / queue_snapshot.VIEW_NAME).unlink()
         self.assertEqual(self.bump_output("1"), (2, "", "build queue: no published queue order\n"))
         self.assertEqual(self.bumps(), [])
 
