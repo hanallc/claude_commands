@@ -174,18 +174,27 @@ def http_post(url: str, data: bytes) -> tuple[int, bytes]:
 
 
 def parent_source() -> str:
-    """The parent command line, bounded for the audit log."""
+    """Return the bounded parent command or use the parent PID."""
+    parent_pid = os.getppid()
+    fallback = f"parent pid {parent_pid}"
+    try:
+        with conf.diagnostics(report=False) as diagnostics:
+            limit = conf.read("notify").whole("pushover.max_source_chars")
+    except conf.Unusable as error:
+        print(f"pushover: {error}", file=sys.stderr)
+        return fallback
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
     try:
         found = subprocess.run(
-            ["ps", "-o", "args=", "-p", str(os.getppid())],
+            ["ps", "-o", "args=", "-p", str(parent_pid)],
             capture_output=True,
             text=True,
             check=False,
         ).stdout.strip()
     except OSError:
         found = ""
-    limit = conf.read("notify").whole("pushover.max_source_chars")
-    return (found or f"parent pid {os.getppid()}")[:limit]
+    return (found or fallback)[:limit]
 
 
 def sender_name(source: str) -> str:

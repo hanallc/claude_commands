@@ -398,6 +398,7 @@ The script prints nothing when no alert applies.
 - **Units**: each folder's unit comes from the `## Units` tables of every registered showrunner's production doc and of `--production-docs`, longest worktree first, else the folder's last component, else `unknown`.
 - **Wait alert**. A unit needs at least 1,000,000 weighted tokens from Codex workers in the window.
   The watch reads `alert.max_wait_share` from `config/waste_watch.conf` once per pass.
+  If the limit is unusable, the watch reports the fault on stderr, skips wait alerts, sends context alerts, and exits with status 1.
   The alert requires a waiting share above that limit, which ships at 10%.
   Codex worker roles are `impl`, `test`, `fix`, `review`, `worker`, and unassigned.
   Waiting by Claude sessions and other Codex roles stays visible in `wait_share`.

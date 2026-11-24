@@ -33,6 +33,7 @@ from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllow
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 
 REAL_REVIEW = review.review
+REAL_PARENT_SOURCE = pushover.parent_source
 PARENT = "python test_pushover.py"
 
 from scripts.notify.push_test_support import registered_send
@@ -535,13 +536,27 @@ class PushoverTests(unittest.TestCase):
         return code, posted, output.getvalue()
 
     def test_cancel_posts_cancel_by_tag_with_the_token_and_logs(self) -> None:
-        code, posted, output = self.run_cancel(["--source", "stall_watch", "handler-prompt"])
         tag = pushover.push_tag("handler-prompt")
-        self.assertEqual(code, 0)
-        self.assertEqual(posted, [(f"https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json", {"token": ["a456"]})])
-        self.assertEqual(output, "pushover: cancelled 1\n")
-        self.assert_log("2", "cancel emergency push", f"key handler-prompt, tag {tag}", "cancel: cancelled 1",
-                        source="stall_watch")
+        cases = (
+            (("--source", "stall_watch"), 80, "stall_watch"),
+            ((), 0, f"parent pid {os.getppid()}"),
+        )
+        for options, limit, source in cases:
+            with self.subTest(source=source):
+                pushover.LOG_FILE.unlink(missing_ok=True)
+                _ = write_config_fixture(self.keys.parent / "notify.conf", f"pushover.max_source_chars={limit}\n")
+                post = mock.Mock(return_value=(200, b'{"status":1,"canceled":1}'))
+                with (mock.patch.object(pushover, "parent_source", REAL_PARENT_SOURCE),
+                      mock.patch.object(silence, "on_mac", return_value=False),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    code = pushover.main(["cancel", *options, "handler-prompt"], self.keys, post)
+                self.assertEqual(code, 0)
+                post.assert_called_once_with(f"https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json", b"token=a456")
+                self.assertEqual(output.getvalue(), "pushover: cancelled 1\n")
+                if not options:
+                    self.assertIn("pushover.max_source_chars='0'", errors.getvalue())
+                self.assert_log("2", "cancel emergency push", f"key handler-prompt, tag {tag}", "cancel: cancelled 1",
+                                source=source)
 
     def test_cancel_with_nothing_repeating_says_so(self) -> None:
         code, _posted, output = self.run_cancel(["k"], body=b'{"status":1,"canceled":0}')
@@ -735,13 +750,22 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(posted, [footed("No action needed.\nThe build passed.", "build-followups", "test.kept")])
 
     def test_an_empty_sender_is_refused_and_nothing_is_posted(self) -> None:
-        for source in ("", "  ", "send.py in "):
-            with self.subTest(source=source), redirect_stderr(io.StringIO()) as errors:
-                code = pushover.post_message(source, "2", "t", "Action: run it\nm", self.keys,
-                                             mock.Mock(side_effect=AssertionError("posted without a sender")), "")
-            self.assertEqual(code, 2)
-            self.assertIn("refused before sending: no sender", errors.getvalue())
-            self.assertEqual(self.log_lines()[-1]["outcome"], "refused before sending: no sender")
+        for source in ("", "  ", "send.py in ", None):
+            with (self.subTest(source=source), redirect_stderr(io.StringIO()) as errors,
+                  redirect_stdout(io.StringIO()), mock.patch.object(silence, "on_mac", return_value=False)):
+                if source is None:
+                    code, form = self.run_send(["--text-id", "nate.adhoc", "--user-asked",
+                                                "--value", "sender=", "--value", "title=Ready",
+                                                "--value", "description=The build passed."])
+                    self.assertEqual((code, form), (2, {}))
+                else:
+                    code = pushover.post_message(source, "2", "t", "Action: run it\nm", self.keys,
+                                                 mock.Mock(side_effect=AssertionError("posted without a sender")), "")
+                    self.assertEqual(code, 2)
+                self.assertIn("refused before sending: no sender", errors.getvalue())
+                self.assertEqual(self.log_lines()[-1]["outcome"],
+                                 "refused before sending: no sender" if source is not None
+                                 else "refused before sending: no sender, user asked")
 
     def test_an_unusable_sender_limit_is_logged_and_refused(self) -> None:
         _ = write_config_fixture(self.keys.parent / "notify.conf", "pushover.max_source_chars=0\n")

@@ -779,7 +779,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Ruled out:** a cap in code on the edited-crate maximum: the limit line `whole: 1..48` holds the bound.
 
-### Phase 18 — Message limit follow-ups  · status: todo
+### Phase 18 — Message limit follow-ups  · status: done
 **Depends on:** Phase 11
 
 #### Work Order

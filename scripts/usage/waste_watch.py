@@ -381,11 +381,21 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
     with closing(usage_report.open_read_store(db)) as store:
         usage_report.check_store_version(store)
         threads = thread_usage(store, start, moment)
-    max_wait_share = conf.read("waste_watch").number("alert.max_wait_share")
+    max_wait_share: float | conf.Unusable
+    try:
+        max_wait_share = conf.read("waste_watch").number("alert.max_wait_share")
+    except conf.Unusable as error:
+        # Finish context delivery before returning the config error.
+        max_wait_share = error
     # A unit needs more waiting usage than the configured share of the minimum.
-    if (sum(thread.wait_weighted for thread in threads if thread.codex_worker())
-            <= max_wait_share * MINIMUM_WEIGHTED
-            and not any(thread.context_flagged() for thread in threads)):
+    has_enough_waiting_usage = (
+        not isinstance(max_wait_share, conf.Unusable)
+        and sum(thread.wait_weighted for thread in threads if thread.codex_worker())
+        > max_wait_share * MINIMUM_WEIGHTED
+    )
+    if not has_enough_waiting_usage and not any(thread.context_flagged() for thread in threads):
+        if isinstance(max_wait_share, conf.Unusable):
+            raise max_wait_share
         return
     resolver = session_staff.RowResolver(staff.snapshot())
     lookup = registered_showrunners(resolver=resolver)
@@ -400,7 +410,7 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
     alerts = read_state(path)
     changed = False
     for usage in sorted(units.values(), key=lambda usage: usage.unit):
-        wait_alert = usage.wait_alert(max_wait_share)
+        wait_alert = not isinstance(max_wait_share, conf.Unusable) and usage.wait_alert(max_wait_share)
         if not wait_alert and not usage.context_threads():
             continue
         if not printing and alerted_recently(alerts, usage.unit, moment):
@@ -431,7 +441,14 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
         alerts[usage.unit] = moment.isoformat()
         changed = True
     if changed:
-        write_state(path, alerts)
+        try:
+            write_state(path, alerts)
+        except OSError:
+            if isinstance(max_wait_share, conf.Unusable):
+                print("waste_watch: " + " ".join(str(max_wait_share).split()), file=sys.stderr)
+            raise
+    if isinstance(max_wait_share, conf.Unusable):
+        raise max_wait_share
 
 
 class WatchArguments(argparse.Namespace):
