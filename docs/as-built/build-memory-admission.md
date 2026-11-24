@@ -251,6 +251,11 @@ An unavailable observation cannot substitute for confirmed cleanup or a settled 
 Busy, blocked, and disk refusals retain normal polling.
 A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
+An explicit `--mac-only` request waits when the Mac is busy.
+When the service refuses that request, it publishes the queue view without the waiter before it replies.
+The refused request cannot hold the Mac or take a place in the probe order.
+The service keeps the start time and host selection for the episode.
+A valid resubmission of the episode reads the Mac again.
 Before this rule, a waiting Mac step made one refused attempt each second.
 A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
@@ -2838,10 +2843,10 @@ A request that waits only for the Mac can hold its place for one probe on a busy
 This rule applies to the Mac-only route with configured order and to both forms of a Mac pin.
 The explicit `--mac-only` option can hold its place on a busy reading.
 Disk, off, and state readings do not start a hold.
-For an overlapping Mac scope, the first eligible older waiter decides the hold.
-A disk answer ends the first waiter's hold.
-A second waiter cannot start another hold against the same free reading.
-The same rule applies when the probe gives another answer or reaches its time limit.
+When a younger request reads the Mac free, the oldest eligible waiter with an overlapping scope can hold it for one probe.
+The hold ends when the probe publishes a result or reaches its time limit.
+A result ends the hold even if the probe started before the hold.
+When the hold ends, a second waiter cannot start a hold against the same free reading.
 If the probe reports free before the hold check, the same pass considers that reading for the older waiter.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
