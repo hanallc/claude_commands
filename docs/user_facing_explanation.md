@@ -87,6 +87,16 @@ Write a title that names the result for the user. Start the item body with the r
 Use three sentences or fewer. Name the user's request or what they see on screen in their words.
 State the one decision. Omit team names for the work.
 
+### Size
+
+After **The point**, give only the facts that can change the answer. Say each fact one time.
+Fit the length to the size of the decision:
+
+- A small yes or no is **The point**, three fact lines or fewer, and the choice line. `elaborate` gives the rest.
+- Use the full item template only for a design decision.
+
+Put a fact for later use, such as steps after an install, in the report after the decision.
+
 ### Item template
 
 1. **The point**
@@ -115,6 +125,20 @@ If the editor stays hidden, you cannot use it. A replacement depends on when the
 I recommend moving the current editor automatically so you can keep editing.
 
 move automatically (recommended — you can keep editing) / leave hidden / let the application replace it / elaborate
+```
+
+### Small example
+
+```markdown
+### Do you bump the newer demo build for your Mac?
+
+**The point**
+
+A newer build of your demo comes to your Mac at about 12:15 PST.
+It adds one thing that you can see: a jack that a tool blocks shows no green outline for a held plug.
+A bump brings it only some minutes sooner, and other runs then wait longer.
+
+no bump (recommended — a bump saves only some minutes) / bump / elaborate
 ```
 
 ### Reader test
