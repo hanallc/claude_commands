@@ -337,6 +337,7 @@ progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py checkpoint --session-dir <dir> --phase-id <id> --commit <full hash> --closed  # Record a missed checkpoint for a finished phase.
 progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
