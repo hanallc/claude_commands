@@ -34,6 +34,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.mac_test.claim_state import (
     WaitClaimCheck,
     claim_worktree_path,
@@ -1737,12 +1738,7 @@ def claim_host(run: RunRecord, config: MacTestConfig) -> str:
 
 
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
-    """Check every live claim once; return whether another pass may still be needed.
-
-    One activity check serves every claim on a host. It counts all of the
-    user's Mac work, since a build process cannot be traced to a repository,
-    so a claim is idle only while the Mac runs nothing at all.
-    """
+    """Check each kept mirror and share one idle check per host."""
 
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
@@ -1778,20 +1774,31 @@ def watch_claim(
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
     run = claim.record
-    if "remote_host" in run and isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now):
+    if "remote_host" in run:
+        saved = claim_state.saved_mac_repository(run)
+        origin = run.get("mac_watch_origin")
+        check_mirror = (origin is not None and isinstance(saved, claim_state.MacMirrorIdentity)
+                        and recoverable_kept_claim(run))
+        idle_expired = isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now)
+        if not check_mirror and not idle_expired:
+            return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
         from scripts.copies import copies
         from scripts.mac_test import offload
 
         with ExitStack() as lease:
             try:
-                lease.enter_context(offload.mac_cleanup_lease(
-                    claim_state.saved_mac_repository(run), run["remote_host"], paths.target))
+                if origin is None:
+                    lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target))
+                else:
+                    root = MacMirrorRoot(origin["mirror_root"])
+                    lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target, mirror_root=root))
             except copies.BusyRemoteMirror:
                 return True
             except (OSError, copies.CopyError, conf.Unusable) as error:
                 print(f"Mac claim cleanup lease unavailable: {error}", flush=True)
                 return True
-            return apply_claim_activity(paths, config, claim, activity, now, release_remote=True)
+            return apply_claim_activity(paths, config, claim, activity, now,
+                                        release_remote=True, check_mirror=check_mirror)
     return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
 
 
@@ -1802,7 +1809,7 @@ def claim_idle_expired(run: RunRecord, path: Path, config: MacTestConfig, now: d
 
 def apply_claim_activity(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
-    *, release_remote: bool,
+    *, release_remote: bool, check_mirror: bool = False,
 ) -> bool:
     """Check the saved claim again before updating or releasing it."""
     run = claim.record
@@ -1837,25 +1844,38 @@ def apply_claim_activity(
             if "idle_since" in current:
                 del current["idle_since"]
                 changed = True
-            if changed:
-                write_json(claim.path, current)
-            return True
-        if "idle_since" not in current:
+        elif "idle_since" not in current:
             current["idle_since"] = timestamp(now)
-            write_json(claim.path, current)
-            return True
+            changed = True
         if changed:
             write_json(claim.path, current)
-        if not claim_idle_expired(current, claim.path, config, now):
+        idle_release = (claim_idle_expired(current, claim.path, config, now)
+                        and ("remote_host" not in current or release_remote))
+    mirror_ended = False
+    if check_mirror:
+        try:
+            result = release_exact_claims(paths, current["pid"], claim_state.claim_identity(current), "",
+                                          watched_claim=claim, watched_idle=idle_release)
+        except (OSError, ValueError) as error:
+            result = ClaimReleaseRefused(str(error))
+        if isinstance(result, ClaimReleaseRefused):
+            if not result.idle_only:
+                if not result.fence_missing:
+                    print(f"Mac claim mirror check kept the claim: {result.reason}", flush=True)
+                return True
+            check_mirror = False
+        else:
+            print_claim_release(result)
+            mirror_ended = not result.fence_missing
+    if not check_mirror:
+        if not idle_release:
             return True
-        if "remote_host" in current and not release_remote:
+        release = CliArguments()
+        release.pid, release.target = current["pid"], paths.target
+        release.claim_id = current["claim_id"]
+        release.episode, release.attempt = current["episode"], current["attempt"]
+        if command_release(release, paths) != 0:
             return True
-    release = CliArguments()
-    release.pid, release.target = current["pid"], paths.target
-    release.claim_id = current["claim_id"]
-    release.episode, release.attempt = current["episode"], current["attempt"]
-    if command_release(release, paths) != 0:
-        return True
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
     quoted_worktree = "'" + current["worktree"].replace("'", "'\"'\"'") + "'"
@@ -1863,10 +1883,12 @@ def apply_claim_activity(
     if "remote_host" in current:
         quoted_host = "'" + current["remote_host"].replace("'", "'\"'\"'") + "'"
         remote_argument = f" --remote {quoted_host}"
+    reason = ("the run left its mirror" if mirror_ended
+              else f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes")
     text = (
         f'Your Mac claim "{current["what"]}" '
         + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
-        + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
+        + f"{reason}, so tests waiting for it can run. "
         + "Claim it again before your next Mac command: "
         + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
         + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
@@ -2637,18 +2659,22 @@ class ClaimsReleased:
 
     count: int
     transfers: tuple[transfer_bytes.TransferBytes, ...]
+    fence_missing: bool = False
 
 
 @dataclass(frozen=True)
 class ClaimReleaseRefused:
     """The reason explains why the claim release was refused."""
     reason: str
+    fence_missing: bool = False
+    idle_only: bool = False
 
 
 def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
     return (claim_owner(current) == claim_owner(record)
             and current.get("remote_host") == record.get("remote_host")
             and current.get("mac_repository") == record.get("mac_repository")
+            and current.get("mac_watch_origin") == record.get("mac_watch_origin")
             and current.get("slot") == record.get("slot"))
 
 
@@ -2657,6 +2683,7 @@ def release_exact_claims(
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
     finish_wait: bool = False,
     release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    watched_claim: HeldClaim | None = None, watched_idle: bool = False,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2672,15 +2699,18 @@ def release_exact_claims(
         # Each file is read alone, so another repository's damaged record
         # cannot keep this owner's claim in place.
         owned: list[tuple[Path, RunRecord]] = []
-        for path in claim_files(paths):
+        for path in claim_files(paths) if watched_claim is None else (watched_claim.path,):
             try:
                 record = read_run(path)
             except StateReadError:
                 continue
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
                 owned.append((path, record))
+        if watched_claim is not None and (not owned or not same_cleanup_claim(owned[0][1], watched_claim.record)):
+            return ClaimReleaseRefused("the exact claim changed before release")
     transfers: list[transfer_bytes.TransferBytes] = []
     retired: set[Path] = set()
+    fence_missing = False
     for path, record in owned:
         if path in retired:
             continue
@@ -2699,7 +2729,8 @@ def release_exact_claims(
             fence_pending = pending.exists()
             count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
                             and isinstance(remote_work, EndStoppedWork))
-            if "remote_host" in record and (fence_pending or count_legacy):
+            if "remote_host" in record and (fence_pending or count_legacy or watched_claim is not None):
+                scope_key = claim_state.claim_fence_scope_key(path, record)
                 if isinstance(remote_work, EndStoppedWork):
                     with nullcontext() if provider_lock_held else locked(paths.lock):
                         current = read_run(path)
@@ -2709,27 +2740,66 @@ def release_exact_claims(
                 if isinstance(remote_work, EndStoppedWork):
                     # Check stopped work before settling the fence it can hold.
                     mirror = offload.mac_cleanup_scope(saved) if paths.platform == "macos" else remote_work.repository
-                    command = offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1) + "\n"
+                    fence = (offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
+                             if fence_pending and paths.platform == "macos" else None)
+                    slot = record.get("slot", 0) or 1
+                    command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence)
+                               if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
                     command = ""
-                if fence_pending:
-                    command += offload.start_fence_command(identity, paths.target, settle=True,
-                        scope_key=claim_state.claim_fence_scope_key(path, record)) + "\n"
-                if isinstance(remote_work, KeepRemoteWork):
+                origin = record.get("mac_watch_origin")
+                if watched_claim is not None:
+                    if origin is None or not isinstance(saved, claim_state.MacMirrorIdentity):
+                        return ClaimReleaseRefused("the saved Mac or mirror is unavailable", idle_only=True)
+                    machine_id = origin["machine_id"]
+                    root = MacMirrorRoot(origin["mirror_root"])
+                    fence = offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
+                    observation = offload.leftover_check_script(offload.mac_cleanup_scope(saved), paths.target,
+                                                                fence=fence, observe=True, mirror_root=root)
+                    command = offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
+                        report_holders=True, leftover_observation=(observation, connection.leftover_timeout_s, machine_id))
+                elif fence_pending:
+                    command += offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
+                                                         report_holders=paths.platform == "macos") + "\n"
+                if watched_claim is None and isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
                                                   release_deadline=release_deadline)
+                if watched_claim is not None and origin is not None:
+                    machine_id = origin["machine_id"]
+                    key = claim_state.pending_start_key(identity)
+                    lines = observed.output.splitlines()
+                    identity_reply = "dispatch_mac_id="
+                    if len(lines) == 1 and lines[0].startswith(identity_reply):
+                        reported_id = lines[0].removeprefix(identity_reply)
+                        if not reported_id:
+                            return ClaimReleaseRefused("the Mac identity is unavailable", idle_only=True)
+                        actual = claim_state.mac_machine_id(reported_id)
+                        if actual is not None and actual != machine_id:
+                            return ClaimReleaseRefused("the Mac identity changed", idle_only=True)
+                    prefix = [identity_reply + machine_id, "leftovers=0", "rc=0"]
+                    fence_missing = (isinstance(observed.result, offload.LeftoversEnded)
+                                     and lines == [*prefix, f"dispatch_start_missing={key}"])
+                    if fence_missing:
+                        if not watched_idle:
+                            return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
+                    elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
+                        reason = offload.start_fence_reason(identity, observed.output)
+                        return ClaimReleaseRefused(reason or "the mirror check gave no answer")
+                elif fence_pending:
+                    reason = offload.start_fence_reason(identity, observed.output)
+                    if reason is not None:
+                        return ClaimReleaseRefused(reason)
                 if not isinstance(observed.result, offload.LeftoversEnded):
                     return ClaimReleaseRefused("the remote work of the claim has not ended")
-                if fence_pending and ("dispatch_start_settled=" + offload.pending_start_key(identity)
-                                      not in observed.output.splitlines()):
-                    return ClaimReleaseRefused("the remote start fence remains unconfirmed")
             with nullcontext() if provider_lock_held else locked(paths.lock):
                 if isinstance(release_deadline, offload.ClaimReleaseDeadline) and release_deadline.remaining() <= 0:
                     return ClaimReleaseRefused("the claim release deadline expired")
                 # The watcher can update its fields during cleanup.
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                    return ClaimReleaseRefused("the exact claim changed during cleanup")
+                if watched_claim is not None and not same_cleanup_claim(current, watched_claim.record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
                 try:
                     retired.update(claim_state.retire_replaced_reservation(paths, path, current))
@@ -2745,7 +2815,12 @@ def release_exact_claims(
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
         start_watcher(paths)
-    return ClaimsReleased(len(owned), tuple(transfers))
+    return ClaimsReleased(len(owned), tuple(transfers), fence_missing=fence_missing)
+
+
+def print_claim_release(released: ClaimsReleased) -> None:
+    if released.transfers:
+        print("copy_bytes=" + json.dumps(list(released.transfers)))
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False,
@@ -2763,8 +2838,7 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12
-    if released.transfers:
-        print("copy_bytes=" + json.dumps(list(released.transfers)))
+    print_claim_release(released)
     return 0
 
 
