@@ -4022,6 +4022,11 @@ window.fetch=async(_path,options={})=>{
                                               "Review the weekly figures.")
                 tokyo_item = the_list.add(MORTY.id, "Review the Tokyo schedule", owner=OWNER.id, source="nate",
                                           changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo})
+                tokyo_series = the_list.ScheduledSeries(tokyo, repeat_rule.parse("FREQ=WEEKLY;BYDAY=TU"),
+                                                        runs_before=1)
+                for number in range(17, 21):
+                    _ = the_list.add(MORTY.id, f"Edit the Tokyo series for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo_series})
                 evaluate(r"""
 (async () => {
  window.refreshSchedules=()=>new Promise(resolve=>{
@@ -4045,7 +4050,7 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,advanceRun=false}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,advanceRun=false}={})=>{
   let posted;
   let readback;
   const send=window.fetch;
@@ -4072,16 +4077,22 @@ window.fetch=async(_path,options={})=>{
    const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
    dialog.querySelector('[data-done]').click();
    await closed;
-   if(rule) check(!status.textContent,status.textContent);
+   if(rule || date) check(!status.textContent,status.textContent);
   }
   const result=await response;
   if(!advanceRun) check(!result.reason,result.reason);
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
-  if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
+  if(date) check(posted.get('until')===date,'The edit sends the selected instant.');
+  if(date && !rule) check(!posted.has('repeat'),'The move keeps the saved repeat rule.');
   if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
    'The edit sends only the instruction for the selected scope.');
-  if(rule) check(posted.get('repeat')===rule && !posted.get('until'),
-   'The rule change uses the start of the displayed run.');
+  if(rule) check(posted.get('repeat')===rule && (date || !posted.get('until')),
+   'The edit sends the new repeat rule and only the selected date.');
+  if(repeatZone){
+   const detail=new DOMParser().parseFromString(result.detail_html,'text/html');
+   const fields=detail.querySelector('[data-schedule-template]').content.firstElementChild;
+   check(fields.dataset.repeatZone===repeatZone,'The saved rule uses the expected time zone.');
+  }
   await new Promise(resolve=>{
    const sent=()=>!form.dataset.sending;
    const observer=new MutationObserver(()=>{if(sent()){observer.disconnect();resolve();}});
@@ -4139,6 +4150,15 @@ window.fetch=async(_path,options={})=>{
   [1,'park','following',{instruction:'Compare the remaining predictions.'}],
   [1,'park','following',{repeat:'custom',rule:'FREQ=WEEKLY;BYDAY=TU',note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
   [16,'park',null,{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',note:'Weekly on Monday · next Nov 30 10:30 EST'}],
+  [17,'park','following',{instruction:'Use the updated figures.',repeatZone:'Asia/Tokyo',
+   note:'Weekly on Tuesday · next Nov 30 10:30 EST'}],
+  [18,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',repeatZone:'Asia/Tokyo',
+   note:'Weekly on Tuesday · next Nov 30 11:00 EST'}],
+  [19,'park','following',{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
+   note:'Weekly on Monday · next Nov 30 10:30 EST'}],
+  [20,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',
+   repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
+   note:'Weekly on Monday · next Nov 30 11:00 EST'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
   [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
@@ -4150,7 +4170,8 @@ window.fetch=async(_path,options={})=>{
   const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
   if(options.date || options.instruction || options.repeat || (action==='park' && options.advanceRun)){
    form.querySelector('[data-later-toggle]').click();
-   if(options.date) pickDate(form,'2026-12-01');
+   if(options.wall){form.elements.until.value=options.wall;edit(form.elements.until);}
+   else if(options.date) pickDate(form,'2026-12-01');
    if(options.instruction){words(form).value=options.instruction;edit(words(form));}
    if(options.repeat){
     const select=form.querySelector('[data-repeat]');
@@ -4167,7 +4188,7 @@ window.fetch=async(_path,options={})=>{
    }
   }
   await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);
-  if(options.instruction && scope==='following')
+  if(number===1 && options.instruction && scope==='following')
    check(row(number).querySelector('[data-scheduled-note]').textContent.endsWith('Dec 1 09:00 EST'),
     'The instruction edit keeps the moved start.');
   if(options.note)

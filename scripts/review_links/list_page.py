@@ -473,8 +473,15 @@ def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
     words = ""
     if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
         series = schedule.series
-        origin = series.first.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        first = series.first.start
+        origin = first.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
         attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
+        if isinstance(first.tzinfo, ZoneInfo):
+            attributes += f' data-repeat-zone="{html.escape(first.tzinfo.key, quote=True)}"'
+        else:
+            offset = first.utcoffset()
+            assert offset is not None
+            attributes += f' data-repeat-offset="{offset.total_seconds():g}"'
         words = series.first.words
     if isinstance(schedule, UpcomingSeriesRun):
         attributes += f' data-run="{schedule.selected.number}"'
@@ -1944,7 +1951,8 @@ function bindScheduleFields(form,until,zone,draft,edit){
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[for="'+select.id+'"]');
- const {start='',rule='',repeatStart,revision}=panel.dataset,number=Number(panel.dataset.run || 0);
+ const {start='',rule='',repeatStart,repeatZone,repeatOffset,revision}=panel.dataset;
+ const number=Number(panel.dataset.run || 0);
  const savedWords=words.value;
  const currentDraft=draft?.revision===revision && draft.number===number ? draft : undefined;
  until.value=currentDraft?.until ?? start;
@@ -2012,18 +2020,20 @@ function bindScheduleFields(form,until,zone,draft,edit){
    const base={number,revision,scope:'',repeat:undefined,words:text,startChanged};
    if(action!=='schedule' || !repeatEdited) return base;
    const repeat=choice==='custom' ? customRule : at ? preset(at,choice) : '';
-   return {...base,repeat:repeat===rule ? undefined : repeat};
+   const sameRule=repeat===rule && (!rule || repeatZone===zone);
+   return {...base,repeat:sameRule ? undefined : repeat};
   },
   applySeriesRepeat:data=>{
    if(data.scope==='this' || (!data.startChanged && data.repeat===undefined)) return true;
-   const at=scheduleDate(data.startChanged ? until.value : start);
-   if(!at) return true;
-   if(!repeatEdited && data.startChanged && choice!=='custom'){
-    const repeat=preset(at,choice);
-    if(repeat!==rule) data.repeat=repeat;
-   }
    const nextRule=repeatParts(data.repeat ?? rule);
-   if(nextRule.FREQ==='WEEKLY' && nextRule.BYDAY && !nextRule.BYDAY.split(',').includes(at.weekday)){
+   if(nextRule.FREQ!=='WEEKLY' || !nextRule.BYDAY) return true;
+   const epoch=dateTimeDraftEpoch(zone,data.startChanged ? until.value : start);
+   if(!Number.isFinite(epoch)) return true;
+   const day=data.repeat!==undefined ? dateInZone(zone,epoch)
+    : repeatZone ? dateInZone(repeatZone,epoch)
+    : new Date(epoch+Number(repeatOffset)*1000).toISOString().slice(0,10);
+   const weekday=weekdays[new Date(day+'T00:00:00Z').getUTCDay()];
+   if(!nextRule.BYDAY.split(',').includes(weekday)){
     status.textContent='The start date must fall on a selected repeat day.';
     return false;
    }

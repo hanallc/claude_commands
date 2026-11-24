@@ -320,6 +320,10 @@ class TheListTests(unittest.TestCase):
                                         repeat_rule.parse("FREQ=DAILY;COUNT=5"))
         tokyo_first = datetime(2026, 11, 24, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
         tokyo_second = tokyo_first + timedelta(days=7)
+        later_in_tokyo = tokyo_second.replace(hour=1, minute=0)
+        ny_start = "2026-11-30T11:00:00-05:00[America/New_York]"
+        between_runs = tokyo_first + timedelta(days=1)
+        new_repeat = ("--repeat", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU")
         weekly = the_list.ScheduledSeries(the_list.ScheduledRun(tokyo_first, old_words),
                                          repeat_rule.parse("FREQ=WEEKLY;BYDAY=TU"))
         moved_run = the_list.RunException(2, the_list.ScheduledRun(moved, old_words))
@@ -333,9 +337,18 @@ class TheListTests(unittest.TestCase):
              "Repeats: Daily"),
             (replace(daily, exceptions=(moved_run,)), second + timedelta(minutes=30),
              ("--repeat", ""), the_list.ScheduledRun(moved, new_words), "Does not repeat"),
-            (weekly, tokyo_first + timedelta(days=1), ("--repeat", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU"),
+            (weekly, between_runs, new_repeat,
              ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=14), new_words)),
              "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (*new_repeat, "--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=14), new_words)),
+             "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (),
+             ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
+            (weekly, between_runs, ("--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
         ):
             with self.subTest(scope="following", exceptions=schedule.exceptions, repeat_options=repeat_options):
                 item = self.add(changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
