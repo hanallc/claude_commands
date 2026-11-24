@@ -294,7 +294,14 @@ Each producer uses its own tab in the `producers` workspace of the shared herdr 
 `restart.producer_launch(row)` resumes `row.current_session` with the producer's configured settings.
 `restart.producer_resume(row, entry)` preserves saved launch options through `pane_record.configured_resume_arguments`.
 It takes the family, model, and effort from the current producer settings.
-`pane_launch` reads `--effort` as an option with a value.
+`pane_launch` reads `--effort` and `--autocompact` as options with a value.
+
+Claude launches use the auto-compact window for producer, showrunner, unit, or worker from `[compact_windows]` in `config/models.conf`.
+The role window applies on start, restart, account move, relaunch, transfer, and resume.
+The unit session's recorded window takes precedence over its role setting.
+An absent key or the value `auto` leaves the window to Claude.
+The context hook reads the nearest Claude ancestor's window first.
+It then checks `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `autoCompactWindow` in `settings.json`, in that order.
 
 When the configured family matches the current session, a named resume uses that session.
 When the family changes, `stop_resume._resume_once` uses the first-start path.

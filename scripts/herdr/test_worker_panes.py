@@ -1644,11 +1644,13 @@ class WorkerPaneTests(StaffTestCase):
     def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
         for family in ("codex", "claude"):
             with self.subTest(family=family):
-                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                _ = write_registry(self.root / "conf/models.conf", {
+                    "assignments": {"direct": family}, "compact_windows": {"worker": "200k"}})
                 first = self.start("folder-" + family)
                 self.assertIsInstance(first, worker_panes.OpenWorker)
                 assert isinstance(first, worker_panes.OpenWorker)
                 self.assertNotIn("--cd", self.world.requests[-1][1])
+                first_arguments = self.world.requests[-1][1]
                 self.world.end_agent(first.pane)
                 resumed = self.start(first.row.name)
                 self.assertIsInstance(resumed, worker_panes.OpenWorker)
@@ -1659,9 +1661,14 @@ class WorkerPaneTests(StaffTestCase):
                 if family == "codex":
                     self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
                     self.assertEqual(arguments[arguments.index("--cd") + 1], str(self.root))
+                    self.assertNotIn("--autocompact", first_arguments)
+                    self.assertNotIn("--autocompact", arguments)
                 else:
                     self.assertEqual(arguments[:2], ["--resume", str(first.row.current_session)])
                     self.assertNotIn("--cd", arguments)
+                    for launch in (first_arguments, arguments):
+                        self.assertEqual(launch.count("--autocompact"), 1)
+                        self.assertEqual(launch[launch.index("--autocompact") + 1], "200k")
 
     def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})

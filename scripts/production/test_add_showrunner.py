@@ -41,6 +41,7 @@ from scripts.production import completion_receipt
 from scripts.production.fake_unit_host import process as write_process
 from scripts.lib import operation_deadline, script_prompts
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -73,15 +74,19 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         self.assertIsNone(staff.initial_snapshot().by_path("demo"))
         identity = fixture_runtime_id("fresh-Claude-showrunner")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
+        models = write_registry(self.root / "models.conf", {"compact_windows": {"showrunner": "250k"}})
         with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", side_effect=backend.launch)):
-            outcome = add_showrunner.launch(child, "fixture", "high", None, self.root,
-                accounts.NamedAccount("claude1", backend.configuration))
+            with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models), "MODELS_LAUNCH_CONFIGURATION": ""}):
+                outcome = add_showrunner.launch(child, "fixture", "high", None, self.root,
+                    accounts.NamedAccount("claude1", backend.configuration))
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
         row = backend.before_opening.by_id(staff.StaffId(identity))
         assert row is not None
         self.assertEqual((row.id, row.name, row.parent), (identity, "demo", staff.StaffRoot()))
         self.assertNotIn("--session-id", backend.arguments)
         self.assertNotIn("--resume", backend.arguments)
+        self.assertEqual(backend.arguments.count("--autocompact"), 1)
+        self.assertEqual(backend.arguments[backend.arguments.index("--autocompact") + 1], "250k")
         self.assertNotIn("STAFF_ID", backend.environment)
 
 

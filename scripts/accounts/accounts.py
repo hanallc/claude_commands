@@ -1729,8 +1729,9 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
     try:
         program = resolve_program("claude", environment=environment)
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
+            _ = environment.pop(models_registry.OPERATION_ENVIRONMENT[1], None)
             os.execvpe(str(SCRIPTS / "lib" / "py"), [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", program, *arguments], models_registry.agent_environment(environment))
+                                      "run", "--", program, *arguments], environment)
         else:
             arguments = models_registry.claude_arguments(arguments, environment)
             os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))

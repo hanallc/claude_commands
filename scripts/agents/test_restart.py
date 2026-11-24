@@ -49,7 +49,7 @@ from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
-from scripts.lib import conf, file_lock, unit_runs, resume_message
+from scripts.lib import conf, file_lock, models_registry, unit_runs, resume_message
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
@@ -3491,6 +3491,43 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], row.name)
         self.assertFalse(entry["remote_control"])
 
+    def test_claude_launches_and_restarts_get_their_role_compact_window(self) -> None:
+        _ = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {"compact_windows": {"producer": "300000"}}, update=True)
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root), {},
+                                   ["claude", "--resume", str(row.current_session), "--autocompact", "200000"])
+        launches = {"first start": restart.producer_first_arguments(row.name)[1],
+                     "start without a saved launch": restart.producer_launch(row)[2],
+                     "restart or move": restart.producer_resume(row, entry)[2]}
+        for path, arguments in launches.items():
+            with self.subTest(path=path):
+                self.assertEqual(arguments.count("--autocompact"), 1)
+                self.assertEqual(arguments[arguments.index("--autocompact") + 1], "300000")
+                self.assertFalse(pane_record.parse_claude_arguments(["claude", *arguments]).has_prompt)
+        codex = replace(row, name="probe-codex")
+        self.assertNotIn("--autocompact", restart.producer_first_arguments(codex.name)[1])
+        unit = pane_record.launch("w1:p1", str(self.rows[1].current_session), str(self.root), {},
+                                  ["claude", "--resume", str(self.rows[1].current_session), "-n", self.rows[1].name])
+        self.assertNotIn("--autocompact", restart._saved_launch(unit, str(self.rows[1].current_session),  # pyright: ignore[reportPrivateUsage]
+                                                                 self.rows[1].name)[2])
+        _ = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {"compact_windows": {"unit": "250k"}}, update=True)
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            arguments = restart._saved_launch(unit, str(self.rows[1].current_session),  # pyright: ignore[reportPrivateUsage]
+                                              self.rows[1].name)[2]
+        self.assertEqual(arguments[arguments.index("--autocompact") + 1], "250k")
+
+        registry = Path(os.environ["MODELS_CONFIG_FILE"])
+        _ = write_registry(registry, {"compact_windows": {"producer": "30k"}}, update=True)
+        for attempt in range(2):
+            with (self.subTest(attempt=attempt), redirect_stderr(io.StringIO()) as errors,
+                  patch.object(models_registry, "registry_text", wraps=models_registry.registry_text) as read):
+                arguments = restart.producer_resume(row, entry)[2]
+            read.assert_called_once_with(registry)
+            self.assertNotIn("--autocompact", arguments)
+            self.assertEqual(errors.getvalue().splitlines(), [
+                f"anomaly: {registry}: compact_windows.producer: --autocompact 30k is outside 100k to 1M. "
+                + "Use the settings.json window."])
+
     def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
         target = self.root / ".claude2"
         before = (target / ".claude.json").read_text()
@@ -3863,8 +3900,10 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.running.clear()
         record = staff.StaffSnapshot((*self.rows, foreign))
 
-        def resume(row: staff.StaffRow, entry: pane_record.PaneLaunch) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-            del entry
+        def resume(row: staff.StaffRow, entry: pane_record.PaneLaunch, *,
+                   configuration: models_registry.LaunchModelConfiguration | None = None
+                   ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+            del entry, configuration
             return restart.producer_launch(row)
 
         _ = self.enterContext(patch.object(restart, "producer_resume", side_effect=resume))

@@ -86,12 +86,14 @@ class LiveAccountUnproved(ResumeFailed):
 
 class RowStarter(Protocol):
     def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
-                  target_account: str | accounts.AccountSelection) -> str: ...
+                  target_account: str | accounts.AccountSelection,
+                  configuration: models_registry.LaunchModelConfiguration | None = None) -> str: ...
     def session_launch(self, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
-    def producer_launch(self, row: StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
-    def producer_resume(self, row: StaffRow, entry: pane_record.PaneLaunch
+    def producer_resume(self, row: StaffRow, entry: pane_record.PaneLaunch, *,
+                        configuration: models_registry.LaunchModelConfiguration | None = None
                         ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
-    def producer_first_arguments(self, name: str) -> tuple[Literal["claude", "codex"], list[str]]: ...
+    def producer_arguments(self, name: str, settings: models_registry.LaunchSettings,
+                           configuration: models_registry.LaunchModelConfiguration) -> list[str]: ...
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,7 @@ class ProducerFamilyChange(ProducerFirstStart):
     kind: Literal["claude", "codex"]
     client: herdr.Herdr
     pane: herdr.PaneIdentity | herdr.NoPane
+    configuration: models_registry.LaunchModelConfiguration
 
 
 def _producer_admission_path(name: str) -> Path:
@@ -387,13 +390,13 @@ def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str, why: 
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
         if row is None:
-            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client,
+            return _first_producer_resume(request, to=to, client=client,
                                           opening=opening, marker=marker, resend_opening=resend_opening)
         with staff.row_operation(str(row.id)):
             if not path.exists() and isinstance(opening, herdr.NoOpeningPrompt) and (not isinstance(request, ProducerFamilyChange)
                                       or row.current_session != request.session):
                 return _resume(str(row.id), to=to, why=why, requester=requester, client=client)
-            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, member=row,
+            return _first_producer_resume(request, to=to, client=client, member=row,
                                           opening=opening, marker=marker, resend_opening=resend_opening)
 
 
@@ -509,7 +512,7 @@ def _check_producer_admission_account(pending: PendingProducerAdmission, to: str
             raise ValueError("pending producer admission uses another account; complete its admission before an account move")
 
 
-def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProducerOpening | herdr.NoOpeningPrompt, to: str, why: str, requester: str,
+def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProducerOpening | herdr.NoOpeningPrompt, to: str,
                            marker: producer_creation.Marker | None, resend_opening: bool,
                            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            member: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW) -> ResumeResult:
@@ -521,13 +524,14 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
                 raise ValueError(f"producer README is unavailable. Run {producer_creation.retry(request.name)}.")
             raise ValueError(f"producer README is unavailable: {request.folder / 'README.md'}")
         starter = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-        kind, arguments = starter.producer_first_arguments(request.name)
+        configuration = (request.configuration if isinstance(request, ProducerFamilyChange)
+                         else models_registry.launch_snapshot())
+        settings = models_registry.launch_settings("producers", request.name, configuration=configuration)
+        kind = settings.kind
         client = herdr.Herdr(herdr.shared_session()) if isinstance(client, herdr.LaunchClientSource) else client
         path = _producer_admission_path(request.name)
         recovering_admission = path.exists()
         if isinstance(request, ProducerFamilyChange) and not recovering_admission:
-            if kind == request.kind:
-                return _resume(request.session, to=to, why=why, requester=requester, client=client)
             _ = member_account.producer_account(kind, to=to)
             _stop_producer_for_family_change(request)
         conflicts = producer_conflicts(request.name, client)
@@ -606,14 +610,16 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             retained = pane_record.read_strict(client.session).get(pending.pane)
             if retained is not None:
                 arguments = pane_record.configured_resume_arguments(retained, pane_record.resume_launch(retained)["session_id"], request.name,
-                    models_registry.launch_settings("producers", request.name))
+                    settings, configuration=configuration)
                 live = herdr.read_conversation(pane_record.resume_launch(retained)["session_id"], kind)
                 if not isinstance(live, herdr.StoppedConversation):
                     raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
-            elif isinstance(member, staff.StaffRow) and isinstance(opening, PendingProducerOpening):
-                _, _, arguments = starter.producer_launch(member)
-                if not isinstance(herdr.read_conversation(member.current_session, kind), herdr.StoppedConversation):
-                    raise ValueError("the admitted producer conversation is not proved stopped")
+            else:
+                arguments = starter.producer_arguments(request.name, settings, configuration)
+                if isinstance(member, staff.StaffRow) and isinstance(opening, PendingProducerOpening):
+                    arguments[:0] = ["resume" if kind == "codex" else "--resume", str(member.current_session)]
+                    if not isinstance(herdr.read_conversation(member.current_session, kind), herdr.StoppedConversation):
+                        raise ValueError("the admitted producer conversation is not proved stopped")
             shell_setup = ":"
             if kind == "claude":
                 if recovering_admission:
@@ -628,7 +634,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
                     shell_setup = f"export {exports}"
                 herdr.trust_claude_launch(request.folder, pending.home)
                 arguments = models_registry.claude_arguments(arguments,
-                    herdr.agent_base_environment(account_reader.named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
+                    configuration.environment(herdr.agent_base_environment(
+                        account_reader.named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS)))
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
@@ -659,7 +666,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
                 document = member.doc
         row = staff.ensure("producer", name=request.name, runtime_id=identity, worktree=folder, doc=document)
         expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
-        with pane_launch.producer_launch_request(expectation):
+        with (pane_launch.producer_launch_request(expectation),
+              pane_launch.producer_publication_configuration(configuration)):
             row = pane_launch.staff_admitted(row)
         publication = pane_record.read_strict(client.session).get(pending.pane)
         if publication is None or not publication.get("producer_binding", False):
@@ -677,7 +685,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
 
 
 def _stop_producer_for_family_change(change: ProducerFamilyChange) -> None:
-    result = stop(change.session, change.kind)
+    with pane_launch.producer_publication_configuration(change.configuration):
+        result = stop(change.session, change.kind)
     if isinstance(result, StopFailed):
         raise ValueError(result.reason)
     if isinstance(result, SessionNotFound):
@@ -1295,7 +1304,8 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
     return unresolved
 
 
-def resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
+def resume_arguments(entry: pane_launch.NativePaneLaunch, *,
+                     configuration: models_registry.LaunchModelConfiguration | None = None) -> list[str]:
     names = _resume_names.get()
     if isinstance(names, LaunchNamesNotRead):
         names = LaunchNames.read()
@@ -1303,22 +1313,24 @@ def resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
     current = names.resume(entry)
     if row is not None and row.kind == "producer":
         restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-        return restart.producer_resume(row, current)[2]
+        return restart.producer_resume(row, current, configuration=configuration)[2]
     if (row is not None and row.kind == "worker" and isinstance(row.role, staff.KnownWorkerRole)
             and pane_launch.saved_kind(current) == "claude"):
         role = row.role.value
+        worker_configuration = models_registry.optional_launch_snapshot() if configuration is None else configuration
 
         def claude_role_fallback() -> pane_record.ClaudeResumeSettings:
             from scripts.herdr import worker_panes
 
-            policy = worker_panes.checked_role_policy(role, "claude")
-            if isinstance(policy, worker_panes.StartRefused):
+            try:
+                settings = worker_panes.role_launch_settings(role, "claude", worker_configuration)
+            except (OSError, ValueError, subprocess.SubprocessError):
                 return pane_record.NO_CLAUDE_RESUME_SETTINGS
-            settings = policy.launch.settings
             return pane_record.ClaudeResumeSettings(settings.model, settings.effort)
 
-        return pane_record.resume_arguments(current, claude_role_fallback=claude_role_fallback)
-    return pane_record.resume_arguments(current)
+        return pane_record.resume_arguments(current, claude_role_fallback=claude_role_fallback, record=names.tab_record,
+                                            configuration=worker_configuration)
+    return pane_record.resume_arguments(current, record=names.tab_record, configuration=configuration)
 
 
 def _pane_environment(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch) -> tuple[list[str], dict[str, str]]:
@@ -1347,7 +1359,8 @@ def _launch_home(entry: pane_launch.NativePaneLaunch) -> staff.SessionHome:
     return home
 
 
-def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str) -> list[str]:
+def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, *,
+                  configuration: models_registry.LaunchModelConfiguration | None = None) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.saved_kind(entry)
@@ -1358,14 +1371,20 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
     if kind == "codex":
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
         program = ["codex"]
+    if kind == "claude" and configuration is None:
+        configuration = models_registry.optional_launch_snapshot()
+    arguments = resume_arguments(entry, configuration=configuration)
+    if configuration is not None:
+        environment = configuration.environment(environment)
     return ["env", *(argument for key in unset for argument in ("-u", key)),
             *(f"{key}={value}" for key, value in environment.items()),
             "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
-            *program, *trust_arguments(kind, entry["cwd"], resume_arguments(entry))]
+            *program, *trust_arguments(kind, entry["cwd"], arguments)]
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch,
-                      account: str, message: str) -> Never:
+                      account: str, message: str, *,
+                      configuration: models_registry.LaunchModelConfiguration | None = None) -> Never:
     """Replace the foreground command with the saved account launch."""
     kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
@@ -1383,9 +1402,11 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = agent_program.resolve_program(kind, environment=environment)
-    arguments = resume_arguments(entry)
-    if kind == "claude":
-        arguments = models_registry.claude_arguments(arguments, environment)
+    if kind == "claude" and configuration is None:
+        configuration = models_registry.optional_launch_snapshot()
+    arguments = resume_arguments(entry, configuration=configuration)
+    if configuration is not None:
+        arguments = models_registry.claude_arguments(arguments, configuration.environment(environment))
     command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
     if message and kind == "claude":
         command.append(message)
@@ -1421,10 +1442,11 @@ def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
             time.sleep(operation_deadline.remaining(min(0.5, remaining)))
 
 
-def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
+def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str, *,
+                   configuration: models_registry.LaunchModelConfiguration | None = None) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
-    command = _pane_command(tab, entry, account)
+    command = _pane_command(tab, entry, account, configuration=configuration)
     settings = conf.read("shutdown")
     start_seconds = settings.number("START_SECONDS")
     _ = settings.number("STAY_SECONDS")
@@ -1802,9 +1824,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                         return running
                 return recovered
             entry = recovered
+        configuration = None
         if row is not None and row.kind == "producer":
-            restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            kind = restart.producer_launch(row)[0]
+            configuration = models_registry.launch_snapshot()
+            kind = models_registry.launch_settings("producers", row.name, configuration=configuration).kind
             current_kind = _producer_current_kind(row, entry)
             if isinstance(current_kind, str) and current_kind != kind:
                 request = _producer_start_request(row)
@@ -1814,7 +1837,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     old_pane = client.pane_row(tab.pane_id)
                 elif isinstance(source_pane, pane_launch.ResumeSourcePane):
                     old_pane = source_client.pane_row(source_pane.pane)
-                change = ProducerFamilyChange(request.name, request.folder, row.current_session, current_kind, source_client, old_pane)
+                change = ProducerFamilyChange(request.name, request.folder, row.current_session, current_kind,
+                                              source_client, old_pane, configuration)
                 return _locked_first_producer_resume(change, to=to or "", why=why, requester=requester, client=client)
             if entry is not None:
                 entry = names.resume(entry)
@@ -1847,7 +1871,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if row is None:
                 return SessionNotFound(session)
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
+            pane = restart.start_row(row, names.tab_record, client, target_account=to or "",
+                                     **({"configuration": configuration} if configuration is not None else {}))
             result = running_on_account(identity, pane, kind=kind)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
@@ -1958,7 +1983,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     entries[tab.pane_id] = pending
                     pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
-            _exec_in_own_pane(tab, entry, label, message)
+            _exec_in_own_pane(tab, entry, label, message,
+                              **({"configuration": configuration} if configuration is not None and kind == "claude" else {}))
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
         if kind == "codex":
             prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], herdr.NO_ENVIRONMENT_REMOVALS)
@@ -1980,7 +2006,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
                 attempt_pane = tab.pane_id
-                live = _start_session(tab, entry, label, message)
+                live = _start_session(tab, entry, label, message,
+                                      **({"configuration": configuration} if configuration is not None else {}))
             started = live
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
@@ -2603,8 +2630,7 @@ def _read_move_source(member: ResolvedMoveMember, identity: str, record: StaffSn
     try:
         publication = pane_record.publication_for_session(identity, record=record)
         if owner is not None and owner.kind == "producer":
-            restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            kind = restart.producer_launch(owner)[0]
+            kind = models_registry.launch_settings("producers", owner.name).kind
         elif publication is not None:
             kind = pane_launch.agent_kind(publication.entry, record=record)
         else:

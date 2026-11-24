@@ -18,6 +18,7 @@ from unittest.mock import patch
 from scripts.hooks import context_usage
 from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.whoami import account
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -105,6 +106,65 @@ class ContextNoticeTests(unittest.TestCase):
         for value in ("inf", "1e308m"):
             with self.subTest(value=value):
                 self.assertIsNone(context_usage.parse_window(value))
+
+    def test_configured_window_uses_the_nearest_claude_process_then_env_and_settings(self) -> None:
+        process = context_usage.ProcessRow
+        for arguments, env_window, expected in (
+            (["/bin/claude", "--autocompact", "300000"], "200k", 300_000),
+            (["node", "/lib/@anthropic-ai/claude-code/cli.js", "--autocompact=400k"], "", 400_000),
+            (["claude", "--autocompact", "auto"], "200k", 200_000),
+            (["claude"], "", 283_800),
+            (["claude", "--", "--autocompact=400k"], "", 283_800),
+            (["claude"], "bad", 283_800),
+        ):
+            table = {30: process(20, ["bash", "hook"]), 20: process(10, arguments),
+                     10: process(1, ["claude", "--autocompact", "500k"])}
+            with (self.subTest(arguments=arguments, env_window=env_window),
+                  patch.object(os, "getppid", return_value=30),
+                  patch.dict(os.environ, {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": env_window}),
+                  patch.object(context_usage, "_process_reader", return_value=table.get),
+                  patch.object(context_usage, "read_settings", return_value={"autoCompactWindow": 283_800})):
+                self.assertEqual(context_usage.configured_window(), expected)
+
+    def test_configured_window_reads_linux_proc_cmdline_through_hook_wrappers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, parent, arguments in ((30, 20, b"/bin/sh\0hook\0"),
+                                           (20, 1, b"/bin/claude\x00--autocompact\x00300k\x00")):
+                path = proc / str(pid)
+                path.mkdir()
+                _ = (path / "stat").write_text(f"{pid} (fixture) S {parent}")
+                _ = (path / "cmdline").write_bytes(arguments)
+            with (patch.object(sys, "platform", "linux"),
+                  patch.object(os, "getppid", return_value=30),
+                  patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_PLATFORM": "linux"}),
+                  patch.object(context_usage, "read_settings", side_effect=AssertionError("settings read"))):
+                self.assertEqual(context_usage.configured_window(), 300_000)
+
+    def test_configured_window_keeps_mac_argument_boundaries(self) -> None:
+        def payload(arguments: tuple[str, ...]) -> bytes:
+            return (len(arguments).to_bytes(4, sys.byteorder, signed=True)
+                    + os.fsencode(arguments[0]) + b"\0\0"
+                    + b"\0".join(os.fsencode(argument) for argument in arguments) + b"\0")
+
+        for start, options, expected in ((None, (), 283_800),
+                                         (None, ("--autocompact", "300000"), 300_000),
+                                         (20, ("--autocompact", "300000"), 300_000)):
+            arguments = ("/opt/bin/claude", "--name", "work --autocompact 100000", *options)
+            listing = "30 20 /bin/sh hook\n20 10 " + " ".join(arguments) + "\n10 1 claude --autocompact=500k\n"
+            kernel_rows = [payload(("/bin/sh", "hook")), payload(arguments)] if start is None else [payload(arguments)]
+            with (self.subTest(start=start, options=options),
+                  patch.object(sys, "platform", "darwin"),
+                  patch.object(os, "getppid", return_value=30),
+                  patch.dict(os.environ, {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "", "HERDR_PS": "ps"}),
+                  patch.object(context_usage, "read_settings", return_value={"autoCompactWindow": 283_800}),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, listing)) as processes,
+                  patch.object(account, "kern_procargs2", side_effect=kernel_rows) as kernel):
+                self.assertEqual(context_usage.configured_window(pid=start), expected)
+            processes.assert_called_once_with(["ps", "-axww", "-o", "pid=,ppid=,args="],
+                                             capture_output=True, text=True, errors="replace", check=True, timeout=2)
+            self.assertEqual([call.args for call in kernel.call_args_list],
+                             [(30,), (20,)] if start is None else [(20,)])
 
     def test_a_showrunner_is_told_to_fill_next_and_not_to_write_a_handoff(self) -> None:
         module = load_file_module(

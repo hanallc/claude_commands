@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
+from scripts.lib import models_registry
 from scripts.lib.atomic_file import write_text_atomic
 
 import io
@@ -493,7 +494,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def start_child(_child: ProductionDocument, _model: str, _effort: str, resume: str | None,
                         cwd: Path, _selected: accounts.ClaudeLaunchAccount,
                         *, identity: add_showrunner.ShowrunnerLaunch,
-                        before_prompt: Callable[[herdr.SessionTranscript], object]) -> herdr.PromptSubmitted:
+                        before_prompt: Callable[[herdr.SessionTranscript], object],
+                        configuration: models_registry.LaunchModelConfiguration) -> herdr.PromptSubmitted:
+            _ = configuration
             self.assertEqual((resume, cwd), (SESSION, self.worktree))
             self.assertEqual(identity.session_id, SESSION)
             _ = before_prompt(herdr.SessionTranscript(_selected.dir, SESSION))

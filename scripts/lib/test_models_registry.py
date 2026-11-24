@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import fcntl
+import io
 import json
 import os
 import pwd
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 from threading import Event, get_ident
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -601,6 +602,38 @@ class LaunchSettingsTests(unittest.TestCase):
         self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
         added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
         self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
+
+    def test_compact_windows_give_only_a_role_with_a_key_its_window(self) -> None:
+        _ = write_registry(self.path, {"compact_windows": {"producer": "300000"}})
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(models_registry.compact_window_arguments("producer"), ["--autocompact", "300000"])
+            for role in ("unit", "showrunner", "worker"):
+                with self.subTest(role=role):
+                    self.assertEqual(models_registry.compact_window_arguments(role), [])
+        self.assertEqual(errors.getvalue(), "")
+        _ = write_registry(self.path, {"compact_windows": {"producer": None}})
+        self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+
+    def test_a_bad_compact_window_prints_one_anomaly_and_keeps_the_settings_json_window(self) -> None:
+        for value in ("", "30k", "3e5", "-300000", "300000.5", "99999", "1000001", "large", "0300000"):
+            with self.subTest(value=value):
+                _ = write_registry(self.path, {"compact_windows": {"producer": value}})
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith(f"anomaly: {self.path}: compact_windows.producer: "), lines[0])
+                self.assertIn("--autocompact", lines[0])
+                self.assertTrue(lines[0].endswith("Use the settings.json window."), lines[0])
+        for value, expected in (("100000", "100000"), ("1000000", "1000000"), ("300K", "300k"), ("1m", "1M")):
+            with self.subTest(value=value):
+                _ = write_registry(self.path, {"compact_windows": {"producer": value}})
+                self.assertEqual(models_registry.compact_window_arguments("producer"), ["--autocompact", expected])
+        _ = write_registry(self.path, {"compact_windows": {"producer": "auto", "unknown": "300k"}})
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: {self.path}: compact_windows.unknown: no role has this name. Use producer, showrunner, unit, worker."])
 
 
 @final
