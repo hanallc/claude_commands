@@ -1747,6 +1747,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 response = {"id": saved.id, "key": created.key, "version": created.version}
+                if saved.attachment_warning:
+                    if not valid_token:
+                        self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                        return
+                    response["attachment_warning"] = saved.attachment_warning + (
+                        "\nThe item keeps the values from the first Send." if edited else "")
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
                 if list_draft_id and edited:
                     request = None
@@ -1789,12 +1795,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.json_response(409, {"code": "screenshot_expired", "error": str(error)})
             else:
                 # The dialog refreshes the token and retries the same draft.
-                self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
-            return
-        except review_submissions.SavedAttachmentMissing as error:
-            if valid_token:
-                self.json_response(409, {"code": "saved_attachment_missing", "id": error.id, "error": str(error)})
-            else:
                 self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
             return
         except review_submissions.DraftAlreadyFiled as error:
@@ -1878,7 +1878,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
 
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
-        if edited:
+        if edited and "attachment_warning" not in response:
             self.json_response(409, {
                 **response, "code": "already_filed",
                 "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",

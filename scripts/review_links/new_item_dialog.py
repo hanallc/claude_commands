@@ -1023,8 +1023,9 @@ SCRIPT = r'''(() => {
  const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
  const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
+ const closeButton = dialog.querySelector('[data-close]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
- const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
+ const fields = [...form.querySelectorAll('fieldset'), words, includePage, closeButton,
                  dialog.querySelector('[data-cancel]')];
  const listSendKey = 'console.list.pending-send';
  const submittedKey = 'console.new-item.submitted';
@@ -1212,7 +1213,7 @@ SCRIPT = r'''(() => {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   failure.definiteRefusal = response.status >= 400 && response.status < 500 && !['draft_pending', 'saved_attachment_missing'].includes(data?.code);
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
@@ -1718,17 +1719,33 @@ SCRIPT = r'''(() => {
   confirmation.textContent = scheduled
    ? ['Saved List item ' + item.id.slice(1) + '.', item.receipt?.replace(/ List item [1-9][0-9]*\.$/, ''),
       ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
-   : saved ? 'Saved ' + item.id + '.' : '';
+   : saved ? ['Saved ' + item.id + '.', item.attachment_warning].filter(Boolean).join('\n') : '';
   confirmation.hidden = savedControls.hidden = !saved;
   body.hidden = saved && !scheduled;
   sendControls.hidden = saved;
+  closeButton.hidden = Boolean(item?.attachment_warning);
   updateSend();
   if (saved) done.focus();
  }
 
- function close({sent = false} = {}) {
+ function close({sent = false, acknowledged = false} = {}) {
   if (!dialog.open || sending) return;
   const result = savedItem;
+  if (result?.attachment_warning) {
+   if (!acknowledged) return;
+   discardCapture();
+   finishDraft();
+   if (laterDraft) {
+    showConfirmation();
+    showLaterDraft();
+    showSentDetails();
+    startCapture();
+    updateSend();
+    words.focus();
+    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+    return;
+   }
+  }
   if (isEditingLater()) showSubmittedDraft(submittedDraft);
   discardCapture();
   opening.abort();
@@ -1816,9 +1833,8 @@ SCRIPT = r'''(() => {
   if (event.persisted && dialog.open) startCapture();
  });
  bindConsoleDialog(dialog, close);
- for (const control of dialog.querySelectorAll('[data-cancel], [data-done]')) {
-  control.addEventListener('click', () => close());
- }
+ dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
+ done.addEventListener('click', () => close({acknowledged: true}));
  async function submissionPayload() {
   const pending = pendingPayload();
   if (pending) return pending;
@@ -1933,7 +1949,10 @@ SCRIPT = r'''(() => {
   } finally {
    setSending(false);
   }
-  if (saved) {
+  if (saved?.attachment_warning) {
+   showConfirmation(saved);
+   dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+  } else if (saved) {
    const keepEdits = Boolean(laterDraft);
    discardCapture(usedPreview);
    finishDraft();

@@ -953,12 +953,13 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             return transfer
 
-        cases = ("same-owner", "transfer-open", "transfer-reopen", "config-reopen",
+        cases = ("same-owner", "native-recovery", "transfer-open", "transfer-reopen", "config-reopen",
                  "transfer-two-reopen", "other-damaged-reopen", "transfer-during-retry-reopen")
         for scenario in cases:
             with self.subTest(scenario=scenario):
                 case = self.review_fixture()
                 owner = case.ready_submission_recipient()
+                original_images = (new_item_dialog.PastedImage("image/png", PNG),) if scenario == "native-recovery" else ()
                 later_owner = None
                 if scenario in ("transfer-two-reopen", "other-damaged-reopen"):
                     other_doc = case.fixture.temporary / "other.md"
@@ -969,7 +970,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
                 cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
                 request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
-                                  page="list", request_id="r2-" + uuid4().hex)
+                                  page="list", request_id="r2-" + uuid4().hex, images=original_images)
                 capture_key, body = capture_body(request)
                 deliveries: list[change_page.MessageDelivery] = []
                 deliver = change_page.deliver_with_outcome
@@ -990,7 +991,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual(self.new_item_http(body, finished=True).status, 503)
                     original, = update_registration.question_records_for_owner(owner.id, strict=True)
                     send.assert_not_called()
-                    register.assert_called_once()
+                    self.assertEqual(register.call_count, 1 + len(original_images))
 
                     delivered_id = ""
                     sources = (owner,)
@@ -1073,12 +1074,21 @@ class ReviewLinksServerTests(unittest.TestCase):
                     repeated = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
 
-                    if scenario == "same-owner":
+                    if scenario in ("same-owner", "native-recovery"):
                         fields = cast(dict[str, object], json.loads(body))
                         fields["request_id"] = "r6-" + request.request_id[3:]
-                        compatible = self.new_item_http(json.dumps(fields).encode(), finished=True)
-                        self.assertEqual(compatible.status, 409, compatible.body)
-                        self.assertEqual(json.loads(compatible.body)["key"], saved["key"])
+                        for lookup in ("base draft", "base draft key") if original_images else ("base draft",):
+                            with self.subTest(lookup=lookup):
+                                earlier = review_submissions.native_origin(original)
+                                assert isinstance(earlier, new_item_dialog.ReviewSubmission)
+                                for pasted in earlier.images[:-1]:
+                                    (review_submissions.image_folder(earlier) / pasted.id / pasted.file).unlink()
+                                compatible = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                                self.assertEqual(compatible.status, 409, compatible.body)
+                                self.assertEqual(json.loads(compatible.body)["key"], saved["key"])
+                                for pasted in earlier.images[:-1]:
+                                    self.assertEqual((review_submissions.image_folder(earlier) / pasted.id / pasted.file)
+                                                     .read_bytes(), image)
                         fields["words"] = "An edit after the old List item was filed."
                         replay = self.new_item_http(json.dumps(fields).encode(), finished=True)
                         self.assertEqual(replay.status, 409, replay.body)
@@ -1111,7 +1121,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                             self.assertEqual(the_list.records(owner.id), [])
 
                     self.assertEqual(the_list.records(target.id), [])
-                    self.assertEqual(origin.images, (review_submissions.PAGE_SCREENSHOT,))
+                    expected_images = original_origin.images if original_images else (review_submissions.PAGE_SCREENSHOT,)
+                    self.assertEqual(origin.images, expected_images)
                     attachment = urlencode({"key": saved["key"], "id": review_submissions.PAGE_SCREENSHOT.id})
                     self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + attachment).body, image)
                     if scenario == "other-damaged-reopen":
@@ -1154,7 +1165,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                         f"session:{sent_to.current_session}", change_page.SENDER, sent_message(delivery, case.status),
                         key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                         recipient_key=sent_to.id)
-                    self.assertEqual(register.call_count, 2 if later_owner is not None or scenario == "config-reopen" else 1)
+                    captures = 2 if later_owner is not None or scenario == "config-reopen" else 1
+                    self.assertEqual(register.call_count, captures + len(original_images))
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_page_owner(self) -> None:
         case = self.review_fixture()
@@ -2618,7 +2630,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         png = base64.b64decode(PNG)
         maker = self.server.page_captures
-        for damage in ("file", "corrupt image", "directory", "receipt interruption", "different retry bytes", "screenshot"):
+        for damage in ("file", "corrupt image", "directory", "receipt interruption", "unreadable claimed record",
+                       "different retry bytes", "screenshot"):
             with self.subTest(damage=damage):
                 images = ((new_item_dialog.PastedImage("image/png", PNG),) if damage != "screenshot" else ())
                 attempt = replace(request, request_id="r6-" + uuid4().hex, images=images)
@@ -2630,7 +2643,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     fields["capture_key"] = key
                 with patch.object(change_page, "send_to_staff", return_value=None) as deliver:
                     with (patch.object(review_submissions, "_publish_receipt", side_effect=OSError("Receipt interrupted."))
-                          if damage == "receipt interruption" else nullcontext()):
+                          if damage in ("receipt interruption", "unreadable claimed record") else nullcontext()):
                         first = self.new_item_http(json.dumps(fields).encode(), finished=True)
                     self.assertEqual(first.status, 200, first.body)
                     saved = cast(dict[str, str], json.loads(first.body))
@@ -2641,18 +2654,31 @@ class ReviewLinksServerTests(unittest.TestCase):
                         _ = attachment.write_bytes(b"Damaged image")
                     else:
                         attachment.unlink()
+                    if damage == "unreadable claimed record":
+                        latest = investigation.folder(attempt.recipient_id) / f"{saved['id']}.md"
+                        original = latest.read_text()
+                        bad_body = original.replace('question_length:', 'damaged_question_length:', 1)
+                        _ = latest.write_text(bad_body)
+                        before = set(latest.parent.glob("I*.md"))
+                        try:
+                            retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                            self.assertEqual(retry.status, 503, retry.body)
+                            self.assertEqual(set(latest.parent.glob("I*.md")), before)
+                        finally:
+                            _ = latest.write_text(original)
                     if damage == "different retry bytes":
                         changed = new_item_dialog.PastedImage("image/png", base64.b64encode(png + b"changed").decode())
                         bad = self.new_item_http(json.dumps({**fields, "images": [asdict(changed)]}).encode(), finished=True)
                         result = cast(dict[str, str], json.loads(bad.body))
-                        self.assertEqual((bad.status, result["code"], result["id"]),
-                                         (409, "saved_attachment_missing", saved["id"]))
+                        self.assertEqual((bad.status, result["id"]), (200, saved["id"]))
+                        self.assertIn("saved pasted image", result["attachment_warning"])
+                        self.assertIn("first Send", result["attachment_warning"])
                     retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
                     result = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(result["id"], saved["id"])
                     if damage == "screenshot":
-                        self.assertEqual((retry.status, result["code"]), (409, "saved_attachment_missing"))
-                        self.assertIn("saved screenshot", result["error"])
+                        self.assertEqual(retry.status, 200, retry.body)
+                        self.assertIn("saved screenshot", result["attachment_warning"])
                     else:
                         self.assertEqual(retry.status, 200, retry.body)
                         reference = attachment.parent.name
@@ -3337,23 +3363,29 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             unrelated = next(investigation.folder(showrunner.id).glob("I*.md"))
             unrelated_list = next(the_list.folder(morty.id).glob("L*.md"))
+            read_text = Path.read_text
             read_bytes = Path.read_bytes
 
-            def read_draft_data(path: Path) -> bytes:
-                if path in (unrelated, unrelated_list):
-                    raise OSError("An unrelated record cannot be read.")
+            def deny_native_read(path: Path, *args: object, **kwargs: object) -> str:
+                if path == unrelated:
+                    raise PermissionError("An unrelated native record cannot be read.")
+                return cast(Callable[..., str], read_text)(path, *args, **kwargs)
+
+            def deny_list_read(path: Path) -> bytes:
+                if path == unrelated_list:
+                    raise PermissionError("An unrelated List item cannot be read.")
                 return read_bytes(path)
 
-            with patch.object(Path, "read_bytes", read_draft_data):
-                for kind in ("scheduled", "bug", "question", "proposal"):
-                    with self.subTest(unreadable_unrelated_record=kind):
-                        draft = "r6-" + uuid4().hex
-                        if kind == "scheduled":
-                            body = json.dumps({**scheduled, "request_id": draft}).encode()
-                        else:
-                            body = self.new_item_body(replace(bug, request_id=draft, kind=new_item_dialog.SubmissionKind(kind)))
-                        response = self.new_item_http(body, finished=True)
-                        self.assertEqual(response.status, 200, response.body)
+            for kind in ("scheduled", "question", "proposal"):
+                with (self.subTest(unreadable_unrelated_record=kind),
+                      patch.object(Path, "read_text", deny_native_read), patch.object(Path, "read_bytes", deny_list_read)):
+                    draft = "r6-" + uuid4().hex
+                    if kind == "scheduled":
+                        body = json.dumps({**scheduled, "request_id": draft}).encode()
+                    else:
+                        body = self.new_item_body(replace(bug, request_id=draft, kind=new_item_dialog.SubmissionKind(kind)))
+                    response = self.new_item_http(body, finished=True)
+                    self.assertEqual(response.status, 200, response.body)
 
             add = the_list.add
             intervening: list[str] = []
@@ -3482,8 +3514,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             write_location = review_submissions._write_location  # pyright: ignore[reportPrivateUsage]
 
-            def fail_notice_progress(path: Path, destination: review_submissions.FilingDestination
-                                     | review_submissions.ListDraftClaim | review_submissions.NativeDraftAlias) -> None:
+            def fail_notice_progress(path: Path, destination: review_submissions.FilingDestination) -> None:
                 if (path.name == "receipt.json" and isinstance(destination, review_submissions.ListItemDestination)
                         and destination.confirmed):
                     raise OSError("The notice progress write failed.")

@@ -17,7 +17,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
+from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions, serve
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -794,7 +794,8 @@ RESTORED_SEND_PROBE = r"""
  const http = window.fetch;
  let posted, expired = false;
  const captureChoice = ['renew', 'omit'].includes(scenario);
- const deferred = ['reopen', 'open', 'unconfirmed'].includes(scenario);
+ const warning = scenario === 'missing-attachment';
+ const deferred = warning || ['reopen', 'open', 'unconfirmed'].includes(scenario);
  window.fetch = async (path, options) => {
   if (path.startsWith('/console/review/new-item?capture_key=')) {
    return new Response(Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0)), {headers:{'Content-Type':'image/png'}});
@@ -813,6 +814,9 @@ RESTORED_SEND_PROBE = r"""
     if (captureChoice && !expired) {
      expired = true;
      return Response.json({code:'screenshot_expired', error:'The screenshot expired.'}, {status:409});
+    }
+    if (warning && payload.request_id === original.request_id) {
+     return Response.json({id:'I1', attachment_warning:'The saved screenshot is missing or damaged.'});
     }
     return Response.json(kind === 'scheduled'
      ? {id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.'} : {id:'I1'});
@@ -913,6 +917,18 @@ RESTORED_SEND_PROBE = r"""
      'Retry uses the chosen screenshot action for the original page.');
    } else {
     check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
+   }
+   if (warning) {
+    const done = dialog.querySelector('[data-done]');
+    const confirmation = dialog.querySelector('#new-item-saved');
+    check(confirmation.textContent === 'Saved I1.\nThe saved screenshot is missing or damaged.' &&
+          !confirmation.hidden && document.activeElement === done && send.disabled,
+          'A saved item with a missing screenshot displays a warning and asks for acknowledgment.');
+    const stored = sessionStorage.getItem('console.new-item.submitted');
+    dialog.dispatchEvent(new Event('cancel', {cancelable:true}));
+    check(dialog.open && stored && sessionStorage.getItem('console.new-item.submitted') === stored,
+          'The submitted draft stays until acknowledgment.');
+    done.click();
    }
    if (deferred) {
     check(dialog.open && !words.readOnly && words.value === 'Keep my later edit.' && recipient('builds-staff').checked,
@@ -1199,6 +1215,7 @@ const reloadAfterSend = __RELOAD_AFTER_SEND__;
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
 const probeKey = 'test-list-first-send', draftKey = 'console.list.pending-send';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+history.replaceState(null, '', '/console/list.html' + location.search);
 const posts = [], fetchHTTP = window.fetch;
 let captures = 0;
 window.fetch = async (path, options) => {
@@ -1213,9 +1230,6 @@ window.fetch = async (path, options) => {
   if (item.discard_capture) return Response.json({});
   if (item.request_id) {
    posts.push(item);
-   if (item.defer_capture) {
-    return fetchHTTP(path, {...options, body:JSON.stringify({...item, capture_key: readyKey})});
-   }
    if (!restored && posts.length === 1) {
     if (reloadAfterSend) {
      const response = await fetchHTTP(path, options);
@@ -1469,7 +1483,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             self.response(status, "application/json", json.dumps(body).encode())
 
         def fixture(self) -> DialogFixture:
-            width = urlsplit(self.headers["Referer"]).path.removeprefix("/case/")
+            width, = parse_qs(urlsplit(self.headers["Referer"]).query)["width"]
             return fixtures[int(width)]
 
         def do_GET(self) -> None:
@@ -1492,9 +1506,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 self.response(204, "image/png", b"")
             elif self.path == "/":
                 self.response(200, "text/html; charset=utf-8", outer)
-            elif address.path.startswith("/case/"):
-                width = int(address.path.removeprefix("/case/"))
-                self.response(200, "text/html; charset=utf-8", documents[width])
+            elif address.path.startswith("/case/") or address.path == "/console/list.html":
+                width, = parse_qs(address.query)["width"]
+                self.response(200, "text/html; charset=utf-8", documents[int(width)])
             else:
                 self.response(404, "text/plain", b"Unknown fixture path")
 
@@ -1534,11 +1548,22 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
                 image = fixture.screenshot if fields.get("capture_key") == CAPTURE_KEY else new_item_dialog.NO_PAGE_SCREENSHOT
+                intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT
+                if "defer_capture" in fields:
+                    key = new_item_dialog.read_capture_key(fields["capture_key"])
+                    capture = serve.deferred_capture_request(fixture.root, request.page, fields["defer_capture"])
+                    intent = new_item_dialog.DeferredCaptureIntent(key, request.request_id, capture)
                 with (patch.dict(os.environ, fixture.environment()),
                       patch.object(Path, "home", return_value=fixture.root),
                       patch.object(reply_tokens, "platform", "linux")):
-                    item = review_submissions.submit(request, screenshot=image,
-                        capture_requested=request.page == "list" and "capture_key" in fields)
+                    item = review_submissions.submit(
+                        request, screenshot=image, capture_intent=intent,
+                        capture_requested=request.page == "list" and "capture_key" in fields and "defer_capture" not in fields)
+                    if (isinstance(intent, new_item_dialog.DeferredCaptureIntent)
+                            and isinstance(intent.request, new_item_dialog.PageCaptureRequest)
+                            and isinstance(fixture.screenshot, new_item_dialog.PageScreenshot)):
+                        _ = review_submissions.attach_submission_screenshot(
+                            new_item_dialog.read_submission_key(item.key), fixture.screenshot)
             except new_item_dialog.SubmissionScreenshotExpired as error:
                 self.send_json(409, {"code": "screenshot_expired", "error": str(error)})
                 return
@@ -1666,6 +1691,14 @@ class NewItemDialogTests(unittest.TestCase):
         submission = record.submission
         assert isinstance(submission, new_item_dialog.ReviewSubmission)
         self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+        if isinstance(image, new_item_dialog.PageScreenshot):
+            intent = submission.capture_intent
+            assert isinstance(intent, new_item_dialog.DeferredCaptureIntent)
+            self.assertEqual(intent.capture_key, fixture.wire_posts[-1]["capture_key"])
+            reference, = submission.images
+            with patch.dict(os.environ, fixture.environment()):
+                attachment = review_submissions.image_folder(submission) / reference.id / reference.file
+            self.assertEqual(attachment.read_bytes(), image.png)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:
@@ -1685,13 +1718,14 @@ class NewItemDialogTests(unittest.TestCase):
                                            (1100, "bug", "builds", "open"),
                                            (1090, "bug", "builds", "unconfirmed"),
                                            (1080, "bug", "builds", "renew"),
-                                           (1040, "bug", "builds", "omit")):
+                                           (1040, "bug", "builds", "omit"),
+                                           (1000, "bug", "builds", "missing-attachment")):
             probes[width] = (RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
                              .replace("__SCENARIO__", scenario))
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in probes}
         capture_dialogs(temporary / "options.png", fixtures,
                         pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
-        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1100: [], 1090: [], 1080: [], 1040: []})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1100: [], 1090: [], 1080: [], 1040: [], 1000: []})
 
     def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()

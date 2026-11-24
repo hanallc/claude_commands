@@ -182,6 +182,7 @@ class SavedSubmission(NativeSubmissionDestination):
 
     record: NativeSubmittedRecord = field(compare=False)
     reused: bool = field(default=False, compare=False)
+    attachment_warning: str = field(default="", compare=False)
 
     @property
     def words(self) -> str:
@@ -350,18 +351,6 @@ def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ImageUpl
         atomic_file.sync_folder(folder)
 
 
-class SavedAttachmentMissing(SubmissionConflict):
-    """The saved item has an attachment that this Send cannot restore."""
-
-    def __init__(self, identity: str, reference: ImageReference) -> None:
-        if reference == PAGE_SCREENSHOT:
-            reason = f"The saved screenshot for {identity} is missing or damaged. The item is already saved."
-        else:
-            reason = f"A saved pasted image for {identity} is missing or damaged. Retry with the original image."
-        super().__init__(reason)
-        self.id: str = identity
-
-
 def _restore_saved_image(images: Path, saved: NativeSubmissionDestination, upload: _ImageUpload) -> None:
     if upload.reference != PAGE_SCREENSHOT:
         _validate_image(upload)
@@ -379,27 +368,33 @@ def _restore_saved_image(images: Path, saved: NativeSubmissionDestination, uploa
 
 
 def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmittedRecord,
-                         retry_uploads: tuple[_ImageUpload, ...], *, payload_matches: bool) -> None:
+                         retry_uploads: tuple[_ImageUpload, ...], *, payload_matches: bool) -> str:
     details = native_origin(record)
     if not isinstance(details, ReviewSubmission):
         raise OSError(f"Cannot read the native Review origin for {saved.id}.")
     images = image_folder(details)
     originals = dict(details.image_digests)
     candidates = {upload.reference: upload for upload in retry_uploads}
+    missing: list[str] = []
     for reference in details.images:
+        name = "The saved screenshot" if reference == PAGE_SCREENSHOT else "A saved pasted image"
+        warning = f"{name} is missing or damaged."
         folder = images / reference.id
         path = folder / reference.file
         metadata = folder / image_store.RECORD
         if any(entry.is_symlink() for entry in (images, folder, path, metadata)):
-            raise SavedAttachmentMissing(saved.id, reference)
+            missing.append(warning)
+            continue
         try:
             description = image_store.read_record(folder)
         except FileNotFoundError:
             description = None
-        except ValueError as error:
-            raise SavedAttachmentMissing(saved.id, reference) from error
+        except ValueError:
+            missing.append(warning)
+            continue
         if description is not None and description["file"] != reference.file:
-            raise SavedAttachmentMissing(saved.id, reference)
+            missing.append(warning)
+            continue
         digest = originals.get(reference.id)
         try:
             with path.open("rb") as stream:
@@ -420,8 +415,10 @@ def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmi
         upload = candidates.get(reference)
         matches = upload is not None and (upload.digest == digest if digest is not None else payload_matches)
         if not matches or upload is None:
-            raise SavedAttachmentMissing(saved.id, reference)
+            missing.append(warning)
+            continue
         _restore_saved_image(images, saved, upload)
+    return "\n".join(dict.fromkeys(missing))
 
 
 @dataclass(frozen=True)
@@ -469,20 +466,6 @@ class ListItemDestination:
         return self.claim.payload_hash
 
 
-@dataclass(frozen=True)
-class NativeDraftAlias:
-    """An older List page draft names a native submission."""
-
-    key: ScopedSubmissionKey
-
-
-@dataclass(frozen=True)
-class ListItemWithoutDraftDetails:
-    """The List has the item but an older save did not include its draft details."""
-
-    id: str
-
-
 class DraftAlreadyFiled(SubmissionConflict):
     def __init__(self, identity: str) -> None:
         super().__init__(f"This item was already filed as {identity}. Any change after that Send was not sent.")
@@ -503,21 +486,19 @@ class UnreadableRequestFile:
 
 _NO_REQUEST_FILE = NoRequestFile()
 type FilingDestination = NativeSubmissionDestination | ListItemDestination
-type RequestFile = FilingDestination | NativeDraftAlias | PendingFiling | ListDraftClaim | NoRequestFile | UnreadableRequestFile
+type RequestFile = FilingDestination | PendingFiling | NoRequestFile | UnreadableRequestFile
 
 
-def _list_claim(fields: dict[str, object], payload_hash: str) -> ListDraftClaim:
+def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str) -> ListItemDestination:
     keeper, assignment, readback = (fields.get(key) for key in ("keeper", "assignment", "readback"))
     warning = fields.get("notice_warning", "")
-    if fields.get("notice") == "started":
-        warning = "The assignment notice result is unconfirmed. The List item is saved."
     if not (isinstance(keeper, str) and isinstance(assignment, str) and isinstance(warning, str)
             and isinstance(readback, list)):
         raise ValueError("Invalid List draft details.")
     lines = cast(list[object], readback)
     if len(lines) != 2 or not isinstance(lines[0], str) or not isinstance(lines[1], str):
         raise ValueError("Invalid List readback.")
-    raw_notices = fields.get("notices", [])
+    raw_notices = fields.get("notices")
     if not isinstance(raw_notices, list):
         raise ValueError("Invalid List draft notices.")
     notices: list[ListAssignmentNotice] = []
@@ -526,20 +507,14 @@ def _list_claim(fields: dict[str, object], payload_hash: str) -> ListDraftClaim:
             raise ValueError("Invalid List draft notice.")
         notice = cast(dict[str, object], value)
         recipient, role, message = (notice.get(key) for key in ("recipient", "role", "text"))
-        producer_name = notice.get("producer_name", "")
+        producer_name = notice.get("producer_name")
         if (not isinstance(recipient, str) or not isinstance(message, str) or not isinstance(producer_name, str)
                 or role not in ("producer", "showrunner")):
             raise ValueError("Invalid List draft notice.")
         notices.append(ListAssignmentNotice(staff.StaffId(recipient), role, message, producer_name))
-    return ListDraftClaim(payload_hash, the_list.staff_id(keeper, "List keeper"), assignment,
-                          (lines[0], lines[1]), tuple(notices), warning)
-
-
-def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str) -> ListDraftClaim | ListItemDestination:
-    claim = _list_claim(fields, payload_hash)
+    claim = ListDraftClaim(payload_hash, the_list.staff_id(keeper, "List keeper"), assignment,
+                           (lines[0], lines[1]), tuple(notices), warning)
     identity = fields.get("id")
-    if path.name == "pending.json" and identity is None:
-        return claim
     confirmed = fields.get("confirmed", [])
     if (path.name not in ("pending.json", "receipt.json") or not isinstance(identity, str)
             or not re.fullmatch(r"L[1-9][0-9]*", identity) or not isinstance(confirmed, list)):
@@ -560,15 +535,9 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
 
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
-        alias = fields.get("alias")
-        if fields.get("destination") == "native" and isinstance(alias, str) and path.name == "receipt.json":
-            try:
-                return NativeDraftAlias(read_submission_key(alias))
-            except SubmissionError as error:
-                raise OSError(f"Cannot read the Review request file at {path}.") from error
         payload_hash = fields.get("payload_hash", fields.get("fingerprint"))
         if isinstance(payload_hash, str) and re.fullmatch(r"[0-9a-f]{64}", payload_hash):
-            if fields.get("destination") == "list" or fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
+            if fields.get("destination") == "list":
                 try:
                     return _list_request_file(path, fields, payload_hash)
                 except ValueError as error:
@@ -649,18 +618,10 @@ def _write_request_file(path: Path, fields: dict[str, object]) -> None:
     atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
 
 
-def _write_location(path: Path, destination: FilingDestination | ListDraftClaim | NativeDraftAlias) -> None:
-    if isinstance(destination, NativeDraftAlias):
-        key = destination.key
-        alias = submission_key(key.kind, key.recipient_id, key.item_id, key.request_id)
-        _write_request_file(path, {"destination": "native", "alias": alias})
-        return
-    if isinstance(destination, (ListDraftClaim, ListItemDestination)):
-        claim = destination.claim if isinstance(destination, ListItemDestination) else destination
-        fields = {"destination": "list", **claim.fields()}
-        if isinstance(destination, ListItemDestination):
-            fields.update(id=destination.id, confirmed=destination.confirmed)
-        _write_request_file(path, fields)
+def _write_location(path: Path, destination: FilingDestination) -> None:
+    if isinstance(destination, ListItemDestination):
+        _write_request_file(path, {"destination": "list", **destination.claim.fields(),
+                                   "id": destination.id, "confirmed": destination.confirmed})
         return
     fields: dict[str, object] = {"destination": "native","id": destination.id, "kind": destination.kind,
               "recipient": destination.recipient_id, "path": str(destination.path),
@@ -1105,6 +1066,8 @@ def locate_native_submission(address: SubmissionAddress, hint: RequestFile,
             break
     else:
         if not search_stores:
+            if unreadable is not None:
+                raise unreadable
             return NoNativeSubmission()
         try:
             located = _search_native_stores(address, owner, paths, staff.snapshot() if members is None else members)
@@ -1145,18 +1108,18 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
 
 
 def _saved_submission(saved: NativeSubmissionDestination, record: NativeSubmittedRecord, *,
-                      edited: bool = False) -> SavedSubmission:
+                      edited: bool = False, attachment_warning: str = "") -> SavedSubmission:
     result = EditedSubmission if edited else SavedSubmission
     return result(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
                   saved.path, saved.original_path, saved.owner, record, browser_token_digest=saved.browser_token_digest,
-                  has_capture_intent=saved.has_capture_intent)
+                  has_capture_intent=saved.has_capture_intent, attachment_warning=attachment_warning)
 
 
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: RequestFile,
                       record: NativeSubmittedRecord, *, first_send: bool = False, edited: bool = False,
                       retry_uploads: tuple[_ImageUpload, ...] = (), payload_matches: bool = False) -> SavedSubmission:
     """Verify the saved attachments before returning the receipt."""
-    _verify_saved_images(saved, record, retry_uploads, payload_matches=payload_matches)
+    attachment_warning = _verify_saved_images(saved, record, retry_uploads, payload_matches=payload_matches)
     receipt = folder / "receipt.json"
     try:
         if receipt.is_file():
@@ -1173,13 +1136,13 @@ def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: Re
         if is_draft_id(folder.name):
             indexed = _read_location_hint(_draft_index(folder), receipt_only=True)
             if indexed != saved:
-                _write_draft_index(folder, saved, filed=True)
+                _write_draft_index(folder, FiledDraft(saved))
     except OSError as error:
         if not first_send and not _has_receipt_for(saved):
             raise
         words = " ".join(str(error).splitlines())
         print(f"Review receipt for {saved.id}: {words}", file=sys.stderr)
-    return _saved_submission(saved, record, edited=edited)
+    return _saved_submission(saved, record, edited=edited, attachment_warning=attachment_warning)
 
 
 def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
@@ -1606,45 +1569,6 @@ def list_draft_evidence(request_id: str, claim: ListDraftClaim) -> str:
     return f"New item draft {request_id}\n" + json.dumps(claim.fields(), separators=(",", ":"))
 
 
-def _legacy_list_draft_record(request_id: str, members: staff.StaffSnapshot
-                       ) -> ListItemDestination | ListItemWithoutDraftDetails | UnclaimedDraft:
-    keepers = [row.id for row in staff.active(members, "producer") if row.name == "morty"]
-    if len(keepers) != 1:
-        return UnclaimedDraft()
-    keeper, = keepers
-    folder = the_list.folder(keeper)
-    marker = f"New item draft {request_id}"
-    needle = marker.encode()
-    try:
-        paths = tuple(folder.iterdir())
-    except FileNotFoundError:
-        return UnclaimedDraft()
-    for path in paths:
-        if path.suffix != ".md" or re.fullmatch(r"L[1-9][0-9]*", path.stem) is None:
-            continue
-        try:
-            if needle not in path.read_bytes():
-                continue
-        except FileNotFoundError:
-            continue
-        item = the_list.load(keeper, path.stem)
-        added = item.log[0].what
-        if not isinstance(added, the_list.FieldChange) or added.action != "Added":
-            continue
-        evidence = added.fields.get("evidence")
-        if evidence == marker:
-            return ListItemWithoutDraftDetails(item.id)
-        if isinstance(evidence, str) and evidence.startswith(marker + "\n"):
-            fields = cast(object, json.loads(evidence[len(marker) + 1:]))
-            if isinstance(fields, dict):
-                fields = cast(dict[str, object], fields)
-                digest = fields.get("payload_hash")
-                if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
-                    return ListItemDestination(item.id, _list_claim(fields, digest))
-            raise OSError(f"Cannot read the recovery details for {item.id}.")
-    return UnclaimedDraft()
-
-
 @dataclass(frozen=True)
 class UnclaimedDraft:
     """The draft has no filing claim."""
@@ -1654,107 +1578,88 @@ class UnclaimedDraft:
 class ClaimedDraft:
     """A write has a claim but no confirmed saved destination."""
 
-    destination: NativeSubmissionDestination | ListItemDestination | ListDraftClaim | PendingFiling
+    destination: FilingDestination
 
 
 @dataclass(frozen=True)
 class FiledDraft:
     """The draft names a saved item."""
 
-    destination: FilingDestination | NativeDraftAlias
+    destination: FilingDestination
 
 
-type DraftFiling = UnclaimedDraft | ClaimedDraft | FiledDraft
+@dataclass(frozen=True)
+class EarlierNativeDraftKey:
+    """The base format links a renamed browser draft to an earlier native record."""
+
+    key: ScopedSubmissionKey
+
+
+type DraftFiling = UnclaimedDraft | ClaimedDraft | FiledDraft | PendingFiling | EarlierNativeDraftKey
 
 
 def _draft_index(folder: Path) -> Path:
     return folder.parent / ".draft-index" / folder.name
 
 
-def _write_draft_index(folder: Path, destination: FilingDestination | ListDraftClaim | NativeDraftAlias,
-                       *, filed: bool = False) -> None:
+def _write_draft_index(folder: Path, filing: ClaimedDraft | FiledDraft) -> None:
     index = _draft_index(folder)
-    index.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Sync each parent before a record can refer to the indexed claim.
     _sync_draft_parents(index)
-    _write_location(index / ("receipt.json" if filed else "pending.json"), destination)
+    _write_location(index / ("receipt.json" if isinstance(filing, FiledDraft) else "pending.json"), filing.destination)
 
 
-def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> ListItemDestination | UnclaimedDraft:
+@dataclass(frozen=True)
+class NoListRecordForClaim:
+    """The selected List number has no record for this draft."""
+
+
+def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDraft | NoListRecordForClaim:
     path = the_list.folder(planned.claim.keeper) / f"{planned.id}.md"
     marker = f"New item draft {draft_id}"
     try:
         if marker.encode() not in path.read_bytes():
-            return UnclaimedDraft()
+            return NoListRecordForClaim()
     except FileNotFoundError:
-        return UnclaimedDraft()
+        return NoListRecordForClaim()
     item = the_list.load(planned.claim.keeper, planned.id)
     added = item.log[0].what
     evidence = added.fields.get("evidence") if isinstance(added, the_list.FieldChange) and added.action == "Added" else ""
-    if isinstance(evidence, str) and (evidence == marker or evidence.startswith(marker + "\n")):
+    if isinstance(evidence, str) and evidence.startswith(marker + "\n"):
         atomic_file.sync_folder(path.parent)
-        return planned
-    return UnclaimedDraft()
+        return FiledDraft(planned)
+    return NoListRecordForClaim()
 
 
-def _classify_claim(folder: Path, candidate: RequestFile,
-                    members: staff.StaffSnapshot | None) -> DraftFiling:
-    if isinstance(candidate, ListItemDestination):
-        saved = _indexed_list_record(folder.name, candidate)
-        if isinstance(saved, ListItemDestination):
-            _write_draft_index(folder, saved, filed=True)
-            return FiledDraft(saved)
-        return ClaimedDraft(candidate)
-    if isinstance(candidate, ListDraftClaim):
-        # An older claim lacks the List number. Search only to recover that claim.
-        current = staff.snapshot() if members is None else members
-        saved = _legacy_list_draft_record(folder.name, current)
-        if isinstance(saved, ListItemWithoutDraftDetails):
-            saved = ListItemDestination(saved.id, candidate)
-        if isinstance(saved, ListItemDestination):
-            _write_draft_index(folder, saved, filed=True)
-            return FiledDraft(saved)
-    if isinstance(candidate, (ListDraftClaim, NativeSubmissionDestination, PendingFiling)):
-        return ClaimedDraft(candidate)
-    if isinstance(candidate, NativeDraftAlias):
-        return FiledDraft(candidate)
-    if isinstance(candidate, UnreadableRequestFile):
-        raise candidate.error
-    return UnclaimedDraft()
-
-
-def _draft_filing(folder: Path, members: staff.StaffSnapshot | None, *, repair_index: bool = True) -> DraftFiling:
-    """Read this draft's index and repair an older or missing entry from its files."""
-    index = _draft_index(folder)
-    receipt = _read_location_hint(index, receipt_only=True)
-    if isinstance(receipt, (ListItemDestination, NativeSubmissionDestination, NativeDraftAlias)):
-        return FiledDraft(receipt)
-    pending = _read_location_hint(index)
-    if not isinstance(pending, NoRequestFile):
-        if not repair_index and isinstance(pending, (ListDraftClaim, ListItemDestination)):
-            return UnclaimedDraft()
-        return _classify_claim(folder, pending, members)
-
-    receipt = _read_location_hint(folder, receipt_only=True)
-    if isinstance(receipt, (ListItemDestination, NativeSubmissionDestination, NativeDraftAlias)):
-        if repair_index:
-            _write_draft_index(folder, receipt, filed=True)
-        return FiledDraft(receipt)
-    pending = _read_location_hint(folder)
-    if isinstance(pending, NoRequestFile):
-        try:
-            key = (folder / "list-receipt-key").read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return UnclaimedDraft()
-        alias = NativeDraftAlias(read_submission_key(key))
-        if repair_index:
-            _write_draft_index(folder, alias, filed=True)
-        return FiledDraft(alias)
-    if not repair_index and isinstance(pending, (ListDraftClaim, ListItemDestination)):
+def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
+    """Read this draft's index and repair missing entries from its files."""
+    for location in (_draft_index(folder), folder):
+        receipt = _read_location_hint(location, receipt_only=True)
+        if isinstance(receipt, (ListItemDestination, NativeSubmissionDestination)):
+            filing = FiledDraft(receipt)
+        else:
+            pending = _read_location_hint(location)
+            if isinstance(pending, NoRequestFile):
+                continue
+            if isinstance(pending, UnreadableRequestFile):
+                raise pending.error
+            if isinstance(pending, PendingFiling):
+                return pending
+            if isinstance(pending, ListItemDestination):
+                if not repair_index:
+                    return UnclaimedDraft()
+                record = _indexed_list_record(folder.name, pending)
+                filing = record if isinstance(record, FiledDraft) else ClaimedDraft(pending)
+            else:
+                filing = ClaimedDraft(pending)
+        if repair_index and (location == folder or isinstance(filing, FiledDraft) and filing.destination != receipt):
+            _write_draft_index(folder, filing)
+        return filing
+    try:
+        key = (folder / "list-receipt-key").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
         return UnclaimedDraft()
-    if repair_index and isinstance(pending, (NativeSubmissionDestination, ListItemDestination)):
-        _write_draft_index(folder, pending)
-    return _classify_claim(folder, pending, members)
+    return EarlierNativeDraftKey(read_submission_key(key))
 
 
 class ListDraftWriter(Protocol):
@@ -1767,22 +1672,19 @@ def file_list_draft(request_id: str, payload_hash: str, *,
     """Recover the first Send or file a List item under its draft lock."""
     with _locked_filing_draft(request_id) as folder:
         _sync_draft_parents(folder)
-        members = staff.snapshot()
-        filing = _draft_filing(folder, members)
-        if isinstance(filing, UnclaimedDraft):
-            candidate = filing
-        else:
-            candidate = filing.destination
-        if isinstance(candidate, NativeDraftAlias):
-            with scoped_submission(candidate.key, members=members) as item:
-                raise DraftAlreadyFiled(item.destination.id)
+        filing = _draft_filing(folder)
+        if isinstance(filing, PendingFiling):
+            raise DraftPending()
+        if isinstance(filing, EarlierNativeDraftKey):
+            raise DraftAlreadyFiled(filing.key.item_id)
+        candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
         if isinstance(candidate, NativeSubmissionDestination):
-            with _locked_request(candidate.address, members, recovered=candidate,
+            with _locked_request(candidate.address, recovered=candidate,
                                  search_owner_stores=isinstance(filing, FiledDraft)) as lookup:
                 if isinstance(lookup.native, LocatedSubmission):
                     saved_native = lookup.native.destination
                     atomic_file.sync_folder(saved_native.path.parent)
-                    _write_draft_index(folder, saved_native, filed=True)
+                    _write_draft_index(folder, FiledDraft(saved_native))
                     raise DraftAlreadyFiled(saved_native.id)
             if isinstance(filing, FiledDraft):
                 raise DraftAlreadyFiled(candidate.id)
@@ -1796,16 +1698,14 @@ def file_list_draft(request_id: str, payload_hash: str, *,
             if isinstance(local, ListItemDestination) and (local.id, local.payload_hash) == (saved.id, saved.payload_hash):
                 saved = local
         else:
-            if isinstance(candidate, PendingFiling):
-                raise DraftPending()
-            if isinstance(candidate, (ListDraftClaim, ListItemDestination)) and candidate.payload_hash != payload_hash:
+            if isinstance(candidate, ListItemDestination) and candidate.payload_hash != payload_hash:
                 raise DraftPending()
             pending = folder / "pending.json"
             try:
                 with prepare() as (claim, save):
                     def claim_number(number: int) -> None:
                         planned = ListItemDestination(f"L{number}", claim)
-                        _write_draft_index(folder, planned)
+                        _write_draft_index(folder, ClaimedDraft(planned))
                         _write_location(pending, planned)
 
                     saved = ListItemDestination(save(claim_number).id, claim)
@@ -1815,7 +1715,7 @@ def file_list_draft(request_id: str, payload_hash: str, *,
                 atomic_file.sync_folder(folder)
                 atomic_file.sync_folder(_draft_index(folder))
                 raise
-            _write_draft_index(folder, saved, filed=True)
+            _write_draft_index(folder, FiledDraft(saved))
         receipt = folder / "receipt.json"
         if not receipt.is_file():
             _write_location(folder / "pending.json", saved)
@@ -1841,7 +1741,7 @@ def _locked_browser_request(address: SubmissionAddress, members: staff.StaffSnap
                             page: str, page_recipient: new_item_dialog.PageRecipient,
                             refusal: SubmissionError | None) -> Generator[SubmissionLookup]:
     with _locked_filing_draft(address.request_id) as folder:
-        with _locked_filed_draft(folder, members, allow_alias=False) as lookup:
+        with _locked_filed_draft(folder, members) as lookup:
             if isinstance(lookup, SubmissionLookup):
                 yield lookup
                 return
@@ -1868,25 +1768,26 @@ def _locked_browser_recipient(address: SubmissionAddress, page: str, page_recipi
 
 
 @contextmanager
-def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, allow_alias: bool = True
-                        ) -> Generator[SubmissionLookup | NoNativeSubmission | NativeDraftAlias]:
+def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on_list: bool = False
+                        ) -> Generator[SubmissionLookup | NoNativeSubmission]:
     token = _browser_draft_token.get()
     recovery = isinstance(token, BrowserDraftRecoveryToken)
-    filing = _draft_filing(folder, members, repair_index=not recovery)
-    if isinstance(filing, UnclaimedDraft):
+    filing = _draft_filing(folder, repair_index=not recovery)
+    if isinstance(filing, EarlierNativeDraftKey) and not recovery:
+        if not on_list:
+            raise DraftAlreadyFiled(filing.key.item_id)
+        with scoped_submission(filing.key, members=members) as item:
+            hint = _request_hint(item.destination.address)
+            yield SubmissionLookup(hint, item, members, item.destination.address, None)
+            return
+    if not isinstance(filing, (ClaimedDraft, FiledDraft)):
         yield NoNativeSubmission()
         return
     hint = filing.destination
-    if not recovery:
-        if isinstance(filing, FiledDraft) and isinstance(hint, ListItemDestination):
+    if not recovery and isinstance(hint, ListItemDestination):
+        if isinstance(filing, FiledDraft):
             raise DraftAlreadyFiled(hint.id)
-        if isinstance(hint, (ListDraftClaim, ListItemDestination)):
-            raise DraftPending()
-        if isinstance(hint, NativeDraftAlias):
-            if not allow_alias:
-                raise DraftAlreadyFiled(hint.key.item_id)
-            yield hint
-            return
+        raise DraftPending()
     if isinstance(hint, NativeSubmissionDestination):
         # A legacy receipt has no digest to check. Recovery files nothing new.
         if recovery and hint.browser_token_digest and not hmac.compare_digest(hint.browser_token_digest, token.digest):
@@ -1965,7 +1866,12 @@ def _list_draft_replay(send: ListDraftSend, intent: new_item_dialog.SubmissionCa
             return ListDraftReplay()
         evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
         uploads = _decode_images(request.images)
-        digest = _browser_payload_hash(request, read_words(request.words, "Your words"), evidence, uploads, filing.screenshot)
+        words = read_words(request.words, "Your words")
+        if item.destination.request_id.startswith(send.request_id + "-"):
+            digest = _browser_payload_hash(request, words, evidence, uploads, filing.screenshot)
+        else:
+            earlier_id = "r2-" + send.request_id[3:]
+            digest = _fingerprint([earlier_id, request.kind, words, _image_fingerprints(uploads)])
         if isinstance(filing.screenshot, new_item_dialog.PageScreenshot):
             uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", filing.screenshot.png))
         original = item.details.capture_intent
@@ -1984,22 +1890,19 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
     if not is_draft_id(send.request_id):
         raise SubmissionError("Invalid List draft ID.")
     with _locked_filing_draft(send.request_id) as folder:
-        with _locked_filed_draft(folder, members) as lookup:
+        with _locked_filed_draft(folder, members, on_list=True) as lookup:
             if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
                 item = lookup.native
                 if item.details.page != "list":
                     raise DraftAlreadyFiled(item.destination.id)
-                _check_capture_target(capture_target, item.destination)
+                saved = item.destination
+                _check_capture_target(capture_target, saved)
                 replay = _list_draft_replay(send, capture_intent, item)
-                return _complete_receipt(folder, item.destination, lookup.hint, item.record,
-                                         edited=not (replay.payload_matches and replay.capture_matches),
+                earlier = not saved.request_id.startswith(send.request_id + "-")
+                receipt_folder = _request_folder(saved.request_id) if earlier else folder
+                return _complete_receipt(receipt_folder, saved, lookup.hint, item.record,
+                                         edited=earlier or not (replay.payload_matches and replay.capture_matches),
                                          retry_uploads=replay.uploads, payload_matches=replay.payload_matches)
-            if isinstance(lookup, NativeDraftAlias):
-                with scoped_submission(lookup.key, members=members) as item:
-                    saved = item.destination
-                    _check_capture_target(capture_target, saved)
-                    return _complete_receipt(_request_folder(saved.request_id), saved, _request_hint(saved.address),
-                                             item.record, edited=True)
         if isinstance(capture_target, ScopedSubmissionKey):
             raise SubmissionConflict("This screenshot belongs to another item.")
         filing = send.prepare()
@@ -2011,9 +1914,9 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
 
 
-def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
-                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
-    """Recover old List filings when the original words, kind, images and recipient match."""
+def _recover_pre_upgrade_native_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
+                                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
+    """Recover a native record from the base draft format."""
     legacy_id = "r2-" + address.request_id[3:]
     fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
     folder = _request_folder(f"r4-{fingerprint}")
@@ -2027,7 +1930,8 @@ def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_I
                 if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
                     continue
                 saved = item.destination
-                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
+                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
+                                         edited=True, retry_uploads=uploads, payload_matches=saved.payload_hash == fingerprint)
     return None
 
 
@@ -2081,8 +1985,6 @@ def submit(
         return _submit(request, members=members, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
-    except SavedAttachmentMissing:
-        raise
     except SubmissionError as error:
         return _recover_unverified_draft(request.request_id, members, error, capture_target=capture_target)
 
@@ -2114,14 +2016,12 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:
-        previous = _legacy_list_draft(address, words, uploads, members)
+        previous = _recover_pre_upgrade_native_draft(address, words, uploads, members)
         if previous is not None:
             _check_capture_target(capture_target, previous)
             folder = _request_folder(request_id)
             _sync_draft_parents(folder)
-            alias = NativeDraftAlias(read_submission_key(previous.key))
-            _write_draft_index(folder, alias, filed=True)
-            _write_location(folder / "receipt.json", alias)
+            atomic_file.write_text_atomic(folder / "list-receipt-key", previous.key + "\n", new_file_mode=0o600)
             return previous
     state = request.page_state
     missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
@@ -2223,7 +2123,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):
                 raise hint.error
-            if isinstance(hint, (ListItemDestination, ListDraftClaim, NativeDraftAlias)):
+            if isinstance(hint, ListItemDestination):
                 raise OSError("The draft has another destination.")
             if not browser_draft and not isinstance(hint, NoRequestFile):
                 _check_same_request(hint, request, payload_hash, draft=legacy_draft)
@@ -2269,7 +2169,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 if list_draft and saved.has_capture_intent:
                     _write_location(_request_folder(submitted_draft_id) / "list-capture-target.json", saved)
                 if browser_draft:
-                    _write_draft_index(folder, saved)
+                    _write_draft_index(folder, ClaimedDraft(saved))
                 _write_location(pending_file, saved)
                 _stage_initial_delivery(folder, address, initial_delivery)
                 destinations[:] = [saved]
