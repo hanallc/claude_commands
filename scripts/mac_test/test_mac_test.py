@@ -3657,13 +3657,19 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
 
     def check_kept_mirror(self, outcome: Literal["empty", "busy", "ssh failure", "timeout", "probe failure",
-                                                "boot changed", "fence held"]) -> None:
+                                                "boot changed", "fence held", "replacement Mac", "changed root"]) -> None:
         from scripts.copies import copies
         from scripts.mac_test import offload
 
         saved = claim_state.CleanupOnlyMacRepository("repo-key", "hana", "hana.json", "hana").for_remote_claim()
-        records = self.write_repository_claims(mac_repository=saved.record(), repo_name=saved.mirror_name,
-                                               repo_key=saved.key, proc_start="ended-owner", cleanup_pending=True)
+        boot = "31C2CDF0-B7BB-4996-A850-E5FE36B08363"
+        saved_path = offload.mac_mirror_root().relative + "/hana"
+        records = self.write_repository_claims(mac_repository={**saved.record(), "dispatch": {
+                                                   "boot_id": boot, "mirror_path": saved_path, "home": str(self.root)}},
+                                               repo_name=saved.mirror_name, repo_key=saved.key,
+                                               proc_start="ended-owner", cleanup_pending=True)
+        if outcome == "changed root":
+            _ = write_config_fixture(Path(os.environ["MAC_TEST_CONFIG"]), "mirror_root=~/new-root\n")
         path = self.paths.claims / saved.claim_file
         claim = claim_state.read_run(path)
         assert isinstance(claim, dict)
@@ -3684,16 +3690,17 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 return subprocess.CompletedProcess(arguments, 255, "", "private SSH failure")
             if outcome == "timeout":
                 raise subprocess.TimeoutExpired(arguments, cast(float, options["timeout"]))
-            mirror = "hana" if outcome == "busy" else "cargo-liner"
-            cwd = f"n{self.root}/{offload.mac_mirror_root().relative}/{mirror}"
+            mirror_path = saved_path if outcome in ("busy", "changed root") else saved_path.rsplit("/", 1)[0] + "/cargo-liner"
+            cwd = f"n{self.root}/{mirror_path}"
+            observed_boot = "other-boot" if outcome == "replacement Mac" else boot
             setup = ("id() { echo 501; }\npgrep() { return 1; }\n"
-                     + "sysctl() { echo 31C2CDF0-B7BB-4996-A850-E5FE36B08363; }\n"
+                     + f"sysctl() {{ echo {observed_boot}; }}\n"
                      + f"lsof() {{ printf 'p42\\n%s\\n' {shlex.quote(cwd)}; }}\n")
             if outcome == "probe failure":
                 setup += "lsof() { return 1; }\n"
             if outcome == "boot changed":
                 setup += ('sysctl() { if [ -f "$HOME/boot-read" ]; then echo changed; '
-                          'else touch "$HOME/boot-read"; echo original; fi; }\n')
+                          f'else touch "$HOME/boot-read"; echo {boot}; fi; }}\n')
             if outcome == "fence held":
                 with fence.open("r") as lock:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3703,6 +3710,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)), \
              mock.patch.object(subprocess, "run", side_effect=remote) as ssh, \
+             mock.patch.object(copies, "remote_lease", wraps=copies.remote_lease) as lease, \
              mock.patch.object(mac_test, "send_message") as send:
             _ = self.watch_once()
         self.assertEqual(self.read_repository_claim("cargo-liner"), records["cargo-liner"])
@@ -3712,10 +3720,36 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             self.assertFalse(fence.exists())
             send.assert_called_once()
         else:
+            self.assertTrue(path.exists(), "The watcher removed the claim.")
             self.assertEqual(self.read_repository_claim("hana"), records["hana"])
             self.assertEqual(pending.read_text(), "pending")
             send.assert_not_called()
         ssh.assert_called_once()
+        lease.assert_called_once_with(copies.RemoteMirror("", copies.SelectedRepository("hana"),
+                                                         "claim-mac", saved_path, ""))
+
+    def test_kept_mirror_stays_when_ssh_reaches_a_replacement_mac(self) -> None:
+        self.check_kept_mirror("replacement Mac")
+
+    def test_kept_mirror_checks_the_dispatch_path_when_the_root_changes(self) -> None:
+        self.check_kept_mirror("changed root")
+
+    def test_kept_mirror_without_dispatch_identity_uses_the_idle_rule(self) -> None:
+        from scripts.copies import copies
+
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "hana", "hana.json", "hana").for_remote_claim()
+        expired = mac_test.timestamp(self.now - timedelta(minutes=20))
+        records = self.write_repository_claims(mac_repository=saved.record(), repo_name=saved.mirror_name,
+                                               repo_key=saved.key, proc_start="ended-owner", idle_since=expired)
+        path = self.paths.claims / saved.claim_file
+        self.assertEqual(claim_state.read_run(path), records["hana"])
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message") as send:
+            _ = self.watch_once()
+        self.assertFalse(path.exists())
+        activity.assert_called_once()
+        send.assert_called_once()
 
     def test_kept_mirror_releases_while_another_repository_runs(self) -> None:
         self.check_kept_mirror("empty")

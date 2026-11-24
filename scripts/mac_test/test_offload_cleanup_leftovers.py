@@ -10,7 +10,7 @@ from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
@@ -55,7 +55,13 @@ class OffloadCommandTests(SeededCleanupFixture):
 
     def test_passed_doc_keeps_claim_while_remote_work_remains(self) -> None:
         result = self.doc_with_cleanup_timeout(live_work=True)
-        self.assertTrue(self.claim_file.exists())
+        claim = claim_state.read_run(self.claim_file)
+        assert not isinstance(claim, claim_state.NoRun)
+        saved = claim_state.saved_mac_repository(claim)
+        assert isinstance(saved, claim_state.MacMirrorIdentity)
+        self.assertEqual(saved.dispatch, {"boot_id": "fixture-boot",
+                                         "mirror_path": f"{offload.mac_mirror_root().relative}/{saved.mirror_name}",
+                                         "home": self.environment["HOME"]})
         self.assertEqual(len(list((self.state_directory / "pending-starts").iterdir())), 1)
         proof, = self.leftover_events()
         self.assertTrue(proof["claimed"])

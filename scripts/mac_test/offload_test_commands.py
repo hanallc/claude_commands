@@ -236,6 +236,9 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
 fi
 if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'lint clippy'* ||
       $remote == *'lint mend-check'* || $remote == *'lint doc'* ]]; then
+    if [[ $remote == *'mac_dispatch='* && -x $root/selectors/sysctl ]]; then
+        printf 'mac_dispatch=%s\t%s\n' "$("$root/selectors/sysctl")" "$HOME"
+    fi
     if (( hold_run )); then
         printf 'mac_exit=0\nfixture acknowledgement\n'
         printf 'started\n' > "$root/run-started"

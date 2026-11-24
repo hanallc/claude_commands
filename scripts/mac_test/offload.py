@@ -1080,6 +1080,7 @@ class ProcessController:
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
         self.mac_repository: claim_state.SavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY
+        self.dispatch_mirror: copies.RemoteMirror | None = None
 
     def stop(self) -> None:
         active = self.active
@@ -1272,6 +1273,31 @@ class ProcessController:
             self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
         return result
 
+    def record_mac_dispatch(self, boot_id: str, home: str) -> None:
+        """Save the identity reported by the SSH command that starts the work."""
+        mirror, saved, identity = self.dispatch_mirror, self.mac_repository, self.claim_identity
+        self.dispatch_mirror = None
+        if (mirror is None or not isinstance(saved, claim_state.MacMirrorIdentity)
+                or not isinstance(identity, claim_state.ClaimIdentity)):
+            return
+        paths = claim_state.state_paths(self.claim_target)
+        path = paths.claims / saved.claim_file
+        try:
+            dispatch = claim_state.mac_dispatch_record(
+                {"boot_id": boot_id, "mirror_path": mirror.path, "home": home}, saved.mirror_name)
+            with claim_state.locked(paths.lock):
+                record = claim_state.read_run(path)
+                if (isinstance(record, claim_state.NoRun) or "remote_host" not in record
+                        or record["remote_host"] != mirror.host or record.get("mac_repository") != saved.record()
+                        or record["pid"] != os.getpid() or claim_state.claim_identity(record) != identity):
+                    return
+                updated = replace(saved, dispatch=dispatch)
+                record["mac_repository"] = updated.record()
+                write_text_atomic(path, json.dumps(record) + "\n")
+                self.mac_repository = updated
+        except (OSError, ValueError) as error:
+            print(f"mac_test: could not save the Mac dispatch identity: {error}", file=sys.stderr, flush=True)
+
     def stream_mac_run(
         self, arguments: Sequence[str],
         cleanup_limit: CleanupAfterVerdict | CleanupOnly | NoCommandTimeLimit = NO_COMMAND_TIME_LIMIT,
@@ -1321,6 +1347,10 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                if self.dispatch_mirror is not None and marker.startswith("mac_dispatch="):
+                    boot_id, _, home = marker.removeprefix("mac_dispatch=").partition("\t")
+                    self.record_mac_dispatch(boot_id, home)
+                    continue
                 identity = self.claim_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
@@ -1608,6 +1638,9 @@ def write_backoff(until: float, target: str = "mac", *, wait: bool = True, stric
     except OSError:
         if strict:
             raise
+
+
+MAC_DEPARTURE_SSH_OPTIONS = ("-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none")
 
 
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
@@ -2279,7 +2312,8 @@ def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
             'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', '')}
 
 
-def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
+def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository, *,
+                           mirror_path: str = "") -> str:
     """Trim the mirror budget before the run releases its lease.
 
     The cleanup runs after the verdict line. It writes only markers: any other line would clear the verdict.
@@ -2287,7 +2321,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
         return "echo mac_cleanup=skipped"
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
-    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    path = mirror_path or remote_mirror(repository, request.target, request.slot)
+    target = shlex.quote(path + "/target")
     program = (
         'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
         'config = conf.read("lint"); '
@@ -2296,7 +2331,7 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     )
     floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
-        f'{{ if cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))}; then '
+        f'{{ if cd "$HOME"/{shlex.quote(path)}; then '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
         + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
@@ -2587,7 +2622,8 @@ def extended_regex_literal(text: str) -> str:
     )
 
 
-def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
+def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *,
+                           dispatch: claim_state.MacDispatchRecord | None = None) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
     A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
@@ -2598,14 +2634,19 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=False)
-    root = mac_mirror_root().relative
-    mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
-    if isinstance(scope, KnownRepository):
-        mirror += "/" + extended_regex_literal(scope.name)
-        command_pattern = f"{mirror}([/'\"[:space:]]|$)"
-        cwd_pattern = f"^n.*/{mirror}(/|$)"
+    if dispatch is not None:
+        path = dispatch["mirror_path"]
+        pattern = f"[{path[0]}]" + extended_regex_literal(path[1:])
+        command_pattern = f"{pattern}([/'\"[:space:]]|$)"
+        cwd_pattern = f"^n{extended_regex_literal(str(Path(dispatch['home']) / path))}(/|$)"
     else:
-        command_pattern = f"{mirror}/"
+        root = mac_mirror_root().relative
+        mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
+        if isinstance(scope, KnownRepository):
+            mirror += "/" + extended_regex_literal(scope.name)
+            command_pattern = f"{mirror}([/'\"[:space:]]|$)"
+        else:
+            command_pattern = f"{mirror}/"
         cwd_pattern = f"^n.*/{mirror}(/|$)"
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
@@ -2625,14 +2666,16 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     )
 
 
-def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1) -> str:
+def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
+                          dispatch: claim_state.MacDispatchRecord | None = None) -> str:
     if isinstance(repository, AllMirrors):
         return mirror_selector_script(repository, target, slot) + r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
-    return mirror_selector_script(repository, target, slot) + r'''
+    guard = mac_dispatch_guard(dispatch) if dispatch is not None else ""
+    return guard + mirror_selector_script(repository, target, slot, dispatch=dispatch) + r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
@@ -2648,21 +2691,31 @@ printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
 
 
+def mac_dispatch_guard(dispatch: claim_state.MacDispatchRecord) -> str:
+    """Require the Mac boot and home recorded at dispatch."""
+    return (
+        'boot=$(sysctl -n kern.bootsessionuuid) || exit 1\n'
+        + f'if [ "$boot" != {shlex.quote(dispatch["boot_id"])} ] '
+        + f'|| [ "$HOME" != {shlex.quote(dispatch["home"])} ]; then\n'
+        + "printf '%s\\n' 'the Mac dispatch identity differs' >&2; exit 1\nfi\n"
+    )
+
+
 def mirror_departure_script(saved: claim_state.MacMirrorIdentity, target: str, fence: str) -> str:
-    """Count work in the saved mirror within one Mac boot session."""
-    command = mirror_selector_script(KnownRepository(saved.mirror_name, saved.key), target)
+    """Count work in the mirror on the Mac that started it."""
+    dispatch = saved.dispatch
+    if dispatch is None:
+        raise ValueError("the claim has no Mac dispatch identity")
+    guard = mac_dispatch_guard(dispatch)
+    command = guard + mirror_selector_script(KnownRepository(saved.mirror_name, saved.key), target, dispatch=dispatch)
     command += r'''
-boot=$(sysctl -n kern.bootsessionuuid) || exit 1
-[ -n "$boot" ] || exit 1
 leftover_pids=$(select_leftovers) || exit 1
 '''
     if fence:
         command += ('if [ -z "$leftover_pids" ]; then\n'
                     + fence + ' || exit 1\n'
                     + 'leftover_pids=$(select_leftovers) || exit 1\nfi\n')
-    return command + r'''
-current_boot=$(sysctl -n kern.bootsessionuuid) || exit 1
-[ "$boot" = "$current_boot" ] || exit 1
+    return command + guard + r'''
 leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
@@ -2699,7 +2752,7 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
     if timeout <= 0:
         return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "")
     try:
-        host_options = ["-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none"] if require_host_key else []
+        host_options = MAC_DEPARTURE_SSH_OPTIONS if require_host_key else ()
         arguments = ["ssh", *host_options, *ssh_options(config), host, script]
         result = subprocess.run(
             arguments,
@@ -2752,10 +2805,10 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     fence = start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key)
+    saved = controller.mac_repository
     if observe_only:
-        saved = controller.mac_repository
-        if not isinstance(saved, claim_state.MacMirrorIdentity):
-            reason = "the claim has no saved Mac mirror"
+        if not isinstance(saved, claim_state.MacMirrorIdentity) or saved.dispatch is None:
+            reason = "the claim has no Mac dispatch identity"
             return StartUnsettled(reason, LeftoverCheckFailed(reason))
         try:
             command = mirror_departure_script(saved, target, fence)
@@ -2763,8 +2816,10 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
         except (OSError, ValueError) as error:
             return StartUnsettled(str(error), LeftoverCheckFailed(str(error)))
     else:
-        command = fence + " || exit 1\n" + leftover_check_script(repository, target, slot)
-        observed = read_leftovers(connection, host, command, target)
+        dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
+        guard = mac_dispatch_guard(dispatch) if dispatch is not None else ""
+        command = guard + fence + " || exit 1\n" + leftover_check_script(repository, target, slot, dispatch=dispatch)
+        observed = read_leftovers(connection, host, command, target, require_host_key=dispatch is not None)
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
         try:
@@ -2791,14 +2846,19 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_current_leftovers(
-    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1,
+    config: OffloadConfig, host: str, repository: MirrorScope, target: str = "mac", slot: int = 1, *,
+    saved: claim_state.SavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY,
 ) -> LeftoverCheckResult:
     """Read the current connection settings before checking retained work."""
     try:
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return LeftoverCheckFailed(f"cleanup settings unavailable: {error}")
-    return check_leftovers(connection, host, repository, target, slot)
+    dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
+    if dispatch is None:
+        return check_leftovers(connection, host, repository, target, slot)
+    command = leftover_check_script(repository, target, slot, dispatch=dispatch)
+    return read_leftovers(connection, host, command, target, require_host_key=True).result
 
 
 def check_taken_over_claim(
@@ -2815,7 +2875,8 @@ def check_taken_over_claim(
             return LeftoverCheckFailed("the kept claim's repository is unavailable")
         if isinstance(controller.pending, PendingStartOperation):
             return settle_pending_start(controller, config, claim.host, scope, target, claim.slot).leftovers
-        return check_current_leftovers(config, claim.host, scope, target, claim.slot)
+        return check_current_leftovers(config, claim.host, scope, target, claim.slot,
+                                       saved=controller.mac_repository)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
@@ -2831,10 +2892,13 @@ def mac_cleanup_lease(saved: claim_state.SavedMacRepository,
     """Protect the saved mirror or all mirrors on the recorded host during cleanup."""
     from scripts.copies import copies
 
-    scope = mac_cleanup_scope(saved)
-    lease = (copies.remote_host_lease(host, exclusive=True) if isinstance(scope, AllMirrors) else
-             copies.remote_lease(copies.RemoteMirror("", copies.SelectedRepository(scope.name), host,
-                                                      remote_mirror(scope, target), "")))
+    if isinstance(saved, claim_state.MacMirrorIdentity):
+        path = (saved.dispatch["mirror_path"] if saved.dispatch is not None
+                else remote_mirror(KnownRepository(saved.mirror_name, saved.key), target))
+        lease = copies.remote_lease(copies.RemoteMirror("", copies.SelectedRepository(saved.mirror_name),
+                                                        host, path, ""))
+    else:
+        lease = copies.remote_host_lease(host, exclusive=True)
     with lease:
         yield
 
@@ -2975,6 +3039,8 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        mirror = (controller.dispatch_mirror if not linux and controller.dispatch_mirror is not None
+                  else request_mirror(config, request, repository))
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
@@ -2991,7 +3057,7 @@ def claimed_run(
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
-        copies.register_remote(request_mirror(config, request, repository))
+        copies.register_remote(mirror)
         routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
@@ -3041,12 +3107,19 @@ def claimed_run(
                 return MacCleanupUnconfirmed(elapsed_seconds(started), "launch authorization has no confirmed reply")
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
+        command = copies.remote_use_command(mirror, step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
+            if not linux and isinstance(controller.mac_repository, claim_state.MacMirrorIdentity):
+                controller.dispatch_mirror = mirror
+                command = ('boot=$(sysctl -n kern.bootsessionuuid) || boot=\n'
+                           + "printf 'mac_dispatch=%s\\t%s\\n' \"$boot\" \"$HOME\"\n" + command)
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         arguments = [*ssh_prefix(config), command]
-        remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
-                         if routed_mac_command else controller.stream_mac_run(arguments))
+        try:
+            remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
+                             if routed_mac_command else controller.stream_mac_run(arguments))
+        finally:
+            controller.dispatch_mirror = None
         if isinstance(remote_status, MissingMacStatus) and isinstance(remote_status.cleanup, CleanupStreamTimedOut):
             return MacCleanupUnconfirmed(elapsed_seconds(started), remote_status.detail)
         if isinstance(remote_status, MirrorBusyRefusal):
@@ -3064,7 +3137,8 @@ def claimed_run(
             elif not isinstance(controller.pending, SettledDispatchOperations):
                 return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
             else:
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                   saved=controller.mac_repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3084,16 +3158,22 @@ def claimed_run(
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
         if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
                 and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
-            arguments = [*ssh_prefix(config),
-                copies.remote_use_command(request_mirror(config, request, repository),
-                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
+            saved = controller.mac_repository
+            command = copies.remote_use_command(mirror,
+                f"echo mac_exit={remote_status.status}; "
+                + remote_cleanup_command(config, request, repository, mirror_path=mirror.path))
+            if isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None:
+                command = mac_dispatch_guard(saved.dispatch) + command
+                arguments = ["ssh", *MAC_DEPARTURE_SSH_OPTIONS, *ssh_options(config), config.host, command]
+            else:
+                arguments = [*ssh_prefix(config), command]
             cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
                        if routed_mac_command else controller.stream_mac_run(arguments))
             remote_status = replace(remote_status, cleanup=(
                 cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
-                       path=f"~/{mirror_target(repository, request.target, request.slot)}",
+                       path=f"~/{mirror.path}/target",
                        free_floor_gib=config.free_floor_gib)
         if (routed_mac_command and isinstance(remote_status, ReportedMacStatus)
                 and isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
@@ -3104,7 +3184,8 @@ def claimed_run(
             observe_cleanup(evidence, settlement.leftovers)
             report_leftover_check(settlement.leftovers, request)
         elif isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                               saved=controller.mac_repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3129,7 +3210,8 @@ def claimed_run(
     except OffloadInterrupted:
         controller.stop()
         if not release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                               saved=controller.mac_repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3645,13 +3727,16 @@ def run_offload(
                               if isinstance(request.placement, AssignedOffloadRequest) else range(1, slots + 1))
             for slot in selected_slots:
                 lease = ExitStack()
+                mirror = request_mirror(config, replace(request, slot=slot), repository)
                 try:
-                    lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
+                    lease.enter_context(copies.remote_lease(mirror))
                 except copies.BusyRemoteHost:
                     return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
                 except copies.BusyRemoteMirror:
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
+                if not linux:
+                    controller.dispatch_mirror = mirror
             result = leased_offload(controller, config, request, repository, started, linux, leases,
                                     mac_repository=mac_repository, retire_wait=retire_wait,
                                     cleanup_takeover=cleanup_takeover)

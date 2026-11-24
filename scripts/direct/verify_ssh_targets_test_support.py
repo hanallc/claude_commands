@@ -226,7 +226,11 @@ def stream(arguments, *limits):
         (root / "mac-loss-ready").touch()
         remote_output, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE + "\n", 101)
                                         if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42\n", 42))
-        program = f"import os, select; print({remote_output.rstrip()!r}, flush=True); "
+        output = remote_output
+        if mode == "cleanup-stream-timeout":
+            assert "mac_dispatch=" in arguments[-1], arguments
+            output = f"mac_dispatch=fixture-boot\t{Path.home()}\n" + output
+        program = f"import os, select; print({output.rstrip()!r}, flush=True); "
         if mode == "post-fetch-cleanup-timeout":
             program += "os.close(1); os.close(2); "
         program += "select.select([], [], [])"
@@ -249,6 +253,9 @@ def stream(arguments, *limits):
         status = statuses.get(mode, 0)
         cleanup = "kept" if mode == "post-fetch-cleanup-timeout" else "0"
         wire = f"mac_exit={status}\nmac_cleanup={cleanup}\n"
+        if mode == "post-fetch-cleanup-timeout":
+            assert "mac_dispatch=" in arguments[-1], arguments
+            wire = f"mac_dispatch=fixture-boot\t{Path.home()}\n" + wire
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)

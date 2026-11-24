@@ -1715,7 +1715,8 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     watched = False
     host_claims: list[HeldClaim] = []
     for claim in claims:
-        if (isinstance(claim_state.saved_mac_repository(claim.record), claim_state.MacMirrorIdentity)
+        saved = claim_state.saved_mac_repository(claim.record)
+        if (isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None
                 and recoverable_kept_claim(claim.record)):
             if watch_kept_mirror(paths, claim):
                 watched = True
@@ -1760,14 +1761,17 @@ def watch_claim(
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
     run = claim.record
-    if "remote_host" in run and isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now):
+    saved = claim_state.saved_mac_repository(run)
+    has_dispatch = isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None
+    if ("remote_host" in run and not has_dispatch and isinstance(activity, MacIdle)
+            and claim_idle_expired(run, claim.path, config, now)):
         from scripts.copies import copies
         from scripts.mac_test import offload
 
         with ExitStack() as lease:
             try:
                 lease.enter_context(offload.mac_cleanup_lease(
-                    claim_state.saved_mac_repository(run), run["remote_host"], paths.target))
+                    saved, run["remote_host"], paths.target))
             except copies.BusyRemoteMirror:
                 return True
             except (OSError, copies.CopyError, conf.Unusable) as error:
@@ -2690,8 +2694,9 @@ def release_exact_claims(
         if kept is not None:
             if not same_release_claim(record, kept.record, kept=True):
                 return ClaimReleaseRefused("the kept claim changed before cleanup")
-            if paths.platform != "macos" or not isinstance(saved, claim_state.MacMirrorIdentity):
-                return ClaimReleaseRefused("the kept claim has no saved Mac mirror")
+            if (paths.platform != "macos" or not isinstance(saved, claim_state.MacMirrorIdentity)
+                    or saved.dispatch is None):
+                return ClaimReleaseRefused("the kept claim has no Mac dispatch identity")
         with ExitStack() as cleanup:
             if (paths.platform == "macos" and "remote_host" in record
                     and isinstance(remote_work, (EndStoppedWork, ConfirmKeptMirror))):
@@ -2716,17 +2721,19 @@ def release_exact_claims(
                 connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
                 fence = offload.start_fence_command(identity, paths.target, settle=True,
                     scope_key=claim_state.claim_fence_scope_key(path, record)) if fence_pending else ""
+                dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
                 if isinstance(remote_work, EndStoppedWork):
                     # Check stopped work before settling the fence it can hold.
                     mirror = offload.mac_cleanup_scope(saved) if paths.platform == "macos" else remote_work.repository
-                    command = offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1) + "\n" + fence
+                    command = offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1,
+                                                           dispatch=dispatch) + "\n" + fence
                 elif isinstance(remote_work, KeepRemoteWork):
                     command = fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n"
                 else:
                     assert isinstance(saved, claim_state.MacMirrorIdentity)
                     command = offload.mirror_departure_script(saved, paths.target, fence)
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
-                                                  require_host_key=kept is not None,
+                                                  require_host_key=dispatch is not None,
                                                   release_deadline=release_deadline)
                 if kept is not None and isinstance(observed.result, offload.LeftoverCheckFailed):
                     print(f"Mac kept claim check failed: {observed.result.reason}", flush=True)
