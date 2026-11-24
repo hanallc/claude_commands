@@ -364,7 +364,10 @@ class QueuePlace:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         record = directory / (uuid.uuid4().hex + ".json")
         wrapper = [sys.executable, str(Path(__file__).with_name("program_start.py").resolve())]
-        command = ([*prefix, *wrapper, "--scope-start", str(self.sidecar), str(holder_pid), holder_start, str(record), *argv]
+        reservation = (startup.ScopeReservation.HELD if isinstance(self.reservation, HeldReservation)
+                       else startup.ScopeReservation.UNRESERVED)
+        command = ([*prefix, *wrapper, "--scope-start", *reservation.arguments(), str(self.sidecar), str(holder_pid),
+                    holder_start, str(record), *argv]
                    if prefix else [*wrapper, "--program-start", str(record), str(holder_pid), holder_start, *argv])
         with cancellation.defer_cleanup_signals():
             process = subprocess.Popen(command, **popen_arguments)
