@@ -678,9 +678,10 @@ The service supplies the full waiting order for moves, including waiters without
 The Builds page uses that order to number the preview and the confirmed move.
 The Builds page shows the unit in its role color in the row label.
 The Machine cell uses the same dim target icons as a waiting row.
-The deadline uses the user's time zone.
+The deadline cell shows `until HH:MM` in the user's time zone.
 The row has no reorder control or memory bar.
 The hover shows the failed run, step, failure time, and deadline.
+The hover includes the time zone in the failure time and deadline.
 The hover shows the match rule for the saved job.
 `build_queue.py` uses the same place numbers and reports a kept place when the user selects it.
 

@@ -895,7 +895,7 @@ class MemoryHoverTests(unittest.TestCase):
         assert table is not None
         self.assertNotIn("wait", table.get("class", "").split())
         self.assertEqual([table.findtext(f"./td[@class='{name}']") for name in ("place", "duration")],
-                         ["2", "until 22:37 PST"])
+                         ["2", "until 22:37"])
         self.assertEqual(len(table), len(grid.findall(".//tr[@class='queue-head']/th")))
         machine = table.find("./td[@class='machine']")
         waiting_machine = grid.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
