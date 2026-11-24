@@ -1,4 +1,7 @@
-"""Repair known reasons an eligible verify call waits while the Mac is idle."""
+"""Save the Mac idle reading, message builds about its outage and repair known waits.
+
+The machine watch reads the saved reading and sends the phone push.
+"""
 
 from __future__ import annotations
 try:
@@ -21,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from scripts.buildlog import store
+from scripts.lib.display_text import display_field
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
@@ -255,7 +259,7 @@ def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = RE
         reason = failure_detail(sent)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         reason = str(error)
-    print(f"Mac idle watch: showrunner message failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
+    print(f"Mac idle watch: showrunner message failed: {display_field(reason)}", file=sys.stderr)
     return False
 
 
@@ -367,34 +371,26 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
     line = mac_idle_alert.alert_line(paths.state / "alert.json", now, user_zone())
     waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
     text = (line or "") + "".join(
-        f"\nRepo {mac_idle_alert.display_field(call.repo)}; {call.kind} "
-        + f"{mac_idle_alert.display_field(call.package)}; pid {call.pid}; "
+        f"\nRepo {display_field(call.repo)}; {call.kind} "
+        + f"{display_field(call.package)}; pid {call.pid}; "
         + f"wait {call.local_reason or _waiting_evidence(call, live, waiters)}" for call in calls)
     return notify_showrunner(text, identity=OutageMessage(int(saved["since"]), now, outage_key(saved)))
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    """Send the unreachable phone push. The machine watch decides when it goes."""
     from scripts.notify import push_texts
     from scripts.notify.push_catalog import waiting_tests
-    from scripts.lib.process_failure import failure_detail
 
     rendered = push_texts.render("mac_idle.unreachable",
         minutes=str(int((now - saved["since"]) // 60)), tests=waiting_tests(saved["waiting"]))
     since = str(int(saved["since"]))
-    command = push_texts.user_send_argv(rendered, sender="Mac idle watch", key=f"mac-idle-{since}")
-    command.extend(["--clears-when", f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}"])
     settings = mac_idle_alert.read_idle_config()
     window = outage_repeat_minutes(saved["since"], now, settings)
-    command.extend(["--repeat-minutes", f"{window:g}", "--recipient-key", "user"])
-    try:
-        sent = subprocess.run(command, capture_output=True, text=True, timeout=settings.send_timeout_s, check=False)
-        if sent.returncode != push_texts.SEND_RETRY_EXIT and sent.returncode == 0:
-            return True
-        reason = failure_detail(sent)
-    except (OSError, subprocess.SubprocessError) as error:
-        reason = str(error)
-    print(f"Mac idle watch: phone push failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
-    return False
+    return push_texts.send_user_push(
+        rendered, sender="Mac idle watch", key=f"mac-idle-{since}", send_timeout_s=settings.send_timeout_s,
+        clears_when=f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}",
+        options=("--repeat-minutes", f"{window:g}"))
 
 
 def mac_off_on_purpose() -> bool:
@@ -468,7 +464,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")
         saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0, "changed": 0.0,
             "waiting": len(calls), "cause": "", "holder": "", "detail": "", "until": 0.0,
-            "messaged": False, "pushed": False}
+            "messaged": False}
         kept: mac_idle_alert.SavedAlert | None = None
         if isinstance(reading, NatedevJobOnMac):
             idle_file.unlink(missing_ok=True)
@@ -517,16 +513,10 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
         saved["changed"] = saved["since"]
         if kept is not None:
-            saved["pushed"] = kept["pushed"]
             saved["changed"] = (kept["changed"]
                                 if (kept["cause"], kept["holder"]) == (saved["cause"], saved["holder"]) else now)
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
-        off = mac_off_on_purpose()
-        if saved["pushed"] and off:
-            # Only a Mac that the user turned off ends a sent push here, so it goes again when the Mac is in use.
-            # Other ends stay with the clear check: one outage sends one push.
-            saved["pushed"] = False
         write_record(paths.state / "alert.json", saved)
         if (not isinstance(reading, IdleMac | MacUnreachable)
                 or now - saved["since"] < settings.alert_seconds or not calls):
@@ -536,17 +526,12 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         admission = admission_waiters()
         if isinstance(admission, AdmissionQueryFailed):
             saved["admission_error"] = admission.reason
-            print(f"Mac idle watch: admission query failed: {mac_idle_alert.display_field(admission.reason)}",
+            print(f"Mac idle watch: admission query failed: {display_field(admission.reason)}",
                   file=sys.stderr)
             write_record(paths.state / "alert.json", saved)
         if not saved["messaged"]:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
-            write_record(paths.state / "alert.json", saved)
-        # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
-        if (isinstance(reading, MacUnreachable) and now - saved["since"] >= settings.push_seconds
-                and not off and not saved["pushed"]):
-            saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
             return

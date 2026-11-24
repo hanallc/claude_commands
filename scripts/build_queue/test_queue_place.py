@@ -191,6 +191,12 @@ class HelperLifelineTests(unittest.TestCase):
                     stream.close()
 
 
+def exported_step_scopes(pid: int) -> list[str]:
+    """Each BUILDLOG_STEP_SCOPE value in the environment of the live process pid."""
+    return [entry.removeprefix(gate.STEP_SCOPE_ENTRY).decode()
+            for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if entry.startswith(gate.STEP_SCOPE_ENTRY)]
+
+
 def private_slice_name() -> str:
     """Name a private test slice after the test process that owns it."""
     return f"{PRIVATE_SLICE_PREFIX}{os.getpid()}_{time.monotonic_ns()}.slice"
@@ -618,6 +624,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
+                    # No reservation pays for the editor scope, so the editor does not name it to its cargo calls.
+                    self.assertNotIn(str(scope), exported_step_scopes(child.pid))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
@@ -1736,6 +1744,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     directory = Path(Path(row["sidecar"]).read_text().strip())
                     self.assertTrue(directory.is_relative_to("/sys/fs/cgroup"))
                     self.assertIn(fixture.private_slice, directory.parts)
+                    # The program names its own scope, in the form the cargo wrapper compares with its cgroup.
+                    cgroup = next(line[3:] for line in Path(f"/proc/{child.pid}/cgroup").read_text().splitlines()
+                                  if line.startswith("0::"))
+                    named = exported_step_scopes(child.pid)
+                    self.assertEqual(named, [f"/sys/fs/cgroup{cgroup}"])
+                    self.assertEqual(Path(named[0]), directory)
                     self.assertIsInstance(gate.reservation_lifetime(row, True), gate.PopulatedStepScope)
                     self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
                     self.assertIsNone(child.poll())
