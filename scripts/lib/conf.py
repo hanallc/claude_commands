@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import socket
-import subprocess
 import sys
 from threading import Lock
 from typing import TYPE_CHECKING, TypeVar
@@ -26,6 +25,7 @@ from scripts.lib import conf_reads
 
 if TYPE_CHECKING:
     from decimal import Decimal
+    from subprocess import CompletedProcess
 
 
 _LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:", "# agent:")
@@ -505,7 +505,9 @@ def positive_whole_seconds(value: str) -> float:
     return float(positive_whole(value))
 
 
-def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _git(folder: Path, *arguments: str) -> CompletedProcess[str]:
+    import subprocess
+
     try:
         return subprocess.run(["git", "-C", str(folder), *arguments], capture_output=True, text=True, check=False)
     except (OSError, UnicodeError) as error:

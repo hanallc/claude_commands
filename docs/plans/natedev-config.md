@@ -735,7 +735,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
-### Phase 16 — User zone helper start time  · status: todo
+### Phase 16 — User zone helper start time  · status: done
 **Depends on:** Phase 4
 
 #### Work Order

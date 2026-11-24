@@ -81,7 +81,7 @@ class UserZoneTests(unittest.TestCase):
         _ = write_config_fixture(self.conf, "zone=UTC\n")
         for pinned, zone, excluded in (
             ("Europe/Paris", "Europe/Paris", ("pathlib",)),
-            ("", "UTC", ("decimal", "scripts.lib.models_registry")),
+            ("", "UTC", ("decimal", "scripts.lib.models_registry", "subprocess")),
         ):
             with self.subTest(zone=zone):
                 environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
