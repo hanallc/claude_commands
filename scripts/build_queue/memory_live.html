@@ -429,7 +429,7 @@ body:not(:has(#review-new-item)) .walk-table :is(.action-spacer, .row-action) { 
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
-body.queue-unavailable .page-action[data-page-action^="builds-"] { display: none; }
+body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .track { position: relative; height: var(--track-height); margin-top: calc((var(--row-line) - var(--track-height)) / 2); cursor: help; overflow: hidden; }
 .track .bud { position: absolute; top: -5px; bottom: -5px; margin-left: -1px; border-left: 2px dashed var(--cap); pointer-events: none; }
 .track .b { position: absolute; top: 0; bottom: 0; border-radius: 3px; overflow: hidden; display: flex; z-index: 1; transition: left 0.6s ease, width 0.6s ease; }
@@ -503,33 +503,29 @@ body.queue-unavailable .page-action[data-page-action^="builds-"] { display: none
   __PAGE_TITLE__
   <div class="page-heading-actions" data-page-actions>__BUILDS_PAGE_ACTIONS__</div>
   <script>
-  // Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button and the owner control's actions argument.
-  // The buttons move into the heading between the owner name and New item; a button opens its dialog.
   (() => {
     const actions = document.currentScript.previousElementSibling;
-    const heading = document.querySelector(".page-heading-actions:not([data-page-actions])");
-    if (heading) {
-      const newItem = heading.querySelector("[data-owner-new]");
-      if (newItem) newItem.before(...actions.children); else heading.append(...actions.children);
-      heading.toggleAttribute("data-page-actions", true);
+    const owner = window.pageActionsArea?.()?.querySelector(".page-owner");
+    if (owner) {
+      const newItem = owner.querySelector("[data-owner-new]");
+      if (newItem) newItem.before(...actions.children); else owner.append(...actions.children);
       actions.remove();
+      return;
     }
-    const bound = new WeakSet();
+    // The published file can also open its dialogs without the console frame.
     document.addEventListener("click", event => {
       const button = event.target.closest("[data-page-action]");
       const dialog = button && document.getElementById(button.getAttribute("aria-controls"));
-      if (!dialog) return;
-      if (!bound.has(dialog)) {
-        bound.add(dialog);
-        bindConsoleDialog(dialog, () => dialog.close());
-      }
+      if (!dialog || dialog.open) return;
+      bindConsoleDialog(dialog, () => dialog.close());
+      dialog.addEventListener("close", () => button.focus({preventScroll: true}), {once: true});
       dialog.showModal();
     });
   })();
   </script>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
-  <div class="pressure"><button type="button" class="pill" id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog"><span class="pd"></span><span id="pill-t">pressure –</span></button></div>
+  <div class="pressure"><button type="button" class="pill" id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog" data-page-action="builds-pressure"><span class="pd"></span><span id="pill-t">pressure –</span></button></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -2271,25 +2267,6 @@ document.addEventListener("click", (e) => {
   toggle.setAttribute("aria-expanded", String(toggle.getAttribute("aria-expanded") !== "true"));
   renderSwap(latest);
 });
-// A closed section dialog returns focus to the element that opened it at this open: the pill or a heading button.
-const dialogOpeners = new WeakMap();
-function rememberOpener(opener) {
-  const dialog = document.getElementById(opener.getAttribute("aria-controls"));
-  if (!dialog) return;
-  if (!dialogOpeners.has(dialog)) dialog.addEventListener("close", () => dialogOpeners.get(dialog).focus({preventScroll: true}));
-  dialogOpeners.set(dialog, opener);
-}
-document.addEventListener("click", event => {
-  const opener = event.target.closest("[data-page-action]");
-  if (opener) rememberOpener(opener);
-}, true);
-// The pressure pill opens the swap dialog through its heading button; the pill tooltip stays off over the dialog.
-$("pill").addEventListener("click", event => {
-  event.stopPropagation();
-  document.querySelector('[data-page-action="builds-swap"]').click();
-  rememberOpener(event.currentTarget);
-});
-
 function renderLeftovers(d) {
   const {leftoverReadings} = shownReading(d);
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>

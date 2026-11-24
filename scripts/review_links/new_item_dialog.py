@@ -1417,7 +1417,8 @@ SCRIPT = r'''(() => {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   place: location.pathname + location.search + location.hash,
+   // The page frame adds the open window under New item, so the screenshot shows it.
+   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
    viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
@@ -1616,7 +1617,12 @@ SCRIPT = r'''(() => {
 
  async function open(trigger, page, {kind = 'bug', recipientName = '', evidence: capture = {kind: 'none'},
                                      tipPreview: shownTip = null} = {}) {
-  if (dialog.open || sending) return;
+  // When New item is open, its button focuses the text field or Done in the Saved state.
+  if (dialog.open) {
+   (body.hidden ? done : words).focus({preventScroll: true});
+   return;
+  }
+  if (sending) return;
   switchDraft(capture.kind === 'build-step' ? 'step:' + capture.step_id : 'page:' + page, capture, shownTip);
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
