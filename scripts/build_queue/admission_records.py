@@ -94,6 +94,18 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class GuestStartNotRecorded:
+    """The queue has no saved confirmation of a guest start."""
+
+
+@dataclass(frozen=True)
+class ConfirmedGuestStart:
+    """The queue accepted a start report for this guest attempt."""
+
+    accepted_at: float
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
     """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
@@ -108,6 +120,7 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

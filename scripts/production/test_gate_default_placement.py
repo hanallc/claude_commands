@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 from tempfile import TemporaryDirectory
+from typing import cast
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ from scripts.build_targets import mac_linux
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, scratch
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
 from scripts.production.gate_routes import GateResultUnknown, ModuleCoverage
@@ -240,29 +242,46 @@ class GateDefaultPlacementTests(unittest.TestCase):
         arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
         parent = mock.Mock(spec=OuterReservation)
         for nested in (True, False):
-            with (self.subTest(nested=nested), mock.patch.dict(os.environ, clear=True),
+            environment = {"BUILDLOG_GATE_TARGETS": "mac-linux"} if nested else {}
+            with (self.subTest(nested=nested), mock.patch.dict(os.environ, environment, clear=True),
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', return_value=gate.NO_GATE_ASSIGNMENT),
-                  mock.patch.object(first_step, 'gate_targets', return_value=()),
+                  mock.patch.object(first_step, 'gate_targets', return_value=()) as targets,
                   mock.patch.object(first_step, 'admitted_run') as admit,
                   mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
                 self.assertEqual(gate.main(arguments), 0)
             admit.assert_not_called()
             self.assertEqual(run.call_args.args[-1], 'natedev')
+            if nested:
+                targets.assert_not_called()
 
     def test_named_module_selection_uses_the_exact_tree_and_has_no_pass_certificate(self) -> None:
-        assignment = placed('mac-linux')
-        result = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 0, 1, ''),), 1, 0,
-                              selection_certified=True)
-        with (mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set())),
-              mock.patch.object(conf, 'read', return_value=mock.Mock(value=mock.Mock(return_value=True))),
-              mock.patch.object(mac_linux, 'route', return_value=result) as run):
-            checked = gate.run_gate_suites(Path.cwd(), mode=gate.SuiteMode.TARGETED,
-                target=gate.placement_target(assignment), named=('fixture/test_ok.py',))
+        checked, run = self.run_named_guest()
         self.assertEqual(run.call_args.kwargs['selected'], gate.TreeSelection(('scripts/fixture/test_ok.py',), 'tree'))
         self.assertFalse(checked.selection_certified)
         self.assertIs(checked.coverage, ModuleCoverage.SUBSET)
         self.assertTrue(checked.passed)
+
+    def test_named_guest_modules_use_the_configured_run_limit(self) -> None:
+        _checked, run = self.run_named_guest()
+        run.assert_called_once()
+        self.assertIsNone(cast(object, run.call_args.kwargs["module_time_limit_s"]))
+
+    def run_named_guest(self) -> tuple[gate.GateRun, mock.Mock]:
+        assignment = placed("mac-linux")
+        result = gate.GateRun((gate.GateJobResult("fixture", "test_ok.py", 0, 1, ""),), 1, 0,
+                              selection_certified=True)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "config"
+            _ = write_config_fixture(settings / "build_targets.conf", "enabled.mac-linux=on\n")
+            with (mock.patch.dict(os.environ, config_environment(settings)),
+                  mock.patch.object(cloud_gate, "working_tree", return_value=("tree", set())),
+                  mock.patch.object(gate, "checked_git", return_value="fixture-commit"),
+                  mock.patch.object(mac_linux, "route", return_value=result) as run):
+                checked = gate.run_gate_suites(root, mode=gate.SuiteMode.TARGETED, module_time_limit_s=30,
+                    target=gate.placement_target(assignment), named=("fixture/test_ok.py",))
+        return checked, run
 
     def test_nightly_types_follow_tool_availability(self) -> None:
         result = gate.GateRun((), 1, 0, selection_certified=True)
