@@ -286,16 +286,17 @@ class _TranscriptReceiptState:
         if text.startswith(SCRIPT_ENVELOPE_START) and text.endswith(SCRIPT_ENVELOPE_END):
             content = text.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
         first, _, body = content.partition("\n")
-        assignment = ("Read the unchanged prompt file" in text and any(instruction in text for instruction in (
+        is_result = first.startswith("Detached run: ")
+        assignment = (not is_result and "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
             "End your final reply with DONE ", "End your final reply with this line alone: DONE ")))
-        if (self.second_stage and self.completion_id != self.second_stage
+        if (not is_result and self.second_stage and self.completion_id != self.second_stage
                 and _prompt_names_completion(text, self.second_stage)):
             self.completion_id = self.second_stage
             self.reply = DispatchSubmitted()
             self.cursor = NoMatchingDone.UNRECORDED
             self.results_before_done = frozenset()
-        if (text in (self.line.strip(), script_prompt(self.line).strip()) if isinstance(self.line, str) else
-                _prompt_names_completion(text, self.completion_id)):
+        if not is_result and (text in (self.line.strip(), script_prompt(self.line).strip())
+                              if isinstance(self.line, str) else _prompt_names_completion(text, self.completion_id)):
             self.result_replies.clear()
             self.submitted = True
             self.responding = True
@@ -311,7 +312,7 @@ class _TranscriptReceiptState:
                 self.reply = replace(self.reply, turn=NoTranscriptTurn.UNRECORDED)
         elif self.submitted:
             if (self.responding and isinstance(self.cursor, TranscriptCursor) and isinstance(cursor, TranscriptCursor)
-                    and first.startswith("Detached run: ") and body.strip()):
+                    and is_result and body.strip()):
                 self.result_message = TranscriptInputMessage(cursor, content, worker_panes.worker_input_digest(input_text))
             results.difference_update(self.other_pass_results)
             if not self.responding:
@@ -669,6 +670,8 @@ def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record:
     verified = read_result_done_evidence(Path(record["session_dir"]), row, passed)
     if isinstance(verified, VerifiedPassDone):
         return verified.covers_run(record, detached_runs.run_finish_time(record))
+    if verified is detached_runs.ResultDoneCoverage.NEEDS_DELIVERY:
+        return detached_runs.ResultDoneCoverage.NO_MATCHING_DONE
     return verified
 
 

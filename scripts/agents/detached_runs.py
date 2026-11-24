@@ -1402,6 +1402,7 @@ class WorkerResultCovered(Enum):
 class ResultDoneCoverage(StrEnum):
     COVERED = "DONE covers the result"
     NEEDS_DELIVERY = "DONE does not cover the result"
+    NO_MATCHING_DONE = "the pass has no matching DONE"
 
 
 @dataclass(frozen=True)
@@ -2275,6 +2276,15 @@ class WorkerResultTarget(Enum):
     DIRECTOR = "the phase interrupted the owning pass"
 
 
+@dataclass(frozen=True)
+class RequestNewDone:
+    completion_id: str
+
+
+class SendResultAlone(Enum):
+    SEND = "send the result without a DONE instruction"
+
+
 class ParkedWorkerDelivery(Enum):
     DEFER = "leave pane restore to the worker event"
 
@@ -2443,11 +2453,12 @@ def _deliver(record: RunRecord, result: CommandResult, *,
 
         def check_pass(selected: staff.StaffRow, ownership: ResultPassOwnership,
                        passed: dict[str, object],
-                       stage: ResultSubmissionPass | ResultWithoutPass | UnknownResultStage) -> WorkerResultTarget:
+                       stage: ResultSubmissionPass | ResultWithoutPass | UnknownResultStage,
+                       ) -> tuple[WorkerResultTarget, RequestNewDone | SendResultAlone]:
             from scripts.direct import progress_history
 
             if ownership is ResultPassOwnership.OUTSIDE_PASS:
-                return WorkerResultTarget.PANE
+                return WorkerResultTarget.PANE, SendResultAlone.SEND
             read_coverage = cast(Callable[[staff.StaffRow, dict[str, object], RunRecord],
                 ResultDoneCoverage | ResultTranscriptUnknown],
                 import_module("scripts.production.worker").result_done_coverage)
@@ -2461,15 +2472,19 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + stage.value)
             if (_cancels_pass(record) and record.get("pane_dispatch_id") == passed.get("instance_id")
                     and passed.get("status") == "interrupted"):
-                return WorkerResultTarget.DIRECTOR
+                return WorkerResultTarget.DIRECTOR, SendResultAlone.SEND
             parked = progress_history.parked_worker_pass(passed)
             if parked and isinstance(resume_parked, ParkedWorkerDelivery):
                 raise _WorkerPassDeliveryBlocked(PARKED_WORKER_RESULT)
-            return WorkerResultTarget.PARKED if parked else WorkerResultTarget.PANE
+            target = WorkerResultTarget.PARKED if parked else WorkerResultTarget.PANE
+            if (coverage is ResultDoneCoverage.NEEDS_DELIVERY and isinstance(stage, ResultSubmissionPass)
+                    and passed.get("status") in ("active", "refused")):
+                return target, RequestNewDone(stage.completion)
+            return target, SendResultAlone.SEND
 
         park_acceptance = ParkedAssignmentAcceptance.UNRECORDED
 
-        def validate_transport() -> dict[str, object]:
+        def validate_transport(*, pane_input: bool = False) -> dict[str, object]:
             from scripts.herdr import worker_panes
 
             if isinstance(input_lock, AcquireWorkerInputLock):
@@ -2500,16 +2515,18 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             current_stage = result_submission_pass(current_pass)
             if current_stage != assignment:
                 raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker stage changed")
-            current_target = check_pass(current, current_ownership, current_pass, current_stage)
+            current_target, current_instruction = check_pass(current, current_ownership, current_pass, current_stage)
             if (current_target is WorkerResultTarget.DIRECTOR) != (target is WorkerResultTarget.DIRECTOR):
                 raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the result destination changed")
+            if pane_input and current_instruction != reply_instruction:
+                raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker DONE requirement changed")
             return current_pass
 
         def before_input() -> None:
             nonlocal park_acceptance
             from scripts.direct import progress_history
 
-            current_pass = validate_transport()
+            current_pass = validate_transport(pane_input=True)
             parked_launch = progress_history.parked_worker_launch(current_pass)
             if (isinstance(assignment, ResultSubmissionPass)
                     and current_pass.get("worker_id") == worker.id
@@ -2539,7 +2556,7 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                         return _save_delivery(path, f"already delivered: {record['run_id']}")
                 except (OSError, ValueError) as error:
                     reason = f"worker transcript is unavailable: {error}"
-            target = check_pass(worker, ownership, passed, assignment)
+            target, reply_instruction = check_pass(worker, ownership, passed, assignment)
             if unconfirmed:
                 return saved
             if target is WorkerResultTarget.DIRECTOR:
@@ -2554,10 +2571,15 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 worker = resumed
                 request = replace(request, worker_only=True)
             text = _worker_result_message(record, result)
+            pane_text = ""
+            if isinstance(reply_instruction, RequestNewDone):
+                separator = "" if text.endswith("\n") else "\n"
+                pane_text = (f"{text}{separator}End your final reply with this line alone: "
+                             f"DONE {reply_instruction.completion_id}")
             timeout = send_budget.seconds()
             with _keep_send_error(path):
                 delivery = send.deliver_worker_text(worker, membership, text,
-                    sender="detached-runs", timeout=timeout, reason=reason, receipt=request)
+                    sender="detached-runs", timeout=timeout, reason=reason, receipt=request, review_text=pane_text)
                 if isinstance(delivery, send.BlockedWorkerResult):
                     if not _cancels_pass(record):
                         _ = validate_transport()

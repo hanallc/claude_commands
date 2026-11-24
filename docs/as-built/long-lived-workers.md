@@ -189,6 +189,7 @@ The selected occurrence covers explicit result receipts that precede it.
 The transcript timestamp can prove additional run coverage.
 Acknowledgement selects the evidence once for all pending results.
 The exact prompt and pass marker checks use separate receipt states and consume the same transcript stream.
+Both checks identify a detached run delivery by its first line before they check for a dispatch prompt.
 The parser discards each decoded record after both states read it.
 The evidence file preserves outstanding results when the transcript becomes unavailable.
 A later reply updates an unfinished completion without repeating its actions or notice.
@@ -216,6 +217,8 @@ The delivery command defers the result when transcript evidence is uncertain.
 If the run has no usable finish time, the receipt can use a recorded delivery before DONE.
 The receipt reports an anomaly if that delivery is absent from the transcript.
 A result without proof of coverage requires another matching DONE.
+If an open pass has a DONE that does not cover the result, the worker's result message ends with this line.
+`End your final reply with this line alone: DONE <dispatch id>`
 The hook, restore, assign, and close keep the pane while that requirement remains on an active pass.
 A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
