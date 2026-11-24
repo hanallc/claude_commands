@@ -139,6 +139,11 @@ When every item is done:
 - **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
 - Step 2's doc question, when asked, is a choice like any other: mark exactly one option recommended.
 - Show before and after code comparisons only when the user asks.
+- Code in an item: show at most the one or two lines that show what the thing is, and one use of it. Show no derive lines, asserts, exports or neighbour types.
+- When the user asks a question on an open item, give the answer alone, in one to three lines. Do not show the item again with added lines. Show it again only when the user asks, and then shorter.
+- The reason in the recommendation names the result that the user sees, not the mechanism.
+- Put a number that the decision depends on in the point or the first fact line, with its unit.
+- An item that asks the user to approve a new thing (a type, a command, a setting, a page) says in one line what exists today that is nearest to it, and why that does not do the job. Check this before you show the item.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.
 - An explanation request never suspends the one-at-a-time rhythm.
