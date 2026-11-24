@@ -914,6 +914,10 @@ An AWS assignment occupies one slot under `cloud_gate_slots`.
 The route checks `enabled` in `cloud_gate.conf` before it reads deployment state.
 The worker checks both switches before it sends a launch request.
 
+The legacy slot queue sorts requests by unit rank, then by queue time.
+Grouped requests keep their unit rank and use the group start time.
+The placement pass assigns scaler requests separately.
+
 The queue supplies these paths beside the placement progress file.
 
 1. The dispatch journal
