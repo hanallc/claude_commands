@@ -184,13 +184,13 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="natedev" i] { color: var(--machine-natedev); }
 .machine:is([data-machine="mac" i], [data-machine="mac-linux" i]) { color: var(--machine-mac); }
 .machine:is([data-machine="aws" i], [data-machine="hana-aws" i], [data-machine="hana-gpu" i]) { color: var(--machine-aws); }
-/* The icon fits the 20px text line. CSS draws its badge. */
+/* The icon fits the 20 px text line. */
 .machine-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 24px;
   margin-block: -2px; vertical-align: top; border-radius: 6px; }
 .machine-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.machine-icon .machine-emoji { font: 20px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
-.machine-icon[data-badge]::after { content: attr(data-badge); position: absolute; right: -7px; bottom: -5px;
-  font: 14px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
+.machine-icon > .machine-badge, .machine-icon[data-badge]::after { position: absolute; right: -7px; bottom: -5px; }
+.machine-icon > .machine-badge { width: 14px; height: 14px; }
+.machine-icon[data-badge]::after { content: attr(data-badge); font: 14px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
 .machine-icon.run { background: color-mix(in srgb, var(--ink) 7%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 16%, transparent); }
 .machine-icon.dim { opacity: 0.5; }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
@@ -358,8 +358,8 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .step { width: var(--step); min-width: var(--step); }
 .walk-table td.machine > * + * { margin-left: 10px; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
+.walk-table :is(.duration, .done, .pid, .vcpus, .tokens) { font-variant-numeric: tabular-nums; }
+.walk-table :is(.duration, .done, .pid, .vcpus, .tokens, :is(.queue-head, .wait, .held) > .place) { text-align: right; }
 .move-mark { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;
   padding: 0 7px 0 5px; font-size: 12px; line-height: 18px; white-space: nowrap;
   color: var(--bump); background: var(--bump-bg); box-shadow: 0 0 0 1px var(--bump-ring); }
@@ -367,8 +367,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .move-mark[data-tip] { cursor: help; }
 .walk-table .move-mark { vertical-align: middle; }
-.walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
-.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 /* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
    The column is never narrower than the widest word. */
 .walk-table .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; }
@@ -391,7 +389,7 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 /* Narrow the column gaps to keep the chart beside the table. */
 .walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 6px; }
 /* The last machine badge extends 7 px past its icon. */
-.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: 7px; }
+.walk.tight .walk-table td.machine:has(> .machine-icon:is([data-badge], :has(> .machine-badge)):last-child) { padding-right: 7px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -533,6 +531,21 @@ small .aws-point { cursor: help; }
 </head>
 <body>
 <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+  <!-- Tux design by Larry Ewing (lewing@isc.tamu.edu), drawn with The GIMP. -->
+  <symbol id="machine-linux" viewBox="0 0 24 24">
+    <path fill="#17171a" stroke="currentColor" stroke-width="1.2" d="M12 1.4c-4 0-5.4 3-5.4 6.5 0 2.4-1.6 3.9-2.9 6.2-2 3.6-1.5 5.3 1.2 5.2 1.4 1.8 4 3.1 7.1 3.1s5.7-1.3 7.1-3.1c2.7.1 3.2-1.6 1.2-5.2-1.3-2.3-2.9-3.8-2.9-6.2 0-3.5-1.4-6.5-5.4-6.5Z"/>
+    <path fill="#fff" stroke="none" d="M12 9.5c3.1 0 5.6 4.5 5.6 8.1 0 2.4-2.5 3.6-5.6 3.6s-5.6-1.2-5.6-3.6c0-3.6 2.5-8.1 5.6-8.1Z"/>
+    <g fill="#ffc449" stroke="#17171a" stroke-width=".75">
+      <path d="M6.5 17.9c-1.7-.9-2.7 1-4.2 2.1-1.9 1.5-.1 2.9 2.2 2.8l4.7-.4c1.8-.2 1.8-1.5.3-2.5l-3-2Zm11 0c1.7-.9 2.7 1 4.2 2.1 1.9 1.5.1 2.9-2.2 2.8l-4.7-.4c-1.8-.2-1.8-1.5-.3-2.5l3-2Z"/>
+    </g>
+    <g fill="#fff" stroke="none">
+      <ellipse cx="9.9" cy="7" rx="1.7" ry="2.3"/><ellipse cx="14.1" cy="7" rx="1.7" ry="2.3"/>
+    </g>
+    <g fill="#17171a" stroke="none">
+      <ellipse cx="10.4" cy="7.4" rx=".7" ry="1.1"/><ellipse cx="13.6" cy="7.4" rx=".7" ry="1.1"/>
+    </g>
+    <path fill="#ffc449" stroke="#17171a" stroke-width=".75" d="M8.3 9.5c.9-.7 2.2-1.3 3.7-1.3s2.8.6 3.7 1.3c-.1 1-1.7 2.3-3.7 2.3s-3.6-1.3-3.7-2.3Z"/>
+  </symbol>
   <symbol id="machine-apple" viewBox="0 0 24 24">
     <path fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round" d="M12.1 6.2c-.2-2.9 2-5 4.5-5.4.1 2.8-1.9 5.2-4.5 5.4ZM12 7.7c1.2 0 2.4-1.4 4.6-1.4 1.7 0 3.2.8 4.1 2.1a4.8 4.8 0 0 0 .7 8.3c-1.3 3.3-3.2 6.2-5.2 6.2-1.5 0-2.1-1-4-1-1.8 0-2.6 1-4 1-2.7 0-5.8-5.4-5.8-10.1 0-4 2.4-6.5 5.6-6.5 1.9 0 3.1 1.4 4 1.4Z"/>
   </symbol>
@@ -707,20 +720,20 @@ function nameParts(parts) {
 function machineName(name) {
   return `<span class="machine" data-machine="${esc(name)}">${esc(name)}</span>`;
 }
-const MACHINE_ICONS = new Map([["natedev", {emoji: "🐧"}], ["mac", {symbol: "apple"}],
-  ["mac-linux", {symbol: "apple", badge: "🐧"}], ["aws", {symbol: "cloud", badge: "🐧"}],
+const MACHINE_ICONS = new Map([["natedev", {symbol: "linux"}], ["mac", {symbol: "apple"}],
+  ["mac-linux", {symbol: "linux", badgeSymbol: "apple"}], ["aws", {symbol: "cloud", badgeSymbol: "linux"}],
   ["hana-aws", {symbol: "cloud", badge: "🌸"}], ["hana-gpu", {symbol: "cloud", badge: "⚡"}]]);
 // A known machine shows as its icon in its machine color, with its name as the accessible name.
 // An unknown machine shows its name. The state is "run", "dim" or "".
 function machineIcon(name, state = "") {
   const icon = MACHINE_ICONS.get(name.toLowerCase());
   if (!icon) return machineName(name);
-  const mark = icon.emoji
-    ? `<span class="machine-emoji" aria-hidden="true">${icon.emoji}</span>`
-    : `<svg aria-hidden="true"><use href="#machine-${icon.symbol}"></use></svg>`;
+  const mark = `<svg aria-hidden="true"><use href="#machine-${icon.symbol}"></use></svg>`;
+  const badge = icon.badgeSymbol
+    ? `<svg class="machine-badge" aria-hidden="true"><use href="#machine-${icon.badgeSymbol}"></use></svg>` : "";
   return `<span class="machine machine-icon${state && " " + state}" data-machine="${esc(name)}"` +
     `${icon.badge ? ` data-badge="${icon.badge}"` : ""} role="img" aria-label="${esc(name)}">` +
-    `${mark}</span>`;
+    `${mark}${badge}</span>`;
 }
 // "natedev or Mac" and "natedev only" give each machine name its color.
 function machineParts(text) {
@@ -1657,9 +1670,9 @@ function rowLabel({name, unit = "", owner = "", starter = "", repository = "", n
     `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
-function rowMemory(tip, note = "") {
+function rowMemory(tip) {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}"></div>` +
-    `<div class="amounts">${esc(note)}</div></div>`;
+    '<div class="amounts"></div></div>';
 }
 function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
@@ -2620,12 +2633,11 @@ function renderWalk(d) {
   rows.push(...ordered.map(r => {
     const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    const guest = guestRow(r);
     const target = targetCell(r.machine, undefined, r.guest_unconfirmed === true ? "not confirmed" : r.guest_unconfirmed);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
       r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens, r.last_move);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
-      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
   const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens", "moved"];
@@ -2945,7 +2957,6 @@ function placeMemoryBars(d) {
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
-    if (guestRow(run)) continue;
     const amount = shown.walk.find(run => run.key === row.dataset.run);
     let bars = "";
     const amounts = [];
@@ -2981,7 +2992,7 @@ function placeMemoryBars(d) {
     if (run.kind !== "cloud") {
       placeAmounts(row, amounts);
       if (run.kind === "mac-unavailable") row.querySelector(".amounts").textContent = run.status;
-      else if (!recorded(run.used)) row.querySelector(".amounts").textContent = macRow(run) ? "Used unavailable" : `Use unavailable: ${run.used.reason}`;
+      else if (!recorded(run.used)) row.querySelector(".amounts").textContent = "Used unavailable";
     }
   }
   const roomTrack = document.querySelector(".wrow.room .track");

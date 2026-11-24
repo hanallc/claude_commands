@@ -902,7 +902,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
         # The Machine cell shows the bright guest icon and the confirmation status.
         self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
-        self.assertIn("</svg></span> starting</td>", table)
+        self.assertIn('<use href="#machine-linux"></use></svg>'
+                      + '<svg class="machine-badge" aria-hidden="true"><use href="#machine-apple"></use></svg>'
+                      + '</span> starting</td>', table)
         text = "\n".join(tips["walk"][page["walk"].index(guest)])
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Testing  2 of 5 modules", text)
@@ -5251,6 +5253,7 @@ class BuildsPageProofTests(unittest.TestCase):
         directory, verdict = self.run_page_proof(gate=True, mode="--queue-rows")
         self.assertIn("rows", verdict)
         self.assertTrue((directory / "after-edge.png").is_file())
+        self.assertTrue((directory / "after.png").is_file())
 
 
 def machine_icons(row: str) -> list[tuple[str, str]]:
@@ -5407,6 +5410,7 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
                                    if row.get("kind") == "mac-build" and "verify" in row)
         pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
+        pages["guest_gate"] = json.loads(memory_feed.page_json(fixture.guest_gate_page()))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))

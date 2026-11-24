@@ -349,12 +349,12 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_each_machine_has_its_icon_in_both_states(self) -> None:
         forms = {
-            "natedev": (None, None, "🐧"),
+            "natedev": ("#machine-linux", None, None),
             "mac": ("#machine-apple", None, None),
-            "mac-linux": ("#machine-apple", "🐧", None),
-            "aws": ("#machine-cloud", "🐧", None),
-            "hana-aws": ("#machine-cloud", "🌸", None),
-            "hana-gpu": ("#machine-cloud", "⚡", None),
+            "mac-linux": ("#machine-linux", "#machine-apple", None),
+            "aws": ("#machine-cloud", "#machine-linux", None),
+            "hana-aws": ("#machine-cloud", None, "🌸"),
+            "hana-gpu": ("#machine-cloud", None, "⚡"),
         }
         rendered = self.page_expression(
             'data.states.flatMap(state => data.names.map(name => machineIcon(name, state))).join("")',
@@ -362,22 +362,20 @@ class MemoryHoverTests(unittest.TestCase):
         icons = ElementTree.fromstring(f"<root>{rendered}</root>")
         self.assertEqual(len(icons), 2 * len(forms))
         for index, state in enumerate(("run", "dim")):
-            for offset, (name, (symbol, badge, emoji)) in enumerate(forms.items()):
+            for offset, (name, (symbol, badge_symbol, emoji_badge)) in enumerate(forms.items()):
                 with self.subTest(name=name, state=state):
                     icon = icons[index * len(forms) + offset]
                     self.assertEqual(icon.get("class"), f"machine machine-icon {state}")
                     self.assertEqual(icon.get("data-machine"), name)
                     self.assertEqual(icon.get("aria-label"), name)
                     self.assertEqual(icon.get("role"), "img")
-                    self.assertEqual(icon.get("data-badge"), badge)
-                    self.assertEqual(len(icon), 1)
-                    self.assertEqual(icon[0].get("aria-hidden"), "true")
-                    if emoji is None:
-                        self.assertEqual(icon[0].tag, "svg")
-                        self.assertEqual([use.get("href") for use in icon[0].findall("use")], [symbol])
-                    else:
-                        self.assertEqual(icon[0].get("class"), "machine-emoji")
-                        self.assertEqual("".join(icon.itertext()), emoji)
+                    self.assertEqual(icon.get("data-badge"), emoji_badge)
+                    expected: list[tuple[str | None, list[str | None]]] = [(None, [symbol])]
+                    if badge_symbol is not None:
+                        expected.append(("machine-badge", [badge_symbol]))
+                    self.assertEqual([(svg.get("class"), [use.get("href") for use in svg.findall("use")])
+                                      for svg in icon], expected)
+                    self.assertTrue(all(svg.tag == "svg" and svg.get("aria-hidden") == "true" for svg in icon))
 
     def role_setup(self) -> str:
         members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
@@ -1150,14 +1148,19 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertNotIn("Guest attempt", tip)
                 self.assertNotIn("fixture-attempt", tip)
 
-    def test_guest_row_shows_on_mac_linux_in_the_memory_column(self) -> None:
-        reading = {"total": 64, "read_at": 200, "walk": [{
-            "name": "test affected", "machine": "mac-linux", "guest_unconfirmed": True,
-            "used": {"kind": "RunUseUnavailable", "reason": "remote memory is unavailable"}}]}
+    def test_guest_and_mac_rows_use_the_same_memory_markup(self) -> None:
+        reading = {"total": 64, "read_at": 200, "walk": [
+            {"name": "test affected", "machine": "mac-linux", "guest_unconfirmed": True,
+             "used": {"kind": "RunUseUnavailable", "reason": "remote memory is unavailable"}},
+            {"name": "terminal: build", "machine": "mac", "kind": "mac-build",
+             "used": {"kind": "MacMemoryUnavailable"}}]}
         table = self.page_expression("(renderWalk(data), $('walk').innerHTML)", reading, walk=True)
-        chart = ElementTree.fromstring(f"<root>{table}</root>").find(".//div[@data-run='fixture-run-0']")
-        assert chart is not None
-        self.assertEqual(chart.findtext(".//div[@class='amounts']"), "on mac-linux")
+        chart = ElementTree.fromstring(f"<root>{table}</root>")
+        for key in ("fixture-run-0", "fixture-run-1"):
+            memory = chart.find(f".//div[@data-run='{key}']/div[@class='row-memory']")
+            assert memory is not None
+            self.assertEqual([(cell.get("class"), cell.text) for cell in memory],
+                             [("track", None), ("amounts", None)])
 
     def test_guest_shows_one_running_icon_and_names_targets_in_the_hover(self) -> None:
         targets = ["natedev", "mac-linux"]

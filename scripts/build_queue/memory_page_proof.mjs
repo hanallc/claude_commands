@@ -16,6 +16,7 @@
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
+// Use --guest-memory after the output folder for the dark chart with a guest and an AWS wait.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
 // Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
 // Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
@@ -66,8 +67,10 @@ const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
+const guestMemoryProof = previousPage === '--guest-memory';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof
+  || guestTipProof || guestMemoryProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -94,9 +97,10 @@ function waitForMoveHandle(evaluate, rowId) {
 
 // nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
 // on the served reading, which has rows in the shape of the live feed. The path names the page to check.
-// With a shot folder, the check first saves the Running and Queued card at each width as real-<width>.png.
+// With a shot folder, save the Running and Queued card and a crop of the four-icon row.
 async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
   await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+  const columns = {};
   for (const width of [1440, 900]) {
     await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
     await navigate(path);
@@ -161,15 +165,72 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
             [icon.getAttribute('aria-label'), ['run', 'dim'].find(state => icon.classList.contains(state)) || '']),
           hover:kind === 'row' || kind === 'wait' ? tipText(key, latest).join('\\n').toLowerCase() : ''};
       });
+      const four = [...walk.querySelectorAll('tr.wait td.machine')].find(cell => cell.children.length === 4);
+      if (!four) throw new Error('The proof has no waiting row with four icons.');
+      const fourBounds = four.getBoundingClientRect();
+      const iconBoxes = [...four.children].map(icon => icon.getBoundingClientRect());
+      const queueHead = walk.querySelector('.walk-table tr.queue-head').getBoundingClientRect();
       return {rows, headers:[...walk.querySelectorAll('thead th, tr.queue-head th')].map(cell => cell.textContent),
+        fourFits:iconBoxes.every(box => box.top === iconBoxes[0].top && box.right <= fourBounds.right),
+        columns:[...walk.querySelectorAll('.walk-table thead th')].map(cell => {
+          const {left, width} = cell.getBoundingClientRect();
+          return [left, width];
+        }),
+        fourClip:{x:card.left+scrollX,y:queueHead.top+scrollY-4,width:card.width,
+          height:fourBounds.bottom-queueHead.top+8,scale:1},
         clip:{x:card.left+scrollX,y:card.top+scrollY,width:card.width,height:card.height,scale:1}};
     })()`);
+    columns[width] = shown.columns;
+    assert.ok(shown.fourFits, `The four machine icons do not fit on one line at ${width} px.`);
     if (shotFolder) {
       const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
       await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
+      if (width === 900) {
+        const crop = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.fourClip});
+        await writeFile(join(shotFolder,'four-icon-dark.png'), Buffer.from(crop.data,'base64'));
+      }
     }
     const kinds = new Set(shown.rows.map(row => row.kind));
     assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    if (path === 'memory_live.html') {
+      const alignment = await evaluate(`(() => {
+        const table = document.querySelector('.walk-table table');
+        const groups = [
+          ['thead tr', 'tr[data-tip^="row:"]', ['done','duration','pid','vcpus','tokens']],
+          ['tr.queue-head', 'tr.wait', ['place','done','duration','pid','vcpus']],
+        ];
+        const leftBefore = [];
+        const mismatches = [];
+        for (const [headingRow, bodyRows, columns] of groups) {
+          for (const column of columns) {
+            const header = table.querySelector(headingRow + ' > th.' + column);
+            const cells = [...table.querySelectorAll(bodyRows + ' > td.' + column)];
+            if (!header || !cells.length || [header,...cells].some(cell => getComputedStyle(cell).textAlign !== 'right'))
+              mismatches.push(headingRow + ' ' + column);
+            leftBefore.push(header);
+            if (column === 'place') leftBefore.push(...cells);
+          }
+        }
+        if (mismatches.length) return {mismatches};
+        const fourIcons = [...table.querySelectorAll('tr.wait td.machine')]
+          .find(cell => cell.querySelectorAll('.machine-icon').length === 4);
+        const positions = () => [...table.querySelectorAll('thead th, tr.queue-head th'), fourIcons].map(cell => {
+          const {left,width} = cell.getBoundingClientRect();
+          return [left,width];
+        });
+        if (!fourIcons) return {mismatches,fourIcons:false};
+        const right = positions();
+        for (const cell of leftBefore) cell.style.textAlign = 'left';
+        fitLabels();
+        const left = positions();
+        for (const cell of leftBefore) cell.style.removeProperty('text-align');
+        fitLabels();
+        return {mismatches,fourIcons:true,right,left};
+      })()`);
+      assert.deepEqual(alignment.mismatches, [], `The numeric cells do not align at ${width} px.`);
+      assert.ok(alignment.fourIcons, 'The proof needs a waiting row with four machine icons.');
+      assert.deepEqual(alignment.right, alignment.left, `Numeric alignment moves a column at ${width} px.`);
+    }
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
@@ -207,6 +268,7 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
         assert.match(row.hover, word(machine), `Orders 3 and 5: the hover of ${where} does not name ${machine}.`);
     }
   }
+  return columns;
 }
 
 async function assertRowCenters(evaluate) {
@@ -585,6 +647,47 @@ try {
           console.log(JSON.stringify({shots,output:folder}));
           break browserProof;
         }
+        if (guestMemoryProof || !focusedProof) {
+          const local = {...readings.verify_calls.walk.find(row => row.queued && row.verify), machine:'natedev'};
+          const guest = readings.guest_gate.walk.find(row => row.guest_run);
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
+          const awsWait = readings.cloud.waiters.find(row => row.kind === 'cloud');
+          servedReading = {...base, walk:[local, guest, mac], waiters:[awsWait], held_places:[]};
+          await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const memoryCells = `[0,1,2].map(index => {
+            const row = document.querySelector('.wrow[data-run="' + proofRun(index) + '"]');
+            const machine = document.querySelector('tr[data-tip="' + proofTip('row',index) + '"] .machine-icon');
+            return {machine:machine.dataset.machine, text:row.querySelector('.amounts').textContent,
+              memory:!!row.querySelector('.seg-used, .seg-remote'), progress:!!row.querySelector('.row-progress')};
+          })`;
+          const measured = await evaluate(memoryCells);
+          assert.deepEqual(measured.map(row => row.machine), ['natedev','mac-linux','mac']);
+          assert.deepEqual(measured.map(row => row.memory), [true,false,true]);
+          assert.ok(measured[1].progress, 'The guest module counter has no progress bar.');
+          assert.equal(measured[1].text, 'Used unavailable');
+          assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon.dim')]
+            .map(icon => [icon.dataset.machine, ...[...icon.querySelectorAll('use')].map(use => use.getAttribute('href'))])`),
+          [['aws','#machine-cloud','#machine-linux']]);
+          const clip = guestMemoryProof ? await evaluate(`(() => {
+            const bounds = document.querySelector('#walk').closest('.card').getBoundingClientRect();
+            return {x:bounds.left+scrollX,y:bounds.top+scrollY,width:bounds.width,height:bounds.height,scale:1};
+          })()`) : null;
+          const shot = clip && await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
+          const unavailable = await evaluate(`(() => {
+            latest.walk[2].used = {kind:'MacMemoryUnavailable'};
+            fitLabels();
+            return ${memoryCells};
+          })()`);
+          assert.deepEqual(unavailable.slice(1).map(({text,memory}) => [text,memory]),
+            [['Used unavailable',false],['Used unavailable',false]]);
+          if (guestMemoryProof) {
+            const path = join(folder, 'after-dark.png');
+            await writeFile(path, Buffer.from(shot.data,'base64'));
+            console.log(JSON.stringify({pass:true,shot:path,rows:measured}));
+            break browserProof;
+          }
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -752,6 +855,8 @@ try {
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
             title:{unit:'admin-console',step:'test affected'},targets:['natedev','hana-aws']});
+          const cloudWait = {...readings.cloud.waiters.find(row => row.kind === 'cloud'),
+            key:'shot-aws-wait', targets:['aws']};
           const ci = {key:'shot-ci',name:'hana CI',ci:true,admitted:true,started_at:reading.read_at-120,
             machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
           reading.walk = [rust, guest, mac, ci];
@@ -781,25 +886,25 @@ try {
             waiting.since = reading.read_at - 90;
             await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
           }
-          servedReading = reading;
           const navigateQueueRows = async width => {
             const showHandle = !shootBefore && width === 1440;
+            servedReading = queueRowsProof && showHandle ? {...reading, waiters:[waiting,cloudWait]} : reading;
             // The narrow layout checks use the read-only view.
-            queueFixture = showHandle ? reading : null;
+            queueFixture = showHandle ? servedReading : null;
             await navigate(shootBefore ? 'before.html' : 'memory_live.html');
             if (showHandle) await waitForMoveHandle(evaluate, waiting.move.row_id);
           };
           const machineGraphics = {
-            'natedev':['🐧', null],
+            'natedev':['#machine-linux', null],
             'mac':['#machine-apple', null],
-            'mac-linux':['#machine-apple', '🐧'],
-            'aws':['#machine-cloud', '🐧'],
+            'mac-linux':['#machine-linux', '#machine-apple'],
+            'aws':['#machine-cloud', '#machine-linux'],
             'hana-aws':['#machine-cloud', '🌸'],
             'hana-gpu':['#machine-cloud', '⚡'],
           };
           const expectedIcon = name => [name, name, ...machineGraphics[name]];
           const runningIcon = name => [...expectedIcon(name), 'img', 'run'];
-          const waitingIcons = ['natedev','hana-aws'].map(name => [...expectedIcon(name), 'img', 'dim']);
+          const waitingIcons = names => names.map(name => [...expectedIcon(name), 'img', 'dim']);
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
           let rows;
@@ -823,8 +928,14 @@ try {
               const waitingName = chart(keys[4]).querySelector('.name');
               const handle = chart(keys[4]).querySelector('.queue-grip');
               const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
-                icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
-                icon?.getAttribute('data-badge')];
+                icon?.querySelector('svg use')?.getAttribute('href'),
+                icon?.querySelector('.machine-badge use')?.getAttribute('href') ?? icon?.getAttribute('data-badge')];
+              const rowIcons = key => [...(table(key)?.querySelectorAll('td.machine .machine-icon') ?? [])].map(icon =>
+                [...iconDetails(icon), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))]);
+              const sizes = selector => [...walk.querySelectorAll(selector)].map(icon => {
+                const {width, height} = icon.getBoundingClientRect();
+                return [width, height];
+              });
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
                 keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
@@ -837,8 +948,10 @@ try {
                 trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
-                icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
-                  [...iconDetails(icon), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
+                icons:keys.map(rowIcons),
+                cloudIcons:rowIcons('wait:shot-aws-wait'),
+                iconSizes:sizes('td.machine .machine-icon'),
+                badgeSizes:sizes('td.machine .machine-badge'),
                 wrappedIcons:[...walk.querySelectorAll('tbody td.machine')].filter(cell =>
                   new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
                   .map(cell => cell.closest('tr').dataset.tip),
@@ -867,7 +980,10 @@ try {
                 ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
               assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
-                [runningIcon('natedev')],waitingIcons]);
+                [runningIcon('natedev')],waitingIcons(waiting.targets)]);
+              if (queueRowsProof && width === 1440) assert.deepEqual(rows.cloudIcons, waitingIcons(cloudWait.targets));
+              assert.ok(rows.iconSizes.every(([w,h]) => w === 28 && h === 24), 'A machine icon changed box size.');
+              assert.ok(rows.badgeSizes.every(([w,h]) => w === 14 && h === 14), 'A symbol badge changed box size.');
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
@@ -1116,11 +1232,11 @@ try {
           servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
           // The queue-move stub gives the page a token, so the reorder handles draw.
           queueFixture = servedReading;
-          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
+          const columns = await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
             standingProof ? folder : '');
           queueFixture = null;
           if (standingProof) {
-            console.log(JSON.stringify({pass:true}));
+            console.log(JSON.stringify({pass:true,columns}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});

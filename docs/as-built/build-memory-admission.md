@@ -306,13 +306,15 @@ The feed adds the guest setup allowance and `query_timeout_seconds` to `started_
 Before the deadline, an unconfirmed row shows `starting`.
 At or after the deadline, it shows `not confirmed`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
-The Machine cell shows one bright Apple icon with a 🐧 badge.
-The Apple icon has a white fill and a black outline in light and dark modes.
+The Machine cell shows one bright Tux icon with a small Apple badge.
+The Apple badge has a white fill and a black outline in light and dark modes.
 The cell shows the unconfirmed state next to the icon. A confirmed row shows the icon alone.
 The tooltip shows `Runs on` and `Named targets`.
 The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
 The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
-The memory column shows `on mac-linux`. The vCPU column shows `—`.
+The memory column shows `Used unavailable` for a guest with no memory reading.
+The guest uses the same progress bar as other runs when it has a counter.
+The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
 The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
@@ -2404,6 +2406,8 @@ The small text is empty when the showrunner is the same name as the unit.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
 For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Machine`, `vCPU`, and `Tokens`.
 The waiting table uses `#` and `Waiting`, and omits `Tokens`.
+The headers and values for `Done`, `Dur`, `Pid`, `vCPU`, and `Tokens` align to the right.
+The waiting rows also align the `#` and `Waiting` headers and values to the right.
 The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
 On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
@@ -2411,16 +2415,16 @@ On 2026-11-23, Nate said: “where it is running should be what shows in the run
 On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): the `Machine` column shows icons, not names.
 `MACHINE_ICONS` in `memory_live.html` gives each known machine its icon.
 
-- `natedev` uses the 🐧 emoji by itself.
+- `natedev` uses a drawing of the full Tux figure.
 - `mac` uses the Apple silhouette.
-- `mac-linux` uses the Apple silhouette with a 🐧 badge.
-- `aws` uses the cloud with a 🐧 badge.
+- `mac-linux` uses Tux with a small Apple badge.
+- `aws` uses the cloud with a small Tux badge.
 - `hana-aws` uses the cloud with a 🌸 badge.
 - `hana-gpu` uses the cloud with a ⚡ badge.
 
-A hidden `<svg>` defines the Apple and cloud symbols once.
-Each SVG icon references its symbol with `<use href>`.
-CSS draws each badge from the icon's `data-badge` value.
+A hidden `<svg>` defines the Tux, Apple, and cloud symbols.
+Each SVG icon and SVG badge references its symbol with `<use href>`.
+CSS uses the icon's `data-badge` value for emoji badges.
 Each icon records its machine in `data-machine` and uses that name in `aria-label`.
 A running row shows one bright icon in a faint box for the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
