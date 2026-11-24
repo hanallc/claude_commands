@@ -23,7 +23,7 @@ from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_wire import CloudGroup
 from scripts.build_queue.admission_test_support import AdmissionFixture
-from scripts.build_queue.queue_fixture import NOW, QueueFixture
+from scripts.build_queue.queue_fixture import NOW, QueueFixture, head_reading
 from scripts.lint import memory_admit as gate
 from scripts.lib.build_steps import StepNames
 from scripts.message.unit_labels import UnitLabels
@@ -53,22 +53,6 @@ class RecordedOwnerQueueTests(unittest.TestCase):
             with self.subTest(label=label):
                 names = StepNames({"names.gate": label})
                 self.assertEqual(recorded_step("gate", names), expected)
-
-    def test_repository_slot_wait_is_shown_without_a_memory_need(self) -> None:
-        with QueueFixture() as fixture:
-            model = queue_model(fixture)
-            base = model.reading
-            slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
-                wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
-                base.explanation.now - 60, "natedev",
-                wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-            reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
-                cloud_gate_stale_pushes=3, repository_slots=(slot,))
-            model = replace(model, reading=reading)
-            self.assertEqual(reading.explanation.totals, base.explanation.totals)
-            self.assertEqual(reading.explanation.room, base.explanation.room)
-            self.assertIn(slot, queue_view.waiting_builds(model))
-
 
     def test_detached_and_systemd_rows_resolve_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
@@ -599,6 +583,18 @@ class MacQueueViewTests(unittest.TestCase):
 
 
 class CloudQueueViewTests(unittest.TestCase):
+    def test_ranked_cloud_waits_keep_the_service_order_beside_local_waits(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        local, = head_reading(since=reading.cloud[1].since).view.waiting
+        waiting_cloud = reading.cloud[1]
+        older = replace(waiting_cloud, since=local.since - 30)
+        ranked = replace(waiting_cloud, owner=wire.Owner(700003, "300"), since=local.since + 30)
+        updated = replace(reading, cloud=(ranked, older), view=replace(reading.view, waiting=(local,)))
+        shown = queue_view.waiting_builds(replace(model, reading=updated))
+        self.assertEqual(shown, [ranked, queue_view.WaitingBuild(1, local), older])
+
     def test_group_waits_sort_by_trial_start_before_a_newer_single_request(self) -> None:
         model, _fixture = self.cloud_model()
         reading = model.reading
@@ -608,8 +604,10 @@ class CloudQueueViewTests(unittest.TestCase):
             with self.subTest(trial_started=trial_started):
                 grouped = replace(single, owner=wire.Owner(700003, "300"), since=single.since + 30,
                     place=wire.CloudPlace("aws", CloudGroup("older", 2, trial_started, wire.Owner(700004, "400"))))
-                waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
-                self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
+                local, = head_reading(since=single.since + 15).view.waiting
+                updated = replace(reading, cloud=(grouped, single), view=replace(reading.view, waiting=(local,)))
+                waiting = queue_view.waiting_builds(replace(model, reading=updated))
+                self.assertEqual(waiting, [grouped, single, queue_view.WaitingBuild(1, local)])
 
     def test_owner_templates_keep_the_step_name_and_prose(self) -> None:
         model = self.cloud_model()[0]

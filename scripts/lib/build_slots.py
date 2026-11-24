@@ -24,7 +24,6 @@ from uuid import uuid4
 
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
-from scripts.lib.slot_root import configured_slot_root as configured_slot_root
 
 
 # Python writes these folders beside each imported module; they hold no work.
@@ -99,17 +98,8 @@ def source_checkout(source: Path) -> Path:
     return (Path(common) / configured).resolve()
 
 
-def _root(settings: conf.ConfigRead, key: str) -> Path:
-    return Path(os.path.expandvars(settings.text(key))).expanduser().resolve()
-
-
-def slot_cargo_root(settings: conf.ConfigRead) -> Path:
-    """Read the root for each slot's build output."""
-    return _root(settings, "roots.slot_cargo")
-
-
 def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the repository limit or the machine's default limit."""
+    """Read the Mac claim limit for the repository, or the machine's default limit."""
     key = f"slots.{machine}.{repository}.max"
     return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
 

@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 from collections import deque
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -47,8 +47,10 @@ from scripts.build_queue import ci_job_start
 from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import memory_trace
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import person_actions, queue_snapshot
+from scripts.build_queue.build_queue import asked_words
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
@@ -371,7 +373,8 @@ class SystemReadings:
             host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
             window = conf.read("build_admission").whole("agent_swap_window_seconds")
             returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
-            return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
+            return (replace(host, swap_in_window_bytes=returning, swap_in_window_seconds=window)
+                    if isinstance(returning, int) else returning)
         except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
@@ -763,8 +766,11 @@ class ReplayLedger(dict[str, ReplayEntry]):
 class PendingAdmission:
     episode: str
     need_source: records.NeedSource
+    # The step was the first queued row in queue order.
     is_head: bool
     wait_seconds: float
+    # The default exists only so that outbox entries saved before this field decode.
+    passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -777,9 +783,14 @@ class PendingLeft:
 
 @dataclass(frozen=True)
 class PendingCloudGroup:
-    """Keep the group's place until admission or coordinator exit."""
+    """Keep the group's place and first caller until admission or coordinator exit."""
     target: str
     group: status_wire.CloudGroup
+    unit: str = ""
+    session_id: str = ""
+
+
+CloudQueueOrder = tuple[int, float, int, str]
 
 
 @dataclass(frozen=True)
@@ -1176,7 +1187,8 @@ class OperatingSystemReader:
     """One thread publishes complete readings at the existing pass cadence."""
 
     def __init__(self, plan: SystemReadingPlan, initial: SystemEvidence,
-                 readings: Readings, proc: Proc, clock: Clock, wake: int) -> None:
+                 readings: Readings, proc: Proc, clock: Clock, wake: int, *,
+                 traces: memory_trace.TraceCapture | memory_trace.TracesOff = memory_trace.TRACES_DISABLED) -> None:
         self.plan: SystemReadingPlan = plan
         self.reading: SystemEvidence = initial
         self.readings: Readings = readings
@@ -1186,6 +1198,8 @@ class OperatingSystemReader:
         self.lock: threading.Lock = threading.Lock()
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
+        self.traces: memory_trace.TraceWorker | memory_trace.TracesOff = (
+            memory_trace.TraceWorker(traces) if isinstance(traces, memory_trace.TraceCapture) else traces)
         self.failure: Exception | NoReadingFailure = NoReadingFailure()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="admission-readings", daemon=True)
         self.thread.start()
@@ -1203,7 +1217,35 @@ class OperatingSystemReader:
                 self.requested.set()
 
     def request_read(self) -> None:
-        self.requested.set()
+        with self.lock:
+            self.requested.set()
+
+    def register_trace(self, record: ReservationRecord, argv: tuple[str, ...], host: str, wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.repo_identity and record.step == "nextest"
+                and record.sidecar and record.need > 0 and argv):
+            width = records.UnspecifiedTestWidth() if isinstance(record.test_width, records.NoTestWidth) else record.test_width
+            shape = memory_trace.HanaTraceShape(host, record.repo_identity, argv, width)
+            self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
+                                                       wall, self.clock.monotonic()))
+
+    def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
+                      wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.step == "nextest" and record.sidecar):
+            status = ending.status if isinstance(ending, ReleaseStatus) else memory_trace.ExitStatusUnavailable()
+            self.traces.release(record.reservation_id, wall, status)
+
+    def record_trace_reserves(self, explanation: records.QueueExplanation) -> None:
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            running = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
+            reserves = {row["reservation_id"]: entry.promise for row, entry in
+                        zip(explanation.decided_from.reservations, running, strict=True)
+                        if row["repo"] == "hana" and row["step"] == "nextest" and row.get("scoped", False)
+                        and "reservation_id" in row and isinstance(entry.step.measured, records.MeasuredMemory)
+                        and isinstance(entry.step.measured.peak_history, records.TestPhaseStarted)}
+            if reserves:
+                self.traces.submit(reserves)
 
     def raise_failure(self) -> None:
         with self.lock:
@@ -1212,15 +1254,17 @@ class OperatingSystemReader:
             raise failure
 
     def _read(self) -> None:
+        last_read = self.clock.monotonic()
         while not self.stopped.is_set():
             with self.lock:
                 plan = self.plan
             interval = plan.config.waiting_pass_seconds if plan.waiting else plan.config.running_pass_seconds
-            _ = self.requested.wait(interval)
-            self.requested.clear()
+            full_deadline = last_read + interval
+            _ = self.requested.wait(max(0.0, full_deadline - self.clock.monotonic()))
             if self.stopped.is_set():
-                return
+                break
             with self.lock:
+                self.requested.clear()
                 plan = self.plan
             try:
                 reading = read_system(plan, self.readings, self.proc, self.clock)
@@ -1231,11 +1275,14 @@ class OperatingSystemReader:
                 with self.lock:
                     self.reading = reading
             os.eventfd_write(self.wake, 1)
+            last_read = self.clock.monotonic()
 
     def close(self) -> None:
         self.stopped.set()
         self.requested.set()
         self.thread.join()
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            self.traces.close()
 
 
 @dataclass(frozen=True)
@@ -1612,16 +1659,44 @@ class NoPendingPriorityRoster:
 
 
 @dataclass(frozen=True)
+class PriorityRosterRead:
+    """The unit labels of the roster and the actor that asked."""
+    labels: Mapping[str, gate.UnitMembership]
+    asker: records.Asker
+
+
+@dataclass(frozen=True)
 class PendingPriorityRoster:
     change: OrderedQueueChange
-    result: Future[Mapping[str, gate.UnitMembership]]
+    why: str
+    result: Future[PriorityRosterRead]
 
 
-def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake: int) -> None:
-    """Read the roster without changing service state."""
+@dataclass(frozen=True)
+class PriorityRosterNotRead:
+    """A clear needs no roster; only a set reads it."""
+
+
+PRIORITY_ROSTER_NOT_READ = PriorityRosterNotRead()
+
+
+@dataclass(frozen=True)
+class PriorityHistoryReadable:
+    """The last priority history read or write worked."""
+
+
+@dataclass(frozen=True)
+class PriorityHistoryUnreadable:
+    """A priority history read or write failed with this text; the change waits until a write works."""
+    error: str
+
+
+def read_priority_roster(result: Future[PriorityRosterRead], actor: str, wake: int) -> None:
+    """Read the roster and the actor that asked without changing service state."""
     try:
         try:
-            result.set_result(gate.priority_labels(gate.RosterUnits()))
+            result.set_result(PriorityRosterRead(gate.priority_labels(gate.RosterUnits()),
+                                                 records.actor_asker(actor, records.queue_staff())))
         except Exception as error:
             result.set_exception(error)
         os.eventfd_write(wake, 1)
@@ -1939,6 +2014,7 @@ class AdmissionServer:
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
                  host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = memory_trace.TRACES_DISABLED,
                  job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
@@ -1997,6 +2073,7 @@ class AdmissionServer:
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
         self.last_policy: records.AdmissionPolicy | NoPass = NoPass()
+        self.last_cloud_waiters: tuple[WaitingAdmission, ...] = ()
         # The natedev hold of each held local waiter at the last pass.
         self.local_holds: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
@@ -2022,12 +2099,14 @@ class AdmissionServer:
         self.bumps: person_actions.BumpProgress = person_actions.BumpProgress()
         self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
         self.queue_changes: deque[OrderedQueueChange] = deque()
+        self.priority_history: PriorityHistoryReadable | PriorityHistoryUnreadable = PriorityHistoryReadable()
         self.last_diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
         self._pending_replies: dict[str, list[wire.Reply]] = {}
         self._persisted: str = ""
         self.durable_encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         self.published: PublishedReplies | NoPass = NoPass()
         self.system_reader: SystemReader | NoSystemReader = NoSystemReader()
+        self.trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = trace_policy
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.owner_confirmation_reading: object = object()
         self.owner_confirmations: dict[int, OwnerStartReading] = {}
@@ -2074,18 +2153,28 @@ class AdmissionServer:
         self._restore()
         _ = self.run_pass()
 
-    def _finish_priority(self) -> None:
-        if isinstance(self.priority, records.NoQueuePriority):
-            return
-        transition = self.priority.transition
-        if isinstance(transition, records.SettledPriority):
-            return
+    def _settle_priority(self) -> bool:
+        """Write the history row of a pending priority change; False while the write fails."""
+        priority = self.priority
+        if isinstance(priority, records.NoQueuePriority) or isinstance(priority.transition, records.SettledPriority):
+            return True
         self.writes.require(store.root())
-        gate.finish_priority_transition(self.priority)
-        self.priority = (records.QueuePriority(self.priority.entries) if self.priority.entries
-                         else records.NO_QUEUE_PRIORITY)
+        try:
+            gate.finish_priority_transition(priority)
+        except (OSError, ValueError) as error:
+            self._report_history_error("a priority change waits for its history row", error)
+            return False
+        self.priority_history = PriorityHistoryReadable()
+        self.priority = records.QueuePriority(priority.entries) if priority.entries else records.NO_QUEUE_PRIORITY
         self.persist()
+        return True
 
+    def _report_history_error(self, waits: str, error: OSError | ValueError) -> None:
+        """Print each distinct history error once."""
+        unreadable = PriorityHistoryUnreadable(str(error))
+        if self.priority_history != unreadable:
+            print(f"memory admission: {waits}: {error}", file=sys.stderr)
+        self.priority_history = unreadable
 
     def _restore(self) -> None:
         path = self.state_dir / "state.json"
@@ -2134,7 +2223,7 @@ class AdmissionServer:
                 self._watch_owner(record.owner)
                 self._watch_scope(lifetime, episode)
         self._prune_places()
-        self._finish_priority()
+        _ = self._settle_priority()
         for request in self.placement_requests.values():
             self.prerequisites[request.episode] = (placement.TokenNotRequired()
                 if isinstance(request.prerequisite, placement.TokenNotRequired) else placement.TokenRequired())
@@ -2445,7 +2534,7 @@ class AdmissionServer:
         priority, order_since, since, pid = gate.waiter_order(row)
         place = self._waiter_run_place(row)
         if place is not None and order_since == place.since:
-            # Keep the run rank and order its steps by arrival time.
+            # Keep the run rank. Sort its steps by arrival time.
             return priority, order_since, place.since, place.first_owner.pid, since, pid
         return priority, order_since, since, pid, since, pid
 
@@ -2475,25 +2564,22 @@ class AdmissionServer:
                 visible.add(place.move_id)
         return [(path, row) for path, row in ordered if row.get("move_id") in visible]
 
+    @staticmethod
+    def _priority_context(priority: records.QueuePriority | records.NoQueuePriority,
+                          callers: Iterable[tuple[str, str]]) -> gate.QueueOrderContext:
+        if not isinstance(priority, records.QueuePriority) or not priority.entries:
+            return gate.QueueOrderContext(priority, {})
+        sessions = list(dict.fromkeys(session for unit, session in callers if not unit and session))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
+        return gate.QueueOrderContext(priority, labels)
+
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
-        # Match CI priority by runner. Publish the current step's unit.
-        ci_waiters: dict[Path, records.RankedWaiter] = {}
-        sessions: list[str] = []
-        ranking_rows: list[tuple[Path, records.Waiter]] = []
-        for path, row in rows:
-            name = self._priority_name(row)
-            if name != row.get("unit", ""):
-                ci_waiters[path] = row
-                row = row.copy()
-                row["unit"] = name
-            elif not name:
-                sessions.append(row.get("session_id", ""))
-            ranking_rows.append((path, row))
-        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
-        ranked, _ = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(priority, labels))
-        return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
-                 if path in ci_waiters else row) for path, row in ranked]
+        context = self._priority_context(priority,
+            ((self._priority_name(row), row.get("session_id", "")) for _, row in rows))
+        # Rank CI steps by runner. Publish the current step's unit.
+        return [(path, gate.rank_waiter(
+            row, gate.unit_order(self._priority_name(row), row.get("session_id", ""), context))) for path, row in rows]
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:
@@ -3433,7 +3519,10 @@ class AdmissionServer:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
-        cloud_started = self._cloud_pass(inputs, self.configuration)
+        cloud_waiters, cloud_groups = self._cloud_waiters()
+        cloud_started = self._cloud_pass(inputs, self.configuration, cloud_waiters, cloud_groups)
+        self.last_cloud_waiters = tuple(waiting for _, waiting in cloud_waiters
+                                        if self.waiters.get(waiting.request.episode) is waiting)
         by_owner = {records.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
         head = result.policy.queued_head
         head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
@@ -3515,35 +3604,61 @@ class AdmissionServer:
             self.system_reader.update(self._reading_plan(config))
         return result
 
-    def _register_cloud_group(self, place: wire.CloudPlace, group: status_wire.CloudGroup
+    def _register_cloud_group(self, place: wire.CloudPlace, group: status_wire.CloudGroup, identity: wire.Identity
                               ) -> wire.Refused | None:
-        pending = PendingCloudGroup(place.target, group)
         previous = self.pending_cloud_groups.get(group.key)
         if previous is not None:
-            if previous != pending:
+            if previous.target != place.target or previous.group != group:
                 return wire.Refused("cloud group members disagree on the group")
-            return None
-        if any(isinstance(record.place, wire.CloudPlace) and isinstance(record.place.group, status_wire.CloudGroup)
-               and record.place.group.key == group.key for record in self.reservations.values()):
+            if previous.unit:
+                return None
+        elif any(isinstance(record.place, wire.CloudPlace) and isinstance(record.place.group, status_wire.CloudGroup)
+                 and record.place.group.key == group.key for record in self.reservations.values()):
             return wire.Refused("cloud group already has reservations")
+
+        session = previous.session_id if previous is not None and previous.session_id else identity.session_id
+        unit = identity.unit if session == identity.session_id else ""
+        if not unit and session:
+            unit = gate.queue_unit(unit, session, gate.priority_labels([session]))
+        pending = PendingCloudGroup(place.target, group, unit, session)
+        if pending == previous:
+            return None
         self.pending_cloud_groups[group.key] = pending
-        if self.proc.owner_start(group.coordinator.pid) == LiveOwnerIdentity(group.coordinator.start_time):
+        if previous is None and self.proc.owner_start(group.coordinator.pid) == LiveOwnerIdentity(group.coordinator.start_time):
             self._watch_owner(group.coordinator)
         self.persist()
         return None
 
-    @staticmethod
-    def _cloud_order(waiting: WaitingAdmission) -> tuple[float, int, str]:
-        request = waiting.request
-        assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
-        return status_wire.cloud_queue_order(request.place, waiting.row["since"])
+    def _cloud_waiters(self) -> tuple[list[tuple[CloudQueueOrder, WaitingAdmission]], dict[str, CloudQueueOrder]]:
+        """Rank the connected waits and the saved groups with the same priority."""
+        waiting_cloud = [waiting for waiting in self.waiters.values()
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace)]
+        context = self._priority_context(self.priority, [
+            *((self._priority_name(waiting.row), waiting.row.get("session_id", "")) for waiting in waiting_cloud),
+            *((pending.unit, pending.session_id) for pending in self.pending_cloud_groups.values()),
+        ])
+        group_orders: dict[str, CloudQueueOrder] = {}
+        for key, pending in self.pending_cloud_groups.items():
+            unit = gate.queue_unit(pending.unit, pending.session_id, context.labels)
+            if unit != pending.unit:
+                self.pending_cloud_groups[key] = replace(pending, unit=unit)
+            rank = gate.priority_rank(gate.unit_order(unit, "", context))
+            group_orders[key] = (rank,
+                *status_wire.cloud_queue_time(wire.CloudPlace(pending.target, pending.group), pending.group.started_at))
+        ordered: list[tuple[CloudQueueOrder, WaitingAdmission]] = []
+        for waiting in waiting_cloud:
+            request = waiting.request
+            assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+            group = request.place.group
+            if isinstance(group, status_wire.CloudGroup):
+                order = group_orders[group.key]
+            else:
+                unit = gate.unit_order(self._priority_name(waiting.row), waiting.row.get("session_id", ""), context)
+                order = (gate.priority_rank(unit), *status_wire.cloud_queue_time(request.place, waiting.row["since"]))
+            ordered.append((order, waiting))
+        return sorted(ordered, key=lambda entry: entry[0]), group_orders
 
-    def _cloud_waiters(self) -> list[WaitingAdmission]:
-        return sorted((waiting for waiting in self.waiters.values()
-            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace)),
-            key=self._cloud_order)
-
-    def _cloud_groups(self, waiting_cloud: list[WaitingAdmission], slots: int
+    def _cloud_groups(self, waiting_cloud: Iterable[WaitingAdmission], slots: int
                       ) -> dict[str, list[WaitingAdmission]]:
         groups: dict[str, list[WaitingAdmission]] = {}
         for waiting in waiting_cloud:
@@ -3591,21 +3706,20 @@ class AdmissionServer:
         return (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
                 or self._cloud_slots_used() >= self.configuration.cloud_gate_slots)
 
-    def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
-        waiting_cloud = self._cloud_waiters()
+    def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration,
+                    waiting_cloud: list[tuple[CloudQueueOrder, WaitingAdmission]],
+                    group_orders: Mapping[str, CloudQueueOrder]) -> bool:
         if not waiting_cloud and not self.pending_cloud_groups:
             return False
         config = configuration.config
         slots = configuration.cloud_gate_slots
-        groups = self._cloud_groups(waiting_cloud, slots)
-        disconnected = min(((pending.group.started_at, 0, key)
-            for key, pending in self.pending_cloud_groups.items() if key not in groups),
-            default=(float("inf"), 0, ""))
+        groups = self._cloud_groups((waiting for _, waiting in waiting_cloud), slots)
+        disconnected = min((group_orders[key] for key in self.pending_cloud_groups if key not in groups), default=None)
         used = self._cloud_slots_used()
         started = False
         blocked = False
         position = 0
-        for waiting in waiting_cloud:
+        for order, waiting in waiting_cloud:
             request = waiting.request
             if self.waiters.get(request.episode) is not waiting:
                 continue
@@ -3614,7 +3728,7 @@ class AdmissionServer:
             members = groups[group.key] if isinstance(group, status_wire.CloudGroup) else [waiting]
             size = group.size if isinstance(group, status_wire.CloudGroup) else 1
             if not blocked:
-                if self._cloud_order(waiting) < disconnected and len(members) == size and used + size <= slots:
+                if (disconnected is None or order < disconnected) and len(members) == size and used + size <= slots:
                     self._admit(members, config, configuration.peak_history_share_percent,
                                 cargo_folder=placement.NoCargoFolder(), verify_slots={})
                     used += size
@@ -3632,7 +3746,8 @@ class AdmissionServer:
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
         return started
 
-    def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration
+    def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration,
+                       waiting_cloud: Iterable[WaitingAdmission]
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
@@ -3664,9 +3779,6 @@ class AdmissionServer:
                 current, counter, wait_state))
         if recorded_launch:
             self.persist()
-        waiting_cloud = self._cloud_waiters()
-        if not rows and not waiting_cloud:
-            return reading
         for waiting in waiting_cloud:
             request = waiting.request
             assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
@@ -3674,6 +3786,8 @@ class AdmissionServer:
             rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
+        if not rows:
+            return reading
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
@@ -3803,6 +3917,9 @@ class AdmissionServer:
         ordered = self._published_queue_order(ordered, hidden)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        if (isinstance(self.trace_policy, memory_trace.MemoryTracePolicy)
+                and isinstance(self.system_reader, OperatingSystemReader)):
+            self.system_reader.record_trace_reserves(reading.explanation)
         local = {path: replace(step, verify=row.get("verify", step.verify))
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
         held_reasons = {records.waiter_owner(self.waiters[episode].row): reason
@@ -3850,7 +3967,9 @@ class AdmissionServer:
         reading = self._placement_reading(reading)
         move_line = self._current_move_line(reading.ordered, self._movable_wait_ids() - hidden)
         reading = replace(reading, view=replace(reading.view, move_line=move_line))
-        reading = replace(self._cloud_reading(reading, self.configuration),
+        remaining_cloud = (waiting for waiting in self.last_cloud_waiters
+                           if self.waiters.get(waiting.request.episode) is waiting)
+        reading = replace(self._cloud_reading(reading, self.configuration, remaining_cloud),
                           held_places=reading.number_held_places(self.held_places, gate.waiter_order, self.priority))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
@@ -4005,6 +4124,8 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
+                if isinstance(pending.passed, gate.PassedRows):
+                    event["passed"] = pending.passed
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
@@ -4116,13 +4237,18 @@ class AdmissionServer:
                 reply: wire.Admitted | wire.LaunchAdmitted = admission
                 self.ledger[request.episode] = ReplayEntry(reply, now)
             else:
-                result = self.last_result
-                candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
+                # Every caller admits after the pass that set last_result, so it is the admitting walk.
+                result, inputs = self.last_result, self.last_inputs
+                started = records.waiter_owner(waiting.row)
+                candidate: gate.QueuedHead | gate.NoQueuedHead = gate.NoQueuedHead()
+                passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
+                if isinstance(result, gate.PassResult) and isinstance(inputs, records.QueueInputs):
+                    candidate = result.policy.queued_head
+                    passed = gate.passed_rows(result.policy.walk, started, inputs.pending_remote_starts)
                 source = request.profile.peak.source
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
-                    isinstance(candidate, gate.QueuedHead)
-                        and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
-                    max(0.0, now - waiting.row["since"])))
+                    isinstance(candidate, gate.QueuedHead) and records.waiter_owner(candidate.waiter) == started,
+                    max(0.0, now - waiting.row["since"]), passed))
                 if (line := self._gate_gap_start(admission, now)) is not None:
                     gap_starts.append(line)
                 self._save_gate_rank(admission, waiting.row.get("move_id", ""))
@@ -4163,6 +4289,10 @@ class AdmissionServer:
         for line in gap_starts:
             print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
+            request = waiting.request
+            if isinstance(reply, wire.Admitted) and isinstance(request, wire.AdmitRequest) and isinstance(
+                    self.system_reader, OperatingSystemReader):
+                self.system_reader.register_trace(self.reservations[request.episode], request.argv, self.host, now)
             self._remove_waiter(waiting, reply)
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
@@ -4192,6 +4322,8 @@ class AdmissionServer:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        if isinstance(self.system_reader, OperatingSystemReader):
+            self.system_reader.release_trace(record, ending, ended_at)
         if record.episode.startswith("uid:"):
             self._sample_runner(record, 0, ended_at)
         self.progress_history.finish(record.reservation_id, ended_at, ended_at - step_estimator.HISTORY_DAYS * 86400)
@@ -6451,11 +6583,11 @@ done
             return "queue moves require the service account"
         if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             return ""
-        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
+        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
                else request.request_id)
         if not key.startswith(f"uid:{uid}:"):
             return "request belongs to another account"
-        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest)):
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
             if self._account(request.owner) != uid or not self._live(request.owner):
                 return "owner belongs to another account or no longer exists"
             if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
@@ -6557,8 +6689,6 @@ done
             status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider,
                                                       permission, report)
             return [status_wire.PlacementStatusReply(status)]
-        if isinstance(request, wire.RepositorySlotRequest):
-            return [wire.Refused("Repository copy capacity no longer requires admission")]
         if isinstance(request, wire.VerifyRunSlotRequest):
             # Older clients can still ask. Only a local memory grant takes a slot.
             return [wire.Ok()]
@@ -6637,13 +6767,13 @@ done
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
             if isinstance(request, wire.AdmitRequest) and self._replaced(request.run):
                 return self._mutation_reply(key, wire.Refused(status_wire.REPLACED_REASON))
-            if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
-                    and isinstance(group := request.place.group, status_wire.CloudGroup)):
-                if (refused := self._register_cloud_group(request.place, group)) is not None:
-                    return self._mutation_reply(key, refused)
             if not isinstance(request, ServiceEstimatedAdmission):
                 members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
                 request = replace(request, identity=self._named_identity(request.identity, members=members))
+            if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+                    and isinstance(group := request.place.group, status_wire.CloudGroup)):
+                if (refused := self._register_cloud_group(request.place, group, request.identity)) is not None:
+                    return self._mutation_reply(key, refused)
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
@@ -6830,13 +6960,16 @@ done
                     return []
             self.queue_changes.append(OrderedQueueChange(request, connections))
             return []
+        why = asked_words(request.why, request.actor)
+        if isinstance(why, wire.Refused):
+            return self._mutation_reply(request.request_id, why)
         if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
-            result: Future[Mapping[str, gate.UnitMembership]] = Future()
-            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), result)
-            threading.Thread(target=read_priority_roster, args=(result, os.dup(self.priority_events)),
+            result: Future[PriorityRosterRead] = Future()
+            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), why, result)
+            threading.Thread(target=read_priority_roster, args=(result, request.actor, os.dup(self.priority_events)),
                              daemon=True, name="priority-roster").start()
             return []
-        return self._apply_queue_change(request, {})
+        return self._apply_queue_change(request, why, PRIORITY_ROSTER_NOT_READ)
 
     def _finish_priority_roster(self) -> None:
         pending = self.pending_priority
@@ -6844,7 +6977,7 @@ done
             return
         self.pending_priority = NoPendingPriorityRoster()
         self._complete_queue_change(pending.change,
-            lambda: self._apply_queue_change(pending.change.request, pending.result.result()))
+            lambda: self._apply_queue_change(pending.change.request, pending.why, pending.result.result()))
         self._continue_queue_changes()
 
     def _continue_queue_changes(self) -> None:
@@ -6872,38 +7005,40 @@ done
                 for reply in replies:
                     self._send(connection, reply)
 
-    def _apply_queue_change(self, request: QueueChange,
-                            labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
+    def _apply_queue_change(self, request: QueueChange, why: str,
+                            roster: PriorityRosterRead | PriorityRosterNotRead) -> list[wire.Reply]:
         key = request.request_id
+        if not self._settle_priority():
+            return [wire.Refused("the last priority change waits for its history row; the queue priority did not change")]
         configuration = self._take_configuration()
         entries = self._priority_entries()
+        asker = None
         if isinstance(request, wire.PrioritySetRequest):
-            if not request.unit.strip():
+            if not request.unit.strip() or isinstance(roster, PriorityRosterNotRead):
                 return self._mutation_reply(key, wire.Refused("unit is required"))
-            if any(entry["unit"] == request.unit for entry in entries):
+            if any(not records.is_run_entry(entry) and entry["unit"] == request.unit for entry in entries):
                 return self._mutation_reply(key, wire.Ok())
             rows = [waiting.row for waiting in self.waiters.values()]
             rows.extend(record.queue_waiter for record in self.reservations.values())
             recorded_names = [(row.get("session_id", ""), name) for row in rows if (name := self._priority_name(row))]
             recorded_sessions = {session for session, _ in recorded_names}
-            known_names = {label.unit for session, label in labels.items() if session not in recorded_sessions}
+            known_names = {label.unit for session, label in roster.labels.items() if session not in recorded_sessions}
             known_names.update(name for _, name in recorded_names)
             if request.unit == "—" or request.unit not in known_names:
                 return self._mutation_reply(key, wire.Refused(
                     f"unknown unit {request.unit}; the queue priority did not change"))
             action = "set"
-            why = request.why
+            asker = roster.asker
         else:
             if not request.unit and not entries:
                 _ = self._priority_history_end(self.clock.now())
                 return self._mutation_reply(key, wire.Ok())
             action = "clear"
-            why = ", ".join(entry["why"] for entry in entries if not request.unit or entry["unit"] == request.unit)
-        if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now()):
+        if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now(), asker=asker):
             return self._mutation_reply(key, wire.Refused(refusal))
         self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
-        self._finish_priority()
+        _ = self._settle_priority()
         _ = self._run_pass(configuration)
         return [self.ledger[key].reply]
 
@@ -6913,19 +7048,22 @@ done
     def _priority_history_end(self, at: float) -> int:
         return store.read_last_whole_row_end(store.host_file(self.host, at))
 
-    def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str,
-                         actor: str, key: str, written_at: float) -> str:
+    def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str, actor: str,
+                         key: str, written_at: float, *, asker: records.Asker | None = None) -> str:
         entries = self._priority_entries()
         if action == "set":
-            if any(entry["unit"] == unit for entry in entries):
+            if any(not records.is_run_entry(entry) and entry["unit"] == unit for entry in entries):
                 return ""
-            entry: records.PriorityEntry = {"unit": unit, "why": why, "set_at": written_at, "set_by": actor}
+            if asker is None:
+                asker = records.actor_asker(actor, records.queue_staff())
+            entry: records.UnitPriorityEntry = {"kind": "UnitPriorityEntry", "unit": unit, "why": why,
+                "set_at": written_at, "set_by": actor, "asker": asker}
             entries = (*entries, entry)
         else:
             kept = tuple(entry for entry in entries if unit and entry["unit"] != unit)
             if kept == entries:
                 return f"unknown unit {unit}; the queue priority did not change" if unit else ""
-            unit = unit or ", ".join(entry["unit"] for entry in entries)
+            unit = unit or ", ".join(dict.fromkeys(entry["unit"] for entry in entries))
             entries = kept
         at = self.clock.now()
         month_row_end = self._priority_history_end(at)
@@ -6952,8 +7090,9 @@ done
         return "the step left the queue"
 
     def _apply_bumps(self) -> None:
+        if not self._settle_priority():
+            return
         for offset, bump in person_actions.pending_bumps(self.state_dir, self.bumps.offset):
-            self._finish_priority()
             action = bump.action
             place = self._bump_place(action.step_key, bump.unit) if isinstance(action, person_actions.SetBump) else None
             refusal = place if isinstance(place, str) else ""
@@ -6974,7 +7113,8 @@ done
                 refusals = (*refusals, person_actions.BumpNotApplied(bump.unit, refusal))
             self.bumps = person_actions.BumpProgress(offset, refusals, moves)
             self.persist()
-            self._finish_priority()
+            if not self._settle_priority():
+                return
 
     def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused | wire.QueueMoveConflict,
                         reservation: str = "") -> list[wire.Reply]:
@@ -7451,12 +7591,17 @@ done
             initial = self.system_evidence
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
-            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock, self.reading_events)
+            traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
+                        self.progress_captures.root, self.boot_id, self.clock)
+                      if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
+            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
+                                                       self.reading_events, traces=traces)
             for descriptor, watch in list(self.watchers.items()):
                 if isinstance(watch, ScopeWatch):
                     self._unwatch(descriptor)
 
     def serve_forever(self) -> None:
+        self.start()
         self.start_reader()
         watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
         timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
@@ -7724,7 +7869,8 @@ def main() -> int:
         if args.command == "export-priority":
             export_priority(args.state_dir)
             return 0
-        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc())
+        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc(),
+                                 trace_policy=memory_trace.read_policy())
         try:
             server.serve_forever()
         finally:

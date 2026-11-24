@@ -59,8 +59,10 @@ nate evaluates each one.
 
 ## Rust design
 
-If one of your items is in a Rust project, load `~/.claude/docs/producer/rust_design.md` at startup, after compaction, and when you get the item. Keep it in context.
-Use it when you read a plan or a design call. Do not review code lines with it.
+Load `~/.claude/docs/producer/rust_design.md` when you receive a Rust item.
+Load the guide at startup and after compaction while you have a Rust item.
+Keep the guide in context.
+Use the guide only for plans and design decisions.
 Ask the style unit about a hard case.
 
 ## Work with showrunners and morty

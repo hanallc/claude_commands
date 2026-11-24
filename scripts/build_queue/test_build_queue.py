@@ -10,7 +10,9 @@ from unittest import mock
 from typing import cast, override
 
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
-from scripts.build_queue import admission_service, build_queue, person_actions, queue_snapshot
+from scripts.build_queue import admission_service, build_queue, head_facts, person_actions, queue_snapshot
+from scripts.buildlog import record as buildlog_record
+from scripts.production import staff
 from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash
 from scripts.lint import memory_admit
 from scripts.message import unit_labels
@@ -22,14 +24,16 @@ class QueueTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture = self.enterContext(AdmissionFixture())
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": ""}))
         self.fixture.free(0)
         self.fixture.hold_starts()
 
-    def waiter(self, pid: int, unit: str) -> wire.AdmitRequest:
+    def waiter(self, pid: int, unit: str, *, session_id: str | None = None) -> wire.AdmitRequest:
         owner = self.fixture.fixture_owner(pid, str(pid))
         request = self.fixture.request(owner=owner)
         request = replace(request, identity=replace(request.identity, name="recorded-" + unit,
-            unit=unit, folder=f"/fixture/tree-{pid}"))
+            unit=unit, folder=f"/fixture/tree-{pid}",
+            session_id=request.identity.session_id if session_id is None else session_id))
         _ = self.fixture.server.handle_request(request)
         return request
 
@@ -70,22 +74,32 @@ class QueueTests(unittest.TestCase):
                     (0, "Usage: /build:bump <position|session|folder> | clear [unit]\nhttps://fixture/builds\n", ""))
                 read.assert_not_called()
 
-    def test_bump_records_with_a_silent_socket(self) -> None:
+    def test_bump_with_words_saves_when_the_service_is_stopped_and_applies_on_restart(self) -> None:
         request = self.waiter(200, "berth")
         selected = self.fixture.server.waiters[request.episode].row.get("move_id", "")
+        self.fixture.server.close()
+        self.assertFalse(self.fixture.socket_path.exists())
         with (mock.patch.object(admission_client, "view", side_effect=wire.AdmissionUnavailable("no answer")) as view,
               mock.patch.object(admission_client, "priority_set",
                                 side_effect=wire.AdmissionUnavailable("no answer")) as set_priority,
               mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "actor-id"}),
               mock.patch("time.time", return_value=123.0)):
-            status, output, errors = self.bump_output("1")
+            status, output, errors = self.bump_output("1", "--words", "/build:bump 1")
         self.assertEqual((status, errors), (0, ""))
         bump, = self.bumps()
         self.assertEqual(output, f"build queue: recorded {bump.id}\n")
         self.assertEqual(bump, person_actions.Bump(bump.id, person_actions.SetBump(selected, 1),
-            "berth", "actor-id", 123.0, "the user's bump"))
+            "berth", "actor-id", 123.0, "/build:bump 1"))
         view.assert_not_called()
         set_priority.assert_not_called()
+        self.assertIsInstance(admission_service.read_state(self.fixture.state_dir).priority, records.NoQueuePriority)
+        self.fixture.restart()
+        priority = self.fixture.server.priority
+        assert isinstance(priority, records.QueuePriority)
+        entry, = priority.entries
+        self.assertEqual((entry.get("kind"), entry["unit"], entry["set_by"], entry["why"]),
+                         ("UnitPriorityEntry", "berth", "actor-id", "/build:bump 1"))
+        self.assertEqual(person_actions.bump_status(self.fixture.state_dir), ())
 
     def test_clear_one_unit_records_a_known_priority(self) -> None:
         _ = self.waiter(200, "demo")
@@ -93,19 +107,72 @@ class QueueTests(unittest.TestCase):
         _ = self.fixture.server.run_pass()
         with (mock.patch.object(records, "queue_command_actor", return_value="actor"),
               mock.patch.object(admission_client, "priority_clear") as socket_clear):
-            status, output, errors = self.bump_output("clear", "demo")
+            status, output, errors = self.bump_output("clear", "demo", "--words=clear demo")
             socket_clear.assert_not_called()
         self.assertEqual((status, errors), (0, ""))
         bump = self.bumps()[-1]
         self.assertEqual(output, f"build queue: recorded {bump.id}\n")
         self.assertEqual((bump.action, bump.unit, bump.actor, bump.reason),
-            (person_actions.ClearBump(), "demo", "actor", "the user's clear"))
+            (person_actions.ClearBump(), "demo", "actor", "clear demo"))
 
     def test_clear_unknown_unit_refuses_without_a_record(self) -> None:
         with mock.patch.object(admission_client, "priority_clear", return_value=wire.Refused("unknown unit missing")):
             self.assertEqual(self.bump_output("clear", "missing"),
                 (3, "build queue: unknown unit missing; the queue priority did not change\n", ""))
         self.assertEqual(self.bumps(), [])
+
+    def test_bump_stores_the_words_and_the_askers_staff_name(self) -> None:
+        _ = self.waiter(100, "head")
+        _ = self.waiter(200, "hana")
+        member = staff.StaffRow(staff.StaffId("natemerge-id"), "unit", "natemerge", staff.StaffRoot(),
+                                current_session=staff.StaffId("merge-session"))
+        cases: tuple[tuple[str, str, str, tuple[staff.StaffRow, ...], records.Asker], ...] = (
+            ("merge-session", "codex-session", "natemerge", (member,), records.StaffAsker("natemerge")),
+            ("", "lone-session", "lone-session", (), records.UnstaffedSession("lone-session")),
+            ("", "", "nate (plain shell)", (), records.PlainShellAsker()),
+        )
+        words = "natemerge can bump at will"
+        for claude, codex, name, members, asker in cases:
+            actor = claude or codex or "user"
+            with (self.subTest(actor=actor),
+                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}),
+                  mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(members)),
+                  mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged):
+                self.assertEqual(self.bump_output("2", "--words", words)[0], 0)
+                _ = self.fixture.server.run_pass()
+                self.assertEqual(self.fixture.queue_pids(), [200, 100])
+                priority = self.fixture.server.priority
+                assert isinstance(priority, records.QueuePriority)
+                entry, = priority.entries
+                self.assertEqual(entry, {"kind": "UnitPriorityEntry", "unit": "hana", "why": words,
+                    "set_at": self.bumps()[-1].written_at, "set_by": actor, "asker": asker})
+                self.assertEqual(head_facts.priority_text(priority), f'queue priority: hana ({name}: "{words}")')
+                self.assertEqual(logged.call_args.args[2:4], (words, actor))
+                self.assertEqual(self.bump_output("clear", "--words", "clear now")[0], 0)
+                _ = self.fixture.server.run_pass()
+                self.assertEqual(logged.call_args.args[2:4], ("clear now", actor))
+                self.assertEqual(self.fixture.queue_pids(), [100, 200])
+
+    def test_words_are_required_except_in_a_plain_shell(self) -> None:
+        _ = self.waiter(100, "head")
+        _ = self.waiter(200, "hana")
+        refusal = "build queue: --words is required: pass the user's words; the queue priority did not change\n"
+        for session, arguments in (("lone-session", ("2",)), ("", ("2",)),
+                                   ("lone-session", ("clear",)), ("", ("clear",))):
+            with (self.subTest(session=session, arguments=arguments),
+                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}),
+                  mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged):
+                before = self.bumps()
+                result = self.bump_output(*arguments)
+                _ = self.fixture.server.run_pass()
+                if session:
+                    self.assertEqual(result, (3, refusal, ""))
+                    self.assertEqual(self.bumps(), before)
+                    logged.assert_not_called()
+                else:
+                    bump = self.bumps()[-1]
+                    self.assertEqual(result, (0, f"build queue: recorded {bump.id}\n", ""))
+                    self.assertEqual(logged.call_args.args[2:4], ("typed by nate in a plain shell", "user"))
 
     def test_bump_pass_applies_records_in_file_order_and_restart_applies_none_twice(self) -> None:
         _ = self.waiter(100, "head")
@@ -167,8 +234,8 @@ class QueueTests(unittest.TestCase):
     def test_bump_passes_a_dash_selector_as_one_value(self) -> None:
         with (mock.patch.object(records, "queue_command_actor", return_value="showrunner"),
               mock.patch.object(build_queue, "bump", return_value=0) as run):
-            self.assertEqual(self.bump_output("-x"), (0, "", ""))
-        run.assert_called_once_with("-x", "showrunner")
+            self.assertEqual(self.bump_output("-x", "--words", "urgent"), (0, "", ""))
+        run.assert_called_once_with("-x", "showrunner", "urgent")
 
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
         with mock.patch.object(unit_labels, "unit_labels_for", return_value={}):
@@ -198,7 +265,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(step_key, 3), "worker"))
 
     def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
-        for selectors in (("berth", "other"), ("two words",)):
+        for selectors in (("berth", "other"), ("two words",), ("--run", "1")):
             with self.subTest(selectors=selectors):
                 self.assertEqual(self.bump_output(*selectors),
                     (3, "build bump: use /build:bump <position|session|folder>\n", ""))
@@ -218,10 +285,28 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([(bump.action, bump.unit) for bump in self.bumps()],
                          [(person_actions.SetBump(selected, 2), "tail")] * 5)
 
+    def test_bump_uses_the_session_label_when_the_waiter_has_no_unit(self) -> None:
+        waiter = self.waiter(100, "")
+        session = waiter.identity.session_id
+        selected = self.fixture.server.waiters[waiter.episode].row.get("move_id", "")
+        with mock.patch.object(memory_admit, "priority_labels",
+                               return_value={session: unit_labels.UnitLabels("worker", unit="roster-unit")}) as read:
+            self.assertEqual(self.bump_output("1")[0], 0)
+        read.assert_called_once_with([session])
+        bump, = self.bumps()
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(selected, 1), "roster-unit"))
+
     def test_unitless_bump_refuses_without_writing_priority(self) -> None:
         _ = self.waiter(100, "")
         with mock.patch.object(memory_admit, "priority_labels", return_value={}):
             self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step 1 has no unit\n", ""))
+        self.assertEqual(self.bumps(), [])
+
+    def test_waiter_with_no_session_or_unit_cannot_be_bumped(self) -> None:
+        _ = self.waiter(100, "", session_id="")
+        with mock.patch.object(memory_admit, "priority_labels") as read:
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step 1 has no unit\n", ""))
+        read.assert_not_called()
         self.assertEqual(self.bumps(), [])
 
     def test_clear_from_any_session_records_the_actor(self) -> None:
@@ -230,10 +315,11 @@ class QueueTests(unittest.TestCase):
             with (self.subTest(actor=actor),
                   mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}),
                   mock.patch.object(admission_client, "priority_clear", return_value=wire.Ok())):
-                self.assertEqual(self.bump_output("clear")[0], 0)
+                self.assertEqual(self.bump_output("clear", "--words", "clear now")[0], 0)
                 self.assertTrue(self.bumps(), "clear must save a record")
                 bump = self.bumps()[-1]
-                self.assertEqual((bump.action, bump.unit, bump.actor), (person_actions.ClearBump(), "", actor))
+                self.assertEqual((bump.action, bump.unit, bump.actor, bump.reason),
+                                 (person_actions.ClearBump(), "", actor, "clear now"))
 
     def test_bump_without_a_published_order_reports_unavailable(self) -> None:
         (self.fixture.state_dir / "queue.json").unlink()
