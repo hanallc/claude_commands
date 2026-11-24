@@ -10,6 +10,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.build_queue import admission_records
+from scripts.copies import copies
 from scripts.production import gate
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib import build_folders
@@ -26,6 +27,9 @@ class TargetedTestTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.environment["BUILDLOG_PREPARED_COPY"] = str(self.checkout)
+        _ = self.enterContext(mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True))
+        _ = self.enterContext(mock.patch.object(gate, "checked_gate_target", return_value="natedev"))
         # The fixture's main branch has no full gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")

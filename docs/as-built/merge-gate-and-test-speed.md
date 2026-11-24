@@ -135,8 +135,10 @@ It prints `Mac Linux guest took no run: <cause>`.
 In merge mode, it undoes the merge and reports the rollback.
 Status 79 identifies a refusal before tests started.
 Status 80 identifies a run with no verdict or a launch that still needs settlement.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
 A direct gate or `copies.py gate-step` uses one placement.
-`copies.py gate-step` preserves status 79 or 80 if cancellation fails and reports the cleanup error on standard error.
+`copies.py run` and `copies.py gate-step` preserve status 79 or 80 if cleanup fails.
+They report the cleanup error on standard error.
 Checkpoint and bump treat these statuses as blocked.
 A nightly gate reports the refusal to its production owner and records no red test result.
 When `copies.py run` owns placement, it reports the claim failure to the queue on status 79.
@@ -150,7 +152,12 @@ An eligible named machine can take the run while the guest is in backoff.
 A fresh reading that still excludes the guest keeps it out of placement.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
-Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
+The command uses `{tree}` for its checkout or repository argument.
+A base check uses the prepared base commit.
+A copy setup failure blocks the checkpoint and reports the test log path.
+The checkpoint skips the rerun and the base check after a copy setup failure.
+Bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
@@ -394,8 +401,13 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/gate.py` merges a checkpoint into the production's merge branch.
 It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
-`python3 -m scripts.production.gate` accepts the same options.
+Run a unit's targeted tests with `copies.py run` and `scripts/production/gate.py --affected`.
+A direct `--affected` call prints the `copies.py run` command on standard error and exits with status 1.
+The command uses the Git worktree root and its current `HEAD` commit.
+The inner gate command always has one `--repo '{tree}'` option for the prepared checkout.
+This option replaces any `--repo` or `--checkout` options from the direct call.
+The gate requires a handoff from `copies.py run` or `copies.py gate-step` before it starts placement or tests.
+`./scripts/lib/py -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
@@ -472,10 +484,11 @@ Cleanup stops the confirmed groups and removes the journal, even when the tempor
 The receipt stays with a retained checkout.
 See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
-### Targeted tests: `scripts/production/targeted_test.py`
+### Targeted tests
 
-The entry has its own parser and description.
-It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
+Run `gate.py --affected` through `copies.py run` from the unit worktree root.
+Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+`scripts/production/targeted_test.py` passes its arguments to `gate.py --affected`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
@@ -497,8 +510,10 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+The six merge flags are required for a checkpoint merge.
+Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+`copies.py run` refuses a named gate without either mode before it requests placement.
 Use the module names that the gate prints.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.

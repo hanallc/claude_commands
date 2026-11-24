@@ -1216,7 +1216,8 @@ The service form `systemd-run --user --wait --pipe ...` starts with the environm
 For raw cargo or `verify.sh` in a folder that has no owner record, add `-E CLAUDE_CODE_SESSION_ID` or `-E CLAUDE_SESSION_NAME`.
 These callers always give an owner, also under systemd or with no session:
 - The gate and the nightly gate: `default_owner(<unit>)` around the suites.
-- `gate.py --tests-only` and `--affected` (targeted_test): `default_owner(copies.source_owner(repo))`.
+- `gate.py --tests-only` and `gate.py --affected` use `default_owner(copies.source_owner(repo))`.
+  Run `gate.py --affected` through `copies.py run` from the unit worktree root.
   `run_tests_only` reads `copies.source_owner` only when `request_owner("")` gives `OwnerNotGiven`:
   the caller set no owner variable and its process family names no owner, so a run from a terminal keeps `terminal`.
 - `cloud_gate.service_command`: `owner_environment()` passes the owner variables to the systemd unit.
