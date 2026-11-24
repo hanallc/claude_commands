@@ -895,7 +895,7 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 Direct gate placement uses natedev and `mac-linux`.
-A merge gate or targeted test with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
+A gate or test affected run with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
 The cloud route reserves a queue slot before it requests a box.
 The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
 With `enabled=off`, a gate without a placement assignment runs its tests on natedev.

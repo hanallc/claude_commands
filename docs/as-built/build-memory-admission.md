@@ -782,7 +782,7 @@ A program uses its history estimate and refreshes it under the normal estimate p
 The gate reads `program_first_peak_gib.gate` at use. Its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
-The merge-gate progress profile key includes `shape` (`tests` or `types`).
+The gate progress profile key includes `shape` (`tests` or `types`).
 Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
 The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
@@ -814,7 +814,7 @@ The estimate reader decodes only rows that can be in the window (`HistoryWindow`
 Rows append when steps end, so a binary search finds the first row that ended one day before the window.
 The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
 A row whose bytes do not hold the host and a requested step is not decoded.
-Merge-gate peaks keep their separate class and remain in the anonymous history.
+Gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
@@ -860,7 +860,7 @@ The lifecycle file retains 571 events across 4.92 days, including older token-ga
 The 220 admissions cover 2026-11-04 20:45:52 through 2026-11-05 13:03:36 UTC: 16.30 hours.
 The anonymous file retains 46,262 rows from 2026-10-07 through 2026-11-05.
 The requested window contains 5,205 anonymous rows.
-Replay reconstructs 4,267 estimates and keeps 815 merge-gate cap rows separate.
+Replay reconstructs 4,267 estimates and keeps 815 gate cap rows separate.
 Another 123 rows lack their own dated index match.
 Recorded intervals and reconstructed estimates are separate populations. Do not add their counts.
 
@@ -955,7 +955,7 @@ This measurement changes no estimator tier.
 
 The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
 It evaluates 15,053 runs and omits 195 runs without an index match.
-Another 617 merge-gate rows retain their separate cap class.
+Another 617 gate rows retain their separate cap class.
 Each estimate uses its historical budget: 21 GiB or 24 GiB.
 Under-half means below half the measured peak. Over-three means above three times the measured peak.
 
