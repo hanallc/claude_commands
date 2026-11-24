@@ -74,6 +74,7 @@ from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
     from scripts.aws_target import ledger as aws_ledger
+    from scripts.mac_test import offload
     from scripts.mac_test.claim_state import RemoteJobClaim
 
 
@@ -1260,6 +1261,13 @@ class DispatchEvidence:
     observed_monotonic: float
 
 
+@dataclass(frozen=True)
+class MacDiskRecoveryPendingEvidence(placement.FreshHostEvidence):
+    """The Mac stays excluded while disk recovery runs."""
+
+    disk: offload.MacDiskShort = field(kw_only=True)
+
+
 class HostEvidenceWorker:
     """One target reader publishes evidence without blocking the service loop."""
 
@@ -1277,6 +1285,7 @@ class HostEvidenceWorker:
         self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
         self.subscriptions: dict[placement.HostEvidenceKey, object] = {key: object()}
+        self.refresh_generation: int = 0
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="placement-evidence-" + key.destination.target, daemon=True)
@@ -1352,6 +1361,16 @@ class HostEvidenceWorker:
             self.due[key] = float("-inf")
         self.requested.set()
 
+    def expedite_all(self) -> None:
+        """Request a new probe of each subscribed key."""
+        with self.lock:
+            if self.stopped.is_set():
+                return
+            self.refresh_generation += 1
+            for key in self.due:
+                self.due[key] = float("-inf")
+        self.requested.set()
+
     def remove(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
             _ = self.due.pop(key, None)
@@ -1388,6 +1407,8 @@ class HostEvidenceWorker:
 
     def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
         """Probe one key and publish its evidence. Return False when the worker stops."""
+        with self.lock:
+            refresh_generation = self.refresh_generation
         observed_at = self.clock.now()
         try:
             evidence = self.probe(key)
@@ -1415,7 +1436,8 @@ class HostEvidenceWorker:
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
                              or self._settlement_time(probe.saved, attempt) is None)):
                     self.dispatch_observations[attempt] = observed
-            self.due[key] = time.monotonic() + self.interval
+            if refresh_generation == self.refresh_generation:
+                self.due[key] = time.monotonic() + self.interval
             if self.stopped.is_set():
                 return False
             try:
@@ -1989,6 +2011,7 @@ class AdmissionServer:
         self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
         self.mac_recovery_lock: threading.Lock = threading.Lock()
         self.mac_recovery_retry_at: dict[str, float] = {}
+        self.mac_disk_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
@@ -4446,13 +4469,14 @@ class AdmissionServer:
             timeout = self._host_probe_timeout(key)
             previous = self.host_observations.get(key)
             target = (key.destination.provider, key.destination.target)
-            reader = self.host_targets.get(target)
-            if reader is None:
-                reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
-                    self.reading_events, interval)
-                self.host_targets[target] = reader
-            else:
-                reader.request(key)
+            with self.mac_recovery_lock:
+                reader = self.host_targets.get(target)
+                if reader is None:
+                    reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
+                        self.reading_events, interval)
+                    self.host_targets[target] = reader
+                else:
+                    reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
             if previous is not None:
                 reader.publish(previous)
@@ -4480,6 +4504,37 @@ class AdmissionServer:
             if self.clock.monotonic() < self.mac_recovery_retry_at.get(target, 0):
                 return False
             self.mac_recovery_retry_at[target] = float("inf")
+            return True
+
+    def _request_mac_disk_recovery(self, host: str, sweep: Callable[[], None]) -> bool:
+        """Start one sweep per host and report whether recovery is pending."""
+        def recover() -> None:
+            try:
+                sweep()
+            except (OSError, ValueError) as error:
+                print(f"memory admission: Mac disk recovery failed: {error}", file=sys.stderr)
+            finally:
+                with self.mac_recovery_lock:
+                    # The immediate probe can still report low disk space.
+                    self.mac_disk_retry_at[host] = self.clock.monotonic() + self._waiting_pass_interval()
+                    for (provider, _), worker in self.host_targets.items():
+                        if provider == "mac":
+                            worker.expedite_all()
+
+        with self.mac_recovery_lock:
+            if self.closed:
+                return False
+            retry_at = self.mac_disk_retry_at.get(host)
+            if retry_at == float("inf"):
+                return True
+            if retry_at is not None and self.clock.monotonic() < retry_at:
+                return False
+            self.mac_disk_retry_at[host] = float("inf")
+            try:
+                threading.Thread(target=recover, name="mac-disk-recovery", daemon=True).start()
+            except RuntimeError:
+                del self.mac_disk_retry_at[host]
+                raise
             return True
 
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -4546,6 +4601,7 @@ class AdmissionServer:
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
+        disk_recovery: offload.MacDiskShort | None = None
         if build_targets.mac_run_bypasses_repository_policy(target, kind):
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
@@ -4558,7 +4614,7 @@ class AdmissionServer:
                     answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                         request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, new_step=True,
                         session=key.session, configuration=configuration, mac_scope=destination.scope,
-                        recover_mac_backoff=recover)
+                        recover_mac_backoff=recover, request_disk_recovery=self._request_mac_disk_recovery)
                 finally:
                     if recover:
                         with self.mac_recovery_lock:
@@ -4566,7 +4622,10 @@ class AdmissionServer:
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration, mac_scope=destination.scope)
+                    configuration=configuration, mac_scope=destination.scope,
+                    request_disk_recovery=self._request_mac_disk_recovery)
+            if isinstance(answer, build_targets.MacDiskRecoveryPending):
+                disk_recovery = answer.disk
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
@@ -4631,7 +4690,11 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record, paths.platform, configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+        evidence = (key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup),
+                    tuple(executions), holder, diagnostic)
+        if disk_recovery is not None:
+            return MacDiskRecoveryPendingEvidence(*evidence, disk=disk_recovery)
+        return placement.FreshHostEvidence(*evidence)
 
     def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
         from scripts.build_targets import mac_linux

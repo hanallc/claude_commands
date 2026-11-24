@@ -21,6 +21,7 @@ import math
 import errno
 import os
 from pathlib import Path
+from queue import Queue
 import stat
 import select
 import shutil
@@ -1553,6 +1554,28 @@ class MacBackoffTestFixture:
         return evidence.eligibility
 
 
+@dataclass(frozen=True)
+class MacDiskSweepFixture:
+    admission: AdmissionFixture
+    key: placement.HostEvidenceKey
+    started: threading.Event
+    release: threading.Event
+    inline: threading.Event
+    readings: Queue[placement.HostEvidence]
+
+    def subscribe(self, key: placement.HostEvidenceKey) -> service.HostEvidenceReader:
+        reader = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                      getattr(self.admission.server, "_host_evidence_reader"))
+        return reader(key, test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def other_key(self) -> placement.HostEvidenceKey:
+        server = self.admission.server
+        other = replace(self.key, package="another-package")
+        request = server.host_requests[self.key]
+        server.host_requests[other] = replace(request, constraints=replace(request.constraints, package=other.package))
+        return other
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -1924,14 +1947,15 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 "the claim has no saved Mac mirror", fixture.clock.now())),))
 
     @contextmanager
-    def mac_backoff_fixture(self) -> Generator[MacBackoffTestFixture]:
+    def mac_backoff_fixture(self, *, backoff: bool = True) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
         from scripts.mac_test import claim_state, eligibility, offload
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
-            _ = write_config_fixture(settings, "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\n")
+            _ = write_config_fixture(settings,
+                "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\nfree_floor_gib=60\n")
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
@@ -1941,10 +1965,140 @@ class LocalHoldPlacementTests(unittest.TestCase):
                   mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror),
                   mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
                   mock.patch.object(offload.ProcessController, "capture", probe.capture)):
-                offload.write_backoff(time.time() + 300, target.name)
+                if backoff:
+                    offload.write_backoff(time.time() + 300, target.name)
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 yield MacBackoffTestFixture(fixture, eligibility.backoff_path(target.name), key, probe)
+
+    @contextmanager
+    def mac_disk_sweep_fixture(self) -> Generator[MacDiskSweepFixture]:
+        from scripts.mac_test import eligibility, offload
+
+        started, release, inline, swept, finished = (threading.Event() for _ in range(5))
+        readings: Queue[placement.HostEvidence] = Queue()
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+        caller = threading.current_thread()
+        ensure = offload.ensure_mac_disk_floor
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+            if arguments[-1].endswith("--floor-only --host mac"):
+                started.set()
+                thread = threading.current_thread()
+                if thread is caller or thread.name.startswith("placement-evidence-"):
+                    inline.set()
+                elif not release.wait(guard):
+                    raise AssertionError("the test did not release the sweep")
+                swept.set()
+                return offload.CommandOutput(0, "", "")
+            free = 60 if swept.is_set() else 59
+            return offload.CommandOutput(0, f"free_gib={free}\nhost=fixture-mac\nrc=0\n", "")
+
+        def observe_sweep(controller: offload.ProcessController,
+                          config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
+                          repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot, target: str = "mac",
+                          slot: int = 1) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
+            try:
+                return ensure(controller, config, repository, probe, target, slot)
+            finally:
+                finished.set()
+
+        with (self.mac_backoff_fixture(backoff=False) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker),
+              mock.patch.object(offload, "ensure_mac_disk_floor", side_effect=observe_sweep)):
+            fixture.probe.answer = capture
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+            try:
+                yield MacDiskSweepFixture(fixture.admission, fixture.key, started, release, inline, readings)
+            finally:
+                release.set()
+                if started.is_set():
+                    self.assertTrue(finished.wait(guard))
+                server.close()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                    self.assertFalse(worker.thread.is_alive())
+
+    def test_mac_disk_probe_returns_pending_before_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            evidence = fixture.admission.server.read_provider_evidence(fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+            assert isinstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.disk, offload.MacDiskShort(59, 60))
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("disk"))
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            self.assertFalse(fixture.release.is_set())
+
+    def test_another_mac_key_gets_fresh_disk_evidence_during_the_sweep(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first = fixture.subscribe(fixture.key)
+            self.assertEqual(fixture.readings.get(timeout=guard).key, fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the first probe ran the sweep inline")
+            self.assertTrue(fixture.started.wait(guard))
+            fixture.admission.clock.advance(1)
+            other = fixture.other_key()
+            second = fixture.subscribe(other)
+            self.assertIs(first.worker, second.worker)
+            evidence = fixture.readings.get(timeout=guard)
+            self.assertEqual(evidence.key, other)
+            self.assertIsInstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.observed_at, fixture.admission.clock.now())
+            self.assertEqual(server.host_evidence(other), evidence)
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_sweep_completion_refreshes_every_key_during_a_probe(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first_read, publish_first, refresh = (threading.Event() for _ in range(3))
+            read = server.host_probe
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                evidence = read(key)
+                if key == fixture.key and not first_read.is_set():
+                    first_read.set()
+                    if not publish_first.wait(guard):
+                        raise AssertionError("the test did not release the probe")
+                return evidence
+
+            server.host_probe = probe
+            reader = fixture.subscribe(fixture.key)
+            try:
+                self.assertTrue(first_read.wait(guard))
+                self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+                self.assertTrue(fixture.started.wait(guard))
+                other = fixture.other_key()
+                _ = fixture.subscribe(other)
+                request = reader.worker.requested.set
+
+                def notify() -> None:
+                    request()
+                    refresh.set()
+
+                with mock.patch.object(reader.worker.requested, "set", side_effect=notify):
+                    fixture.release.set()
+                    self.assertTrue(refresh.wait(guard))
+                publish_first.set()
+                self.assertIsInstance(fixture.readings.get(timeout=guard), service.MacDiskRecoveryPendingEvidence)
+                refreshed = [fixture.readings.get(timeout=guard) for _ in range(2)]
+                self.assertEqual({reading.key for reading in refreshed}, {fixture.key, other})
+                for evidence in refreshed:
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.AllowedHost())
+            finally:
+                publish_first.set()
 
     def test_good_mac_probe_ends_active_backoff(self) -> None:
         from scripts.mac_test import offload

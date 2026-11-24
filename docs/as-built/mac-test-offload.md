@@ -875,7 +875,10 @@ Existing waits keep their place on natedev until then.
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
 Below the required floor, it runs one shared floor sweep and reads free space again.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
-A caller that finds a running sweep waits for its result.
+A direct caller that finds a running sweep waits for its result.
+An admission probe publishes a pending disk reading that excludes the Mac.
+One recovery thread per host runs the sweep while the evidence worker reads other keys.
+When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock during removal.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.

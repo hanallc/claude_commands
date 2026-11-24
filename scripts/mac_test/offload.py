@@ -2265,6 +2265,11 @@ def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDisk
     return MacDiskShort(probe.free_gib, free_floor_gib)
 
 
+def mac_disk_floor(config: OffloadConfig | eligibility.SshProbeSettings) -> float:
+    return (config.free_floor_gib if isinstance(config, OffloadConfig)
+            else config.configuration.number("free_floor_gib"))
+
+
 @dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
@@ -2284,8 +2289,7 @@ def ensure_mac_disk_floor(
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
-             else config.configuration.number("free_floor_gib"))
+    floor = mac_disk_floor(config)
     disk = check_mac_disk_floor(probe, floor)
     if isinstance(disk, MacDiskReady):
         return disk
