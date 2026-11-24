@@ -2802,7 +2802,11 @@ def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members
     builds = gate.builds_slice_cgroup()
     detached = builds / "builds-detached.slice"
     agent_scopes = sorted(path for path in tool_group_children(agents) if path.suffix == ".scope")
-    detached_scopes = sorted(path for path in tool_group_children(detached) if path.suffix == ".scope")
+    detached_groups = tool_group_children(detached)
+    detached_scopes = [path for path in detached_groups if path.suffix == ".scope"]
+    # Each detached run puts its command scope in a child slice.
+    detached_scopes.extend(scope for run in detached_groups if run.suffix == ".slice"
+                           for scope in tool_group_children(run) if scope.suffix == ".scope")
     if not agent_scopes and not detached_scopes:
         return []
     try:
@@ -2813,7 +2817,7 @@ def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members
     ticks_per_second = os.sysconf("SC_CLK_TCK")
     seen: set[int] = set()
     rows = [row for scope in agent_scopes for row in outside_agent_rows(scope, scan, limit, ticks_per_second, seen)]
-    rows.extend(row for scope in detached_scopes if (row := outside_detached_row(scope, scan, limit)) is not None)
+    rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
     return sorted(rows, key=lambda row: (-row["cpu_seconds"], row["pid"]))
 
 

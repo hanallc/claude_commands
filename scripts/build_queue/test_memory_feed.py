@@ -285,7 +285,8 @@ class MemoryFeedTests(unittest.TestCase):
         _ = config.write_text("# whole: 1..\ndirect_test.time_limit_seconds=120\n")
 
         write_scope(user / "app.slice/app-agents.slice/run-p8100.scope", members=(8100, 8101, 8104, 8107))
-        detached = user / "builds.slice/builds-detached.slice/detached-python-tests-fixture.scope"
+        run_slice = user / "builds.slice/builds-detached.slice/builds-detached-20261117T19250434733015b4c.slice"
+        detached = run_slice / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
         write_scope(detached, members=(8102, 8105))
         for pid in (8102, 8103, 8105):
             _ = (self.root / f"proc/{pid}/cgroup").write_text(f"0::/{detached.relative_to(self.root / 'cgroup')}\n")
@@ -361,6 +362,15 @@ class MemoryFeedTests(unittest.TestCase):
                          [(8102, "targeted_test.py", "test")])
         self.assertEqual(byte_reads[cmdline], 2)
         self.assertEqual(byte_reads[environ], 2)
+
+        queued = run_slice / "cargo.scope"
+        write_scope(queued, members=(8105,))
+        _ = (queued / "cpu.stat").write_text(cpu_stat.read_text())
+        _ = child_group.write_text(f"0::/{queued.relative_to(self.root / 'cgroup')}\n")
+        source = admission_records.ScopeSource(queued, frozenset({8105}))
+        memory = admission_records.MeasuredMemory(0, anonymous_source=source)
+        step = admission_records.RunningStep("", "", "check", "/fixture", 0, memory, pid=8105)
+        self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
 
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
