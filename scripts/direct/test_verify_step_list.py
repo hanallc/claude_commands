@@ -210,6 +210,52 @@ else:
         self.assertEqual((lint_waits["mend"], lint_waits["clippy"]), (4200, 720))
         self.assertEqual([row["step_wait_s"] for row in rows[1:]], [{"test": 1290}, {"doc": 420}])
 
+    def test_confirmed_placement_cancellation_records_the_memory_wait(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        startup = root / "verify-clock.sh"
+        _ = startup.write_text('''if [[ ${0##*/} == verify.sh ]]; then
+    unset EPOCHREALTIME
+    EPOCHREALTIME="$(date +%s).000000"
+fi
+''')
+        self.fixture.environment.update({"BUILDLOG_OFF": "0", "BASH_ENV": str(startup),
+                                         "COPIES_STEP_SOURCE": str(root),
+                                         "LINT_QUEUE_LEAVE_HOOK": "test -f leave-admission"})
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        episodes: list[str] = []
+        canceled: list[str] = []
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                if not episodes:
+                    folder, = tool_folders(root / "tmp", "verify", pid=request.owner.pid)
+                    path = folder / f"placement-{request.episode}.json.wait"
+                    notice = admission_client.PlacementWaitNotice(0, (), 1,
+                        wire.PlacementResourceWait("mac", "busy"), 4)
+                    _ = path.write_text(wire.encode_record(notice))
+                else:
+                    (root / "leave-admission").touch()
+                episodes.append(request.episode)
+                return [wire.PlacementWait(request.episode, request.since, 1, ())]
+            if isinstance(request, wire.CancelPlacement) and request.reason == "the caller left before placement":
+                canceled.append(request.episode)
+                return [wire.Ok()]
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("check", "sample", "--local", "requires Linux")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        episode, = canceled
+        self.assertEqual(episodes, [episode, episode])
+        row, = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual(row["step_wait_s"], {"check": 4})
+        self.assertEqual(row["admission_wait_s"], 4)
+        self.assert_removed()
+
     def test_term_marks_the_unfinished_admission_call_as_not_measured(self) -> None:
         self.prepare_repository()
         root = self.fixture.root

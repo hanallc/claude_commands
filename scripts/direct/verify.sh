@@ -3237,10 +3237,13 @@ placement_once() {
     wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
     reply=$(< "$HOLD_WAIT_DIR/placement-reply") || return $?
-    # Publish the samples together after reading a grant or a refusal.
-    if (( status == 0 || status == 2 )) && [[ -n "$reply" && -s "$wait_result" ]]; then
-        mv -- "$pending_wait" "${pending_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
-    fi
+    # A grant, refusal, or confirmed cancellation ends the admission wait.
+    case "$status" in
+        0|2|"$LINT_LEFT_QUEUE_STATUS")
+            if [[ -s "$wait_result" ]]; then
+                mv -- "$pending_wait" "${pending_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
+            fi ;;
+    esac
     while IFS= read -r line; do
         case "$line" in
             first|holder\ *|resource\ *|memory-seconds\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
