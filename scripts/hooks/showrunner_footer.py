@@ -20,6 +20,7 @@ from scripts.production.update_registration import ReportItem as ReportItem, rep
 from scripts.production.update_registration import QuestionStaff
 from scripts.production import showrunners, staff
 from scripts.agents.remote import local_machine
+from scripts.review_links import question_path
 
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
 
@@ -123,7 +124,8 @@ def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | N
     except (OSError, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         return None
-    now = datetime.now(ZoneInfo(zone)).replace(tzinfo=None)
+    local_zone = ZoneInfo(zone)
+    now = datetime.now(local_zone)
     afters: list[datetime] = []
     for name in names:
         try:
@@ -131,9 +133,10 @@ def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | N
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             continue
-        afters.extend(item.timing.at for item in items
-                      if isinstance(item.timing, DeferredUntil) and item.timing.at > now)
-    return min(afters).replace(tzinfo=ZoneInfo(zone)) if afters else None
+        deadlines = (question_path.resolve_later_time(item.timing.at, local_zone) for item in items
+                     if isinstance(item.timing, DeferredUntil))
+        afters.extend(at for at in deadlines if question_path.later_active(at, now))
+    return min(afters, key=lambda at: at.timestamp(), default=None)
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:

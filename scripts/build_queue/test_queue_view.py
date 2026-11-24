@@ -36,11 +36,7 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.test-affected=test affected\n"
         + "names.gate=gate\n"
-        + "prose.gate=the gate\n"
-        + "owned.test-affected={unit} targeted\n"
-        + "owned.gate={unit} merge\n"
-        + "owned.showrunner-gate=showrunner merge\n"
-        + "owned.default={unit} {step}\n",
+        + "prose.gate=the gate\n",
         encoding="utf-8",
     )
     with mock.patch.dict(os.environ, {"CONF_DIR": str(fixture.root)}):
@@ -625,13 +621,10 @@ class CloudQueueViewTests(unittest.TestCase):
                 waiting = queue_view.waiting_builds(replace(model, reading=updated))
                 self.assertEqual(waiting, [grouped, single, queue_view.WaitingBuild(1, local)])
 
-    def test_owner_templates_keep_the_step_name_and_prose(self) -> None:
+    def test_step_name_and_prose_use_the_configured_labels(self) -> None:
         model = self.cloud_model()[0]
-        settings = dict(model.names.settings)
-        settings["owned.test-affected"] = "targeted for {unit}"
-        configured = replace(model, names=type(model.names)(settings))
-        self.assertEqual(configured.names.shown("test-affected"), "test affected")
-        self.assertEqual(configured.names.prose("gate"), "the gate")
+        self.assertEqual(model.names.shown("test-affected"), "test affected")
+        self.assertEqual(model.names.prose("gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

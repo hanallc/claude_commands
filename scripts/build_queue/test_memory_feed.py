@@ -461,11 +461,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=gate\n"
-            + "owned.default={unit} {step}\n"
-            + "owned.test-affected={unit} {step}\n"
-            + "owned.ci-default=CI {step}\n"
-            + "owned.showrunner-default=showrunner {step}\n")
+            + "names.gate=gate\n")
         self.configure()
         self.configure_console()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
@@ -3919,20 +3915,13 @@ const refresh = createPageRefresh(tick);
                     row, = [row for row in table if row.get("kind") == "cloud"]
                     self.assertEqual((row["name"], row["title"]["step"]), (expected, expected))
 
-    def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
+    def test_a_cloud_row_with_no_recorded_owner_keeps_the_owner_name(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
-        config = self.root / "build_steps.conf"
-        template = config.read_text()
-        step = "test-affected"
-        for text in ("—", "owner not recorded", "${unit}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
-            with self.subTest(template=text):
-                _ = config.write_text(template.replace("owned.test-affected={unit} {step}",
-                                                        f"owned.test-affected={text}"))
-                page = self.cloud_owner_page(step, director, identity=wire.Identity("legacy", "", step, ""))
-                for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
-                    row, = [row for row in table if row.get("kind") == "cloud"]
-                    self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
+        page = self.cloud_owner_page("test-affected", director, identity=wire.Identity("legacy", "", "test-affected", ""))
+        for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+            row, = [row for row in table if row.get("kind") == "cloud"]
+            self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
 
     def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
         with isolated_staff_file(self.root / "staff.json", {}):

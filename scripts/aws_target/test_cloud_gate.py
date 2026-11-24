@@ -5476,7 +5476,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        override_fixture_settings(self.root / 'build_steps.conf', 'owned.gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

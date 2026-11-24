@@ -69,7 +69,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -394,9 +394,6 @@ names.test-all=test all
 names.test-modules=test named
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 """,
     "showrunners": """\
 # range: 0..100
@@ -856,7 +853,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
     def test_recovery_recreates_the_checkout_after_manual_removal(self) -> None:
         base = git(self.checkout, "rev-parse", "main")
         record = worktrees.new_record(self.worktree, "alpha-branch", self.checkout, base, "alpha", "main")
-        record_path = worktrees.record_file(self.worktree)
+        record_path = worktree_records.record_file(self.worktree)
         worktrees.write_record(record)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
@@ -865,7 +862,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(worktrees.read_record(record_path), record)
+        self.assertEqual(worktree_records.read_record(record_path), record)
 
         unit = shutdown.recovery_find_unit("alpha", str(self.unit_staff_id))
         assert isinstance(unit, shutdown.RetiredUnitRecovery)
@@ -876,7 +873,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(git(self.worktree, "branch", "--show-current"), record.branch)
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), base)
         layout = worktrees.output_record("origin", "alpha", "worktree")
-        self.assertEqual(worktrees.read_record(record_path), replace(record, layout=layout))
+        self.assertEqual(worktree_records.read_record(record_path), replace(record, layout=layout))
         self.assertEqual((self.worktree / "target").readlink(), layout.output)
 
     def test_retirement_refuses_a_rebase_in_the_main_checkout(self) -> None:
@@ -3913,7 +3910,7 @@ class UnitRenameTests(UnitRenameFixture):
         internal.symlink_to(source, target_is_directory=True)
         alias.symlink_to(internal, target_is_directory=True)
         with mock.patch.dict(os.environ, self.env):
-            record = worktrees.new_record(source, "alpha-director", worktrees.main_checkout(source), "base",
+            record = worktrees.new_record(source, "alpha-director", worktree_records.main_checkout(source), "base",
                                           "alpha", "demo")
             worktrees.write_record(replace(record, layout=worktrees.output_record("origin", "alpha", "director")))
             identity = worktrees.FolderIdentity.read(source)
@@ -3979,7 +3976,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertFalse((new_output / copy_lock.name).exists())
         self.assertEqual(git_files.at(copy.path).git_dir, copy_git)
         with mock.patch.dict(os.environ, self.env):
-            self.assertEqual(worktrees.read_record(worktrees.record_file(destination)).branch, "gamma-director")
+            self.assertEqual(worktree_records.read_record(worktree_records.record_file(destination)).branch, "gamma-director")
             journal = worktrees.read_move(worktrees.move_file(alias))
             self.assertEqual((journal.move.new, journal.move.unit), (new_internal, "gamma"))
             self.assertFalse(worktrees.move_file(internal).exists())
@@ -3988,7 +3985,7 @@ class UnitRenameTests(UnitRenameFixture):
             self.assertEqual(journal.stage, worktrees.MoveStage.PLANNED)
             self.assertEqual(worktrees.worktree_output(destination),
                              worktrees.output_record("origin", "gamma", "director"))
-            self.assertFalse(worktrees.record_file(source).exists())
+            self.assertFalse(worktree_records.record_file(source).exists())
 
     def test_bare_unit_rename_rerun_keeps_the_callers_unit_and_leaves_the_foreign_unit_unchanged(self) -> None:
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")

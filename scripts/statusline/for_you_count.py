@@ -16,7 +16,7 @@ from scripts.review_links import for_you
 def global_action_count(config: Path) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        count = for_you.read(config, include_comparison_reason=False).open_count
+        count = for_you.read(config, include_running_revision=False).open_count
         return str(count.value) if isinstance(count, for_you.KnownOpenCount) else "unavailable"
     except Exception:
         # Keep the status line available when a count source fails.
