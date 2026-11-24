@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Read live configuration, refuse missing keys and files, and recover invalid values from Git."""
+"""Read live configuration and recover missing or invalid values from Git."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -151,12 +151,12 @@ class UnavailableValue:
 
 
 @dataclass(frozen=True)
-class MissingValue(UnavailableValue):
-    """The live file or key is missing, so no recovery applies."""
+class _MissingValue(UnavailableValue):
+    """The live file or key is missing and has no usable value."""
 
     @override
     def unrecovered(self) -> str:
-        """Give the reason alone, because no recovery applies to a missing value."""
+        """Give the repair instruction for the missing key or file."""
         return self.reason
 
 
@@ -203,6 +203,11 @@ class ConfigRead:
     settings: dict[str, Setting] | _UnreadableFile
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
 
+    @property
+    def file_missing(self) -> bool:
+        """The file was missing when the reader opened it."""
+        return isinstance(self.settings, _UnreadableFile) and self.settings.missing
+
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
                  recover_invalid: bool = True, use_file_limits: bool = True,
@@ -210,12 +215,12 @@ class ConfigRead:
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<unreadable>"
 
-        def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
+        def read_key(settings: dict[str, Setting], *, use_default: bool = True) -> tuple[Result, str | None]:
             nonlocal bad
             try:
                 setting = _setting(settings, key, host_override)
             except _MissingKey:
-                if isinstance(default, UseConfiguredValue):
+                if not use_default or isinstance(default, UseConfiguredValue):
                     raise
                 return default, None
             bad = setting.value
@@ -225,20 +230,25 @@ class ConfigRead:
                 return convert(""), setting.value
             return _converted(setting, convert), setting.value
 
+        missing: _MissingValue | None = None
         try:
             if isinstance(self.settings, _UnreadableFile):
                 if self.settings.missing:
-                    return MissingValue(f"{_missing_key(self.source, key)}; the file does not exist")
+                    raise _MissingKey(self.settings.reason)
                 raise ValueError(self.settings.reason)
             value, _ = read_key(self.settings)
             return UsableLiveValue(value)
-        except _MissingKey:
-            return MissingValue(_missing_key(self.source, key))
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
+            if isinstance(error, _MissingKey):
+                repair = _missing_key(self.source, key)
+                if self.file_missing:
+                    repair += "; the file does not exist"
+                missing = _MissingValue(repair)
+                bad = "<missing>"
             reason = f"{self.source}: {key}={bad!r}: {error}"
         if not recover_invalid:
-            return UnavailableValue(reason)
-        if warn:
+            return missing if missing is not None else UnavailableValue(reason)
+        if warn and missing is None:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
         if use_file_limits and isinstance(self.settings, dict):
@@ -248,10 +258,12 @@ class ConfigRead:
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
             try:
-                value, raw_value = read_key(_parse(committed))
+                value, raw_value = read_key(_parse(committed), use_default=missing is None)
             except (ValueError, ArithmeticError):
                 continue
             if not current_limit:
+                if warn and missing is not None:
+                    _key_warning(self.source, key, reason, "<missing>", self.stamp)
                 return RecoveredValue(value, reason)
             if fallback is None:
                 fallback = RecoveredValue(value, reason)
@@ -262,6 +274,8 @@ class ConfigRead:
             except (ValueError, ArithmeticError):
                 continue
             return RecoveredValue(value, reason)
+        if missing is not None:
+            return missing
         return fallback if fallback is not None else UnavailableValue(reason)
 
     def origin(self, key: str, convert: Callable[[str], Result], *, use_file_limits: bool = True
@@ -272,7 +286,7 @@ class ConfigRead:
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
               recover_invalid: bool = True, host_override: HostOverride = HostOverride.APPLIES) -> Result:
-        """Read one key with a domain conversion and an optional default."""
+        """Read one key with an optional default. A caller can require a live value."""
         result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
                                recover_invalid=recover_invalid, host_override=host_override)
         if isinstance(result, UnavailableValue):
@@ -302,7 +316,7 @@ class ConfigRead:
         """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
         settings = self.settings
         if isinstance(settings, _UnreadableFile):
-            settings = self._recover_file(settings)
+            settings = _recover_file(self.source, settings)
         selected = dict.fromkeys(keys or settings)
         if host_only_prefix:
             suffix = f".{_local_host_name()}"
@@ -325,14 +339,14 @@ class ConfigRead:
                 result[key] = self.text(key)
         return result
 
-    def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
-        if fault.missing:
-            raise Unusable(_missing_file(self.source))
-        for contents in _committed_files(self.source):
-            _warning(f"warning: {self.source}: keys: {fault.reason}")
-            return _parse(contents)
-        _warning(f"warning: {self.source}: keys: {fault.reason}")
-        raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
+
+def _recover_file(source: Path, fault: _UnreadableFile) -> dict[str, Setting]:
+    _warning(f"warning: {source}: keys: {fault.reason}")
+    for contents in _committed_files(source):
+        return _parse(contents)
+    if fault.missing:
+        raise Unusable(_missing_file(source))
+    raise Unusable(f"{source}: keys: {fault.reason}; no usable committed file")
 
 
 @dataclass(frozen=True)
@@ -532,7 +546,8 @@ def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def _committed_files(source: Path) -> Iterator[str]:
-    root = _git(source.parent, "rev-parse", "--show-toplevel")
+    folder = next((parent for parent in source.absolute().parents if parent.is_dir()), source.parent)
+    root = _git(folder, "rev-parse", "--show-toplevel")
     if root.returncode:
         return
     checkout = Path(root.stdout.strip())
@@ -573,8 +588,8 @@ def known_host_names() -> frozenset[str]:
     source = path("machines")
     try:
         machines = _parse(source.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise Unusable(_missing_file(source)) from None
+    except FileNotFoundError as error:
+        machines = _recover_file(source, _UnreadableFile(str(error), missing=True))
     aliases = machines.get("aliases")
     hosts = {_local_host_name().casefold()}
     if aliases is not None:

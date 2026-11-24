@@ -1169,11 +1169,13 @@ Production readers follow `CONF_DIR`:
 - `user_zone.settings_path()` reads `USER_ZONE_CONF`, else `conf.path("user_zone")`, at each call.
 - `statusline.sh` reads `statusline.conf` and `user_zone.conf` from `${CONF_DIR:-$HOME/.claude/config}`, the `conf.sh` rule. `USER_ZONE_CONF` still comes first.
 - `copies.config_settings()` and `record.sync_config()` read `COPIES_CONFIG` or `BUILD_TARGETS_CONFIG`, else `conf.read_or_repository` under `CONF_DIR`.
-- No reader falls back to the repository `config/` for a missing live key or file.
-  `conf.read`, `shutdown_record.record_lock_seconds` and `copies.guard_choice_limit` fail and name the key and the path.
-  `conf.known_host_names` fails and names the path.
-  `waiting_rows.model_color_key` refuses the color, and `accounts.SessionModelReader.registry` gives no rows.
-  A fixture that lacks a key gets it from the twin through `write_config_fixture` or `copy_for_test`.
+- The Python reader uses the settings file's Git history for a missing file or a missing required key.
+  `conf.known_host_names` uses that history for a missing `machines.conf`.
+  With no usable value, the reader reports the live path and the required key.
+  `copies.guard_choice_limit` requires its key in the selected copies settings.
+  When the model registry is unavailable, `waiting_rows.model_color_key` refuses the color.
+  `accounts.SessionModelReader.registry` gives no rows in that case.
+  A fixture can get a missing key from the twin through `write_config_fixture` or `copy_for_test`.
 - Under `CONF_DIR` at import, the default paths `stall_watch.WATCH_DEFAULTS`, `nextest_log.DEFAULT_SETTINGS`, `review.NOTIFY_CONFIG`, `rust_release.LINT_CONFIG`, `rebuild_row.DEFAULT_CONFIG` and `design_roles.DEFAULT_CONFIG` are the twins.
 
 `conf.test_config_path(stem)` is the one path to a test-owned file.

@@ -197,14 +197,9 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
                 else:
                     _ = config.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={damage}\n")
                 result = self.read_config(config, self.python_reader)
-                if damage in ("missing file", "missing key"):
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(result.stdout, "")
-                    self.assertIn("build_oom_score_adj is missing", result.stderr)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, "650\n")
-                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "650\n")
+                self.assertEqual(len(result.stderr.splitlines()), 1)
                 self.assertIn(str(config), result.stderr)
                 self.assertIn("build_oom_score_adj", result.stderr)
                 # A fresh private folder has no revision to recover.
@@ -215,6 +210,15 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
                 # This folder is still under the fixture repo; the file itself has no history.
                 self.assertNotEqual(refused.returncode, 0)
                 self.assertIn("Unusable", refused.stderr)
+                if damage in ("missing file", "missing key"):
+                    if damage == "missing file":
+                        empty.unlink()
+                    else:
+                        _ = empty.write_text("other=1\n")
+                    refused = self.read_config(empty, self.python_reader)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(refused.stdout, "")
+                    self.assertIn("build_oom_score_adj is missing", refused.stderr)
 
     def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
         for value in ("", " # comment", "abc", "2000", "-1001"):

@@ -144,18 +144,18 @@ class MacIdleConfigTests(unittest.TestCase):
             self.assertEqual(settings.alert_seconds, 23)
             self.assertIn("alert_seconds='nan'", errors.getvalue())
             path.unlink()
-            with (mock.patch.dict(os.environ, {"CONF_DIR": directory}), redirect_stderr(io.StringIO()),
-                  self.assertRaises(conf.Unusable) as caught):
-                _ = mac_idle_alert.read_idle_config()
-            self.assertIn(f"{path}: ", str(caught.exception))
-            self.assertIn("is missing", str(caught.exception))
+            with mock.patch.dict(os.environ, {"CONF_DIR": directory}), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(mac_idle_alert.read_idle_config().alert_seconds, 23)
+            self.assertIn(f"{path}: ", errors.getvalue())
 
     def test_missing_or_invalid_values_without_history_raise_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.dict(os.environ, {"CONF_DIR": directory}):
             path = Path(directory) / "mac_test.conf"
-            with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable) as caught:
                 _ = mac_idle_alert.read_idle_config()
+            self.assertIn(f"{path}: ", str(caught.exception))
+            self.assertIn("is missing", str(caught.exception))
             for key in ("alert_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s"):
                 for value in ("0", "-1", "nan", "inf", "bad"):
                     with self.subTest(key=key, value=value):

@@ -639,7 +639,7 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
         pass
     switch = "offload" if target_config.uses_legacy_mac_layout(configured.platform) else "enabled"
     try:
-        # A missing key reads the committed file, as the router does. A bad value counts as in use.
+        # Only a usable live switch can show that the user turned the target off.
         if not conf.read(configured.settings).value(switch, conf.on_off, recover_invalid=False):
             return OffOnPurpose(f"{switch}=off")
     except ConfigError:

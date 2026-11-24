@@ -355,10 +355,11 @@ from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
 from scripts.direct import pass_record as pass_recorder
+from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
+          pass_recorder.DEFAULT_MODELS_CONFIG_PATH, user_zone.settings_path(),
           {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
@@ -374,7 +375,7 @@ for number in (1, 2):
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
                    'UNIT_NOW_EPOCH': '1000'}
-    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
+    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR', 'USER_ZONE_CONF',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -397,7 +398,7 @@ for number in (1, 2):
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
+                pass_recorder.DEFAULT_MODELS_CONFIG_PATH, user_zone.settings_path(),
                 {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')

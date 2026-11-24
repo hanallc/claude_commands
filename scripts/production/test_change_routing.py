@@ -16,7 +16,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
@@ -640,5 +640,13 @@ class ChangeReviewConfigTests(unittest.TestCase):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = folder / "change_review.conf"
         _ = write_config_fixture(path, f"lists_directory={folder / 'lists'}\n")
+        commit_config_fixture(path)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
             self.assertEqual(change_routing.configured_lists_directory(), folder / "lists")
+            _ = path.write_text("other=1\n")
+            with self.assertRaisesRegex(ValueError, "key is missing"):
+                _ = change_routing.configured_lists_directory(sources=[])
+            path.unlink()
+            sources: list[Path] = []
+            self.assertEqual(change_routing.configured_lists_directory(sources=sources), folder / "lists")
+            self.assertEqual(sources, [path])
