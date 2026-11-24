@@ -446,10 +446,16 @@ def remove_stray_producer(name: str, session: str) -> int:
         return finish_producer_cleanup(cleanup_path, cleanup, admission)
 
 
-def _message(row: staff.StaffRow, text: str) -> restart_support.MessageSendOutcome:
-    address = "codex:" if isinstance(staff.backend(row), staff.CodexBackend) else "session:"
+def _message(row: staff.StaffRow, text: str, *, require_live: bool = False) -> restart_support.MessageSendOutcome:
+    address = str(row.id)
+    if not require_live:
+        prefix = "codex:" if isinstance(staff.backend(row), staff.CodexBackend) else "session:"
+        address = prefix + row.current_session
     try:
-        result = restart_support.send_message(address + row.current_session, "agents lifecycle", text)
+        if require_live:
+            result = restart_support.send_message(address, "agents lifecycle", text, recipient_kind=row.kind)
+        else:
+            result = restart_support.send_message(address, "agents lifecycle", text)
     except (OSError, ValueError, RuntimeError) as error:
         result = restart_support.MessageUnconfirmed(kind="unconfirmed", reason=str(error))
     if not restart_support.message_was_delivered(result):
@@ -505,10 +511,6 @@ def _lifecycle(options: CommandLine) -> int:
     code = 0
     for row in rows:
         if options.command == "resume":
-            if isinstance(row.worktree, staff.RemovedWorktree):
-                print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
-                code = 2
-                continue
             with ExitStack() as operation:
                 try:
                     _ = operation.enter_context(staff.row_operation(str(row.id)))
@@ -518,16 +520,27 @@ def _lifecycle(options: CommandLine) -> int:
                     print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
                     code = 2
                     continue
+                current = staff.initial_snapshot().by_id(row.id)
+                if current is None:
+                    print(f"{row.name}: staff row is missing", file=sys.stderr)
+                    code = 2
+                    continue
+                row = current
+                if isinstance(row.worktree, staff.RemovedWorktree):
+                    print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
+                    code = 2
+                    continue
                 started = False
                 keep_workers = isinstance(row.paused, staff.Paused) and row.paused.keep_workers
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
                     text = stop_resume.PAUSED_CONTINUATION
-                    if not keep_workers:
+                    if keep_workers:
+                        delivery = _message(row, text, require_live=True)
+                    else:
                         workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
                                    else "Resume your existing workers. Do not open new workers.")
-                        text += f" {workers}"
-                    delivery = _message(row, text)
+                        delivery = _message(row, f"{text} {workers}")
                     if restart_support.message_was_delivered(delivery):
                         started = True
                         shutdown_record.remove_started([str(row.id)])
@@ -545,7 +558,8 @@ def _lifecycle(options: CommandLine) -> int:
                             result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
                         if started and keep_workers:
-                            started = restart_support.message_was_delivered(_message(row, stop_resume.PAUSED_CONTINUATION))
+                            delivery = _message(row, stop_resume.PAUSED_CONTINUATION, require_live=True)
+                            started = restart_support.message_was_delivered(delivery)
                             if not started:
                                 code = max(code, 1)
                                 continue

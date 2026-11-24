@@ -75,6 +75,30 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_codex_prompt_reads_the_same_director_hold_as_claude(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        child = fixture_member("worker", name="impl", parent=director.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        prompt = cross_session(child.name, "The worker finished the review.")
+        command = [sys.executable, conversation_pause.__file__, "codex-director-hold"]
+
+        def submit(session_id: str) -> str:
+            result = self.invoke(command, input=json.dumps({"hook_event_name": "UserPromptSubmit",
+                                                           "session_id": session_id, "prompt": prompt}),
+                                 capture_output=True, text=True, check=False, env=self.environment)
+            self.assertEqual((result.returncode, result.stderr), (0, ""))
+            return result.stdout
+
+        claude = self.run_prompt(prompt, extra={"session_id": director.current_session})
+        codex = submit(director.current_session)
+        self.assertEqual(claude.returncode, 0, claude.stderr)
+        self.assertEqual(json.loads(codex), json.loads(claude.stdout))
+        self.assertIn("Hold at the prompt", codex)
+        self.assertEqual(submit(child.current_session), "")
+        _ = staff.resume(str(director.id))
+        self.assertEqual(submit(director.current_session), "")
+
     def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
         other = self.create_instance("showrunner-other", session_id="another-owner")
         for failure in ("invalid JSON", "directory"):

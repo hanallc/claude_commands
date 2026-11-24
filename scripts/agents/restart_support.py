@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Literal, TypedDict
 
 from scripts.message import send as message_send, send_result, send_budget, session_send
+from scripts.production import staff
 
 class MessageSent(TypedDict):
     kind: Literal["sent"]
@@ -110,6 +111,7 @@ def send_message(
     machine: str = "",
     key: str = "",
     repeat_minutes: int = 0,
+    recipient_kind: staff.Kind | None = None,
 ) -> MessageSendOutcome:
     """Send to a session and return the observed send outcome."""
     if recipient == "user":
@@ -123,6 +125,8 @@ def send_message(
         "--summary",
         summary,
     ]
+    if recipient_kind is not None:
+        command.extend(("--recipient-kind", recipient_kind))
     if key:
         command.extend(("--key", key))
         if repeat_minutes:

@@ -37,7 +37,7 @@ Add `--finish-step` to wait for the workers' current tasks before stopping them.
 The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
 The pause record includes `keep_workers` when pause keeps the workers.
-`agents status` names the kept workers of a paused director.
+`agents status` names the kept workers with open agent panes.
 JSON status lists the names under `kept_workers`.
 `agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
@@ -49,11 +49,14 @@ A worker message to a paused director waits in the director's transcript until r
 A paused director on the other machine gets the continuation message without a local liveness read.
 The machine comes from its worktree or its showrunner document.
 A stopped paused director starts through the shared resume path, including its requested `--to` account.
+With `--keep-workers`, resume requires a live staff recipient for its continuation.
+If its socket is unavailable, the send fails and leaves no queued continuation.
 Queued or failed delivery restores the same pause record and returns failure.
 A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
-The prompt hook retains a paused director's hold for every prompt source.
-It adds context without blocking or removing the message.
+The Claude and Codex prompt hooks read the same director hold for every prompt source.
+Each hook adds the hold instruction and preserves the message in the transcript.
+The Codex hook installer registers and trusts the director hold in each selected Codex home.
 An own-pane resume resolves the agent executable before it removes the exit record.
 It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.

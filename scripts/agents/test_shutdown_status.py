@@ -353,8 +353,10 @@ else:
         owner = fixture_member("showrunner", name="production")
         director = fixture_member("unit", name="selected", parent=owner.id)
         other = fixture_member("unit", name="other", parent=owner.id)
-        _ = fixture_worker("review", director.id)
-        _ = fixture_worker("impl", director.id)
+        review = fixture_worker("review", director.id)
+        impl = fixture_worker("impl", director.id)
+        stopped = fixture_worker("stopped", director.id)
+        closed = fixture_worker("closed", director.id)
         _ = fixture_worker("unrelated", other.id)
         _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
         _ = staff.pause(str(other.id), "maintenance")
@@ -364,17 +366,30 @@ else:
             for row in (director, other)
         ]
         report = inventory.parse_inventory(json.dumps({**empty_inventory(), "sessions": reports}))
-        with (patch.object(status_entry, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+        states = {director.id: [worker_panes.OpenWorker(review, "w1:p1", "review", herdr.AgentStatus.IDLE),
+                                worker_panes.OpenWorker(impl, "w1:p2", "impl", herdr.AgentStatus.WORKING),
+                                worker_panes.StoppedWorker(stopped, "w1:p3", "stopped"),
+                                worker_panes.ClosedWorker(closed)]}
+        with (patch.object(status_entry, "inventory", return_value=report),
+              patch.object(worker_panes, "observe_parents", return_value=states),
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         lines = output.getvalue().splitlines()
         self.assertTrue(any("unit selected" in line and "paused (workers kept: impl, review)" in line for line in lines))
         self.assertFalse(any("unit other" in line and "workers kept" in line for line in lines))
 
-        with (patch.object(status_entry, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+        with (patch.object(status_entry, "inventory", return_value=report),
+              patch.object(worker_panes, "observe_parents", return_value=states),
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here", "--json"]), 0)
         expected = {**report, "sessions": [{**report["sessions"][0], "kept_workers": ["impl", "review"]},
                                            report["sessions"][1]]}
         self.assertEqual(output.getvalue(), json.dumps(expected, sort_keys=True) + "\n")
+
+        peer = {**expected, "machine": "Mac"}
+        result, peer_output, errors = self.run_status(0, json.dumps(peer))
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(json.loads(peer_output), [empty_inventory(), peer])
 
     def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
         authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))

@@ -5,6 +5,7 @@ The tool checks match `apply_patch` or `Bash`. STE runs at SessionStart and
 SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
 names. PreCompact records the start of manual and automatic compaction.
+UserPromptSubmit adds the director's pause context.
 UserPromptSubmit and PostCompact clear the session's compaction marker.
 Stop sends worker turn completion to the shared handler.
 Listing and trust use the event, matcher, command and timeout together,
@@ -97,6 +98,8 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("compaction-marker", PythonHookScript("pre-compact-marker.py", ("--family", "codex")),
               "PreCompact", matcher="*"),
     CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
+              "UserPromptSubmit", matcher="*"),
+    CodexHook("director-hold", PythonHookScript("conversation_pause.py", ("codex-director-hold",)),
               "UserPromptSubmit", matcher="*"),
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
