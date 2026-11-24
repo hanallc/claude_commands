@@ -3,8 +3,9 @@
 
   mac_wake.py watch   probe the Mac until it answers, then run `zone.py drain`; exit when nothing waits
 
-start() runs the watcher in its own session when a pull waits and no watcher holds the lock.
+start() runs the installed watcher (~/.claude) in its own session when a pull waits and no watcher holds the lock.
 The notes timer calls it each quota pass, so a watcher comes back after a reboot.
+The watcher works in its lock folder, so it never holds the caller's folder (a worktree move needs it free).
 A fixture queue (ZONE_STATE, XDG_STATE_HOME or HOME moved) starts no watcher;
 MAC_WAKE_PROGRAM replaces this file in tests.
 """
@@ -38,9 +39,12 @@ def _waiting() -> bool:
     return isinstance(pending, main_publish.PendingMacPull) and bool(pending.pulls or pending.text)
 
 
+def _home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
 def _live_queue() -> bool:
-    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    return main_publish.queue_path() == home / ".local/state/zone/mac.json"
+    return main_publish.queue_path() == _home() / ".local/state/zone/mac.json"
 
 
 def _try_lock(handle: TextIO) -> bool:
@@ -61,9 +65,10 @@ def start() -> list[str]:
     with path.open("a") as handle:
         if not _try_lock(handle):
             return []
-    _ = subprocess.Popen([sys.executable, program or str(Path(__file__).resolve()), "watch"],
+    program = program or str(_home() / ".claude/scripts/lib/mac_wake.py")
+    _ = subprocess.Popen([sys.executable, program, "watch"],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         cwd=path.parent, start_new_session=True)
     return ["mac: a watcher sends the waiting pull as soon as the Mac answers"]
 
 
@@ -79,12 +84,15 @@ def _seconds(key: str) -> int:
 
 def watch() -> int:
     """Hold the lock; probe the Mac, pausing between probes, and drain the queue when it answers."""
-    path = lock_path()
+    path = lock_path().absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chdir(path.parent)
     with path.open("a") as handle:
         if not _try_lock(handle):
             return 0
         while _waiting():
+            if not ZONE_SCRIPT.is_file():
+                return 1
             if _answers():
                 done = subprocess.run([sys.executable, str(ZONE_SCRIPT), "drain"], capture_output=True,
                                       text=True, check=False)

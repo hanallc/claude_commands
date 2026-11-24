@@ -2190,8 +2190,22 @@ class AdmissionServer:
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
-            return self._rank_priority_waiters(rows, self.priority)
-        return gate.sort_waiters(rows)
+            rows = self._rank_priority_waiters(rows, self.priority)
+        return sorted(rows, key=lambda item: self._waiter_order(item[1]))
+
+    def _waiter_run_place(self, row: records.Waiter) -> wire.RunPlace | None:
+        place = self.places.get(_place_key(wire.Owner(row["pid"], row["start_time"]), row["since"]))
+        if place is not None and isinstance(place.run, wire.RunIdentity):
+            return self.run_places.get(records.run_owner(place.run.pid, place.run.start_time))
+        return None
+
+    def _waiter_order(self, row: records.RankedWaiter) -> tuple[int, float, float, int, int]:
+        priority, order_since, since, pid = gate.waiter_order(row)
+        place = self._waiter_run_place(row)
+        if place is not None and order_since == place.since:
+            # Keep the original tie-break when a new step uses the run's rank.
+            return priority, order_since, place.since, place.first_owner.pid, pid
+        return priority, order_since, since, pid, pid
 
     def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
                           ) -> list[tuple[Path, records.RankedWaiter]]:
@@ -2221,7 +2235,7 @@ class AdmissionServer:
 
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
-        # Match CI priority by runner. Keep the runner out of the published unit field.
+        # Match CI priority by runner. Publish the current step's unit.
         ci_waiters: dict[Path, records.RankedWaiter] = {}
         sessions: list[str] = []
         ranking_rows: list[tuple[Path, records.Waiter]] = []
@@ -3523,12 +3537,52 @@ class AdmissionServer:
             record = replace(record, slot_staff=step_staff(record.queue_waiter, self.host))
         return self._freeze_test_phase_need(record, config, share_percent)
 
+    def _save_gate_rank(self, admission: ReservationRecord, move_id: str) -> None:
+        run = admission.run
+        row = admission.queue_waiter
+        if (not move_id or not isinstance(run, wire.RunIdentity) or not isinstance(admission.place, wire.LocalPlace)
+                or row.get("step") not in ("gate", "test-affected")):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        rank = self.run_places.get(key)
+        if (rank is not None and (not rank.move_id or not rank.repository)
+                and rank.first_owner == admission.owner and rank.since == row["since"]):
+            self.run_places[key] = replace(rank, move_id=rank.move_id or move_id,
+                                          repository=rank.repository or row.get("repository_name", admission.repo))
+
+    def _gate_gap_start(self, admission: ReservationRecord, now: float) -> str | None:
+        """Describe a local grant during an older gate's existing memory gap."""
+        run = admission.run
+        if not self.slots or not isinstance(run, wire.RunIdentity) or not isinstance(admission.place, wire.LocalPlace):
+            return None
+        current = self.run_places.get(records.run_owner(run.pid, run.start_time))
+        if current is None:
+            return None
+        active = {record.run for record in self.reservations.values()}
+        current_order = (current.since, current.first_owner.pid)
+        older: wire.RunPlace | None = None
+        for slot in self.slots.values():
+            gap = gate.between_steps(slot)
+            if gap.expires_at <= now:
+                continue
+            rank = self.run_places.get(records.run_owner(gap.run.pid, gap.run.start_time))
+            if rank is None or not rank.move_id or not rank.repository or rank.run in active:
+                continue
+            order = (rank.since, rank.first_owner.pid)
+            if order < current_order and (older is None or order < (older.since, older.first_owner.pid)):
+                older = rank
+        if older is None:
+            return None
+        return (f"memory admission: run {run.pid}:{run.start_time} started in the gate gap of "
+                f"{older.run.pid}:{older.run.start_time} for {older.repository} on {self.host}")
+
     def _admit(self, waiters: list[WaitingAdmission], config: records.MemoryConfig, share_percent: int, *,
                cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
                verify_slots: Mapping[str, VerifyRunSlot]) -> None:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
+        gap_starts: list[str] = []
         for waiting, admission in zip(waiters, prepared, strict=True):
             request = waiting.request
             if isinstance(admission, wire.LaunchAdmitted):
@@ -3542,6 +3596,9 @@ class AdmissionServer:
                     isinstance(candidate, gate.QueuedHead)
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
+                if (line := self._gate_gap_start(admission, now)) is not None:
+                    gap_starts.append(line)
+                self._save_gate_rank(admission, waiting.row.get("move_id", ""))
                 self.reservations[request.episode] = admission
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
                 if slot is not None:
@@ -3574,6 +3631,8 @@ class AdmissionServer:
             self._prune_watches()
         # Save every grant before sending any reply for the group.
         self.persist()
+        for line in gap_starts:
+            print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
             self._remove_waiter(waiting, reply)
 

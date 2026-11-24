@@ -30,6 +30,7 @@ from scripts.build_queue import admission_client as client, mac_run, queue_snaps
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
+from scripts.build_queue.admission_test_support import FixedSystemReader
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
@@ -1033,6 +1034,50 @@ class PlacementTests(unittest.TestCase):
                 replay, = fixture.connect(request).replies()
                 self.assertNotIsInstance(replay, wire.LocalPlacementGranted)
 
+    def test_completed_placed_gate_allows_a_younger_gate_while_its_caller_lives(self) -> None:
+        with PlacementFixture() as fixture:
+            base = placement_request(fixture)
+            request = replace(base, constraints=replace(base.constraints,
+                candidates=(local_candidate(fixture),), command_kind="final"),
+                profile=replace(base.profile, step="gate"), identity=replace(base.identity, step="gate"))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.release(granted.grant)
+            fixture.clock.advance(60)
+            fixture.allow_next_start()
+            younger = fixture.request(step="gate")
+            _ = only_admitted(fixture.server.handle_request(younger))
+            assert isinstance(request.run, wire.RunIdentity)
+            self.assertIn(records.run_owner(request.run.pid, request.run.start_time), fixture.server.run_places)
+
+    def test_younger_run_logs_once_inside_a_placed_gate_gap(self) -> None:
+        with PlacementFixture() as fixture:
+            base = placement_request(fixture)
+            assert isinstance(base.local, wire.LocalAdmissionContext)
+            request = replace(base, constraints=replace(base.constraints,
+                candidates=(local_candidate(fixture),), command_kind="final"),
+                profile=replace(base.profile, step="gate"), identity=replace(base.identity, step="gate"),
+                local=replace(base.local, sidecar=str(fixture.root / "gate.cgroup")))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.release(granted.grant)
+            fixture.allow_next_start()
+            slot, = fixture.server.slots.values()
+            self.assertGreater(gate.between_steps(slot).expires_at, fixture.clock.now())
+            run = request.run
+            assert isinstance(run, wire.RunIdentity)
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                grant = only_admitted(fixture.server.handle_request(younger))
+                self.assertEqual(only_admitted(fixture.server.handle_request(younger)), grant)
+                _ = fixture.run_pass()
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {run.pid}:{run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
+
     def test_restart_requires_token_confirmation_before_a_local_grant(self) -> None:
         with PlacementFixture() as fixture:
             fixture.free(0)
@@ -1468,8 +1513,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
         # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1526,8 +1569,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_newer_than_the_system_reading_consumes_its_guest_permission(self) -> None:
         # copies.py starts the gate after the last system reading, so that reading does not show the holder.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1542,8 +1583,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_whose_pid_named_another_process_in_the_reading_consumes_its_guest_permission(self) -> None:
         # The last system reading shows the gate pid with the start time of an earlier process.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1562,8 +1601,6 @@ class PlacementTests(unittest.TestCase):
     def test_a_holder_the_fresh_read_does_not_confirm_keeps_the_guest_permission(self) -> None:
         # The last system reading shows the holder pid with the start time of an earlier process.
         # The fresh read then refuses a holder that is not a descendant or that states a start that is not live.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         cases = (("not a descendant", False, None), ("not the live start", True, "not-the-live-start"))
         for case, descendant, stated_start in cases:
             with self.subTest(case), PlacementFixture() as fixture:
