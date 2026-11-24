@@ -31,7 +31,8 @@ MIN_OUTPUT_IMAGE_HEIGHT = 160
 class ImageRecord(TypedDict):
     id: str
     file: str
-    caption: str
+    title: str
+    look_for: list[str]
     owner: str
     subject: str
     registered_at: str
@@ -49,11 +50,15 @@ def read_record(folder: Path) -> ImageRecord:
     if not isinstance(value, dict):
         raise ValueError(f"{folder.name}: invalid image record")
     fields = cast(dict[str, object], value)
-    texts = ("id", "file", "caption", "owner", "subject", "registered_at")
-    if any(not isinstance(fields.get(key), str) for key in texts) or fields["id"] != folder.name:
+    texts = ("id", "file", "owner", "subject", "registered_at")
+    title = fields.get("title", fields.get("caption"))
+    lines = fields.get("look_for", [])
+    if (not isinstance(title, str) or not isinstance(lines, list)
+            or not all(isinstance(line, str) for line in cast(list[object], lines))
+            or any(not isinstance(fields.get(key), str) for key in texts) or fields["id"] != folder.name):
         raise ValueError(f"{folder.name}: invalid image record")
     record: ImageRecord = {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]),
-                           "caption": cast(str, fields["caption"]), "owner": cast(str, fields["owner"]),
+                           "title": title, "look_for": cast(list[str], lines), "owner": cast(str, fields["owner"]),
                            "subject": cast(str, fields["subject"]), "registered_at": cast(str, fields["registered_at"])}
     for key in ("before", "feedback_at"):
         value = fields.get(key)
@@ -75,7 +80,14 @@ def read_record(folder: Path) -> ImageRecord:
 
 
 def write_record(folder: Path, record: ImageRecord) -> None:
-    atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
+    # Older services require a caption. Keep all the text if they save the record.
+    caption = "\n".join((record["title"], *look_for_message_lines(record)))
+    atomic_file.write_bytes_atomic(folder / RECORD, json.dumps({**record, "caption": caption}).encode("utf-8"), mode=0o600)
+
+
+def look_for_message_lines(record: ImageRecord) -> tuple[str, ...]:
+    lines = record["look_for"]
+    return ("Look for:", *(f"- {line}" for line in lines)) if lines else ()
 
 
 @dataclass(frozen=True)
@@ -121,8 +133,9 @@ class ImageQuestionStore:
             write_record(folder, record)
 
 
-def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
-                  *, before: Path | None = None, identity: str = "", private: bool = False) -> ImageRecord:
+def register_file(image: Path, folder: Path, title: str = "", owner: str = "", subject: str = "",
+                  *, look_for: tuple[str, ...] = (), before: Path | None = None, identity: str = "",
+                  private: bool = False) -> ImageRecord:
     """Publish one image or a pair with one record and one atomic folder rename."""
     sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
     for _, source in sources:
@@ -140,7 +153,7 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
         files = {stem: stem + source.suffix.casefold() for stem, source in sources}
         # The last source is the after image of a pair, or the single image.
         record: ImageRecord = {"id": identity, "file": files[sources[-1][0]],
-                               "caption": caption.strip(), "owner": owner, "subject": subject,
+                               "title": title.strip(), "look_for": list(look_for), "owner": owner, "subject": subject,
                                "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
         if "before" in files:
             record["before"] = files["before"]

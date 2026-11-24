@@ -461,8 +461,9 @@ def image_question_target(path: Path, image: image_store.ImageRecord) -> Questio
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
                + '--id {item} --question {question_id} --text "<answer>"')
     owner = staff.StaffId(image["owner"])
+    summary = "\n".join((image["title"], *image_store.look_for_message_lines(image)))
     return QuestionDeliveryTarget(path, image["id"], owner, IMAGE_QUESTION_ROW_PREFIX + image["id"],
-                                  image["caption"], command, owner)
+                                  summary, command, owner)
 
 
 @dataclass(frozen=True)

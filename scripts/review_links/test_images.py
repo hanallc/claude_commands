@@ -1,6 +1,7 @@
 """Test image registration, the Images page, deletes and feedback in private folders."""
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -58,7 +59,8 @@ class ImagesFixture(unittest.TestCase):
             "page.images.url=python:scripts.review_links.images:page_url\n"
             + "page.images.items=python:scripts.review_links.images:waiting_images\n")
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\n")
+        _ = write_config_fixture(
+            settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\nmax_chars.image_title=80\n")
         self.root = self.temporary / "snapshots"
         self.status = change_page.DeliveryStatus(self.root)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -90,8 +92,9 @@ class ImagesFixture(unittest.TestCase):
         assert self.owner is not None
         return self.owner.id
 
-    def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
-        return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+    def register(self, title: str = "The Images navigation",
+                 *, look_for: tuple[str, ...] = ()) -> image_store.ImageRecord:
+        return images.register(self.shot, title, self.owner_id(), "Phase console-images", look_for=look_for)
 
     def run_firefox(self, handler: type[BaseHTTPRequestHandler], name: str, *, timeout: int = 45,
                     release: Callable[[], None] = lambda: None) -> None:
@@ -231,22 +234,41 @@ class ImagesTests(ImagesFixture):
     def test_register_refuses_bad_input_and_leaves_no_folder(self) -> None:
         text = self.temporary / "notes.txt"
         _ = text.write_text("not an image")
-        cases = ((text, "caption", self.owner_id(), "use one of"),
-                 (self.temporary / "absent.png", "caption", self.owner_id(), "no such image file"),
-                 (self.shot, "  ", self.owner_id(), "the caption is empty"),
-                 (self.shot, "caption", staff.StaffId("absent-owner"), "no staff record"))
-        for image, caption, owner, reason in cases:
+        cases = ((text, "Cards", self.owner_id(), "use one of"),
+                 (self.temporary / "absent.png", "Cards", self.owner_id(), "no such image file"),
+                 (self.shot, "  ", self.owner_id(), "one nonempty line"),
+                 (self.shot, "Cards\nPanel", self.owner_id(), "one nonempty line"),
+                 (self.shot, "Cards", staff.StaffId("absent-owner"), "no staff record"))
+        for image, title, owner, reason in cases:
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
-                _ = images.register(image, caption, owner, "Change sdlc/C1")
+                _ = images.register(image, title, owner, "Change sdlc/C1")
+        with self.assertRaisesRegex(ValueError, "Each --look-for value must be one nonempty line."):
+            _ = self.register(look_for=("First line\nSecond line",))
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).glob("*")) if (self.root / image_store.IMAGES_FOLDER).exists() else [], [])
 
-    def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
+    def test_register_reports_the_limit_and_length_of_a_long_title(self) -> None:
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = images.main(["register", "--image", str(self.shot), "--title", "A" * 81,
+                                "--owner", self.owner_id(), "--phase", "image-card"])
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(),
+                         "images: --title has 81 characters. The limit is 80. Put the details in --look-for lines.\n")
+        self.assertFalse(images.images_root(self.root).exists())
+
+    def test_command_stores_the_title_and_look_for_lines_prints_links_and_deletes(self) -> None:
         output = StringIO()
         with redirect_stdout(output):
-            code = images.main(["register", "--image", str(self.shot), "--caption", "Look at the cards",
+            code = images.main(["register", "--image", str(self.shot), "--title", "List cards",
+                                "--look-for", "The count above the table", "--look-for", " The owner label ",
                                 "--owner", self.owner_id(), "--change", "sdlc/C9"])
         self.assertEqual(code, 0)
         record = images.records(self.root)[0]
+        stored = cast(dict[str, object], json.loads(
+            (images.images_root(self.root) / record["id"] / image_store.RECORD).read_text()))
+        self.assertEqual(stored["title"], "List cards")
+        self.assertEqual(stored["look_for"], ["The count above the table", "The owner label"])
+        self.assertEqual(stored["caption"], "List cards\nLook for:\n- The count above the table\n- The owner label")
         self.assertEqual(record["subject"], "Change sdlc/C9")
         self.assertEqual(output.getvalue().splitlines(), [
             f"registered {record['id']}: http://127.0.0.1:8765/images/{record['id']}/image.png",
@@ -551,7 +573,7 @@ class ImagesTests(ImagesFixture):
   const view = host.defaultView;
   check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
         'The browser uses the phone width and dark theme.');
-  for (const action of ['feedback', 'approved']) {
+  for (const action of ['feedback', 'approved', 'question']) {
    form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
    await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
    const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
@@ -569,7 +591,7 @@ class ImagesTests(ImagesFixture):
    await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
    check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
   }
-  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved', 'Undo sends nothing more.');
+  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved,question', 'Undo sends nothing more.');
  } catch (error) {
   failures.push(String(error));
  }
@@ -581,8 +603,8 @@ class ImagesTests(ImagesFixture):
         page = page.replace("</body>", probe.replace("__RECEIVER__", json.dumps(name)) + "</body>")
         self.assertEqual(firefox_probe_results(page.encode(), window_size=(390, 860), dark=True), [[]])
 
-    def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
-        record = self.register("Look at <the> cards")
+    def test_card_shows_the_title_look_for_details_image_and_actions(self) -> None:
+        record = self.register("Look at <the> cards", look_for=("Check <the> count.", "Look for a gap."))
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         image_store.write_record(self.root / image_store.IMAGES_FOLDER / record["id"], record)
         card = images.card(record, "token", staff.snapshot(), 3)
@@ -591,7 +613,9 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner" data-send-receiver="shot-owner">'
-            + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
+            + '<h2 class="image-title">Look at &lt;the&gt; cards</h2>'
+            + '<ul class="image-look-for"><li>Check &lt;the&gt; count.</li><li>Look for a gap.</li></ul>'
+            + '<dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
             + f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
@@ -643,6 +667,63 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
         self.assertNotIn('value="delete"', page)
 
+    def add_legacy_caption(self) -> str:
+        record = self.register()
+        path = images.images_root(self.root) / record["id"] / image_store.RECORD
+        stored = cast(dict[str, object], json.loads(path.read_text()))
+        _ = stored.pop("title")
+        _ = stored.pop("look_for")
+        caption = "Check <the> cards. " * 12 + "\nThe last line stays visible."
+        stored["caption"] = caption
+        _ = path.write_text(json.dumps(stored))
+        return caption
+
+    def test_an_old_caption_only_record_shows_the_full_title(self) -> None:
+        caption = self.add_legacy_caption()
+        page = images.render(self.status).decode()
+        self.assertIn('<h2 class="image-title">' + html.escape(caption) + '</h2>', page)
+        self.assertNotIn('<ul class="image-look-for">', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_shows_the_title_at_the_limit_and_wraps_long_text_in_dark_mode(self) -> None:
+        title = "W" * 80
+        _ = self.register(title, look_for=("Check the spacing above each button.",))
+        _ = self.add_legacy_caption()
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  document.documentElement.dataset.theme='dark';
+  frameElement.style.width='1382px';
+  await painted();
+  const points=document.querySelector('.image-look-for');
+  const title=points.closest('article').querySelector('.image-title');
+  const legacy=[...document.querySelectorAll('.image-title')].find(heading=>heading!==title);
+  const style=getComputedStyle(title);
+  check(innerWidth===1382 && title.textContent==='W'.repeat(80) &&
+        title.scrollWidth===title.clientWidth && title.scrollHeight===title.clientHeight &&
+        title.getBoundingClientRect().height>1.5*parseFloat(style.lineHeight),
+        'The full title wraps at 1382 px.');
+  check(style.fontWeight==='400' && getComputedStyle(legacy).fontWeight==='400' && style.fontSize==='17px',
+        'Both titles use normal weight and the List font size.');
+  check(style.color==='rgb(240, 239, 236)' && getComputedStyle(points).color==='rgb(195, 194, 183)',
+        'The dark theme uses secondary text for the bullet list.');
+  check(legacy.getBoundingClientRect().height>2*parseFloat(style.lineHeight),
+        'The legacy title wraps in the card.');
+  frameElement.style.width='390px';
+  await painted();
+  const root=document.documentElement;
+  check(innerWidth===390 && root.scrollWidth===root.clientWidth &&
+        title.getBoundingClientRect().height>1.5*parseFloat(style.lineHeight) && title.scrollWidth===title.clientWidth,
+        'The phone title wraps without horizontal overflow.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = images.render(self.status)
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def feedback_body(self, record: image_store.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
@@ -660,7 +741,7 @@ class ImagesTests(ImagesFixture):
                 self.assertEqual([message for _, _, message in self.sent], ["\n".join((
                     f"From the user (via the Images page): {first}", *lines,
                     f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
-                    "Caption: After: the panel.", "For: Phase console-images",
+                    "Title: After: the panel.", "For: Phase console-images",
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
@@ -674,7 +755,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn(record["id"], images.render(self.status).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
-        record = self.register("After: the panel. Look at the counts.")
+        record = self.register("Panel counts", look_for=("Check the counts.", "Check their order."))
         self.submit(self.feedback_body(record, "  The counts are wrong.  "))
         assert self.owner is not None
         self.assertEqual(len(self.sent), 1)
@@ -684,7 +765,7 @@ class ImagesTests(ImagesFixture):
             "From the user (via the Images page): your image is not approved. The feedback follows.",
             "Feedback: The counts are wrong.",
             f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
-            "Caption: After: the panel. Look at the counts.",
+            "Title: Panel counts", "Look for:", "- Check the counts.", "- Check their order.",
             "For: Phase console-images",
             "After you act on it, delete the image: "
             + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}")))
@@ -884,14 +965,14 @@ class ImageQuestionTests(ImagesFixture):
         record = self.register()
         self.ask(record)
         images.answer_question(self.root, record['id'], 'Q1', 'The gate passed.')
-        images.send_answer(self.root, record['id'], 'feedback', 'Use a larger caption.')
+        images.send_answer(self.root, record['id'], 'feedback', 'Use a larger title.')
         stored = image_store.read_record(images.images_root(self.root) / record['id'])
         self.assertIn('feedback_at', stored)
         self.assertNotIn(record['id'], images.render(self.status).decode())
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset())
 
     def test_an_asked_image_leaves_the_page_and_its_answer_returns_as_new(self) -> None:
-        record = self.register('Check <the> gate')
+        record = self.register('Check <the> gate', look_for=('Check the first row.',))
         pages = tuple(page for page in console.read_pages() if page.identity == 'images')
         self.assertEqual(console.news(self.root, pages, 'images'), ())
         self.ask(record)
@@ -909,6 +990,7 @@ class ImageQuestionTests(ImagesFixture):
         assert self.owner is not None
         self.assertEqual(self.sent[0][0], 'session:'+self.owner.current_session)
         self.assertIn(f"Images {record['id']}: Ask question", self.sent[0][2])
+        self.assertIn("Check <the> gate\nLook for:\n- Check the first row.\n", self.sent[0][2])
         self.assertIn(f"--id {record['id']} --question Q1 --text", self.sent[0][2])
         # An unrelated feedback mark must not prevent the answer from returning.
         stored['feedback_at'] = datetime.now(UTC).isoformat()
@@ -1416,8 +1498,8 @@ async (find, whenPageShows, check, controlRefresh) => {
 (async () => {
  const failures = [];
  const check = (ok, message) => {if (!ok) failures.push(message);};
- const find = caption => [...document.querySelectorAll('[data-image]')]
-  .find(card => card.querySelector('.caption').textContent === caption);
+ const find = title => [...document.querySelectorAll('[data-image]')]
+  .find(card => card.querySelector('.image-title').textContent === title);
  const browserNow = performance.now.bind(performance);
  const waitLimit = 12000;
  const whenPageShows = (name, predicate) => new Promise((resolve, reject) => {
@@ -1614,10 +1696,10 @@ async (find, whenPageShows, check, controlRefresh) => {
 
 
 class ImagePairTests(ImagesFixture):
-    def register_pair(self, caption: str = "The panel. Look at the counts.") -> image_store.ImageRecord:
+    def register_pair(self, title: str = "Panel counts") -> image_store.ImageRecord:
         after = self.temporary / "after.webp"
         _ = after.write_bytes(PNG[::-1])
-        return images.register(after, caption, self.owner_id(), "Phase image-pairs", before=self.shot)
+        return images.register(after, title, self.owner_id(), "Phase image-pairs", before=self.shot)
 
     def test_a_pair_is_one_record_in_one_folder_and_one_delete_removes_both(self) -> None:
         record = self.register_pair()
@@ -1641,7 +1723,7 @@ class ImagePairTests(ImagesFixture):
 
         with patch("scripts.review_links.image_store.shutil.copyfile", side_effect=copy_image), \
                 self.assertRaisesRegex(OSError, "the after image cannot be copied"):
-            _ = images.register(after, "caption", self.owner_id(), "Phase image-pairs", before=self.shot)
+            _ = images.register(after, "Cards", self.owner_id(), "Phase image-pairs", before=self.shot)
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).iterdir()), [])
         self.assertEqual(images.records(self.root), [])
 
@@ -1650,7 +1732,7 @@ class ImagePairTests(ImagesFixture):
         _ = text.write_text("not an image")
         for before, reason in ((text, "use one of"), (self.temporary / "absent.png", "no such image file")):
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
-                _ = images.register(self.shot, "caption", self.owner_id(), "Phase image-pairs", before=before)
+                _ = images.register(self.shot, "Cards", self.owner_id(), "Phase image-pairs", before=before)
         self.assertFalse((self.root / image_store.IMAGES_FOLDER).exists())
 
     def test_a_record_whose_before_is_not_text_stays_off_the_page(self) -> None:
@@ -1668,10 +1750,12 @@ class ImagePairTests(ImagesFixture):
         _ = after.write_bytes(PNG)
         output = StringIO()
         with redirect_stdout(output):
-            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--caption", "Cards",
+            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--title", "Cards",
+                                "--look-for", "Check the row count.",
                                 "--owner", self.owner_id(), "--phase", "image-pairs"])
         self.assertEqual(code, 0)
         record = images.records(self.root)[0]
+        self.assertEqual((record["title"], record["look_for"]), ("Cards", ["Check the row count."]))
         origin = f"http://127.0.0.1:8765/images/{record['id']}"
         self.assertEqual(output.getvalue().splitlines(), [
             f"registered {record['id']}: {origin}/before.png {origin}/after.png",
@@ -1680,7 +1764,7 @@ class ImagePairTests(ImagesFixture):
         for options in (["--before", str(self.shot)], ["--image", str(self.shot), "--after", str(after)], []):
             with self.subTest(options=options), redirect_stderr(StringIO()) as errors, \
                     self.assertRaises(SystemExit):
-                _ = images.main(["register", *options, "--caption", "Cards", "--owner", self.owner_id(),
+                _ = images.main(["register", *options, "--title", "Cards", "--owner", self.owner_id(),
                                  "--phase", "image-pairs"])
             self.assertIn("give --image, or --before and --after", errors.getvalue())
         self.assertEqual(images.records(self.root), [record])
