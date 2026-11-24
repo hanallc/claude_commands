@@ -729,7 +729,8 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(limits_view.wait_words(limits_view.waiting_cause(row)).one, "1 run waits for a machine choice.")
 
     def test_a_guest_reading_after_backoff_can_restore_a_waiting_guest(self) -> None:
-        with PlacementFixture() as fixture:
+        configuration = self.enterContext(TemporaryDirectory())
+        with mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture:
             backoff = mac_linux_fixture(fixture)
             guest = mac_linux_candidate()
             request = placement_request(fixture)
@@ -782,10 +783,6 @@ class PlacementTests(unittest.TestCase):
 
                 accepted_at = fixture.clock.now()
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
-                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
-                start = fixture.server.assignments[key].confirmed_guest_start
-                assert isinstance(start, records.ConfirmedGuestStart), start
-                self.assertEqual(start.accepted_at, accepted_at)
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
@@ -796,6 +793,13 @@ class PlacementTests(unittest.TestCase):
                                  (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
                 self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
                 self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+
+                fixture.restart()
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                self.assertNotIn(key, fixture.server.execution_evidence)
+                start = fixture.server.assignments[key].confirmed_guest_start
+                assert isinstance(start, records.ConfirmedGuestStart), start
+                self.assertEqual(start.accepted_at, accepted_at)
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
     def test_guest_start_report_survives_restart_and_closure(self) -> None:
