@@ -17,6 +17,7 @@ COPY_HELPERS = (
     "scripts/lib", "scripts/buildlog", "scripts/copies", "scripts/mac_test", "scripts/message",
     "scripts/production", "scripts/agents", "scripts/direct", "scripts/hooks", "scripts/lint", "scripts/herdr",
     "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
+    "scripts/worktree",
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
 VERIFY_TEST_ENVIRONMENT = frozenset({

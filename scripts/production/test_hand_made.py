@@ -1236,6 +1236,7 @@ class BuildsPageTests(unittest.TestCase):
             assert isinstance(waiting, wire.PlacementWait)
             self.assertIsInstance(waiting.wait, wire.PlacementResourceWait)
             fixture.allow_next_start()
+            _ = fixture.run_pass()
             granted, = fixture.server.handle_request(request)
             assert isinstance(granted, wire.LocalPlacementGranted)
             fixture.release(granted.grant)

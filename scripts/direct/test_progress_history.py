@@ -6310,6 +6310,116 @@ with patch.object(fcntl, "flock", admission):
             + "ux check minutes 3, ux repair minutes 20",
         )
 
+    def test_review_trial_counts_a_back_dated_subagent_review_as_review_worker_minutes(self) -> None:
+        """A subagent review recorded after it returns adds its own minutes, and none to the ux check."""
+        self.write_full_config()
+        base = 73_000
+        session_dir = self.start_run("subagent-review", base)
+        self.start_phase(session_dir, base + 10)
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(base + offset, UTC).isoformat()
+
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Subagent review",
+            "--activity", "reviewing the diff", "--started-at", moment(100), at=base + 2_000,
+        )
+        _ = self.run_command(
+            "finish-activity", "--session-dir", str(session_dir), "--finished-at", moment(1_300),
+            at=base + 2_010,
+        )
+        started = self.phase_events("subagent-review", "activity_started")[-1]
+        finished = self.phase_events("subagent-review", "activity_finished")[-1]
+        self.assertEqual((started.get("timestamp_epoch"), started.get("backfilled")), (float(base + 100), True))
+        self.assertEqual((finished.get("timestamp_epoch"), finished.get("activity_elapsed_seconds")),
+                         (float(base + 1_300), 1_200))
+        self.assertEqual(
+            self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 2_100),
+            "review trial: ux 0 findings, code 0 findings, review-worker minutes 20, "
+            + "ux check minutes 0, ux repair minutes 0",
+        )
+
+    def test_a_back_dated_activity_time_out_of_bounds_is_refused(self) -> None:
+        """Each refusal leaves the open activity active and records no finish."""
+        base = 74_000
+        session_dir = self.start_run("bad-activity-time", base)
+        self.start_phase(session_dir, base + 100)
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(base + offset, UTC).isoformat()
+
+        def assert_refused(result: subprocess.CompletedProcess[str], cause: str, label: str, finishes: int) -> None:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(cause, result.stderr)
+            phase = recorder_state.open_phases(self.read_state(session_dir))[-1]
+            activity = cast(dict[str, object], phase["activity"])
+            self.assertEqual((activity["label"], activity["status"]), (label, "active"))
+            self.assertEqual(len(self.phase_events("bad-activity-time", "activity_finished")), finishes)
+
+        def start(offset: int) -> subprocess.CompletedProcess[str]:
+            return self.run_failing_command(
+                "start-activity", "--session-dir", str(session_dir), "--label", "Subagent review",
+                "--activity", "reviewing", "--started-at", moment(offset), at=base + 400,
+            )
+
+        def finish(offset: int) -> subprocess.CompletedProcess[str]:
+            return self.run_failing_command(
+                "finish-activity", "--session-dir", str(session_dir), "--finished-at", moment(offset),
+                at=base + 410,
+            )
+
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Verify",
+            "--activity", "verifying", at=base + 150,
+        )
+        assert_refused(start(500), f"--started-at {moment(500)} is in the future", "Verify", 0)
+        assert_refused(start(50), "--started-at is before Phase 3 started", "Verify", 0)
+        # The accepted start interrupts Verify: one finish event.
+        self.assertEqual(start(200).returncode, 0)
+        assert_refused(finish(180), "--finished-at is before the activity 'Subagent review' started",
+                       "Subagent review", 1)
+        assert_refused(finish(600), f"--finished-at {moment(600)} is in the future", "Subagent review", 1)
+
+    def test_a_back_dated_activity_start_interrupts_the_active_one_at_that_time(self) -> None:
+        base = 75_000
+        session_dir = self.start_run("back-dated-interrupt", base)
+        self.start_phase(session_dir, base + 10)
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Verify",
+            "--activity", "verifying", at=base + 50,
+        )
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Subagent review",
+            "--activity", "reviewing", "--started-at",
+            datetime.fromtimestamp(base + 100, UTC).isoformat(), at=base + 900,
+        )
+        closed = self.phase_events("back-dated-interrupt", "activity_finished")[-1]
+        self.assertEqual(
+            (closed.get("activity_label"), closed.get("status"), closed.get("timestamp_epoch"),
+             closed.get("activity_elapsed_seconds"), closed.get("backfilled")),
+            ("Verify", "interrupted", float(base + 100), 50, True),
+        )
+
+    def test_a_back_dated_start_before_the_active_activity_closes_it_at_now(self) -> None:
+        base = 75_500
+        session_dir = self.start_run("back-dated-before-active", base)
+        self.start_phase(session_dir, base + 10)
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Verify",
+            "--activity", "verifying", at=base + 500,
+        )
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir), "--label", "Subagent review",
+            "--activity", "reviewing", "--started-at",
+            datetime.fromtimestamp(base + 100, UTC).isoformat(), at=base + 900,
+        )
+        closed = self.phase_events("back-dated-before-active", "activity_finished")[-1]
+        self.assertEqual(
+            (closed.get("activity_label"), closed.get("status"), closed.get("timestamp_epoch"),
+             closed.get("activity_elapsed_seconds"), closed.get("backfilled")),
+            ("Verify", "interrupted", float(base + 900), 400, None),
+        )
+
     def test_the_board_refuses_a_handoff_that_names_no_role(self) -> None:
         """A handoff is a role change; prose there is a movement the table never shows."""
         session_dir = self.start_run("barehandoff", 65_000)
