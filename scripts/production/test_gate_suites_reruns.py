@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 from scripts.build_queue import queue_place
@@ -215,6 +215,23 @@ class MergeGateRerunsTests(GateSuitesFixture):
         for call in scopes[-2:]:
             self.assertEqual(sum(previous["args"] == call["args"] for previous in scopes), 2)
         self.assertFalse(any("basedpyright" in " ".join(call["args"]) for call in scopes))
+
+    @gate_suites("lib", "hooks")
+    def test_whole_machine_can_rerun_a_failed_module_alone(self) -> None:
+        self.write(self.state / "fail-first-hooks", "once")
+        machine = gate.WholeMachine(rerun_failed_modules=True)
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout, full=True, machine=machine, selected=gate.ALL_MODULES)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertIn("--- hooks/test_first.py passed on rerun alone; first run exit=1 ---", output.getvalue())
+        first, second = (job for job in run.executions if job.suite == "hooks")
+        self.assertEqual((first.returncode, second.returncode), (1, 0))
+        self.assertIn("fixture first run in hooks/test_first.py", first.output)
+        self.assertEqual([job for job in run.jobs if job.suite == "hooks"], [second])
+        events = self.module_events()
+        self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
+        self.assertTrue(all(event["suite"] == "hooks" for event in events[-2:]))
+        self.assertEqual(sum(event["event"] == "start" for event in events), self.module_count + 1)
 
     def test_scope_skips_disabled_failed_probe_and_existing_builds_slice(self) -> None:
         for reason in ("disabled", "probe", "existing"):

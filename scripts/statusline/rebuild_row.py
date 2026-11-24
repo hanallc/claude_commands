@@ -10,10 +10,9 @@ import fcntl
 import json
 import os
 import re
-import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -66,19 +65,8 @@ class CommandRunner(Protocol):
     def __call__(self, command: list[str], *, timeout: int = 30) -> str: ...
 
 
-def command_output(command: list[str], *, timeout: int = 30) -> str:
-    """Return command output, or an empty string when the command fails."""
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    # Keep the field separator in Git log output.
-    return result.stdout.strip(" \t\r\n") if result.returncode == 0 else ""
-
-
-def system_path(value: str) -> bool:
-    """Accept a single absolute Nix store path."""
-    return value.startswith("/nix/store/") and len(value.split("/")) == 4 and not any(c.isspace() for c in value)
+command_output = need.command_output
+system_path = need.system_path
 
 
 @dataclass(frozen=True)
@@ -201,23 +189,23 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
 type OpenRebuildNeeds = tuple[need.MachineNeeds, ...]
 
 
-class _NoKnownRebuildNeeds:
-    """Let the Rebuilds page list the records that are available."""
+@dataclass(frozen=True)
+class RebuildNeedsNotRead:
+    """The open rebuild records have not been read."""
 
     def __iter__(self) -> Iterator[need.MachineNeeds]:
         return iter(())
 
 
 @dataclass(frozen=True)
-class RebuildNeedsNotRead(_NoKnownRebuildNeeds):
-    """The open rebuild records have not been read."""
-
-
-@dataclass(frozen=True)
-class RebuildNeedsUnavailable(_NoKnownRebuildNeeds):
-    """The open rebuild records could not be read."""
+class RebuildNeedsUnavailable:
+    """The read failed wholly or returned some valid records."""
 
     reason: str
+    summaries: OpenRebuildNeeds | None = None
+
+    def __iter__(self) -> Iterator[need.MachineNeeds]:
+        return iter(self.summaries or ())
 
 
 @dataclass(frozen=True)
@@ -247,13 +235,14 @@ class RebuildAnswer:
         return self.failure.commit if isinstance(self.failure, EvaluationFailure) else ""
 
 
-def config_values(path: Path) -> dict[str, str]:
+def config_values(path: Path) -> Mapping[str, str]:
     values: dict[str, str] = {}
-    for line in conf_reads.read_text(path).splitlines():
+    contents = conf_reads.read_text(path)
+    for line in contents.splitlines():
         key, sep, value = line.partition("#")[0].partition("=")
         if sep:
             values[key.strip()] = value.strip()
-    return values
+    return conf_reads.trace_values(path, contents, values)
 
 
 def cache_path(config: Path) -> Path:
@@ -282,7 +271,7 @@ class ComparedChanges:
     """The commits from the running system revision to the configured revision."""
 
     running_path: str
-    switch_revision: str
+    active_revision: str
     configured_revision: str
     commits: tuple[Change, ...]
 
@@ -291,9 +280,7 @@ type CachedChanges = ComparedChanges | tuple[Change, ...]
 
 
 BRIDGE = re.compile(r"https://claude\.ai/code/(session_[0-9A-Za-z]+)")
-LOG_PATH = re.compile(r"~?[\w./-]+")
-REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-SWITCH_FIELDS = 5
+REVISION = need.REVISION
 
 
 def changes_path(cache: Path) -> Path:
@@ -302,15 +289,6 @@ def changes_path(cache: Path) -> Path:
 
 def sessions_path(cache: Path) -> Path:
     return cache.with_name(cache.name + "-sessions.json")
-
-
-def switched_commit(log: str, running: str, *, require_match: bool = False) -> str:
-    """Return the revision for the running system. Allow the last switch as a fallback."""
-    switches = [fields for fields in (line.split() for line in log.splitlines())
-                if len(fields) == SWITCH_FIELDS and fields[1] == "switch"]
-    fallback = switches[-1] if switches and not require_match else None
-    last = next((fields for fields in reversed(switches) if fields[4] == running), fallback)
-    return last[3] if last is not None else ""
 
 
 def transcript_session(bridge: str, run: CommandRunner) -> str:
@@ -329,22 +307,15 @@ def transcript_session(bridge: str, run: CommandRunner) -> str:
     return sessions[0] if sessions else ""
 
 
-def machine_changes(settings: RebuildSettings, command: list[str], known: dict[str, str],
-                    run: CommandRunner, *, configured: str) -> CachedChanges | None:
-    """List commits after the switch. Record the revision pair when the comparison supplies it."""
-    lines = run(command).splitlines()
-    if not lines:
-        return None
-    running = lines[0]
-    log = "\n".join(lines[1:])
-    matching = switched_commit(log, running, require_match=True)
-    revision = matching or switched_commit(log, running)
-    commit = revision.removesuffix("-dirty")
-    if not REVISION.fullmatch(commit):
-        return None
-    listing = run(["git", "-C", str(settings.repo), "log",
-                   "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
-                   f"{commit}..{configured or settings.ref}"])
+def machine_changes(settings: RebuildSettings, system: need.ActiveSystem, known: dict[str, str],
+                    run: CommandRunner, *, configured: str) -> CachedChanges:
+    """List commits after a verified running revision."""
+    commit = system.revision.removesuffix("-dirty")
+    if not commit:
+        return ()
+    listing = "" if commit == configured else run(["git", "-C", str(settings.repo), "log",
+        "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
+        f"{commit}..{configured or settings.ref}"])
     changes: list[Change] = []
     for line in listing.splitlines():
         fields = line.split("\x1f")
@@ -354,9 +325,7 @@ def machine_changes(settings: RebuildSettings, command: list[str], known: dict[s
         if bridge is not None and bridge[1] not in known:
             known[bridge[1]] = transcript_session(bridge[1], run)
         changes.append(Change(fields[0], fields[1], fields[2], known[bridge[1]] if bridge is not None else ""))
-    if configured and matching and system_path(running):
-        return ComparedChanges(running, revision, configured, tuple(changes))
-    return tuple(changes)
+    return ComparedChanges(system.path, system.revision, configured, tuple(changes))
 
 
 def write_changes(config: Path, run: CommandRunner = command_output) -> None:
@@ -367,9 +336,6 @@ def write_changes(config: Path, run: CommandRunner = command_output) -> None:
         log = config_values(config)["rebuild.generations"]
     except (OSError, ValueError, KeyError):
         return
-    if not LOG_PATH.fullmatch(log):
-        return
-    script = f"realpath /run/current-system && tail -n 200 {log}"
     cache.parent.mkdir(parents=True, exist_ok=True)
     with changes_path(cache).with_suffix(".lock").open("a") as lock:
         try:
@@ -385,11 +351,17 @@ def write_changes(config: Path, run: CommandRunner = command_output) -> None:
         answer = _read_cache(config, time.time)
         configured = answer.configured_revision()
         machines: dict[str, object] = {}
-        for machine, command in (("natedev", ["sh", "-c", script]),
-                                 ("mac", ["ssh", "-o", "BatchMode=yes", settings.ssh, script])):
-            changes = machine_changes(settings, command, known, run, configured=configured)
-            if changes is None:
-                changes = previous.get(machine)
+        for machine in MACHINES:
+            system = need.active_system(run(need.active_probe(machine, log=log, ssh=settings.ssh)))
+            if system is None:
+                old = previous.get(machine)
+                changes = old.commits if isinstance(old, ComparedChanges) else old
+            else:
+                try:
+                    need.clear_running_needs(machine, system, settings.repo, run)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    print(f"rebuild needs: {error}", file=sys.stderr)
+                changes = machine_changes(settings, system, known, run, configured=configured)
             if isinstance(changes, ComparedChanges):
                 machines[machine] = asdict(changes)
             elif changes is not None:
@@ -418,14 +390,14 @@ def _read_changes(cache: Path) -> dict[str, CachedChanges]:
         for machine, changes in cast(dict[str, object], value).items():
             if isinstance(changes, dict):
                 fields = cast(dict[str, object], changes)
-                if "switch_revision" not in fields and "running_revision" in fields:
-                    # The old cache did not record whether the running system had local changes.
+                if "active_revision" not in fields:
+                    # Older caches did not verify the active generation.
                     result[machine] = _decode_commits(fields["commits"])
                     continue
-                path, running, configured = fields["running_path"], fields["switch_revision"], fields["configured_revision"]
+                path, running, configured = fields["running_path"], fields["active_revision"], fields["configured_revision"]
                 if (not isinstance(path, str) or not system_path(path)
                         or not isinstance(running, str) or not REVISION.fullmatch(running.removesuffix("-dirty"))
-                        or not isinstance(configured, str) or not REVISION.fullmatch(configured)):
+                        or not isinstance(configured, str) or (configured and not REVISION.fullmatch(configured))):
                     continue
                 result[machine] = ComparedChanges(path, running, configured, _decode_commits(fields["commits"]))
             else:
@@ -468,12 +440,13 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
                 pass
         except FileNotFoundError:
             pass
-        needs = tuple(need.read_needs())
+        errors: list[str] = []
+        needs = tuple(need.read_needs(errors))
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
     return replace(answer, machines=tuple(machine for machine in MACHINES if machine in machines),
-                   needs=needs)
+                   needs=RebuildNeedsUnavailable("\n".join(errors), needs) if errors else needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:

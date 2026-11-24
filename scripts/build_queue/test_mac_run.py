@@ -25,13 +25,14 @@ from scripts.build_queue.admission_records import RepositoryIdentity
 from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.buildlog import repository, store, sync as buildlog_sync
-from scripts.build_targets import build_targets, target_config
+from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
 from scripts.lib import conf, process_start as process_identity
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.mac_test import claim_state, eligibility, mac_queue_run, mac_test, offload
 from scripts.production.gate_routes import SuiteMode
+from scripts.worktree import worktrees
 
 
 ORIGIN = "https://github.com/hanallc/claude_commands.git"
@@ -2084,3 +2085,28 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                 with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
                     raise ValueError("guest failed")
         self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {refused.reason}"])
+
+    def test_mac_host_migration_holds_the_repository_claim_around_the_ssh_run(self) -> None:
+        with (self.root / "mac_test.conf").open("a") as settings:
+            _ = settings.write("host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\n"
+                               + "# range: 5e-324..\nleftover_timeout_s=2\n")
+        commands: list[tuple[str, ...]] = []
+
+        def fake_ssh(command: tuple[str, ...]) -> int:
+            claim, = claim_state.read_claims(self.paths)
+            self.assertEqual(claim.record["what"], "migrate --repo claude_commands")
+            self.assertEqual(claim.record["worktree"], str(self.checkout))
+            self.assertTrue(claim.record["claim_id"].startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+            commands.append(command)
+            return 255
+
+        with (mock.patch.object(worktrees, "main_checkout_for_word", return_value=self.checkout),
+              mock.patch.object(worktrees, "_run_ssh", fake_ssh)):
+            self.assertEqual(worktrees.migrate_on_mac("claude_commands", dry_run=False), 255)
+        remote = ("~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py"
+                  + " migrate --repo claude_commands")
+        self.assertEqual(commands, [("ssh", *mac_linux.SSH_OPTIONS, "-o", f"ConnectTimeout={mac_linux.SSH_CONNECT_TIMEOUT_SECONDS}",
+                                     *eligibility.server_alive_options(UNREACHABLE_WAIT_FIXTURE_SECONDS), "fixture-mac", remote)])
+        self.assertIn("ServerAliveInterval=15", commands[0])
+        self.assertIn("ServerAliveCountMax=3", commands[0])
+        self.assertEqual(claim_state.read_claims(self.paths), ())

@@ -25,7 +25,7 @@ from scripts.direct.verify_mac_offload_test_support import processes_carrying, r
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_pressure_reading
+from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.production import staff
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 
@@ -214,6 +214,7 @@ else:
 ''')
         self.executable(self.root / "bin/systemd-cat", "#!/bin/sh\nexec cat\n")
         self.environment.update({"LINT_SKIP_SWEEP": "0", "CLAUDE_PYTHON": str(wrapper)})
+        _ = write_config_fixture(self.config, "sweep=on\n")
         process, log, marker = self.start_doc(command=(
             "bash", "-c", 'exec 8>"$1" 74>&8; shift; exec bash "$@"',
             "doc-sweep", str(sweep_events), str(VERIFY), "doc",
@@ -356,7 +357,7 @@ else:
             self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
             self.assertEqual(build_folders.build_folder_state(slot.path), "held")
             self.assertEqual(list((self.root / "build").glob("*/*/*.lease.json")),
-                             [build_slots.lease_path(slot.path)])
+                             [build_folders.lease_path(slot.path)])
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")

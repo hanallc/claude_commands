@@ -4,6 +4,8 @@
 Rust workers run only exact prompt lines with this form:
 `bash ~/.claude/scripts/direct/verify.sh <command> [<package>] [flags]`.
 Omit the package for the whole workspace. Give at most one positional word after the command.
+To prove a phase with one call, use `bash ~/.claude/scripts/direct/verify.sh test,lint <package>` when the prompt lists it.
+Use `test`, `lint`, and `doc` at most once each in a comma list.
 
 | Intent | Command |
 | --- | --- |
@@ -36,8 +38,9 @@ prevents a saved pass. `--tree` requires `--saved`.
 
 Builds can run on any eligible target. A remote build prints `binary: <target>:<path>`.
 Use `--local "<why>"` for a Linux-only test or a binary that must run on natedev.
-Name the Linux requirement or the local launch. A reservation reason is refused. Use `/build:mac block <why>` for a Mac hold.
-Before CI, either machine can answer a test, including merge gates.
+Name the Linux requirement or the local launch. The command refuses a reservation reason.
+Use `/build:mac block <why>` for a Mac hold only on Nate's explicit request.
+Before CI, either machine can run tests, including gate jobs.
 
 Rules:
 

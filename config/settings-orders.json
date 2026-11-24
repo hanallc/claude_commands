@@ -38,6 +38,7 @@
   },
   "statusline": {
     "account.claude2": 15,
+    "account.claude6": 24,
     "role.worker": 12
   },
   "user_zone": {

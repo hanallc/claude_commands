@@ -30,6 +30,7 @@ from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
@@ -44,8 +45,7 @@ PROGRAM = Path(__file__).with_name("statusline.jq")
 CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Preserve the fixture PATH when NixOS starts a child shell.
-SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
+SHELL_ENVIRONMENT = fixture_zsh_environment()
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
@@ -612,7 +612,7 @@ class ForYouStatusTests(unittest.TestCase):
                       patch.object(os, "execvp") as render):
                     assignment.main()
                 read.assert_called_once_with()
-                needs.assert_called_once_with()
+                needs.assert_called_once_with([])
                 self.assertEqual(refresh.call_count, int(expire))
                 render.assert_called_once()
                 arguments = cast(list[str], render.call_args.args[1])
@@ -2308,17 +2308,24 @@ class RebuildRowTests(unittest.TestCase):
                                   + "rebuild.generations=~/.local/state/rebuild/generations.log\n", encoding="utf-8")
             switched = {"natedev": "a" * 40, "mac": "b" * 40}
             # The running natedev system is the earlier switch, so a later switch to another system is not the base.
-            logs = {"natedev": f"/nix/store/x\nt switch system-1-link {'a' * 40}-dirty /nix/store/x\n"
-                               + f"t switch system-2-link {'c' * 40} /nix/store/y",
-                    "mac": f"/nix/store/m\nt switch system-9-link {'b' * 40} /nix/store/m"}
+            def switch(path: str, generation: int, revision: str) -> str:
+                return (f"/nix/store/{path}\nactivated 2026-11-19T13:00:00Z 100\n"
+                        f"generation system-{generation}-link 2026-11-19T12:59:59Z 101\n--- generations ---\n"
+                        f"2026-11-19T13:00:01Z switch system-{generation}-link {revision} /nix/store/{path}")
+
+            logs = {"natedev": switch("x", 1, switched["natedev"] + "-dirty")
+                               + f"\n2026-11-19T13:00:02Z switch system-2-link {'c' * 40} /nix/store/x",
+                    "mac": switch("m", 9, switched["mac"])}
             commands: list[list[str]] = []
             mac_reachable = True
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
                 if command[0] == "sh":
-                    self.assertEqual(command[2], "realpath /run/current-system && tail -n 200 "
-                                     + "~/.local/state/rebuild/generations.log")
+                    self.assertIn("current=/run/current-system", command[2])
+                    self.assertIn('realpath "$current"', command[2])
+                    self.assertIn('cat "$running/configuration-revision"', command[2])
+                    self.assertIn('tail -n 200 "$HOME"/.local/state/rebuild/generations.log', command[2])
                     return logs["natedev"]
                 if command[0] == "ssh":
                     return logs["mac"] if mac_reachable else ""
@@ -2334,7 +2341,8 @@ class RebuildRowTests(unittest.TestCase):
                         + "https://claude.ai/code/session_01Abc\n"
                         + f"{'e' * 40}\x1f2026-11-15T01:09:21-05:00\x1fby hand\x1f")
 
-            with patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]):
+            with (patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]),
+                  patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(root / "needs")})):
                 rebuild_row.write_changes(config, run)
                 wrote = [rebuild_row.Change("d" * 40, "2026-11-15T08:45:08-05:00", "memory: THP defrag defer", "96b016bf"),
                          rebuild_row.Change("e" * 40, "2026-11-15T01:09:21-05:00", "by hand", "")]
@@ -2345,12 +2353,11 @@ class RebuildRowTests(unittest.TestCase):
                 commands.clear()
                 mac_reachable = False
                 switched["natedev"] = "c" * 40
-                logs["natedev"] = f"/nix/store/y\nt switch system-2-link {'c' * 40} /nix/store/y"
+                logs["natedev"] = switch("y", 2, switched["natedev"])
                 rebuild_row.write_changes(config, run)
                 # The session map is kept, and a Mac that does not answer keeps its last list.
                 self.assertFalse(any(command[0] == "rg" for command in commands))
                 self.assertEqual(rebuild_row.read_changes(config)["mac"], tuple(wrote))
-                self.assertEqual(rebuild_row.switched_commit("", "/nix/store/x"), "")
 
     def test_read_command_prints_both_one_or_no_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2556,7 +2563,13 @@ class RebuildRowTests(unittest.TestCase):
                     with self.assertRaises(RecursionError):
                         _ = ActionStore(actions).list()
                 elif source == "needs":
-                    (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
+                    folder = home / ".local/state/rebuild/needs"
+                    (folder / "unreadable.json").mkdir(parents=True)
+                    with patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(folder)}):
+                        need.add_need("mac", "a" * 40, "Apply settings.", "fixture")
+                    _ = ActionStore(actions).add(title="Check the build", command="check", machine="mac",
+                                                 cwd="/fixture", requested_by="fixture", reason="Read the result.",
+                                                 waits="Build", concerns="fixture", dedupe_key="check")
                 for shell in SHELLS:
                     with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
@@ -2564,8 +2577,10 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: rebuild natedev" if source == "ready" else "For you: rebuild natedev, Unavailable"
-                        self.assertEqual(result.stdout.splitlines()[-1], expected)
+                        expected = {"ready": "For you: rebuild natedev",
+                                    "actions": "For you: rebuild natedev, Unavailable",
+                                    "needs": "For you: rebuild natedev, rebuild mac, 1+ actions"}
+                        self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], expected[source])
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)
 

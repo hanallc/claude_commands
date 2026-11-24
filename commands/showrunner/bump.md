@@ -13,7 +13,7 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
+1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py <position|session|folder>` for a waiting step of the bumped unit. The queue applies the bump on its next pass. Clear it in step 5. Make the work the production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come.
 2. **Checkpoint now.** Tell the owning unit director: "Bump: checkpoint and
@@ -47,4 +47,4 @@ it changes, and say so in one line.
 - A bump never skips the Change-Review line, the overlap check with other
   units, or the design check of <MergeCheckpoint/>. It skips only the full
   suite before the merge.
-- A second urgent request replaces the live queue priority at once.
+- A second bump adds a unit to the priority list. Use `clear <unit>` to remove the earlier unit.
