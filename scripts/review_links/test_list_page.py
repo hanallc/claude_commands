@@ -4927,7 +4927,7 @@ observer.observe(original.parentElement,{childList:true});
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")

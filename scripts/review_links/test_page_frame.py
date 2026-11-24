@@ -19,6 +19,7 @@ from unittest.mock import patch
 from typing import cast, override
 
 from scripts.review_links import console, page_frame, review_submissions, serve
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.lib import conf
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -158,8 +159,6 @@ class PageStatusTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
     def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
-
         page = long_open_row_page()
         reference = json.dumps(main_heading(page).decode()).replace('<', r'\u003c').encode()
         probe = b'''<script>
@@ -271,8 +270,6 @@ class PageStatusTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner under a sticky status.")
     def test_late_or_failed_status_never_covers_the_owner(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
-
         probe = b'''<script>
 (async()=>{
  const failures=[];
@@ -367,7 +364,6 @@ class PageStatusTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
     def test_aws_region_filter_sticks_below_the_heading_row(self) -> None:
         from scripts.review_links import console_theme
-        from scripts.review_links.test_accounts_page import firefox_probe_results
 
         source = console_theme.with_theme((SCRIPTS / "aws_target" / "aws_prices.html").read_text(encoding="utf-8"))
         page = (page_frame.template(source, "AWS", "aws").replace("__AWS_QUOTA_HELP__", "", 1)
@@ -407,7 +403,6 @@ class PageStatusTests(unittest.TestCase):
     def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
         from scripts.build_queue import memory_feed
         from scripts.review_links import console_theme
-        from scripts.review_links.test_accounts_page import firefox_probe_results
 
         source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
         page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")

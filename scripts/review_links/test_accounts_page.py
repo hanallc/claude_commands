@@ -5,7 +5,6 @@ from scripts.lint.memory_test_support import copy_config_fixture, write_config_f
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import json
 import os
@@ -14,13 +13,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.review_links.browser_test_support import firefox_probe_results as firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
@@ -193,51 +192,6 @@ MENU_PROBE = '''<script>
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-
-
-def firefox_probe_results(page: bytes) -> list[list[str]]:
-    """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
-    results: list[list[str]] = []
-    complete = threading.Event()
-
-    class BrowserProbe(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            if self.path == "/complete":
-                _ = complete.wait(TEST_HANG_GUARD_SECS)
-            elif self.path == "/":
-                _ = self.wfile.write(b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
-            else:
-                _ = self.wfile.write(page)
-
-        def do_POST(self) -> None:
-            payload = self.rfile.read(int(self.headers["Content-Length"]))
-            results.append(cast(list[str], json.loads(payload)))
-            complete.set()
-            self.send_response(204)
-            self.end_headers()
-
-        @override
-        def log_message(self, format: str, *args: object) -> None:
-            pass
-
-    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-        thread.start()
-        try:
-            profile = Path(temporary) / "profile"
-            profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                  "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
-            if run.returncode:
-                raise AssertionError(run.stderr)
-        finally:
-            server.shutdown()
-            thread.join(TEST_HANG_GUARD_SECS)
-    return results
 
 
 NEWER_SCRIPT_PROBE = r"""<script>
@@ -632,16 +586,19 @@ window.fetch=(url,options)=>options?.method==='POST'
   check(panel.hidden,'an outside click closes the panel');
   // A refresh that starts while the panel is open must not bring the alert back after the clear.
   const old='<!doctype html>'+document.documentElement.outerHTML;
-  button.click();holdRefresh=true;document.dispatchEvent(new Event('visibilitychange'));await paint();
+  button.click();holdRefresh=true;document.dispatchEvent(new Event('visibilitychange'));
+  // The fetch stub runs during dispatch. Click Clear before Firefox can resize the frame and close the panel.
   check(heldRefresh,'a refresh is in flight while the panel is open');
-  clear.click();await paint();
+  clear.click();
+  check(clearForm?.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
+   'Clear posts the account and level');
+  await paint();
   heldRefresh?.({ok:true,text:async()=>old});
   for(let wait=0;wait<5;wait++) await paint();
   check(panel.hidden && !button.isConnected,'Clear closes the panel and removes the button');
   check(!document.querySelector('[data-quota-account=claude1]'),'a refresh from before the clear does not bring the alert back');
-  check(clearForm.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
-   'Clear posts the account and level');
-  check(percent.textContent==='4%' && getComputedStyle(percent).color===color,'the percentage keeps its color');
+  check(percent.isConnected && percent.textContent==='4%' && getComputedStyle(percent).color===color,
+   'the percentage keeps its color');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
