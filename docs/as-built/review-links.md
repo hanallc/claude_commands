@@ -1482,7 +1482,9 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry.
-Mark read on an unparked Waiting for nate item with no open question also sets the state to Working.
+Mark read on an unparked Waiting for nate item with no open question and no open ask also sets the state to Working.
+An open ask whose target has no staff row does not count here, because the page shows no box for it.
+A Go that leaves no ask with a box moves the item to Working by the same rule; see [Asks for nate's Go](#asks-for-nates-go).
 The same write logs the state change and saves a notice for the item's producer.
 The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
 For an item in a legacy keeper folder, the command also has `--keeper <keeper>`. For morty's folder, it has no `--keeper`.
@@ -1659,6 +1661,7 @@ After Mark read, an open question returns the item to Producer answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells its recipient which action nate completed.
+A Go next-step notice names the item's producer as its recipient.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell saves the user's words in the log and sends them to the item's producer.
@@ -1751,6 +1754,93 @@ The counts strip uses the status line readers for questions, changes, and rebuil
 Each count links to its existing page.
 The strip omits proposals and efficiencies.
 Closed items show no check text in the page or CLI.
+
+#### Asks for nate's Go
+
+An ask names one change that waits for nate's go or approval (List item 232).
+A producer opens it with `the_list.py ask` ([The List: `the_list.py`](showrunner-automation.md#the-list-the_listpy)).
+An open ask whose target has a staff row puts the item in Needs me, also during an active park.
+An open ask whose target has no staff row shows no box and does not hold the item.
+`the_list.answerable_asks` is the one rule for both: the page boxes, Needs me, Mark read and the Go use it.
+Mark read on an item with an open ask that shows a box clears the dot, keeps the state and sends no message.
+The open row shows one box for each open ask, above the item fields.
+The box has a warning border and a heading: “Needs your go” or “Needs your approval”.
+It shows What, Who needs it (the target's staff name and role) and Why.
+The role comes from the staff row, such as “a unit director of sdlc”, “the merge director of sdlc” or “the List producer”.
+The button is Go for a go ask and Approved for an approval ask. A config ask has the same button.
+Small muted text next to the button names the target: “Pressing Go sends your go to <agent>.”
+For an approval ask, it says “Pressing Approved sends your approval to <agent>.”
+The button has `aria-describedby` on that text. The keyboard and a screen reader use it like the other row buttons.
+A click sends a signed POST to `/console/list-go` with the item, the ask id and the page address.
+The server refuses a click from natedev with 403 and writes nothing.
+natedev's addresses are each loopback address and each address that natedev owns.
+A bind of a test socket to the client address shows that natedev owns it.
+The server also refuses each extra address in `go_refused_addresses`, and a client address that does not parse.
+A bind error other than EADDRNOTAVAIL counts as owned, so the server refuses the click.
+The row shows a refusal in its normal status place, as for the other row actions.
+An accepted click does these steps in this order:
+
+1. The server writes one ledger record in `go-ledger/<go id>.json` under its state folder.
+   The record has the go id (random), the ask, the item, the target, What, the time, the client address, the page address and `used: false`.
+   It also has `sent` and `reported` for each recipient, all false at first.
+   `sent` is true when the message reached the recipient. `reported` is true when nate saw that it did not.
+   The file lock `go-ledger/.lock` orders each ledger change across processes and threads.
+   The server holds it from this record to the end of the List save in step 2.
+2. The List closes the ask with the go id and logs “**Go** — nate: <what> → <agent>” (or **Approved**).
+   When no ask that shows a box stays open, the item leaves Needs me.
+   When the Go leaves no ask that shows a box on an unparked Waiting for nate item with no open question, the item becomes Working.
+   The same write logs the state change and saves a next-step notice for the item's producer, as Mark read does.
+   When the Go makes the item read, it also logs “Marked read” after the state change, as Mark read does.
+   A later unread walk stops there, so a later Go on the same item can make it read again.
+   The notice has the request id `<go id>-next-step`, so its delivery key differs from the key of the Go message.
+   An item in another state keeps its state.
+   The item becomes read only when it has no other unread change, such as an unread answer, an unread delivery or a newer update.
+   When the save cannot confirm folder durability, the List reads the item again.
+   If the ask holds this go id, the server keeps the record and continues.
+   When that read fails, the Go is on disk. The page shows “The Go is saved. It is sent at the next server start.”
+   If the save fails, the server reads the item again.
+   If an ask holds this go id, the server keeps the record, and the page shows “The Go is saved. It is sent at the next server start.”
+   If no ask holds this go id, the server removes the ledger record, and the page shows “The Go could not be saved. Try again.”
+   When that read also fails, the record stays and the page shows “The Go could not be saved. Try again.”
+   At each server start, the server reads the item of each kept record. It removes the record when no ask holds its go id, and keeps it when the read fails.
+3. The server answers the page. The page removes the box and applies the saved state, so a Working row leaves Needs me in place.
+4. The server sends the target and morty one message through the List Tell sender.
+   The message names What and carries only the go id and the check command.
+   When the Go set Working, the producer gets one message.
+   A producer that is a Go recipient gets the Go message with the next-step line at its end. The notice becomes sent with it.
+   Another producer gets the next-step notice alone, through the List Tell sender.
+   The server sets `sent` to true for each recipient that the message reached.
+   A failed send alerts the item's showrunners with the title “List Go needs attention”.
+   It also adds the log line “Go not delivered to <agent>”, so nate sees it.
+   The alert and the log line occur once for each recipient of a Go.
+
+At server start, the server sends each Go that has an unsent recipient again, through the same path.
+It sends only to the recipients that the message did not reach.
+It removes each record whose item shows no ask with its go id. When the item read fails, the record stays.
+It does this before the List Tell recovery, so a resend to the producer carries its next-step line in the same message.
+The List Tell recovery does not send a next-step notice whose Go record has its recipient unsent.
+Only the Go path sends that notice, with the Go, also when nate presses Go during the start recovery.
+When the producer is not a Go recipient, the List Tell recovery sends the notice alone.
+
+`go_check.py <go id>` asks the server with the caller's staff id from `staff.py`.
+The server answers `go ok` only when all of these are true:
+
+1. The record exists.
+2. The List item has a closed ask with this go id, the same target and the same What.
+3. The target is the caller.
+4. The record is not used.
+
+Then it marks the record used, under the ledger file lock, so a Go has one use at most.
+When that write cannot confirm folder durability, the mark is on disk, and the server answers `go ok`.
+A second use, another caller and an unknown id get one refusal line and exit 1.
+
+Risks:
+
+- The `caller` value is what the session says. A session that has a forwarded go id can name the target as the caller.
+  morty and the List record both hold the go id. This is in the class of a session that breaks the rules on purpose.
+- An agent on the Mac that breaks the rules can still post a Go. The refusal stops only a click from natedev.
+- The item log shows nate every Go.
+Item 225 (Undo) does not exist, so a Go has no Undo.
 
 ### Images page
 
@@ -2328,6 +2418,11 @@ The server returns 403 when the host or origin check fails.
 - `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.
 - The server renders a published `changes.html` with a private manifest from the review record. A published console page, such as `memory_live.html`, gets HTTP 200 with no validator. For other regular files, it sends `ETag` and `Last-Modified` with HTTP 200 or 304. A matching `If-None-Match` gives HTTP 304. HTTP 200 also includes `Content-Type`, `Content-Length` and `X-Content-Type-Options: nosniff`.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
+- `POST /console/list-go` takes a List Go. It passes the same host and origin check as the other POST requests.
+  It refuses with 403 a loopback client address, an address that natedev owns and each extra address in `go_refused_addresses`.
+  It writes the ledger record in `<state folder>/go-ledger/` before it closes the ask; see [Asks for nate's Go](#asks-for-nates-go).
+- `GET /console/go-check?id=<go id>&caller=<staff id>` answers `go_check.py` with JSON `ok` and `text`.
+  It gives 200 and marks the record used for the first check by the target, and 403 for each refusal.
 - Each request writes the standard access line to stderr.
 
 ### Sweep
@@ -2458,6 +2553,9 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_sweep_seconds` and `tailscale_check_seconds` control the server checks.
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
+`go_refused_addresses` lists extra client addresses whose List Go the server refuses, separated by spaces.
+The server always refuses loopback addresses and addresses that natedev owns.
+The list holds natedev's Tailscale IPv4 and IPv6 addresses. The server reads it at each click.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
 The `later_*` keys set the Review page Later presets; each render reads them.

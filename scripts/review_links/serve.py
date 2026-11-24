@@ -45,7 +45,7 @@ from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
+from scripts.review_links import console_tune, go_ledger, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
@@ -994,6 +994,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_token(route.query)
             return None
+        if route.path == go_ledger.GO_CHECK_PATH:
+            self.go_check(route.query)
+            return None
         if route.path == console_tune.PAGE_PATH:
             self.tune_token(route.query)
             return None
@@ -1338,6 +1341,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if route.path == list_page.PAGE_PATH:
             self._write_post(self.list_post)
+            return
+        if route.path == go_ledger.GO_PATH:
+            self._write_post(self.go_post)
             return
         if route.path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
@@ -2225,6 +2231,57 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 except OSError as error:
                     print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def go_post(self) -> None:
+        """Refuse a Go from natedev; else write the ledger record, close the ask and send the Go."""
+        server = cast(ReviewLinksServer, self.server)
+        client = self.client_address[0]
+        try:
+            refused = go_ledger.refused_address(client)
+        except (OSError, ValueError) as error:
+            self.browser_failure(503, "The Go settings are not available.", error)
+            return
+        if refused:
+            self.json_response(403, {"reason": "Press Go from your own device. A Go from natedev is refused."})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 100000:
+                raise ValueError("invalid List Go size")
+            body = self.rfile.read(length).decode("utf-8")
+            with server.list_store_access():
+                go_id, current = list_page.save_go(server.root, server.store_folder, body, client,
+                                                   review_records=server.list_review_records())
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except list_page.GoSavedUnsent as error:
+            self.browser_failure(503, "The Go is saved. It is sent at the next server start.", error)
+            return
+        except OSError as error:
+            self.browser_failure(503, "The Go could not be saved. Try again.", error)
+            return
+        try:
+            self.json_response(200, {"state": "sent", **({"detail_unavailable": True} if current is None else current)})
+        finally:
+            try:
+                list_page.deliver_go(server.store_folder, go_id)
+            except (OSError, ValueError) as error:
+                print(f"review-links List Go delivery: {error}", file=sys.stderr)
+
+    def go_check(self, query: str) -> None:
+        """Answer go_check.py: accept one use of a Go by its target session."""
+        server = cast(ReviewLinksServer, self.server)
+        fields = parse_qs(query, keep_blank_values=True)
+        if set(fields) != {"id", "caller"} or any(len(values) != 1 for values in fields.values()):
+            self.json_response(400, {"ok": False, "text": "give one go id and one caller."})
+            return
+        try:
+            answer = go_ledger.check(server.store_folder, fields["id"][0], fields["caller"][0])
+        except (OSError, ValueError) as error:
+            self.browser_failure(503, "The go ledger is not available.", error)
+            return
+        self.json_response(200 if answer["ok"] else 403, answer)
+
     def investigation_post(self) -> None:
         """Save Mark read and return an error for the card when the save fails."""
         root = cast(ReviewLinksServer, self.server).root
@@ -2422,6 +2479,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
+        recover_goes = list_page.recover_goes
         self.delivery_status.startup_recovery_pending.set()
 
         def recover_pending() -> None:
@@ -2433,7 +2491,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     print(f"review-links delivery recovery: {error}", file=sys.stderr)
                 finally:
                     self.delivery_status.startup_recovery_pending.clear()
-                recover_list()
+                # A Go goes first: its resend carries the producer's next-step notice in the same message.
+                try:
+                    recover_goes(self.store_folder)
+                finally:
+                    recover_list(self.store_folder)
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
         try:

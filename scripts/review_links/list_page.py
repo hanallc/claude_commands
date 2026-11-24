@@ -23,8 +23,8 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import question_path, change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import review_items, review_page
+from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, record_table
+from scripts.review_links import question_path, review_items, review_link, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -81,9 +81,9 @@ CHIP_BY_QUEUE = {
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
-              unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
+              unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False) -> ListChip:
     """Find the one status chip for this item."""
-    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer, later=parked,
+    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer or open_ask, later=parked,
                                 unread_delivery=unread_delivery, waiting_for_answer=open_question)
     return CHIP_BY_QUEUE[queue]
 
@@ -279,6 +279,17 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
         body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, (the_list.AskOpened, the_list.GoGiven)):
+        ask = content.ask
+        target = names.html(ask.target, owner_name(names.members, ask.target))
+        if isinstance(content, the_list.AskOpened):
+            body = "Asked nate for " + ("a go" if ask.kind is the_list.AskKind.GO else "approval") + by + ": "
+        else:
+            body = f"<strong>{ASK_BUTTONS[ask.kind]}</strong>" + by + ": "
+        body += html.escape(ask.what) + " → " + target
+    elif isinstance(content, the_list.GoNotDelivered):
+        recipient = names.html(content.recipient, owner_name(names.members, content.recipient))
+        body = "Go not delivered to " + recipient + by + ": " + html.escape(content.ask.what)
     elif isinstance(content, str):
         body = html.escape(content) + by
     else:
@@ -499,8 +510,50 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
     return ''.join(sections)
 
 
+ASK_HEADINGS = {the_list.AskKind.GO: "Needs your go", the_list.AskKind.APPROVAL: "Needs your approval"}
+ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
+ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
+             the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
+STAFF_ROLES = {"showrunner": "a showrunner", "unit": "a unit director", "worker": "a worker", "producer": "a producer"}
+UNIT_ROLES = {"direct": "a unit director", "merge": "the merge director", "style": "the style director"}
+
+
+def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> str:
+    """Name the role as the Go box shows it, such as "the merge director of sdlc" or "the List producer"."""
+    if member.kind == "producer" and member.name == "morty":
+        return "the List producer"
+    role = UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails) else STAFF_ROLES[member.kind]
+    parent = names.members.by_id(member.parent.id) if isinstance(member.parent, staff.ReportsTo) else None
+    return role + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
+
+
+def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> str:
+    """Show one box with a Go or Approved button for each open ask."""
+    boxes: list[str] = []
+    row_id = entry.key.replace("/", "-")
+    for ask in the_list.answerable_asks(entry.item, names.members):
+        member = names.members.by_id(ask.target)
+        assert member is not None
+        box_id = html.escape(f"ask-{row_id}-{ask.ask_id}", quote=True)
+        token = signed_token(secret, entry.keeper, entry.item.id, go_ledger.token_prefix(ask.ask_id))
+        hidden = ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+                         for name, value in (("keeper", entry.keeper), ("id", entry.item.id),
+                                             ("ask", ask.ask_id), ("token", token)))
+        boxes.append(
+            f'<section class="list-ask" data-ask="{ask.ask_id}" aria-labelledby="{box_id}">'
+            + f'<h3 id="{box_id}">{ASK_HEADINGS[ask.kind]}</h3>'
+            + f'<dl><dt>What</dt><dd>{html.escape(ask.what)}</dd>'
+            + f'<dt>Who needs it</dt><dd>{names.html(member.id, member.name)}, {staff_role_html(member, names)}</dd>'
+            + f'<dt>Why</dt><dd>{html.escape(ask.why)}</dd></dl>'
+            + f'<form method="post" action="{go_ledger.GO_PATH}" data-go-form>' + hidden
+            + f'<button type="submit" aria-describedby="{box_id}-note">{ASK_BUTTONS[ask.kind]}</button>'
+            + f'<small id="{box_id}-note">{html.escape(ASK_NOTES[ask.kind].format(agent=member.name))}</small>'
+            + '</form></section>')
+    return '<div class="list-asks">' + ''.join(boxes) + '</div>' if boxes else ''
+
+
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str]) -> str:
+                 unread_answers: frozenset[str], asks: str = "") -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
@@ -512,7 +565,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         + field_html(field, value, today, names) + '</section>'
         for field, value in (("state", item.state), ("eta", item.eta), ("latest_status", item.latest_status),
                              ("next_step", item.next_step), ("done_when", item.done_when)))
-    return ('<div class="list-panel"><div><div class="list-item-fields">' + fields
+    return ('<div class="list-panel"><div>' + asks + '<div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log) + '</div>')
 
@@ -595,7 +648,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
-    return detail_panel(entry, sections, today, names, unread_answers)
+    return detail_panel(entry, sections, today, names, unread_answers, ask_boxes(entry, secret, names))
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
@@ -613,7 +666,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     questions = panel_questions(item, today, unread_answers, visibility.failed)
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers)
+        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names))
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
@@ -635,6 +688,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "unread-answer": str(bool(unread_answers)).lower(),
+                  "open-ask": str(bool(the_list.answerable_asks(item, names.members))).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
@@ -748,6 +802,7 @@ class SavedActionState(TypedDict):
     check_html: str
     waiting_for_answer: str
     open_question: str
+    open_ask: str
     unread_delivery: NotRequired[str]
     unread_answer: NotRequired[str]
     waiting_details_html: NotRequired[str]
@@ -784,6 +839,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     open_question = item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
+    open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -791,6 +847,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                "check_html": check_row_html(item.next_check, local_today, parked=parked),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
+                               "open_ask": str(open_ask).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower(),
                                "unread_answer": str(bool(unread_answers)).lower()}
     if park_request:
@@ -962,11 +1019,165 @@ def deliver(submission: ListActionSubmission) -> None:
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
 
 
-def recover_pending() -> None:
-    """Retry each pending request once at server start."""
+def _signed_go(root: Path, body: str) -> tuple[staff.StaffId, str, str, str]:
+    fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
+    if set(fields) != {"keeper", "id", "ask", "token", "page"} or any(len(values) != 1 for values in fields.values()):
+        raise question_record.AnswerRefused("use the Go button on this page")
+    keeper = staff.StaffId(fields["keeper"][0])
+    identity, ask_id = fields["id"][0], fields["ask"][0]
+    if re.fullmatch(r"L[1-9]\d*", identity) is None or the_list.ASK_ID.fullmatch(ask_id) is None:
+        raise question_record.AnswerRefused("the Go does not match this page")
+    prefix = go_ledger.token_prefix(ask_id)
+    token = fields["token"][0].encode()
+    if not any(secrets.compare_digest(token, signed_token(secret, keeper, identity, prefix).encode())
+               for secret in (form_secret(root), bootstrap_form_secret(root))):
+        raise question_record.AnswerRefused("the List token does not match this page")
+    return keeper, identity, ask_id, fields["page"][0]
+
+
+class GoSavedUnsent(OSError):
+    """The List holds the Go, but the server did not send it; the next server start sends it."""
+
+
+def _remove_unheld_go(ledger: Path, keeper: staff.StaffId, identity: str, go_id: str) -> bool | None:
+    """Remove the ledger record only when a read of the item shows that no ask holds this go id.
+
+    Return True when the record is removed and False when an ask holds the go id.
+    Return None when the read fails: the record stays, and `check` and `deliver_go` need a closed ask with this go id.
+    The caller holds the ledger lock, so no Go click is between its record and its List save.
+    """
+    try:
+        item = the_list.load(keeper, identity)
+    except (OSError, ValueError) as error:
+        print(f"review-links List Go {identity}: the ledger record stays; the read failed: {error}", file=sys.stderr)
+        return None
+    if any(ask.go_id == go_id for ask in item.asks):
+        return False
+    go_ledger.remove(ledger, go_id)
+    return True
+
+
+def save_go(root: Path, ledger: Path, body: str, client: str, *,
+            review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
+            ) -> tuple[str, SavedActionState | None]:
+    """Write the ledger record, then close the ask with its go id."""
+    keeper, identity, ask_id, page = _signed_go(root, body)
+    members = staff.snapshot()
+    item = the_list.load(keeper, identity)
+    ask = next((ask for ask in the_list.answerable_asks(item, members) if ask.ask_id == ask_id), None)
+    target = members.by_id(ask.target) if ask is not None else None
+    if ask is None or target is None:
+        raise question_record.AnswerRefused("This ask is no longer open.")
+    recipients = tuple(dict.fromkeys((target.id, the_list.producer_id(members, "morty"))))
+    with go_ledger.locked(ledger):
+        entry = go_ledger.record(ledger, ask=ask, item=f"{keeper}/{identity}", recipients=recipients, client=client,
+                                 page=page, moment=the_list.now())
+        try:
+            edit = the_list.give_go(keeper, identity, ask_id, entry["go_id"], source="nate")
+        except the_list.SavedReadFailed as error:
+            raise GoSavedUnsent(str(error)) from error
+        except BaseException as error:
+            if _remove_unheld_go(ledger, keeper, identity, entry["go_id"]) is False:
+                raise GoSavedUnsent(str(error)) from error
+            raise
+    try:
+        state = action_state(keeper, edit.item, review_records=review_records, include_detail=True)
+    except Exception as error:
+        print(f"review-links List Go {identity}: {error}", file=sys.stderr)
+        return entry["go_id"], None
+    return entry["go_id"], state
+
+
+def deliver_go(ledger: Path, go_id: str) -> None:
+    """Send the Go to each unsent recipient through the List Tell sender and keep the result in the ledger.
+
+    When the Go moved the item to Working, the producer gets one message with the next step.
+    A producer that is a Go recipient gets the Go and the next step together; another producer gets the next step alone.
+    A failed send alerts the item's showrunners and adds a "Go not delivered" log line for nate, once per recipient.
+    """
+    entry = go_ledger.read(ledger, go_id)
+    found = go_ledger.closed_ask(entry)
+    pending = tuple(staff.StaffId(recipient) for recipient, sent in entry["sent"].items() if not sent)
+    if found is None or not pending:
+        return
+    keeper, item, ask = found
+    members = staff.snapshot()
+    target = members.by_id(ask.target)
+    settings = conf.read("review_links")
+    tries = settings.whole("delivery_tries")
+    pause = settings.number("delivery_pause_seconds")
+    message = go_ledger.message(item, ask, go_id, target.name if target is not None else ask.target)
+    source = the_list.folder(keeper) / f"{item.id}.md"
+    key = change_page.review_delivery_key(source, item.id, go_id)
+    next_step = the_list.go_next_step_request(go_id)
+    notice = the_list.feedback_requests(item).get(next_step)
+    producer = notice.recipient_id(keeper) if notice is not None and notice.state == "pending" else None
+    plain = tuple(recipient for recipient in pending if recipient != producer)
+    failures = change_page.send_with_retries(change_page.SENDER, plain, message, tries, pause, key=key)
+    failed = {failure.recipient for failure in failures}
+    sent = [recipient for recipient in plain if recipient not in failed]
+    if producer is not None and producer in pending:
+        def send(_: the_list.ListItem, saved: the_list.PageFeedback) -> the_list.PageFeedback:
+            missed = change_page.send_with_retries(change_page.SENDER, (producer,), message + "\n" + saved.words,
+                                                   tries, pause, key=key)
+            failures.extend(missed)
+            if missed:
+                return saved
+            sent.append(producer)
+            return replace(saved, state="sent")
+        the_list.deliver_feedback(keeper, item.id, next_step, send)
+    go_ledger.mark(ledger, go_id, "sent", sent)
+    if producer is not None and producer not in entry["sent"]:
+        deliver(ListFeedbackDelivery(keeper, item.id, next_step))
+    # Report each failed recipient to nate once per Go; a resend at a later start reports nothing new.
+    new = [failure for failure in failures if not entry["reported"].get(str(failure.recipient), False)]
+    if not new:
+        return
+    owners = tuple(owner.id for owner in alert_showrunners(item, members) if owner.id not in pending)
+    _ = change_page.alert_delivery_failures(new, tries, source=source, row=item.id, message=message,
+                                            recipients=owners, attempt=go_id, title="List Go needs attention")
+    reported = tuple(staff.StaffId(failure.recipient) for failure in new if isinstance(failure.recipient, str))
+    for recipient in reported:
+        _ = the_list.log_go_not_delivered(keeper, item.id, go_id, recipient)
+    go_ledger.mark(ledger, go_id, "reported", reported)
+
+
+def recover_goes(ledger: Path) -> None:
+    """Send each unsent Go again once at server start, through the same path as a click.
+
+    Remove each record whose item a read shows with no ask that holds its go id.
+    """
+    for go_id in go_ledger.unsent(ledger):
+        try:
+            with go_ledger.locked(ledger):
+                keeper, _, identity = go_ledger.read(ledger, go_id)["item"].partition("/")
+                if _remove_unheld_go(ledger, staff.StaffId(keeper), identity, go_id):
+                    continue
+            deliver_go(ledger, go_id)
+        except (OSError, ValueError) as error:
+            print(f"List Go recovery {go_id}: {error}", file=sys.stderr)
+
+
+def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.PageFeedback) -> bool:
+    """Find a Go's next-step notice that only the Go path sends: the Go record has its recipient unsent.
+
+    The Go path sends that recipient the Go and the next step in one message.
+    """
+    go_id = the_list.next_step_go_id(feedback.request)
+    if go_id is None:
+        return False
+    try:
+        entry = go_ledger.read(ledger, go_id)
+    except (OSError, ValueError):
+        return False
+    return entry["sent"].get(feedback.recipient_id(keeper)) is False
+
+
+def recover_pending(ledger: Path) -> None:
+    """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
-            if feedback.state == "pending":
+            if feedback.state == "pending" and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
                     deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
                 except (OSError, ValueError) as error:
@@ -1079,7 +1290,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         unread_answers = the_list.unread_answer_ids(entry.item)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
                               unread_delivery=the_list.unread_delivery(entry.item),
-                              unread_answer=bool(unread_answers))] += 1
+                              unread_answer=bool(unread_answers),
+                              open_ask=bool(the_list.answerable_asks(entry.item, members)))] += 1
         row_reviews = reviews
         if entry.item.reviews and (
             reviews is LinkedReviewRead.AFTER_RENDER
@@ -1207,6 +1419,15 @@ background:var(--ink-2);border-radius:50%}
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
 }
 .list-tell>[data-send-status]:empty{display:none}
+.list-ask{border:1px solid var(--warning);border-radius:8px;padding:12px 14px;margin:0 0 12px}
+.list-ask h3{color:var(--warning);margin:0 0 8px}
+.list-ask dl{display:grid;grid-template-columns:7.5rem minmax(0,1fr);gap:4px 12px;margin:0 0 10px}
+.list-ask dt{color:var(--ink-3)}.list-ask dd{margin:0;overflow-wrap:anywhere}
+.list-ask form{display:flex;align-items:center;flex-wrap:wrap;gap:6px 12px}
+.list-ask button{min-height:32px;padding:6px 18px;border:0;border-radius:6px;background:var(--warning);color:#1b1b1b;
+font-weight:600;cursor:pointer}
+.list-ask button:disabled{opacity:.45;cursor:default}
+.list-ask small{color:var(--ink-3)}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
@@ -1264,7 +1485,7 @@ const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
  const parked=isParked(data);
- return chipsByQueue[questionQueue(queuesByState[data.state],data.unread==='true' && data.unreadAnswer==='true',
+ return chipsByQueue[questionQueue(queuesByState[data.state],data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
@@ -1519,6 +1740,7 @@ function bindFeedbackForm(form){
     }else note?.remove();
    }
    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
+   if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
    const questionNote=item.querySelector('[data-open-question-note]');
    if(item.dataset.openQuestion==='true'){
     if(!questionNote){
@@ -1584,6 +1806,7 @@ function bindFeedbackForm(form){
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
+  form.applySavedState=applySavedState;
   retain();
   const edit=()=>{draftStamp++;retain();};
   words.addEventListener('input',edit);until.addEventListener('input',edit);
@@ -1829,6 +2052,46 @@ function bindFeedbackForm(form){
    }
   });
 }
+// A Go form sends nate's Go or Approved for one ask; the server closes the ask.
+document.addEventListener('submit',async event=>{
+ const form=event.target instanceof Element ? event.target.closest('form[data-go-form]') : null;
+ if(!form || !content.contains(form)) return;
+ event.preventDefault();
+ const item=recordFromDetail(form),box=form.closest('[data-ask]'),button=form.querySelector('button');
+ if(button.disabled) return;
+ const key=item.dataset.key,hadFocus=box.contains(document.activeElement);
+ const data=new URLSearchParams(new FormData(form));data.set('page',location.href);
+ button.disabled=true;
+ startListSave();
+ const submission=tableView.startAction(item);
+ let saved=false;
+ try{
+  const response=await fetch(form.action,{method:'POST',body:data});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  saved=true;
+  tableView.preserveRecordRowTop(()=>{
+   const asks=box.parentElement;
+   box.remove();
+   if(!asks.children.length) asks.remove();
+   // The row's feedback form applies the saved state, so a Go that sets Working moves the row as Mark read does.
+   recordDetails(item).querySelector('[data-feedback-form]').applySavedState(result);
+   tableView.applyAction();
+   if(item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.applyAction();}
+  });
+  if(hadFocus && listOwnsFocus()){
+   if(item.hidden) focusAfterQuestion(item);
+   else (recordDetails(item)?.querySelector('[data-go-form] button') ?? item.querySelector('.list-toggle')).focus();
+  }
+ }catch(error){
+  button.disabled=false;
+  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+   {kind:'failure',message:'Not sent: '+(error instanceof Error ? error.message : String(error))});
+ }finally{
+  saving--;
+  refreshAfterListSave(saved);
+ }
+});
 let listCounts=null,reviewSaveVersion=0;
 const listCountsSource=()=>content.querySelector('[data-list-counts-url]');
 function presentReviewLinks(row,links){

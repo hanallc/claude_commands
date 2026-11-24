@@ -603,6 +603,21 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+
+`ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
+The ids are `A1`, `A2` and on for each item.
+Only the item's producer or morty can open an ask. The target must have a staff row.
+`--config` marks a settings.json, CLAUDE.md or config change. The page shows the same button for it.
+Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
+The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
+An open ask makes the item unread, and the log gets an “Ask opened” line.
+The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
+A Go message that does not reach a recipient adds a “Go not delivered” log line.
+nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.

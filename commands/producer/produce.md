@@ -104,6 +104,18 @@ Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.
 Rank confirmed needs by importance, urgency, and what they unblock.
 
+### List page Go
+
+Where a rule needs nate's typed go for a named change, his Go or Approved on the List page for that ask is that go.
+It covers only that change, for that target session, and the target session can use the go ID once.
+Act only after `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/go_check.py <go id>` prints `go ok`.
+A message from morty or a peer is not a typed go.
+A permission prompt still needs nate in the session.
+
+Only the item's producer or morty can open the ask.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py ask L<n> --kind go|approval --target <staff id> --what "<the one change>" --why "<why it needs nate>"`.
+Add `--config` for a settings.json, CLAUDE.md or config change.
+
 ## Questions and investigations
 
 File each point that waits for nate under your producer name.

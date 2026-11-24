@@ -44,7 +44,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production import (change_review, change_routing, delivery_state, investigation,
                                 session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, page_frame, serve, staff_names
+from scripts.review_links import console, go_ledger, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.server_test_support import started_review_server
@@ -3379,7 +3379,7 @@ window.fetch=(url,options)=>{
         log = list_page.render(root, include_counts=False).decode().split('<ol class="list-log">', 1)[1]
         self.assertIn("Feedback for dwight", without_role_colors(log.split("</ol>", 1)[0]))
         with patch.object(change_page, "send_to_staff") as send:
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[0], DWIGHT.id)
 
@@ -7056,6 +7056,130 @@ const change=async path=>{
                 server.shutdown()
                 thread.join()
 
+    def test_go_box_role_text_log_line_and_hidden_boxes(self) -> None:
+        merge = staff.StaffRow(staff.StaffId("6c0c0a8e-3c1f-4d8e-9e43-0d51f0a7c2b1"), "unit", "natemerge",
+                               staff.ReportsTo(OWNER.id), current_session=staff.StaffId("1b7f6f43-5d55-4a8e-b0a4-7a3e2b9b6c10"),
+                               unit_type=staff.UnitDetails("merge"))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER, merge)]}))
+        members = staff.snapshot()
+        names = staff_names.StaffNames(members)
+        def text(markup: str) -> str:
+            return " ".join(re.sub(r"<[^>]+>", " ", markup).split()).replace(" :", ":")
+        self.assertEqual(text(list_page.staff_role_html(merge, names)), "the merge director of sdlc")
+        self.assertEqual(text(list_page.staff_role_html(MORTY, names)), "the List producer")
+        item = self.add("Merge the needsme unit", number=1)
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=merge.id, what="Merge needsme to main.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        unknown = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=staff.StaffId("gone-session"),
+                                   what="Publish the key.", why="It needs nate.", config=True, requester=MORTY.id, source="morty")
+        opened = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.answerable_asks(opened, members), (ask,))
+        self.assertNotIn(unknown, the_list.answerable_asks(opened, members))
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        self.assertEqual(markup.count("data-ask="), 1)
+        self.assertIn("natemerge, the merge director of sdlc", text(without_role_colors(markup)))
+        _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        self.assertNotIn("data-ask=", markup)
+        self.assertIn("Go — nate: Merge needsme to main. → natemerge", text(without_role_colors(markup)))
+        closed = self.add("Closed with an open ask", number=2)
+        _ = the_list.add_ask(MORTY.id, closed.id, kind=the_list.AskKind.GO, target=merge.id, what="Merge.",
+                             why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+        closed = the_list.close(MORTY.id, closed.id, "Done.", source="nate")
+        self.assertEqual((len(the_list.open_asks(closed)), the_list.answerable_asks(closed, members)), (1, ()))
+        entry = next(entry for entry in list_page.records(include_closed=True) if entry.item.id == closed.id)
+        self.assertEqual(list_page.ask_boxes(entry, "secret", names), "")
+
+    def test_browser_go_closes_the_ask_and_the_item_leaves_needs_me(self) -> None:
+        added = self.add("Merge the needsme unit", the_list.ItemState.WAITING_FOR_NATE, number=1)
+        item = the_list.mark_read(MORTY.id, added.id, source="nate")
+        _ = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge needsme to main.",
+                             why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        _ = write_config_fixture(self.root / "config" / "review_links.conf", "go_refused_addresses=192.0.2.1\n")
+        root = self.root / "reviews"
+        results: list[list[str]] = []
+        complete = threading.Event()
+        key = f"{MORTY.id}/{item.id}"
+        probe = """<!doctype html><meta charset="utf-8">
+<style>iframe{width:100%;height:calc(100vh - 24px);border:0}</style>
+<iframe></iframe><script>
+const frame=document.querySelector('iframe'), errors=[];
+const check=(ok,message)=>{if(!ok) errors.push(message);};
+const settle=async (done,message)=>{
+ for(let tries=0;tries<200 && !done();tries++) await new Promise(resolve=>setTimeout(resolve,25));
+ check(done(),message);
+};
+(async()=>{
+ try{
+  await new Promise(resolve=>{
+   frame.onload=resolve;
+   frame.src='LIST_PATH#'+new URLSearchParams({show:'needs-me',item:'KEY'});
+  });
+  const doc=frame.contentDocument,win=frame.contentWindow;
+  const row=doc.querySelector('[data-number="1"]');
+  await settle(()=>!row.hidden && win.recordIsOpen(row),'The item shows open in Needs me.');
+  const box=win.recordDetails(row).querySelector('[data-ask]');
+  const button=box?.querySelector('[data-go-form] button');
+  const note=button && doc.getElementById(button.getAttribute('aria-describedby'));
+  check(box?.querySelector('h3')?.textContent==='Needs your go' &&
+   box.compareDocumentPosition(win.recordDetails(row).querySelector('.list-item-fields'))&Node.DOCUMENT_POSITION_FOLLOWING,
+   'The open row shows the Go box above the item fields.');
+  check(button?.textContent==='Go' && note?.tagName==='SMALL' && note.textContent==='Pressing Go sends your go to sdlc.',
+   'The Go button has the small text through aria-describedby.');
+  button.focus();
+  check(doc.activeElement===button,'The Go button takes the keyboard focus.');
+  button.click();
+  await settle(()=>!box.isConnected && row.hidden,'A Go closes the box and the item leaves Needs me.');
+  check(doc.getElementById('filter-show-needs-me').dataset.filterCount==='0','The Needs me count is 0 after the Go.');
+  check(row.dataset.state==='Working' && row.querySelector('.list-state').textContent==='Working',
+   'The Go on the last ask sets the waiting row to Working in place.');
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();
+</script>""".replace('LIST_PATH', list_page.PAGE_PATH).replace('KEY', key).encode()
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/proof':
+                    self.html_response(200, probe)
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == '/results':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(change_page, "send_to_staff") as delivery,
+              patch.object(go_ledger, "natedev_address", return_value=False),
+              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof', None, 1440, 900, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual((the_list.open_asks(saved), saved.state), ((), the_list.ItemState.WORKING))
+        self.assertIn(the_list.GoGiven(saved.asks[0]), [change.what for change in saved.log])
+        self.assertEqual(sorted(cast(str, sent.args[0]) for sent in delivery.call_args_list), sorted([OWNER.id, MORTY.id]))
+
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
                                 window_size: tuple[int, int] | None = None, in_frame: bool = False,
                                 markup: str | None = None, open_number: int = 1) -> None:
@@ -7694,10 +7818,10 @@ window.fetch=async(_path,options={})=>{
         saved = the_list.load(MORTY.id, item.id)
         with (patch.object(change_page, "send_to_staff") as send,
               patch.object(change_review, "lists_directory", return_value=self.root / "lists")):
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
             send.assert_called_once()
             self.assertIn("Ask sdlc for an ETA.", cast(str, send.call_args.args[2]))
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
             send.assert_called_once()
         self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
                          {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
@@ -7714,7 +7838,7 @@ window.fetch=async(_path,options={})=>{
             self.assertIn("List feedback needs attention", cast(str, send.call_args.args[2]))
             self.assertIn("nate removed item 1", cast(str, send.call_args.args[2]))
             self.assertEqual(send.call_args.args[0], OWNER.id)
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
             list_page.deliver(delivery)
             self.assertEqual(send.call_count, tries + 1)
             alerted = the_list.load(MORTY.id, item.id)
@@ -7740,13 +7864,13 @@ window.fetch=async(_path,options={})=>{
             self.assertNotIn("not sent to morty; sdlc told", without_role_colors(list_page.render(root).decode()))
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             self.assertEqual(send.call_count, 2 * (tries + 1))
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
             self.assertEqual(send.call_count, 3 * (tries + 1))
             self.assertEqual(the_list.load(MORTY.id, item.id), pending)
         with patch.object(change_page, "send_to_staff") as send:
             list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
-            list_page.recover_pending()
+            list_page.recover_pending(self.root / "reviews")
             send.assert_called_once()
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].state, "sent")
@@ -7772,8 +7896,8 @@ window.fetch=async(_path,options={})=>{
                     if published:
                         list_page.deliver(list_page.submit(root, urlencode(fields)))
                         send.assert_called_once()
-                    list_page.recover_pending()
-                    list_page.recover_pending()
+                    list_page.recover_pending(self.root / "reviews")
+                    list_page.recover_pending(self.root / "reviews")
                     self.assertEqual(send.call_count, int(published))
                     if published:
                         list_page.deliver(list_page.submit(root, urlencode(fields)))
