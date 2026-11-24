@@ -2197,8 +2197,11 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     except (OSError, wire.AdmissionUnavailable) as error:
         print(f'Cannot report the AWS gate result to the queue. {error}', file=sys.stderr, flush=True)
     if isinstance(path, placement.DispatchPathPending):
-        detail = f'{path.reason}. {outcome.reason}' if isinstance(outcome, CloudDeclined) else path.reason
-        raise gate.AwsGateLaunchPending(detail)
+        if isinstance(outcome, CloudCompleted):
+            reason = ' '.join(path.reason.split())
+            print(f'AWS gate settlement remains open. {reason}', file=sys.stderr, flush=True)
+            return outcome.run
+        raise gate.AwsGateLaunchPending(f'{path.reason}. {outcome.reason}')
     if isinstance(outcome, CloudCompleted):
         return outcome.run
     if settled == 'no launch':
