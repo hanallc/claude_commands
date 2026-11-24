@@ -1701,8 +1701,10 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
                        else placement.AttemptDeclined(outcome.reason))
         state = finish_assigned_run(authorization, attempt, disposition)
         if isinstance(state, placement.Pending):
-            detail = f'{state.reason}. {outcome.reason}' if isinstance(outcome, CloudDeclined) else state.reason
-            raise gate.AwsGateLaunchPending(detail)
+            if isinstance(outcome, CloudDeclined):
+                raise gate.AwsGateLaunchPending(f'{state.reason}. {outcome.reason}')
+            reason = ' '.join(state.reason.split())
+            print(f'AWS gate settlement remains open. {reason}', file=sys.stderr, flush=True)
         if isinstance(outcome, CloudDeclined) and isinstance(state, NoCloudLaunch):
             raise gate.AwsGateTookNoRun(outcome.reason)
     return outcome

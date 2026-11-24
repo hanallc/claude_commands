@@ -406,6 +406,39 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
             self.assertIsInstance(sent.path, placement.DispatchPathPending)
             self.assertEqual(sent.outcome, placement.AttemptDeclined('The launch reply is unavailable'))
 
+    def test_assigned_run_keeps_a_verdict_while_settlement_is_pending(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            authorization = wire.FirstAuthorization(assignment, placement.assigned_claim_reference(assignment))
+            run = partial(cloud_gate.run, self.root, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=3,
+                          authorization=authorization)
+            completed = cloud_gate.CloudCompleted(gate.GateRun((
+                gate.GateJobResult('fixture', 'test_red.py', 1, 1, ''),
+            ), 1, 0))
+            declined = cloud_gate.CloudDeclined('fixture launch declined')
+            reason = 'fixture launch still open'
+
+            for outcome in (completed, declined):
+                with (self.subTest(outcome=outcome),
+                      mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+                      mock.patch.object(cloud_gate, 'run_cloud', return_value=outcome),
+                      mock.patch.object(cloud_gate, 'finish_assigned_run',
+                                        return_value=placement.Pending(reason)) as finish,
+                      mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Unexpected AWS command')),
+                      redirect_stderr(StringIO()) as errors):
+                    if isinstance(outcome, cloud_gate.CloudCompleted):
+                        self.assertIs(run(), completed)
+                        self.assertEqual(errors.getvalue(), f'AWS gate settlement remains open. {reason}\n')
+                        finish.assert_called_once_with(authorization, mock.ANY, placement.AttemptCompleted(1))
+                    else:
+                        with self.assertRaises(gate.AwsGateLaunchPending) as pending:
+                            _ = run()
+                        self.assertEqual(str(pending.exception), f'{reason}. {declined.reason}')
+                        self.assertEqual(errors.getvalue(), '')
+                        finish.assert_called_once_with(authorization, mock.ANY, placement.AttemptDeclined(declined.reason))
+
     def test_assigned_worker_refuses_after_the_bill_refresh_crosses_the_cap(self) -> None:
         attempt = ledger.text(self.request, 'attempt')
         self.request['placement_claim'] = attempt

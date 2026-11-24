@@ -920,6 +920,7 @@ The final refusal row includes the interruption count when retries or capacity c
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The route reports pending settlement to the queue while the launch remains uncertain.
+A completed run with open settlement returns its verdict and prints `AWS gate settlement remains open. <reason>` once. A declined run with open settlement raises `AwsGateLaunchPending`.
 The stop cleanup looks up an unknown instance by client token.
 Cleanup accepts a saved termination for the same booking, region, and set of instances.
 An empty lookup proves absence only if the lookup starts at or after the booking expiry.
