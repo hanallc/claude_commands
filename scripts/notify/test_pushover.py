@@ -665,12 +665,26 @@ class PushoverTests(unittest.TestCase):
     def assert_footer(self, message: str, sender: str, template: str) -> None:
         self.assertEqual(message.splitlines()[-2:], ["", f"Sent by: {sender} · Template: {template}"])
 
-    def test_cold_keys_template_has_only_its_action_and_delivery_footer(self) -> None:
-        code, form = self.run_send(["--text-id", "github.keys_cold", "--value", "sender=hana",
-                                    "--value", "machine=natedev"])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["title"], ["GitHub keys locked on natedev"])
-        self.assertEqual(form["message"], [footed("Action: Run github-warmup in a terminal on natedev", "hana", "github.keys_cold")])
+    def test_registered_templates_post_the_expected_title_and_message(self) -> None:
+        for text_id, example_name, sender, priority, title, message in (
+                ("github.keys_cold", "typical", "hana", "2", "GitHub keys locked on natedev",
+                 "Action: Run github-warmup in a terminal on natedev"),
+                ("nightly.assigned", "tests_failed", "sdlc", "0", "Nightly check failed", "Fix assigned to: staff."),
+                ("nightly.assigned", "types_failed", "sdlc", "0", "Nightly check failed", "Fix assigned to: types."),
+                ("nightly.not_run", "fetch_failed", "nightly", "0", "Nightly check did not run",
+                 "Why: git fetch of main failed: ssh connection timed out.\nNext run: Tue 11-24 00:53 PST."),
+                ("nightly.not_run", "cold_credentials", "nightly", "0", "Nightly check did not run",
+                 "Action: In a terminal on natedev, run github-warmup\n"
+                 + "Why: GitHub credentials are cold.\nNext run: Tue 11-24 00:53 PST.")):
+            with self.subTest(text_id=text_id, example=example_name):
+                entry = next(item for item in push_texts.catalog() if item.id == text_id)
+                values = next(example.values for example in entry.examples if example.name == example_name)
+                argv = ["--text-id", text_id, *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+                code, form = self.run_send(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(form["priority"], [priority])
+                self.assertEqual(form["title"], [title])
+                self.assertEqual(form["message"], [footed(message, sender, text_id)])
 
     def test_emergency_agent_text_is_withheld_when_review_names_a_fixed_template(self) -> None:
         failure = review.RuleFailure("use-registered-template:mac.locked", "Every Mac screenshot is black.")

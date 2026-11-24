@@ -377,10 +377,11 @@ New escalate holds retain their registered template and values.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `nightly.result` reports the branch, finish time, type result and full test result.
-  `nightly.not_run` reports the reason that the checks could not start.
+  `nightly.not_run` shows `Nightly check did not run`, the reason, and the next scheduled run in the user's time zone.
   Both texts use sender `nightly`, need `note`, and key `nightly-result`.
-  The result requires no action. The failure text includes an action.
-  The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+  The gate sends `nightly.not_run` with an empty action.
+  `ActionTemplate(omit_when_empty=True)` omits the action line when its value is empty.
+  The timer keeps the `github-warmup` action line when GitHub credentials are cold.
   Silence keeps only the newest push and delivers it when silence ends.
   The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
