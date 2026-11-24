@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout, suppress
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from functools import partial
 import io
@@ -335,9 +336,15 @@ class MacGateSuitesTests(GateSuitesFixture):
         local_result = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0,
                                     selection_certified=True)
         with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
+            @contextmanager
+            def grant_local(*_arguments: object, **_options: object) -> Generator[object]:
+                self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
+                released.assert_not_called()
+                yield object()
+
             def run_local(*_arguments: object, **_options: object) -> gate.GateRun:
-                # The gate takes its own reservation here, after the caller's reservation ended.
-                self.assert_reservation_ended(reply)
+                with gate.gate_reservation(self.checkout, self.root, gate.NoBuildHoldCheck()):
+                    self.assert_reservation_ended(reply)
                 return local_result
 
             with mock.patch.object(admission_client, "release", side_effect=partial(queue_release, queue)) as released:
@@ -348,6 +355,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(mac_linux, "route") as guest,
+                      mock.patch.object(gate, "queue_place", side_effect=grant_local),
                       mock.patch.object(gate, "run_suites", side_effect=run_local) as local,
                       redirect_stderr(io.StringIO()) as errors):
                     status = gate.main(argv)
@@ -367,7 +375,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
         local.assert_called_once()
 
-    def test_a_named_module_gate_ends_the_natedev_reservation_when_it_starts(self) -> None:
+    def test_a_named_module_gate_ends_the_natedev_reservation_after_its_own_grant(self) -> None:
         status, errors, reply, released, local = self.run_handed_off_gate(
             ("natedev", "mac-linux"), "--module", "lib/test_first.py")
         self.assertEqual((status, errors), (0, ""))
@@ -443,7 +451,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual((status, result.returncode), (0, 0), result.output)
         self.assertIn("[]", result.output.splitlines())
 
-    def test_a_merge_gate_ends_the_natedev_reservation_before_its_hold_wait(self) -> None:
+    def test_a_merge_gate_keeps_the_natedev_reservation_during_its_hold_wait(self) -> None:
         argv = ["--repo", str(self.checkout), "--merge-branch", "integration", "--unit-branch", "unit-phase",
                 "--checkpoint", "checkpoint", "--previous-checkpoint", "previous", "--unit", "fixture",
                 "--phase", "phase-2"]
@@ -463,8 +471,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                       redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(gate.main(argv), 1)
         self.assertEqual(errors.getvalue(), "REFUSED: the fixture stops at the hold wait\n")
-        self.assertEqual(waits, [placement.ClosedAssignment("local reservation has ended")])
-        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
+        self.assertEqual(waits, [placement.CurrentAssignment()])
+        released.assert_not_called()
 
     def test_mac_linux_runs_the_whole_gate_when_enabled_and_placed(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
@@ -486,6 +494,29 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.placement_status.assert_called_once_with("episode", "attempt")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
+
+    def test_mac_linux_prints_a_summary_only_when_the_guest_passes(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        target = gate.MacLinuxAssignment(self.gate_assignment("mac-linux"))
+        commit = self.git(self.checkout, "rev-parse", "HEAD")[:10]
+        types = gate.GateJobResult("types", "basedpyright", 0, 1, "", kind=gate.GateJobKind.TYPE_CHECK)
+        first = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
+        second = gate.GateJobResult("lib", "test_first.py", 0, 1, "")
+        for status, dirty in ((0, False), (1, False), (0, True)):
+            if dirty:
+                self.write(self.checkout / "uncommitted.txt", "Guest snapshot fixture.\n")
+            result = gate.GateRun((replace(first, returncode=status), second, types), 1673, 0)
+            with (self.subTest(status=status, dirty=dirty), mock.patch.object(mac_linux, "route", return_value=result),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED, full=True, target=target)
+                self.assertIs(run, result)
+                if status == 0:
+                    self.assertEqual(output.getvalue(),
+                                     f"Mac Linux guest gate passed: 2 modules in 27 min 53 s (checkout HEAD {commit})\n")
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("Mac Linux guest gate failed\n", errors.getvalue())
 
     @gate_suites("lib")
     def test_mac_linux_checks_types_in_the_guest_when_the_tests_are_reused(self) -> None:

@@ -1958,13 +1958,29 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
     return tuple(attributed)
 
 
+def gate_handoff_key(row: Waiter) -> tuple[str, float, str, str] | None:
+    """Match the two reservations of one gate submission."""
+    run = row.get("build_run")
+    step = row.get("step", "")
+    if step in ("gate", "test-affected") and isinstance(run, LiveBuildRun):
+        return records.run_owner(run.pid, run.start_time), row["since"], step, row.get("repository_name", "")
+    return None
+
+
 def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     """Group attributed steps and ephemeral handoffs inside the pure pass."""
     groups: dict[str, RunMemory] = {}
+    gate_needs: dict[tuple[str, float, str, str], int] = {}
     for row, step, attributed in attributed_step_uses(inputs):
         run = reservation_run(row, step)
         owner = reservation_owner(row, step)
         need = reservation_need(row, step.measured)
+        waiter = row.get("queue_waiter")
+        key = gate_handoff_key(waiter) if waiter is not None else None
+        if key is not None:
+            previous_need = gate_needs.get(key, 0)
+            gate_needs[key] = max(previous_need, need)
+            need = gate_needs[key] - previous_need
         use = attributed.use
         previous = groups.get(owner)
         if previous is None:
@@ -2071,11 +2087,12 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
                        if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
-        if not held_owners:
+        returned = {slot.slot.reservation for slot in inputs.slots
+                    if isinstance(slot, ContinuationSlot) and slot.owner in held_owners}
+        if not returned:
             break
         # Return the claim before checking the earlier row's room again.
-        returned_claims.update(slot.slot.reservation for slot in inputs.slots
-                               if isinstance(slot, ContinuationSlot) and slot.owner in held_owners)
+        returned_claims.update(returned)
         inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
             if not isinstance(slot, ContinuationSlot) or slot.owner not in held_owners))
     clear = (isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold)
@@ -2149,9 +2166,18 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     new_started = False
     gpu = policy.gpu_tests
     # The reservation is the slot: it ends at release or when its owner exits.
-    gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
+    gpu_used = 0
     limits = policy.repository_runs
     repository_runs = reserved_repository_runs(inputs, limits)
+    gate_needs: dict[tuple[str, float, str, str], int] = {}
+    active = (step for step in inputs.running if running_has_reservation(step))
+    for reservation, step in zip(inputs.reservations, active, strict=True):
+        waiter = reservation.get("queue_waiter")
+        key = gate_handoff_key(waiter) if waiter is not None else None
+        if gpu_test_reservation(reservation, gpu) and (key is None or key not in gate_needs):
+            gpu_used += 1
+        if key is not None:
+            gate_needs[key] = max(gate_needs.get(key, 0), reservation_need(reservation, step.measured))
     run_limit_waiters: dict[str, str] = {}
     first_held_by_run_limit: dict[str, RankedWaiter] = {}
     first_for_folder: dict[placement.CargoFolder, Waiter] = {}
@@ -2170,9 +2196,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         claim = claims.get(owner)
         held = claim.slot.bytes if claim is not None else 0
         need = row["need"]
-        extra = max(0, need - held)
-        reused = claim is not None
-        within = reused and need <= held
+        key = gate_handoff_key(row)
+        gate_need = 0 if key is None else gate_needs.get(key, 0)
+        extra = max(0, need - held - gate_need)
+        reused = claim is not None or gate_need > 0
+        within = reused and need <= held + gate_need
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
@@ -2217,7 +2245,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         ready = (local and disk_allows_start and wait is None and not remote_start_pending and fresh
                  and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
-        gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
+        needs_gpu_slot = gpu_step and (key is None or key not in gate_needs)
+        gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if needs_gpu_slot and gpu_used >= gpu.slots else GpuSlotFree()
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
         if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
@@ -2246,8 +2275,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
         if can_start:
             memory_head_seen = True
-            remaining += held + released - need
-            gpu_used += gpu_step
+            remaining += held + released - max(0, need - gate_need)
+            if key is not None:
+                gate_needs[key] = max(gate_need, need)
+            gpu_used += needs_gpu_slot
             if runs is not None:
                 runs.add(run_owner)
             if not reused:

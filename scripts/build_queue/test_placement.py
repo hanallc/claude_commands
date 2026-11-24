@@ -33,9 +33,8 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Observe
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
-from scripts.lint import memory_test_support
+from scripts.lint import memory_admit as gate, memory_test_support
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
-from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -648,6 +647,74 @@ class PlacementTests(unittest.TestCase):
                 with PlacementFixture():
                     pass
             self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_gate_handoff_keeps_the_head_and_uses_the_first_grants_memory(self) -> None:
+        with PlacementFixture() as fixture:
+            gib = records.GIB
+            caller = fixture.proc.spawn(used=0)
+            run = wire.RunIdentity(caller.pid, caller.start_time)
+            first = fixture.request(need=8 * gib, step="gate", owner=caller, run=run)
+            first_grant, = fixture.server.handle_request(first)
+            assert isinstance(first_grant, wire.Admitted), first_grant
+            fixture.allow_next_start()
+            fixture.clock.advance(1)
+            fixture.free(0)
+            younger = fixture.request(need=5 * gib, step="gate")
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
+
+            child = fixture.proc.spawn(used=0)
+            write_process(fixture.proc.path, child.pid, parent=caller.pid, start=child.start_time)
+            gate_request = fixture.request(need=10 * gib, step="gate", owner=child, since=first.since, run=run)
+            # The first grant has charged 8 GiB. There is room for the younger request alone.
+            fixture.free(16 * gib)
+            grant, = fixture.server.handle_request(gate_request)
+            assert isinstance(grant, wire.Admitted), grant
+            self.assertIn(first.episode, fixture.server.reservations)
+            self.assertIn(gate_request.episode, fixture.server.reservations)
+            self.assertNotIn(younger.episode, fixture.server.reservations)
+
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            gate_memory, = (row for row in gate.run_memories(inputs)
+                            if row.owner == records.run_owner(run.pid, run.start_time))
+            self.assertEqual((gate_memory.need, gate_memory.held), (10 * gib, 0))
+
+            fixture.release(first_grant)
+            self.assertIn(gate_request.episode, fixture.server.reservations)
+            self.assertNotIn(first_grant.reservation, fixture.server.slots)
+
+    def test_gate_handoff_keeps_its_repository_and_gpu_slots(self) -> None:
+        with PlacementFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text() +
+                                  f"\nmax_runs.{fixture.server.host}.hana=1\nmax_runs.exempt_unit=natemerge\n")
+            caller = fixture.proc.spawn(used=0)
+            run = wire.RunIdentity(caller.pid, caller.start_time)
+            first = fixture.request(step="gate", owner=caller, run=run)
+            first = replace(first, profile=replace(first.profile, repo="hana"))
+            first_grant, = fixture.server.handle_request(first)
+            assert isinstance(first_grant, wire.Admitted), first_grant
+            child = fixture.proc.spawn(used=0)
+            write_process(fixture.proc.path, child.pid, parent=caller.pid, start=child.start_time)
+            gate_request = fixture.request(step="gate", owner=child, since=first.since, run=run)
+            gate_request = replace(gate_request, profile=replace(gate_request.profile, repo="hana"))
+
+            grant, = fixture.server.handle_request(gate_request)
+            assert isinstance(grant, wire.Admitted), grant
+            self.assertIn(first.episode, fixture.server.reservations)
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            limits = records.RepositoryRunLimits({f"{fixture.server.host}.hana": 1})
+            self.assertEqual(gate.reserved_repository_runs(inputs, limits),
+                             {"hana": {records.run_owner(run.pid, run.start_time)}})
+
+            peer = fixture.request(step="gate")
+            peer = replace(peer, profile=replace(peer.profile, repo="hana"))
+            wait, = fixture.server.handle_request(peer)
+            assert isinstance(wait, wire.Wait), wait
+            self.assertEqual(wait.snapshot.decision.gpu, records.GpuSlotWait(1, 1))
 
     def test_gate_constraints_name_the_guest_and_natedev(self) -> None:
         from scripts.build_targets import build_targets
