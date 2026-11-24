@@ -1734,14 +1734,34 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         directory = self.base / "waits"
         step = directory / "wait-clippy"
         step.mkdir(parents=True)
-        for sample, expected in ((None, None), ("nan\n", None), ("0\n", 0.0), ("0.4\n", 0.4)):
+        cases = ((None, "", None), ("nan\n", "0", None), ("0\n", "0", 0.0), ("0.4\n", "0", 0.4))
+        for sample, initial_hold_wait, expected in cases:
             with self.subTest(sample=sample):
                 if sample is not None:
                     _ = (step / "seconds").write_text(sample)
                 result = self.record("call", "reused", "0", "1", "0", "0", "0", "9", "0", "lint", "hana",
-                                     extra={"BUILDLOG_WAIT_DIR": str(directory), "BUILDLOG_HOLD_WAIT_S": "0"})
+                                     extra={"BUILDLOG_WAIT_DIR": str(directory),
+                                            "BUILDLOG_HOLD_WAIT_S": initial_hold_wait})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.records()[-1]["hold_wait_s"], expected)
+
+    def test_call_waits_keep_zero_when_verify_skips_the_hold_check(self) -> None:
+        directory = self.base / "waits"
+        (directory / "wait-clippy").mkdir(parents=True)
+        environment = {"BUILDLOG_WAIT_DIR": str(directory), "BUILDLOG_HOLD_WAIT_S": "0"}
+        for outcome, expected in (("ran", 0.0), ("interrupted", None)):
+            with self.subTest(outcome=outcome):
+                result = self.record("call", outcome, "0", "0", "0", "0", "0", "0", "0", "lint", "hana",
+                                     extra=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["hold_wait_s"], expected)
+
+        (directory / "wait-clippy" / "placement-call-1.pending").mkdir()
+        result = self.record("call", "failed", "2", "0", "0", "0", "0", "0", "0", "lint", "hana",
+                             extra=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.records()[-1]["hold_wait_s"])
+        self.assertIsNone(self.records()[-1]["admission_wait_s"])
 
     def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
         for value in ("", "abc", "-1"):
