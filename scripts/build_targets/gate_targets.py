@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.aws_target.config import AwsOff, cloud_gate_off_reason
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import execution_identity, placement
 from scripts.build_queue.admission_client import OuterReservation, outer_reservation, placement_constraint_builder
@@ -37,7 +36,7 @@ def scaler_gate_exclusion(registry: conf.ConfigRead, target: target_config.Scale
     if not registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False):
         return "off"
     if not conf.read(target.settings).value("enabled", conf.on_off, default=False, recover_invalid=False):
-        return cloud_gate_off_reason(AwsOff())
+        return "cloud gates are off (cloud_gate.conf enabled=off)"
     return ""
 
 
