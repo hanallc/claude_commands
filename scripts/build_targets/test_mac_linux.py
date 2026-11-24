@@ -3244,7 +3244,8 @@ fi
                               ('arm', ('probe', 'arm')), ('probe', ('probe',))):
             with self.subTest(stage=stage), patch.dict(os.environ, {f'FIXTURE_SSH_{stage.upper()}': 'reset'}):
                 _ = self.trace.write_text('')
-                result = self.not_started(self.route())
+                route = self.route()
+                result = self.blocked(route) if stage == 'run' else self.not_started(route)
                 self.assertIn('Connection reset by peer after 1 connect attempt', result)
                 self.assert_guest_clean(*events)
 
