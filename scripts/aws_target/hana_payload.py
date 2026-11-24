@@ -19,10 +19,11 @@ from typing import BinaryIO, cast
 from scripts.aws_target import hana_protocol
 
 
-IMAGE_SLOT_POLICY = Path('/var/lib/hana-runtime/config/build_folders.conf')
+IMAGE_COPY_POLICY = Path('/var/lib/hana-runtime/config/build_folders.conf')
 BUILD_ROOT_KEY = 'roots.build'
 PROBE_WAIT_KEY = 'locks.probe_wait_seconds'
 PROBE_RETRY_KEY = 'locks.probe_retry_seconds'
+COPY_LIMIT_KEYS = ('copies.aws-hana.hana.max', 'copies.aws-hana.hana.max_bytes')
 
 
 def payload_mount(home: Path) -> Path:
@@ -37,19 +38,20 @@ class BundleSlice:
 
 
 @dataclass(frozen=True)
-class ImageSlotPolicy:
+class ImageCopyPolicy:
     build_root: Path
     probe_wait_seconds: float
     probe_retry_seconds: float
     overrides: dict[str, str]
 
-    def copy_path(self, slot: int) -> Path:
-        """Locate the numbered copy for the assigned slot."""
-        return self.build_root / hana_protocol.REPOSITORY / hana_protocol.COPY_UNIT / str(slot)
+    def copy_path(self, number: int) -> Path:
+        """Locate the numbered copy with the assigned number."""
+        return self.build_root / hana_protocol.REPOSITORY / hana_protocol.COPY_UNIT / str(number)
 
 
-def read_slot_policy(path: Path) -> ImageSlotPolicy:
-    """Read the capacity, build root, and lock timing from the image."""
+def read_copy_policy(path: Path) -> ImageCopyPolicy:
+    """Read the copy limits, build root, and lock timing from the image."""
+    keys = (BUILD_ROOT_KEY, PROBE_WAIT_KEY, PROBE_RETRY_KEY, *COPY_LIMIT_KEYS)
     overrides: dict[str, str] = {}
     limits: dict[str, str] = {}
     values: dict[str, str] = {}
@@ -58,8 +60,7 @@ def read_slot_policy(path: Path) -> ImageSlotPolicy:
         for line in path.read_text().splitlines():
             key, separator, value = re.split(r'(?:^|\s)#', line, maxsplit=1)[0].partition('=')
             key = key.strip()
-            if separator and (key in (PROBE_WAIT_KEY, PROBE_RETRY_KEY, BUILD_ROOT_KEY)
-                    or key.startswith('slots.aws-hana.')) and key not in overrides:
+            if separator and key in keys and key not in overrides:
                 overrides[key] = line
                 values[key] = value.strip()
                 if previous.startswith(('# whole:', '# range:')):
@@ -71,16 +72,16 @@ def read_slot_policy(path: Path) -> ImageSlotPolicy:
         if (not root.is_absolute() or '..' in root.parts or not math.isfinite(wait) or wait < 0
                 or not math.isfinite(retry) or retry <= 0
                 or any(int(values[key]) <= 0 or not limits[key].startswith('# whole:')
-                       for key in ('slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'))):
+                       for key in COPY_LIMIT_KEYS)):
             raise ValueError
     except (OSError, KeyError, ValueError):
-        raise ValueError('The image slot policy is invalid') from None
-    return ImageSlotPolicy(root, wait, retry, {key: limits.get(key, '') + '\n' + line
-                                             for key, line in overrides.items()})
+        raise ValueError('The image copy policy is invalid') from None
+    return ImageCopyPolicy(root, wait, retry,
+                           {key: limits.get(key, '') + '\n' + line for key, line in overrides.items()})
 
 
-def apply_slot_policy(path: Path, policy: ImageSlotPolicy) -> None:
-    """Give the runner the image's build root, capacity, and lock timing."""
+def apply_copy_policy(path: Path, policy: ImageCopyPolicy) -> None:
+    """Give the runner the image's build root, copy limits, and lock timing."""
     try:
         lines: list[str] = []
         for line in path.read_text().splitlines():
@@ -93,7 +94,7 @@ def apply_slot_policy(path: Path, policy: ImageSlotPolicy) -> None:
         lines.extend(policy.overrides.values())
         _ = path.write_text('\n'.join(lines) + '\n')
     except OSError:
-        raise ValueError('The Hana payload slot policy could not be applied') from None
+        raise ValueError('The Hana payload copy policy could not be applied') from None
 
 
 def download_payload(url: str, archive: BinaryIO, max_bytes: int, timeout_s: int) -> None:
@@ -167,7 +168,7 @@ def main(max_bytes: int, download_timeout_s: int, command_timeout_s: float) -> i
             raise ValueError('The Hana payload action is invalid')
         action = selected
         request = hana_protocol.decode_request(json.dumps(fields['request']).encode())
-        policy = read_slot_policy(IMAGE_SLOT_POLICY)
+        policy = read_copy_policy(IMAGE_COPY_POLICY)
         home = Path.home()
         checkout = hana_protocol.main_checkout(home)
         with (tempfile.TemporaryFile(dir=checkout) as archive,
@@ -177,7 +178,7 @@ def main(max_bytes: int, download_timeout_s: int, command_timeout_s: float) -> i
             runtime = Path(workspace) / 'runtime'
             bundle = unpack_payload(archive, request.manifest, runtime)
             configuration = runtime / 'config'
-            apply_slot_policy(configuration / 'build_folders.conf', policy)
+            apply_copy_policy(configuration / 'build_folders.conf', policy)
             start_fd = report_start.fileno()
             result = subprocess.run([sys.executable, '-I', str(runtime / 'runner.py'),
                 '--bundle-fd', str(archive.fileno()), '--bundle-offset', str(bundle.offset),

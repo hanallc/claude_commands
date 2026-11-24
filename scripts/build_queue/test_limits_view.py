@@ -257,6 +257,11 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(rows["other"], limits_view.Cell())
         self.assertEqual(shown.mac.waits, {})
 
+    def test_mac_limits_skip_a_linux_target(self) -> None:
+        target = target_config.SshTarget("linux", "linux", Path("linux.conf"))
+        snapshot = targets.TargetSnapshot(target, (targets.Free(),), (), eligibility.NO_BACKOFF)
+        self.assertEqual(limits_view.read_mac(snapshot, limits_view.Origins()), limits_view.MacReading())
+
     def test_kept_mac_claim_counts_in_the_limit_but_is_not_in_use(self) -> None:
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)

@@ -115,7 +115,10 @@ class HanaRenderTests(unittest.TestCase):
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
                 + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
                 + 'roots.slots.fixture-guest=/fixture/slots\n'
-                + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
+                + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n'
+                + 'copies.aws-hana.hana.max=7\ncopies.aws-hana.hana.max_bytes=1000\n'
+                + 'copies.aws-hana.hana.max.fixture-guest=9\ncopies.aws-hana.hana.max_bytes.fixture-guest=2000\n'
+                + 'copies.aws-hana.hana.max.other-host=11\n')
             _ = folders.write_text(folder_values)
             (checkout / 'config').mkdir(exist_ok=True)
             for path in (targets, folders):

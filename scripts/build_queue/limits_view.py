@@ -643,7 +643,8 @@ def read_mac_origins(now: float, earlier: Origins) -> Origins | ReadingState:
 def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
     """Read claim and policy facts for one configured Mac."""
     target = snapshot.target
-    assert isinstance(target, target_config.SshTarget)
+    if not isinstance(target, target_config.SshTarget) or target.platform != "macos":
+        return MacReading()
     state = snapshot.states[0]
     paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
                                   registry_selected=True, platform=target.platform)

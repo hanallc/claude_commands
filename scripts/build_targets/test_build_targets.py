@@ -30,6 +30,7 @@ from scripts.build_hold import build_hold, override_guard
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
+from scripts.copies import copies
 from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
 from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert, write_live_mac_state
@@ -103,6 +104,37 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             self.assertEqual(len(children), 1)
             with self.assertRaises(ChildProcessError):
                 _ = real_waitpid(children[0], os.WNOHANG)
+
+    def test_linux_recovery_probes_only_claim_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, open(os.devnull) as descriptor:
+            root = Path(directory)
+            args = build_targets.CliArguments()
+            args.target = "linux"
+            args.repo_root = str(root)
+            args.kind = "test"
+            args.recovery_fd = os.dup(descriptor.fileno())
+            target = target_config.SshTarget(args.target, "linux", root / "linux.conf")
+            repository = eligibility.KnownRepository("hana", "fixture/hana")
+            config = eligibility.OffloadConfig(True,
+                eligibility.SshConnectionSettings("fixture-linux", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
+                1, 1, 1, "1", {"slots.hana": "3"})
+            paths = claim_state.StatePaths(root, args.target, platform="linux")
+            with (mock.patch.object(target_config, "configured_ssh_target", return_value=target),
+                  mock.patch.object(build_targets, "ssh_target_config", return_value=config),
+                  mock.patch.object(eligibility, "repository_identity", return_value=repository),
+                  mock.patch.object(mac_test, "state_paths", return_value=paths),
+                  mock.patch.object(mac_test, "free_now", return_value="bad"),
+                  mock.patch.object(offload, "holder_session", return_value="fixture"),
+                  mock.patch.object(offload, "request_mirror") as request_mirror,
+                  mock.patch.object(copies, "remote_lease", return_value=nullcontext()) as lease,
+                  mock.patch.object(offload, "claim_for_run", return_value=None) as claim):
+                self.assertEqual(build_targets.command_recover_probe(args), 0)
+            request_mirror.assert_called_once()
+            request = cast(offload.OffloadRequest, request_mirror.call_args.args[1])
+            self.assertEqual(request.slot, 1)
+            lease.assert_called_once()
+            claim.assert_called_once_with(mock.ANY, config, request, repository, (1,),
+                                          mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY)
 
     def test_verify_commands_open_each_config_once(self) -> None:
         code = """import io, json, os, runpy, sys
@@ -905,6 +937,24 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET), 0)
         self.assertEqual(sweep.call_count, 1)
         return output.getvalue(), errors.getvalue()
+
+    def test_linux_candidate_uses_one_claim_without_reading_capacity(self) -> None:
+        settings = self.root / "linux.conf"
+        _ = settings.write_text("host=fixture-linux\nkinds=check\nslots=4\nslots.hana=3\n")
+        target = target_config.SshTarget("linux", "linux", settings)
+        scope = claim_state.RepositoryScope("hana", "fixture/hana")
+        paths = claim_state.StatePaths(self.root, "linux", platform="linux")
+        with (mock.patch.object(claim_state, "state_paths", return_value=paths),
+              mock.patch.object(claim_state, "target_claim_scope", return_value=scope),
+              mock.patch.object(target_config, "slot_capacity",
+                                side_effect=AssertionError("Linux placement read capacity"))):
+            candidate, = build_targets.fixed_remote_candidates(
+                target, build_targets.CONFIGURED_PROVIDER_SETTINGS, eligibility.KnownRepository("hana", scope.key),
+                self.root, "portable", "check", ("cargo", "check"), build_targets.AnyTarget(),
+                selection=Pinned(target.name))
+        self.assertEqual(candidate.destination, placement.PlacementDestination(
+            "ssh", "linux", "fixture-linux", claim_state.RepositoryScope(scope.name, scope.key, 1), 1))
+        self.assertIsInstance(candidate.eligibility, placement.AllowedHost)
 
     def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
         for background in (False, True):

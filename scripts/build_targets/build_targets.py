@@ -512,17 +512,15 @@ def fixed_remote_candidates(
             answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
             if isinstance(answer, eligibility.IneligibleMacStep):
                 policy = placement.FixedExclusion(answer.reason)
-        slots = (target_config.slot_capacity(configuration, repository.name,
-                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
-                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
     except conf.Unusable:
         destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
         return (placement.PlacementCandidate(destination, placement.FixedExclusion("state unreadable"), settings),)
 
-    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target.name, host,
-        claim_state.RepositoryScope(scope.name, scope.key, slot)
-            if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
-        slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
+    slot = 1 if target.platform == "linux" else 0
+    if slot and isinstance(scope, claim_state.RepositoryScope):
+        scope = claim_state.RepositoryScope(scope.name, scope.key, slot)
+    destination = placement.PlacementDestination(provider, target.name, host, scope, slot)
+    return (placement.PlacementCandidate(destination, policy, settings),)
 
 
 def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path, kind: CommandKind,
@@ -713,19 +711,11 @@ def command_recover_probe(args: CliArguments) -> int:
         try:
             with offload.interrupt_handlers(controller):
                 with ExitStack() as leases:
-                    slots: list[int] = []
-                    capacity = (1 if target.platform == "macos" else target_config.slot_capacity(
-                        config.values, repository.name, missing=target_config.MissingSlotCapacity.SINGLE_SLOT))
-                    for slot in range(1, capacity + 1):
-                        try:
-                            leases.enter_context(copies.remote_lease(offload.request_mirror(
-                                config, replace(request, slot=slot), repository)))
-                        except copies.BusyRemoteMirror:
-                            continue
-                        slots.append(slot)
-                    if not slots:
+                    try:
+                        _ = leases.enter_context(copies.remote_lease(offload.request_mirror(config, request, repository)))
+                    except copies.BusyRemoteMirror:
                         return 0
-                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots),
+                    claim = offload.claim_for_run(controller, config, request, repository, (1,),
                         mac_repository=(mac_repository if isinstance(mac_repository, claim_state.MacRepositoryIdentity)
                                         else claim_state.NO_SAVED_MAC_REPOSITORY))
                     if not isinstance(claim, offload.FreshMacClaim):

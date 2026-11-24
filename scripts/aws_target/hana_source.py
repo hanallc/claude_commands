@@ -103,10 +103,10 @@ def materialize(manifest: hana_protocol.SourceManifest, limits: hana_protocol.So
     if manifest.repository.rsplit('-', 1)[0] != repository:
         raise hana_protocol.SourceRefused('The manifest does not name the Hana repository')
     configuration = conf.read_or_repository('build_folders')
-    capacity = configuration.whole('slots.aws-hana.hana.max')
-    size_limit = configuration.whole('slots.aws-hana.hana.max_bytes')
-    if type(number) is not int or not 1 <= number <= capacity:
-        raise ValueError('The assigned slot exceeds the configured capacity')
+    copy_limit = configuration.whole('copies.aws-hana.hana.max')
+    size_limit = configuration.whole('copies.aws-hana.hana.max_bytes')
+    if type(number) is not int or not 1 <= number <= copy_limit:
+        raise ValueError('The assigned copy number exceeds the configured limit')
     main = hana_protocol.main_checkout(Path.home())
     metadata = main / '.git'
     if main.is_symlink() or metadata.is_symlink():

@@ -128,7 +128,7 @@ source_basis_max_commits=8
         _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
         override_fixture_settings(private.settings,
             f'roots.build.aws-hana={self.root / "guest-build"}\n'
-            + '# whole: 1..\nslots.aws-hana.hana.max=1\n# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n')
+            + '# whole: 1..\ncopies.aws-hana.hana.max=1\n# whole: 1..\ncopies.aws-hana.hana.max_bytes=1073741824\n')
         self.checkout = hana_protocol.main_checkout(Path.home())
         self.checkout.mkdir(parents=True)
         _ = self.git('init', '--quiet', '-b', 'main')
@@ -350,20 +350,21 @@ source_basis_max_commits=8
             assert isinstance(leased, source.LeasedSource)
             artifact = leased.copy.cargo_dir / 'artifact'
             _ = artifact.write_text('cache')
-        override_fixture_settings(self.pool_settings, '# whole: 1..\nslots.aws-hana.hana.max_bytes=1\n')
+        override_fixture_settings(self.pool_settings, '# whole: 1..\ncopies.aws-hana.hana.max_bytes=1\n')
         with self.guest(), self.materialize(manifest) as leased:
             assert isinstance(leased, source.LeasedSource)
             self.assertFalse(artifact.exists())
             self.assertTrue(leased.copy.cargo_dir.is_dir())
             self.assertEqual((leased.path / 'tracked').read_text(), 'committed\n')
 
-    def test_missing_guest_slot_keys_stop_admission(self) -> None:
+    def test_old_guest_keys_do_not_replace_missing_copy_keys(self) -> None:
         manifest = self.prepare()
         original = self.pool_settings.read_text()
-        for key in ('slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'):
+        for key in ('copies.aws-hana.hana.max', 'copies.aws-hana.hana.max_bytes'):
             with self.subTest(key=key):
-                _ = self.pool_settings.write_text('\n'.join(line for line in original.splitlines()
-                                                            if not line.startswith(key + '=')) + '\n')
+                _ = self.pool_settings.write_text('\n'.join(
+                    line.replace(key, key.replace('copies.', 'slots.', 1), 1)
+                    if line.startswith(key + '=') else line for line in original.splitlines()) + '\n')
                 with self.guest(), self.assertRaises(conf.Unusable), self.materialize(manifest):
                     self.fail('missing guest keys admitted source')
                 self.assertFalse((self.root / 'guest-build').exists())

@@ -18,7 +18,7 @@ CONTROL_MAX_BYTES = 65536
 # Reserve space for the wrapper, the permit, and both signed publication URLs.
 COMMAND_ENVELOPE_RESERVE_BYTES = 16 * 1024
 COMMAND_RESULT_PENDING = 'The command result is pending'
-RUNTIME_ABI = 2
+RUNTIME_ABI = 3
 REPOSITORY = 'hana'
 COPY_UNIT = 'aws-hana'
 

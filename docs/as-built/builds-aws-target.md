@@ -241,15 +241,15 @@ It installs the Python closure in `scripts/aws_target/hana_image.files` under `/
 That closure supplies the root receiver, the safety code, and the unprivileged bootstrap.
 `scripts/aws_target/hana_image.sha256` holds the source hash of that closure.
 [Hana image freshness](#hana-image-freshness) gives the rule for the hash and the runtime ABI.
-NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved slot settings.
+NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved copy limits.
 
 The NixOS build runs the renderer from its pinned `claude-commands` input.
 The NixOS image requires these integration changes.
 
-1. Update the `claude-commands` pin to include runtime ABI 2 and the Hana folder changes.
+1. Update the `claude-commands` pin to include runtime ABI 3 and the Hana folder changes.
 2. Use `scripts/aws_target/hana_render.files` as the renderer input filter.
 3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
-4. Append the approved capacity block below to the rendered `runtime/config/build_folders.conf`.
+4. Append the approved copy limits below to the rendered `runtime/config/build_folders.conf`.
 5. Create the directories below with runner ownership after the data mount.
 6. Remove the old slot, Cargo, mirror, shell, and temporary root settings and directory creation.
 7. Provide Python 3.13 or newer for the bootstrap.
@@ -259,14 +259,15 @@ List `~/rust`, `~/rust/hana`, `~/rust/hana/.git`, `~/rust/hana/.git/hana-payload
 
 ```ini
 # whole: 1..
-slots.aws-hana.default_max=1
+copies.aws-hana.hana.max=1
 # whole: 1..
-slots.aws-hana.hana.max=1
-# whole: 1..
-slots.aws-hana.hana.max_bytes=137438953472
+copies.aws-hana.hana.max_bytes=137438953472
 ```
 
-Root and the bootstrap read the installed `build_folders.conf`.
+The receiver and the bootstrap read the installed `build_folders.conf`.
+The image limits the box to one Hana copy.
+The runner clears Cargo output before use if the copy exceeds 128 GiB.
+Update the box settings when you rebuild the image for ABI 3.
 User data supplies the boot descriptor and signed control access.
 
 Run this command from the repository root:
@@ -618,11 +619,11 @@ The digest also covers `hana_protocol.RUNTIME_ABI`.
 The image receiver refuses a manifest with another runtime ABI.
 The digest does not cover the Python source under `runtime/`. The image still installs that source.
 `hana_render` adds the digest to the rendered `safety.json`.
-Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
+Safety settings, receiver settings, the command timeout, and the copy lock probe settings affect the digest.
 The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
-The renderer rejects invalid slot probe settings before it computes the digest.
+The renderer rejects invalid copy lock probe settings before it computes the digest.
 The renderer supplies `roots.build` and includes it in the digest.
-NixOS appends the approved capacity settings.
+NixOS appends the approved copy limits.
 NixOS supplies the compiler version and runner environment.
 Those NixOS settings take effect with a new image.
 
@@ -1760,11 +1761,12 @@ The shell cache lives at `~/build/hana/main/shells`.
 
 The guest must use host name `aws-hana`.
 The image selects `roots.build` for the guest and expands `~/` against the runner's home.
-Admission requires a `# whole:` limit above each of `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
+Admission requires a `# whole:` limit above each of `copies.aws-hana.hana.max` and `copies.aws-hana.hana.max_bytes`.
 The image supplies these values and includes Git, curl, and Python.
 The per-run runtime supplies the source, copy maker, rescue, and configuration modules.
 The runner retains the numbered copy lock through command execution.
-Runtime ABI 2 requires an image that probes the numbered copy lock.
+Runtime ABI 3 requires an image that supplies the new copy limits.
+The receiver still probes the lock for the assigned copy.
 
 ## Hana result transport
 
@@ -1833,7 +1835,7 @@ A pinned target reports the refusal.
 The image bootstrap verifies the payload and its ABI inside the unprivileged command unit.
 It gives the runner the verified local Git bundle.
 The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
-The bootstrap applies the image's approved roots, slot capacity, and probe timing.
+The bootstrap applies the image's build root, copy limits, and lock probe timing.
 It uses the command's runtime workspace for `TMPDIR`.
 The runner uses the image's command timeout.
 The runner sends the reason for an expected refusal.
@@ -1842,6 +1844,9 @@ It flushes the reply before it tries to print the traceback on the box.
 Systemd removes the per-run runtime filesystem when the unit ends.
 
 ## Hana placement adapter
+
+Linux SSH placement submits one candidate.
+A recovery probe uses claim 1 without reading a capacity setting.
 
 Hana retains the configured SSH target family and uses signed control instead of an SSH connection.
 `target_config.read_execution_transport()` selects the transport before any connection settings or provider probes.

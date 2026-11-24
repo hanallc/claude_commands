@@ -128,7 +128,7 @@ class HanaReceiverSettingsTests(unittest.TestCase):
             (previous, hana_guest.CommandAdmissionRefusalCode.RUNTIME_ABI_MISMATCH,
              f'The Hana runtime ABI {previous} differs from the image ABI {hana_protocol.RUNTIME_ABI}'),
             (hana_protocol.RUNTIME_ABI, hana_guest.CommandAdmissionRefusalCode.PRE_COMMAND_FAILED,
-             'The image slot policy is invalid'),
+             'The image copy policy is invalid'),
         ):
             with self.subTest(abi=abi), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -176,7 +176,7 @@ class HanaReceiverSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = hana_payload.unpack_payload(BytesIO(payload), request_for(payload).manifest, Path(temporary) / 'runtime')
 
-    def test_bootstrap_gives_the_runner_the_verified_source_and_image_slot_policy(self) -> None:
+    def test_bootstrap_gives_the_runner_the_verified_source_and_image_copy_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = b'fixture source bundle'
@@ -191,8 +191,11 @@ assert Path(__file__).is_relative_to(Path.home() / 'rust/hana/.git/hana-payload'
 assert sys.stdin.buffer.read() == Path(os.environ['FIXTURE_INPUT']).read_bytes()
 policy = (Path(os.environ['CONF_DIR']) / 'build_folders.conf').read_text()
 assert 'roots.build=/fixture/build' in policy
-assert '# whole: 1..\\nslots.aws-hana.hana.max=1\\n' in policy
+assert '# whole: 1..\\ncopies.aws-hana.hana.max=1\\n' in policy
+assert '# whole: 1..\\ncopies.aws-hana.hana.max_bytes=1073741824\\n' in policy
 assert '# range: 0..\\nlocks.probe_wait_seconds=0\\n' in policy
+assert 'copies.aws-hana.hana.max.aws-hana' not in policy
+assert 'copies.aws-hana.hana.max_bytes.aws-hana' not in policy
 assert '/bad' not in policy
 assert 'patterns.slot=fixture' in policy
 print(args['--command-timeout-s'])
@@ -202,7 +205,7 @@ print(args['--command-timeout-s'])
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
                 ('runtime/config/build_folders.conf',
                  b'patterns.slot=fixture\nroots.build=/bad\nroots.build.aws-hana=/bad\n'
-                 + b'slots.aws-hana.hana.max.aws-hana=9\n',
+                 + b'copies.aws-hana.hana.max.aws-hana=9\ncopies.aws-hana.hana.max_bytes.aws-hana=1\n',
                  tarfile.REGTYPE))
             write_policy(root / 'policy.conf', Path('/fixture/build'))
             for label, cause in (
@@ -306,8 +309,8 @@ with socket.socket(socket.AF_UNIX) as connection:
 
 
 def write_policy(path: Path, build_root: Path) -> None:
-    _ = path.write_text(f'roots.build={build_root}\n# whole: 1..\nslots.aws-hana.hana.max=1\n'
-        + '# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n'
+    _ = path.write_text(f'roots.build={build_root}\n# whole: 1..\ncopies.aws-hana.hana.max=1\n'
+        + '# whole: 1..\ncopies.aws-hana.hana.max_bytes=1073741824\n'
         + '# range: 0..\nlocks.probe_wait_seconds=0\n# range: 0..\nlocks.probe_retry_seconds=0.005\n')
 
 
@@ -330,7 +333,7 @@ sys.path.insert(0, sys.argv[2])
 from scripts.aws_target import hana_payload
 
 root = Path(sys.argv[1])
-hana_payload.IMAGE_SLOT_POLICY = root / 'policy.conf'
+hana_payload.IMAGE_COPY_POLICY = root / 'policy.conf'
 raise SystemExit(hana_payload.main(1048576, 7, 23.5))
 ''', str(root), str(Path(__file__).resolve().parents[2])]
     env = {**os.environ, 'HOME': str(home), 'PATH': str(root) + ':' + os.environ['PATH'],

@@ -101,10 +101,10 @@ def source_update_directory(directory: Path) -> Path:
 class GuestCommandSupervisor:
     """Root supervises the unit while the unit owns all source and compiler processes."""
 
-    def __init__(self, settings: ReceiverSettings, *, slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY,
+    def __init__(self, settings: ReceiverSettings, *, slot_policy: Path = hana_payload.IMAGE_COPY_POLICY,
                  clock: Callable[[], float] = time.time) -> None:
         self.settings: ReceiverSettings = settings
-        self.slot_policy: Path = slot_policy
+        self.copy_policy: Path = slot_policy
         self.timeout_s: int = settings.aws_timeout_s
         self.clock: Callable[[], float] = clock
         self.children: dict[Path, subprocess.Popen[bytes]] = {}
@@ -121,7 +121,7 @@ class GuestCommandSupervisor:
     def _start(self, request: hana_protocol.HanaExecutionRequest, directory: Path, arguments: list[str],
                action: str, output_max_bytes: int) -> execution_identity.HanaCommandAdmissionRefused | None:
         try:
-            _ = hana_payload.read_slot_policy(self.slot_policy)
+            _ = hana_payload.read_copy_policy(self.copy_policy)
         except ValueError as error:
             return execution_identity.HanaCommandAdmissionRefused(str(error))
         try:
@@ -254,7 +254,7 @@ class GuestCommandSupervisor:
             terminated = empty_group and launcher_ended
             lease_free = False
             if terminated:
-                policy = hana_payload.read_slot_policy(self.slot_policy)
+                policy = hana_payload.read_copy_policy(self.copy_policy)
                 probe_timing = build_folder_lock.ProbeTiming(policy.probe_wait_seconds, policy.probe_retry_seconds)
                 lease_free = build_folder_lock.probe(
                     policy.copy_path(slot), policy.build_root, lambda: probe_timing) == 'free'
@@ -723,7 +723,7 @@ def _control_step(step: Callable[[], None]) -> ControlStepCompleted | ControlSte
 
 def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
                  *, paths: guest.GuestPaths = guest.GUEST_PATHS,
-                 slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY,
+                 slot_policy: Path = hana_payload.IMAGE_COPY_POLICY,
                  fetch: Callable[[Request, int], bytes] = transfer, pause: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.time, keep_running: Callable[[], bool] = lambda: True) -> None:
     """Read root-only IMDS user data once per boot and publish scoped acknowledgements."""
