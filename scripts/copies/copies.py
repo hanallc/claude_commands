@@ -90,11 +90,13 @@ class AdmissionSourceCopy:
 
 ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
 
+COPY_ERROR_STATUS = 2
+
 
 class CopyError(Exception):
     """An invalid request or an unavailable checkout."""
 
-    exit_code: int = 2
+    exit_code: int = COPY_ERROR_STATUS
 
 
 # Git's exit status when `git remote get-url` names no configured remote.
@@ -3202,7 +3204,7 @@ def main(argv: list[str] | None = None) -> int:
     except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
             SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
-        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else 2
+        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else COPY_ERROR_STATUS
     return 0
 
 
