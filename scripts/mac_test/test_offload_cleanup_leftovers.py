@@ -3,24 +3,29 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 import json
 import os
+from pathlib import Path
 import subprocess
 from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.copies import copies
 from scripts.mac_test import claim_state, eligibility, offload
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_support import FIXTURE_MIRROR_ROOT, HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
-    def doc_with_cleanup_timeout(self, *, live_work: bool) -> subprocess.CompletedProcess[str]:
+    def doc_with_cleanup_timeout(self, *, live_work: bool, mirror_root: str = FIXTURE_MIRROR_ROOT) -> subprocess.CompletedProcess[str]:
         self.write_portable_workspace()
-        self.fixture.update(selector_shell="sh", run_cleanup_line="")
+        (Path(self.environment["HOME"]) / mirror_root / "hana").mkdir(parents=True)
+        self.fixture.update(selector_shell="sh", run_cleanup_line="", run_fence_reported=False)
         self.sync_fixture()
         selectors = self.stub_directory / "selectors"
         selectors.mkdir()
@@ -67,6 +72,52 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertTrue(proof["claimed"])
         self.assertNotIn("kill ", proof["args"][-1])
         self.assertIn("stays busy", result.stderr)
+
+    def test_lost_link_before_dispatch_save_keeps_claim(self) -> None:
+        self.fixture.update(run_dispatch_reported=False, run_status_reported=False, run_ssh_status=255)
+        self.sync_fixture()
+
+        def empty_probe(*_args: object, **_options: object) -> offload.LeftoverObservation:
+            claim = claim_state.read_run(self.claim_file)
+            assert not isinstance(claim, claim_state.NoRun)
+            key = offload.pending_start_key(claim_state.claim_identity(claim))
+            return offload.LeftoverObservation(offload.LeftoversEnded(), f"dispatch_start_settled={key}\n")
+
+        with mock.patch.object(offload, "read_leftovers", side_effect=empty_probe) as probe:
+            result = self.command(separate_stderr=True)
+        self.assertTrue(self.claim_file.exists(), result.stdout + result.stderr)
+        self.assertEqual(len(list((self.state_directory / "pending-starts").iterdir())), 1)
+        probe.assert_not_called()
+
+    def test_root_change_after_lease_keeps_copy_command_and_probe_on_leased_path(self) -> None:
+        first = MacMirrorRoot(".local/state/mac-test/first-root")
+        second = MacMirrorRoot(".local/state/mac-test/second-root")
+        configured = first
+        lease = copies.remote_lease
+
+        @contextmanager
+        def change_root(mirror: copies.RemoteMirror) -> Generator[None]:
+            nonlocal configured
+            with lease(mirror):
+                configured = second
+                yield
+
+        with mock.patch.object(copies, "remote_lease", change_root), \
+             mock.patch.object(offload, "mac_mirror_root", side_effect=lambda: configured):
+            _ = self.doc_with_cleanup_timeout(live_work=True, mirror_root=first.relative)
+        claim = claim_state.read_run(self.claim_file)
+        assert not isinstance(claim, claim_state.NoRun)
+        saved = claim_state.saved_mac_repository(claim)
+        assert isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None
+        path = f"{first.relative}/{saved.mirror_name}"
+        self.assertEqual(saved.dispatch["mirror_path"], path)
+        copy, = self.events_for("rsync")
+        self.assertTrue(copy["args"][-1].endswith(f":{path}/"), copy["args"])
+        command, = [event["args"][-1] for event in self.events_for("ssh") if "lint doc" in event["args"][-1]]
+        self.assertIn(f"cd {path} &&", command)
+        proof, = self.leftover_events()
+        self.assertIn(first.relative.removeprefix(".") + "/hana", proof["args"][-1])
+        self.assertNotIn(second.relative, proof["args"][-1])
 
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
@@ -226,10 +277,12 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assertEqual(float(self.wire_result()["seconds"]), 13.0 if outcome == "timeout" else 8.0)
 
     def test_leftover_selectors_complete_under_sh_and_zsh_before_releasing_claim(self) -> None:
+        (Path(self.environment["HOME"]) / FIXTURE_MIRROR_ROOT / "hana").mkdir(parents=True)
         selectors = self.stub_directory / "selectors"
         selectors.mkdir()
         for name in ("pgrep", "lsof", "sleep"):
             write_shell(selectors / name, SELECTOR_STUB)
+        write_shell(selectors / "sysctl", "printf 'fixture-boot\\n'")
         self.fixture["run_status_reported"] = True
         self.fixture["run_cleanup_line"] = ""
         self.config["leftover_timeout_s"] = "300"
@@ -256,7 +309,8 @@ class OffloadCommandTests(SeededCleanupFixture):
                         self.assertIn("lsof", names)
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
+                            self.assertEqual(call["args"][:3], ["-u", str(os.getuid()), "-f"])
+                            self.assertTrue(call["args"][3].startswith(HANA_COMMAND_PATTERN + "|[/]"))
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()

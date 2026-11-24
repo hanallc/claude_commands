@@ -52,7 +52,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
-    CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+    CLAIM_STUB, OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1156,13 +1156,6 @@ class OffloadCommandTests(OffloadCommandFixture):
 
         missing = self.repository
         _ = missing.rename(self.root / "former-checkout")
-        selectors = self.stub_directory / "selectors"
-        selectors.mkdir()
-        self.write_executable(selectors / "pgrep", "raise SystemExit(1)\n")
-        self.write_executable(selectors / "lsof", f"print('p41\\nn/home/fixture/{FIXTURE_MIRROR_ROOT}/old-mirror')\n")
-        self.write_executable(selectors / "sleep", "raise SystemExit(0)\n")
-        self.fixture["selector_shell"] = "sh"
-        self.sync_fixture()
         result = self.command(repository=missing, subprocess_cli=True, assigned_adapter=True, settings=Path(settings), runner_options=(
             *assignment, "--target", target, "--claim-owner-pid", waiter, "--claim-id", claim_id,
             "--episode", episode, "--attempt", attempt, "--claim-session", session,
@@ -1171,18 +1164,13 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertTrue(result.stdout.endswith(f"mac_test: not running on the {target} (busy)\n"), result.stdout)
         self.assert_wire("declined", "busy")
         self.assertTrue(claim_file.exists())
-        cleanup, = self.leftover_events()
-        self.assertEqual(self.events(), [cleanup])
-        adopted = cleanup.get("claim")
-        self.assertIsNotNone(adopted)
-        assert adopted is not None
-        self.assertNotEqual(adopted["pid"], int(waiter))
-        self.assertEqual(adopted["claim_id"], retained["claim_id"])
-        self.assertEqual(adopted["worktree"], ".")
-        self.assertEqual(adopted["remote_host"], retained["remote_host"])
-        script = cleanup["args"][-1]
-        self.assertNotIn("kill ", script)
-        self.assertEqual((self.stub_directory / "selector-answer").read_text().splitlines(), ["leftovers=1", "rc=0"])
+        self.assertEqual(self.events(), [])
+        record = claim_state.read_run(claim_file)
+        assert not isinstance(record, claim_state.NoRun) and "remote_host" in record
+        self.assertNotEqual(record["pid"], int(waiter))
+        self.assertEqual(record["claim_id"], retained["claim_id"])
+        self.assertEqual(record["worktree"], ".")
+        self.assertEqual(record["remote_host"], retained["remote_host"])
 
     def test_claim_stub_preserves_the_host_and_worktree_during_cleanup_handoff(self) -> None:
         kept = self.write_kept_claim(legacy=True)

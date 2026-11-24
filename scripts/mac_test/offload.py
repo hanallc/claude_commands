@@ -1672,11 +1672,8 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
         kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
 
 
-def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
-    return f"{remote_mirror(repository, target, slot)}/target"
-
-
-def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1, *,
+                 mirror_path: str = "") -> str:
     from scripts.copies import copies
 
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
@@ -1684,7 +1681,7 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
     return "\n".join(
         (
-            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
+            copies.mirror_probe_setup(mirror_path or remote_mirror(repository, target, slot)),
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
             "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
             + '"$free_gib" "$(hostname -s)"',
@@ -2027,7 +2024,7 @@ def probe_mac(
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
-    *, record_version_decline: bool = True,
+    *, record_version_decline: bool = True, mirror_path: str = "",
 ) -> ProbeResult:
     mark = eligibility.state_directory(target) / "failed_probe"
 
@@ -2059,7 +2056,7 @@ def probe_mac(
             return failed("SSH reachability check failed")
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
-        script = probe_script(repository, target, slot)
+        script = probe_script(repository, target, slot, mirror_path=mirror_path)
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
@@ -2146,7 +2143,7 @@ class SweepFailed:
 
 def ensure_mac_disk_floor(
     controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
-    probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
+    probe: ProbeSnapshot, target: str = "mac", slot: int = 1, *, mirror_path: str = "",
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
     floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
@@ -2194,7 +2191,8 @@ def ensure_mac_disk_floor(
                 lock.flush()
             _ = lock.seek(0)
             cause = lock.read()
-            after = probe_mac(controller, config, repository, target, slot)
+            after = (probe_mac(controller, config, repository, target, slot, mirror_path=mirror_path)
+                     if mirror_path else probe_mac(controller, config, repository, target, slot))
             if cause != "ok":
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
@@ -2265,6 +2263,7 @@ def copy_tree(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    mirror: copies.RemoteMirror | None = None,
 ) -> bool:
     from scripts.copies import copies
 
@@ -2272,7 +2271,7 @@ def copy_tree(
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
-    mirror = request_mirror(config, request, repository)
+    mirror = mirror or request_mirror(config, request, repository)
     try:
         with mirror_exclude_file(ignored) as exclude_path:
             result = controller.capture_copy(copies.remote_rsync(
@@ -2288,9 +2287,10 @@ def copy_tree_with_key(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    mirror: copies.RemoteMirror | None = None,
 ) -> CopiedTree | TreeCopyFailed:
     before = read_tree_key(request.source_root)
-    if not copy_tree(controller, config, request, repository):
+    if not copy_tree(controller, config, request, repository, mirror):
         return TreeCopyFailed(controller.copy_failure_detail)
     after = read_tree_key(request.source_root)
     if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
@@ -2363,7 +2363,7 @@ def remote_test_command(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
-    *, history_key: str = store.UNKNOWN_IDENTITY,
+    *, history_key: str = store.UNKNOWN_IDENTITY, mirror_path: str = "",
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -2390,12 +2390,13 @@ def remote_test_command(
     )
     repo_identity = (f"BUILDLOG_REPO_IDENTITY={shlex.quote(history_key)} "
                      if history_key and history_key != store.UNKNOWN_IDENTITY else "")
-    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    path = mirror_path or remote_mirror(repository, request.target, request.slot)
+    target = shlex.quote(path + "/target")
     custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
     else:
-        cleanup_command = remote_cleanup_command(config, request, repository)
+        cleanup_command = remote_cleanup_command(config, request, repository, mirror_path=path)
     abandoned_sessions = ""
     if not custom_target:
         abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
@@ -2417,7 +2418,7 @@ def remote_test_command(
         report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
     runner = "run_nextest_logged " if capture else ""
     return (
-        f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+        f"cd {shlex.quote(path)} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
@@ -2476,6 +2477,7 @@ def fetch_folder(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    mirror_path: str = "",
 ) -> FetchResult:
     """Fetch under the run's claim, publishing only a complete per-call folder."""
     folder = request.fetch
@@ -2484,6 +2486,7 @@ def fetch_folder(
     # The call ID becomes a local directory component, never a path supplied to SSH.
     if re.fullmatch(r"[A-Za-z0-9_.-]+", request.call_id) is None or request.call_id in (".", ".."):
         return FetchFailed("the call ID is not a directory name")
+    path = mirror_path or remote_mirror(repository, request.target, request.slot)
     fetched = eligibility.state_directory(request.target) / "fetched"
     destination = fetched / request.call_id
     partial = fetched / f"{request.call_id}.partial"
@@ -2501,7 +2504,7 @@ def fetch_folder(
             return FetchFailed("the fetched destination already exists")
         quoted = shlex.quote(folder.value)
         size_command = (
-            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+            f"cd {shlex.quote(path)} && "
             + f"if [ -d {quoted} ]; then "
             + f"if size=$(du -sk {quoted}); then "
             + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
@@ -2524,7 +2527,7 @@ def fetch_folder(
         landing.mkdir(parents=True)
         copied = controller.capture([
             "rsync", "-rlp", "--compress", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
-            f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
+            f"{config.host}:{path}/{folder.value}/", f"{landing}/",
         ])
         if not isinstance(copied, CommandOutput) or copied.status != 0:
             return FetchFailed("the folder copy from the Mac failed")
@@ -2545,6 +2548,7 @@ def return_fix(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey,
+    mirror_path: str = "",
 ) -> FixResult:
     """Bring a passed Mac fix pass back under the run's claim.
 
@@ -2560,7 +2564,7 @@ def return_fix(
     ignored = ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return fix_return.FixFailed("git did not list the ignored paths")
-    mirror = remote_mirror(repository, request.target, request.slot)
+    mirror = mirror_path or remote_mirror(repository, request.target, request.slot)
     transport = ["-e", shlex.join(["ssh", *ssh_options(config.connection)])]
     metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
     root = request.repo_root
@@ -2628,7 +2632,8 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
 
     A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
     """
-    if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
+    if dispatch is None and not target_config.uses_legacy_mac_layout(
+            eligibility.configured_ssh_target(target or "mac").platform):
         if not isinstance(scope, KnownRepository):
             raise ValueError("Linux cleanup requires a repository and slot")
         from scripts.mac_test import linux_runner
@@ -2638,7 +2643,18 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         path = dispatch["mirror_path"]
         pattern = f"[{path[0]}]" + extended_regex_literal(path[1:])
         command_pattern = f"{pattern}([/'\"[:space:]]|$)"
-        cwd_pattern = f"^n{extended_regex_literal(str(Path(dispatch['home']) / path))}(/|$)"
+        # Split the literal path to exclude the probe command from pgrep.
+        first, rest = shlex.quote(path[0]), shlex.quote(path[1:])
+        saved_path = f"""\"$HOME\"/{first}''{rest}"""
+        cwd_setup = (f"saved_mirror={saved_path}\n" + r"""physical_mirror=$(CDPATH= cd -P "$saved_mirror" && pwd -P) || exit 1
+[ "$saved_mirror" -ef "$physical_mirror" ] || exit 1
+physical_command_pattern=$(printf '%s\n' "$physical_mirror" | sed 's/[][\\.^$*+?(){}|]/\\&/g') || exit 1
+mirror_command_pattern="$mirror_command_pattern|[/]${physical_command_pattern#/}([/'\"[:space:]]|$)"
+""")
+        cwd_filter = r"""MAC_LOGICAL_MIRROR="$saved_mirror" MAC_PHYSICAL_MIRROR="$physical_mirror" awk '
+BEGIN { saved = "n" ENVIRON["MAC_LOGICAL_MIRROR"]; physical = "n" ENVIRON["MAC_PHYSICAL_MIRROR"] }
+/^p/ { pid = substr($0, 2) }
+$0 == saved || index($0, saved "/") == 1 || $0 == physical || index($0, physical "/") == 1 { print pid }'"""
     else:
         root = mac_mirror_root().relative
         mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
@@ -2647,10 +2663,11 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
             command_pattern = f"{mirror}([/'\"[:space:]]|$)"
         else:
             command_pattern = f"{mirror}/"
-        cwd_pattern = f"^n.*/{mirror}(/|$)"
+        cwd_setup = f"mirror_cwd_pattern={shlex.quote(f'^n.*/{mirror}(/|$)')}\n"
+        cwd_filter = r"""awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'"""
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
-        + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
+        + cwd_setup
         + r'''select_leftovers() {
     if command_pids=$(pgrep -u "$(id -u)" -f "$mirror_command_pattern"); then
         :
@@ -2659,7 +2676,9 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         [ "$selector_result" -eq 1 ] || return 1
     fi
     cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
-    cwd_pids=$(printf '%s\n' "$cwd_records" | awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }') || return 1
+''' + f"""
+    cwd_pids=$(printf '%s\\n' "$cwd_records" | {cwd_filter}) || return 1
+""" + r'''
     printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
 }
 '''
@@ -2787,9 +2806,11 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
 
 
 def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
-                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
+                   target: str = "mac", slot: int = 1, *,
+                   dispatch: claim_state.MacDispatchRecord | None = None) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
-    return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
+    command = leftover_check_script(repository, target, slot, dispatch=dispatch)
+    return read_leftovers(config, host, command, target, require_host_key=dispatch is not None).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
@@ -2800,12 +2821,17 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     identity = controller.claim_identity
     if not isinstance(identity, claim_state.ClaimIdentity):
         return StartUnsettled("the exact start identity is unavailable", LeftoverCheckFailed("the exact start identity is unavailable"))
+    saved = controller.mac_repository
+    dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
+    if dispatch is None and target_config.uses_legacy_mac_layout(
+            eligibility.configured_ssh_target(target or "mac").platform):
+        reason = "the claim has no Mac dispatch identity"
+        return StartUnsettled(reason, LeftoverCheckFailed(reason))
     try:
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     fence = start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key)
-    saved = controller.mac_repository
     if observe_only:
         if not isinstance(saved, claim_state.MacMirrorIdentity) or saved.dispatch is None:
             reason = "the claim has no Mac dispatch identity"
@@ -2816,7 +2842,6 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
         except (OSError, ValueError) as error:
             return StartUnsettled(str(error), LeftoverCheckFailed(str(error)))
     else:
-        dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
         guard = mac_dispatch_guard(dispatch) if dispatch is not None else ""
         command = guard + fence + " || exit 1\n" + leftover_check_script(repository, target, slot, dispatch=dispatch)
         observed = read_leftovers(connection, host, command, target, require_host_key=dispatch is not None)
@@ -2855,10 +2880,11 @@ def check_current_leftovers(
     except (OSError, ValueError) as error:
         return LeftoverCheckFailed(f"cleanup settings unavailable: {error}")
     dispatch = saved.dispatch if isinstance(saved, claim_state.MacMirrorIdentity) else None
-    if dispatch is None:
-        return check_leftovers(connection, host, repository, target, slot)
-    command = leftover_check_script(repository, target, slot, dispatch=dispatch)
-    return read_leftovers(connection, host, command, target, require_host_key=True).result
+    if dispatch is not None:
+        return check_leftovers(connection, host, repository, target, slot, dispatch=dispatch)
+    if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
+        return LeftoverCheckFailed("the claim has no Mac dispatch identity")
+    return check_leftovers(connection, host, repository, target, slot)
 
 
 def check_taken_over_claim(
@@ -2987,6 +3013,8 @@ def claimed_run(
         linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
         if linux and request.verb == "mend-fix":
             return declined("target does not permit this command", started)
+        mirror = (controller.dispatch_mirror if not linux and controller.dispatch_mirror is not None
+                  else request_mirror(config, request, repository))
         if linux:
             expected = expected_linux_parity(controller, config)
             if isinstance(expected, UnavailableToolParity):
@@ -3025,26 +3053,26 @@ def claimed_run(
                 report_leftover_check(checked, request)
                 return declined("disk", started)
         else:
-            probe = probe_mac(controller, config, repository, request.target, request.slot)
+            probe = probe_mac(controller, config, repository, request.target, request.slot, mirror_path=mirror.path)
             if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
+            disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot,
+                                         mirror_path=mirror.path)
             if isinstance(disk, SweepFailed):
                 return DeclinedMacRun("disk", elapsed_seconds(started), disk.cause)
             if isinstance(disk, SweepShort):
                 return declined("disk", started)
             copy_started = time.monotonic()
-            copied = copy_tree_with_key(controller, config, request, repository)
+            copied = copy_tree_with_key(controller, config, request, repository, mirror)
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
-        mirror = (controller.dispatch_mirror if not linux and controller.dispatch_mirror is not None
-                  else request_mirror(config, request, repository))
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
-                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY)
+                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY,
+                mirror_path=mirror.path)
         except ValueError as error:
             evidence.execution = execution_identity.ExecutionNotStarted()
             return DeclinedMacRun("state", elapsed_seconds(started), str(error))
@@ -3154,23 +3182,22 @@ def claimed_run(
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
                         or (linux and remote_status.status == os.EX_TEMPFAIL))
-        fetched = (fetch_folder(controller, config, request, repository)
+        fetched = (fetch_folder(controller, config, request, repository, mirror.path)
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
         if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
                 and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
             saved = controller.mac_repository
-            command = copies.remote_use_command(mirror,
-                f"echo mac_exit={remote_status.status}; "
-                + remote_cleanup_command(config, request, repository, mirror_path=mirror.path))
             if isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None:
-                command = mac_dispatch_guard(saved.dispatch) + command
+                command = mac_dispatch_guard(saved.dispatch) + copies.remote_use_command(mirror,
+                    f"echo mac_exit={remote_status.status}; "
+                    + remote_cleanup_command(config, request, repository, mirror_path=mirror.path))
                 arguments = ["ssh", *MAC_DEPARTURE_SSH_OPTIONS, *ssh_options(config), config.host, command]
+                cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
+                           if routed_mac_command else controller.stream_mac_run(arguments))
+                cleanup_result = cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()
             else:
-                arguments = [*ssh_prefix(config), command]
-            cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
-                       if routed_mac_command else controller.stream_mac_run(arguments))
-            remote_status = replace(remote_status, cleanup=(
-                cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
+                cleanup_result = CleanupUnconfirmed()
+            remote_status = replace(remote_status, cleanup=cleanup_result)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror.path}/target",
@@ -3201,7 +3228,7 @@ def claimed_run(
                 return MacCleanupUnconfirmed(seconds, "nextest setup failed and its cleanup did not end")
             return declined("state", started)
         if remote_status.status == 0:
-            fixed = (return_fix(controller, config, request, repository, copied.tree_key)
+            fixed = (return_fix(controller, config, request, repository, copied.tree_key, mirror.path)
                      if request.verb == "mend-fix" else FIX_NOT_RUN)
             return PassedOnMac(seconds, fetched, remote_status.build_target_directory, fixed)
         if remote_status.status == 4 and request.verb == "nextest":
@@ -3773,6 +3800,12 @@ def cleanup_taken_over_claim(controller: ProcessController, config: OffloadConfi
                              repository: eligibility.RepositoryIdentity, started: float
                              ) -> ClaimReleaseConfirmed | BusyMacDecline | DeclinedMacRun:
     controller.attempt_evidence.slot = claim.slot if isinstance(claim, TakenOverMacClaim) else 0
+    saved = controller.mac_repository
+    if (isinstance(claim, TakenOverMacClaim)
+            and target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
+            and (not isinstance(saved, claim_state.MacMirrorIdentity) or saved.dispatch is None)):
+        controller.attempt_evidence.cleanup = "unconfirmed"
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     checked = check_taken_over_claim(controller, config, claim, repository, request.target)
     observe_cleanup(controller.attempt_evidence, checked)
     report_leftover_check(checked, request)

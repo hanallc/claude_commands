@@ -236,8 +236,8 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
 fi
 if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'lint clippy'* ||
       $remote == *'lint mend-check'* || $remote == *'lint doc'* ]]; then
-    if [[ $remote == *'mac_dispatch='* && -x $root/selectors/sysctl ]]; then
-        printf 'mac_dispatch=%s\t%s\n' "$("$root/selectors/sysctl")" "$HOME"
+    if [[ $remote == *'mac_dispatch='* && ${run_dispatch_reported:-1} == 1 ]]; then
+        printf 'mac_dispatch=fixture-boot\t%s\n' "$HOME"
     fi
     if (( hold_run )); then
         printf 'mac_exit=0\nfixture acknowledgement\n'
@@ -260,7 +260,8 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
     if (( run_status_reported )); then
         printf '%s\n' "$run_status_line"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
-        python3 - "$claim_file" <<'SETTLE_FENCE'
+        if (( ${run_fence_reported:-1} )); then
+            python3 - "$claim_file" <<'SETTLE_FENCE'
 ''' + python_tool_source(r'''
 from pathlib import Path
 import subprocess
@@ -277,6 +278,7 @@ command = offload.start_fence_command(
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''
 SETTLE_FENCE
+        fi
     fi
     exit "$run_ssh_status"
 fi

@@ -253,9 +253,6 @@ def stream(arguments, *limits):
         status = statuses.get(mode, 0)
         cleanup = "kept" if mode == "post-fetch-cleanup-timeout" else "0"
         wire = f"mac_exit={status}\nmac_cleanup={cleanup}\n"
-        if mode == "post-fetch-cleanup-timeout":
-            assert "mac_dispatch=" in arguments[-1], arguments
-            wire = f"mac_dispatch=fixture-boot\t{Path.home()}\n" + wire
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
@@ -264,6 +261,8 @@ def stream(arguments, *limits):
             assert settled.returncode == 0, settled.stderr
             wire += settled.stdout
 
+    if "mac_dispatch=" in arguments[-1]:
+        wire = f"mac_dispatch=fixture-boot\t{Path.home()}\n" + wire
     remote_output, remote_status = wire, status
 
     if limits:

@@ -88,6 +88,8 @@ class CommandFixture(TypedDict):
     rsync_status: int
     hold_copy: bool
     run_lines: list[RemoteLine]
+    run_dispatch_reported: NotRequired[bool]
+    run_fence_reported: NotRequired[bool]
     run_status_reported: bool
     run_status_line: str
     run_cleanup_line: str
@@ -764,10 +766,14 @@ raise SystemExit(offload.main())
 
     def assert_leftover_selectors(self, remote: str) -> None:
         self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", remote)
-        self.assertIn(f"mirror_cwd_pattern={shlex.quote(HANA_CWD_PATTERN)}\n", remote)
         self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', remote)
         self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
-        self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
+        if "physical_mirror=" in remote:
+            self.assertIn('cd -P "$saved_mirror"', remote)
+            self.assertIn('MAC_LOGICAL_MIRROR="$saved_mirror" MAC_PHYSICAL_MIRROR="$physical_mirror"', remote)
+        else:
+            self.assertIn(f"mirror_cwd_pattern={shlex.quote(HANA_CWD_PATTERN)}\n", remote)
+            self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
         self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
@@ -796,7 +802,12 @@ raise SystemExit(offload.main())
                                      "remote_host": host}
         if not legacy:
             repository = self.mac_repository()
-            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
+            mirror_path = f"{FIXTURE_MIRROR_ROOT}/{repository.mirror_name}"
+            home = self.environment["HOME"]
+            (Path(home) / mirror_path).mkdir(parents=True, exist_ok=True)
+            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository={
+                **repository.record(), "dispatch": {"boot_id": "fixture-boot", "mirror_path": mirror_path, "home": home},
+            })
         _ = self.claim_file.write_text(json.dumps(record))
         return record
 

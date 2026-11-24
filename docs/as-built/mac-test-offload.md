@@ -125,7 +125,8 @@ A PID alone cannot release another attempt.
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
   A live claim blocks only its repository.
-  A kept claim, whose holder process is gone, does not answer `busy`: the next claim takes it over and cleans its leftovers.
+  The next claimant can take over a kept claim after the holder exits.
+  The runner checks for leftovers only if the claim has a recorded dispatch identity.
   A live mirror refusal time also answers `busy` for that repository.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
@@ -391,7 +392,8 @@ The remote claim stays available for recovery until the runner confirms cleanup.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests. An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
 - `copies.remote_rsync` builds the refresh command for the configured mirror root.
-  It excludes `/.git`, `/target/`, ignored paths, and the metadata that copies.py owns.
+  The probe, copy, command, and dispatch record use the mirror path from the lease.
+  The copy excludes `/.git`, `/target/`, ignored paths, and the metadata that copies.py owns.
   The mirror's build output survives the refresh.
 - The run uses one ssh call through `lint <verb>`.
   `mac_skip.<repo>` applies only to nextest's `-E` filter.
@@ -436,7 +438,9 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The runner releases the claim before it exits if all checks pass.
   The runner keeps the claim if work remains or a check fails.
   If a stream ends without a usable cleanup marker, `claimed_run` checks for leftovers.
-  In that case, it releases the claim only after `LeftoversEnded`.
+  The runner keeps the Mac claim without a recorded dispatch identity.
+  With that identity, the runner uses the recorded mirror only after it verifies the boot ID and home.
+  It releases the claim only after `LeftoversEnded`.
 - When launch authorization has no confirmed reply, one deadline covers the exact release.
   The release helper gives SSH the remaining time.
   At the deadline, the runner stops the release helper and its local SSH process as a group.
@@ -451,6 +455,8 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The claim watcher's activity check uses scope `ALL_MIRRORS`.
   The command selector uses `pgrep` for mirror command paths.
   The working-directory selector uses `lsof` and `awk`.
+  For an identified Mac dispatch, the selectors match the recorded path and its physical path.
+  The probe fails if it cannot resolve the physical path.
   A `KnownRepository` scope stops both patterns at the repository boundary.
   `extended_regex_literal` escapes the repository name.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
@@ -630,7 +636,7 @@ Both values use the existing configuration reader.
 - The claim files live on natedev. A process-bound claim ends when its owner ends.
   The watcher uses the mirror path recorded at dispatch for the lease and the process check.
   The watcher releases a kept claim when it confirms departure for that mirror.
-  A different boot ID or home keeps the claim.
+  A different boot ID or home keeps the claim. A failed path resolution also keeps the claim.
   A claim without a dispatch identity can end after the whole-Mac idle interval.
   The owner can also release a kept claim after confirming departure.
 - One native claim uses one repository mirror. A whole-Mac claim in `run.json` excludes every other claim. A block refuses claims from other sessions. The watcher checks that the claim is unchanged before release. A failed check keeps the claim.
