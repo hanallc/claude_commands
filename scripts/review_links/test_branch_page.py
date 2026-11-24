@@ -23,7 +23,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
 from scripts.agents import remote
-from scripts.lib import conf, file_lock
+from scripts.lib import file_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import branch_page, change_page, page_frame, serve
@@ -195,19 +195,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
 
 
 class BranchPageTests(unittest.TestCase):
-    def test_git_commands_use_the_configured_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "review_links.conf"
-            _ = config.write_text("# whole: 1..300\nbranch_git_timeout_seconds=8\n", encoding="utf-8")
-            with (patch.dict(os.environ, {"CONF_DIR": directory}),
-                  patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 8)) as run):
-                for arguments in (("fetch", "origin"), ("push", "origin", "--delete", "--", "test")):
-                    with self.subTest(arguments=arguments), self.assertRaisesRegex(branch_page.GitTimeout,
-                                                                                 f"Git {arguments[0]} timed out after 8 seconds."):
-                        _ = branch_page.git(Path(directory), *arguments)
-                    self.assertEqual(run.call_args.kwargs["timeout"], 8)
-
-    def test_post_reports_an_unusable_timeout_and_hides_deleted_rows_if_both_saves_fail(self) -> None:
+    def test_post_hides_deleted_rows_if_both_saves_fail(self) -> None:
         with (scratch_branches() as fixture,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(change_page, "send_to_staff")):
@@ -218,38 +206,11 @@ class BranchPageTests(unittest.TestCase):
             body = urlencode({"token": page.token, "branch": branch})
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
             before = fixture.remote_names()
-            whole = conf.ConfigRead.whole
-            completed: Queue[None] = Queue()
-            delete_branches = serve.ReviewLinksHandler.delete_branches
-
-            def finish_request(handler: serve.ReviewLinksHandler) -> None:
-                try:
-                    delete_branches(handler)
-                finally:
-                    completed.put(None)
-
-            _ = self.enterContext(patch.object(serve.ReviewLinksHandler, "delete_branches", new=finish_request))
-
-            def invalid_timeout(settings: conf.ConfigRead, key: str) -> int:
-                if key == "branch_git_timeout_seconds":
-                    raise conf.Unusable("Unusable branch_git_timeout_seconds.")
-                return whole(settings, key)
-
             with serve.ReviewLinksServer((serve.tailscale_ip(), 0), root) as server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
                 try:
-                    with patch.object(conf.ConfigRead, "whole", new=invalid_timeout):
-                        connection.request("POST", path, body, headers)
-                        response = connection.getresponse()
-                        content = response.read().decode()
-                        _ = completed.get(timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(response.status, 200)
-                    self.assertIn('id="branch-failure" role="alert">', content)
-                    self.assertIn(f"{branch}: Unusable branch_git_timeout_seconds.", content)
-                    self.assertEqual(fixture.remote_names(), before)
-
                     with (patch.object(branch_page, "write_manifest", side_effect=OSError("Cannot save the manifest.")),
                           patch.object(branch_page, "publish_for", side_effect=OSError("Cannot publish the next list."))):
                         connection.request("POST", path, body, headers)
@@ -692,22 +653,6 @@ class BranchPageTests(unittest.TestCase):
                     final_body = urlencode({"token": final_page.token, "branch": final_selection}, doseq=True)
                     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-                    def time_out(_repository: Path, command: str, *_arguments: str) -> subprocess.CompletedProcess[str]:
-                        raise branch_page.GitTimeout(f"Git {command} timed out after 8 seconds.")
-
-                    with patch.object(branch_page, "git", side_effect=time_out):
-                        connection.request("POST", final_path, final_body, headers)
-                        response = connection.getresponse()
-                        content = response.read().decode("utf-8")
-                    self.assertEqual(response.status, 200)
-                    self.assertIn("Git push timed out after 8 seconds.", content)
-                    self.assertIn("Git fetch timed out after 8 seconds.", content)
-                    after_timeout = BranchForm()
-                    after_timeout.feed(content)
-                    self.assertEqual(after_timeout.offered, final_selection)
-                    self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), final_page.folder)
-                    _ = messages.get(timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(branch_page.page_at(root, path), final_page)
                     connection.request("POST", final_path, final_body, headers)
                     response = connection.getresponse()
                     content = response.read().decode("utf-8")

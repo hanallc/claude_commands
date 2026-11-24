@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.lib import build_folders
 from scripts.direct import plan_history
 from scripts.agents import remote
-from scripts.lib import atomic_file, conf, file_lock, unit_runs
+from scripts.lib import atomic_file, file_lock, unit_runs
 from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
@@ -114,10 +114,6 @@ class PageSubmitted(ValueError):
     """An older marker has no address for the next branch page."""
 
 
-class GitTimeout(TimeoutError):
-    """A Git command for the branch page exceeded the configured limit."""
-
-
 @dataclass(frozen=True)
 class FormerUnit:
     name: str
@@ -168,17 +164,13 @@ class RepositoryScope:
         return matches
 
 
-def git(repository: Path, command: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-    timeout = conf.read("review_links").whole("branch_git_timeout_seconds")
-    try:
-        return subprocess.run(["git", "--no-optional-locks", "-C", str(repository), command, *arguments],
-                              capture_output=True, text=True, check=False, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        raise GitTimeout(f"Git {command} timed out after {timeout} seconds.") from error
+def git(repository: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "--no-optional-locks", "-C", str(repository), *arguments],
+                          capture_output=True, text=True, check=False)
 
 
-def git_text(repository: Path, command: str, *arguments: str) -> str:
-    result = git(repository, command, *arguments)
+def git_text(repository: Path, *arguments: str) -> str:
+    result = git(repository, *arguments)
     result.check_returncode()
     return result.stdout.strip()
 
@@ -540,7 +532,7 @@ def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
             result = git(deletion.page.repository, "push", "origin", "--delete", "--", name)
             deleted = result.returncode == 0
             results.append(DeleteResult(name, "deleted" if deleted else failure_detail(result), deleted))
-        except (OSError, subprocess.SubprocessError, conf.Unusable) as error:
+        except (OSError, subprocess.SubprocessError) as error:
             results.append(DeleteResult(name, str(error), False))
     return tuple(results)
 
@@ -569,8 +561,7 @@ def finish_deletion(deletion: BranchDeletion) -> tuple[set[str], str]:
         published = publish_for(page.repository, page.publisher)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, staff.StaffRefused, Refusal) as error:
         lines.append("Next page failed: " + " ".join(str(error).splitlines()))
-        failures.append(str(error) if isinstance(error, (GitTimeout, conf.Unusable))
-                        else "The next branch page could not be prepared.")
+        failures.append("The next branch page could not be prepared.")
     else:
         next_page = published.page
         try:

@@ -874,7 +874,7 @@ async function checkSessionLayout() {
 
     def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
         row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
-               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana/report/1", "slot_machine": "natedev",
+               "key": "run", "used": 2.0, "slot_folder": "hana/report/1", "slot_machine": "natedev",
                "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
         body = cast(str, self.run_drive("""
@@ -890,7 +890,7 @@ async function checkSessionLayout() {
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot": 1, "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+                "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
                            {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}
