@@ -111,8 +111,9 @@ The gate prints `Mac Linux guest took no run: <cause>` and exits with status 79.
 In merge mode, it undoes the merge and reports the rollback.
 Status 80 identifies an unknown result after a guest could have started tests.
 A direct gate or `copies.py gate-step` places the run once.
-Checkpoint and bump stop after status 79 or 80.
-`copies.py gate-step` preserves both statuses if cancellation fails and prints the cleanup error on standard error.
+Checkpoint and bump tests stop on status 79 or 80 when the supervisor returns it.
+`copies.py run` and `copies.py gate-step` preserve both statuses if cleanup fails.
+They print the cleanup error on standard error.
 When `copies.py run` owns placement, it reports the claim failure to the queue on status 79 and requests placement again.
 The queue accepts a claim failure after launch permission was used if a new process read confirms the gate ended.
 The caller writes the new assignment to the same file and runs the gate on the assigned machine.
@@ -120,7 +121,11 @@ A 180-second delay applies to another attempt on the same guest. A free named ma
 A second decline excludes the guest for the rest of the run.
 If placement fails, the caller reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
-Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+Checkpoint merge gates use `copies.py run` with the prepared commit.
+The checkpoint reports `copies.py run` setup failures as a block with the test log path.
+The checkpoint skips the rerun and the base check for that failure.
+Placement failures that `gate.py` reports with status 1 follow the red test path.
+Bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.

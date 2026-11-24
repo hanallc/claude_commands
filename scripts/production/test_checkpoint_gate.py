@@ -29,6 +29,33 @@ GATE = ("python3", "scripts/production/gate.py", "--tests-only")
 
 
 class CheckpointGateTests(unittest.TestCase):
+    def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary).resolve()
+            production = ProductionDocument(folder / "production.md", "fixture", "merge", folder,
+                                            folder / "production.log", ZoneInfo("UTC"))
+            prefix = ["env", "HERDR_BIN=/nonexistent/herdr"]
+            command = [*prefix, *GATE, "--checkout", "."]
+            step = checkpoint_gate.CheckpointTestStep("merge test 1", command, folder)
+            log = folder / "test.log"
+            script_dir = Path(checkpoint_gate.__file__).resolve().parents[1]
+            expected = [*prefix, str(script_dir / "lib/py"), str(script_dir / "copies/copies.py"), "run",
+                        "--repo", str(folder), "--commit", "merged-tip", "--", *GATE, "--checkout", "{tree}"]
+            retry = [*expected, "--module", "known_flake"]
+
+            with mock.patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess(expected, 1, RED_OUTPUT, ""),
+                    subprocess.CompletedProcess(retry, 0, "", ""),
+            ]) as run:
+                result = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}),
+                                                        log, merge_head="merged-tip")
+            options = {"cwd": folder, "capture_output": True, "text": True, "check": False, "pass_fds": ()}
+            self.assertEqual(run.call_args_list, [mock.call(expected, **options), mock.call(retry, **options)])
+            self.assertEqual(result, "merge test 1")
+            self.assertIn("merge_test_1_EXIT=1", log.read_text())
+            self.assertIn("merge_test_1_RERUN_EXIT=0", log.read_text())
+            self.assertIn("known flaky tests known_flake", production.log.read_text())
+
     def test_named_gate_uses_a_supervisor_with_the_gate_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -131,7 +158,6 @@ class CheckpointGateTests(unittest.TestCase):
                              "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf.")
 
 
-COMMAND = ["python3", "gate.py", "--tests-only"]
 RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructure.py exit=1 ---\n"
 
 
@@ -142,33 +168,29 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         production = ProductionDocument(root / "production.md", "fixture", "merge", root,
                                         root / "production.log", ZoneInfo("UTC"))
         log = root / "test.log"
-        step = checkpoint_gate.CheckpointTestStep("merge test 1", COMMAND, root)
-        admitted = mock.Mock(spec=first_step.FirstStepAdmission)
+        command = ["env", "HERDR_BIN=/nonexistent/herdr", *GATE]
+        step = checkpoint_gate.CheckpointTestStep("merge test 1", command, root)
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            args = copies.CopyArguments(repo=str(folder), targets="mac-linux,natedev")
-            result = copies.run_gate_step(args, command)
-            return subprocess.CompletedProcess(command, result, RED_OUTPUT, "")
-
-        with (mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as place,
-              mock.patch.object(subprocess, "run",
-                                return_value=subprocess.CompletedProcess(COMMAND, status)) as child,
-              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run),
+        with (mock.patch.object(subprocess, "run",
+                                return_value=subprocess.CompletedProcess(command, status, RED_OUTPUT, "")) as child,
               self.assertRaises(checkpoint_gate.Stop) as stopped):
             _ = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}), log,
-                                               retry_failed_steps=retry_failed_steps)
-        place.assert_called_once_with(COMMAND, root, targets=("mac-linux", "natedev"))
+                                               retry_failed_steps=retry_failed_steps, merge_head="merged-tip")
         child.assert_called_once()
         if status == 1:
             assert isinstance(stopped.exception, checkpoint_gate.RedCheckpointTests)
             self.assertEqual(stopped.exception.red, (checkpoint_gate.RedStep(step, frozenset({"lib/test_infrastructure.py"})),))
         else:
             self.assertEqual(stopped.exception.state, "blocked")
-            self.assertIn(f"gate status {status}", stopped.exception.detail)
-            self.assertNotIn("RERUN", log.read_text())
+            self.assertIn(f"status {status}", stopped.exception.detail)
+            self.assertIn(str(log), stopped.exception.detail)
+            output = log.read_text()
+            self.assertIn(f"merge_test_1_EXIT={status}", output)
+            self.assertNotIn("RERUN", output)
+            self.assertNotIn("BASE", output)
         self.assertFalse(production.log.exists())
 
-    def test_silent_guest_blocks_the_checkpoint_without_a_retry(self) -> None:
+    def test_guest_refusal_status_blocks_the_checkpoint_without_a_test_retry(self) -> None:
         self.run_step(79, retry_failed_steps=True)
 
     def test_unknown_guest_result_blocks_the_checkpoint_without_a_retry(self) -> None:
@@ -176,3 +198,8 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
     def test_red_gate_remains_a_test_failure(self) -> None:
         self.run_step(1, retry_failed_steps=False)
+
+    def test_copy_setup_errors_block_the_checkpoint_without_a_test_retry(self) -> None:
+        for status in (copies.COPY_ERROR_STATUS, os.EX_TEMPFAIL, 127):
+            with self.subTest(status=status):
+                self.run_step(status, retry_failed_steps=True)
