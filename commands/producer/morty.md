@@ -8,10 +8,10 @@ Load `/producer:produce` before this command.
 
 ## List tracking
 
-morty is the producer of the List page (item 106).
-morty also manages the producer skills in `commands/producer/*.md`, `docs/producer/` and the producer READMEs.
-Send each request to change these skills to morty.
-morty tracks and checks all other work.
+morty is the producer of the List page (item 106). morty tracks and checks all work other than the List page and the producer skills.
+Morty takes `/recall` and New item requests and selects the producer.
+Send an overdue check time to the item's producer.
+morty also manages the producer skills: `commands/producer/*.md`, `docs/producer/` and the producer READMEs. Send each change request for them to morty.
 Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
 
 Give The List first priority. Advance items and record their current state.
@@ -27,15 +27,15 @@ Release the hold when nate is back and gives approval.
 ## Persistent state
 
 Read The List records and morty's other `checkins.json` state at startup and after compaction.
-Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
-Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item in morty's folder.
+Save substantive item changes through `the_list.py add`, `update`, `park`, `unpark`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
-Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
+Use `--producer <name or staff ID>` with `add` or `update` to assign an item in morty's folder.
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
-New items default to morty.
-The assigned producer writes the title, done when, unit, latest status, next step, ETA, state, next check and evidence.
-Each producer adds, parks, closes and reopens its own items.
-Morty keeps reassign, and add, park, close and reopen for all items.
+Items that you add without `--producer` go to morty.
+You can use every List command on items in morty's folder.
+Only `answer` and `update` accept `--keeper <staff ID>` to select a legacy keeper's folder.
+See `commands/producer/produce.md` for the commands that each producer uses on its own items.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -59,6 +59,7 @@ Do not repeat answered questions. Read existing evidence without starting builds
 nate's verdicts and question answers go to the owner, not to morty.
 Read them from the records before an item says `Waiting for nate`, as `morty-operations.md` shows.
 Then correct the item state and ask the owner for nate's answer.
+nate's words on a List page item of another producer go to that producer. Read them from the item log.
 
 ## Low-context status rounds
 
@@ -97,13 +98,17 @@ If nothing needs nate and no unread update remains, say so. Continue authorized 
 Do not advance automatically after nate answers. Record the answer and act within its scope.
 Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
 Treat List page feedback as nate's words for the named item.
-Answer List questions with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer L<N> --question <id> --text "<answer>"`.
+Answer questions on your List items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer L<N> --question <id> --text "<answer>"`.
+You may answer any List question.
 Act through `the_list.py` and tell the owner, as for any instruction from nate.
 
 ## Lists and unread updates
 
+Read the status, next step, and done-when of every producer's items in each round.
+Correct text that nate cannot read in ten seconds, or ask the producer to correct it.
+
 `list` prints `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list`.
-After adding an item, print the complete visible list.
+After adding an item, give its number, owner and producer, and the link to the List page.
 For managed follow-ups, State includes the next check time. Label overdue checks accurately and restore their schedule.
 Use `●` for an unread substantive update and `—` otherwise.
 A clear summary shown to nate marks that update read. A table badge alone does not.

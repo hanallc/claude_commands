@@ -818,8 +818,7 @@ try {
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
-          // bob, 2026-11-23: a Mac build with no unit starts with who started it, here a terminal.
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === 'trunk');
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
@@ -922,7 +921,7 @@ try {
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
                   [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
-                colors:[chart(keys[0]),chart(keys[4])].map(row => [
+                colors:[chart(keys[0]),chart(keys[2]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
@@ -942,13 +941,13 @@ try {
               await assertRowCenters(evaluate);
               assert.deepEqual(rows.headers, runningHeaders);
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
-                ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
+                ['queue','builds','','gate'],['trunk','hana','','nextest'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
               assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
                 [runningIcon('natedev')],waitingIcons]);
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
-              assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
+              assert.deepEqual(rows.colors, Array.from({length:3},()=>['role.unit-director','role.showrunner']));
               assert.equal(rows.heading, 'Waiting, in queue order');
               assert.equal(rows.runAge, `${runAgeMinutes} min`);
               assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
@@ -2856,14 +2855,13 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            // A Mac build with no unit starts with its owner; the step after ": " goes in Step.
-            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner']);
+            assert.deepEqual(macProof.map(row=>row.name),['trunk-p172-assembly-rows','trunk','cargo-liner']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.step),['build','nextest','nextest']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
-              repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
+              owner:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.owner),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -2993,7 +2991,7 @@ try {
                 const dualTargets = structuredClone(base);
                 dualTargets.walk = [
                   structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify)),
-                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by)),
+                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build')),
                 ];
                 dualTargets.walk[0].machine = 'natedev';
                 dualTargets.walk[1].machine = 'mac';
@@ -3846,7 +3844,6 @@ try {
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
           Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
             progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
-          delete mac.started_by;
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
@@ -4411,12 +4408,13 @@ try {
           document.querySelector(${gateButton}).click();
           await loaded;
           const preview = dialog.querySelector('.new-item-evidence .tip');
-          const tooltip = tooltipHtml(proofTip('row', ${gateIndex}), latest);
+          const tooltip = document.createElement('template');
+          tooltip.innerHTML = tooltipHtml(proofTip('row', ${gateIndex}), latest);
           const bounds = dialog.getBoundingClientRect();
           const regions = [dialog.querySelector('.new-item-body'), preview, ...preview.children];
           return {open:dialog.matches(':modal'),
             recipient:dialog.querySelector('[name="recipient_id"]:checked').value,
-            kind:dialog.querySelector('[name="kind"]:checked').value, sameTip:preview.outerHTML === tooltip,
+            kind:dialog.querySelector('[name="kind"]:checked').value, sameTip:preview.isEqualNode(tooltip.content.firstElementChild),
             fits:bounds.left >= 0 && bounds.right <= innerWidth && bounds.top >= 0 && bounds.bottom <= innerHeight &&
               regions.every(region => region.scrollWidth <= region.clientWidth),
             evidence:dialog.querySelector('.new-item-evidence').textContent};
@@ -4428,22 +4426,18 @@ try {
         };
         const submitRowAsk = async row => {
           submittedItem = undefined;
-          await rowAskStep('Send New item evidence', `(async () => {
+          const result = await rowAskStep('Send New item evidence', `(async () => {
             const dialog = document.querySelector('#review-new-item');
-            const created = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
+            const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
             const words = dialog.querySelector('textarea');
             words.value = 'Can we check this gate?';
             words.dispatchEvent(new Event('input', {bubbles:true}));
-            const saved = dialog.querySelector('#new-item-saved');
-            const shown = new Promise(resolve => new MutationObserver((_, observer) => {
-              if (saved.textContent === 'Saved Q1.') { observer.disconnect(); resolve(); }
-            }).observe(saved, {childList:true, characterData:true, subtree:true}));
             dialog.querySelector('[type="submit"]').click();
-            await shown;
-            // The dialog announces the saved item when Done closes it.
-            dialog.querySelector('[data-done]').click();
-            await created;
+            const closedAtSend = !dialog.open;
+            const {detail} = await created;
+            return {closedAtSend,id:detail.id};
           })()`);
+          assert.deepEqual(result, {closedAtSend:true,id:'Q1'});
           assert.equal(submittedItem.recipient_id, 'fixture-builds');
           assert.equal(submittedItem.words, 'Can we check this gate?');
           const evidence = submittedItem.evidence;

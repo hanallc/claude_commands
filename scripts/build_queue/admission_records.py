@@ -94,6 +94,11 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class GuestStartNotReported:
+    """The assignment has no saved guest execution folder."""
+
+
+@dataclass(frozen=True)
 class GuestStartNotRecorded:
     """The queue has no saved confirmation of a guest start."""
 
@@ -120,6 +125,7 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
     guest_execution_observed: bool = False
     guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
@@ -1369,6 +1375,8 @@ def execution_group(step: RunningStep, fallback: str) -> str:
         identity = evidence.identity
         if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        if isinstance(identity, execution_identity.GuestExecution):
+            return repr((identity.target, identity.attempt))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
         return repr((step.assignment_host, fallback))
