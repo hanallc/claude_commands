@@ -53,6 +53,7 @@ from scripts.lint import test_memory_admit as memory_tests
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -1712,9 +1713,8 @@ process.stdout.write(JSON.stringify({
                 caller = Path(directory)
                 environment = {**os.environ, "TMPDIR": str(caller), "PYTHON": sys.executable,
                     "CHROME": str(chrome), "CHROME_REPORT": str(report), "CHROME_END": ending}
-                result = subprocess.run([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
-                    str(proof)], env=environment, text=True, capture_output=True,
-                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                result = run_process_group([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
+                    str(proof)], env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertNotEqual(result.returncode, 0)
                 if ending == 'request':
                     self.assertRegex(result.stderr, "Chrome (closed during a debugger request|debugger connection closed)")
@@ -5230,9 +5230,9 @@ class BuildsPageProofTests(unittest.TestCase):
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         write_private_slot_roots(directory / "build_folders.conf", directory, FIXTURE_MACHINE)
-        result = subprocess.run(command,
-            env={**environment, "CONF_DIR": str(directory), "TMPDIR": str(directory)}, text=True, capture_output=True,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        result = run_process_group(command,
+            env={**environment, "CONF_DIR": str(directory), "TMPDIR": str(directory)},
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         verdict = cast(dict[str, object], json.loads(result.stdout.splitlines()[-1]))
         self.assertIs(verdict.get("pass"), True)
