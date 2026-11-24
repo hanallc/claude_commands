@@ -13,6 +13,7 @@ SubmittingSession = OwningSession | NoOwningSession
 
 GATE_MACHINES = ("natedev", "mac-linux", "aws")
 GATE_CALLER_EXCLUSION = "the run asks for it"
+CLOUD_GATE_OFF_REASON = "cloud gates are off (cloud_gate.conf enabled=off)"
 TARGET_READING_UNAVAILABLE = "the target reading is unavailable"
 
 
