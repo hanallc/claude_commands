@@ -1973,7 +1973,59 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertTrue(ledger.gate_is_open(by_attempt[attempt]))
                 self.assertEqual(by_attempt[other].state, ledger.GateTerminated(int(self.now), 'i-' + other))
                 self.assertIn(f'Skipped gate cleanup for {attempt}: the booking owner changed', errors.getvalue())
-                self.assertEqual(termination_locks, [True])
+                self.assertEqual(termination_locks, [False])
+
+    def test_cleanup_refuses_resume_while_aws_terminates_the_box(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        cloud_gate.save(self.folder / 'launch.json', {'instance': 'i-' + attempt, 'region': 'fixture-region'})
+        owner = ledger.GateWorkerOwner(os.getpid(), 'resume-start', str(self.folder))
+        resume = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        checked_resume = False
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal checked_resume
+            if 'describe-instances' in arguments:
+                self.assertIn('i-' + attempt, self.fake.terminated_instances)
+                with self.assertRaisesRegex(ledger.LedgerUnavailable, 'booking is in cleanup'):
+                    self.book.gate_owner(attempt, owner)
+                with self.assertRaisesRegex(ledger.LedgerUnavailable, 'booking is in cleanup'):
+                    _ = resume.launch(self.folder, self.request, self.deployment)
+                checked_resume = True
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertTrue(checked_resume)
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-' + attempt))
+
+    def test_reconcile_resolves_a_lost_termination_reply(self) -> None:
+        def lose_termination_reply(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            result = self.fake(arguments, **options)
+            if 'terminate-instances' in arguments:
+                raise subprocess.TimeoutExpired('terminate-instances', 1)
+            return result
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=lose_termination_reply),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'fallback')
+        self.assertEqual(self.fake.terminated_instances, {'i-fixture'})
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertTrue(ledger.gate_is_open(booking))
+        self.assertLess(self.now, booking.expires)
+        _ = (self.folder / 'launch.json').write_text('{')
+
+        recovered = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        with mock.patch.object(cloud_gate, 'process_start', return_value=Unreadable('fixture outage')):
+            recovered.reconcile()
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
 
     def test_reconcile_command_ends_an_expired_gate_and_launches_no_box(self) -> None:
         self.record_running_gate('expired', 'm7a.8xlarge', 'us-east-2')

@@ -149,6 +149,20 @@ NO_GATE_CLEANUP_OWNER_CHECK = NoGateCleanupOwnerCheck()
 
 
 @dataclass(frozen=True)
+class GateCleanupNotStarted:
+    """Cleanup has not reserved the booking for termination."""
+
+
+GATE_CLEANUP_NOT_STARTED = GateCleanupNotStarted()
+
+
+@dataclass(frozen=True)
+class GateCleanupPending:
+    region: str
+    instances: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class NoGateTrial:
     pass
 
@@ -177,6 +191,7 @@ class GateReservation:
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
     placement_claim: str = ''
+    cleanup: GateCleanupNotStarted | GateCleanupPending = GATE_CLEANUP_NOT_STARTED
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
@@ -813,14 +828,31 @@ class GateCleanupSuperseded(LedgerUnavailable):
     """The booking closed or changed owner after cleanup selected it."""
 
 
+class GateCleanupInProgress(LedgerUnavailable):
+    """The booking is reserved for cleanup."""
+
+
 def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
-                               owner: GateWorkerOwner | GateOwnerUnknown) -> None:
+                               owner: GateWorkerOwner | GateOwnerUnknown) -> GateReservation:
     """Check the cleanup selection while the ledger lock is held."""
     booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
     if booking is None or not gate_is_open(booking):
         raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
     if booking.owner != owner:
         raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking owner changed')
+    return booking
+
+
+def mark_gate_cleanup(state: LedgerEvidence, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
+                      cleanup: GateCleanupPending) -> None:
+    """Reserve the selected instances for cleanup before the AWS call."""
+    booking = require_gate_cleanup_owner(state, attempt, owner)
+    if isinstance(booking.cleanup, GateCleanupPending):
+        if booking.cleanup != cleanup:
+            raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+        return
+    state.gate_reservations[state.gate_reservations.index(booking)] = replace(
+        booking, region=cleanup.region, cleanup=cleanup)
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -939,6 +971,13 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
         else:
             raise LedgerUnavailable('unknown gate reservation state')
+        cleanup = GATE_CLEANUP_NOT_STARTED
+        if 'cleanup' in item:
+            saved = mapping(item['cleanup'])
+            instances = tuple(text(instance, 'id') for instance in rows(saved, 'instances'))
+            if not isinstance(gate_state, (GateRunning, GateLaunchPending)) or not instances:
+                raise LedgerUnavailable('Invalid gate cleanup state')
+            cleanup = GateCleanupPending(text(saved, 'region'), instances)
         evidence.gate_reservations.append(GateReservation(
             text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
             money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
@@ -955,7 +994,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
             if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))),
-            text(item, 'placement_claim') if 'placement_claim' in item else ''))
+            text(item, 'placement_claim') if 'placement_claim' in item else '', cleanup))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     if 'gate_quota_refusals' in row:
@@ -1041,6 +1080,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
              **({'placement_claim': r.placement_claim} if r.placement_claim else {}),
+             **({'cleanup': {'region': r.cleanup.region, 'instances': [{'id': value} for value in r.cleanup.instances]}}
+                if isinstance(r.cleanup, GateCleanupPending) else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -2455,8 +2496,8 @@ class CostLedger:
     def recheck_gate_booking(self, settings_path: Path, attempt: str, now: int) -> str:
         """Check the pending booking against the current account bill."""
         with self._locked() as state:
-            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
-            if booking is None or not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
+            booking = self._launchable_gate(state, attempt)
+            if not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
                 raise LedgerUnavailable('The gate booking cannot launch a box')
             return self._gate_cap(state, read_settings(settings_path), booking, now)
 
@@ -2528,24 +2569,33 @@ class CostLedger:
             reason = 'monthly_limit'
         return reason
 
-    def gate_region(self, attempt: str, region: str, *,
-                    expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK) -> None:
+    def require_gate_launchable(self, attempt: str) -> None:
+        """Refuse a saved launch while cleanup owns the booking."""
+        _ = self._launchable_gate(self.read_snapshot(), attempt)
+
+    @staticmethod
+    def _launchable_gate(state: LedgerEvidence, attempt: str) -> GateReservation:
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if booking is None or not gate_is_open(booking):
+            raise LedgerUnavailable('The gate booking is no longer open')
+        if isinstance(booking.cleanup, GateCleanupPending):
+            raise GateCleanupInProgress('The gate booking is in cleanup')
+        return booking
+
+    def gate_region(self, attempt: str, region: str) -> None:
         """Retain the region before AWS can accept a launch."""
         with self._locked() as state:
-            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
-                require_gate_cleanup_owner(state, attempt, expected_owner)
-            state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            booking = self._launchable_gate(state, attempt)
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, region=region)
             self._save(state)
 
     def gate_owner(self, attempt: str, owner: GateWorkerOwner, *, now: float = 0) -> None:
         """Save the worker identity before an attempt can launch a box."""
         with self._locked() as state:
-            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
-            if booking is None or not gate_is_open(booking) or booking.placement_claim and booking.expires <= now:
+            booking = self._launchable_gate(state, attempt)
+            if booking.placement_claim and booking.expires <= now:
                 raise LedgerUnavailable('The gate booking cannot take a worker')
-            state.gate_reservations = [replace(row, owner=owner) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, owner=owner)
             self._save(state)
 
     def record_gate_quota_refusal(self, pool: SpotQuotaPool, now: float) -> None:
@@ -2556,13 +2606,21 @@ class CostLedger:
             self._save(state)
 
     def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '',
-                     expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK) -> None:
+                     expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK,
+                     cleanup: GateCleanupPending | GateCleanupNotStarted = GATE_CLEANUP_NOT_STARTED) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
             if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
-                require_gate_cleanup_owner(state, attempt, expected_owner)
-            if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
+                _ = require_gate_cleanup_owner(state, attempt, expected_owner)
+            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            if booking is not None and isinstance(booking.state, GateTerminated):
                 return
+            if isinstance(cleanup, GateCleanupPending):
+                if (booking is None or booking.cleanup != cleanup or not isinstance(outcome, GateTerminated)
+                        or outcome.instance_id not in cleanup.instances):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+            elif booking is not None and isinstance(booking.cleanup, GateCleanupPending):
+                raise GateCleanupInProgress('The gate booking is in cleanup')
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
             cooldown = inf
             if state.gate_quota_refusals:
@@ -2574,7 +2632,8 @@ class CostLedger:
             if isinstance(outcome, GateRunning):
                 # Clear expired marks before this launch increases the count.
                 state.clear_ended_quota_refusals(now, cooldown)
-            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
+            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type,
+                                               cleanup=GATE_CLEANUP_NOT_STARTED)
                                        if row.attempt == attempt else row for row in state.gate_reservations]
             state.clear_ended_quota_refusals(now, cooldown)
             self._price_gates(state, self.read_bills(), now)
