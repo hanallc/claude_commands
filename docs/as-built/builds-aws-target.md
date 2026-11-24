@@ -362,8 +362,9 @@ The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
 The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
-Version 2 makes older readers and writers refuse the ledger.
-Upgrade ledger users before they access version 2.
+Drain old gate workers and upgrade ledger users before the first version 2 write.
+After that write, a code-only rollback to version 1 makes old reconcile code refuse the ledger.
+Keep version 2 support in all rollbacks.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.

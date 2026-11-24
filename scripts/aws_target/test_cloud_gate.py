@@ -2043,6 +2043,14 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(document['version'], 2)
         pending = ledger.mapping(ledger.rows(document, 'gate_reservations')[0]['cleanup'])
 
+        saved = self.book.path.read_bytes()
+        inode = self.book.path.stat().st_ino
+        with (mock.patch.object(ledger, 'LEDGER_VERSION', 1),
+              self.assertRaisesRegex(ledger.LedgerUnavailable, 'unsupported ledger version')):
+            self.record_running_gate('old-writer', 'm7a.8xlarge', 'fixture-region')
+        self.assertEqual(self.book.path.stat().st_ino, inode)
+        self.assertEqual(self.book.path.read_bytes(), saved)
+
         self.record_running_gate('other', 'm7a.8xlarge', 'fixture-region')
         document = cloud_gate.read(self.book.path)
         self.assertEqual(document['version'], 2)
